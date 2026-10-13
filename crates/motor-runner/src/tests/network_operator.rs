@@ -8,6 +8,30 @@ fn config(f: &Fixture) -> Config {
     config
 }
 
+fn restart_config(root: &Path) -> Config {
+    let mut config = Config::new(root.join("state"), "e2e");
+    config.workspace_roots = vec![root.join("remote/worktrees")];
+    config.owned_workspace_roots = vec![root.join("remote")];
+    config.free_space_floor_bytes = 0;
+    config.isolate_jobs = true;
+    config.job_network = Some(JobNetwork::Veth);
+    config.disable_warm_builds = true;
+    config
+}
+
+#[test]
+fn restart_child_configuration_admits_fixture_destinations() {
+    let f = Fixture::new();
+    let mut config = restart_config(f.scratch.path());
+    config.isolate_jobs = false;
+    config.job_network = None;
+    config.cpu_topology = f.config().cpu_topology;
+    config.test_processes = f.config().test_processes;
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    assert_run_accepted(&runner, &request);
+}
+
 fn install_probe(f: &Fixture) {
     fs::write(
         f.main.join("network-check.py"),
@@ -49,7 +73,12 @@ async fn finished(runner: &Runner, id: Uuid) -> TerminalRecord {
         }
     })
     .await
-    .expect("network operator job did not terminate")
+    .unwrap_or_else(|_| {
+        panic!(
+            "network operator job {id} did not terminate; {}",
+            runner_diagnostics(runner)
+        )
+    })
 }
 
 fn job_output(runner: &Runner, id: Uuid) -> String {
@@ -188,16 +217,8 @@ fn restart_child() {
     let root =
         PathBuf::from(std::env::var_os("MOTOR_NET_RESTART_FIXTURE").expect("restart fixture"));
     let request: Run = read_json(&root.join("request.json")).unwrap();
-    let mut config = Config::new(root.join("state"), "e2e");
-    config.free_space_floor_bytes = 0;
-    config.isolate_jobs = true;
-    config.job_network = Some(JobNetwork::Veth);
-    config.disable_warm_builds = true;
-    let runner = Runner::open(config).unwrap();
-    assert!(matches!(
-        runner.accept(request.clone()).unwrap(),
-        Admission::Accepted(_)
-    ));
+    let runner = Runner::open(restart_config(&root)).unwrap();
+    assert_run_accepted(&runner, &request);
     runner
         .fetch_run(&request, &root.join("bundles"), true)
         .unwrap();
@@ -205,7 +226,11 @@ fn restart_child() {
     while !Path::new(&request.workspace_key).join("marker").exists() {
         let status = runner.job_status(request.job_id).unwrap();
         assert!(status.terminal.is_none(), "{status:?}");
-        assert!(started.elapsed() < Duration::from_secs(60));
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "waiting for network restart marker; {}",
+            runner_diagnostics(&runner)
+        );
         std::thread::park_timeout(Duration::from_millis(25));
     }
     let process = runner.core.inner.lock().unwrap().jobs[&request.job_id]
@@ -242,7 +267,13 @@ pub(crate) async fn restart() {
     .unwrap()
     .wait()
     .unwrap();
-    assert_eq!(status.code(), Some(86));
+    assert_eq!(
+        status.code(),
+        Some(86),
+        "network restart child failed for job {} at {}; request={request:?}",
+        request.job_id,
+        f.key
+    );
     let old: Job = read_json(
         &config(&f)
             .state_dir()
