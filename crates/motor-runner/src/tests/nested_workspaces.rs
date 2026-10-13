@@ -60,11 +60,13 @@ async fn nested_workspace_is_refused_before_any_workspace_is_created() {
     request.cwd = request.workspace_key.clone();
 
     let detail = refusal_detail(&runner, &request).await;
-    assert!(detail.contains(&format!(
+    // Refusal details pass through the runner's sanitizer, which renames runner
+    // state paths; scratch folders can live there, so compare after sanitizing.
+    assert!(detail.contains(&runner.safe_refusal_detail(format!(
         "workspace {} is inside runner workspace {}; nested workspaces aren't supported, so move it outside any remote workspace",
         nested.display(),
         outer.display()
-    )), "{detail}");
+    ), std::iter::empty::<String>())), "{detail}");
     assert!(!nested.exists());
 }
 
@@ -101,11 +103,11 @@ async fn sibling_inside_a_known_workspace_is_refused_before_setup() {
     sibling.siblings[0].canonical_path = text(&sibling_path).to_owned();
 
     let detail = refusal_detail(&runner, &sibling).await;
-    assert!(detail.contains(&format!(
+    assert!(detail.contains(&runner.safe_refusal_detail(format!(
         "sibling {} is inside runner workspace {}; nested workspaces aren't supported, so move it outside any remote workspace",
         sibling_path.display(),
         outer.display()
-    )), "{detail}");
+    ), std::iter::empty::<String>())), "{detail}");
     assert!(!Path::new(&sibling.workspace_key).exists());
     assert!(!sibling_path.exists());
 }
@@ -156,7 +158,12 @@ async fn nested_prepare_is_refused_before_workspace_or_repository_registration()
         RefusalReason::WorkspaceSetupFailed
     ));
     let detail = refusal.detail.unwrap();
-    assert!(detail.contains(&request.repository_root), "{detail}");
+    assert!(
+        detail.contains(
+            &runner.safe_refusal_detail(&request.repository_root, std::iter::empty::<String>())
+        ),
+        "{detail}"
+    );
     assert!(!Path::new(&request.workspace_key).exists());
     assert!(!runner
         .core
