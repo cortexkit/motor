@@ -498,6 +498,19 @@ fn prepare_javascript_dependencies(state: &Path, workspace: &Path, tree: &str) -
     })
 }
 
+fn prepare_javascript_checkouts(
+    workspace: &Path,
+    tree: &str,
+    siblings: &[SiblingSnapshot],
+    mut prepare: impl FnMut(&Path, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    prepare(workspace, tree)?;
+    for sibling in siblings {
+        prepare(Path::new(&sibling.canonical_path), &sibling.tree_hash)?;
+    }
+    Ok(())
+}
+
 fn prepare_javascript_with(
     workspace: &Path,
     paths: &[PathBuf],
@@ -1610,7 +1623,9 @@ impl Sandbox {
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
         if !writer {
-            prepare_javascript_dependencies(state, workspace, tree)?;
+            prepare_javascript_checkouts(workspace, tree, siblings, |checkout, checkout_tree| {
+                prepare_javascript_dependencies(state, checkout, checkout_tree)
+            })?;
         }
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
