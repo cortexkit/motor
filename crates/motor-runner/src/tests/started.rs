@@ -301,3 +301,196 @@ fn legacy_replay_rejects_started_that_is_not_first() {
         io::ErrorKind::InvalidData
     );
 }
+
+struct FaultBackend {
+    stage: &'static str,
+    launched: Arc<AtomicBool>,
+    reaped: Arc<AtomicBool>,
+}
+struct FaultExecution {
+    inner: Box<dyn backend::Execution>,
+    stage: &'static str,
+    reaped: Arc<AtomicBool>,
+}
+impl backend::Execution for FaultExecution {
+    fn release(&mut self) -> io::Result<()> {
+        self.inner.release()?;
+        if self.stage == "release" {
+            Err(io::Error::other("injected release failure"))
+        } else {
+            Ok(())
+        }
+    }
+    fn output(&self) -> io::Result<backend::Output> {
+        if self.stage == "output" {
+            Err(io::Error::other("injected output failure"))
+        } else {
+            self.inner.output()
+        }
+    }
+    fn wait(&mut self) -> io::Result<backend::ExecutionOutcome> {
+        self.inner.wait()
+    }
+    fn reap(&self) {
+        self.inner.reap();
+        self.reaped.store(true, Ordering::SeqCst);
+    }
+}
+impl Backend for FaultBackend {
+    fn materialize(&self, c: &Config, t: &Trees, s: &Setup) -> io::Result<Prepared> {
+        backend::HostBackend.materialize(c, t, s)
+    }
+    fn launch(
+        &self,
+        c: &Config,
+        t: &Trees,
+        s: &Setup,
+        p: &Prepared,
+        w: u32,
+    ) -> io::Result<backend::Launch> {
+        let mut launch = backend::HostBackend.launch(c, t, s, p, w)?;
+        launch.execution = Box::new(FaultExecution {
+            inner: launch.execution,
+            stage: self.stage,
+            reaped: self.reaped.clone(),
+        });
+        self.launched.store(true, Ordering::SeqCst);
+        Ok(launch)
+    }
+    fn cancel(&self, c: &Config, j: &Job, hard: bool) -> io::Result<()> {
+        backend::HostBackend.cancel(c, j, hard)
+    }
+    fn unit_alive(
+        &self,
+        c: &Config,
+        p: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>> {
+        backend::HostBackend.unit_alive(c, p)
+    }
+    fn collect_changes(&self, t: &Trees, j: &Job) -> io::Result<Option<Vec<String>>> {
+        if self.stage == "collect" {
+            Err(io::Error::other("injected change collection failure"))
+        } else {
+            backend::HostBackend.collect_changes(t, j)
+        }
+    }
+    fn reconcile(&self, c: &Config, jobs: &[Job]) -> io::Result<Vec<Uuid>> {
+        backend::HostBackend.reconcile(c, jobs)
+    }
+}
+
+async fn launch_fault(stage: &'static str) {
+    launch_fault_inner(stage, false).await;
+}
+
+async fn launch_fault_inner(stage: &'static str, isolated: bool) {
+    let f = Fixture::new();
+    let launched = Arc::new(AtomicBool::new(false));
+    let reaped = Arc::new(AtomicBool::new(false));
+    let hold = Hold::new("launch-cleanup");
+    let _release = Release(hold.clone());
+    hold.arm();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    config.isolate_jobs = isolated;
+    config.long_work = Some(hold.hook());
+    if stage == "save" {
+        config.before_job_write = Some({
+            let launched = launched.clone();
+            Arc::new(move |_| {
+                if launched.swap(false, Ordering::SeqCst) {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+    }
+    let runner = Runner::open_with_backend(
+        config,
+        Box::new(FaultBackend {
+            stage,
+            launched,
+            reaped: reaped.clone(),
+        }),
+    )
+    .unwrap();
+    let (request, bytes) = f.run("sleep 60");
+    f.submit(&runner, &request, &bytes);
+    reached(&hold).await;
+    {
+        let inner = runner
+            .core
+            .inner
+            .try_lock()
+            .expect("cleanup must not hold the global state lock");
+        assert!(Runner::occupied(&inner, &f.key));
+        assert!(inner.finalizing.contains(&request.job_id));
+        assert!(!reaped.load(Ordering::SeqCst));
+    }
+    hold.release();
+    let result = terminal(&runner, request.job_id).await;
+    assert!(reaped.load(Ordering::SeqCst));
+    if cfg!(target_os = "linux") && stage != "release" {
+        assert!(matches!(result.outcome, Outcome::RefusedBeforeStart { .. }));
+        assert_eq!(result.ran, Some(Ran::None));
+        assert_eq!(
+            runner.replay(request.job_id, 0).unwrap(),
+            vec![Frame::Terminal(result)]
+        );
+    } else {
+        assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    }
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(!Runner::occupied(&inner, &f.key));
+    assert!(!inner.starting.contains(&request.job_id));
+    assert!(!inner.finalizing.contains(&request.job_id));
+}
+
+#[tokio::test]
+async fn started_write_failure_stops_and_reaps_unreleased_execution() {
+    launch_fault("save").await;
+}
+#[tokio::test]
+async fn output_handle_failure_stops_and_reaps_unreleased_execution() {
+    launch_fault("output").await;
+}
+#[tokio::test]
+async fn partial_release_failure_stops_and_reaps_without_no_start_claim() {
+    launch_fault("release").await;
+}
+
+#[tokio::test]
+async fn change_collection_failure_still_persists_terminal_and_releases_owner() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    let runner = Runner::open_with_backend(
+        config,
+        Box::new(FaultBackend {
+            stage: "collect",
+            launched: Arc::new(AtomicBool::new(false)),
+            reaped: Arc::new(AtomicBool::new(false)),
+        }),
+    )
+    .unwrap();
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(result.workspace_changes, Some(vec![]));
+    let saved: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    assert_eq!(saved.terminal, Some(result));
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(!Runner::occupied(&inner, &f.key));
+    assert!(!inner.finalizing.contains(&request.job_id));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires trusted operator, motor-job account, ACL tools and systemd private PID support"]
+async fn isolated_post_launch_faults_stop_services_before_releasing_ownership() {
+    for stage in ["save", "release"] {
+        launch_fault_inner(stage, true).await;
+    }
+}

@@ -6,6 +6,7 @@ fn fixture() -> (ScratchDir, Runner, Run, Vec<u8>) {
     let scratch = ScratchDir::new("motor-transfer-clock");
     let mut config = crate::Config::new(scratch.join("state"), "transfer-clock");
     config.free_space_floor_bytes = 0;
+    config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
     let runner = Runner::open(config).unwrap();
     let bytes = vec![42; 21];
     let key = scratch

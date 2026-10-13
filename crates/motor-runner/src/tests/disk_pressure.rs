@@ -217,6 +217,7 @@ fn disk_admission_protects_canonical_alias_through_job_insertion() {
     let entered = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
     let mut c = config(&f, |_| Ok(150));
+    c.owned_workspace_roots.push(alias.clone());
     let at_handoff = entered.clone();
     let resume = release.clone();
     c.long_work = Some(Arc::new(move |label| {

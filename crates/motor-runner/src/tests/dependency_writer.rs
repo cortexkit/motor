@@ -637,6 +637,7 @@ fn writer_restart_child() {
     let mut config = Config::new(path.join("state"), "e2e");
     config.free_space_floor_bytes = 0;
     config.workspace_roots = vec![path.join("remote/worktrees")];
+    config.owned_workspace_roots = vec![path.clone()];
     config.isolate_jobs = true;
     config.base_commands = vec![RESTART_COMMAND.into()];
     let runner = Runner::open(config).unwrap();

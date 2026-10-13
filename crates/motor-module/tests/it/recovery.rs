@@ -343,6 +343,7 @@ impl Fixture {
         fs::create_dir_all(key.parent().unwrap()).unwrap();
         git(&main, &["worktree", "add", "-b", "task", &text(&key)]);
         let mut runner_config = RunnerConfig::new(scratch.join("runner-state"), "e2e");
+        runner_config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
         runner_config.free_space_floor_bytes = 0;
         runner_config.max_weight = max_weight.max(1);
         // No generated artifacts: empty warm targets do not require a reflink

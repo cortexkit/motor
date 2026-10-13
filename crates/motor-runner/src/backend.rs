@@ -283,6 +283,12 @@ pub(crate) struct HostBackend;
 impl Backend for HostBackend {
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
+        workspace::validate_destinations(
+            &config.owned_workspace_roots,
+            if s.base { &r.cwd } else { &r.workspace_key },
+            Some(&r.cwd),
+            &r.siblings,
+        )?;
         if !s.base {
             crate::writer::validate_paths(
                 config,

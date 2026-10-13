@@ -151,3 +151,42 @@ async fn writer_path_exclusion_leaves_foreground_workspaces_and_other_instance_n
         .values()
         .all(|job| !job.base));
 }
+
+#[test]
+fn terminal_writer_without_checkout_does_not_fence_its_parent_workspace() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (mut request, _) = f.run("true");
+    request.cwd = text(&Path::new(&f.key).join("nested/.motor-base-e2e-failed")).into();
+    let mut job = Job::new(request.job_id, Some(request.clone()), runner.now(), 1, 4);
+    job.base = true;
+    job.terminal(Outcome::OutcomeUnknown, runner.now());
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .insert(job.id, job.clone());
+    assert!(!Path::new(&request.cwd).exists());
+    runner
+        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .unwrap();
+    job.terminal = None;
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .insert(job.id, job.clone());
+    assert!(runner
+        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .is_err());
+    job.terminal(Outcome::OutcomeUnknown, runner.now());
+    runner.core.inner.lock().unwrap().jobs.insert(job.id, job);
+    fs::create_dir_all(&request.cwd).unwrap();
+    assert!(runner
+        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .is_err());
+}

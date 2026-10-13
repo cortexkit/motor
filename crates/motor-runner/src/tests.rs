@@ -229,6 +229,7 @@ impl Fixture {
         c.cpu_topology =
             Some(CpuTopology::new((0..16).map(|cpu| vec![cpu, cpu + 16]).collect()).unwrap());
         c.workspace_roots = vec![self.scratch.join("remote/worktrees")];
+        c.owned_workspace_roots = vec![self.scratch.join("remote")];
         c.base_commands = vec!["printf warm > \"$CARGO_TARGET_DIR/artifact\"".into()];
         let clock = self.clock.clone();
         c.clock = Arc::new(move || clock.load(Ordering::SeqCst));
@@ -1117,6 +1118,7 @@ fn surviving_unit_child() {
     let root = PathBuf::from(root);
     let request: Run = read_json(&root.join("request.json")).unwrap();
     let mut config = Config::new(root.join("state"), "e2e");
+    config.owned_workspace_roots = vec![root.clone()];
     config.free_space_floor_bytes = 0;
     config.isolate_jobs = true;
     config.disable_warm_builds = true;
@@ -2489,6 +2491,7 @@ fn launch_gate_child() {
     let path = PathBuf::from(path);
     let r: Run = read_json(&path.join("request.json")).unwrap();
     let mut c = Config::new(path.join("state"), "e2e");
+    c.owned_workspace_roots = vec![path.clone()];
     c.free_space_floor_bytes = 0;
     c.base_commands = vec!["true".into()];
     c.before_gate = Some(Arc::new(|| unsafe { libc::_exit(86) }));
@@ -4292,3 +4295,21 @@ fn vm_selection_fails_before_creating_host_state_and_never_falls_back() {
 // Run admission, materialization and recovery rather than launching only a sandbox.
 #[path = "tests/network.rs"]
 pub(super) mod network;
+
+#[test]
+fn runner_socket_parent_is_private_before_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let config = f.config();
+    fs::create_dir_all(config.state_dir()).unwrap();
+    fs::set_permissions(config.state_dir(), fs::Permissions::from_mode(0o777)).unwrap();
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(
+        fs::metadata(runner.config().socket_path().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}

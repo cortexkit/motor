@@ -216,6 +216,7 @@ async fn public_fixture_waits_for_a_background_fill_before_scratch_removal() {
     let mut config = motor_runner::Config::new(scratch.join("state"), "cleanup");
     config.free_space_floor_bytes = 0;
     config.workspace_roots = vec![scratch.join("workspaces")];
+    config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
     config.base_commands = vec![format!(
         "printf started > '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; test -d \"$CARGO_TARGET_DIR\" && printf complete > '{}'",
         started.display(), release.display(), completed.display()
