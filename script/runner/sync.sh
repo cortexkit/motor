@@ -5,8 +5,9 @@
 set -euo pipefail
 host=${RUNNER_HOST:-alfonso-runner}
 script_dir=$(cd "$(dirname "$0")" && pwd)
-# Keep a slow source transfer exclusive for a full day before reclaiming its lease.
-lock_stale_after=${RUNNER_LOCK_STALE_AFTER_S:-86400}
+# A real sync takes minutes. A lock older than an hour belongs to a sync that
+# was killed or lost its connection, so a later sync may reclaim it.
+lock_stale_after=${RUNNER_LOCK_STALE_AFTER_S:-3600}
 [[ "$lock_stale_after" =~ ^[1-9][0-9]*$ ]] || {
   echo 'RUNNER_LOCK_STALE_AFTER_S must be a positive number of seconds' >&2
   exit 2
