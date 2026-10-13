@@ -312,10 +312,7 @@ impl Fixture {
         upload
     }
     fn submit(&self, runner: &Runner, request: &Run, bytes: &[Vec<u8>]) {
-        assert!(matches!(
-            runner.accept(request.clone()).unwrap(),
-            Admission::Accepted(_)
-        ));
+        assert_run_accepted(runner, request);
         let spool = self.spool(runner, request, bytes);
         runner.fetch_run(request, &spool.directory, true).unwrap();
     }
@@ -641,26 +638,75 @@ fn require_reflink_scratch(scratch: &Path) {
     }
 }
 
-async fn until(mut predicate: impl FnMut() -> bool) {
+fn runner_diagnostics(runner: &Runner) -> String {
+    let Ok(inner) = runner.core.inner.try_lock() else {
+        return "runner state lock unavailable".into();
+    };
+    let jobs: Vec<_> = inner.jobs.values().map(|job| {
+        format!("id={} base={} state={:?} key={} cwd={:?} process={:?} started_ms={:?} monitoring_error={:?} terminal={:?}",
+            job.id, job.base, job.state, job.key(), job.request.as_ref().map(|r| &r.cwd), job.process, job.started_ms, job.monitoring_error, job.terminal)
+    }).collect();
+    format!("jobs={jobs:#?}; starting={:?}; finalizing={:?}; reserved={:?}; dropping={:?}; owned_roots={:?}",
+        inner.starting, inner.finalizing, inner.reserved.keys().collect::<Vec<_>>(), inner.dropping, runner.config().owned_workspace_roots)
+}
+
+fn assert_run_accepted(runner: &Runner, request: &Run) {
+    let admission = runner.accept(request.clone()).unwrap_or_else(|error| {
+        panic!(
+            "Run admission errored for {}: {error}; {}",
+            request.job_id,
+            runner_diagnostics(runner)
+        )
+    });
+    let refusal = match admission {
+        Admission::Accepted(_) => return,
+        Admission::Refused(reason) => format!("{reason:?}"),
+        Admission::Duplicate => "Duplicate".into(),
+        Admission::DiskFull(full) => format!("DiskFull: {full:?}"),
+    };
+    panic!(
+        "Run admission failed for {} at {}: {refusal}; {}",
+        request.job_id,
+        request.workspace_key,
+        runner_diagnostics(runner)
+    );
+}
+
+async fn until_with_diagnostics(
+    mut predicate: impl FnMut() -> bool,
+    diagnostics: impl FnOnce() -> String,
+) {
     tokio::time::timeout(Duration::from_secs(15), async {
         while !predicate() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("test condition timed out: {}", diagnostics()));
+}
+
+async fn until(predicate: impl FnMut() -> bool) {
+    until_with_diagnostics(predicate, || "predicate did not become true".into()).await;
 }
 async fn terminal(runner: &Runner, id: Uuid) -> TerminalRecord {
-    until(|| {
-        runner
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .jobs
-            .get(&id)
-            .is_some_and(|j| j.terminal.is_some())
-    })
+    until_with_diagnostics(
+        || {
+            runner
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .jobs
+                .get(&id)
+                .is_some_and(|j| j.terminal.is_some())
+        },
+        || {
+            format!(
+                "waiting for terminal of {id}; {}",
+                runner_diagnostics(runner)
+            )
+        },
+    )
     .await;
     runner.core.inner.lock().unwrap().jobs[&id]
         .terminal
@@ -668,16 +714,24 @@ async fn terminal(runner: &Runner, id: Uuid) -> TerminalRecord {
         .unwrap()
 }
 async fn base_done(runner: &Runner) {
-    until(|| {
-        !runner
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .jobs
-            .values()
-            .any(|j| j.base && j.terminal.is_none())
-    })
+    until_with_diagnostics(
+        || {
+            !runner
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .jobs
+                .values()
+                .any(|j| j.base && j.terminal.is_none())
+        },
+        || {
+            format!(
+                "waiting for background fills; {}",
+                runner_diagnostics(runner)
+            )
+        },
+    )
     .await;
 }
 
@@ -2005,9 +2059,12 @@ async fn failed_fetch_or_absent_snapshot_rejects_without_held_refs() {
 async fn warm(f: &Fixture, runner: &Runner) {
     let (r, bytes) = f.run("true");
     f.submit(runner, &r, &bytes);
+    let result = terminal(runner, r.job_id).await;
     assert_eq!(
-        terminal(runner, r.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
+        result.outcome,
+        Outcome::Exit { code: 0 },
+        "warmup job failed: {result:?}; {}",
+        runner_diagnostics(runner)
     );
     base_done(runner).await;
 }
@@ -4312,4 +4369,26 @@ fn runner_socket_parent_is_private_before_binding() {
             & 0o777,
         0o700
     );
+}
+
+#[test]
+fn admission_failure_diagnostics_include_refusal_and_destination() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.owned_workspace_roots = vec![f.scratch.join("other-destinations")];
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_run_accepted(&runner, &request);
+    }))
+    .unwrap_err();
+    let message = panic.downcast_ref::<String>().unwrap();
+    for detail in [
+        "WorkspaceKeyRejected",
+        "allowed_roots=",
+        &f.key,
+        &request.job_id.to_string(),
+    ] {
+        assert!(message.contains(detail), "missing {detail:?} in {message}");
+    }
 }

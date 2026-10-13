@@ -66,7 +66,17 @@ fn assert_retained(f: &Fixture, legacy: &LegacyFixture) {
 }
 
 async fn trash_empty(runner: &Runner) {
-    until(|| fs::read_dir(runner.trash()).unwrap().next().is_none()).await;
+    until_with_diagnostics(
+        || fs::read_dir(runner.trash()).unwrap().next().is_none(),
+        || {
+            format!(
+                "waiting for migration trash purge at {}; {}",
+                runner.trash().display(),
+                runner_diagnostics(runner)
+            )
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -368,10 +378,13 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
         .join("sandboxes")
         .join(base.id.to_string())
         .join("output/stdout");
-    until(|| {
-        as_account("motor-job", "/usr/bin/cat", &[text(&stdout)])
+    // Durable output is runner control-plane storage, not a host path the job
+    // account may traverse outside its service's mount namespace.
+    until_with_diagnostics(|| {
+        fs::read_to_string(&stdout)
             .is_ok_and(|output| output.contains("live"))
-    })
+    }, || format!("waiting for pre-migration legacy service to emit live: process={:?} unit_alive={:?} stdout_path={} stdout={:?} state_permissions={:?}",
+        base.process, platform::unit_alive(base.process), stdout.display(), fs::read_to_string(&stdout), fs::metadata(config.state_dir()).map(|m| m.permissions())))
     .await;
     assert_eq!(platform::unit_alive(base.process).unwrap(), Some(true));
     config.isolate_jobs = true;
@@ -396,8 +409,26 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
         .map(|entry| entry.unwrap().path())
         .find(|path| fs::symlink_metadata(path).unwrap().ino() == legacy_inode)
         .expect("legacy directory was renamed into trash");
-    let private = retired.join("target/private/sticky/keep");
-    let owner = as_account("motor-job", "/usr/bin/stat", &["-c", "%u", text(&private)]).unwrap();
+    // purge_hold blocks the background deleter before any files are removed.
+    // While deletion is paused, inspect this same inode under a fixture parent
+    // the job account can traverse, then return it to the queued purge path.
+    // No socket-parent or descendant permissions are changed by inspection.
+    let inspection = f.scratch.join("remote/retired-owner-inspection");
+    fs::rename(&retired, &inspection).unwrap();
+    let private = inspection.join("target/private/sticky/keep");
+    let inspected_inode = fs::symlink_metadata(&inspection).unwrap().ino();
+    let owner = as_account("motor-job", "/usr/bin/stat", &["-c", "%u", text(&private)]);
+    fs::rename(&inspection, &retired).unwrap();
+    let owner = owner.unwrap();
+    assert_eq!(
+        inspected_inode, legacy_inode,
+        "inspection must use the retired checkout itself"
+    );
+    assert_eq!(
+        fs::metadata(runner.config().state_dir()).unwrap().mode() & 0o777,
+        0o700,
+        "inspection must not open the socket parent to the job account"
+    );
     assert_eq!(
         owner.trim(),
         job_uid.trim(),
@@ -407,7 +438,7 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
     assert!(runner.core.inner.lock().unwrap().jobs[&base.id]
         .terminal
         .is_some());
-    assert!(as_account("motor-job", "/usr/bin/cat", &[text(&stdout)])
+    assert!(fs::read_to_string(&stdout)
         .unwrap()
         .contains("storage-present-at-stop"));
     live.wait().unwrap();
@@ -427,7 +458,9 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
     warm(&f, &runner).await;
     assert_eq!(
         runner.status().repositories[0].last_rebuild_result,
-        Some(RebuildResult::Ok)
+        Some(RebuildResult::Ok),
+        "first post-migration fill failed; {}",
+        runner_diagnostics(&runner)
     );
     drop(live);
     drop(sandbox);
@@ -435,7 +468,18 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
     runner.wait_for_background_deletes(Duration::from_secs(30));
     let trash = runner.trash();
     drop(runner);
-    until(|| core.strong_count() == 0).await;
+    until_with_diagnostics(
+        || core.strong_count() == 0,
+        || {
+            format!(
+                "waiting for migrated runner shutdown: strong_count={} trash={:?}",
+                core.strong_count(),
+                fs::read_dir(&trash)
+                    .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
+            )
+        },
+    )
+    .await;
     assert!(fs::read_dir(trash).unwrap().next().is_none());
     let uid = account.uid.to_string();
     for path in [
