@@ -75,7 +75,7 @@ fn descriptor_changes_for_toolchain_and_command_without_lockfile_changes() {
 }
 
 #[tokio::test]
-async fn failed_descriptor_is_retried_only_by_a_new_request_after_restart_cleanup() {
+async fn failed_descriptor_is_suppressed_until_change_or_restart() {
     let f = Fixture::new();
     let mut config = f.config();
     config.base_commands = vec!["false".into()];
@@ -89,17 +89,8 @@ async fn failed_descriptor_is_retried_only_by_a_new_request_after_restart_cleanu
     assert_eq!(writer_count(&runner), count);
     drop(runner);
     let runner = reopen(config);
-    assert!(!runner
-        .core
-        .inner
-        .lock()
-        .unwrap()
-        .catalog
-        .repositories
-        .contains_key(&f.root));
-
-    warm(&f, &runner).await;
-    assert_eq!(writer_count(&runner), count + 1);
+    until(|| writer_count(&runner) == count + 1).await;
+    base_done(&runner).await;
     assert_eq!(repository(&f, &runner).result, Some(RebuildResult::Failed));
     fs::write(f.main.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
     commit(&f.main, "manifest change\n");
@@ -1112,14 +1103,7 @@ async fn restart_does_not_authorize_legacy_catalog_tips_without_descriptors() {
         count,
         "legacy desired tip was replayed without default-branch approval"
     );
-    assert!(!runner
-        .core
-        .inner
-        .lock()
-        .unwrap()
-        .catalog
-        .repositories
-        .contains_key(&f.root));
+    assert!(repository(&f, &runner).desired.is_none());
     warm(&f, &runner).await;
     assert_eq!(
         writer_count(&runner),
