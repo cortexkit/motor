@@ -464,10 +464,17 @@ async fn legacy_client_hello_projects_started_and_replay_cursors() {
     for cursor in [0, 1] {
         let mut peer = f.proxy.connect(terminal.job_id).await.unwrap();
         write_frame_async(&mut peer, &legacy_hello()).await.unwrap();
-        assert!(matches!(
-            read_frame_async(&mut peer).await.unwrap(),
-            Some(Frame::Hello { .. })
-        ));
+        // The runner's writer can send its first heartbeat before the Hello reply.
+        let reply = loop {
+            match read_frame_async(&mut peer).await.unwrap() {
+                Some(Frame::Heartbeat { .. }) => continue,
+                other => break other,
+            }
+        };
+        assert!(
+            matches!(reply, Some(Frame::Hello { .. })),
+            "expected the runner's Hello reply, got {reply:?}"
+        );
         write_frame_async(
             &mut peer,
             &Frame::Attach(AttachRequest::new(terminal.job_id, cursor)),
