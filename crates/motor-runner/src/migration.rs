@@ -143,10 +143,10 @@ impl Runner {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = metadata;
-        fs::create_dir_all(self.trash())?;
-        let retired = self.trash().join(Uuid::now_v7().to_string());
-        fs::rename(path, &retired)?;
-        self.purge(retired);
-        Ok(())
+        // Legacy checkouts sit beside caller workspaces, which can be on another
+        // filesystem from the runner's trash (on the build server, /Users is its
+        // own mount, so a rename there fails with EXDEV). discard falls back to
+        // a trash name beside the path in that case.
+        self.discard(path)
     }
 }
