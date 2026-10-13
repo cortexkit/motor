@@ -175,16 +175,21 @@ async fn nested_prepare_is_refused_before_workspace_or_repository_registration()
         .contains_key(&request.repository_root));
 }
 
-#[test]
-fn maintenance_removes_failed_missing_repository_but_keeps_work_in_progress() {
+#[tokio::test]
+async fn maintenance_removes_only_failed_repositories_nested_in_a_workspace() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
-    let stale = f.scratch.join("not-created/stale");
-    let busy = f.scratch.join("not-created/busy");
-    let building = f.scratch.join("not-created/building");
-    let waiting = f.scratch.join("not-created/waiting");
+    let outer = f.scratch.join("remote/worktrees/outer");
+    prepare_workspace(&f, &runner, &outer).await;
+    let stale = outer.join("gates/stale");
+    let busy = outer.join("gates/busy");
+    let building = outer.join("gates/building");
+    let waiting = outer.join("gates/waiting");
     let existing = f.main.clone();
-    let filled = f.scratch.join("not-created/filled");
+    let filled = outer.join("gates/filled");
+    // A main checkout used only through linked worktrees never exists on the
+    // runner host; its failed-fill record must survive to stop retry loops.
+    let worktree_only = f.scratch.join("not-created/worktree-only");
 
     let stale_record: Repository = serde_json::from_value(serde_json::json!({
         "failure_detail": "checkout workspace: Permission denied (os error 13)",
@@ -259,6 +264,11 @@ fn maintenance_removes_failed_missing_repository_but_keeps_work_in_progress() {
             .catalog
             .repositories
             .insert(text(&filled).to_owned(), filled_record);
+        let worktree_only_record = inner.catalog.repositories[text(&stale)].clone();
+        inner
+            .catalog
+            .repositories
+            .insert(text(&worktree_only).to_owned(), worktree_only_record);
         inner.jobs.insert(active_job.id, active_job);
     }
 
@@ -266,7 +276,14 @@ fn maintenance_removes_failed_missing_repository_but_keeps_work_in_progress() {
 
     let inner = runner.core.inner.lock().unwrap();
     assert!(!inner.catalog.repositories.contains_key(text(&stale)));
-    for repository in [&busy, &building, &waiting, &existing, &filled] {
+    for repository in [
+        &busy,
+        &building,
+        &waiting,
+        &existing,
+        &filled,
+        &worktree_only,
+    ] {
         assert!(inner.catalog.repositories.contains_key(text(repository)));
     }
 }

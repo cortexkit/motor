@@ -2427,6 +2427,19 @@ impl Runner {
             self.discard(Path::new(&key))?;
             inner.catalog.workspaces.remove(&key);
         }
+        // A repository inside another runner workspace can no longer be admitted,
+        // but an entry recorded before that refusal existed still fences the
+        // outer workspace through its derived fill checkout. Remove such entries
+        // once nothing depends on them. A missing path alone isn't stale: main
+        // checkouts used only through linked worktrees never exist on this host,
+        // and their failed-fill records stop a failing fill from rerunning.
+        let nested_in_workspace = |repository: &str| {
+            let path = Path::new(repository);
+            inner.catalog.workspaces.keys().any(|workspace| {
+                let workspace = Path::new(workspace);
+                path != workspace && path.starts_with(workspace)
+            })
+        };
         let stale_repositories: Vec<_> = inner
             .catalog
             .repositories
@@ -2447,7 +2460,7 @@ impl Runner {
                         .is_some_and(|requested| {
                             record.failed_descriptor.as_ref() != Some(requested)
                         });
-                (!Path::new(repository).exists()
+                (nested_in_workspace(repository)
                     && !has_unfinished_job
                     && !fill_in_progress
                     && !waiting_for_first_attempt
