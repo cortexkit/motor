@@ -1,8 +1,78 @@
-use super::recovery::{Cut, Fixture};
-use crate::Connector;
+use super::recovery::{Cut, Fixture, Proxy};
+use crate::{Connector, Duplex};
 use motor_protocol::*;
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::io::AsyncWriteExt;
 use tokio::{net::TcpListener, process::Command};
+
+struct RunnerHello {
+    proxy: Arc<Proxy>,
+    frame: Arc<Mutex<Option<Frame>>>,
+    legacy_reply: bool,
+}
+
+fn legacy_hello() -> Frame {
+    serde_json::from_value(serde_json::json!({
+        "type": "hello",
+        "protocol_version": PROTOCOL_VERSION,
+    }))
+    .unwrap()
+}
+
+fn runner_gate_jobs(hello: &Mutex<Option<Frame>>) -> bool {
+    let Some(Frame::Hello { gate_jobs, .. }) = *hello.lock().unwrap() else {
+        panic!("runner Hello must be observed on the direct job connection");
+    };
+    gate_jobs
+}
+
+impl Connector for RunnerHello {
+    fn connect(
+        &self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        Box::pin(async move {
+            let upstream = self.proxy.connect(id).await?;
+            let (client, bridge) = tokio::io::duplex(262144);
+            let hello = self.frame.clone();
+            let legacy_reply = self.legacy_reply;
+            tokio::spawn(async move {
+                let (mut cr, mut cw) = tokio::io::split(bridge);
+                let (mut sr, mut sw) = tokio::io::split(upstream);
+                let up = tokio::io::copy(&mut cr, &mut sw);
+                let down = async {
+                    let mut frame = read_frame_async(&mut sr)
+                        .await?
+                        .ok_or_else(|| io::Error::other("pinned runner closed before Hello"))?;
+                    if !matches!(frame, Frame::Hello { .. }) {
+                        return Err(io::Error::other("pinned runner did not send Hello first"));
+                    }
+                    // Ordinary legacy tests replace only the runner's capability advertisement.
+                    if legacy_reply {
+                        frame = legacy_hello();
+                    }
+                    // The pinned-runner test observes and relays its real Hello unchanged.
+                    *hello.lock().unwrap() = Some(frame.clone());
+                    write_frame_async(&mut cw, &frame).await?;
+                    cw.flush().await?;
+                    tokio::io::copy(&mut sr, &mut cw).await.map(|_| ())
+                };
+                tokio::select! {
+                    result = up => result.map(|_| ()),
+                    result = down => result,
+                }
+            });
+            Ok(Box::new(client) as Box<dyn Duplex>)
+        })
+    }
+}
 
 fn commit_checkout(path: &std::path::Path) -> String {
     crate::snapshot::git(path, &["add", "-A"]).unwrap();
@@ -39,7 +109,7 @@ async fn successful_run(motor: &crate::Motor, request: RunRequest) {
 
 #[tokio::test]
 #[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production runner"]
-async fn new_direct_client_omits_gate_mark_and_old_runner_admits_ordinary_job() {
+async fn new_direct_client_negotiates_gate_mark_with_pinned_runner() {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let helper = std::env::var_os("MOTOR_COMPAT_RUNNER")
         .expect("run python3 scripts/mixed-version.py to build the unchanged pinned runner");
@@ -69,7 +139,17 @@ async fn new_direct_client_omits_gate_mark_and_old_runner_admits_ordinary_job() 
     .unwrap();
     assert_eq!(ready, "ready\n", "pinned runner failed before serving");
     f.use_external_runner_socket(socket);
-    let motor = f.motor();
+    let hello = Arc::new(Mutex::new(None));
+    let motor = crate::Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(RunnerHello {
+            proxy: f.proxy.clone(),
+            frame: hello.clone(),
+            legacy_reply: false,
+        }),
+    )
+    .unwrap();
     let mut request = f.request("printf old-runner-gate");
     request.timeout = Some(60);
     let mut stream = motor.run_direct(request, None).unwrap();
@@ -91,6 +171,7 @@ async fn new_direct_client_omits_gate_mark_and_old_runner_admits_ordinary_job() 
     .await
     .unwrap();
     assert_eq!(output, b"old-runner-gate");
+    let gate_jobs = runner_gate_jobs(&hello);
     {
         let frames = f.proxy.frames.lock().unwrap();
         let run = frames
@@ -100,8 +181,16 @@ async fn new_direct_client_omits_gate_mark_and_old_runner_admits_ordinary_job() 
                 _ => None,
             })
             .unwrap();
-        assert!(!run.gate_job, "an old runner must receive no gate mark");
-        assert!(serde_json::to_value(run).unwrap().get("gate_job").is_none());
+        assert_eq!(
+            run.gate_job, gate_jobs,
+            "gate mark must follow runner Hello"
+        );
+        let wire = serde_json::to_value(run).unwrap();
+        if gate_jobs {
+            assert_eq!(wire["gate_job"], true);
+        } else {
+            assert!(wire.get("gate_job").is_none());
+        }
         assert_eq!(run.queue_wait_limit_s, 1800);
     }
     let record: serde_json::Value = serde_json::from_slice(
@@ -114,11 +203,69 @@ async fn new_direct_client_omits_gate_mark_and_old_runner_admits_ordinary_job() 
         .unwrap(),
     )
     .unwrap();
-    assert!(record["request"].get("gate_job").is_none());
+    if gate_jobs {
+        assert_eq!(record["request"]["gate_job"], true);
+    } else {
+        assert!(record["request"].get("gate_job").is_none());
+    }
     assert_eq!(record["base"], false);
     assert_eq!(record["terminal"]["outcome"]["code"], 0);
     helper.kill().await.unwrap();
     helper.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_runner_hello_omits_direct_gate_mark() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let hello = Arc::new(Mutex::new(None));
+    let motor = crate::Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(RunnerHello {
+            proxy: f.proxy.clone(),
+            frame: hello.clone(),
+            legacy_reply: true,
+        }),
+    )
+    .unwrap();
+    let records = super::recovery::collect(
+        motor
+            .run_direct(f.request("printf legacy-runner-gate"), None)
+            .unwrap(),
+    )
+    .await;
+    let terminal = super::recovery::terminal(&records);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+    let output: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            StreamRecord::Output(o) => Some(o.bytes.0.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(output, b"legacy-runner-gate");
+    let gate_jobs = runner_gate_jobs(&hello);
+    assert!(!gate_jobs, "legacy Hello must omit gate_jobs");
+    let frames = f.proxy.frames.lock().unwrap();
+    let run = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Run(run) if run.job_id == terminal.job_id => Some(run),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(run.gate_job, gate_jobs);
+    assert!(serde_json::to_value(run).unwrap().get("gate_job").is_none());
+    assert_eq!(run.queue_wait_limit_s, 1800);
+    let job = f
+        .jobs()
+        .into_iter()
+        .find(|job| job["id"] == terminal.job_id.to_string())
+        .unwrap();
+    assert!(job["request"].get("gate_job").is_none());
+    assert_eq!(job["base"], false);
 }
 
 async fn idle(f: &Fixture) {
@@ -253,21 +400,113 @@ async fn records(mut command: Command) -> Vec<StreamRecord> {
         .collect()
 }
 
-fn assert_stream(records: &[StreamRecord], from: u64) {
+fn assert_stream(records: &[StreamRecord], from: u64, started: bool) {
     let mut cursor = from;
+    let mut started_count = 0;
+    let mut output_count = 0;
     for record in records {
-        if let StreamRecord::Output(o) = record {
-            assert_eq!(
-                o.seq, cursor,
-                "caller-visible output must be contiguous, starting at its requested cursor"
-            );
-            assert_eq!(o.truncated_before_seq, None, "Started is not lost output");
-            cursor += 1;
+        match record {
+            StreamRecord::Started(s) => {
+                assert!(started, "Started requires client Hello support");
+                assert_eq!(from, 0, "Started must not precede the replay cursor");
+                assert_eq!(s.seq, 0, "Started must be the first sequenced record");
+                assert_eq!(cursor, 0, "Started must precede output");
+                started_count += 1;
+                cursor += 1;
+            }
+            StreamRecord::Output(o) => {
+                assert_eq!(
+                    o.seq, cursor,
+                    "caller-visible records must be contiguous, starting at the requested cursor"
+                );
+                assert_eq!(o.truncated_before_seq, None, "Started is not lost output");
+                output_count += 1;
+                cursor += 1;
+            }
+            _ => {}
         }
     }
-    assert!(cursor > from, "real old client must receive Output");
+    assert_eq!(started_count, usize::from(started && from == 0));
+    assert!(output_count > 0, "real pinned client must receive Output");
     assert!(
         matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 0 })
+    );
+}
+
+fn client_started(f: &Fixture) -> bool {
+    f.proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|frame| match frame {
+            Frame::Hello { started, .. } => Some(*started),
+            _ => None,
+        })
+        .expect("pinned client Hello must be observed on the job connection")
+}
+
+#[tokio::test]
+async fn legacy_client_hello_projects_started_and_replay_cursors() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let native = super::recovery::collect(
+        f.motor()
+            .run(f.request("printf legacy-output; printf legacy-error >&2"))
+            .unwrap(),
+    )
+    .await;
+    assert!(native
+        .iter()
+        .any(|record| matches!(record, StreamRecord::Started(s) if s.seq == 0)));
+    let terminal = super::recovery::terminal(&native);
+    let mut replays = Vec::new();
+    for cursor in [0, 1] {
+        let mut peer = f.proxy.connect(terminal.job_id).await.unwrap();
+        write_frame_async(&mut peer, &legacy_hello()).await.unwrap();
+        assert!(matches!(
+            read_frame_async(&mut peer).await.unwrap(),
+            Some(Frame::Hello { .. })
+        ));
+        write_frame_async(
+            &mut peer,
+            &Frame::Attach(AttachRequest::new(terminal.job_id, cursor)),
+        )
+        .await
+        .unwrap();
+        let replay = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut records = Vec::new();
+            loop {
+                match read_frame_async(&mut peer).await.unwrap().unwrap() {
+                    Frame::Output(o) => records.push(StreamRecord::Output(o)),
+                    Frame::Terminal(t) => {
+                        records.push(StreamRecord::Terminal(t));
+                        break records;
+                    }
+                    Frame::Heartbeat { .. } => {}
+                    other => panic!("unexpected legacy replay frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("legacy replay hung");
+        assert!(!client_started(&f), "legacy Hello must omit started");
+        assert_stream(&replay, cursor, client_started(&f));
+        assert_eq!(super::recovery::terminal(&replay), terminal);
+        replays.push(replay);
+    }
+    for bytes in [b"legacy-output".as_slice(), b"legacy-error".as_slice()] {
+        assert!(replays[0]
+            .iter()
+            .any(|record| matches!(record, StreamRecord::Output(o) if o.bytes.0 == bytes)));
+    }
+    assert_eq!(
+        replays[1],
+        replays[0]
+            .iter()
+            .filter(|r| !matches!(r, StreamRecord::Output(o) if o.seq < 1))
+            .cloned()
+            .collect::<Vec<_>>()
     );
 }
 
@@ -277,6 +516,11 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
     let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
         .expect("run python3 scripts/mixed-version.py to build the real pinned client");
     let f = Fixture::new(Cut::None, 28).await;
+    // A client that supports cache fills sends the repository's default-branch tip,
+    // and the runner then queues a cache fill job. Renaming the only branch to
+    // `feature` leaves no main, master or origin/HEAD, so the pinned client sends no
+    // tip whatever its age, and the no-fill check at the end stays meaningful.
+    crate::snapshot::git(&f.main, &["branch", "-m", "feature"]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let proxy = f.proxy.clone();
@@ -318,14 +562,14 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
             .any(|job| job["id"] == id && job["started"].is_object()),
         "the actual job record must retain Started"
     );
-    assert_stream(&live, 0);
+    assert_stream(&live, 0, client_started(&f));
     for bytes in [b"legacy-output".as_slice(), b"legacy-error".as_slice()] {
         assert!(live
             .iter()
             .any(|record| matches!(record, StreamRecord::Output(o) if o.bytes.0 == bytes)));
     }
     let replay = records(invoke("attach", &id, "0")).await;
-    assert_stream(&replay, 0);
+    assert_stream(&replay, 0, client_started(&f));
     assert_eq!(
         replay,
         live.into_iter()
@@ -333,12 +577,16 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
             .collect::<Vec<_>>()
     );
     let middle = records(invoke("attach", &id, "1")).await;
-    assert_stream(&middle, 1);
+    assert_stream(&middle, 1, client_started(&f));
     assert_eq!(
         middle,
         replay
             .into_iter()
-            .filter(|r| !matches!(r, StreamRecord::Output(o) if o.seq < 1))
+            .filter(|r| match r {
+                StreamRecord::Started(s) => s.seq >= 1,
+                StreamRecord::Output(o) => o.seq >= 1,
+                _ => true,
+            })
             .collect::<Vec<_>>()
     );
 
@@ -359,6 +607,15 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
                 ) && terminal.ran == Some(Ran::None)
         ),
         "old production client must decode the new runner's refusal: {refusal:?}"
+    );
+    let Some(StreamRecord::Terminal(terminal)) = refusal.last() else {
+        panic!("refusal Terminal required");
+    };
+    let detail = terminal.refusal_detail().expect("terminal refusal detail");
+    assert!(detail.contains("vcpu request 40"), "{detail}");
+    assert!(
+        detail.contains("outside the supported range 1..="),
+        "{detail}"
     );
 
     assert!(
@@ -413,7 +670,7 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
     assert!(idle.is_ok(), "runner never reached idle status");
     assert!(
         f.jobs().iter().all(|job| job["base"] != true),
-        "the pinned production client must never trigger a cache fill"
+        "without a default-branch tip, the pinned client must not trigger a cache fill"
     );
     let status = tokio::time::timeout(Duration::from_secs(15), invoke("status", "", "").output())
         .await
