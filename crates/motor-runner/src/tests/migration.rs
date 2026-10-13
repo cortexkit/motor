@@ -424,10 +424,13 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
         inspected_inode, legacy_inode,
         "inspection must use the retired checkout itself"
     );
+    // The state directory is private to the daemon. Its ACL deliberately lets the
+    // job and cache-writer accounts traverse it (the group bits then show the ACL
+    // mask, --x), but nobody else may read or write it.
     assert_eq!(
-        fs::metadata(runner.config().state_dir()).unwrap().mode() & 0o777,
-        0o700,
-        "inspection must not open the socket parent to the job account"
+        fs::metadata(runner.config().state_dir()).unwrap().mode() & 0o067,
+        0,
+        "inspection must not open the socket parent beyond traversal"
     );
     assert_eq!(
         owner.trim(),
