@@ -589,7 +589,7 @@ fn codec_pins_big_endian_prefix_and_detects_truncation() {
     let hostile = [255u8; 4];
     assert_eq!(
         read_frame(&mut &hostile[..]).unwrap_err().kind(),
-        io::ErrorKind::UnexpectedEof
+        io::ErrorKind::InvalidData
     );
     let empty = [0; 4];
     assert_eq!(
@@ -614,6 +614,237 @@ fn byte_payloads_preserve_split_utf8_and_reject_invalid_base64() {
         assert!(serde_json::from_value::<BytePayload>(json!(encoded)).is_err());
     }
     assert!(serde_json::from_value::<Frame>(json!({"type": "future_frame"})).is_err());
+}
+
+#[test]
+fn oversized_header_is_refused_before_reading_body() {
+    struct HeaderOnly(io::Cursor<[u8; 4]>);
+    impl Read for HeaderOnly {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            assert!(self.0.position() < 4, "oversized frame body was read");
+            self.0.read(bytes)
+        }
+    }
+    let mut reader = HeaderOnly(io::Cursor::new(u32::MAX.to_be_bytes()));
+    assert_eq!(
+        read_frame(&mut reader).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(reader.0.position(), 4);
+}
+
+#[tokio::test]
+async fn protocol_reader_skips_future_types_and_reads_resume_frames() {
+    let future = br#"{"type":"future_control","seq":7,"payload":{"anything":[1,2]}}"#;
+    let mut wire = (future.len() as u32).to_be_bytes().to_vec();
+    wire.extend(future);
+    write_frame(&mut wire, &Frame::Resume).unwrap();
+    write_frame(&mut wire, &Frame::ResumeReply { resumed: true }).unwrap();
+    let mut reader = &wire[..];
+    assert_eq!(read_frame(&mut reader).unwrap(), Some(Frame::Resume));
+    assert_eq!(
+        read_frame(&mut reader).unwrap(),
+        Some(Frame::ResumeReply { resumed: true })
+    );
+    let mut reader = &wire[..];
+    assert_eq!(
+        read_frame_async(&mut reader).await.unwrap(),
+        Some(Frame::Resume)
+    );
+    assert_eq!(
+        read_frame_async(&mut reader).await.unwrap(),
+        Some(Frame::ResumeReply { resumed: true })
+    );
+}
+
+#[test]
+fn tolerant_decoder_uses_supported_tags_and_preserves_future_cursors() {
+    let mut cases = Vec::new();
+    for name in FRAME_CASES {
+        cases.extend(frames(&vector("frames", name)));
+    }
+    cases.extend([
+        Frame::Drain {
+            deadline_s: 30,
+            exit_after: false,
+        },
+        Frame::DrainReply {
+            timed_out: false,
+            restart_recoverable_jobs: None,
+        },
+        Frame::JobStatus {
+            job_id: uuid_for_test(),
+        },
+    ]);
+    let mut tags = BTreeSet::new();
+    for frame in cases {
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        assert_eq!(decode_frame(&bytes).unwrap(), DecodedFrame::Frame(frame));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let tag = value["type"].as_str().unwrap();
+        tags.insert(tag.to_owned());
+        let minimal = serde_json::to_vec(&json!({"type":tag,"seq":7})).unwrap();
+        match decode_frame(&minimal) {
+            Ok(DecodedFrame::Frame(_)) => {}
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+            Ok(DecodedFrame::Unknown(_)) => panic!("supported tag {tag} treated as future"),
+        }
+    }
+    assert_eq!(tags.len(), 29);
+    for tag in ["resume", "resume_reply"] {
+        assert!(tags.contains(tag));
+    }
+    assert!(decode_frame(br#"{"type":"resume_reply","resumed":"wrong-type","seq":7}"#).is_err());
+    for (json, seq) in [
+        (
+            json!({"type":"future_control","seq":7,"payload":[1,2,3]}),
+            Some(7),
+        ),
+        (
+            json!({"type":"future_control","seq":u64::MAX}),
+            Some(u64::MAX),
+        ),
+        (json!({"type":"future_control"}), None),
+        (json!({"type":"future_control","seq":"not-a-cursor"}), None),
+        (json!({"type":"future_control","seq":-1}), None),
+    ] {
+        let bytes = serde_json::to_vec(&json).unwrap();
+        assert_eq!(decode_frame(&bytes).unwrap(), DecodedFrame::Unknown(seq));
+        let mut wire = (bytes.len() as u32).to_be_bytes().to_vec();
+        wire.extend(bytes);
+        assert_eq!(
+            read_record(&mut &wire[..]).unwrap(),
+            Some(DecodedFrame::Unknown(seq))
+        );
+    }
+    for bytes in [
+        b"{}".as_slice(),
+        br#"{"type":7}"#,
+        br#"{"type":"future","broken":}"#,
+    ] {
+        assert_eq!(
+            decode_frame(bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
+
+fn uuid_for_test() -> Uuid {
+    serde_json::from_value(json!("018f8f2c-1234-7abc-8000-000000000001")).unwrap()
+}
+
+#[tokio::test]
+async fn frame_limit_accepts_boundary_and_bundle_chunks_and_rejects_oversized_writes() {
+    let frame = Frame::BundleChunk {
+        index: u32::MAX,
+        offset: u64::MAX,
+        data: BytePayload(vec![0xff; 64 * 1024]),
+    };
+    let bytes = serde_json::to_vec(&frame).unwrap();
+    assert_eq!(bytes.len(), 87_466);
+    assert!(bytes.len() < MAX_FRAME_BYTES);
+    assert_eq!(decode_frame(&bytes).unwrap(), DecodedFrame::Frame(frame));
+    let mut body = br#"{"type":"future_control","seq":7}"#.to_vec();
+    body.resize(MAX_FRAME_BYTES, b' ');
+    let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+    wire.extend(&body);
+    assert_eq!(
+        read_record(&mut &wire[..]).unwrap(),
+        Some(DecodedFrame::Unknown(Some(7)))
+    );
+    assert_eq!(
+        read_record_async(&mut &wire[..]).await.unwrap(),
+        Some(DecodedFrame::Unknown(Some(7)))
+    );
+    body.push(b' ');
+    assert_eq!(
+        decode_frame(&body).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    let oversized = Frame::BundleChunk {
+        index: 0,
+        offset: 0,
+        data: BytePayload(vec![0; MAX_FRAME_BYTES]),
+    };
+    let mut wire = vec![42];
+    assert_eq!(
+        write_frame(&mut wire, &oversized).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(wire, [42]);
+    assert_eq!(
+        write_frame_async(&mut wire, &oversized)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(wire, [42]);
+}
+
+#[tokio::test]
+async fn asynchronous_oversized_header_is_refused_before_reading_body() {
+    struct HeaderOnly(io::Cursor<[u8; 4]>);
+    impl tokio::io::AsyncRead for HeaderOnly {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            assert!(self.0.position() < 4, "oversized frame body was polled");
+            let n = self.0.read(buf.initialize_unfilled()).unwrap();
+            buf.advance(n);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    for length in [MAX_FRAME_BYTES as u32 + 1, u32::MAX] {
+        let mut reader = HeaderOnly(io::Cursor::new(length.to_be_bytes()));
+        assert_eq!(
+            read_record_async(&mut reader).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(reader.0.position(), 4);
+    }
+}
+
+#[test]
+fn request_environment_policy_allows_build_controls_but_not_paths_or_credentials() {
+    for name in [
+        "RUST_BACKTRACE",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "RUST_TEST_THREADS",
+        "CARGO_INCREMENTAL",
+        "CARGO_BUILD_JOBS",
+        "NEXTEST_PROFILE",
+        "CI",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+    ] {
+        assert!(allowed_env(name), "denied {name}");
+    }
+    for name in [
+        "",
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "SSH_AUTH_SOCK",
+        "SUBC_LAUNCH_NONCE",
+        "CARGO_HOME",
+        "CARGO_INSTALL_ROOT",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_RUSTC",
+        "RUSTUP_HOME",
+        "cargo_incremental",
+    ] {
+        assert!(!allowed_env(name), "allowed {name}");
+    }
+    for prefix in ["RUST_", "CARGO_", "NEXTEST_"] {
+        for secret in ["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"] {
+            assert!(!allowed_env(&format!("{prefix}{secret}")));
+        }
+    }
 }
 
 #[tokio::test]

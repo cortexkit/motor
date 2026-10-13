@@ -1022,6 +1022,106 @@ async fn unknown_record_without_seq_leaves_reattach_cursor_unchanged() {
     assert_unknown_record_recovery(serde_json::json!({"type":"future_record"}), 7).await;
 }
 
+#[tokio::test]
+async fn malformed_resume_reply_does_not_advance_reattach_cursor() {
+    assert_unknown_record_recovery(
+        serde_json::json!({"type":"resume_reply", "resumed":"wrong-type", "seq":7}),
+        7,
+    )
+    .await;
+}
+
+#[test]
+fn client_and_runner_share_one_environment_predicate() {
+    assert!(std::ptr::fn_addr_eq(
+        crate::allowed_env as fn(&str) -> bool,
+        motor_runner::allowed_env as fn(&str) -> bool,
+    ));
+    assert!(std::ptr::fn_addr_eq(
+        crate::allowed_env as fn(&str) -> bool,
+        motor_protocol::allowed_env as fn(&str) -> bool,
+    ));
+}
+
+struct WireRecords(Vec<u8>);
+impl Connector for WireRecords {
+    fn connect(
+        &self,
+        _: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        Box::pin(async {
+            let (a, mut b) = tokio::io::duplex(4096);
+            let wire = self.0.clone();
+            tokio::spawn(async move {
+                assert!(matches!(
+                    read_frame_async(&mut b).await.unwrap(),
+                    Some(Frame::Hello { .. })
+                ));
+                write_frame_async(
+                    &mut b,
+                    &Frame::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        started: true,
+                        default_branch_tip: false,
+                        gate_jobs: false,
+                        platforms: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = b.write_all(&wire).await;
+                // Keep the stream open so an oversized prefix must be rejected
+                // by the size bound, not by EOF or the inactivity deadline.
+                let mut byte = [0];
+                while matches!(b.read(&mut byte).await, Ok(1)) {}
+            });
+            Ok(Box::new(a) as Box<dyn Duplex>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn channel_rejects_oversized_prefix_without_waiting_for_body() {
+    let wire = (motor_protocol::MAX_FRAME_BYTES as u32 + 1)
+        .to_be_bytes()
+        .to_vec();
+    let mut channel = crate::transport::Channel::open(&WireRecords(wire), Uuid::now_v7())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), channel.next_job()).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "oversized frame was not rejected immediately: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn channel_decodes_resume_and_future_frames_with_the_shared_decoder() {
+    use crate::transport::Incoming;
+    let mut wire = Vec::new();
+    motor_protocol::write_frame(&mut wire, &Frame::Resume).unwrap();
+    motor_protocol::write_frame(&mut wire, &Frame::ResumeReply { resumed: true }).unwrap();
+    let future = br#"{"type":"future_control","seq":7,"payload":{"anything":[1,2]}}"#;
+    wire.extend((future.len() as u32).to_be_bytes());
+    wire.extend(future);
+    let mut channel = crate::transport::Channel::open(&WireRecords(wire), Uuid::now_v7())
+        .await
+        .unwrap();
+    assert!(matches!(
+        channel.next_job().await.unwrap(),
+        Incoming::Frame(Frame::Resume)
+    ));
+    assert!(matches!(
+        channel.next_job().await.unwrap(),
+        Incoming::Frame(Frame::ResumeReply { resumed: true })
+    ));
+    assert!(matches!(
+        channel.next_job().await.unwrap(),
+        Incoming::Unknown(Some(7))
+    ));
+}
+
 #[test]
 fn manifest_advertises_exact_capability_and_all_operations() {
     let value = serde_json::to_value(crate::module::manifest("ck-motor")).unwrap();
