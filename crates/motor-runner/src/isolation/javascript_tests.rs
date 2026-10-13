@@ -388,6 +388,15 @@ fn tracked_tree(workspace: &Path) -> String {
     workspace::git(workspace, &["write-tree"]).unwrap()
 }
 
+fn sibling_snapshot(path: &Path, tree: &str) -> SiblingSnapshot {
+    SiblingSnapshot {
+        canonical_path: path.canonicalize().unwrap().to_string_lossy().into_owned(),
+        commit: String::new(),
+        tree_hash: tree.to_owned(),
+        base_commit: None,
+    }
+}
+
 fn write_js_pair(workspace: &Path, directory: &str, lockfile: &str) {
     let dir = workspace.join(directory);
     fs::create_dir_all(&dir).unwrap();
@@ -667,11 +676,22 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
         }
     }
     fn prepare(&self, f: &Fixture, tree: &str) -> io::Result<()> {
-        let tracked = javascript_tracked_tree(&f.workspace, tree)?;
-        self.prepare_tracked(f, &tracked)
+        self.prepare_checkout(f, &f.workspace, tree)
+    }
+    fn prepare_checkout(&self, f: &Fixture, checkout: &Path, tree: &str) -> io::Result<()> {
+        let tracked = javascript_tracked_tree(checkout, tree)?;
+        self.prepare_tracked_checkout(f, checkout, &tracked)
     }
     fn prepare_tracked(&self, f: &Fixture, tracked: &JavascriptTree) -> io::Result<()> {
-        prepare_javascript_with(&f.workspace, &tracked.paths, |install, command| {
+        self.prepare_tracked_checkout(f, &f.workspace, tracked)
+    }
+    fn prepare_tracked_checkout(
+        &self,
+        f: &Fixture,
+        checkout: &Path,
+        tracked: &JavascriptTree,
+    ) -> io::Result<()> {
+        prepare_javascript_with(checkout, &tracked.paths, |install, command| {
             let mut fake = Command::new(&self.executable);
             fake.args(command.get_args())
                 .current_dir(command.get_current_dir().unwrap())
@@ -680,7 +700,7 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
                 .env("JS_CALLS", &self.calls)
                 .env("JS_INTERRUPTED", &self.interrupted)
                 .env("JS_MEMBERS", &self.members);
-            cache_javascript_install(&f.state, &f.workspace, tracked, install, &mut fake)
+            cache_javascript_install(&f.state, checkout, tracked, install, &mut fake)
         })
     }
     fn count(&self) -> usize {
@@ -689,6 +709,126 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
             .lines()
             .count()
     }
+}
+
+fn prepare_checkouts_with_fake_manager(
+    f: &Fixture,
+    manager: &FakeJavascriptManager,
+    workspace_tree: &str,
+    siblings: &[SiblingSnapshot],
+) -> io::Result<()> {
+    prepare_javascript_checkouts(&f.workspace, workspace_tree, siblings, |checkout, tree| {
+        manager.prepare_checkout(f, checkout, tree)
+    })
+}
+
+#[test]
+fn javascript_sibling_with_lockfile_gets_node_modules() {
+    let f = Fixture::new();
+    let sibling = f.scratch.join("sibling");
+    fs::create_dir_all(&sibling).unwrap();
+    write_js_pair(&sibling, "", "package-lock.json");
+    let workspace_tree = tracked_tree(&f.workspace);
+    let sibling_tree = tracked_tree(&sibling);
+    let siblings = [sibling_snapshot(&sibling, &sibling_tree)];
+    let manager = FakeJavascriptManager::new(&f);
+
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
+
+    assert!(sibling.join("node_modules/.bin/fixture-tool").is_file());
+    assert!(!f.workspace.join("node_modules").exists());
+    assert_eq!(manager.count(), 1);
+}
+
+#[test]
+fn javascript_sibling_without_lockfiles_is_untouched() {
+    let f = Fixture::new();
+    let sibling = f.scratch.join("sibling");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("README.md"), "not a JavaScript checkout").unwrap();
+    let sibling_tree = tracked_tree(&sibling);
+    let sentinel = sibling.join("node_modules/keep-me");
+    fs::create_dir_all(&sentinel).unwrap();
+    fs::write(sentinel.join("marker"), "preserved").unwrap();
+    let workspace_tree = tracked_tree(&f.workspace);
+    let siblings = [sibling_snapshot(&sibling, &sibling_tree)];
+    let manager = FakeJavascriptManager::new(&f);
+
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
+
+    assert_eq!(manager.count(), 0);
+    assert_eq!(fs::read(sentinel.join("marker")).unwrap(), b"preserved");
+}
+
+#[test]
+fn javascript_sibling_local_dependency_escape_is_refused_like_workspace() {
+    fn write_escaping_install(checkout: &Path) -> String {
+        fs::create_dir_all(checkout).unwrap();
+        fs::write(
+            checkout.join("package.json"),
+            r#"{"dependencies":{"outside":"file:../outside.tgz"}}"#,
+        )
+        .unwrap();
+        fs::write(checkout.join("package-lock.json"), "fixture lockfile").unwrap();
+        tracked_tree(checkout)
+    }
+
+    let f = Fixture::new();
+    let reference = f.scratch.join("reference-workspace");
+    let reference_tree = write_escaping_install(&reference);
+    let sibling = f.scratch.join("sibling");
+    let sibling_tree = write_escaping_install(&sibling);
+    let workspace_tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    let expected = manager
+        .prepare_checkout(&f, &reference, &reference_tree)
+        .unwrap_err()
+        .to_string();
+    let siblings = [sibling_snapshot(&sibling, &sibling_tree)];
+    let error = prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(error, expected);
+    assert!(
+        error.contains("JavaScript manifest package.json"),
+        "{error}"
+    );
+    assert!(error.contains("file:../outside.tgz"), "{error}");
+    assert!(
+        error.contains("path resolves outside the repository"),
+        "{error}"
+    );
+    assert_eq!(manager.count(), 0);
+}
+
+#[test]
+fn javascript_sibling_second_job_reuses_install_cache_for_same_tree() {
+    let f = Fixture::new();
+    let workspace_tree = tracked_tree(&f.workspace);
+    let first = f.scratch.join("sibling-first");
+    let second = f.scratch.join("sibling-second");
+    for sibling in [&first, &second] {
+        fs::create_dir_all(sibling).unwrap();
+        write_js_pair(sibling, "", "package-lock.json");
+    }
+    let first_tree = tracked_tree(&first);
+    let second_tree = tracked_tree(&second);
+    assert_eq!(first_tree, second_tree);
+    let manager = FakeJavascriptManager::new(&f);
+    let first_siblings = [sibling_snapshot(&first, &first_tree)];
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &first_siblings).unwrap();
+    fs::remove_dir_all(first.join("node_modules")).unwrap();
+
+    let second_siblings = [sibling_snapshot(&second, &second_tree)];
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &second_siblings).unwrap();
+
+    assert_eq!(manager.count(), 1, "the second sibling must hit the cache");
+    assert!(second.join("node_modules/.bin/fixture-tool").is_file());
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        1
+    );
 }
 
 #[test]
