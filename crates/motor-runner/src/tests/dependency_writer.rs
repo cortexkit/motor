@@ -1121,10 +1121,20 @@ async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
 
     let f = Fixture::new();
     fs::write(f.main.join("source.rs"), "pub fn value() -> u32 { 7 }\n").unwrap();
+    fs::write(
+        f.main.join("Cargo.toml"),
+        "[package]\nname='acl-cache'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='source.rs'\n",
+    )
+    .unwrap();
+    fs::write(
+        f.main.join("Cargo.lock"),
+        "version=4\n[[package]]\nname='acl-cache'\nversion='0.1.0'\n",
+    )
+    .unwrap();
     commit(&f.main, "cache ACL fixture\n");
     let mut config = f.config();
     config.isolate_jobs = true;
-    config.base_commands = vec!["sccache rustc --crate-type lib --crate-name acl_cache source.rs -o \"$CARGO_TARGET_DIR/libacl_cache.rlib\" && sccache --show-stats".into()];
+    config.base_commands = vec!["sccache rustc --crate-type=rlib --crate-name acl_cache --emit=link source.rs --out-dir \"$CARGO_TARGET_DIR\" && sccache --show-stats".into()];
     let state = config.state_dir();
     fs::create_dir_all(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1180,6 +1190,20 @@ async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
         "cache writer must be enabled"
     );
     assert_private();
+    fn cache_files(path: &Path) -> usize {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    cache_files(&entry.path())
+                } else {
+                    usize::from(entry.file_type().unwrap().is_file())
+                }
+            })
+            .sum()
+    }
+    assert_eq!(cache_files(&runner.config().sccache_dir()), 0);
     let (r, bytes) = f.run("true");
     f.submit(&runner, &r, &bytes);
     assert_eq!(
@@ -1203,5 +1227,10 @@ async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
         .filter(|job| job.base)
         .count();
     assert_eq!(fills, 1, "fixture must complete one real cache fill");
+    assert!(
+        cache_files(&runner.config().sccache_dir()) > 0,
+        "fill must publish a real cache entry: {}",
+        writer_diagnostics(&f, &runner)
+    );
     assert_private();
 }

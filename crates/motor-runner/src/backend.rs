@@ -169,6 +169,14 @@ pub(crate) trait Backend: Send + Sync {
     fn initialize(&self, _config: &Config) -> io::Result<()> {
         Ok(())
     }
+    /// None means this backend cannot prove that its live execution list is
+    /// complete. Only isolated host services have an authoritative unit listing.
+    fn live_units(
+        &self,
+        _config: &Config,
+    ) -> io::Result<Option<std::collections::BTreeSet<String>>> {
+        Ok(None)
+    }
     fn unit_name(&self, config: &Config, id: Uuid) -> String {
         match config.backend {
             BackendKind::WindowsVm => format!("motor-windows-{}-{id}.service", config.instance),
@@ -283,9 +291,68 @@ pub(crate) fn systemctl(config: &Config, args: &[&str]) -> io::Result<std::proce
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn live_job_units(config: &Config) -> io::Result<std::collections::BTreeSet<String>> {
+    let output = systemctl(
+        config,
+        &[
+            "list-units",
+            "--all",
+            "--type=service",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+            "motor-job-*",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "list live job units: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    if output.stdout.len() > 1024 * 1024 {
+        return Err(io::Error::other("live job unit listing exceeds size limit"));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(io::Error::other)?;
+    let mut units = std::collections::BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        if index >= 10_000 || line.len() > 4096 {
+            return Err(io::Error::other("live job unit listing exceeds row limit"));
+        }
+        let mut fields = line.split_whitespace();
+        let Some(unit) = fields.next() else { continue };
+        let load = fields.next();
+        let active = fields.next();
+        let sub = fields.next();
+        if !unit.starts_with("motor-job-")
+            || !unit.ends_with(".service")
+            || load.is_none()
+            || active.is_none()
+            || sub.is_none()
+        {
+            return Err(io::Error::other("malformed live job unit listing"));
+        }
+        if !matches!(active, Some("inactive" | "failed")) {
+            units.insert(unit.to_string());
+        }
+    }
+    Ok(units)
+}
+
 pub(crate) struct HostBackend;
 
 impl Backend for HostBackend {
+    #[cfg(target_os = "linux")]
+    fn live_units(
+        &self,
+        config: &Config,
+    ) -> io::Result<Option<std::collections::BTreeSet<String>>> {
+        if !config.isolate_jobs || config.windows_instance() {
+            return Ok(None);
+        }
+        live_job_units(config).map(Some)
+    }
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
         workspace::validate_destinations(

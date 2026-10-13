@@ -722,3 +722,195 @@ fn failed_workspace_expiry_preserves_catalog_and_continues_maintenance() {
         .workspaces
         .contains_key(&f.key));
 }
+
+struct EnumeratingBackend;
+
+impl Backend for EnumeratingBackend {
+    fn live_units(&self, config: &Config) -> io::Result<Option<BTreeSet<String>>> {
+        backend::live_job_units(config).map(Some)
+    }
+    fn materialize(&self, _: &Config, _: &Trees, _: &Setup) -> io::Result<Prepared> {
+        unreachable!("these tests only admit requests")
+    }
+    fn launch(
+        &self,
+        _: &Config,
+        _: &Trees,
+        _: &Setup,
+        _: &Prepared,
+        _: u32,
+    ) -> io::Result<backend::Launch> {
+        unreachable!("these tests only admit requests")
+    }
+    fn cancel(&self, _: &Config, _: &Job, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+    fn unit_alive(
+        &self,
+        _: &Config,
+        _: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+    fn collect_changes(&self, _: &Trees, _: &Job) -> io::Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+    fn reconcile(&self, _: &Config, _: &[Job]) -> io::Result<Vec<Uuid>> {
+        Ok(vec![])
+    }
+}
+
+fn enumerated_quarantine(
+    f: &Fixture,
+    listing: &str,
+    failed: bool,
+) -> (Runner, Uuid, Arc<Mutex<(String, bool)>>) {
+    use std::os::unix::process::ExitStatusExt;
+    let mut config = f.config();
+    let id = Uuid::now_v7();
+    let record = config
+        .state_dir()
+        .join("jobs")
+        .join(id.to_string())
+        .join("record.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(record, b"{broken job}").unwrap();
+    let state = Arc::new(Mutex::new((listing.to_string(), failed)));
+    config.systemd_command = Some({
+        let state = state.clone();
+        Arc::new(move |args| {
+            assert_eq!(args[0], "list-units");
+            assert!(args.contains(&"--all"));
+            assert_eq!(args.last(), Some(&"motor-job-*"));
+            let state = state.lock().unwrap();
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if state.1 { 1 << 8 } else { 0 }),
+                stdout: state.0.as_bytes().to_vec(),
+                stderr: if state.1 {
+                    b"enumeration unavailable".to_vec()
+                } else {
+                    vec![]
+                },
+            })
+        })
+    });
+    (
+        Runner::open_with_backend(config, Box::new(EnumeratingBackend)).unwrap(),
+        id,
+        state,
+    )
+}
+
+#[test]
+fn quarantine_without_unaccounted_units_allows_unrelated_admission() {
+    let f = Fixture::new();
+    let (runner, quarantined, _) = enumerated_quarantine(&f, "", false);
+    let (mut request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    runner.cancel(request.job_id).unwrap();
+    request.job_id = quarantined;
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Duplicate
+    ));
+    assert!(runner.allow_prepare().is_ok());
+    assert_eq!(runner.job_status(quarantined).unwrap().state, "quarantined");
+    assert!(runner.ensure_reconciled().is_err());
+}
+
+#[test]
+fn quarantine_unaccounted_unit_fences_until_it_exits() {
+    let f = Fixture::new();
+    let launch = Uuid::now_v7();
+    let name = backend::host_unit_name(launch);
+    let (runner, quarantined, state) = enumerated_quarantine(
+        &f,
+        &format!("{name} loaded activating start waiting\n"),
+        false,
+    );
+    assert_ne!(quarantined, launch);
+    assert!(runner
+        .ensure_admission_ownership()
+        .unwrap_err()
+        .to_string()
+        .contains(&name));
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+    ));
+    state.lock().unwrap().0 = format!("{name} loaded inactive dead exited\n");
+    runner.refresh_quarantine_admission(true);
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    runner.cancel(request.job_id).unwrap();
+    assert_eq!(runner.job_status(quarantined).unwrap().state, "quarantined");
+}
+
+#[test]
+fn quarantine_matches_readable_process_launch_units_not_job_ids() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    let job_id = Uuid::now_v7();
+    let launch = Uuid::now_v7();
+    let mut job = Job::new(job_id, None, runner.now(), 1, 1);
+    job.state = JobState::Running;
+    job.process = Some(platform::ProcessIdentity {
+        pid: 0,
+        start: 0,
+        unit: Some(launch),
+    });
+    runner.core.inner.lock().unwrap().jobs.insert(job_id, job);
+    state.lock().unwrap().0 = format!(
+        "{} loaded active running command\n",
+        backend::host_unit_name(launch)
+    );
+    runner.refresh_quarantine_admission(true);
+    assert!(runner.ensure_admission_ownership().is_ok());
+    let wrong = backend::host_unit_name(job_id);
+    state.lock().unwrap().0 = format!("{wrong} loaded active running command\n");
+    runner.refresh_quarantine_admission(true);
+    assert!(runner
+        .ensure_admission_ownership()
+        .unwrap_err()
+        .to_string()
+        .contains(&wrong));
+    runner.core.inner.lock().unwrap().jobs.remove(&job_id);
+}
+
+#[test]
+fn quarantine_failed_or_malformed_enumeration_cannot_release_the_fence() {
+    for (listing, failed) in [
+        ("", true),
+        ("motor-job-broken.service loaded\n", false),
+        ("unrelated.service loaded active running\n", false),
+    ] {
+        let f = Fixture::new();
+        let (runner, _, _) = enumerated_quarantine(&f, listing, failed);
+        assert!(runner
+            .ensure_admission_ownership()
+            .unwrap_err()
+            .to_string()
+            .contains("enumeration failed"));
+        let (request, _) = f.run("true");
+        assert!(matches!(
+            runner.accept(request).unwrap(),
+            Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+        ));
+    }
+}
+
+#[test]
+fn portable_host_backend_cannot_prove_quarantined_execution_is_idle() {
+    let f = Fixture::new();
+    assert!(backend::HostBackend
+        .live_units(&f.config())
+        .unwrap()
+        .is_none());
+}

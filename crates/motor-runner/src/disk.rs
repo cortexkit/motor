@@ -563,7 +563,7 @@ impl Runner {
     /// Delete synchronously off the state lock and probe after each tree. Rename
     /// to trash is not enough: on XFS shared extents may reclaim no free space.
     pub(super) fn ensure_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
-        self.ensure_reconciled()?;
+        self.ensure_admission_ownership()?;
         let _pressure = self.core.disk.lock().unwrap();
         let floor = self.core.config.free_space_floor_bytes;
         if floor == 0 {
@@ -574,6 +574,14 @@ impl Runner {
         let soft = floor.saturating_mul(2);
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         let mut free = probe()?;
+        if !self.core.quarantined.is_empty() {
+            // Admission can proceed after every live unit is accounted for, but
+            // damaged historical records still cannot authorize destructive GC.
+            return Ok((free < floor).then_some(RunnerDiskFull {
+                free_bytes: free,
+                floor_bytes: floor,
+            }));
+        }
         if free >= soft {
             return Ok(None);
         }

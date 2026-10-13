@@ -436,6 +436,8 @@ struct Core {
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
+    quarantine_admission: Mutex<Option<String>>,
+    quarantine_probe: Mutex<Option<std::time::Instant>>,
     /// Serialize pressure cleanup, without holding the output/persistence lock.
     disk: Mutex<()>,
     health: Mutex<health::Health>,
@@ -887,6 +889,11 @@ impl Runner {
                     cpu_times: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
                 }),
+                quarantine_admission: Mutex::new(
+                    (!quarantined.is_empty())
+                        .then(|| "live unit ownership has not been inspected".into()),
+                ),
+                quarantine_probe: Mutex::new(None),
                 quarantined,
                 disk: Mutex::new(()),
                 health,
@@ -914,6 +921,7 @@ impl Runner {
             }
             runner.discard(&scratch)?;
         }
+        runner.refresh_quarantine_admission(true);
         runner.maintenance()?;
         for (id, process) in lost {
             runner.recovery_diagnostic(id, process, false)?;
@@ -944,12 +952,63 @@ impl Runner {
     pub fn config(&self) -> &Config {
         &self.core.config
     }
+    fn refresh_quarantine_admission(&self, force: bool) {
+        if self.core.quarantined.is_empty() {
+            return;
+        }
+        let Ok(mut probe) = self.core.quarantine_probe.try_lock() else {
+            return;
+        };
+        if !force && probe.is_some_and(|last| last.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        *probe = Some(std::time::Instant::now());
+        // Service enumeration can block. Snapshot record ownership only after
+        // it returns, so a newly recorded launch is not mistaken for an orphan.
+        let reason = match self.core.backend.live_units(&self.core.config) {
+            Ok(Some(units)) => {
+                let inner = self.core.inner.lock().unwrap();
+                let accounted: BTreeSet<_> = inner
+                    .jobs
+                    .values()
+                    .filter(|job| job.terminal.is_none())
+                    .filter_map(|job| job.process.and_then(|process| process.unit))
+                    .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
+                    .collect();
+                let unknown: Vec<_> = units.difference(&accounted).cloned().collect();
+                (!unknown.is_empty())
+                    .then(|| format!("unaccounted live job units: {}", unknown.join(", ")))
+            }
+            Ok(None) => Some(format!(
+                "{:?} backend cannot enumerate live execution ownership",
+                self.core.config.backend
+            )),
+            Err(error) => Some(format!("live job unit enumeration failed: {error}")),
+        };
+        let mut previous = self.core.quarantine_admission.lock().unwrap();
+        if *previous != reason {
+            if let Some(reason) = &reason {
+                tracing::warn!(%reason, "quarantined job admission fence holds");
+            } else {
+                tracing::info!(
+                    "all live units have readable ownership; quarantined IDs remain fenced"
+                );
+            }
+            *previous = reason;
+        }
+    }
+    fn ensure_admission_ownership(&self) -> io::Result<()> {
+        match self.core.quarantine_admission.lock().unwrap().as_ref() {
+            Some(reason) => Err(invalid(reason)),
+            None => Ok(()),
+        }
+    }
     fn ensure_reconciled(&self) -> io::Result<()> {
         if self.core.quarantined.is_empty() {
             Ok(())
         } else {
             Err(invalid(
-                "quarantined job ownership must be reconciled before new work or cleanup",
+                "quarantined job historical ownership must be reconciled before destructive cleanup",
             ))
         }
     }
@@ -1412,7 +1471,7 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
-        if let Err(error) = self.ensure_reconciled() {
+        if let Err(error) = self.ensure_admission_ownership() {
             return Some((RefusalReason::WorkspaceSetupFailed, error.to_string()));
         }
         if request.network.is_some() {
@@ -1910,7 +1969,7 @@ impl Runner {
         )
     }
     pub(crate) fn allow_prepare(&self) -> io::Result<()> {
-        self.ensure_reconciled()?;
+        self.ensure_admission_ownership()?;
         if self.core.config.windows_instance() {
             Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"))
         } else {
@@ -2907,6 +2966,7 @@ impl Runner {
         Ok(())
     }
     fn tick(&self) -> io::Result<()> {
+        self.refresh_quarantine_admission(false);
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
         let now = self.now();
@@ -2987,7 +3047,7 @@ impl Runner {
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
-        if !self.core.quarantined.is_empty() {
+        if self.ensure_admission_ownership().is_err() {
             return Ok(());
         }
         loop {
