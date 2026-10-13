@@ -154,6 +154,8 @@ pub struct Handler {
     /// anything it puts in a request body.
     direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
     run_count: Arc<std::sync::atomic::AtomicUsize>,
+    startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    startup_error: Arc<Mutex<Option<String>>>,
 }
 impl Handler {
     pub fn new(config: Config) -> Self {
@@ -165,6 +167,8 @@ impl Handler {
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
             run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_task: Arc::new(Mutex::new(None)),
+            startup_error: Arc::new(Mutex::new(None)),
         }
     }
     /// Serve with an already open `Motor` instead of opening one from the
@@ -180,8 +184,94 @@ impl Handler {
         self
     }
     pub async fn shutdown(&self) {
+        let startup = self.startup_task.lock().unwrap().take();
+        if let Some(startup) = startup {
+            startup.abort();
+            let _ = startup.await;
+        }
         if let Some(ssh) = self.ssh.get() {
             ssh.shutdown().await;
+        }
+    }
+    fn storage_root(&self, ack: &ModuleHelloAckBody) -> io::Result<PathBuf> {
+        match &ack.storage {
+            Some(value) => {
+                let descriptor: StorageDescriptor =
+                    serde_json::from_value(value.clone()).map_err(io::Error::other)?;
+                match descriptor.backend {
+                    StorageBackend::Sqlite { path } => {
+                        Ok(PathBuf::from(format!("{path}.ck-motor")))
+                    }
+                    _ => Err(io::Error::other("ck-motor requires SQLite module storage")),
+                }
+            }
+            None => {
+                let data = match std::env::var_os("XDG_DATA_HOME") {
+                    Some(data) => PathBuf::from(data),
+                    None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+                        io::Error::other("neither XDG_DATA_HOME nor HOME is set")
+                    })?)
+                    .join(".local/share"),
+                };
+                Ok(data
+                    .join("cortexkit/ck-motor")
+                    .join(&self.config.runner_instance))
+            }
+        }
+    }
+    fn startup_failed(&self, detail: String) {
+        tracing::warn!(%detail, "ck-motor storage unavailable");
+        *self.startup_error.lock().unwrap() = Some(detail);
+    }
+    async fn initialize_storage(
+        &self,
+        root: PathBuf,
+        first_attempt: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut first_attempt = Some(first_attempt);
+        let mut backoff = std::time::Duration::from_millis(100);
+        loop {
+            let config = self.config.clone();
+            let path = root.clone();
+            let opened = tokio::task::spawn_blocking(move || Motor::open(config, &path)).await;
+            match opened.unwrap_or_else(|error| Err(io::Error::other(error))) {
+                Ok(mut motor) => {
+                    // The lease must be held before initialization can replace an
+                    // earlier process's private SSH agent directory.
+                    let ssh = Arc::new(
+                        SshConnector::initialize(
+                            self.config.clone(),
+                            &root,
+                            Arc::clone(&self.resolver),
+                        )
+                        .await,
+                    );
+                    motor.set_connector(ssh.clone());
+                    self.ssh.set(ssh).ok();
+                    self.motor.set(motor).ok();
+                    *self.startup_error.lock().unwrap() = None;
+                    if let Some(ready) = first_attempt.take() {
+                        let _ = ready.send(());
+                    }
+                    return;
+                }
+                Err(error) => {
+                    let contended = error.kind() == io::ErrorKind::WouldBlock;
+                    self.startup_failed(if contended {
+                        "storage_lease_busy: another process owns module storage".into()
+                    } else {
+                        format!("storage_open_failed: {error}")
+                    });
+                    if let Some(ready) = first_attempt.take() {
+                        let _ = ready.send(());
+                    }
+                    if !contended {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
         }
     }
     fn attribution(&self, handle: RouteHandle, preset: Option<String>) -> Option<JobAttribution> {
@@ -319,9 +409,19 @@ impl Handler {
         }
     }
     fn initialized(&self) -> io::Result<&Motor> {
-        self.motor
-            .get()
-            .ok_or_else(|| io::Error::other("module not initialized"))
+        self.motor.get().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "ck-motor unavailable: {}",
+                    self.startup_error
+                        .lock()
+                        .unwrap()
+                        .as_deref()
+                        .unwrap_or("module not initialized")
+                ),
+            )
+        })
     }
 }
 
@@ -341,34 +441,27 @@ impl ModuleHandler for Handler {
         if self.motor.get().is_some() {
             return;
         }
-        let root = match &ack.storage {
-            Some(value) => {
-                let descriptor: StorageDescriptor =
-                    serde_json::from_value(value.clone()).expect("ck-motor storage descriptor");
-                match descriptor.backend {
-                    StorageBackend::Sqlite { path } => PathBuf::from(format!("{path}.ck-motor")),
-                    _ => panic!("ck-motor requires SQLite module storage"),
-                }
-            }
-            None => {
-                let data = std::env::var_os("XDG_DATA_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".local/share")
-                    });
-                data.join("cortexkit/ck-motor")
-                    .join(&self.config.runner_instance)
+        let root = match self.storage_root(ack) {
+            Ok(root) => root,
+            Err(error) => {
+                self.startup_failed(format!("invalid_storage_descriptor: {error}"));
+                return;
             }
         };
-        // Acquire the single-writer lease before creating the private agent dir.
-        let mut motor =
-            Motor::open(self.config.clone(), &root).expect("open ck-motor module storage");
-        let ssh = Arc::new(
-            SshConnector::initialize(self.config.clone(), &root, Arc::clone(&self.resolver)).await,
-        );
-        motor.set_connector(ssh.clone());
-        self.ssh.set(ssh).ok();
-        self.motor.set(motor).ok();
+        let (ready, first_attempt) = tokio::sync::oneshot::channel();
+        {
+            let mut task = self.startup_task.lock().unwrap();
+            if self.motor.get().is_some() || task.as_ref().is_some_and(|task| !task.is_finished()) {
+                return;
+            }
+            let handler = self.clone();
+            *task = Some(tokio::spawn(async move {
+                handler.initialize_storage(root, ready).await
+            }));
+        }
+        // Keep the ordinary startup ready before serving requests. Contention
+        // returns after one attempt, while the retry task runs independently.
+        let _ = first_attempt.await;
     }
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
         match request.principal.as_ref() {
@@ -423,12 +516,22 @@ impl ModuleHandler for Handler {
         self.direct_jobs.lock().unwrap().clear();
     }
     async fn health(&self) -> HealthReport {
-        let reason = match self.ssh.get() {
-            Some(ssh) => crate::Connector::refusal(ssh.as_ref()),
-            None => Some("module_not_initialized"),
+        let reason = if self.motor.get().is_none() {
+            Some(
+                self.startup_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "module_not_initialized".into()),
+            )
+        } else {
+            self.ssh
+                .get()
+                .and_then(|ssh| crate::Connector::refusal(ssh.as_ref()))
+                .map(str::to_owned)
         };
         let detail = crate::diagnostics::health_detail();
-        let detail = Some(match reason {
+        let detail = Some(match &reason {
             Some(reason) => format!("{reason}; {detail}"),
             None => detail,
         });
@@ -482,10 +585,7 @@ impl ModuleHandler for Handler {
                     message: format!("ck-motor refuses {} for reserved:{module_id}", envelope.op),
                 });
             }
-            let motor = self
-                .motor
-                .get()
-                .ok_or_else(|| io::Error::other("module not initialized"))?;
+            let motor = self.initialized()?;
             let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
             match envelope.op.as_str() {
                 "exec.run" => {
@@ -542,7 +642,12 @@ impl ModuleHandler for Handler {
         match result {
             Ok(outcome) => outcome,
             Err(e) => HandlerOutcome::Error {
-                code: "exec_remote_error".into(),
+                code: if e.kind() == io::ErrorKind::NotConnected && self.motor.get().is_none() {
+                    "motor_unavailable"
+                } else {
+                    "exec_remote_error"
+                }
+                .into(),
                 message: e.to_string(),
             },
         }
@@ -663,7 +768,10 @@ where
                     let record = record?;
                     let terminal = matches!(record, StreamRecord::Terminal(_));
                     emit(record).await?;
-                    if terminal { return Ok(()); }
+                    if terminal {
+                        stream.acknowledge_terminal()?;
+                        return Ok(());
+                    }
                 },
                 None => return Err(io::Error::other("stream ended without terminal record")),
             }
@@ -686,5 +794,120 @@ mod admission_tests {
         drop(replacement);
         drop(permits);
         assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+        time::Duration,
+    };
+
+    #[test]
+    fn lease_holder_process() {
+        let Some(root) = std::env::var_os("MOTOR_TEST_LEASE_ROOT") else {
+            return;
+        };
+        let _storage = crate::storage::Storage::open(std::path::Path::new(&root)).unwrap();
+        println!("LEASE HELD");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_retries_a_live_process_lease_until_released() {
+        let temp = cortexkit_test_support::ScratchDir::new("motor-startup-lease");
+        let path = temp.join("module.sqlite");
+        let root = PathBuf::from(format!("{}.ck-motor", path.display()));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "module::startup_tests::lease_holder_process",
+                "--nocapture",
+            ])
+            .env("MOTOR_TEST_LEASE_ROOT", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert!(output.read_line(&mut line).unwrap() > 0);
+            if line.contains("LEASE HELD") {
+                break;
+            }
+            line.clear();
+        }
+        let handler = Handler::new(Config::default());
+        let descriptor = StorageDescriptor {
+            module_id: "ck-motor".into(),
+            storage_namespace: "ck-motor".into(),
+            isolation: cortexkit_store_types::Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: path.to_string_lossy().into_owned(),
+            },
+        };
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: subc_protocol::PROTOCOL_VERSION,
+            subc_ops: Vec::new(),
+            subc_capabilities: Vec::new(),
+            storage: Some(serde_json::to_value(descriptor).unwrap()),
+            machine_id: None,
+        };
+        let startup = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.on_hello_ack(&ack).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(handler.initialized().is_err());
+        assert!(matches!(
+            handler.health().await.status,
+            HealthStatus::Failing
+        ));
+        assert!(handler
+            .health()
+            .await
+            .detail
+            .unwrap()
+            .contains("storage_lease_busy"));
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        startup.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handler.initialized().is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("startup recovers without another hello acknowledgement");
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_descriptor_leaves_startup_unavailable_without_panicking() {
+        let handler = Handler::new(Config::default());
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: subc_protocol::PROTOCOL_VERSION,
+            subc_ops: Vec::new(),
+            subc_capabilities: Vec::new(),
+            storage: Some(json!({"backend": "invalid"})),
+            machine_id: None,
+        };
+        handler.on_hello_ack(&ack).await;
+        assert!(handler
+            .initialized()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalid_storage_descriptor"));
+        assert!(matches!(
+            handler.health().await.status,
+            HealthStatus::Failing
+        ));
+        assert!(handler.startup_task.lock().unwrap().is_none());
     }
 }
