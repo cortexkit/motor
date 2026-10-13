@@ -2,7 +2,7 @@ use crate::{
     allowed_env,
     diagnostics::{record_unreachable, UnreachableStep},
     snapshot::{self, Snapshots},
-    storage::{JobAttribution, Storage},
+    storage::{JobAttribution, JobLease, Storage},
     transport::{Channel, Incoming, InstanceConnector},
     Config, Connector, SshConnector,
 };
@@ -23,8 +23,14 @@ pub struct JobStream {
     pub records: mpsc::Receiver<io::Result<StreamRecord>>,
     storage: Arc<Storage>,
     wake: watch::Sender<bool>,
+    _lease: JobLease,
 }
 impl JobStream {
+    /// Record terminal delivery only after the consumer has successfully handled
+    /// the terminal record. Merely queueing a record does not count as delivery.
+    pub fn acknowledge_terminal(&self) -> io::Result<()> {
+        self.storage.terminal_delivered(self.job_id)
+    }
     /// Persist before waking the attached task. Dropping a stream is a detach,
     /// not a cancel; only this explicit operation records cancellation intent.
     pub fn cancel(&self) -> io::Result<()> {
@@ -110,6 +116,8 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create(id, wait, attribution, instance, gate_job)?;
+        self.storage
+            .retain_job(id, Some(request.workspace_key.clone()))?;
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
@@ -128,6 +136,7 @@ impl Motor {
     }
     pub fn attach(&self, request: AttachRequest) -> io::Result<JobStream> {
         let id = request.job_id;
+        self.storage.retain_job(id, None)?;
         self.connector_for_job(id)?;
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
@@ -183,6 +192,7 @@ impl Motor {
                 records,
                 storage: self.storage.clone(),
                 wake,
+                _lease: self.storage.lease_job(id),
             },
             tx,
             rx,
@@ -678,11 +688,18 @@ impl Motor {
                     }
                 }
                 Ok(Incoming::Frame(Frame::Terminal(mut terminal))) => {
+                    if terminal.job_id != id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "terminal job ID mismatch",
+                        ));
+                    }
                     // A retry is safe only when the runner proves the command never started.
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+                    self.storage.terminal_observed(id)?;
                     return emit(tx, StreamRecord::Terminal(terminal)).await;
                 }
                 Ok(Incoming::Frame(Frame::WithdrawReply { .. })) => {}
@@ -769,6 +786,7 @@ impl Motor {
             .ok_or_else(|| io::Error::other("runner does not report health (upgrade required)"))
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
+        self.storage.retain_job(id, None)?;
         let connector = self.connector_for_job(id)?;
         let mut channel = Channel::open(connector.as_ref(), id)
             .await
@@ -969,4 +987,131 @@ mod started_tests;
 fn log_refusal(id: Uuid, refusal: &Refusal) {
     tracing::info!(job_id = %id, reason = ?refusal.reason,
         retry_after_ms = refusal.retry_after_ms, "runner admission refused");
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    struct TerminalPeer;
+    impl Connector for TerminalPeer {
+        fn connect(
+            &self,
+            id: Uuid,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = io::Result<Box<dyn crate::transport::Duplex>>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let (client, mut peer) = tokio::io::duplex(65536);
+                tokio::spawn(async move {
+                    assert!(matches!(
+                        read_frame_async(&mut peer).await.unwrap(),
+                        Some(Frame::Hello { .. })
+                    ));
+                    write_frame_async(
+                        &mut peer,
+                        &Frame::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            started: false,
+                            default_branch_tip: false,
+                            gate_jobs: false,
+                            platforms: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    loop {
+                        match read_frame_async(&mut peer).await.unwrap() {
+                            Some(Frame::Heartbeat { .. }) => continue,
+                            Some(Frame::Attach(request)) => {
+                                assert_eq!(request.job_id, id);
+                                break;
+                            }
+                            other => panic!("expected attach, got {other:?}"),
+                        }
+                    }
+                    write_frame_async(
+                        &mut peer,
+                        &Frame::Terminal(
+                            TerminalRecord::new(id, Outcome::Exit { code: 0 }, 1, 0, 0)
+                                .with_ran(Ran::Remote),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                });
+                Ok(Box::new(client) as Box<dyn crate::transport::Duplex>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_is_observed_before_delivery_is_acknowledged() {
+        let scratch = ScratchDir::new("motor-remote-terminal-delivery");
+        let motor =
+            Motor::with_connector(Config::default(), &scratch, Arc::new(TerminalPeer)).unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        let mut stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+        let record = tokio::time::timeout(Duration::from_secs(5), stream.records.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(record, StreamRecord::Terminal(_)));
+        let job = motor.storage.job(id).unwrap();
+        assert!(job.terminal_observed_at_ms.is_some());
+        assert!(job.terminal_delivered_at_ms.is_none());
+        assert!(
+            job.local_terminal.is_none(),
+            "remote replay must still include the runner's output"
+        );
+        stream.acknowledge_terminal().unwrap();
+        assert!(motor
+            .storage
+            .job(id)
+            .unwrap()
+            .terminal_delivered_at_ms
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_is_durable_only_after_successful_forwarding() {
+        let scratch = ScratchDir::new("motor-terminal-delivery");
+        let motor = Motor::open(Config::default(), &scratch).unwrap();
+        let stream = motor.refuse_capacity().unwrap();
+        let id = stream.job_id;
+        let result = crate::module::forward(std::future::pending(), stream, |_| async {
+            Err(io::Error::other("caller disconnected"))
+        })
+        .await;
+        assert!(result.is_err());
+        let job = motor.storage.job(id).unwrap();
+        assert!(job.terminal_observed_at_ms.is_some());
+        assert!(job.terminal_delivered_at_ms.is_none());
+
+        let stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+        crate::module::forward(std::future::pending(), stream, |record| async move {
+            assert!(matches!(record, StreamRecord::Terminal(_)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let job = motor.storage.job(id).unwrap();
+        assert!(job.terminal_delivered_at_ms.is_some());
+        assert!(job.retain_until_ms.unwrap() > job.terminal_delivered_at_ms.unwrap());
+        drop(motor);
+        let reopened = Motor::open(Config::default(), &scratch).unwrap();
+        assert!(reopened
+            .storage
+            .job(id)
+            .unwrap()
+            .terminal_delivered_at_ms
+            .is_some());
+    }
 }
