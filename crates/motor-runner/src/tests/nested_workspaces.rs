@@ -169,22 +169,49 @@ async fn nested_prepare_is_refused_before_workspace_or_repository_registration()
 }
 
 #[test]
-fn maintenance_removes_only_missing_unfilled_repositories_without_live_jobs() {
+fn maintenance_removes_failed_missing_repository_but_keeps_work_in_progress() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
     let stale = f.scratch.join("not-created/stale");
-    let failed = f.scratch.join("not-created/failed");
     let busy = f.scratch.join("not-created/busy");
+    let building = f.scratch.join("not-created/building");
+    let waiting = f.scratch.join("not-created/waiting");
     let existing = f.main.clone();
     let filled = f.scratch.join("not-created/filled");
 
-    let failed_record = Repository {
-        failed_descriptor: Some("failed-fill".into()),
-        ..Repository::default()
-    };
+    let stale_record: Repository = serde_json::from_value(serde_json::json!({
+        "failure_detail": "checkout workspace: Permission denied (os error 13)",
+        "filled_descriptor": null,
+        "filled_descriptors": {},
+        "recorded_without_writer": [],
+        "miss_refills": [],
+        "failed_descriptor": "050bbf…",
+        "requested_descriptor": "050bbf…",
+        "commit": null,
+        "finished_ms": null,
+        "result": "failed",
+        "desired": {
+            "tip": "0cdc379…",
+            "workspace": text(&stale),
+            "siblings": [],
+            "git_dependencies": [],
+            "command": "cargo nextest run"
+        }
+    }))
+    .unwrap();
     let filled_record = Repository {
         filled_descriptor: Some("completed-fill".into()),
         filled_descriptors: BTreeMap::from([("completed-fill".into(), 1)]),
+        ..Repository::default()
+    };
+    let building_record = Repository {
+        requested_descriptor: Some("in-progress".into()),
+        result: Some(RebuildResult::Building),
+        ..Repository::default()
+    };
+    let waiting_record = Repository {
+        failed_descriptor: Some("previous-fill".into()),
+        requested_descriptor: Some("next-fill".into()),
         ..Repository::default()
     };
 
@@ -204,15 +231,19 @@ fn maintenance_removes_only_missing_unfilled_repositories_without_live_jobs() {
         inner
             .catalog
             .repositories
-            .insert(text(&stale).to_owned(), Repository::default());
-        inner
-            .catalog
-            .repositories
-            .insert(text(&failed).to_owned(), failed_record);
+            .insert(text(&stale).to_owned(), stale_record);
         inner
             .catalog
             .repositories
             .insert(text(&busy).to_owned(), Repository::default());
+        inner
+            .catalog
+            .repositories
+            .insert(text(&building).to_owned(), building_record);
+        inner
+            .catalog
+            .repositories
+            .insert(text(&waiting).to_owned(), waiting_record);
         inner
             .catalog
             .repositories
@@ -228,7 +259,7 @@ fn maintenance_removes_only_missing_unfilled_repositories_without_live_jobs() {
 
     let inner = runner.core.inner.lock().unwrap();
     assert!(!inner.catalog.repositories.contains_key(text(&stale)));
-    for repository in [&failed, &busy, &existing, &filled] {
+    for repository in [&busy, &building, &waiting, &existing, &filled] {
         assert!(inner.catalog.repositories.contains_key(text(repository)));
     }
 }

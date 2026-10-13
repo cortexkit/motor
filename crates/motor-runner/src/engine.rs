@@ -2438,20 +2438,19 @@ impl Runner {
                             request.repository_root.as_str() == repository.as_str()
                         })
                 });
-                // Keep writer history and pending requests: they suppress retries,
-                // preserve approvals, or record a completed fill.
-                let has_writer_state = record.failure_detail.is_some()
-                    || record.failed_descriptor.is_some()
-                    || record.requested_descriptor.is_some()
-                    || record.result.is_some()
-                    || record.desired.is_some()
-                    || record.commit.is_some()
-                    || record.finished_ms.is_some()
-                    || !record.recorded_without_writer.is_empty()
-                    || !record.miss_refills.is_empty();
+                let fill_in_progress = record.result.as_ref() == Some(&RebuildResult::Building);
+                // Preserve a new descriptor until its first fill attempt reports a result.
+                let waiting_for_first_attempt = record.result.is_none()
+                    && record
+                        .requested_descriptor
+                        .as_ref()
+                        .is_some_and(|requested| {
+                            record.failed_descriptor.as_ref() != Some(requested)
+                        });
                 (!Path::new(repository).exists()
                     && !has_unfinished_job
-                    && !has_writer_state
+                    && !fill_in_progress
+                    && !waiting_for_first_attempt
                     && record.filled_descriptor.is_none()
                     && record.filled_descriptors.is_empty())
                 .then(|| repository.clone())
