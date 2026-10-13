@@ -1,0 +1,9 @@
+[package]
+name = "prefrontal-build-slot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "prefrontal-build-slot"
+path = "src/main.rs"

@@ -1,0 +1,20 @@
+[
+  ["/usr/sbin/nft", "list", "table", "inet", "motor_net"],
+  ["/usr/sbin/ip", "-j", "link", "show"],
+  ["/usr/sbin/ip", "link", "add", "mnet-0000000000", "type", "veth", "peer", "name", "mj-0000000000"],
+  ["/usr/sbin/ip", "link", "set", "dev", "mnet-0000000000", "alias", "motor-net:00000000-0000-0000-0000-000000000000:0"],
+  ["/usr/sbin/ip", "addr", "add", "10.88.0.1/30", "dev", "mnet-0000000000"],
+  ["/usr/sbin/ip", "link", "set", "dev", "mj-0000000000", "netns", "1"],
+  ["/usr/sbin/ip", "link", "set", "dev", "mnet-0000000000", "up"],
+  ["/usr/sbin/ip", "link", "delete", "dev", "mnet-0000000000"],
+  ["/usr/bin/nsenter", "--target", "1", "--net", "/usr/sbin/ip", "link", "set", "dev", "mj-0000000000", "name", "eth0"],
+  ["/usr/bin/nsenter", "--target", "1", "--net", "/usr/sbin/sysctl", "-q", "-w", "net.ipv6.conf.eth0.disable_ipv6=1"],
+  ["/usr/bin/nsenter", "--target", "1", "--net", "/usr/sbin/ip", "addr", "add", "10.88.0.2/30", "dev", "eth0"],
+  ["/usr/bin/nsenter", "--target", "1", "--net", "/usr/sbin/ip", "link", "set", "dev", "eth0", "up"],
+  ["/usr/bin/nsenter", "--target", "1", "--net", "/usr/sbin/ip", "route", "add", "default", "via", "10.88.0.1"],
+  ["/usr/bin/systemctl", "show", "--property=MainPID", "--value", "motor-job-00000000-0000-0000-0000-000000000000.service"],
+  ["/usr/bin/systemctl", "show", "--property=ActiveState", "--value", "motor-job-00000000-0000-0000-0000-000000000000.service"],
+  ["/usr/bin/systemctl", "show", "--property=BindsTo", "--value", "motor-net-0000000000.service"],
+  ["/usr/bin/systemctl", "stop", "motor-net-0000000000.service"],
+  ["/usr/bin/systemd-run", "--quiet", "--collect", "--service-type=oneshot", "--unit=motor-net-0000000000.service", "--property=BindsTo=motor-job-00000000-0000-0000-0000-000000000000.service", "--property=After=motor-job-00000000-0000-0000-0000-000000000000.service", "--property=RemainAfterExit=yes", "--property=ExecStop=/usr/sbin/ip link delete dev mnet-0000000000", "/usr/bin/true"]
+]

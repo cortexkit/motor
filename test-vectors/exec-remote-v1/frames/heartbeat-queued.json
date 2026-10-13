@@ -1,0 +1,4 @@
+{
+  "type": "heartbeat",
+  "queue_wait_ms": 250
+}

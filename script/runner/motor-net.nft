@@ -1,0 +1,32 @@
+# motor_net v1: only this table belongs to the runner; never flush the ruleset.
+table inet motor_net {
+    set non_public_v4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+            169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24,
+            192.31.196.0/24, 192.52.193.0/24, 192.88.99.0/24,
+            192.168.0.0/16, 192.175.48.0/24, 198.18.0.0/15,
+            198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4
+        }
+    }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        iifname "mnet-*" meta l4proto tcp reject with tcp reset
+        iifname "mnet-*" reject with icmpx type port-unreachable
+    }
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname "enp6s0" oifname "mnet-*" ip daddr 10.88.0.0/16 ct state established,related accept
+        oifname "mnet-*" counter drop
+        iifname "mnet-*" oifname "enp6s0" ip saddr 10.88.0.0/16 ip daddr != @non_public_v4 ct state new,established,related accept
+        iifname "mnet-*" meta l4proto tcp reject with tcp reset
+        iifname "mnet-*" reject with icmpx type port-unreachable
+        iifname != "mnet-*" oifname != "mnet-*" counter drop
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 10.88.0.0/16 oifname "enp6s0" masquerade
+    }
+}

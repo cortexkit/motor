@@ -1,0 +1,690 @@
+use crate::{storage::JobAttribution, Config, JobStream, Motor, SshConnector};
+use cortexkit_claustrum_client::{CredentialResolver, UnavailableCredentialResolver};
+use cortexkit_store_types::{StorageBackend, StorageDescriptor};
+use motor_protocol::*;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+use subc_client_rs::{
+    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
+    ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+};
+use subc_protocol::{
+    manifest::{
+        Bindings, CapabilityDeclarations, Concurrency, IdentityBinding, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
+    },
+    scope::{ScopeStamp, FLOW_SCOPES_CAPABILITY},
+    ModuleHelloAckBody, Principal,
+};
+
+pub const CAPABILITY: &str = "exec-remote/v1";
+// subc-client-rs 0.26.1 lib.rs:86 fixes provider handler capacity at 64.
+pub const SDK_HANDLER_CAPACITY: usize = 64;
+// Reserve slots for status, cancel and attach when long-lived run streams fill
+// the provider. These control operations must remain usable under saturation.
+pub const CONTROL_HEADROOM: usize = 8;
+pub const RUN_ADMISSION_LIMIT: usize = SDK_HANDLER_CAPACITY - CONTROL_HEADROOM;
+struct RunPermit(Arc<std::sync::atomic::AtomicUsize>);
+impl RunPermit {
+    fn acquire(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        let mut current = count.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if current >= RUN_ADMISSION_LIMIT {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(count.clone())),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+pub const OPERATIONS: &[&str] = &[
+    "exec.run",
+    "exec.attach",
+    "exec.cancel",
+    "exec.status",
+    "runner.health",
+    "workspace.prepare",
+    "workspace.drop",
+];
+/// The one flow admitted to ck-motor: it reads `runner.health` every half hour
+/// and wakes MOTOR when the build server's health changes. Its source lives in
+/// `.cortexkit/flows/motor-build-server-health/`.
+pub(crate) const HEALTH_FLOW_ID: &str = "motor-build-server-health";
+
+/// A flow route is the health flow when the daemon stamped it with a scope that
+/// prefrontal-core owns and was authorized to set, naming that flow. The stamp
+/// is the daemon's, so a flow can't claim another flow's id.
+fn is_health_flow(scope: Option<&ScopeStamp>) -> bool {
+    scope.is_some_and(|scope| {
+        matches!(&scope.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
+            && scope.owner_authorized
+            && scope.attributes.flow_id.as_deref() == Some(HEALTH_FLOW_ID)
+    })
+}
+
+/// Advertised only when the Windows runner is configured; AFT sends
+/// `runon: "windows"` only to a module that lists it. The daemon refuses a
+/// module's HELLO unless every capability is spelled `<name>/v<N>`.
+pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
+pub(crate) const NETWORK_CAPABILITY: &str = "exec-remote-net/v1";
+
+pub fn manifest(module_id: &str) -> ModuleManifest {
+    manifest_with_config(module_id, &Config::default())
+}
+
+pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest {
+    let mut provides = vec![CAPABILITY.into(), FLOW_SCOPES_CAPABILITY.into()];
+    if config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some() {
+        provides.push(WINDOWS_CAPABILITY.into());
+    }
+    if config.network_routing {
+        provides.push(NETWORK_CAPABILITY.into());
+    }
+    ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .trust_tier(Some(TrustTier::FirstParty))
+        .protocol_ver(subc_protocol::PROTOCOL_VERSION)
+        .capabilities(Some(CapabilityDeclarations {
+            // The daemon routes a flow's requests (scheduled automation run by
+            // Basal) only to modules that declare they handle flow scopes.
+            provides,
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
+        .bindings(Some(Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: true,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: Vec::new(),
+            },
+        }))
+        .provides(vec![ProviderRole::ManagementSurface {
+            concurrency: Concurrency::ModuleManaged,
+            operations: OPERATIONS
+                .iter()
+                .map(|name| ManagementOperation {
+                    name: (*name).into(),
+                    kind: if matches!(*name, "exec.status" | "runner.health") {
+                        ManagementOperationKind::Query
+                    } else {
+                        ManagementOperationKind::Mutate
+                    },
+                    description: None,
+                })
+                .collect(),
+            config_schema: json!({"type":"object"}),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+        }])
+        .build()
+}
+#[derive(Clone)]
+pub struct Handler {
+    config: Config,
+    motor: Arc<OnceLock<Motor>>,
+    ssh: Arc<OnceLock<Arc<SshConnector>>>,
+    resolver: Arc<dyn CredentialResolver>,
+    routes: Arc<Mutex<HashMap<RouteHandle, RouteBindRequest>>>,
+    /// Jobs started by direct routes, keyed to the route that started them. The
+    /// route handle is the daemon's own stamp for a bound route on this
+    /// connection, so a direct caller can't name another route's jobs by
+    /// anything it puts in a request body.
+    direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
+    run_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Handler {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            motor: Arc::new(OnceLock::new()),
+            ssh: Arc::new(OnceLock::new()),
+            resolver: Arc::new(UnavailableCredentialResolver),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            direct_jobs: Arc::new(Mutex::new(HashMap::new())),
+            run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+    /// Serve with an already open `Motor` instead of opening one from the
+    /// daemon's storage descriptor, so tests can drive this handler against an
+    /// in-process runner.
+    #[cfg(test)]
+    pub(crate) fn with_motor(self, motor: Motor) -> Self {
+        let _ = self.motor.set(motor);
+        self
+    }
+    pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+    pub async fn shutdown(&self) {
+        if let Some(ssh) = self.ssh.get() {
+            ssh.shutdown().await;
+        }
+    }
+    fn attribution(&self, handle: RouteHandle, preset: Option<String>) -> Option<JobAttribution> {
+        let routes = self.routes.lock().unwrap();
+        let route = routes.get(&handle)?;
+        let scope = route.scope.as_ref()?;
+        Some(JobAttribution {
+            session: route.identity.session.clone(),
+            preset,
+            scope_ref: scope.scope_ref.clone(),
+            scope_epoch: scope.scope_epoch,
+        })
+    }
+}
+/// The refusal reason a direct `exec.run` gets when its timeout is missing or
+/// over [`Config::direct_exec_max_timeout_secs`].
+pub const DIRECT_TIMEOUT_REFUSED: &str = "direct_timeout_refused";
+
+/// Why a direct run's timeout is unacceptable, or `None` when it is within the
+/// cap. Ownership of a direct job is tied to the route that started it, so a
+/// caller that loses its connection can neither re-attach nor cancel: the job
+/// has to end on its own, and the runner's deadline is what ends it. The CLI
+/// prints the same text when it refuses a timeout locally.
+pub fn direct_timeout_refusal(timeout: Option<u64>, cap: u64) -> Option<String> {
+    const WHY: &str = "a direct caller that loses its connection can't re-attach to or cancel its job, so the job must end on its own";
+    match timeout {
+        None => Some(format!(
+            "a direct exec.run needs a timeout of at most {cap} seconds: {WHY}"
+        )),
+        Some(timeout) if timeout > cap => Some(format!(
+            "timeout {timeout} seconds exceeds the direct-job cap of {cap} seconds: {WHY}"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// What a direct caller gets for a job its route did not start. The bytes are
+/// the same whether the job belongs to another caller or does not exist, so a
+/// direct caller can't learn which job IDs are live.
+fn direct_job_not_found() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "motor_job_not_found".into(),
+        message: "ck-motor has no such job for this caller".into(),
+    }
+}
+
+impl Handler {
+    /// Requests on a route the daemon attested as `Principal::Direct`, admitted
+    /// only while `admit_direct_exec` is on. A direct caller may start jobs and
+    /// attach to, cancel or check the jobs its own route started; nothing else.
+    async fn handle_direct(
+        &self,
+        ctx: RequestCtx,
+        envelope: Envelope,
+    ) -> io::Result<HandlerOutcome> {
+        let route = ctx.route_handle();
+        let op = envelope.op.as_str();
+        if !matches!(
+            op,
+            "exec.run" | "exec.attach" | "exec.cancel" | "exec.status"
+        ) {
+            return Ok(HandlerOutcome::Error {
+                code: "motor_op_not_permitted_for_principal".into(),
+                message: format!("ck-motor refuses {op} for direct"),
+            });
+        }
+        let owned = |id: Uuid| self.direct_jobs.lock().unwrap().get(&id) == Some(&route);
+        fn parse<T: serde::de::DeserializeOwned>(params: Value) -> io::Result<T> {
+            serde_json::from_value(params).map_err(io::Error::other)
+        }
+        match op {
+            "exec.run" => {
+                let request: RunRequest = parse(envelope.params)?;
+                let motor = self.initialized()?;
+                if let Some(detail) = direct_timeout_refusal(
+                    request.timeout,
+                    self.config.direct_exec_max_timeout_secs,
+                ) {
+                    let stream = motor.refuse_before_start(
+                        RefusalReason::Unknown(DIRECT_TIMEOUT_REFUSED.into()),
+                        Some(detail),
+                    )?;
+                    pump_direct(&ctx, stream).await?;
+                    return Ok(HandlerOutcome::Streamed);
+                }
+                let _permit = match RunPermit::acquire(&self.run_count) {
+                    Some(permit) => permit,
+                    None => {
+                        pump_direct(&ctx, motor.refuse_capacity()?).await?;
+                        return Ok(HandlerOutcome::Streamed);
+                    }
+                };
+                let stream = motor.run_direct(request, self.attribution(route, envelope.preset))?;
+                self.direct_jobs
+                    .lock()
+                    .unwrap()
+                    .insert(stream.job_id, route);
+                tracing::info!(caller = "direct", job_id = %stream.job_id, "direct job submitted");
+                pump_direct(&ctx, stream)
+                    .await
+                    .map(|()| HandlerOutcome::Streamed)
+            }
+            "exec.attach" => {
+                let request: AttachRequest = parse(envelope.params)?;
+                if !owned(request.job_id) {
+                    return Ok(direct_job_not_found());
+                }
+                pump_direct(&ctx, self.initialized()?.attach(request)?)
+                    .await
+                    .map(|()| HandlerOutcome::Streamed)
+            }
+            "exec.cancel" => {
+                let request: CancelRequest = parse(envelope.params)?;
+                if !owned(request.job_id) {
+                    return Ok(direct_job_not_found());
+                }
+                tracing::info!(caller = "direct", job_id = %request.job_id, "direct job cancel requested");
+                response(self.initialized()?.cancel(request).await?)
+            }
+            _ => {
+                // Aggregate runner status and disk reports describe every
+                // caller's work, so a direct caller may ask only by job ID.
+                let Some(id) = envelope.params.get("job_id") else {
+                    return Ok(HandlerOutcome::Error {
+                        code: "motor_op_not_permitted_for_principal".into(),
+                        message: "ck-motor refuses exec.status without a job_id for direct; a direct caller may check only its own jobs".into(),
+                    });
+                };
+                let id: Uuid = parse(id.clone())?;
+                if !owned(id) {
+                    return Ok(direct_job_not_found());
+                }
+                response(self.initialized()?.job_status(id).await?)
+            }
+        }
+    }
+    fn initialized(&self) -> io::Result<&Motor> {
+        self.motor
+            .get()
+            .ok_or_else(|| io::Error::other("module not initialized"))
+    }
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    #[serde(alias = "method")]
+    op: String,
+    #[serde(default)]
+    params: Value,
+    /// AFT's selected preset is attribution, not a policy input to motor.
+    #[serde(default)]
+    preset: Option<String>,
+}
+#[async_trait]
+impl ModuleHandler for Handler {
+    async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        if self.motor.get().is_some() {
+            return;
+        }
+        let root = match &ack.storage {
+            Some(value) => {
+                let descriptor: StorageDescriptor =
+                    serde_json::from_value(value.clone()).expect("ck-motor storage descriptor");
+                match descriptor.backend {
+                    StorageBackend::Sqlite { path } => PathBuf::from(format!("{path}.ck-motor")),
+                    _ => panic!("ck-motor requires SQLite module storage"),
+                }
+            }
+            None => {
+                let data = std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".local/share")
+                    });
+                data.join("cortexkit/ck-motor")
+                    .join(&self.config.runner_instance)
+            }
+        };
+        // Acquire the single-writer lease before creating the private agent dir.
+        let mut motor =
+            Motor::open(self.config.clone(), &root).expect("open ck-motor module storage");
+        let ssh = Arc::new(
+            SshConnector::initialize(self.config.clone(), &root, Arc::clone(&self.resolver)).await,
+        );
+        motor.set_connector(ssh.clone());
+        self.ssh.set(ssh).ok();
+        self.motor.set(motor).ok();
+    }
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        match request.principal.as_ref() {
+            Some(Principal::Reserved { module_id })
+                if module_id == "aft" || module_id == "prefrontal-core" => {}
+            // Basal runs every scheduled flow, so all their routes share the
+            // reserved:basal principal and it can't tell flows apart. The
+            // daemon also stamps each route with the scope it was opened under,
+            // which names the flow and can't be forged by the flow. Only the
+            // build-server health flow is admitted, and the request handler
+            // then allows it the read-only runner.health report only.
+            Some(Principal::Reserved { module_id })
+                if module_id == "basal" && is_health_flow(request.scope.as_ref()) => {}
+            Some(Principal::Direct) if self.config.admit_direct_exec => {}
+            Some(Principal::Direct) => {
+                return BindDecision::reject(
+                    "motor_direct_refused",
+                    "ck-motor refuses direct binds",
+                )
+            }
+            Some(Principal::Unverified) | None => {
+                return BindDecision::reject(
+                    "motor_unverified_refused",
+                    "ck-motor refuses unverified binds",
+                )
+            }
+            Some(Principal::Reserved { module_id }) => {
+                return BindDecision::reject(
+                    "motor_principal_refused",
+                    format!("ck-motor refuses reserved:{module_id}; only reserved:aft, reserved:prefrontal-core and the {HEALTH_FLOW_ID} flow may bind"),
+                )
+            }
+        }
+        self.routes
+            .lock()
+            .unwrap()
+            .insert(request.handle, request.clone());
+        BindDecision::accept()
+    }
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.routes.lock().unwrap().remove(handle);
+        // A closed route's jobs keep running on the runner until they finish or
+        // reach their timeout; no later route may claim them.
+        self.direct_jobs
+            .lock()
+            .unwrap()
+            .retain(|_, owner| owner != handle);
+    }
+    async fn on_connection_end(&self, _end: ConnectionEnd) {
+        self.shutdown().await;
+        self.routes.lock().unwrap().clear();
+        self.direct_jobs.lock().unwrap().clear();
+    }
+    async fn health(&self) -> HealthReport {
+        let reason = match self.ssh.get() {
+            Some(ssh) => crate::Connector::refusal(ssh.as_ref()),
+            None => Some("module_not_initialized"),
+        };
+        let detail = crate::diagnostics::health_detail();
+        let detail = Some(match reason {
+            Some(reason) => format!("{reason}; {detail}"),
+            None => detail,
+        });
+        HealthReport {
+            status: if reason.is_some() {
+                HealthStatus::Failing
+            } else {
+                HealthStatus::Ok
+            },
+            detail,
+            metrics: None,
+        }
+    }
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let result = async {
+            let envelope: Envelope = serde_json::from_slice(&body).map_err(io::Error::other)?;
+            let principal = self
+                .routes
+                .lock()
+                .unwrap()
+                .get(&ctx.route_handle())
+                .and_then(|route| route.principal.clone());
+            let module_id = match principal {
+                Some(Principal::Reserved { module_id }) => module_id,
+                // on_bind admits a direct route only while the switch is on;
+                // the check is repeated so a route bound under another
+                // configuration can't act.
+                Some(Principal::Direct) if self.config.admit_direct_exec => {
+                    return self.handle_direct(ctx, envelope).await;
+                }
+                _ => {
+                    return Ok(HandlerOutcome::Error {
+                        code: "motor_route_not_admitted".into(),
+                        message: "ck-motor requires an admitted reserved:aft, reserved:prefrontal-core or reserved:basal route".into(),
+                    })
+                }
+            };
+            // AFT executes commands; core owns remote workspace lifecycle. Check
+            // the daemon-attested route principal before parsing any op params.
+            let permitted = match envelope.op.as_str() {
+                "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" => module_id == "aft",
+                "runner.health" => {
+                    module_id == "aft" || module_id == "prefrontal-core" || module_id == "basal"
+                }
+                "workspace.prepare" | "workspace.drop" => module_id == "prefrontal-core",
+                _ => false,
+            };
+            if !permitted {
+                return Ok(HandlerOutcome::Error {
+                    code: "motor_op_not_permitted_for_principal".into(),
+                    message: format!("ck-motor refuses {} for reserved:{module_id}", envelope.op),
+                });
+            }
+            let motor = self
+                .motor
+                .get()
+                .ok_or_else(|| io::Error::other("module not initialized"))?;
+            let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
+            match envelope.op.as_str() {
+                "exec.run" => {
+                    let _permit = match RunPermit::acquire(&self.run_count) {
+                        Some(permit) => permit,
+                        None => {
+                            pump(&ctx, motor.refuse_capacity()?).await?;
+                            return Ok(HandlerOutcome::Streamed);
+                        }
+                    };
+                    pump(
+                        &ctx,
+                        motor.run_attributed(
+                            parse(envelope.params)?,
+                            self.attribution(ctx.route_handle(), envelope.preset),
+                        )?,
+                    )
+                    .await
+                    .map(|()| HandlerOutcome::Streamed)
+                }
+                "exec.attach" => pump(
+                    &ctx,
+                    motor.attach(
+                        serde_json::from_value(envelope.params).map_err(io::Error::other)?,
+                    )?,
+                )
+                .await
+                .map(|()| HandlerOutcome::Streamed),
+                "exec.cancel" => response(
+                    motor
+                        .cancel(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
+                        .await?,
+                ),
+                "exec.status" => {
+                    status_reply(motor, &envelope.params).await
+                },
+                "runner.health" => runner_health_reply_for(motor, &envelope.params).await,
+                "workspace.prepare" => response(
+                    motor
+                        .prepare(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
+                        .await?,
+                ),
+                "workspace.drop" => response(
+                    motor
+                        .drop_workspace(
+                            serde_json::from_value(envelope.params).map_err(io::Error::other)?,
+                        )
+                        .await?,
+                ),
+                _ => Err(io::Error::other("unknown operation")),
+            }
+        }
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(e) => HandlerOutcome::Error {
+                code: "exec_remote_error".into(),
+                message: e.to_string(),
+            },
+        }
+    }
+}
+pub(crate) fn response(value: impl serde::Serialize) -> io::Result<HandlerOutcome> {
+    Ok(HandlerOutcome::Response(
+        serde_json::to_vec(&value).map_err(io::Error::other)?,
+    ))
+}
+pub(crate) async fn status_reply(
+    motor: &Motor,
+    params: &serde_json::Value,
+) -> io::Result<HandlerOutcome> {
+    let platform = optional_platform(params)?;
+    if let Some(id) = params.get("job_id") {
+        response(
+            motor
+                .job_status(serde_json::from_value(id.clone()).map_err(io::Error::other)?)
+                .await?,
+        )
+    } else if !matches!(platform, None | Some(motor_protocol::Platform::Linux)) {
+        let reply = motor.runner_status_for(platform.as_ref()).await?;
+        if params.get("disk").and_then(serde_json::Value::as_bool) == Some(true) {
+            response(reply)
+        } else {
+            response(reply.status)
+        }
+    } else if params.get("disk").and_then(serde_json::Value::as_bool) == Some(true) {
+        response(motor.disk_status().await)
+    } else {
+        response(motor.status().await)
+    }
+}
+#[cfg(test)]
+pub(crate) async fn runner_health_reply(motor: &Motor) -> io::Result<HandlerOutcome> {
+    runner_health_reply_for(motor, &json!({})).await
+}
+pub(crate) async fn runner_health_reply_for(
+    motor: &Motor,
+    params: &serde_json::Value,
+) -> io::Result<HandlerOutcome> {
+    let platform = optional_platform(params)?;
+    match motor.runner_health_for(platform.as_ref()).await {
+        Ok(health) => response(health),
+        Err(error) => Ok(HandlerOutcome::Error {
+            code: "runner_health_unavailable".into(),
+            message: error.to_string(),
+        }),
+    }
+}
+fn optional_platform(params: &serde_json::Value) -> io::Result<Option<motor_protocol::Platform>> {
+    params
+        .get("platform")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()).map_err(io::Error::other))
+        .transpose()
+}
+async fn reply(ctx: &RequestCtx, value: impl serde::Serialize) -> io::Result<()> {
+    ctx.emit(serde_json::to_vec(&value).map_err(io::Error::other)?)
+        .await
+        .map_err(io::Error::other)
+}
+async fn pump(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
+    forward(ctx.cancelled(), stream, |record| reply(ctx, record)).await
+}
+
+/// `pump` for a direct caller, writing each direct job's acceptance and
+/// terminal outcome to ck-motor's log with `caller=direct`.
+async fn pump_direct(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
+    let id = stream.job_id;
+    let mut terminal = false;
+    let result = forward(ctx.cancelled(), stream, |record| {
+        match &record {
+            StreamRecord::Accepted(_) => {
+                tracing::info!(caller = "direct", job_id = %id, "direct job accepted")
+            }
+            StreamRecord::Terminal(t) => {
+                terminal = true;
+                tracing::info!(caller = "direct", job_id = %id, outcome = ?t.outcome,
+                    killed = ?t.killed, "direct job terminal");
+            }
+            _ => {}
+        }
+        reply(ctx, record)
+    })
+    .await;
+    if !terminal {
+        tracing::info!(caller = "direct", job_id = %id,
+            "direct caller left before the terminal; the job runs until it ends or reaches its timeout");
+    }
+    result
+}
+
+/// Forward a job's records to its caller until the terminal record, or until the
+/// request is cancelled. A cancelled request is a detach, never a job cancel:
+/// the request is cancelled when the caller drops its stream (AFT does this on
+/// Esc, a tool timeout or its own restart, then reattaches with exec.attach) and
+/// when ck-motor itself shuts down. Only exec.cancel stops a job.
+pub(crate) async fn forward<F, E>(
+    cancelled: impl std::future::Future<Output = ()>,
+    mut stream: JobStream,
+    mut emit: E,
+) -> io::Result<()>
+where
+    E: FnMut(StreamRecord) -> F,
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::pin!(cancelled);
+    loop {
+        tokio::select! {
+            _ = &mut cancelled => {
+                eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                return Ok(());
+            },
+            record = stream.records.recv() => match record {
+                Some(record) => {
+                    let record = record?;
+                    let terminal = matches!(record, StreamRecord::Terminal(_));
+                    emit(record).await?;
+                    if terminal { return Ok(()); }
+                },
+                None => return Err(io::Error::other("stream ended without terminal record")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn run_permits_enforce_capacity_and_release_on_drop() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut permits: Vec<_> = (0..RUN_ADMISSION_LIMIT)
+            .map(|_| RunPermit::acquire(&count).unwrap())
+            .collect();
+        assert!(RunPermit::acquire(&count).is_none());
+        permits.pop();
+        let replacement = RunPermit::acquire(&count).expect("a finished stream releases admission");
+        drop(replacement);
+        drop(permits);
+        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}

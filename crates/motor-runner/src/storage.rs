@@ -1,0 +1,355 @@
+use motor_protocol::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    fs::{self, File},
+    io::{self, Write},
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+pub const REPLAY_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JobState {
+    AwaitingBundles,
+    Queued,
+    Running,
+    Terminal,
+    Tombstone,
+    Lost,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Chunk {
+    pub seq: u64,
+    pub stream: OutputStream,
+    pub length: u64,
+}
+
+pub(crate) const NO_QUEUE: u64 = u64::MAX;
+pub(crate) fn empty_queue_entry() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(NO_QUEUE))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Job {
+    pub id: Uuid,
+    pub request: Option<Run>,
+    pub state: JobState,
+    pub accepted_ms: u64,
+    #[serde(default)]
+    pub queued_ms: Option<u64>,
+    /// Runtime copy of queued_ms for heartbeat writers, shared without the
+    /// runner state lock. queued_ms remains durable; this handle needs no
+    /// restoration because startup refuses queued jobs before new subscribers.
+    #[serde(skip, default = "empty_queue_entry")]
+    pub queue_entry: Arc<AtomicU64>,
+    #[serde(default)]
+    pub setup_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    pub started_ms: Option<u64>,
+    /// Sequenced start progress survives restart and output-chunk eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<Started>,
+    pub process: Option<crate::platform::ProcessIdentity>,
+    pub terminal: Option<TerminalRecord>,
+    pub chunks: VecDeque<Chunk>,
+    pub next_seq: u64,
+    pub output_bytes: u64,
+    pub weight: u32,
+    /// Retained for inspection after terminal; only live jobs hold these CPUs.
+    #[serde(default)]
+    pub cpus: Vec<u32>,
+    pub order: u64,
+    pub base: bool,
+    #[serde(default)]
+    pub writer_descriptor: Option<String>,
+    pub kill: Option<(Killed, u64)>,
+    /// Durable isolated stream positions, advanced atomically with replay chunks.
+    #[serde(default)]
+    pub stdout_offset: u64,
+    #[serde(default)]
+    pub stderr_offset: u64,
+    #[serde(default)]
+    pub durable_output: bool,
+    /// Retained in the record even when replay storage cannot accept a diagnostic.
+    #[serde(default)]
+    pub monitoring_error: Option<String>,
+    /// Why the job was stopped by its memory limit, when it was. The terminal
+    /// record sent to callers (`TerminalRecord` in cortexkit-exec-remote-types)
+    /// has no free-form detail field outside refusals, so the text is kept here
+    /// and also written to the job's stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_use: Option<ReservationUse>,
+    /// Fixed execution end, independent of delayed launcher-accounting delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ended_ms: Option<u64>,
+}
+
+impl Job {
+    pub fn gate_job(&self) -> bool {
+        !self.base
+            && self
+                .request
+                .as_ref()
+                .is_some_and(|request| request.gate_job)
+    }
+    pub fn new(id: Uuid, request: Option<Run>, now: u64, order: u64, weight: u32) -> Self {
+        Self {
+            id,
+            request,
+            state: JobState::AwaitingBundles,
+            accepted_ms: now,
+            queued_ms: None,
+            queue_entry: empty_queue_entry(),
+            setup_ms: None,
+            finished_ms: None,
+            started_ms: None,
+            started: None,
+            process: None,
+            terminal: None,
+            chunks: VecDeque::new(),
+            next_seq: 0,
+            output_bytes: 0,
+            weight,
+            cpus: Vec::new(),
+            order,
+            base: false,
+            writer_descriptor: None,
+            kill: None,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            durable_output: false,
+            monitoring_error: None,
+            memory_limit_detail: None,
+            reservation_use: None,
+            execution_ended_ms: None,
+        }
+    }
+    pub fn pending(&self) -> bool {
+        matches!(self.state, JobState::AwaitingBundles | JobState::Queued)
+    }
+    pub fn claimed_cpus(&self) -> &[u32] {
+        if self.terminal.is_some() {
+            &[]
+        } else {
+            &self.cpus
+        }
+    }
+    pub fn key(&self) -> &str {
+        self.request
+            .as_ref()
+            .map(|r| r.workspace_key.as_str())
+            .unwrap_or("")
+    }
+    pub fn terminal(&mut self, outcome: Outcome, now: u64) {
+        self.queue_entry.store(NO_QUEUE, Ordering::Release);
+        let remote = self.started_ms.is_some();
+        let bundle_bytes = self
+            .request
+            .as_ref()
+            .map(|r| {
+                r.bundles
+                    .iter()
+                    .chain(r.git_dependencies.iter().filter_map(|d| d.bundle.as_ref()))
+                    .map(|b| b.length)
+                    .sum()
+            })
+            .unwrap_or(0);
+        let mut terminal = TerminalRecord::new(
+            self.id,
+            outcome,
+            self.started_ms.map(|t| now.saturating_sub(t)).unwrap_or(0),
+            self.queue_wait_ms(now),
+            bundle_bytes,
+        )
+        .with_ran(if remote { Ran::Remote } else { Ran::None });
+        if let Some((killed, _)) = &self.kill {
+            terminal = terminal.with_killed(killed.clone());
+        }
+        if let Some(tree_hash) = self.request.as_ref().map(|r| &r.tree_hash) {
+            terminal = terminal.with_tree_hash(tree_hash.clone());
+        }
+        if remote {
+            terminal = terminal.with_workspace_changes(Vec::new());
+        }
+        self.terminal = Some(terminal);
+        self.finished_ms = Some(now);
+        self.state = JobState::Terminal;
+    }
+
+    pub fn queue_wait_ms(&self, now: u64) -> u64 {
+        self.setup_ms
+            .or(self.started_ms)
+            .unwrap_or(now)
+            .saturating_sub(self.queued_ms.unwrap_or(self.accepted_ms))
+    }
+
+    pub fn record_reservation_use(&mut self, cpu_time_ns: u64, ended_ms: u64) {
+        let Some(wall_ms) = self.started_ms.map(|start| ended_ms.saturating_sub(start)) else {
+            return;
+        };
+        if wall_ms == 0 || self.weight == 0 {
+            return;
+        }
+        // cpu_time_ns / (wall_ms * vCPUs) is already in millionths: converting
+        // milliseconds to nanoseconds cancels the 1_000_000 ppm multiplier.
+        let average_use_ppm = (u128::from(cpu_time_ns)
+            / (u128::from(wall_ms) * u128::from(self.weight)))
+        .min(u128::from(u64::MAX)) as u64;
+        self.reservation_use = Some(ReservationUse {
+            cpu_time_ns,
+            wall_ms,
+            average_use_ppm,
+        });
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Workspace {
+    #[serde(default)]
+    pub kind: WorkspaceKind,
+    pub repository: String,
+    pub snapshot: String,
+    pub siblings: Vec<SiblingSnapshot>,
+    pub used_ms: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Repository {
+    pub failure_detail: Option<String>,
+    pub filled_descriptor: Option<String>,
+    pub filled_descriptors: BTreeMap<String, u64>,
+    pub recorded_without_writer: BTreeSet<String>,
+    pub miss_refills: BTreeSet<String>,
+    pub failed_descriptor: Option<String>,
+    pub requested_descriptor: Option<String>,
+    pub commit: Option<String>,
+    pub finished_ms: Option<u64>,
+    pub result: Option<RebuildResult>,
+    pub desired: Option<BaseRequest>,
+}
+
+/// Exact catalog-owned checkout paths awaiting cheap retirement into trash.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LegacyCheckout {
+    pub repository: String,
+    pub tip: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BaseRequest {
+    pub tip: String,
+    pub workspace: String,
+    pub siblings: Vec<SiblingSnapshot>,
+    #[serde(default)]
+    pub git_dependencies: Vec<GitDependency>,
+    /// The warm command derived for `tip`; absent in catalogs written before
+    /// warm commands were per repository.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct RetainedTransfer {
+    pub repository: String,
+    pub snapshot: String,
+    pub tip: String,
+    pub siblings: Vec<SiblingSnapshot>,
+    pub finished_ms: u64,
+}
+
+fn pending_legacy_generations() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Catalog {
+    pub workspaces: BTreeMap<String, Workspace>,
+    pub repositories: BTreeMap<String, Repository>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_checkouts: BTreeMap<String, LegacyCheckout>,
+    #[serde(default = "pending_legacy_generations")]
+    pub legacy_generations_pending: bool,
+    #[serde(default)]
+    pub generation_migration_complete: bool,
+    pub sibling_commits: BTreeMap<String, String>,
+    #[serde(default)]
+    pub transferred: BTreeMap<Uuid, RetainedTransfer>,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            workspaces: BTreeMap::new(),
+            repositories: BTreeMap::new(),
+            legacy_checkouts: BTreeMap::new(),
+            legacy_generations_pending: true,
+            generation_migration_complete: false,
+            sibling_commits: BTreeMap::new(),
+            transferred: BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) fn invalid(message: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
+/// Rename alone is insufficient: sync the file and its containing directory
+/// before acknowledging a state transition to a peer or releasing a launch gate.
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    atomic_json_mode(path, value, false)
+}
+
+pub(crate) fn atomic_json_private(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    atomic_json_mode(path, value, true)
+}
+
+fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("record has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("tmp");
+    let mut file = if private {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file
+    } else {
+        File::create(&tmp)?
+    };
+    serde_json::to_writer(&mut file, value).map_err(invalid)?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(tmp, path)?;
+    File::open(parent)?.sync_all()
+}
+
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    serde_json::from_reader(File::open(path)?).map_err(invalid)
+}
+
+pub(crate) fn mint_ms(id: Uuid) -> u64 {
+    id.get_timestamp()
+        .map(|t| {
+            let (s, n) = t.to_unix();
+            s * 1000 + u64::from(n) / 1_000_000
+        })
+        .unwrap_or(0)
+}

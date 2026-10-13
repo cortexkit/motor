@@ -1,0 +1,2276 @@
+//! Linux jobs are transient system services, not children with the daemon's UID.
+//! The existing administrative sudo grant is used only by the trusted daemon;
+//! no setuid helper, job sudo grant, or new privileged service is installed.
+use crate::{platform, workspace};
+use motor_protocol::SiblingSnapshot;
+use sha2::Digest;
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io,
+    os::{
+        fd::{FromRawFd, IntoRawFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
+    },
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+use uuid::Uuid;
+
+mod hosts;
+
+const USER: &str = "motor-job";
+pub(crate) const WRITER_USER: &str = "motor-cache";
+/// The job's /etc/hosts. `localhost` maps to IPv4 only, as on the build server
+/// and Ubuntu: a client that tried ::1 first would be refused by servers that
+/// listen on 127.0.0.1 alone.
+const JOB_HOSTS: &str = "127.0.0.1\tlocalhost\n::1\tip6-localhost\tip6-loopback\n";
+
+fn checked(command: &mut Command) -> io::Result<()> {
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_account() -> io::Result<()> {
+    validate_identity(
+        USER,
+        account_uid(USER)?,
+        &[],
+        account_groups(USER)?.as_deref(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriterAccount {
+    pub(crate) uid: u32,
+}
+
+pub(crate) fn validate_writer_account() -> io::Result<WriterAccount> {
+    let uid = account_uid(WRITER_USER)?;
+    let job_uid = account_uid(USER)?
+        .ok_or_else(|| io::Error::other("provision motor-job before starting the runner"))?;
+    validate_identity(
+        WRITER_USER,
+        uid,
+        &[job_uid],
+        account_groups(WRITER_USER)?.as_deref(),
+    )?;
+    Ok(WriterAccount { uid: uid.unwrap() })
+}
+
+fn account_uid(user: &str) -> io::Result<Option<u32>> {
+    let output = Command::new("/usr/bin/id").args(["-u", user]).output()?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .flatten())
+}
+
+fn account_groups(user: &str) -> io::Result<Option<String>> {
+    let output = Command::new("/usr/bin/id").args(["-nG", user]).output()?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+fn validate_identity(
+    user: &str,
+    uid: Option<u32>,
+    forbidden: &[u32],
+    groups: Option<&str>,
+) -> io::Result<()> {
+    let uid = uid
+        .ok_or_else(|| io::Error::other(format!("provision {user} before starting the runner")))?;
+    if uid == 0 || uid == unsafe { libc::geteuid() } || forbidden.contains(&uid) {
+        return Err(io::Error::other(format!(
+            "{user} must differ from root, the runner and other sandbox accounts"
+        )));
+    }
+    if groups.is_none_or(|groups| {
+        groups.trim().is_empty()
+            || groups
+                .split_whitespace()
+                .any(|g| ["sudo", "admin", "adm", "lxd", "docker"].contains(&g))
+    }) {
+        return Err(io::Error::other(format!(
+            "{user} has an administrative or unknown group"
+        )));
+    }
+    Ok(())
+}
+
+/// Both access and default ACLs are replaced, not merged: a legacy permissive
+/// group or named-user ACL must never give a foreground job cache-write access.
+fn writer_cache_acl(directory: bool) -> String {
+    let access = if directory { "r-x" } else { "r--" };
+    let owner = if directory { "rwx" } else { "rw-" };
+    let runner = unsafe { libc::geteuid() };
+    let acl = format!("u::{owner},u:{USER}:{access},u:{runner}:{access},g::---,m::{access},o::---");
+    if directory {
+        format!("{acl},d:u::rwx,d:u:{USER}:r-x,d:u:{runner}:r-x,d:g::---,d:m::r-x,d:o::---")
+    } else {
+        acl
+    }
+}
+
+pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::Result<()> {
+    let root = fleet
+        .parent()
+        .ok_or_else(|| io::Error::other("cache has no parent"))?;
+    let state = root
+        .parent()
+        .ok_or_else(|| io::Error::other("cache has no state directory"))?;
+    // Do not repair a symlink into somebody else's tree. Storage is fixed under
+    // the instance state directory, never supplied by a job or a repository.
+    for directory in [root, fleet] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(io::Error::other(
+                    "compiler cache must be a physical directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                checked(
+                    Command::new("/usr/bin/sudo")
+                        .args(["-n", "/usr/bin/mkdir", "-p", "--"])
+                        .arg(directory),
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        // Adopt only an empty directory. Existing cache trees were created by
+        // the writer; recursively repairing arbitrary old contents would both
+        // trust an unknown owner and walk a potentially 200-GiB cache.
+        if fs::symlink_metadata(directory)?.uid() != account.uid
+            && fs::read_dir(directory)?.next().is_some()
+        {
+            return Err(io::Error::other(
+                "nonempty compiler cache has an unexpected owner",
+            ));
+        }
+        checked(
+            Command::new("/usr/bin/sudo")
+                .args([
+                    "-n",
+                    "/usr/bin/chown",
+                    "-P",
+                    &writer_cache_owner(account),
+                    "--",
+                ])
+                .arg(directory),
+        )?;
+        repair_writer_cache_path(directory, true)?;
+    }
+    // State ancestors need traversal, not list or write access. ACLs on the
+    // cache directories themselves give reads, including future writer entries.
+    for ancestor in state.ancestors() {
+        checked(
+            Command::new("/usr/bin/sudo")
+                .args([
+                    "-n",
+                    "/usr/bin/setfacl",
+                    "-m",
+                    &format!("u:{USER}:--x,u:{WRITER_USER}:--x"),
+                    "--",
+                ])
+                .arg(ancestor),
+        )?;
+    }
+    Ok(())
+}
+
+fn writer_cache_owner(account: WriterAccount) -> String {
+    format!("{}:{WRITER_USER}", account.uid)
+}
+
+pub(crate) fn repair_writer_cache_path(path: &Path, directory: bool) -> io::Result<()> {
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "/usr/bin/setfacl",
+                "-P",
+                "--set",
+                &writer_cache_acl(directory),
+                "--",
+            ])
+            .arg(path),
+    )
+}
+
+/// Prepare the immutable host trees mounted into jobs. Existing entries get
+/// access ACLs once at daemon startup; recursive default ACLs on every Cargo
+/// cache directory let trusted Cargo fetches add readable content between jobs
+/// without rescanning the shared trees before each launch.
+pub(crate) fn prepare_shared_read_access() -> io::Result<()> {
+    prepare_shared_read_access_as(USER)
+}
+
+pub(crate) fn prepare_writer_shared_read_access() -> io::Result<()> {
+    prepare_shared_read_access_as(WRITER_USER)
+}
+
+fn prepare_shared_read_access_as(user: &str) -> io::Result<()> {
+    let cargo_home = PathBuf::from(
+        std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+    );
+    let rustup_home = PathBuf::from(
+        std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
+    );
+    let bun_bin = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bun/bin"));
+    prepare_shared_read_access_from_as(&cargo_home, &rustup_home, bun_bin.as_deref(), user)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_shared_read_access_from(
+    cargo_home: &Path,
+    rustup_home: &Path,
+    bun_bin: Option<&Path>,
+) -> io::Result<()> {
+    prepare_shared_read_access_from_as(cargo_home, rustup_home, bun_bin, USER)
+}
+
+fn prepare_shared_read_access_from_as(
+    cargo_home: &Path,
+    rustup_home: &Path,
+    bun_bin: Option<&Path>,
+    user: &str,
+) -> io::Result<()> {
+    for name in ["registry", "git"] {
+        let path = cargo_home.join(name);
+        fs::create_dir_all(&path)?;
+        grant_read_only_tree_as(&path, true, user)?;
+    }
+    grant_read_only_tree_as(rustup_home, false, user)?;
+    grant_read_only_tree_as(&cargo_home.join("bin"), false, user)?;
+
+    if let Some(bun) = bun_bin {
+        if path_is_directory_without_following(bun)? {
+            grant_read_only_tree_as(bun, false, user)?;
+        }
+    }
+    Ok(())
+}
+
+fn path_is_directory_without_following(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::other(format!(
+            "refusing shared read-only symlink: {}",
+            path.display()
+        ))),
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn grant_read_only_tree_as(path: &Path, inherit: bool, user: &str) -> io::Result<()> {
+    let _access = crate::tree_access::lock(path);
+    if !path_is_directory_without_following(path)? {
+        return Err(io::Error::other(format!(
+            "shared read-only directory is missing: {}",
+            path.display()
+        )));
+    }
+    let acl = format!("u:{user}:rX");
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-m", &acl, "--"])
+            .arg(path),
+    )?;
+    if inherit {
+        // Every existing directory receives a read-only default ACL. `-P` on
+        // find is essential: registry trees may contain untrusted symlinks.
+        checked(Command::new("/usr/bin/find").arg("-P").arg(path).args([
+            "-type",
+            "d",
+            "-exec",
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/setfacl",
+            "-P",
+            "-d",
+            "-m",
+            &acl,
+            "--",
+            "{}",
+            "+",
+        ]))?;
+    }
+    Ok(())
+}
+
+fn optional_regular_file(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::other(format!(
+            "refusing JavaScript manifest or lockfile symlink: {}",
+            path.display()
+        ))),
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::other(format!(
+            "JavaScript manifest or lockfile is not a regular file: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+const JAVASCRIPT_LOCKFILES: [&str; 4] = [
+    "bun.lock",
+    "bun.lockb",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct JavascriptInstall {
+    directory: PathBuf,
+    lockfile: &'static str,
+}
+
+fn javascript_git(workspace: &Path, args: &[&std::ffi::OsStr]) -> io::Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_KEY_0")
+        .env_remove("GIT_CONFIG_VALUE_0")
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output.stdout)
+}
+
+struct JavascriptObject {
+    mode: String,
+    kind: String,
+    id: String,
+}
+
+struct JavascriptTree {
+    paths: Vec<PathBuf>,
+    objects: BTreeMap<PathBuf, JavascriptObject>,
+    manifests: BTreeMap<PathBuf, io::Result<serde_json::Value>>,
+}
+
+fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<JavascriptTree> {
+    use std::os::unix::ffi::OsStringExt;
+    // -t includes directory object IDs as well as blobs, so local dependency
+    // subtrees need neither another Git traversal nor a process per file.
+    let entries = javascript_git(
+        workspace,
+        &[
+            "ls-tree".as_ref(),
+            "-r".as_ref(),
+            "-t".as_ref(),
+            "-z".as_ref(),
+            tree.as_ref(),
+        ],
+    )?;
+    let mut objects = BTreeMap::new();
+    // ls-tree lists children, not the root whose verified ID the caller supplied.
+    objects.insert(
+        PathBuf::new(),
+        JavascriptObject {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            id: tree.into(),
+        },
+    );
+    let mut paths = Vec::new();
+    let mut manifests = BTreeMap::new();
+    for entry in entries.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or_else(|| io::Error::other("malformed JavaScript Git tree entry"))?;
+        let header = std::str::from_utf8(&entry[..tab]).map_err(io::Error::other)?;
+        let fields: Vec<_> = header.split_whitespace().collect();
+        if fields.len() != 3 {
+            return Err(io::Error::other("malformed JavaScript Git tree object"));
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_vec(entry[tab + 1..].to_vec()));
+        if path
+            .components()
+            .any(|part| part.as_os_str() == "node_modules")
+        {
+            continue;
+        }
+        let object = JavascriptObject {
+            mode: fields[0].into(),
+            kind: fields[1].into(),
+            id: fields[2].into(),
+        };
+        if object.kind != "tree" {
+            paths.push(path.clone());
+        }
+        if object.kind == "blob" && path.file_name().is_some_and(|name| name == "package.json") {
+            // Read the materialized manifests before any install can alter the
+            // checkout. Defer errors for manifests outside an install's inputs.
+            let manifest = (|| {
+                if !optional_regular_file(&workspace.join(&path))? {
+                    return Err(io::Error::other("tracked manifest is missing"));
+                }
+                serde_json::from_slice(&fs::read(workspace.join(&path))?).map_err(io::Error::other)
+            })();
+            manifests.insert(path.clone(), manifest);
+        }
+        objects.insert(path, object);
+    }
+    Ok(JavascriptTree {
+        paths,
+        objects,
+        manifests,
+    })
+}
+
+#[cfg(test)]
+fn javascript_tracked_paths(workspace: &Path, tree: &str) -> io::Result<Vec<PathBuf>> {
+    Ok(javascript_tracked_tree(workspace, tree)?.paths)
+}
+
+fn discover_javascript_installs(paths: &[PathBuf]) -> io::Result<Vec<JavascriptInstall>> {
+    let mut directories: BTreeMap<PathBuf, (bool, [bool; 4])> = BTreeMap::new();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default();
+        if name == "package.json" || JAVASCRIPT_LOCKFILES.iter().any(|lock| name == *lock) {
+            let entry = directories
+                .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
+                .or_default();
+            if name == "package.json" {
+                entry.0 = true;
+            } else if let Some(i) = JAVASCRIPT_LOCKFILES.iter().position(|lock| name == *lock) {
+                entry.1[i] = true;
+            }
+        }
+    }
+    let mut installs = Vec::new();
+    for (directory, (manifest, locks)) in directories {
+        let lockfile = locks
+            .iter()
+            .position(|present| *present)
+            .map(|i| JAVASCRIPT_LOCKFILES[i]);
+        let label = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &directory
+        };
+        match (manifest, lockfile) {
+            (false, Some(lockfile)) => return Err(io::Error::other(format!(
+                "workspace directory {} has {} but no package.json; refusing an unlocked JavaScript install",
+                label.display(), directory.join(lockfile).display()
+            ))),
+            (true, None) if directory.as_os_str().is_empty() => return Err(io::Error::other(
+                "workspace directory . has package.json but no supported JavaScript lockfile (expected bun.lock, bun.lockb, package-lock.json, or pnpm-lock.yaml); refusing an unlocked JavaScript install"
+            )),
+            (true, Some(lockfile)) => installs.push(JavascriptInstall { directory, lockfile }),
+            _ => {}
+        }
+    }
+    installs.sort_by(|a, b| {
+        (a.directory.components().count(), &a.directory)
+            .cmp(&(b.directory.components().count(), &b.directory))
+    });
+    Ok(installs)
+}
+
+fn prepare_javascript_dependencies(state: &Path, workspace: &Path, tree: &str) -> io::Result<()> {
+    let tracked = javascript_tracked_tree(workspace, tree)?;
+    prepare_javascript_with(workspace, &tracked.paths, |install, command| {
+        cache_javascript_install(state, workspace, &tracked, install, command)
+    })
+}
+
+fn prepare_javascript_with(
+    workspace: &Path,
+    paths: &[PathBuf],
+    mut install: impl FnMut(&JavascriptInstall, &mut Command) -> io::Result<()>,
+) -> io::Result<()> {
+    for entry in discover_javascript_installs(paths)? {
+        let result = javascript_install_command(workspace, &entry)
+            .and_then(|mut command| install(&entry, &mut command));
+        result.map_err(|error| {
+            io::Error::other(format!(
+                "JavaScript setup in directory {} using {}: {error}",
+                if entry.directory.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    &entry.directory
+                }
+                .display(),
+                entry.directory.join(entry.lockfile).display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn javascript_manager(lockfile: &str) -> &'static str {
+    match lockfile {
+        "bun.lock" | "bun.lockb" => "bun",
+        "package-lock.json" => "npm",
+        "pnpm-lock.yaml" => "pnpm",
+        _ => unreachable!("discovery selects only supported lockfiles"),
+    }
+}
+
+fn javascript_install_command(
+    workspace: &Path,
+    install: &JavascriptInstall,
+) -> io::Result<Command> {
+    let directory = workspace.join(&install.directory);
+    for name in ["package.json", install.lockfile] {
+        if !optional_regular_file(&directory.join(name))? {
+            return Err(io::Error::other(format!(
+                "tracked JavaScript input is missing: {}",
+                install.directory.join(name).display()
+            )));
+        }
+    }
+    let node_modules = directory.join("node_modules");
+    match fs::symlink_metadata(&node_modules) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::other(format!(
+                "workspace {} has a non-directory node_modules entry",
+                directory.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let manager = javascript_manager(install.lockfile);
+    let executable = if manager == "bun" {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".bun/bin/bun"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("bun"))
+    } else {
+        PathBuf::from(manager)
+    };
+    let mut command = Command::new(executable);
+    if manager == "npm" {
+        command.args(["ci", "--ignore-scripts"]);
+    } else {
+        command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
+    }
+    command.current_dir(directory);
+    Ok(command)
+}
+
+fn javascript_version(command: &Command, executable: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    let mut version = Command::new(executable);
+    version.arg("--version");
+    if let Some(directory) = command.get_current_dir() {
+        version.current_dir(directory);
+    }
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                version.env(name, value);
+            }
+            None => {
+                version.env_remove(name);
+            }
+        }
+    }
+    let output = version.output().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::other(format!(
+                "{} not installed on the build server: {error}",
+                executable.to_string_lossy()
+            ))
+        } else {
+            error
+        }
+    })?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot read {} --version: {}",
+            executable.to_string_lossy(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn javascript_key_input(path: &Path, install: &JavascriptInstall) -> bool {
+    path == install.directory.join(install.lockfile)
+        || (matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("package.json" | ".npmrc" | "bunfig.toml" | "pnpm-workspace.yaml")
+        ) && (path.starts_with(&install.directory)
+            || install
+                .directory
+                .starts_with(path.parent().unwrap_or(Path::new("")))))
+}
+
+fn javascript_local_specs<'a>(value: &'a serde_json::Value, specs: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(spec)
+            if ["file:", "link:", "portal:"]
+                .iter()
+                .any(|prefix| spec.starts_with(prefix)) =>
+        {
+            specs.push(spec)
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                javascript_local_specs(value, specs);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                javascript_local_specs(value, specs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn javascript_local_dependency(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    manifest: &Path,
+    spec: &str,
+) -> io::Result<Vec<PathBuf>> {
+    let refuse = |reason: &str| {
+        io::Error::other(format!(
+            "JavaScript manifest {} has local dependency {spec:?}: {reason}",
+            manifest.display()
+        ))
+    };
+    let target = Path::new(spec.split_once(':').expect("local dependency scheme").1);
+    let (base, target) = if target.is_absolute() {
+        (
+            Path::new(""),
+            target
+                .strip_prefix(workspace)
+                .map_err(|_| refuse("path resolves outside the repository"))?,
+        )
+    } else {
+        (manifest.parent().unwrap_or(Path::new("")), target)
+    };
+    let mut relative = base.to_path_buf();
+    for component in target.components() {
+        match component {
+            Component::Normal(name) => relative.push(name),
+            Component::CurDir => {}
+            Component::ParentDir if relative.pop() => {}
+            _ => return Err(refuse("path resolves outside the repository")),
+        }
+    }
+    let object = tracked
+        .objects
+        .get(&relative)
+        .ok_or_else(|| refuse("path is not tracked in the job tree"))?;
+    if !matches!(object.kind.as_str(), "blob" | "tree") {
+        return Err(refuse(
+            "path has no tracked file or directory content in the job tree",
+        ));
+    }
+    // A tracked symlink must not turn an apparently local reference into an
+    // unkeyed dependency outside the checkout, or into an untracked target.
+    let canonical = workspace
+        .join(&relative)
+        .canonicalize()
+        .map_err(|error| refuse(&format!("cannot resolve tracked path: {error}")))?;
+    let root = workspace.canonicalize()?;
+    let resolved = canonical
+        .strip_prefix(root)
+        .map_err(|_| refuse("path resolves outside the repository"))?
+        .to_path_buf();
+    let resolved_object = tracked
+        .objects
+        .get(&resolved)
+        .ok_or_else(|| refuse("resolved path is not tracked in the job tree"))?;
+    if !matches!(resolved_object.kind.as_str(), "blob" | "tree") {
+        return Err(refuse(
+            "resolved path has no tracked file or directory content in the job tree",
+        ));
+    }
+    Ok(vec![relative, resolved])
+}
+
+fn javascript_cache_key(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+    manager_version: &[u8],
+    node_version: &[u8],
+) -> io::Result<String> {
+    fn field(hash: &mut sha2::Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    let mut hash = sha2::Sha256::new();
+    // v3: a v2 entry could hold a workspace root's install without its members'
+    // node_modules, and restoring it gave an incomplete install. No v3 key
+    // matches a v2 entry, so those entries are never restored again and the
+    // disk guard evicts them once idle.
+    field(&mut hash, b"motor-javascript-install-v3");
+    field(&mut hash, javascript_manager(install.lockfile).as_bytes());
+    field(&mut hash, manager_version);
+    field(&mut hash, node_version);
+    field(&mut hash, std::env::consts::OS.as_bytes());
+    field(&mut hash, std::env::consts::ARCH.as_bytes());
+    field(&mut hash, install.lockfile.as_bytes());
+    let mut inputs: std::collections::BTreeSet<_> = tracked
+        .paths
+        .iter()
+        .filter(|path| javascript_key_input(path, install))
+        .cloned()
+        .collect();
+    let mut pending: Vec<_> = inputs
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "package.json"))
+        .cloned()
+        .collect();
+    let mut visited = std::collections::BTreeSet::new();
+    // Local packages can refer to siblings outside their own subtree. Follow
+    // their manifests too, and visit each path once so dependency cycles finish.
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let manifest = tracked
+            .manifests
+            .get(&path)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "JavaScript manifest {} is not a tracked regular file",
+                    path.display()
+                ))
+            })?
+            .as_ref()
+            .map_err(|error| {
+                io::Error::other(format!("JavaScript manifest {}: {error}", path.display()))
+            })?;
+        let mut specs = Vec::new();
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "overrides",
+            "resolutions",
+        ] {
+            if let Some(value) = manifest.get(section) {
+                javascript_local_specs(value, &mut specs);
+            }
+        }
+        for spec in specs {
+            for dependency in javascript_local_dependency(workspace, tracked, &path, spec)? {
+                if tracked.objects[&dependency].kind == "tree" {
+                    let manifest = dependency.join("package.json");
+                    if tracked.objects.contains_key(&manifest) {
+                        inputs.insert(manifest.clone());
+                        if !visited.contains(&manifest) {
+                            pending.push(manifest);
+                        }
+                    }
+                }
+                inputs.insert(dependency);
+            }
+        }
+    }
+    for path in inputs {
+        let object = &tracked.objects[&path];
+        field(&mut hash, path.as_os_str().as_bytes());
+        field(&mut hash, object.mode.as_bytes());
+        field(&mut hash, object.kind.as_bytes());
+        field(&mut hash, object.id.as_bytes());
+    }
+    // Daemon configuration can affect dependency selection even with an identical
+    // lockfile (for example NODE_ENV or npm_config_omit).
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            ["NPM_CONFIG_", "BUN_", "PNPM_", "NODE_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    environment.sort();
+    for (name, value) in environment {
+        field(&mut hash, name.as_bytes());
+        field(&mut hash, value.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn cache_javascript_install(
+    state: &Path,
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+    command: &mut Command,
+) -> io::Result<()> {
+    use fs2::FileExt;
+    let manager_version = javascript_version(command, command.get_program())?;
+    let node_version = if javascript_manager(install.lockfile) == "bun" {
+        Vec::new()
+    } else {
+        javascript_version(command, "node".as_ref())?
+    };
+    let key = javascript_cache_key(workspace, tracked, install, &manager_version, &node_version)?;
+    let lock = platform::javascript_cache_lock(state, &key)?;
+    lock.lock_exclusive()?;
+    let cache = state.join("js-installs");
+    fs::create_dir_all(&cache)?;
+    let entry = cache.join(&key);
+    let modules = workspace.join(&install.directory).join("node_modules");
+    if entry.is_dir() {
+        if modules.exists() {
+            fs::remove_dir_all(&modules)?;
+        }
+        platform::clone_target(&entry.join("node_modules"), &modules)?;
+        File::open(&entry)?
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+        return Ok(());
+    }
+    run_javascript_install(
+        &workspace.join(&install.directory),
+        javascript_manager(install.lockfile),
+        &install.directory.join(install.lockfile).to_string_lossy(),
+        command,
+    )?;
+    // A workspace install can also write node_modules inside member packages
+    // (bun's isolated linker, pnpm, npm version conflicts), but a cache entry
+    // stores only <dir>/node_modules. Caching such an install would give later
+    // jobs members without their dependencies, so it is not cached and runs
+    // fresh in every job.
+    if javascript_install_wrote_member_modules(workspace, tracked, install) {
+        return Ok(());
+    }
+    // Managers may omit node_modules entirely for a dependency-free package.
+    // An empty tree is still a successful install and can be reused.
+    fs::create_dir_all(&modules)?;
+    struct TemporaryEntry(PathBuf);
+    impl Drop for TemporaryEntry {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let temporary = TemporaryEntry(cache.join(format!("{key}.{}.tmp", Uuid::now_v7())));
+    fs::create_dir(&temporary.0)?;
+    platform::clone_target(&modules, &temporary.0.join("node_modules"))?;
+    fs::rename(&temporary.0, &entry)?;
+    Ok(())
+}
+
+/// Whether the install left a node_modules in any tracked directory below the
+/// install directory. Installs run shallowest first in a cleaned checkout, so
+/// any such tree was written by this install.
+fn javascript_install_wrote_member_modules(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+) -> bool {
+    let mut directories = std::collections::BTreeSet::new();
+    for path in &tracked.paths {
+        let Ok(relative) = path.strip_prefix(&install.directory) else {
+            continue;
+        };
+        let mut current = relative.parent();
+        while let Some(directory) = current.filter(|d| !d.as_os_str().is_empty()) {
+            directories.insert(install.directory.join(directory));
+            current = directory.parent();
+        }
+    }
+    directories.iter().any(|directory| {
+        fs::symlink_metadata(workspace.join(directory).join("node_modules")).is_ok()
+    })
+}
+
+fn run_javascript_install(
+    workspace: &Path,
+    manager: &str,
+    lockfile: &str,
+    command: &mut Command,
+) -> io::Result<()> {
+    checked(command).map_err(|error| {
+        let detail = if error.kind() == io::ErrorKind::NotFound {
+            format!("{manager} not installed on the build server: {error}")
+        } else {
+            error.to_string()
+        };
+        io::Error::other(format!(
+            "locked {manager} install using {lockfile} failed in {}: {detail}",
+            workspace.display()
+        ))
+    })
+}
+
+/// Let the job bind any port, including 443, on its own loopback.
+///
+/// The job sees only its own loopback and, when opted in, a firewalled veth.
+/// Binding low ports cannot claim a host port, so the low-port restriction
+/// protects nothing on the host; Docker sets the same value for containers.
+/// It is set from the host while the unit's main process still waits
+/// on the start gate, entering only that process's network namespace, so the
+/// host keeps its own setting and the job gains no capability. A systemd `+`
+/// pre-step cannot do this: under RootDirectory it runs in the sandbox root
+/// without the unit's mount namespace, where /proc is an empty directory.
+fn allow_low_ports(id: Uuid) -> io::Result<()> {
+    let output = Command::new("/usr/bin/sudo")
+        .args([
+            "-n",
+            "/usr/bin/systemctl",
+            "show",
+            "--property=MainPID",
+            "--value",
+            &unit(id),
+        ])
+        .output()?;
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| io::Error::other("job unit has no main process"))?;
+    let status = Command::new("/usr/bin/sudo")
+        .args([
+            "-n",
+            "/usr/bin/nsenter",
+            "--target",
+            &pid.to_string(),
+            "--net",
+            "/usr/sbin/sysctl",
+            "-q",
+            "-w",
+            "net.ipv4.ip_unprivileged_port_start=0",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "cannot allow low ports in the job's network namespace: {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn unit(id: Uuid) -> String {
+    crate::backend::host_unit_name(id)
+}
+
+pub(crate) fn unit_alive(id: Uuid) -> io::Result<bool> {
+    crate::systemd::alive(&unit(id), systemctl)
+}
+
+fn systemctl(args: &[&str]) -> io::Result<std::process::Output> {
+    Command::new("/usr/bin/sudo")
+        .args(["-n", "/usr/bin/systemctl"])
+        .args(args)
+        .output()
+}
+
+pub(crate) fn signal(id: Uuid, hard: bool) {
+    // Stop marks a unit as stopping as well as killing its entire cgroup. It
+    // also cancels a pending start; unlike kill(pid), it crosses the UID boundary.
+    if let Err(error) = crate::systemd::signal(&unit(id), hard, systemctl) {
+        tracing::error!(%id, %error, "could not stop isolated job cgroup");
+    }
+}
+
+/// Stop a sandbox that never started and unload its unit. Job units stay loaded
+/// after failing, so the runner can read why a started job died, but only the
+/// finish path unloads them. A sandbox refused before start never reaches that
+/// path, so without this its failed unit would stay loaded indefinitely.
+fn discard_unstarted(id: Uuid) {
+    signal(id, true);
+    // The stop is asynchronous. Wait, bounded, for the unit to settle, so that
+    // reset-failed acts on its final state rather than on a unit still stopping.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unit_alive(id).unwrap_or(false) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match systemctl(&["reset-failed", &unit(id)]) {
+        // A unit that stopped cleanly, or was never created, is already unloaded.
+        Ok(output) if output.status.success() || is_not_loaded(&output) => {}
+        Ok(output) => tracing::warn!(
+            %id,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "could not unload a sandbox unit that never started"
+        ),
+        Err(error) => {
+            tracing::warn!(%id, %error, "could not unload a sandbox unit that never started")
+        }
+    }
+}
+
+fn is_not_loaded(output: &std::process::Output) -> bool {
+    String::from_utf8_lossy(&output.stderr).contains("not loaded")
+}
+
+// BindPaths is a systemd word list, not a shell command. Escape separators,
+// whitespace, quotes and specifiers so repository paths cannot add mounts.
+fn word(path: &Path) -> io::Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("non-UTF8 mount path"))?;
+    if !Path::new(path).is_absolute() {
+        return Err(io::Error::other("non-absolute mount path"));
+    }
+    let mut result = String::new();
+    for byte in path.bytes() {
+        match byte {
+            b'%' => result.push_str("%%"),
+            b'/' | b'.' | b'_' | b'-' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                result.push(byte as char)
+            }
+            _ => result.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    Ok(result)
+}
+
+fn bind(source: &Path, destination: &Path) -> io::Result<String> {
+    Ok(format!("{}:{}", word(source)?, word(destination)?))
+}
+
+fn grant(path: &Path) -> io::Result<()> {
+    // Grant the job account access without following symlinks. Remove default
+    // ACLs so new private files keep the job's normal umask-derived permissions;
+    // restore daemon access only after the job has stopped.
+    let acl = format!("u:{USER}:rwX");
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-k", "-m", &acl, "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "job target is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    let uid = Command::new("/usr/bin/id").args(["-u", USER]).output()?;
+    if !uid.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot resolve job account for target {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&uid.stderr)
+        )));
+    }
+    let uid = String::from_utf8_lossy(&uid.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| io::Error::other(format!("invalid job account UID for {}", path.display())))?;
+    let marker = state.join("job-targets").join(format!(
+        "{:x}",
+        sha2::Sha256::digest(path.as_os_str().as_bytes())
+    ));
+    let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+    // Record the target's device and inode only after recursive ownership and
+    // mode repair succeeds. A match skips later tree walks, while a replaced
+    // directory gets repaired even when it occupies the same path.
+    if metadata.uid() == uid
+        && fs::read_to_string(&marker).ok().as_deref() == Some(identity.as_str())
+    {
+        return Ok(());
+    }
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "/usr/bin/chown",
+                "-R",
+                "-P",
+                "motor-job:motor-job",
+                "--",
+            ])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
+            .arg(path),
+    )?;
+    fs::create_dir_all(marker.parent().unwrap())?;
+    fs::write(marker, identity)?;
+    Ok(())
+}
+
+fn create_sandbox_root(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "sandbox root is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn set_sandbox_directory_owner_mode(path: &Path, owner: &str, mode: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "sandbox mount ancestor is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chown", owner, "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-b", "-k", "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", mode, "--"])
+            .arg(path),
+    )
+}
+
+fn prepare_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<()> {
+    if !destination.is_absolute() {
+        return Err(io::Error::other(format!(
+            "sandbox mount destination is not absolute: {}",
+            destination.display()
+        )));
+    }
+    let components = destination
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name.to_os_string())),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                Some(Err(io::Error::other(format!(
+                    "unsafe sandbox mount destination: {}",
+                    destination.display()
+                ))))
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut current = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::other(format!(
+                    "sandbox mount ancestor is not a physical directory: {}",
+                    current.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn secure_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<()> {
+    let components = destination
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name.to_os_string())),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                Some(Err(io::Error::other(format!(
+                    "unsafe sandbox mount destination: {}",
+                    destination.display()
+                ))))
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut current = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component);
+        set_sandbox_directory_owner_mode(&current, "root:root", "0755")?;
+    }
+    Ok(())
+}
+
+fn prepare_private_tmp(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    set_sandbox_directory_owner_mode(path, "root:root", "1777")
+}
+
+fn prepare_job_home(path: &Path) -> io::Result<()> {
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "/usr/bin/chown",
+                "-R",
+                "-P",
+                "motor-job:motor-job",
+                "--",
+            ])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "0700", "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn prepare_job_checkout_root(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "job checkout is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chown", "motor-job:motor-job", "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "0755", "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::test_cleanup::record_checkout_work("restore_runner_checkout_root", path);
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "runner checkout is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    });
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chown", &owner, "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "0755", "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
+    let _access = crate::tree_access::lock(path);
+    // ACLs alone cannot override sticky-directory unlink rules. Once the job's
+    // cgroup is gone, reclaim the entire private tree (including nested sticky
+    // directories and root-owned mount ancestors), without following symlinks.
+    restore_runner_access(path)?;
+    let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    });
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chown", "-R", "-P", &owner, "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
+    let _access = crate::tree_access::lock(path);
+    #[cfg(test)]
+    crate::test_cleanup::record_checkout_work("restore_runner_access", path);
+    // Rust/Cargo create some cache files with mode 0600 and directories with
+    // mode 0700. Those modes mask even an inherited named ACL. Once the prior
+    // job has stopped, the trusted preparer must restore access before Git
+    // cleanup or a reflink clone; it never follows job-created symlinks.
+    let acl = format!("u:{}:rwX", unsafe { libc::geteuid() });
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-m", &acl, "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn prepare_writer_tree(path: &Path, account: WriterAccount) -> io::Result<()> {
+    let _access = crate::tree_access::lock(path);
+    #[cfg(test)]
+    crate::test_cleanup::record_checkout_work("prepare_writer_tree", path);
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "/usr/bin/chown",
+                "-R",
+                "-P",
+                &writer_cache_owner(account),
+                "--",
+            ])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
+            .arg(path),
+    )?;
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
+            .arg(path),
+    )?;
+    Ok(())
+}
+
+pub(crate) struct Sandbox {
+    id: Uuid,
+    root: PathBuf,
+    home: PathBuf,
+    cargo: PathBuf,
+    rustup: PathBuf,
+    path: String,
+    read_only: Vec<String>,
+    read_write: Vec<String>,
+    pub(crate) wrapper: Option<PathBuf>,
+    runtime: std::sync::Arc<RuntimeDir>,
+    /// Keep a failed unit loaded after it exits, so the engine can read its
+    /// Result (for example oom-kill) before resetting it. Only the engine sets
+    /// this, because only the engine's finish path resets the unit again; any
+    /// other caller lets systemd unload the unit as soon as it exits.
+    retain_failed: bool,
+    #[cfg(test)]
+    parent_umask: u32,
+    #[cfg(test)]
+    memory_floor_gib: Option<u64>,
+    // Operator fixtures reuse the production mount layout with the writer identity.
+    user: &'static str,
+    writer: bool,
+    network: bool,
+}
+
+pub(crate) struct RuntimeDir(
+    PathBuf,
+    std::sync::OnceLock<crate::cleanup::BackgroundDelete>,
+);
+pub(crate) fn recovered_runtime(state: &Path, id: Uuid) -> RuntimeDir {
+    RuntimeDir(
+        state.join("sandboxes").join(id.to_string()),
+        std::sync::OnceLock::new(),
+    )
+}
+impl RuntimeDir {
+    pub(crate) fn tracking(self, count: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.track(count);
+        self
+    }
+    fn track(&self, count: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        assert!(self
+            .1
+            .set(crate::cleanup::BackgroundDelete::new(count))
+            .is_ok());
+    }
+}
+impl Drop for RuntimeDir {
+    fn drop(&mut self) {
+        let _access = crate::tree_access::lock(&self.0);
+        // A job can create mode-0700 temporary directories. Reclaim its private
+        // home/tmp only after the last launch handle (and its cgroup) is gone.
+        // Disk-pressure eviction may already have removed a dead job's tree
+        // while this handle waited for the tree lock; nothing is left to do.
+        if !self.0.exists() {
+            return;
+        }
+        if let Err(error) = reclaim_runtime(&self.0) {
+            tracing::warn!(%error, path = %self.0.display(), "could not reclaim private job directory ownership");
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            tracing::warn!(%error, path = %self.0.display(), "could not remove private job home");
+        }
+    }
+}
+
+/// Populate sources as the trusted daemon, never as the cache-writing account.
+/// Writer inputs are its mirror-materialized tip, not the requesting branch.
+fn prefetch_cargo_dependencies(
+    writer: bool,
+    state: &Path,
+    workspace: &Path,
+    dependency_routes: &BTreeMap<String, PathBuf>,
+    cargo: &Path,
+    rustup: &Path,
+) -> io::Result<()> {
+    if workspace.join("Cargo.toml").is_file() {
+        let stage = if writer {
+            "fetch integration-tip dependencies"
+        } else {
+            "fetch job dependencies"
+        };
+        checked(
+            workspace::dependencies::fetch_command(
+                state,
+                workspace,
+                dependency_routes,
+                cargo,
+                rustup,
+            )?
+            .env("CARGO_NET_OFFLINE", "false"),
+        )
+        .map_err(|error| io::Error::other(format!("{stage}: {error}")))?;
+    }
+    Ok(())
+}
+
+impl Sandbox {
+    pub(crate) fn tracking_cleanup(
+        self,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.runtime.track(count);
+        self
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    pub(crate) fn prepare(
+        id: Uuid,
+        state: &Path,
+        workspace: &Path,
+        target: &Path,
+        siblings: &[SiblingSnapshot],
+        wrapper: Option<&Path>,
+        slots: &Path,
+        limit: u32,
+    ) -> io::Result<Self> {
+        // An earlier isolation test may leave this checkout root owned by the
+        // job account. Restore daemon access and root ownership before Git uses
+        // the workspace for the next fixture.
+        if fs::symlink_metadata(workspace)?.uid() != unsafe { libc::geteuid() } {
+            restore_runner_access(workspace)?;
+            restore_runner_checkout_root(workspace)?;
+        }
+        checked(Command::new("git").args(["init", "-q"]).arg(workspace))?;
+        checked(Command::new("git").arg("-C").arg(workspace).args([
+            "add",
+            "-f",
+            "--",
+            ".",
+            ":(exclude)target",
+            ":(exclude)**/node_modules/**",
+        ]))?;
+        let tree = workspace::git(workspace, &["write-tree"])?;
+        Self::prepare_with_dependencies(
+            id,
+            state,
+            workspace,
+            target,
+            siblings,
+            wrapper,
+            slots,
+            limit,
+            &std::collections::BTreeMap::new(),
+            &tree,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_with_dependencies(
+        id: Uuid,
+        state: &Path,
+        workspace: &Path,
+        target: &Path,
+        siblings: &[SiblingSnapshot],
+        wrapper: Option<&Path>,
+        slots: &Path,
+        limit: u32,
+        dependency_routes: &std::collections::BTreeMap<String, PathBuf>,
+        tree: &str,
+    ) -> io::Result<Self> {
+        Self::prepare_role(
+            id,
+            state,
+            workspace,
+            target,
+            siblings,
+            wrapper,
+            slots,
+            limit,
+            dependency_routes,
+            tree,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_writer(
+        id: Uuid,
+        state: &Path,
+        workspace: &Path,
+        target: &Path,
+        wrapper: Option<&Path>,
+        slots: &Path,
+        limit: u32,
+        dependency_routes: &BTreeMap<String, PathBuf>,
+        tree: &str,
+    ) -> io::Result<Self> {
+        Self::prepare_role(
+            id,
+            state,
+            workspace,
+            target,
+            &[],
+            wrapper,
+            slots,
+            limit,
+            dependency_routes,
+            tree,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_role(
+        id: Uuid,
+        state: &Path,
+        workspace: &Path,
+        target: &Path,
+        siblings: &[SiblingSnapshot],
+        wrapper: Option<&Path>,
+        slots: &Path,
+        limit: u32,
+        dependency_routes: &BTreeMap<String, PathBuf>,
+        tree: &str,
+        writer: bool,
+    ) -> io::Result<Self> {
+        let declared_hosts = hosts::from_tree(workspace, tree)?;
+        validate_account()?;
+        let writer_account = if writer {
+            Some(validate_writer_account()?)
+        } else {
+            None
+        };
+        // Fetch from a neutral directory: Cargo does not load an uploaded
+        // .cargo/config.toml (credential providers/rustc wrappers can execute
+        // programs). No build.rs or test runs in this trusted preparation step.
+        if workspace.join("Cargo.toml").is_file() {
+            // Read-only default ACLs on the shared Cargo registry and Git cache
+            // make newly fetched files readable to jobs without rescanning the
+            // cache after every trusted dependency fetch.
+            let cargo = PathBuf::from(
+                std::env::var_os("CARGO_HOME")
+                    .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+            );
+            let rustup = PathBuf::from(
+                std::env::var_os("RUSTUP_HOME")
+                    .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
+            );
+            prefetch_cargo_dependencies(
+                writer,
+                state,
+                workspace,
+                dependency_routes,
+                &cargo,
+                &rustup,
+            )?;
+        }
+        // Offline jobs have no route to package registries. Resolve only from
+        // a checked-in lockfile while still trusted, and never run package
+        // lifecycle scripts as the daemon.
+        if !writer {
+            prepare_javascript_dependencies(state, workspace, tree)?;
+        }
+        // Each checkout's Git metadata is read-only inside the job. Dissociate
+        // it first so Git needs neither a mirror mount nor the daemon's home.
+        for path in std::iter::once(workspace.to_path_buf())
+            .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
+        {
+            if path.join(".git/objects/info/alternates").is_file() {
+                workspace::git(&path, &["repack", "-a", "-d"])?;
+                fs::remove_file(path.join(".git/objects/info/alternates"))?;
+            }
+        }
+        // Each job gets a private root tree so its visible mount ancestors can
+        // stay root-owned even when the host checkout lives under an operator's
+        // writable home directory.
+        let runtime = std::sync::Arc::new(RuntimeDir(
+            state.join("sandboxes").join(id.to_string()),
+            std::sync::OnceLock::new(),
+        ));
+        let root = runtime.0.join("root");
+        create_sandbox_root(&root)?;
+        let host_home = runtime.0.join("home");
+        let tmp = runtime.0.join("tmp");
+        prepare_private_tmp(&tmp)?;
+        let home = PathBuf::from("/motor-home");
+        // Only existing output inodes are writable, never the directory. A job
+        // must not replace a log with a symlink that the trusted reader follows.
+        let output = runtime.0.join("output");
+        fs::create_dir_all(&output)?;
+        for name in ["stdout", "stderr", "exit", "cache-stats"] {
+            let file = output.join(name);
+            fs::write(&file, "")?;
+            grant(&file)?;
+        }
+        set_sandbox_directory_owner_mode(&output, "root:root", "0755")?;
+        // Supply only the default names and validated repository loopback
+        // aliases: the job root has no resolver or host /etc/hosts to inherit.
+        let hosts = runtime.0.join("hosts");
+        fs::write(&hosts, format!("{JOB_HOSTS}{}", declared_hosts.concat()))?;
+        let cargo = home.join("cargo");
+        let rust = workspace.join("Cargo.toml").is_file();
+        let mut mount_destinations = vec![
+            workspace.to_path_buf(),
+            target.to_path_buf(),
+            home.clone(),
+            PathBuf::from("/tmp"),
+        ];
+        fs::create_dir_all(host_home.join("tmp"))?;
+        fs::create_dir_all(host_home.join("cargo/registry"))?;
+        fs::create_dir_all(host_home.join("cargo/git"))?;
+        for path in std::iter::once(workspace.to_path_buf())
+            .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
+        {
+            // Git's ownership check is still enabled; grant only the declared
+            // immutable repositories, not a wildcard exception for the host.
+            checked(
+                Command::new("git")
+                    .args(["config", "--file"])
+                    .arg(host_home.join(".gitconfig"))
+                    .args(["--add", "safe.directory"])
+                    .arg(path),
+            )?;
+        }
+        prepare_job_home(&host_home)?;
+        let shared_cargo = PathBuf::from(
+            std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+        );
+        let rustup = PathBuf::from(
+            std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
+        );
+        let mut read_only = Vec::new();
+        for path in [
+            "/usr",
+            "/bin",
+            "/lib",
+            "/lib64",
+            "/etc/ld.so.cache",
+            "/etc/passwd",
+            "/etc/group",
+            "/etc/nsswitch.conf",
+            "/etc/alternatives",
+            "/etc/ssl/certs",
+            // OpenSSL's default config, /usr/lib/ssl/openssl.cnf, is a symlink
+            // to this file; without it TLS clients and the openssl CLI fail.
+            "/etc/ssl/openssl.cnf",
+        ] {
+            if Path::new(path).exists() {
+                read_only.push(word(Path::new(path))?);
+                mount_destinations.push(PathBuf::from(path));
+            }
+        }
+        read_only.push(word(&rustup)?);
+        mount_destinations.push(rustup.clone());
+        let cargo_bin = shared_cargo.join("bin");
+        read_only.push(word(&cargo_bin)?);
+        mount_destinations.push(cargo_bin);
+        let mut path = format!(
+            "{}:/usr/local/bin:/usr/bin:/bin",
+            shared_cargo.join("bin").display()
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            let bun = PathBuf::from(home).join(".bun/bin");
+            if bun.is_dir() {
+                read_only.push(word(&bun)?);
+                mount_destinations.push(bun.clone());
+                path = format!("{}:{path}", bun.display());
+            }
+        }
+        // The shared source/index trees are immutable. Cargo's locks and cache
+        // bookkeeping live in the job's private CARGO_HOME, not the shared one.
+        for name in ["registry", "git"] {
+            let source = shared_cargo.join(name);
+            if source.is_dir() {
+                let destination = cargo.join(name);
+                read_only.push(bind(&source, &destination)?);
+                mount_destinations.push(destination);
+            }
+        }
+        let mut read_write = vec![
+            word(workspace)?,
+            word(target)?,
+            bind(&host_home, &home)?,
+            bind(&tmp, Path::new("/tmp"))?,
+        ];
+        if rust {
+            if writer {
+                fs::create_dir_all(workspace.join("target"))?;
+                read_write.push(bind(target, &workspace.join("target"))?);
+                mount_destinations.push(workspace.join("target"));
+            }
+            read_write.push(bind(target, Path::new(crate::compile_cache::TARGET))?);
+            mount_destinations.push(PathBuf::from(crate::compile_cache::TARGET));
+            // Eviction may remove this root between setup and unit launch. An
+            // optional bind lets the job start and compile misses locally.
+            let cache = state.join("sccache/fleet");
+            if writer {
+                read_write.push(bind(&cache, Path::new(crate::compile_cache::CACHE))?);
+            } else {
+                read_only.push(format!(
+                    "-{}",
+                    bind(&cache, Path::new(crate::compile_cache::CACHE))?
+                ));
+            }
+            mount_destinations.push(PathBuf::from(crate::compile_cache::CACHE));
+        }
+        read_only.push(bind(&hosts, Path::new("/etc/hosts"))?);
+        mount_destinations.push(PathBuf::from("/etc/hosts"));
+        read_only.push(bind(&output, Path::new("/motor-output"))?);
+        mount_destinations.push(PathBuf::from("/motor-output"));
+        for name in ["stdout", "stderr", "exit", "cache-stats"] {
+            let destination = Path::new("/motor-output").join(name);
+            read_write.push(bind(&output.join(name), &destination)?);
+            mount_destinations.push(destination);
+        }
+        if workspace.join(".git").is_dir() {
+            let git = workspace.join(".git");
+            read_only.push(word(&git)?);
+            mount_destinations.push(git);
+        }
+        for sibling in siblings {
+            let path = Path::new(&sibling.canonical_path);
+            read_only.push(word(path)?);
+            mount_destinations.push(path.to_path_buf());
+            let alias = workspace
+                .parent()
+                .ok_or_else(|| io::Error::other("workspace parent"))?
+                .join(
+                    path.file_name()
+                        .ok_or_else(|| io::Error::other("sibling name"))?,
+                );
+            if alias != path {
+                read_only.push(bind(path, &alias)?);
+                mount_destinations.push(alias);
+            }
+        }
+        let tools = runtime.0.join("tools");
+        if rust || wrapper.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(&tools)?;
+            fs::set_permissions(&tools, fs::Permissions::from_mode(0o755))?;
+            if rust {
+                let cache_wrapper = tools.join("sccache");
+                fs::copy(
+                    prepare_cache_readiness_probe(state)?,
+                    tools.join("sccache.ready"),
+                )?;
+                fs::set_permissions(
+                    tools.join("sccache.ready"),
+                    fs::Permissions::from_mode(0o755),
+                )?;
+                fs::write(&cache_wrapper, include_str!("sccache-wrapper.sh"))?;
+                fs::set_permissions(&cache_wrapper, fs::Permissions::from_mode(0o755))?;
+                fs::write(
+                    cache_wrapper.with_extension("backend"),
+                    shared_cargo
+                        .join("bin/sccache")
+                        .to_string_lossy()
+                        .as_bytes(),
+                )?;
+                fs::set_permissions(
+                    cache_wrapper.with_extension("backend"),
+                    fs::Permissions::from_mode(0o644),
+                )?;
+                path = format!("/motor-tools:{path}");
+                if writer {
+                    fs::write(
+                        tools.join("writer-preflight.py"),
+                        crate::writer::fill::PREFLIGHT,
+                    )?;
+                    fs::set_permissions(
+                        tools.join("writer-preflight.py"),
+                        fs::Permissions::from_mode(0o644),
+                    )?;
+                }
+            }
+            read_only.push(bind(&tools, Path::new("/motor-tools"))?);
+            mount_destinations.push(PathBuf::from("/motor-tools"));
+        }
+        // Copy the supervisor into the read-only tool mount. Bind only existing
+        // slot locks read-write so jobs can acquire slots but cannot replace
+        // locks or change the shared slot limit.
+        let wrapper = if let Some(wrapper) = wrapper {
+            let copy = tools.join("prefrontal-build-slot");
+            fs::copy(wrapper, &copy)?;
+            fs::write(copy.with_extension("root"), "/motor-slots")?;
+            fs::write(
+                copy.with_extension("cache"),
+                if rust {
+                    PathBuf::from("/motor-tools/sccache")
+                } else {
+                    PathBuf::new()
+                }
+                .to_string_lossy()
+                .as_bytes(),
+            )?;
+            read_only.push(bind(slots, Path::new("/motor-slots"))?);
+            mount_destinations.push(PathBuf::from("/motor-slots"));
+            for name in std::iter::once("queue.lock".to_string())
+                .chain((0..limit).map(|i| format!("{i}.lock")))
+            {
+                let path = slots.join(&name);
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)?;
+                grant(&path)?;
+                if writer {
+                    checked(
+                        Command::new("/usr/bin/sudo")
+                            .args([
+                                "-n",
+                                "/usr/bin/setfacl",
+                                "-m",
+                                &format!("u:{WRITER_USER}:rw"),
+                                "--",
+                            ])
+                            .arg(&path),
+                    )?;
+                }
+                let slot_destination = Path::new("/motor-slots").join(name);
+                read_write.push(bind(&path, &slot_destination)?);
+                mount_destinations.push(slot_destination);
+            }
+            Some(PathBuf::from("/motor-tools/prefrontal-build-slot"))
+        } else {
+            None
+        };
+        // Build the full destination tree before root owns it; the trusted
+        // daemon cannot create deeper mount ancestors after changing a parent.
+        for destination in &mount_destinations {
+            prepare_root_owned_mount_ancestors(&root, destination)?;
+        }
+        set_sandbox_directory_owner_mode(&root, "root:root", "0755")?;
+        for destination in &mount_destinations {
+            secure_root_owned_mount_ancestors(&root, destination)?;
+        }
+        grant(workspace)?;
+        prepare_job_checkout_root(workspace)?;
+        grant(&tmp)?;
+        prepare_job_writable_target(state, target)
+            .map_err(|error| io::Error::other(format!("prepare job target: {error}")))?;
+        if !target.starts_with(workspace) {
+            grant(target)?;
+        }
+        if let Some(account) = writer_account {
+            for private in [workspace, target, &host_home, &tmp] {
+                prepare_writer_tree(private, account)?;
+            }
+            for name in ["stdout", "stderr", "exit", "cache-stats"] {
+                checked(
+                    Command::new("/usr/bin/sudo")
+                        .args([
+                            "-n",
+                            "/usr/bin/setfacl",
+                            "-m",
+                            &format!("u:{WRITER_USER}:rw"),
+                            "--",
+                        ])
+                        .arg(output.join(name)),
+                )?;
+            }
+        }
+        Ok(Self {
+            // Caller job IDs can be reused in a different runner instance.
+            // The system-manager namespace is machine-wide, so never let a
+            // duplicate request select (or cancel) another instance's unit.
+            id: Uuid::now_v7(),
+            root,
+            home,
+            cargo,
+            rustup,
+            path,
+            read_only,
+            read_write,
+            wrapper,
+            runtime,
+            retain_failed: false,
+            #[cfg(test)]
+            parent_umask: 0o022,
+            #[cfg(test)]
+            memory_floor_gib: None,
+            user: if writer { WRITER_USER } else { USER },
+            writer,
+            network: false,
+        })
+    }
+
+    /// See [`Sandbox::retain_failed`].
+    pub(crate) fn retaining_failed_units(mut self) -> Self {
+        self.retain_failed = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_memory_floor_gib(mut self, floor_gib: Option<u64>) -> Self {
+        self.memory_floor_gib = floor_gib;
+        self
+    }
+
+    pub(crate) fn with_network(mut self) -> io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let resolver = self.runtime.0.join("resolv.conf");
+        fs::write(&resolver, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n")?;
+        fs::set_permissions(&resolver, fs::Permissions::from_mode(0o444))?;
+        grant(&resolver)?;
+        self.read_only
+            .push(bind(&resolver, Path::new("/etc/resolv.conf"))?);
+        self.network = true;
+        Ok(self)
+    }
+
+    fn command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        durable: bool,
+        cpus: &[u32],
+    ) -> io::Result<Command> {
+        let user = self.user;
+        let mut cmd = Command::new("/usr/bin/sudo");
+        let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR");
+        // Output is a read-only directory with fixed writable file bind mounts,
+        // so an exit file cannot be created or replaced by rename here. A normal
+        // exit completes this write; if the shell is killed mid-write, the failed
+        // unit retains its status for the engine's systemd fallback to read.
+        let shell = if durable && self.writer {
+            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; if test \"$code\" = 0; then /bin/bash -c \"$1\" </dev/null >>/motor-output/stdout 2>>/motor-output/stderr; code=$?; fi; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>>/motor-output/stderr || true; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+        } else if durable && cached {
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+        } else if durable {
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+        } else if self.writer {
+            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py || exit $?; exec /bin/bash -c \"$1\" </dev/null"
+        } else {
+            "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
+        };
+        cmd.args([
+            "-n",
+            "/usr/bin/systemd-run",
+            "--wait",
+            "--service-type=exec",
+            // The job command is shell source, not systemd command-line syntax.
+            // Leave dollar expansion to Bash inside the job's environment.
+            "--expand-environment=no",
+        ])
+        .arg(format!("--unit={}", unit(self.id)));
+        if durable {
+            // Inheriting --pipe stderr would let a job forge launcher accounting
+            // through its parent's descriptors. Only stdin crosses the boundary.
+            for (property, mode, path) in [
+                ("StandardInput", "file", self.runtime.0.join("gate")),
+                (
+                    "StandardOutput",
+                    "append",
+                    self.runtime.0.join("output/stdout"),
+                ),
+                (
+                    "StandardError",
+                    "append",
+                    self.runtime.0.join("output/stderr"),
+                ),
+            ] {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("non-UTF-8 sandbox stream path"))?;
+                cmd.arg(format!("--property={property}={mode}:{path}"));
+            }
+        } else {
+            cmd.args(["--quiet", "--pipe"]);
+        }
+        if self.retain_failed {
+            cmd.arg("--property=CollectMode=inactive");
+        } else {
+            cmd.arg("--collect");
+        }
+        if !cpus.is_empty() {
+            cmd.arg(format!(
+                "--property=AllowedCPUs={}",
+                crate::cpu::format_list(cpus)
+            ));
+            #[cfg(test)]
+            let memory_max = crate::backend::memory_max(cpus.len() as u32, self.memory_floor_gib);
+            #[cfg(not(test))]
+            let memory_max = crate::backend::memory_max(cpus.len() as u32);
+            cmd.arg(format!("--property=MemoryMax={memory_max}"));
+        }
+        cmd.arg(format!("--property=User={user}"))
+            .arg(format!("--property=Group={user}"));
+        for property in [
+            "NoNewPrivileges=yes",
+            "CapabilityBoundingSet=",
+            "ProtectSystem=strict",
+            "ProtectHome=tmpfs",
+            "PrivateTmp=yes",
+            "PrivateDevices=yes",
+            "PrivatePIDs=yes",
+            "PrivateNetwork=yes",
+            "ProtectProc=invisible",
+            "IgnoreSIGPIPE=no",
+            // RestrictSUIDSGID is deliberately off. Its seccomp filter cannot
+            // inspect openat2's arguments, so it fails every openat2 with ENOSYS,
+            // and GNU tar 1.35 extracts through openat2 without falling back.
+            // Set-id bits a job writes gain nothing: every job runs under
+            // NoNewPrivileges as the one job account, and nothing outside a job
+            // executes job-written files.
+            "RestrictNamespaces=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "MountAPIVFS=yes",
+            "KillMode=control-group",
+            "TimeoutStopSec=2s",
+            "SendSIGKILL=yes",
+        ] {
+            cmd.arg(format!("--property={property}"));
+        }
+        #[cfg(test)]
+        let parent_umask = self.parent_umask;
+        #[cfg(not(test))]
+        let parent_umask = 0o022;
+        cmd.arg(format!("--property=UMask={parent_umask:04o}"));
+        for (key, value) in [
+            ("RootDirectory", word(&self.root)?),
+            ("WorkingDirectory", word(cwd)?),
+            ("BindReadOnlyPaths", self.read_only.join(" ")),
+            ("BindPaths", self.read_write.join(" ")),
+        ] {
+            cmd.arg(format!("--property={key}={value}"));
+        }
+        let mut env: BTreeMap<_, _> = env.iter().cloned().collect();
+        let tmp = self.home.join("tmp").to_string_lossy().into_owned();
+        for (key, value) in [
+            ("HOME", self.home.to_string_lossy().into_owned()),
+            ("CARGO_HOME", self.cargo.to_string_lossy().into_owned()),
+            ("RUSTUP_HOME", self.rustup.to_string_lossy().into_owned()),
+            ("CARGO_NET_OFFLINE", "true".into()),
+            ("USER", user.into()),
+            ("LOGNAME", user.into()),
+            ("SHELL", "/bin/bash".into()),
+            // Override inherited/caller paths even if a client bypasses the
+            // engine's allowlist. All temp-directory conventions use job scratch.
+            ("TMPDIR", tmp.clone()),
+            ("TMP", tmp.clone()),
+            ("TEMP", tmp),
+            ("PATH", self.path.clone()),
+        ] {
+            env.insert(key.into(), value);
+        }
+        for (key, value) in env {
+            cmd.arg(format!("--setenv={key}={value}"));
+        }
+        // Hold the service at this stdin gate until the durable job record is
+        // written; EOF on daemon crash exits without running the command. The
+        // one-byte release switches the command's stdin to /dev/null so the
+        // still-open gate writer cannot block ordinary input reads.
+        // Cancellation cannot precede creation of an untracked privileged job.
+        cmd.args(["/bin/bash", "-c", shell, user, command]);
+        Ok(cmd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+    ) -> io::Result<platform::Launch> {
+        self.launch_inner(command, cwd, env, false, &[])
+    }
+    pub(crate) fn launch_durable(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        cpus: &[u32],
+    ) -> io::Result<platform::Launch> {
+        self.launch_inner(command, cwd, env, true, cpus)
+    }
+    fn launch_inner(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        durable: bool,
+        cpus: &[u32],
+    ) -> io::Result<platform::Launch> {
+        #[cfg(test)]
+        crate::test_cleanup::record_unit(self.id, cwd);
+        #[cfg(test)]
+        let test_guard = crate::test_cleanup::LaunchGuard(platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(self.id),
+        });
+        let gate = if durable {
+            use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+            let path = self.runtime.0.join("gate");
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Opening both ends avoids blocking systemd's pre-exec FIFO open.
+            // The manager opens stdin before chroot/User=; jobs cannot reopen
+            // this daemon-owned FIFO for writing.
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)?,
+            )
+        } else {
+            None
+        };
+        let mut child = self
+            .command(command, cwd, env, durable, cpus)?
+            .env_clear()
+            .stdin(if durable {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let started = Instant::now();
+        loop {
+            let active = Command::new("/usr/bin/sudo")
+                .args([
+                    "-n",
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "--quiet",
+                    &unit(self.id),
+                ])
+                .status()?;
+            if active.success() {
+                break;
+            }
+            if child.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(15) {
+                discard_unstarted(self.id);
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                return Err(io::Error::other(format!(
+                    "sandbox did not start: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let active_at = Instant::now();
+        if let Err(error) = allow_low_ports(self.id) {
+            discard_unstarted(self.id);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!("sandbox did not start: {error}")));
+        }
+        if self.network {
+            if let Err(error) = crate::network::linux::attach(self.id) {
+                discard_unstarted(self.id);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::other(format!(
+                    "sandbox network setup failed: {error}"
+                )));
+            }
+            tracing::info!(job_id = %self.id, elapsed_us = active_at.elapsed().as_micros(), "network active-to-attach finished");
+            #[cfg(test)]
+            if std::env::var_os("MOTOR_NET_MEASURE_ATTACH").is_some() {
+                println!("MOTOR_NET_ATTACH_US {}", active_at.elapsed().as_micros());
+            }
+        }
+        let mut identity = platform::identity(child.id() as i32)
+            .ok_or_else(|| io::Error::other("sandbox client vanished"))?;
+        identity.unit = Some(self.id);
+        Ok(platform::Launch {
+            #[cfg(test)]
+            _test_guard: test_guard,
+            durable_output: durable,
+            identity,
+            stdout: unsafe { File::from_raw_fd(child.stdout.take().unwrap().into_raw_fd()) },
+            stderr: unsafe { File::from_raw_fd(child.stderr.take().unwrap().into_raw_fd()) },
+            gate: gate.unwrap_or_else(|| unsafe {
+                File::from_raw_fd(child.stdin.take().unwrap().into_raw_fd())
+            }),
+            runtime: Some(self.runtime.clone()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+fn prepare_cache_readiness_probe(state: &Path) -> io::Result<PathBuf> {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    let source = include_str!("sccache-ready.rs.in");
+    let digest = format!("{:x}", Sha256::digest(source));
+    let output = state.join(format!("sccache-ready-{digest}"));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(output.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    if !output.is_file() {
+        let source_path = output.with_extension("rs");
+        fs::write(&source_path, source)?;
+        let temporary = output.with_extension(format!("{}.tmp", Uuid::now_v7()));
+        let result = checked(
+            Command::new("rustc")
+                .arg(&source_path)
+                .args(["--edition=2021", "-O", "-o"])
+                .arg(&temporary),
+        );
+        fs::remove_file(source_path)?;
+        result?;
+        fs::rename(temporary, &output)?;
+    }
+    Ok(output)
+}

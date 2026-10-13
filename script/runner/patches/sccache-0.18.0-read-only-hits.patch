@@ -1,0 +1,39 @@
+Upstream: Mozilla sccache 0.18.0, licensed under Apache-2.0.
+This patch modifies its local disk-cache read behavior.
+
+Read-only local caches: serve hits without touching the entry.
+
+sccache 0.18.0's LruDiskCache::get_file refreshes the entry's file times
+(utimensat) before opening it, to keep its LRU order on disk. With
+SCCACHE_LOCAL_RW_MODE=READ_ONLY on a read-only mount, or on entries the
+reader may read but not write, that call fails (EROFS or EACCES), and every
+lookup becomes a cache read error and a miss. In read-only mode, look the
+key up in the in-memory LRU (which still updates its order) and open the
+file read-only. Apply from the crate root with `patch -p1`.
+
+--- a/src/cache/disk.rs
++++ b/src/cache/disk.rs
+@@ -82,9 +82,23 @@
+         let path = make_key_path(key);
+         let lru = self.lru.clone();
+         let key = key.to_owned();
++        let rw_mode = self.rw_mode;
+ 
+         self.pool
+             .spawn_blocking(move || {
++                // LruDiskCache::get refreshes the entry's file times before
++                // opening it. A read-only cache (a read-only mount, or entries
++                // the reader may not write) can't allow that, so look the key
++                // up in the in-memory LRU and open the file read-only.
++                if rw_mode == CacheMode::ReadOnly {
++                    let found = lru.lock().unwrap().get_or_init()?.get_abs_path(&path);
++                    let Some(found) = found else {
++                        trace!("DiskCache::get({}): FileNotInCache", key);
++                        return Ok(Cache::Miss);
++                    };
++                    let hit = CacheRead::from(std::fs::File::open(found)?)?;
++                    return Ok(Cache::Hit(hit));
++                }
+                 let io = match lru.lock().unwrap().get_or_init()?.get(&path) {
+                     Ok(f) => f,
+                     Err(LruError::FileNotInCache) => {

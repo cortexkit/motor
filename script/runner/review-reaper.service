@@ -1,0 +1,19 @@
+[Unit]
+Description=Delete idle review copies under /srv/build/review
+RequiresMountsFor=/srv/build
+
+[Service]
+Type=oneshot
+# Root is required: review copies hold root-owned files from root-only test
+# runs, and only root can read every process's open files to prove a copy unused.
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-review-reaper.py
+RuntimeDirectory=motor-review-reaper
+ProtectSystem=strict
+ReadWritePaths=/srv/build/review
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+# Walking idle Cargo targets is bulk metadata I/O; keep it behind build jobs.
+Nice=19
+IOSchedulingClass=idle

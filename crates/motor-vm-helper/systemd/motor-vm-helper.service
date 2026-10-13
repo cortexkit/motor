@@ -1,0 +1,21 @@
+[Unit]
+Description=Motor microVM privilege and slot-lease helper
+After=local-fs.target
+RequiresMountsFor=/srv/build/vm
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/motor-vm-helper --config /etc/motor-vm-helper.json
+Restart=on-failure
+RestartSec=1
+Delegate=yes
+DelegateSubgroup=helper
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0022
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

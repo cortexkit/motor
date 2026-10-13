@@ -1,0 +1,8 @@
+{
+  "name": "fixture-dep",
+  "version": "1.0.0",
+  "main": "index.js",
+  "bin": {
+    "fixture-tool": "cli.js"
+  }
+}

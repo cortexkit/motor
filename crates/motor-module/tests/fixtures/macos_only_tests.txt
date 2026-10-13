@@ -1,0 +1,11 @@
+# Exact lib-test names, not substring exclusions. These exercise Darwin APIs,
+# Seatbelt, BSD immutable flags, or the /tmp -> /private/tmp alias.
+campaign_driver::factory::tests::known_hosts_materialization_does_not_wait_for_slow_disk_sync
+campaign_driver::local::tests::no_egress_wraps_the_candidate_and_leaves_the_handing_off_harness_unwrapped
+campaign_driver::local::tests::candidate_runner_denies_the_candidate_network_when_handed_the_policy
+campaign_driver::local::tests::a_provision_interrupted_after_the_ownership_hand_over_provisions_again_from_scratch
+campaign_driver::local::tests::a_partial_rig_that_cannot_be_cleared_refuses_with_the_reason
+campaign_driver::local::tests::isolation_probe_accepts_the_real_darwin_user_temp_dir_and_its_private_spelling
+campaign_driver::local::tests::darwin_user_temp_sweep_empties_the_folder_and_keeps_it
+campaign_driver::local::tests::darwin_user_temp_sweep_names_what_it_could_not_remove_and_refuses_foreign_folders
+sidekick::research::tests::sidekick_named_linked_worktree_accepts_tmp_and_private_tmp

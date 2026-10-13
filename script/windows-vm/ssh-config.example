@@ -1,0 +1,20 @@
+# Copy to .cortexkit/windows-vm/ssh-config and replace the placeholder values.
+# Standalone operator config: do not reuse a pre-reload host ControlMaster.
+# ck-motor supplies its own vault-held identity, never this operator private key.
+Host alfonso-runner
+    HostName build-host.example.invalid
+    User operator-user
+    IdentityFile ~/.ssh/operator_key
+    IdentitiesOnly yes
+    ControlMaster no
+    ControlPath none
+
+Host windows-build-vm
+    HostName 127.0.0.1
+    Port 2222
+    User guest-user
+    IdentityFile ~/.ssh/operator_key
+    IdentitiesOnly yes
+    ProxyJump alfonso-runner
+    ControlMaster no
+    ControlPath none

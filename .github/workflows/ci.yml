@@ -1,0 +1,96 @@
+name: Motor CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Host-isolation and root-helper lanes need dedicated trusted infrastructure
+# and privileges; Mac tests need a real Mac. They are not hosted CI lanes.
+# See AGENTS.md for operator build-server and local Mac instructions.
+jobs:
+  linux-ordinary:
+    name: Linux ordinary
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.138
+      # The runner's JavaScript install tests drive real package managers.
+      # Pin the versions the build server runs (script/runner/tools.txt).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+      - name: Tool versions
+        run: |
+          node --version
+          npm --version
+          bun --version
+          pnpm --version
+          rustc --version
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo --version
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo fmt --version
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo nextest --version
+          python3 --version
+      - name: Nothing tracked under .cortexkit/ outside the allowlist
+        run: |
+          tracked=$(git ls-files -ci --exclude-standard -- .cortexkit)
+          if [ -n "$tracked" ]; then echo "$tracked"; exit 1; fi
+      - name: Formatting
+        run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo fmt --all --check
+      - name: All-target workspace check
+        run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo check --workspace --all-targets --locked
+      - name: Clippy
+        run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The ordinary transport test verifies connection reuse against a real
+      # /usr/sbin/sshd. Runner fixtures clone workspaces with FICLONE, which
+      # requires native reflinks: ext4 /tmp is not a valid scratch root.
+      # A sparse XFS image supplies native reflinks; mounting must fail loudly.
+      - name: Prepare SSH fixture and XFS reflink scratch
+        run: |
+          test -x /usr/sbin/sshd || (sudo apt-get update -q && sudo apt-get install -y -q openssh-server)
+          sudo mkdir -p /run/sshd
+          command -v mkfs.xfs >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q xfsprogs)
+          truncate -s 64G "$RUNNER_TEMP/reflink.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/reflink.img"
+          sudo mkdir -p /mnt/reflink
+          sudo mount -o loop "$RUNNER_TEMP/reflink.img" /mnt/reflink
+          sudo chown "$(id -u):$(id -g)" /mnt/reflink
+          echo "TMPDIR=/mnt/reflink" >> "$GITHUB_ENV"
+      # nextest reports how many tests passed. Fail when no tests are selected,
+      # overriding NEXTEST_NO_TESTS even if it is set to allow an empty run.
+      - name: Workspace tests (nonzero passed count)
+        run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo nextest run --workspace --locked --no-tests fail
+      - name: Pinned production client compatibility
+        run: python3 scripts/mixed-version.py
+      - name: Protocol vectors
+        run: python3 crates/motor-protocol/tests/generate_vectors.py --check
+      - name: Motor safety gates and self-tests
+        run: |
+          python3 scripts/test-binary-fold.py
+          python3 scripts/unreachable-modules.py
+          python3 scripts/test-dev-binaries.py
+          python3 scripts/test-scratch.py
+          python3 scripts/subc-daemon-env.py
+          python3 -m unittest -v scripts/tests/test_test_binary_fold.py scripts/tests/test_unreachable_modules.py scripts/tests/test_safety_fences.py

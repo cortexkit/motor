@@ -1,0 +1,40 @@
+//! Standalone, dependency-free readiness probe for the job-local sccache server.
+//! Built only from this embedded trusted source, never a submitted workspace.
+use std::{
+    env,
+    net::{Ipv4Addr, SocketAddr, TcpStream},
+    os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr as UnixAddr, UnixStream},
+    },
+    time::Duration,
+};
+
+fn ready() -> bool {
+    if let Some(socket) = env::var_os("SCCACHE_SERVER_UDS") {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = socket.as_os_str().as_bytes();
+        if let Some(name) = bytes.strip_prefix(b"\\x00") {
+            return UnixAddr::from_abstract_name(name)
+                .ok()
+                .is_some_and(|addr| UnixStream::connect_addr(&addr).is_ok());
+        }
+        return UnixStream::connect(socket).is_ok();
+    }
+    let port = match env::var("SCCACHE_SERVER_PORT") {
+        Ok(port) => match port.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => return false,
+        },
+        Err(_) => 4226,
+    };
+    TcpStream::connect_timeout(
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        Duration::from_millis(250),
+    )
+    .is_ok()
+}
+
+fn main() {
+    std::process::exit(if ready() { 0 } else { 1 });
+}

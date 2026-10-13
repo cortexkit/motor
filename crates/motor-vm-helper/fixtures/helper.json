@@ -1,0 +1,43 @@
+{
+  "allowed_uids": [1000],
+  "socket_gid": 1000,
+  "uid_base": 200000,
+  "job_account_range": { "base": 100000, "count": 65536 },
+  "slots": [
+    {
+      "cpus": "0-7,16-23",
+      "mems": "0",
+      "cpu_max": "1600000 100000",
+      "memory_max": 18253611008,
+      "io_weight": 100,
+      "io_max": null
+    },
+    {
+      "cpus": "8-15,24-31",
+      "mems": "0",
+      "cpu_max": "1600000 100000",
+      "memory_max": 18253611008,
+      "io_weight": 100,
+      "io_max": null
+    }
+  ],
+  "jailer": "/usr/local/libexec/jailer",
+  "firecracker": "/usr/local/libexec/firecracker",
+  "loader": "/usr/local/libexec/motor-vm-loader",
+  "job_snapshot": {
+    "vmstate": "/srv/build/vm/images/job.vmstate",
+    "rootfs": "/srv/build/vm/images/rootfs",
+    "memory": "/srv/build/vm/images/job.memory",
+    "record": "/srv/build/vm/images/job.record.json"
+  },
+  "scan_snapshot": {
+    "vmstate": "/srv/build/vm/images/scan.vmstate",
+    "rootfs": "/srv/build/vm/images/rootfs",
+    "memory": "/srv/build/vm/images/scan.memory",
+    "record": "/srv/build/vm/images/scan.record.json"
+  },
+  "hugepages_per_slot": 8192,
+  "agent_port": 52001,
+  "proxy_port": 52002,
+  "proxy_for_jobs": false
+}

@@ -1,0 +1,16 @@
+{
+  "type": "terminal",
+  "job_id": "0192a64a-1234-7000-8000-000000000001",
+  "outcome": {
+    "type": "exit",
+    "code": 0
+  },
+  "wall_ms": 125,
+  "queue_wait_ms": 25,
+  "bundle_bytes": 29,
+  "ran": "remote",
+  "tree_hash": "3333333333333333333333333333333333333333",
+  "workspace_changes": [
+    "result.txt"
+  ]
+}

@@ -1,0 +1,59 @@
+# Cargo tools to preinstall in the runner's configured shared CARGO_HOME/bin.
+# Offline jobs cannot `cargo install`; list required tools here and install
+# them with install-tools.sh before admitting jobs.
+#
+# One tool per line:
+#   <crate> <version>
+#   <crate> git=<url> rev=<full sha> [default]
+# A git tool is installed once per revision, because repositories pin different
+# revisions and their outputs differ between them. Each binary is reachable as
+# <bin>-<first 8 hex of rev>; the line marked `default` also owns the plain
+# <bin> name. Mark at most one line per crate as default.
+#
+# Optional prerequisites not managed here (OS packages or non-Cargo installs):
+# - wasm-opt: binaryen, for repositories that build WebAssembly.
+# - x86_64-w64-mingw32-gcc/g++: gcc-mingw-w64-x86-64 and g++-mingw-w64-x86-64
+#   with win32 threads, so crates with bundled C code (rusqlite, ring)
+#   can be checked for x86_64-pc-windows-gnu.
+# - sccache 0.18.0, patched: built by script/runner/build-sccache.sh from the
+#   crates.io source plus patches/sccache-0.18.0-read-only-hits.patch. Stock
+#   0.18.0 refreshes an entry's file times before every read, so readers of the
+#   shared compile cache need the patch for read-only mounts. The runner uses
+#   it for isolated read-only readers and the separate motor-cache writer.
+#   It is not in the Cargo list below: cargo install would replace it with stock.
+# - libsqlite3-dev: the system SQLite library and headers, for crates that link
+#   SQLite instead of bundling it on Linux.
+# - hivexregedit: libwin-hivex-perl 1.3.24 (not libhivex-bin, which ships only
+#   hivexsh, hivexget and hivexml). Operator-only: the Windows no-persistence
+#   qualification writes a registry canary into a job overlay's SOFTWARE hive.
+# - Node, pnpm and Bun: preinstall the versions required by repository manifests.
+#   The runner also uses Bun for pre-job bun.lock installs. Verify official
+#   release archives against published SHA-256 sums. Install tools under /usr
+#   so the job sandbox can see them; its root does not bind /opt.
+# - Rust targets: preinstall required targets through rustup for each required
+#   toolchain. Examples include x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu,
+#   x86_64-pc-windows-msvc, aarch64-pc-windows-msvc, wasm32-unknown-unknown,
+#   wasm32-wasip1 and x86_64-unknown-linux-musl (the microVM loader ships as a
+#   static musl binary). Jobs see the rustup home read-only and cannot add targets.
+# - Pinned Rust toolchains, through `rustup toolchain install <version> --profile
+#   minimal --component clippy --component rustfmt`. The same read-only rule
+#   applies: preinstall every toolchain required by a repository's pins.
+cargo-nextest 0.9.138
+# Optional integration tests using NATS require nats-server 2.10 or later,
+# installed on a PATH visible to the test environment.
+wasm-bindgen-cli 0.2.126
+worker-build 0.8.7
+# cortexkit-mutate 0.8.0, 0.9.0, 0.9.1, 0.9.3, 0.9.5, 0.9.8 and 0.12.0;
+# repositories pin these in CK_MUTATE_REV. Before 0.9.5 the tool takes its lock
+# under .git, which is read-only in remote jobs, so only 0.9.5 and later run
+# there. 0.12.0 is the default: it reads a catalogue split into a mutations.d/
+# directory, which 0.9.8 can't read. It still reads a single
+# mutations.toml, but since 0.10.0 it refuses duplicate control ids, even within
+# one file.
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=46cc166b0df2edcfd14b3eb54ed6eeac588fed69
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=0097d269a4c409db13306a11fc2c504057629791
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=c1591d4a76fa3d3a7367237922b0bca5214dbf11
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=73c7e66145e131eadffdd874c82d93548868b668
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
+cortexkit-mutate git=https://github.com/cortexkit/commons rev=be120e9254c4972191b39b2e6814987918206afc default

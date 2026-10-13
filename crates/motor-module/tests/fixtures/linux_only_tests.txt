@@ -1,0 +1,2 @@
+# Network namespace isolation exists only on Linux.
+campaign_driver::local::tests::linux_real_isolation_creates_netns_before_candidate_uid_drop

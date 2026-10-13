@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly sweep of idle review copies under /srv/build/review
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

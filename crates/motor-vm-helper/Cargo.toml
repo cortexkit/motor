@@ -1,0 +1,21 @@
+[package]
+name = "motor-vm-helper"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Root-owned microVM slot leases and Linux privilege boundary"
+
+[features]
+# These gates intentionally fail on a machine lacking their prerequisites.
+linux-root-tests = []
+linux-service-tests = ["linux-root-tests"]
+
+[dependencies]
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+cortexkit-test-support = "=0.1.0"

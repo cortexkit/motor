@@ -1,0 +1,24 @@
+[package]
+name = "motor-vm-loader"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+linux-root-tests = ["linux-sandbox-tests"]
+linux-uffd-tests = []
+linux-sandbox-tests = []
+
+[dependencies]
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "copy"
+harness = false
+
+[dev-dependencies]
+motor-vm-helper = { path = "../motor-vm-helper" }
+cortexkit-test-support = "=0.1.0"

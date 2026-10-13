@@ -1,0 +1,9 @@
+{
+  "type": "refusal",
+  "job_id": "0192a64a-1234-7000-8000-000000000001",
+  "reason": "runner_disk_full",
+  "disk_full": {
+    "free_bytes": 10,
+    "floor_bytes": 20
+  }
+}

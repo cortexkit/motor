@@ -1,0 +1,779 @@
+//! Execution-specific work lives here; scheduling, persistence and transport
+//! remain in the engine. A backend must never fall back to host execution.
+use crate::{
+    engine::Config,
+    platform,
+    storage::*,
+    workspace::{self, Trees},
+};
+use motor_protocol::*;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{self, Read},
+    path::PathBuf,
+    process::ExitStatus,
+    str::FromStr,
+};
+
+pub(crate) fn setup_step<T>(step: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|error| io::Error::other(format!("{step}: {error}")))
+}
+
+/// How this runner instance runs jobs; each instance serves one platform.
+/// Host runs Linux jobs on the build server in a sandboxed systemd unit as the
+/// unprivileged job account. Vm and WindowsVm run each job inside a VM instead,
+/// and WindowsVm also applies the Windows instance's own limits and layout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BackendKind {
+    #[default]
+    Host,
+    Vm,
+    WindowsVm,
+}
+
+impl FromStr for BackendKind {
+    type Err = io::Error;
+
+    fn from_str(value: &str) -> io::Result<Self> {
+        match value {
+            "host" => Ok(Self::Host),
+            "vm" => Ok(Self::Vm),
+            "windows-vm" => Ok(Self::WindowsVm),
+            _ => Err(invalid("unknown backend; expected host, vm or windows-vm")),
+        }
+    }
+}
+
+pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
+    match config.backend {
+        BackendKind::Host => Ok(Box::new(HostBackend)),
+        BackendKind::Vm if config.vm_config.is_none() => {
+            Err(invalid("--backend vm requires --vm-config <file>"))
+        }
+        BackendKind::Vm => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VM backend is not available in this build; use --backend host",
+        )),
+        BackendKind::WindowsVm if config.vm_config.is_none() => {
+            Err(invalid("--backend windows-vm requires --vm-config <file>"))
+        }
+        BackendKind::WindowsVm => Ok(Box::new(crate::windows::WindowsBackend)),
+    }
+}
+
+/// One job's reserved setup, carried to the materialization thread without
+/// holding the engine's state lock.
+pub(crate) struct Setup {
+    pub id: Uuid,
+    pub cpus: Vec<u32>,
+    pub request: Run,
+    pub base: bool,
+    /// Sibling checkout paths mapped to their commits when setup was reserved.
+    /// Checkout compares these with the requested commits before reusing files.
+    pub recorded: BTreeMap<String, String>,
+}
+
+pub(crate) struct Prepared {
+    pub cwd: PathBuf,
+    pub target: PathBuf,
+    pub wrapper: Option<PathBuf>,
+    pub sandbox: Option<Box<dyn IsolationLauncher>>,
+    pub windows: Option<std::sync::Mutex<Option<crate::windows::PreparedVm>>>,
+}
+
+/// Owns the prepared service and mount configuration. Tests can substitute a
+/// launcher to observe dispatch without requiring systemd or a job account.
+pub(crate) trait IsolationLauncher: Send + Sync {
+    fn launch(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        cpus: &[u32],
+    ) -> io::Result<platform::Launch>;
+}
+
+#[cfg(target_os = "linux")]
+impl IsolationLauncher for crate::isolation::Sandbox {
+    fn launch(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        cpus: &[u32],
+    ) -> io::Result<platform::Launch> {
+        self.launch_durable(command, cwd, env, cpus)
+    }
+}
+
+/// The engine persists the process identity before opening the execution gate.
+/// It drains stdout and stderr before persisting the final job outcome.
+pub(crate) struct Launch {
+    pub process: Option<platform::ProcessIdentity>,
+    pub durable_output: bool,
+    pub execution: Box<dyn Execution>,
+}
+
+pub(crate) struct Output {
+    pub stdout: Box<dyn Read + Send>,
+    pub stderr: Box<dyn Read + Send>,
+}
+
+pub(crate) trait Execution: Send {
+    fn release(&mut self) -> io::Result<()>;
+    fn output(&self) -> io::Result<Output>;
+    fn wait(&mut self) -> io::Result<ExecutionOutcome>;
+    fn reap(&self);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExecutionOutcome {
+    Unix(ExitStatus),
+    WindowsExit { code: u32 },
+}
+impl ExecutionOutcome {
+    pub(crate) fn success(&self) -> bool {
+        match self {
+            Self::Unix(status) => status.success(),
+            Self::WindowsExit { code } => *code == 0,
+        }
+    }
+    pub(crate) fn wire(self) -> motor_protocol::Outcome {
+        use std::os::unix::process::ExitStatusExt;
+        match self {
+            Self::Unix(status) => status
+                .code()
+                .map(|code| motor_protocol::Outcome::Exit { code })
+                .unwrap_or(motor_protocol::Outcome::Signal {
+                    signal: status.signal().unwrap_or(9),
+                }),
+            Self::WindowsExit { code } => windows_outcome(code),
+        }
+    }
+}
+
+fn windows_outcome(code: u32) -> motor_protocol::Outcome {
+    motor_protocol::Outcome::WindowsExit { code }
+}
+
+pub(crate) trait Backend: Send + Sync {
+    fn validate(&self, _config: &Config) -> io::Result<()> {
+        Ok(())
+    }
+    fn initialize(&self, _config: &Config) -> io::Result<()> {
+        Ok(())
+    }
+    fn unit_name(&self, config: &Config, id: Uuid) -> String {
+        match config.backend {
+            BackendKind::WindowsVm => format!("motor-windows-{}-{id}.service", config.instance),
+            _ => host_unit_name(id),
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn unit_pattern(&self, config: &Config) -> String {
+        match config.backend {
+            BackendKind::WindowsVm => format!("motor-windows-{}-*", config.instance),
+            _ => "motor-job-*".into(),
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn failed_job_units(&self, config: &Config) -> io::Result<u64> {
+        crate::systemd::failed_job_units(&self.unit_pattern(config), |args| systemctl(config, args))
+    }
+    fn materialize(&self, config: &Config, trees: &Trees, setup: &Setup) -> io::Result<Prepared>;
+    fn launch(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        setup: &Setup,
+        prepared: &Prepared,
+        weight: u32,
+    ) -> io::Result<Launch>;
+    /// `hard` escalates cancellation after the engine's grace period.
+    /// The job id is available even for backends without a host process group.
+    fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()>;
+    fn unit_alive(
+        &self,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>>;
+    fn oom_stopped(
+        &self,
+        _config: &Config,
+        _process: Option<platform::ProcessIdentity>,
+    ) -> Option<bool> {
+        None
+    }
+    fn unit_exit_status(
+        &self,
+        _config: &Config,
+        _process: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<std::process::ExitStatus>> {
+        Ok(None)
+    }
+    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>>;
+    /// Called under the exclusive instance lock before serving jobs. Returns
+    /// the ids whose execution or durable output can be monitored after restart.
+    fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>>;
+}
+
+pub(crate) fn host_unit_name(id: Uuid) -> String {
+    format!("motor-job-{id}.service")
+}
+
+// Small CPU requests still need enough memory for Rust builds. Use a 16 GiB
+// floor, then scale at 3.5 GiB per vCPU to leave host headroom for larger jobs.
+const MEMORY_BYTES_PER_VCPU: u64 = 7 * (1 << 29);
+const MEMORY_FLOOR_GIB: u64 = 16;
+
+fn memory_max_with_floor(vcpus: u32, floor_gib: u64) -> u64 {
+    (u64::from(vcpus) * MEMORY_BYTES_PER_VCPU).max(floor_gib.saturating_mul(1 << 30))
+}
+
+#[cfg(not(test))]
+pub(crate) fn memory_max(vcpus: u32) -> u64 {
+    memory_max_with_floor(vcpus, MEMORY_FLOOR_GIB)
+}
+
+#[cfg(test)]
+pub(crate) fn memory_max(vcpus: u32, floor_gib: Option<u64>) -> u64 {
+    memory_max_with_floor(vcpus, floor_gib.unwrap_or(MEMORY_FLOOR_GIB))
+}
+
+fn format_memory_limit_gib(bytes: u64) -> String {
+    let whole = bytes / (1 << 30);
+    if bytes.is_multiple_of(1 << 30) {
+        whole.to_string()
+    } else {
+        format!("{whole}.5")
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn memory_limit_gib(vcpus: u32) -> String {
+    format_memory_limit_gib(memory_max(vcpus))
+}
+
+#[cfg(test)]
+pub(crate) fn memory_limit_gib(vcpus: u32, floor_gib: Option<u64>) -> String {
+    format_memory_limit_gib(memory_max(vcpus, floor_gib))
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn systemctl(config: &Config, args: &[&str]) -> io::Result<std::process::Output> {
+    #[cfg(test)]
+    if let Some(run) = &config.systemd_command {
+        return run(args);
+    }
+    if config.windows_instance() || config.isolate_jobs {
+        std::process::Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/systemctl"])
+            .args(args)
+            .output()
+    } else {
+        std::process::Command::new("/usr/bin/systemctl")
+            .args(args)
+            .output()
+    }
+}
+
+pub(crate) struct HostBackend;
+
+impl Backend for HostBackend {
+    fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
+        let r = &s.request;
+        if !s.base {
+            crate::writer::validate_paths(
+                config,
+                &r.workspace_key,
+                Some(&r.cwd),
+                &r.siblings,
+                &[],
+            )?;
+        } else if !config.writer_enabled() {
+            return Err(io::Error::other("dependency writer account is unavailable"));
+        }
+        let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && path.exists() {
+            crate::isolation::restore_runner_access(&path)
+                .map_err(|error| io::Error::other(format!("restore workspace access: {error}")))?;
+            if path.is_dir() {
+                crate::isolation::restore_runner_checkout_root(&path).map_err(|error| {
+                    io::Error::other(format!("restore workspace root ownership: {error}"))
+                })?;
+                if s.base && path.join(".git").is_dir() {
+                    // Writer sandbox setup owns the checkout root and .git as
+                    // motor-cache. Git's repository safety checks include both
+                    // owners, so restore them before the daemon synchronizes.
+                    crate::isolation::restore_runner_checkout_root(&path.join(".git")).map_err(
+                        |error| {
+                            io::Error::other(format!(
+                                "restore writer Git directory ownership: {error}"
+                            ))
+                        },
+                    )?;
+                }
+            }
+        }
+        // A sibling checkout can also be another job's own workspace (for
+        // example a repository's main checkout), which that job's sandbox left
+        // owned by the job account. Git refuses a repository whose root another
+        // user owns, so take each sibling back as the workspace above. This is
+        // separate from the workspace check because a job's first run has no
+        // workspace yet while its siblings can already exist. Admission never
+        // lets a sibling be prepared while a job is running in it, so no job is
+        // affected.
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs {
+            for sibling in &r.siblings {
+                let sibling = std::path::Path::new(&sibling.canonical_path);
+                if !sibling.is_dir() {
+                    continue;
+                }
+                crate::isolation::restore_runner_access(sibling).map_err(|error| {
+                    io::Error::other(format!(
+                        "restore sibling {} access: {error}",
+                        sibling.display()
+                    ))
+                })?;
+                crate::isolation::restore_runner_checkout_root(sibling).map_err(|error| {
+                    io::Error::other(format!(
+                        "restore sibling {} root ownership: {error}",
+                        sibling.display()
+                    ))
+                })?;
+            }
+        }
+        if s.base {
+            setup_step(
+                "checkout workspace",
+                trees.sync_workspace(
+                    &r.repository_root,
+                    &path,
+                    &r.snapshot_commit,
+                    &r.tree_hash,
+                    &r.snapshot_commit,
+                ),
+            )?;
+        } else {
+            let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
+                workspace::resolve_caller_commit(
+                    &trees.mirror(&r.repository_root),
+                    &r.snapshot_commit,
+                    &r.tree_hash,
+                )
+            });
+            setup_step(
+                "populate workspace",
+                trees.populate(
+                    &r.workspace_key,
+                    &r.repository_root,
+                    &r.snapshot_commit,
+                    &r.siblings,
+                    &s.recorded,
+                    &r.tree_hash,
+                    &caller_commit,
+                ),
+            )?;
+        }
+        if setup_step("verify workspace tree", trees.tree_hash(&path))? != r.tree_hash {
+            return Err(invalid("tree_hash_mismatch"));
+        }
+        let cwd = setup_step("resolve job cwd", fs::canonicalize(&r.cwd))?;
+        if !cwd.starts_with(setup_step(
+            "resolve workspace path",
+            fs::canonicalize(&path),
+        )?) {
+            return Err(invalid("cwd outside workspace"));
+        }
+        let target = if s.base {
+            let target = config.writer_scratch_dir().join(s.id.to_string());
+            setup_step("create writer scratch", fs::create_dir_all(&target))?;
+            target
+        } else {
+            path.join("target")
+        };
+        let wrapper = trees.state.join("prefrontal-build-slot");
+        #[cfg(target_os = "linux")]
+        let wrapper = if config.isolate_jobs {
+            use sha2::{Digest, Sha256};
+            // Hash the supervisor source embedded in this runner so a binary
+            // compiled from an uploaded tree is never reused, and changes to
+            // the embedded source invalidate the cache.
+            trees.state.join(format!(
+                "prefrontal-build-slot-{:x}",
+                Sha256::digest(include_str!("../../prefrontal-build-slot/src/main.rs"))
+            ))
+        } else {
+            wrapper
+        };
+        let source = path.join("crates/prefrontal-build-slot/src/main.rs");
+        let mut wrapper = if source.exists() {
+            #[cfg(target_os = "linux")]
+            let source = if config.isolate_jobs {
+                // Uploaded Rust compiled as the daemon could use include_str!
+                // to embed files the daemon can read, including its SSH keys,
+                // in a binary the job later runs. Compile only the supervisor
+                // source embedded in this trusted runner executable.
+                let source = wrapper.with_extension("rs");
+                let temporary = source.with_extension(format!("{}.tmp", s.id));
+                setup_step(
+                    "write trusted compiler supervisor source",
+                    fs::write(
+                        &temporary,
+                        include_str!("../../prefrontal-build-slot/src/main.rs"),
+                    ),
+                )?;
+                setup_step(
+                    "install compiler supervisor source",
+                    fs::rename(temporary, &source),
+                )?;
+                source
+            } else {
+                source
+            };
+            setup_step(
+                "build compiler-slot wrapper",
+                platform::build_wrapper(
+                    &source,
+                    &wrapper,
+                    &config.build_slot_root,
+                    config.rustc_slots,
+                ),
+            )?;
+            Some(wrapper)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let sandbox = if config.isolate_jobs {
+            let lockfile = workspace::git(
+                &trees.mirror(&r.repository_root),
+                &["show", &format!("{}:Cargo.lock", r.snapshot_commit)],
+            )
+            .unwrap_or_default();
+            let (routes, missing) =
+                trees.dependency_fetch_routes(&r.git_dependencies, &lockfile)?;
+            if s.base && !missing.is_empty() {
+                return Err(invalid(missing.join("; ")));
+            }
+            let locks: Vec<_> = routes
+                .values()
+                .map(|mirror| trees.dependency_lock(mirror))
+                .collect();
+            let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+            trees.refresh_dependency_aliases(&lockfile, &routes)?;
+            let sandbox = setup_step(
+                "prepare isolated job sandbox",
+                if s.base {
+                    crate::isolation::Sandbox::prepare_writer(
+                        s.id,
+                        &trees.state,
+                        &path,
+                        &target,
+                        wrapper.as_deref(),
+                        &config.build_slot_root,
+                        config.rustc_slots,
+                        &routes,
+                        &r.tree_hash,
+                    )
+                } else {
+                    crate::isolation::Sandbox::prepare_with_dependencies(
+                        s.id,
+                        &trees.state,
+                        &path,
+                        &target,
+                        &r.siblings,
+                        wrapper.as_deref(),
+                        &config.build_slot_root,
+                        config.rustc_slots,
+                        &routes,
+                        &r.tree_hash,
+                    )
+                }
+                // When a job ends, the engine checks whether systemd stopped its
+                // unit for exceeding the memory limit (Result=oom-kill), then
+                // resets the unit so systemd unloads it. Keep it loaded until then.
+                .map(|sandbox| {
+                    #[cfg(test)]
+                    let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
+                    sandbox.retaining_failed_units()
+                })
+                .and_then(|sandbox| {
+                    #[cfg(test)]
+                    if config.job_network_hook.is_some() {
+                        return Ok(sandbox);
+                    }
+                    if r.network == Some(Network::Outbound) {
+                        sandbox.with_network()
+                    } else {
+                        Ok(sandbox)
+                    }
+                })
+                .map_err(|e| {
+                    if missing.is_empty() {
+                        e
+                    } else {
+                        invalid(format!("{e}; {}", missing.join("; ")))
+                    }
+                }),
+            )?;
+            let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
+            wrapper = sandbox.wrapper.clone();
+            Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let sandbox = {
+            let _ = &mut wrapper;
+            None
+        };
+        Ok(Prepared {
+            cwd,
+            target,
+            wrapper,
+            sandbox,
+            windows: None,
+        })
+    }
+    fn launch(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        s: &Setup,
+        prepared: &Prepared,
+        weight: u32,
+    ) -> io::Result<Launch> {
+        let r = &s.request;
+        let mut env = BTreeMap::new();
+        #[cfg(test)]
+        if r.network.is_some() {
+            if let Some(hook) = &config.job_network_hook {
+                setup_step("network attach", hook(crate::network::Phase::Attach(s.id)))?;
+            }
+        }
+        for &key in JOB_BASE_ENV {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.to_string(), value);
+            }
+        }
+        for (k, v) in &r.env {
+            if crate::allowed_env(k) {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        // Match test and compile concurrency to the permits reserved for this job, not to
+        // the host's CPU count or an unrelated daemon's worker budget.
+        for key in [
+            "RUST_TEST_THREADS",
+            "NEXTEST_TEST_THREADS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            env.entry(key.to_string())
+                .or_insert_with(|| weight.to_string());
+        }
+        for key in [
+            "SUBC_LAUNCH_NONCE",
+            "SUBC_LAUNCH_NONCE_FD",
+            "SUBC_MODULE_ID",
+            "SSH_AUTH_SOCK",
+        ] {
+            env.remove(key);
+        }
+        let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
+            workspace::resolve_caller_commit(
+                &trees.mirror(&r.repository_root),
+                &r.snapshot_commit,
+                &r.tree_hash,
+            )
+        });
+        env.insert("CK_REMOTE_SOURCE_COMMIT".to_string(), caller_commit);
+        env.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            prepared.target.to_string_lossy().to_string(),
+        );
+        if let Some(wrapper) = &prepared.wrapper {
+            env.insert(
+                "RUSTC_WRAPPER".to_string(),
+                wrapper.to_string_lossy().to_string(),
+            );
+        } else {
+            env.remove("RUSTC_WRAPPER");
+        }
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs
+            && (s.base
+                || std::path::Path::new(&r.workspace_key)
+                    .join("Cargo.toml")
+                    .is_file())
+        {
+            crate::compile_cache::reader_environment(&mut env, config.sccache_size_gib);
+            if s.base {
+                env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
+                env.insert("CARGO_INCREMENTAL".into(), "1".into());
+                env.insert(
+                    "SCCACHE_SERVER_UDS".into(),
+                    config.writer_sccache_server_uds(s.id),
+                );
+            }
+            if prepared.wrapper.is_none()
+                && (s.base
+                    || !crate::compile_cache::configured_wrapper(
+                        std::path::Path::new(&r.workspace_key),
+                        &prepared.cwd,
+                    )?)
+            {
+                env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+            }
+        }
+        let env = env.into_iter().collect::<Vec<_>>();
+        let launch = if config.isolate_jobs {
+            let sandbox = prepared
+                .sandbox
+                .as_ref()
+                .ok_or_else(|| io::Error::other("isolated job has no prepared sandbox"))?;
+            sandbox.launch(&s.request.command, &prepared.cwd, &env, &s.cpus)
+        } else {
+            // The non-isolated host backend is development-only and does not pin CPUs.
+            platform::launch(&s.request.command, &prepared.cwd, &env)
+        }?;
+        Ok(Launch {
+            process: Some(launch.identity),
+            durable_output: launch.durable_output,
+            execution: Box::new(launch),
+        })
+    }
+
+    fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {
+        if let Some(process) = job.process {
+            #[cfg(test)]
+            if let (Some(run), Some(unit)) = (&config.systemd_command, process.unit) {
+                let _ =
+                    crate::systemd::signal(&self.unit_name(config, unit), hard, |args| run(args));
+                return Ok(());
+            }
+            let _ = config;
+            platform::signal(process, hard);
+        }
+        Ok(())
+    }
+
+    fn unit_alive(
+        &self,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>> {
+        #[cfg(test)]
+        if let (Some(run), Some(unit)) = (&config.systemd_command, process.and_then(|p| p.unit)) {
+            return crate::systemd::alive(&self.unit_name(config, unit), |args| run(args))
+                .map(Some);
+        }
+        let _ = config;
+        platform::unit_alive(process)
+    }
+
+    fn oom_stopped(
+        &self,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
+    ) -> Option<bool> {
+        #[cfg(any(target_os = "linux", test))]
+        {
+            let unit = process
+                .and_then(|process| process.unit)
+                .map(|id| self.unit_name(config, id))?;
+            let result = crate::systemd::oom_killed(&unit, |args| systemctl(config, args)).ok()?;
+            // OOM failures otherwise remain loaded after the result is read; clearing
+            // the failure lets systemd collect the inactive transient unit again.
+            let _ = systemctl(config, &["reset-failed", &unit]);
+            Some(result)
+        }
+        #[cfg(not(any(target_os = "linux", test)))]
+        {
+            let _ = (config, process);
+            None
+        }
+    }
+
+    fn unit_exit_status(
+        &self,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(any(target_os = "linux", test))]
+        if let Some(unit) = process.and_then(|process| process.unit) {
+            return crate::systemd::exit_status(&self.unit_name(config, unit), |args| {
+                systemctl(config, args)
+            })
+            .map(Some);
+        }
+        let _ = (config, process);
+        Ok(None)
+    }
+
+    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+        Ok((!job.base).then(|| trees.changes(std::path::Path::new(job.key()))))
+    }
+
+    fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
+        let mut recovered = Vec::new();
+        for job in interrupted {
+            if job.pending() && job.started_ms.is_none() && job.process.is_none() {
+                continue;
+            }
+            let alive = self.unit_alive(config, job.process)?;
+            if alive == Some(true) || job.durable_output {
+                recovered.push(job.id);
+            } else if job.process.is_some_and(|p| p.unit.is_none()) {
+                // A process without a systemd unit cannot be reattached. Stop
+                // it before releasing its workspace for another job; platform
+                // signalling checks the recorded kernel start time for PID reuse.
+                self.cancel(config, job, true)?;
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+impl Execution for platform::Launch {
+    fn release(&mut self) -> io::Result<()> {
+        self.release()
+    }
+    fn output(&self) -> io::Result<Output> {
+        Ok(Output {
+            stdout: Box::new(self.stdout.try_clone()?),
+            stderr: Box::new(self.stderr.try_clone()?),
+        })
+    }
+    fn wait(&mut self) -> io::Result<ExecutionOutcome> {
+        self.wait().map(ExecutionOutcome::Unix)
+    }
+    fn reap(&self) {
+        self.reap()
+    }
+}
+
+// Preserve only the daemon context toolchains need. Request values are filtered
+// separately, and isolated backends supply their own base environment.
+const JOB_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+];
+
+#[cfg(test)]
+#[path = "backend_tests.rs"]
+mod tests;

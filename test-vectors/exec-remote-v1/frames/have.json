@@ -1,0 +1,18 @@
+{
+  "type": "have",
+  "repositories": [
+    {
+      "repository": "/Users/example/src/prefrontal",
+      "commits": [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222"
+      ]
+    },
+    {
+      "repository": "/Users/example/src/commons",
+      "commits": [
+        "4444444444444444444444444444444444444444"
+      ]
+    }
+  ]
+}

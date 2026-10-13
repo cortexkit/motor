@@ -1,0 +1,15 @@
+[Unit]
+Description=CortexKit motor-runner (exec-remote/v1 runner, instance main)
+
+[Service]
+Environment=HOME=/home/ubuntu
+Environment=CARGO_HOME=/srv/build/cargo-home
+Environment=RUSTUP_HOME=/home/ubuntu/.rustup
+Environment=PATH=/srv/build/cargo-home/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/.cargo/bin/motor-runner serve --instance main --max-weight 80 --job-network veth
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

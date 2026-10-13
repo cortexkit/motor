@@ -1,0 +1,7 @@
+{
+  "type": "drop_reply",
+  "dropped": true,
+  "cancelled_jobs": [
+    "0192a64a-1234-7000-8000-000000000001"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "runner-bun-fixture",
+      "dependencies": {
+        "fixture-dep": "file:vendor/fixture-dep",
+      },
+    },
+  },
+  "packages": {
+    "fixture-dep": ["fixture-dep@file:vendor/fixture-dep", { "bin": { "fixture-tool": "cli.js" } }],
+  }
+}

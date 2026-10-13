@@ -1,0 +1,202 @@
+# Runs elevated after setup-guest.ps1 -JobBaseline has installed Git and MSVC.
+# This image is for disposable job VMs, never for the standing SSH build VM.
+param([string]$AgentSource = "$PSScriptRoot\motor-winagent")
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Job baseline setup must run elevated'
+}
+if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Job baseline requires x64 Windows' }
+
+$toolchain = '1.99.0'
+$hostTriple = 'x86_64-pc-windows-msvc'
+$motor = 'C:\ProgramData\Motor'
+$jobUser = 'motor-job'
+$credential = "$motor\job-password.txt"
+New-Item $motor -ItemType Directory -Force | Out-Null
+# Limit C:\ProgramData\Motor to SYSTEM and Administrators before the agent
+# binary and the job account's password file are written into it, so neither
+# is ever readable by a job.
+& icacls $motor /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+if ($LASTEXITCODE -ne 0) { throw 'Motor directory ACL setup failed' }
+
+$bytes = New-Object byte[] 48
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$rng.Dispose()
+$password = 'Aa1!' + [Convert]::ToBase64String($bytes)
+$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+$service = Get-Service motor-winagent -ErrorAction SilentlyContinue
+if ($service -and $service.Status -ne 'Stopped') { Stop-Service motor-winagent -Force }
+if (Get-LocalUser $jobUser -ErrorAction SilentlyContinue) {
+    Set-LocalUser $jobUser -Password $securePassword -PasswordNeverExpires $true -UserMayChangePassword $false -AccountNeverExpires
+    Enable-LocalUser $jobUser
+} else {
+    New-LocalUser $jobUser -Password $securePassword -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires | Out-Null
+}
+$jobSid = (Get-LocalUser $jobUser).SID.Value
+$users = Get-LocalGroup -SID 'S-1-5-32-545'
+$admins = Get-LocalGroup -SID 'S-1-5-32-544'
+if (-not (Get-LocalGroupMember $users | Where-Object { $_.SID.Value -eq $jobSid })) {
+    Add-LocalGroupMember $users -Member $jobUser
+}
+if (Get-LocalGroupMember $admins | Where-Object { $_.SID.Value -eq $jobSid }) {
+    Remove-LocalGroupMember $admins -Member $jobUser
+}
+[IO.File]::WriteAllText($credential, $password, (New-Object Text.UTF8Encoding $false))
+& icacls $credential /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F'
+if ($LASTEXITCODE -ne 0) { throw 'Job credential ACL setup failed' }
+$password = $null
+
+# Preserve existing batch-logon grants while adding the standard job account.
+$policy = Join-Path $env:TEMP 'motor-batch-right.inf'
+$policyDb = Join-Path $env:TEMP 'motor-batch-right.sdb'
+try {
+    & secedit /export /cfg $policy /areas USER_RIGHTS /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Exporting local logon rights failed' }
+    $lines = @(Get-Content $policy)
+    $entry = $lines | Where-Object { $_ -match '^SeBatchLogonRight\s*=' }
+    if ($entry) {
+        $grants = @((($entry -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($grants -notcontains "*$jobSid") { $grants += "*$jobSid" }
+        $lines = $lines | ForEach-Object {
+            if ($_ -match '^SeBatchLogonRight\s*=') { 'SeBatchLogonRight = ' + ($grants -join ',') } else { $_ }
+        }
+    } else {
+        $lines = $lines | ForEach-Object {
+            $_
+            if ($_ -eq '[Privilege Rights]') { "SeBatchLogonRight = *$jobSid" }
+        }
+    }
+    $lines | Set-Content $policy -Encoding Unicode
+    & secedit /configure /db $policyDb /cfg $policy /areas USER_RIGHTS /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Granting batch logon failed' }
+} finally {
+    Remove-Item $policy,$policyDb -Force -ErrorAction SilentlyContinue
+}
+
+# Create the real profile now so exclusions use its actual path, including any suffix.
+$profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$jobSid"
+if (-not (Test-Path $profileKey)) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class MotorProfile {
+    [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+    public static extern int CreateProfile(string sid, string user, StringBuilder path, uint length);
+}
+'@
+    $profileBuffer = New-Object Text.StringBuilder 260
+    $result = [MotorProfile]::CreateProfile($jobSid, $jobUser, $profileBuffer, 260)
+    if ($result -ne 0) { throw "Creating job profile failed: $result" }
+}
+$jobProfile = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty $profileKey).ProfileImagePath)
+$jobCargo = Join-Path $jobProfile '.cargo'
+New-Item $jobCargo,'C:\m',"$motor\cache" -ItemType Directory -Force | Out-Null
+& icacls 'C:\m' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
+if ($LASTEXITCODE -ne 0) { throw 'Job source directory ACL setup failed' }
+& icacls $jobCargo /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
+if ($LASTEXITCODE -ne 0) { throw 'Job cargo home ACL setup failed' }
+# Let the job account list and enter C:\ProgramData\Motor (no inheritance
+# flags), so it can reach the cache folder below it. The grant applies to the
+# folder itself only, so the password file stays unreadable to the job.
+& icacls $motor /grant:r "*${jobSid}:RX"
+if ($LASTEXITCODE -ne 0) { throw 'Motor traversal ACL setup failed' }
+
+$drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\vioserial\2k22\amd64\vioser.inf") } | Select-Object -First 1
+if (-not $drivers) { throw 'Official virtio-win CD with the Server 2022 serial driver not found' }
+& pnputil /add-driver "$($drivers.DriveLetter):\vioserial\2k22\amd64\vioser.inf" /install
+if ($LASTEXITCODE -notin @(0,3010)) { throw "Virtio-serial driver installation failed: $LASTEXITCODE" }
+
+$env:RUSTUP_HOME = 'C:\rust\rustup'
+$env:CARGO_HOME = 'C:\rust\cargo'
+New-Item $env:RUSTUP_HOME,$env:CARGO_HOME -ItemType Directory -Force | Out-Null
+Invoke-WebRequest 'https://win.rustup.rs/x86_64' -OutFile "$env:TEMP\rustup-init.exe" -UseBasicParsing
+& "$env:TEMP\rustup-init.exe" -y --profile minimal --default-toolchain $toolchain --default-host $hostTriple --no-modify-path
+if ($LASTEXITCODE -ne 0) { throw "Machine-wide rustup installation failed: $LASTEXITCODE" }
+[Environment]::SetEnvironmentVariable('RUSTUP_HOME', $env:RUSTUP_HOME, 'Machine')
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';') -notcontains 'C:\rust\cargo\bin') {
+    [Environment]::SetEnvironmentVariable('Path', "C:\rust\cargo\bin;$machinePath", 'Machine')
+}
+$env:Path = 'C:\rust\cargo\bin;' + $env:Path
+$rustc = & 'C:\rust\cargo\bin\rustc.exe' -vV
+if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $toolchain" -or $rustc -notcontains "host: $hostTriple") {
+    throw 'Machine-wide Rust version/host verification failed'
+}
+$rustc | Write-Host
+& 'C:\rust\cargo\bin\cargo.exe' --version
+if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Cargo verification failed' }
+$git = 'C:\Program Files\Git\cmd\git.exe'
+if (-not (Test-Path 'C:\Program Files\Git\bin\bash.exe')) { throw 'Git Bash is missing' }
+& $git --version
+if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Git verification failed' }
+& $git config --system core.longpaths true
+if ($LASTEXITCODE -ne 0) { throw 'Git long-path configuration failed' }
+New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+foreach ($path in @('C:\m', 'C:\rust', $jobCargo)) { Add-MpPreference -ExclusionPath $path }
+
+foreach ($name in @('Cargo.toml', 'Cargo.lock', 'src')) {
+    if (-not (Test-Path (Join-Path $AgentSource $name))) { throw "Standalone agent source is missing $name" }
+}
+# Build with the pinned toolchain and lockfile inside this MSVC-equipped seed VM.
+& 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple
+if ($LASTEXITCODE -ne 0) { throw "Agent release build failed: $LASTEXITCODE" }
+Copy-Item "$AgentSource\target\$hostTriple\release\motor-winagent.exe" "$motor\motor-winagent.exe" -Force
+$agentHash = (Get-FileHash "$motor\motor-winagent.exe" -Algorithm SHA256).Hash
+Set-Content "$PSScriptRoot\winagent.sha256" "$agentHash  motor-winagent.exe" -Encoding ascii
+Write-Host "Installed motor-winagent SHA-256: $agentHash"
+# Freeze toolchain files after building; jobs use their own writable Cargo home.
+# Set the protected ACL on C:\rust only, then make every descendant inherit it.
+# Granting (OI)(CI) entries recursively with /inheritance:r leaves each file
+# with an empty DACL, because inheritance flags don't apply to files and the
+# inherited entries are stripped; nobody, administrators included, can then
+# run rustc. /L resets rustup's symlinked proxies themselves, not only their target.
+& icacls 'C:\rust' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)RX"
+if ($LASTEXITCODE -ne 0) { throw 'Read-only job toolchain ACL setup failed' }
+& icacls 'C:\rust\*' /reset /T /C /L /Q
+if ($LASTEXITCODE -ne 0) { throw 'Toolchain ACL inheritance reset failed' }
+# The freeze must leave the toolchain runnable; verify it after the ACL change.
+$rustc = & 'C:\rust\cargo\bin\rustc.exe' -vV
+if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $toolchain") {
+    throw 'Rust is not runnable after the toolchain ACL change'
+}
+& 'C:\rust\cargo\bin\cargo.exe' --version
+if ($LASTEXITCODE -ne 0) { throw 'Cargo is not runnable after the toolchain ACL change' }
+
+# A rerun must also remove SSH state, not merely skip installing the server.
+$sshd = Get-Service sshd -ErrorAction SilentlyContinue
+if ($sshd) { Stop-Service sshd -Force -ErrorAction Stop }
+$sshServer = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+if ($sshServer.State -eq 'Installed') {
+    Remove-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+}
+foreach ($rule in @('OpenSSH-Server-In-TCP', 'WindowsBuilderSSH')) {
+    Get-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+}
+foreach ($path in @('C:\ProgramData\ssh', "$PSScriptRoot\authorized_keys", "$PSScriptRoot\ssh-ready")) {
+    if (Test-Path $path) { Remove-Item $path -Recurse -Force }
+}
+Get-ChildItem C:\Users -Directory -Force | ForEach-Object {
+    $sshHome = Join-Path $_.FullName '.ssh'
+    if (Test-Path $sshHome) { Remove-Item $sshHome -Recurse -Force }
+}
+if ((Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0).State -eq 'Installed') {
+    throw 'Job baseline still has an SSH server'
+}
+
+if ($service) {
+    & sc.exe config motor-winagent binPath= "$motor\motor-winagent.exe" start= auto obj= LocalSystem
+    if ($LASTEXITCODE -ne 0) { throw 'Updating agent service failed' }
+} else {
+    New-Service -Name motor-winagent -BinaryPathName "$motor\motor-winagent.exe" -StartupType Automatic -DisplayName 'Motor Windows job agent' | Out-Null
+}
+# Do not start on the provisioning boot: only a job VM supplies the port and nonce.
+$agentService = Get-CimInstance Win32_Service -Filter "Name='motor-winagent'"
+if ($agentService.StartName -ne 'LocalSystem' -or $agentService.StartMode -ne 'Auto') {
+    throw 'Agent must be an auto-start LocalSystem service'
+}
+Write-Host 'Job baseline setup complete; reboot and verify as motor-job through the agent before sealing.'

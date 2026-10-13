@@ -1,0 +1,15 @@
+{
+  "type": "have_reply",
+  "repositories": [
+    {
+      "repository": "/Users/example/src/prefrontal",
+      "commits": [
+        "1111111111111111111111111111111111111111"
+      ]
+    },
+    {
+      "repository": "/Users/example/src/commons",
+      "commits": []
+    }
+  ]
+}

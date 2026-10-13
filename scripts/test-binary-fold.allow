@@ -1,0 +1,7 @@
+# Repository-relative entry point<TAB>reason for retaining its own process.
+crates/motor-protocol/tests/it/main.rs	Consolidated integration harness.
+crates/motor-runner/tests/it/main.rs	Consolidated integration harness.
+crates/prefrontal-build-slot/tests/it/main.rs	Consolidated integration harness.
+crates/motor-module/tests/it/main.rs	Consolidated integration harness.
+# Real-server daemon, exclusive run lock and process-wide scratch environment require a separate ignored binary.
+crates/motor-module/tests/motor_e2e.rs	Fenced real-server daemon, exclusive run lock and process-wide scratch environment cannot share a process with other tests.

@@ -1,0 +1,25 @@
+# Internal documents and tool state under .cortexkit/ are ignored.
+# Only the explicitly allowlisted paths below are tracked.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
+
+# Rust build output
+/target/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and local environment
+*.log
+.env
+.env.local
+# The guest agent is a standalone crate with its own lockfile, so building it
+# in place writes a second target folder.
+crates/motor-winagent/target/

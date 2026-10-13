@@ -1,0 +1,37 @@
+{
+  "queue_depth": 2,
+  "running_jobs": [
+    {
+      "job_id": "0192a64a-1234-7000-8000-000000000001",
+      "workspace_key": "/Users/example/worktrees/task",
+      "weight": 16
+    },
+    {
+      "job_id": "0192a64a-1234-7000-8000-000000000002",
+      "workspace_key": "base:/Users/example/src/prefrontal",
+      "weight": 4
+    }
+  ],
+  "server_reachable": true,
+  "repositories": [
+    {
+      "repository_root": "/Users/example/src/prefrontal",
+      "warm_target_age_s": 90,
+      "published_commit": "1111111111111111111111111111111111111111",
+      "last_rebuild_result": "building"
+    },
+    {
+      "repository_root": "/Users/example/src/commons",
+      "warm_target_age_s": 120,
+      "published_commit": "4444444444444444444444444444444444444444",
+      "last_rebuild_result": "ok"
+    },
+    {
+      "repository_root": "/Users/example/src/claustrum",
+      "warm_target_age_s": 180,
+      "published_commit": "2222222222222222222222222222222222222222",
+      "last_rebuild_result": "failed"
+    }
+  ],
+  "rustc_version": "rustc 1.90.0 (1159e78c4 2025-09-14)"
+}

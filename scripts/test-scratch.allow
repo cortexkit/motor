@@ -1,0 +1,3 @@
+# path enclosing-function maximum-call-count
+# Motor tests use cortexkit_test_support::scratch_root(). Its root derivation
+# is in the published dependency, so no motor source needs an exemption.

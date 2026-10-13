@@ -1,0 +1,6 @@
+# Cargo resolves runner paths relative to the directory containing .cargo.
+[target.aarch64-apple-darwin]
+runner = ".cargo/sign-test-binary.sh"
+
+[target.x86_64-apple-darwin]
+runner = ".cargo/sign-test-binary.sh"

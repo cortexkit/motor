@@ -1,0 +1,11 @@
+{
+  "name": "runner-pnpm-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "preinstall": "echo ran > lifecycle-ran"
+  },
+  "dependencies": {
+    "fixture-dep": "workspace:*"
+  }
+}

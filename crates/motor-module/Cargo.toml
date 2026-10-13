@@ -1,0 +1,47 @@
+[package]
+name = "motor-module"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "ck-motor subc module serving exec-remote/v1"
+
+[[bin]]
+name = "ck-motor"
+path = "src/main.rs"
+
+[features]
+bench-client = []
+
+[[bin]]
+name = "motor-bench-client-dev"
+path = "../../scripts/bench-client.rs"
+required-features = ["bench-client"]
+
+[dependencies]
+motor-protocol = { path = "../motor-protocol" }
+cortexkit-claustrum-client = "=0.1.0"
+cortexkit-store-types = { workspace = true }
+subc-protocol = { workspace = true }
+subc-transport = { workspace = true }
+subc-client-rs = { workspace = true }
+subc-os = { workspace = true }
+subc-jsonc = { workspace = true }
+base64 = "0.22"
+fs2 = "0.4"
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
+tokio = { workspace = true, features = ["fs", "process", "signal"] }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+motor-runner = { path = "../motor-runner" }
+cortexkit-test-support = "=0.1.0"
+rand = "0.8"
+ed25519-dalek = { workspace = true }
+ssh-key = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

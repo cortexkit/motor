@@ -1,0 +1,53 @@
+{
+  "request": {
+    "workspace_key": "/Users/example/worktrees/task",
+    "repository_root": "/Users/example/src/prefrontal",
+    "cwd": "/Users/example/worktrees/task",
+    "command": "cargo nextest run -p prefrontal-core-store",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "weight_hint": 16,
+    "timeout": 60,
+    "queue_wait_limit_s": 300,
+    "siblings": [
+      "/Users/example/src/commons"
+    ]
+  },
+  "stream": [
+    {
+      "type": "accepted",
+      "job_id": "0192a64a-1234-7000-8000-000000000001",
+      "queue_position": 1,
+      "env_not_forwarded": []
+    },
+    {
+      "type": "started",
+      "seq": 0,
+      "queue_wait_ms": 25,
+      "started_at_ms": 1729468800000
+    },
+    {
+      "type": "output",
+      "seq": 1,
+      "stream": "stdout",
+      "bytes": "4g=="
+    },
+    {
+      "type": "terminal",
+      "job_id": "0192a64a-1234-7000-8000-000000000001",
+      "outcome": {
+        "type": "exit",
+        "code": 0
+      },
+      "wall_ms": 125,
+      "queue_wait_ms": 25,
+      "bundle_bytes": 29,
+      "ran": "remote",
+      "tree_hash": "3333333333333333333333333333333333333333",
+      "workspace_changes": [
+        "result.txt"
+      ]
+    }
+  ]
+}

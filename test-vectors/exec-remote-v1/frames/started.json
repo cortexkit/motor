@@ -1,0 +1,7 @@
+{
+  "type": "started",
+  "job_id": "0192a64a-1234-7000-8000-000000000001",
+  "seq": 0,
+  "queue_wait_ms": 25,
+  "started_at_ms": 1729468800000
+}

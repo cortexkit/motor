@@ -1,0 +1,161 @@
+[
+  {
+    "type": "have",
+    "repositories": [
+      {
+        "repository": "/Users/example/src/prefrontal",
+        "commits": [
+          "1111111111111111111111111111111111111111",
+          "2222222222222222222222222222222222222222"
+        ]
+      },
+      {
+        "repository": "/Users/example/src/commons",
+        "commits": [
+          "4444444444444444444444444444444444444444"
+        ]
+      }
+    ],
+    "git_dependencies": [
+      "https://unroutable.invalid/private.git"
+    ]
+  },
+  {
+    "type": "have_reply",
+    "repositories": [
+      {
+        "repository": "/Users/example/src/prefrontal",
+        "commits": [
+          "1111111111111111111111111111111111111111"
+        ]
+      },
+      {
+        "repository": "/Users/example/src/commons",
+        "commits": []
+      }
+    ]
+  },
+  {
+    "type": "run",
+    "workspace_key": "/Users/example/worktrees/task",
+    "repository_root": "/Users/example/src/prefrontal",
+    "cwd": "/Users/example/worktrees/task",
+    "command": "cargo nextest run -p prefrontal-core-store",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "weight_hint": 16,
+    "timeout": 60,
+    "queue_wait_limit_s": 300,
+    "siblings": [
+      {
+        "canonical_path": "/Users/example/src/commons",
+        "commit": "4444444444444444444444444444444444444444",
+        "tree_hash": "5555555555555555555555555555555555555555"
+      }
+    ],
+    "job_id": "0192a64a-1234-7000-8000-000000000001",
+    "snapshot_commit": "1111111111111111111111111111111111111111",
+    "tree_hash": "3333333333333333333333333333333333333333",
+    "integration_tip": "2222222222222222222222222222222222222222",
+    "bundles": [
+      {
+        "index": 0,
+        "repository": "/Users/example/src/prefrontal",
+        "length": 13,
+        "sha256": "0b83970f1e3bbe340877a7f13fa55b521e6f884fbaf4404d315199d9eb585237"
+      },
+      {
+        "index": 1,
+        "repository": "/Users/example/src/commons",
+        "length": 16,
+        "sha256": "b69b962b108cd4d468afc5d006cb0b350cf1a7b01abbeb5dcc5c436c344b7972"
+      }
+    ]
+  },
+  {
+    "type": "accepted",
+    "job_id": "0192a64a-1234-7000-8000-000000000001",
+    "queue_position": 1,
+    "env_not_forwarded": []
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 0,
+    "offset": 0,
+    "data": "bWFpbgA="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 0,
+    "offset": 5,
+    "data": "/2J1bmQ="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 0,
+    "offset": 10,
+    "data": "bGUK"
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 1,
+    "offset": 0,
+    "data": "c2libGk="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 1,
+    "offset": 5,
+    "data": "bmcAgGI="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 1,
+    "offset": 10,
+    "data": "dW5kbGU="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "bundle_chunk",
+    "index": 1,
+    "offset": 15,
+    "data": "Cg=="
+  },
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "terminal",
+    "job_id": "0192a64a-1234-7000-8000-000000000001",
+    "outcome": {
+      "type": "exit",
+      "code": 0
+    },
+    "wall_ms": 125,
+    "queue_wait_ms": 25,
+    "bundle_bytes": 29,
+    "ran": "remote",
+    "tree_hash": "3333333333333333333333333333333333333333",
+    "workspace_changes": [
+      "result.txt"
+    ]
+  }
+]
