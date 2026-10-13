@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "linux"))]
 use std::process::Stdio;
 use std::{
-    fs::File,
-    io,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::Path,
     process::{Command, ExitStatus},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -271,6 +273,67 @@ pub(crate) fn clone_target(source: &Path, target: &Path) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+static NEXT_CONTROL_FILE_TEMP: AtomicU64 = AtomicU64::new(0);
+
+fn publish_control_file(path: &Path, contents: &[u8], create_if_missing: bool) -> io::Result<()> {
+    publish_control_file_with(path, contents, create_if_missing, || Ok(()))
+}
+
+fn publish_control_file_with(
+    path: &Path,
+    contents: &[u8],
+    create_if_missing: bool,
+    before_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match fs::read(path) {
+        Ok(existing) if existing == contents || create_if_missing => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "control file has no file name")
+    })?;
+    let (temporary_path, mut temporary_file) = loop {
+        let sequence = NEXT_CONTROL_FILE_TEMP.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temporary_path = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => break (temporary_path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let write_result = (|| {
+        temporary_file.write_all(contents)?;
+        temporary_file.sync_all()
+    })();
+    drop(temporary_file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(error) = before_rename().and_then(|()| fs::rename(&temporary_path, path)) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 /// Instances use different wrappers but the same slot root and limit file.
 pub(crate) fn build_wrapper(
     source: &Path,
@@ -286,7 +349,7 @@ pub(crate) fn build_wrapper(
         .write(true)
         .open(slots.join("configure.lock"))?;
     lock.lock_exclusive()?;
-    std::fs::write(slots.join("limit"), limit.to_string())?;
+    publish_control_file(&slots.join("limit"), limit.to_string().as_bytes(), false)?;
     if !output.exists() {
         let status = Command::new("rustc")
             .arg(source)
@@ -299,11 +362,12 @@ pub(crate) fn build_wrapper(
             return Err(io::Error::other("build-slot compilation failed"));
         }
     }
-    std::fs::write(
-        output.with_extension("root"),
+    publish_control_file(
+        &output.with_extension("root"),
         slots.as_os_str().as_encoded_bytes(),
+        false,
     )?;
-    std::fs::write(output.with_extension("cache"), "")?;
+    publish_control_file(&output.with_extension("cache"), b"", true)?;
     Ok(())
 }
 
@@ -360,5 +424,59 @@ mod tests {
         assert!(launch.wait().unwrap().success());
         launch.reap();
         assert_eq!(stdout, "0022\n755\n");
+    }
+
+    #[test]
+    fn control_file_publication_keeps_old_contents_until_rename() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-control-file-atomic");
+        let path = scratch.join("limit");
+        std::fs::write(&path, b"old").unwrap();
+
+        let result = publish_control_file_with(&path, b"new", false, || {
+            assert_eq!(std::fs::read(&path).unwrap(), b"old");
+            Err(io::Error::other("injected publication failure"))
+        });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "injected publication failure"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+    }
+
+    #[test]
+    fn unchanged_control_file_publication_preserves_mtime() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-control-file-mtime");
+        let path = scratch.join("limit");
+        std::fs::write(&path, b"4").unwrap();
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        publish_control_file(&path, b"4", false).unwrap();
+
+        let after = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn build_wrapper_preserves_existing_cache_setting() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-wrapper-cache");
+        let source = scratch.join("supervisor.rs");
+        let output = scratch.join("wrapper");
+        let slots = scratch.join("slots");
+        std::fs::create_dir(&slots).unwrap();
+        std::fs::write(&output, b"already built").unwrap();
+        let cache = output.with_extension("cache");
+        std::fs::write(&cache, b"/usr/bin/sccache\\n").unwrap();
+
+        build_wrapper(&source, &output, &slots, 2).unwrap();
+
+        assert_eq!(std::fs::read(cache).unwrap(), b"/usr/bin/sccache\\n");
     }
 }
