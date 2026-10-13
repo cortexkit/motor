@@ -27,6 +27,8 @@ mod health;
 mod migration;
 #[path = "tests/monitoring.rs"]
 mod monitoring;
+#[path = "tests/nested_workspaces.rs"]
+mod nested_workspaces;
 #[path = "tests/platform.rs"]
 mod platform_refusal;
 #[path = "tests/refusals.rs"]

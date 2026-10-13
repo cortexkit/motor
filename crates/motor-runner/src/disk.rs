@@ -141,6 +141,18 @@ impl Runner {
             disk_full,
             detail: Some(self.safe_refusal_detail(detail, std::iter::empty::<String>())),
         };
+        if let Some(detail) = nested_workspace_detail(
+            &self.core.inner.lock().unwrap(),
+            &r.workspace_key,
+            &r.repository_root,
+            &r.siblings,
+        ) {
+            return Ok(Err(refusal(
+                RefusalReason::WorkspaceSetupFailed,
+                None,
+                detail,
+            )));
+        }
         if let Err(error) = self.validate_writer_paths(&r.workspace_key, None, &r.siblings) {
             return Ok(Err(refusal(
                 RefusalReason::WorkspaceKeyRejected,
@@ -170,6 +182,15 @@ impl Runner {
             )));
         }
         let mut inner = self.core.inner.lock().unwrap();
+        if let Some(detail) =
+            nested_workspace_detail(&inner, &r.workspace_key, &r.repository_root, &r.siblings)
+        {
+            return Ok(Err(refusal(
+                RefusalReason::WorkspaceSetupFailed,
+                None,
+                detail,
+            )));
+        }
         if inner.drain_deadline.is_some() {
             return Ok(Err(refusal(
                 RefusalReason::RunnerDraining,
