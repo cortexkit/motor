@@ -1,4 +1,8 @@
-"""Run with python3 -m unittest -v script/runner/test_sync_lock.py."""
+"""Run with python3 -m unittest -v script/runner/test_sync_lock.py on Linux.
+
+The stand-in runs sync.sh's remote half locally, and that half uses GNU
+coreutils (mv -T, stat -c) as the build server does, so macOS can't run it.
+"""
 import fcntl
 import os
 from pathlib import Path
