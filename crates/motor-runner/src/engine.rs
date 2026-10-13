@@ -3291,7 +3291,12 @@ impl Runner {
         self.long_work("launch-cleanup");
         let mut delay = Duration::from_millis(50);
         loop {
-            match self.core.backend.cancel(&self.core.config, &finished, true) {
+            match self
+                .core
+                .backend
+                .cancel(&self.core.config, &finished, true)
+                .and_then(|()| execution.abort())
+            {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(job_id = %id, %error, "launch cleanup stop failed; retaining ownership");

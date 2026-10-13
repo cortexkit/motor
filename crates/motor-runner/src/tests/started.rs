@@ -331,6 +331,9 @@ impl backend::Execution for FaultExecution {
     fn wait(&mut self) -> io::Result<backend::ExecutionOutcome> {
         self.inner.wait()
     }
+    fn abort(&self) -> io::Result<()> {
+        self.inner.abort()
+    }
     fn reap(&self) {
         self.inner.reap();
         self.reaped.store(true, Ordering::SeqCst);
