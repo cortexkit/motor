@@ -5,6 +5,14 @@
 set -euo pipefail
 host=${RUNNER_HOST:-alfonso-runner}
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# Keep a slow source transfer exclusive for a full day before reclaiming its lease.
+lock_stale_after=${RUNNER_LOCK_STALE_AFTER_S:-86400}
+[[ "$lock_stale_after" =~ ^[1-9][0-9]*$ ]] || {
+  echo 'RUNNER_LOCK_STALE_AFTER_S must be a positive number of seconds' >&2
+  exit 2
+}
+lock_owner="$host pid=$$ token=$RANDOM$RANDOM"
+printf -v lock_owner_arg '%q' "$lock_owner"
 if [ "$#" -eq 0 ]; then
   set -- "$(cd "$script_dir/../.." && pwd)"
 fi
@@ -15,10 +23,22 @@ unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 scratch=$(mktemp -d)
 locked=0
 cleanup() {
-  rm -rf "$scratch"
   if [ "$locked" -eq 1 ]; then
-    ssh -o BatchMode=yes -o ForwardAgent=no "$host" 'rmdir /srv/build/runner.lock' || true
+    if ! ssh -o BatchMode=yes -o ForwardAgent=no "$host" \
+      "flock -x /srv/build/runner.lock.guard bash -s -- release $lock_owner_arg" <<'REMOTE'
+set -euo pipefail
+lock=/srv/build/runner.lock
+owner=$2
+if [ -d "$lock" ] && [ -r "$lock/owner" ] && [ "$(cat -- "$lock/owner")" = "$owner" ]; then
+  rm -f -- "$lock/owner" "$lock/started_at"
+  rmdir -- "$lock"
+fi
+REMOTE
+    then
+      echo "Unable to release source-copy lock for $lock_owner; it can be reclaimed after ${lock_stale_after}s" >&2
+    fi
   fi
+  rm -rf "$scratch"
 }
 trap cleanup EXIT
 
@@ -111,13 +131,52 @@ for (const [name, root] of roots) {
 fs.writeFileSync(path.join(scratch, "repos"), rows);
 JS
 
-if [ "${RUNNER_LOCK_HELD:-0}" != 1 ]; then
-  ssh -o BatchMode=yes -o ForwardAgent=no "$host" 'mkdir /srv/build/runner.lock' || {
-    echo 'Runner busy (or not set up); check /srv/build and the runner.lock owner before retrying' >&2
+# The remote update uses several SSH sessions, so one owner record protects the whole sync.
+if ! ssh -o BatchMode=yes -o ForwardAgent=no "$host" \
+  "flock -x /srv/build/runner.lock.guard bash -s -- acquire $lock_owner_arg $lock_stale_after" <<'REMOTE'
+set -euo pipefail
+lock=/srv/build/runner.lock
+owner=$2
+stale_after=$3
+now=$(date +%s)
+if [ -e "$lock" ]; then
+  old_owner='unrecorded legacy lock'
+  if [ -r "$lock/owner" ]; then old_owner=$(cat -- "$lock/owner"); fi
+  if [ -r "$lock/started_at" ]; then
+    old_started=$(cat -- "$lock/started_at")
+  else
+    old_started=$(stat -c %Y -- "$lock")
+  fi
+  if [[ ! "$old_started" =~ ^[0-9]+$ ]]; then
+    old_started=$(stat -c %Y -- "$lock")
+  fi
+  age=$((now - old_started))
+  if (( age < 0 )); then age=0; fi
+  if (( age < stale_after )); then
+    printf 'Runner busy: owner=%s started_at=%s age_s=%s\n' "$old_owner" "$old_started" "$age" >&2
     exit 1
-  }
-  locked=1
+  fi
+  printf 'Reclaiming stale source-copy lock: owner=%s started_at=%s age_s=%s\n' \
+    "$old_owner" "$old_started" "$age" >&2
+  stale=$(mktemp -d /srv/build/.runner.lock.stale.XXXXXX)
+  rmdir -- "$stale"
+  mv -T -- "$lock" "$stale"
+  rm -rf -- "$stale"
 fi
+pending=$(mktemp -d /srv/build/.runner.lock.new.XXXXXX)
+printf '%s\n' "$owner" > "$pending/owner"
+date +%s > "$pending/started_at"
+if ! mv -T -- "$pending" "$lock"; then
+  rm -rf -- "$pending"
+  echo 'Runner busy while acquiring the source-copy lock' >&2
+  exit 1
+fi
+REMOTE
+then
+  echo 'Runner busy (or not set up); inspect /srv/build/runner.lock before retrying' >&2
+  exit 1
+fi
+locked=1
 while IFS=$'\t' read -r name root; do
   echo "sync: $name <- $root"
   head=$(git -C "$root" rev-parse --verify HEAD)
