@@ -799,7 +799,7 @@ impl Snapshots {
             )
             .map_err(|_| Failure {
                 tree_hash: hash.clone(),
-                check: "snapshot build failed".into(),
+                check: format!("prepare base {base} is not a commit in {key}"),
             })?;
             main.tree_hash = git(
                 Path::new(key),
@@ -807,7 +807,7 @@ impl Snapshots {
             )
             .map_err(|_| Failure {
                 tree_hash: hash.clone(),
-                check: "snapshot build failed".into(),
+                check: format!("cannot read the tree of prepare base {}", main.commit),
             })?;
         }
         let mut snapshots = Vec::new();
@@ -815,14 +815,20 @@ impl Snapshots {
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf));
         for (i, sibling) in siblings.iter().enumerate() {
-            let path = fs::canonicalize(sibling).map_err(|_| Failure {
+            let path = fs::canonicalize(sibling).map_err(|error| Failure {
                 tree_hash: hash.clone(),
-                check: "snapshot build failed".into(),
+                check: format!("sibling {sibling} cannot be resolved: {error}"),
             })?;
             if path.parent() != parent.as_deref() {
+                // motor-runner recreates each sibling on the build host at this
+                // same absolute path and accepts only direct neighbours of the
+                // repository root, so it would refuse a sibling anywhere else.
                 return Err(Failure {
                     tree_hash: hash,
-                    check: "snapshot build failed".into(),
+                    check: format!(
+                        "sibling {} must sit in the same folder as the repository root {root}; for a linked worktree, the repository root is its main checkout",
+                        path.display()
+                    ),
                 });
             }
             snapshots.push(
@@ -831,7 +837,7 @@ impl Snapshots {
                     text(&path)
                         .map_err(|_| Failure {
                             tree_hash: hash.clone(),
-                            check: "snapshot build failed".into(),
+                            check: format!("sibling path {} is not valid UTF-8", path.display()),
                         })?
                         .into(),
                     &spool.0,
@@ -844,10 +850,14 @@ impl Snapshots {
                 })?,
             );
         }
-        let git_dependencies = lockfile_sources(&main.path, &main.commit).map_err(|_| Failure {
-            tree_hash: hash,
-            check: "snapshot build failed".into(),
-        })?;
+        let git_dependencies =
+            lockfile_sources(&main.path, &main.commit).map_err(|error| Failure {
+                tree_hash: hash,
+                check: format!(
+                    "cannot read git dependencies from Cargo.lock at {}: {error}",
+                    main.commit
+                ),
+            })?;
         Ok(Self {
             main,
             siblings: snapshots,
@@ -1292,6 +1302,47 @@ mod tests {
             None,
         )
         .unwrap_or_else(|failure| panic!("{}", failure.check))
+    }
+
+    #[test]
+    fn sibling_beside_a_linked_worktree_names_the_main_checkout_it_must_sit_beside() {
+        let (scratch, checkout, spool, _) = repository();
+        let gate = scratch.join("gate");
+        fs::create_dir_all(&gate).unwrap();
+        git(
+            &gate,
+            &["clone", "-q", checkout.to_str().unwrap(), "sibling"],
+        )
+        .unwrap();
+        let linked = gate.join("workspace");
+        git(
+            &checkout,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        )
+        .unwrap();
+        let root = fs::canonicalize(&checkout).unwrap();
+        let sibling = fs::canonicalize(gate.join("sibling")).unwrap();
+
+        let failure = Snapshots::build(
+            &Config::default(),
+            text(&linked).unwrap(),
+            text(&root).unwrap(),
+            &[text(&sibling).unwrap().to_string()],
+            &spool,
+            Uuid::now_v7(),
+            None,
+        )
+        .err()
+        .expect("a sibling beside the linked worktree, not its main checkout, must refuse");
+
+        assert_eq!(
+            failure.check,
+            format!(
+                "sibling {} must sit in the same folder as the repository root {}; for a linked worktree, the repository root is its main checkout",
+                sibling.display(),
+                root.display()
+            )
+        );
     }
 
     #[test]

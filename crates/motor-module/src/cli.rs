@@ -436,7 +436,9 @@ pub fn settle(terminal: &TerminalRecord, err: &mut dyn Write) -> u8 {
                 .retry_after_ms
                 .map(|ms| format!(" (retry after {ms} ms)"))
                 .unwrap_or_default();
-            Some(format!("refused before start: {reason}{detail}{retry}"))
+            Some(format!(
+                "refused before start: {reason}{detail}{retry} (job_id={id})"
+            ))
         }
         (Some(Killed::Deadline), _) => {
             Some(format!("job_id={id} reached its timeout and was stopped"))
