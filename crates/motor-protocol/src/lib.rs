@@ -4,10 +4,15 @@
 //! Unknown object fields are deliberately ignored for additive compatibility.
 
 mod codec;
+mod environment;
 pub mod logging;
 mod types;
 
-pub use codec::{read_frame, read_frame_async, write_frame, write_frame_async};
+pub use codec::{
+    decode_frame, read_frame, read_frame_async, read_record, read_record_async, write_frame,
+    write_frame_async, DecodedFrame, MAX_FRAME_BYTES,
+};
+pub use environment::allowed_env;
 pub use types::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;

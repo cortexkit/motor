@@ -18,21 +18,7 @@ pub use motor::{JobStream, Motor};
 pub use transport::{Connector, Duplex, SshConnector};
 pub use transport::{RUNNER_CREDENTIAL_CATEGORY, RUNNER_CREDENTIAL_ID};
 
-pub fn allowed_env(name: &str) -> bool {
-    (name.starts_with("RUST_")
-        || matches!(name, "RUSTFLAGS" | "RUSTDOCFLAGS")
-        || name.starts_with("CARGO_")
-        || name.starts_with("NEXTEST_")
-        || matches!(name, "CI" | "NO_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE"))
-        && !matches!(
-            name,
-            "CARGO_HOME" | "CARGO_INSTALL_ROOT" | "CARGO_TARGET_DIR"
-        )
-        && (!name.starts_with("CARGO_BUILD_") || name == "CARGO_BUILD_JOBS")
-        && !["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"]
-            .iter()
-            .any(|s| name.contains(s))
-}
+pub use motor_protocol::allowed_env;
 
 #[cfg(test)]
 #[path = "../tests/it/mod.rs"]

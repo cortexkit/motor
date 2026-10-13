@@ -235,11 +235,29 @@ pub enum WithdrawOutcome {
     Started,
 }
 
-/// One SSH/Unix-socket frame. Version 1 uses `type` as its discriminator; variant
-/// fields are inline in the same object. Extra fields never reject a known type.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Frame {
+// Generate the tag probe from the same declaration as Frame so new variants
+// cannot be mistaken for future records when their payload is malformed.
+macro_rules! define_frames {
+    ($($variant:ident $( { $($fields:tt)* } )? $( ( $payload:ty ) )?,)*) => {
+        /// One SSH/Unix-socket frame. Version 1 uses `type` as its discriminator;
+        /// variant fields are inline. Extra fields never reject a known type.
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        pub enum Frame {
+            $($variant $( { $($fields)* } )? $( ( $payload ) )?,)*
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub(crate) enum FrameTag {
+            $($variant,)*
+            #[serde(other)]
+            Unknown,
+        }
+    };
+}
+
+define_frames! {
     Hello {
         protocol_version: u32,
         /// Opt in to sequenced Started records; absence preserves the legacy output cursor.

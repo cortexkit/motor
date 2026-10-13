@@ -478,11 +478,7 @@ impl Connector for SshConnector {
 
 // Boxing decoded frames allocates for every message and makes each consumer
 // unpack a wrapper before it can handle the protocol variant.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Incoming {
-    Frame(Frame),
-    Unknown(Option<u64>),
-}
+pub(crate) use motor_protocol::DecodedFrame as Incoming;
 type WriteRequest = (Frame, oneshot::Sender<io::Result<()>>);
 pub(crate) struct Channel {
     pub gate_jobs: bool,
@@ -654,35 +650,22 @@ impl Channel {
             loop {
                 let mut frame_started = false;
                 let result = async {
-                    let mut header = [0; 4];
+                    let mut first = [0; 1];
                     // A peer can finish its reply and close input while a
                     // heartbeat write fails. Drain readable frames before
                     // treating an outbound failure as an empty response stream.
                     tokio::select! {
                         biased;
-                        result = read_exact_active(&mut read, &mut header[..1]) => result?,
+                        result = read_exact_active(&mut read, &mut first) => result?,
                         _ = read_broken.wait_for(|failed| *failed) => return Err(io::Error::other("channel write failed")),
                     }
                     frame_started = true;
-                    read_exact_active(&mut read, &mut header[1..]).await?;
-                    let len = u32::from_be_bytes(header) as usize;
-                    let mut bytes = vec![0; len];
-                    read_exact_active(&mut read, &mut bytes).await?;
-                    let value: serde_json::Value =
-                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                    match serde_json::from_value::<Frame>(value.clone()) {
-                        Ok(frame) => Ok(Incoming::Frame(frame)),
-                        // Future records do not establish any before-start proof.
-                        // Skip them, but carry their cursor so replay cannot loop.
-                        Err(_)
-                            if value["type"]
-                                .as_str()
-                                .is_some_and(|t| !KNOWN_TYPES.contains(&t)) =>
-                        {
-                            Ok(Incoming::Unknown(value["seq"].as_u64()))
-                        }
-                        Err(e) => Err(io::Error::other(e)),
-                    }
+                    // Return the boundary byte to the shared reader. Once a
+                    // frame starts, an outbound failure must not truncate it.
+                    let mut prefixed = first.as_slice().chain(ActiveReader::new(&mut read));
+                    motor_protocol::read_record_async(&mut prefixed)
+                        .await?
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame"))
                 }
                 .await;
                 match result {
@@ -767,36 +750,6 @@ impl Channel {
             .ok_or_else(|| io::Error::other("channel detached"))
     }
 }
-const KNOWN_TYPES: &[&str] = &[
-    "hello",
-    "have",
-    "have_reply",
-    "run",
-    "accepted",
-    "started",
-    "refusal",
-    "bundle_chunk",
-    "output",
-    "heartbeat",
-    "withdraw",
-    "withdraw_reply",
-    "attach",
-    "terminal",
-    "prepare",
-    "prepare_accepted",
-    "prepared",
-    "drop",
-    "drop_reply",
-    "status",
-    "status_reply",
-    "job_status",
-    "job_status_reply",
-    "drain",
-    "drain_reply",
-    "cancel",
-    "cancel_reply",
-];
-
 #[cfg(test)]
 #[path = "../tests/it/master.rs"]
 mod master_tests;
@@ -999,6 +952,50 @@ mod disconnect_tests {
 }
 
 // Bound silence between actual I/O advances, not the duration of a large frame.
+struct ActiveReader<R> {
+    read: R,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<R> ActiveReader<R> {
+    fn new(read: R) -> Self {
+        Self {
+            read,
+            deadline: Box::pin(tokio::time::sleep(Duration::from_secs(60))),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ActiveReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.read).poll_read(cx, buf) {
+            std::task::Poll::Ready(result) => {
+                if result.is_ok() && buf.filled().len() > before {
+                    self.deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_secs(60));
+                }
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => {
+                if self.deadline.as_mut().poll(cx).is_ready() {
+                    std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "read inactivity",
+                    )))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 async fn read_exact_active<R: AsyncRead + Unpin>(
     read: &mut R,
     mut bytes: &mut [u8],
@@ -1018,10 +1015,8 @@ async fn read_exact_active<R: AsyncRead + Unpin>(
     Ok(())
 }
 async fn write_active<W: AsyncWrite + Unpin>(write: &mut W, frame: &Frame) -> io::Result<()> {
-    let json = serde_json::to_vec(frame).map_err(io::Error::other)?;
-    let len = u32::try_from(json.len()).map_err(io::Error::other)?;
-    let mut bytes = len.to_be_bytes().to_vec();
-    bytes.extend(json);
+    let mut bytes = Vec::new();
+    motor_protocol::write_frame(&mut bytes, frame)?;
     let mut offset = 0;
     while offset < bytes.len() {
         let n = tokio::time::timeout(Duration::from_secs(60), write.write(&bytes[offset..]))
