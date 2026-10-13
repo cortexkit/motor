@@ -93,6 +93,53 @@ pub(crate) struct Job {
     pub execution_ended_ms: Option<u64>,
 }
 
+/// A sidecar preserves damaged records and any independently readable ownership.
+/// It has no expiry: only an operator who has reconciled the execution may remove
+/// it and repair the original record. Keeping the original unreadable also makes
+/// rollback fail closed on runners that do not recognize this sidecar.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct QuarantinedJob {
+    pub id: Uuid,
+    pub request: Option<Run>,
+    pub process: Option<crate::platform::ProcessIdentity>,
+    pub observed_ms: u64,
+}
+
+impl QuarantinedJob {
+    pub fn preserve_rollback_fence(&self, record: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(record) {
+            // An older runner ignores the quarantine index. If storage loses
+            // the original too, an unreadable placeholder preserves its startup
+            // refusal. Repeating this migration never changes an existing record.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                atomic_json_private(record, &serde_json::json!({ "quarantined_job": self.id }))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn inspect(id: Uuid, path: &Path, now: u64) -> Self {
+        let value = read_json::<serde_json::Value>(path).ok().filter(|value| {
+            value.get("id").and_then(|id| id.as_str()) == Some(id.to_string().as_str())
+        });
+        let request = value
+            .as_ref()
+            .and_then(|value| value.get("request"))
+            .and_then(|request| serde_json::from_value::<Run>(request.clone()).ok())
+            .filter(|request| request.job_id == id);
+        let process = value
+            .as_ref()
+            .and_then(|value| value.get("process"))
+            .and_then(|process| serde_json::from_value(process.clone()).ok());
+        Self {
+            id,
+            request,
+            process,
+            observed_ms: now,
+        }
+    }
+}
+
 impl Job {
     pub fn gate_job(&self) -> bool {
         !self.base
@@ -334,7 +381,7 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
     } else {
         File::create(&tmp)?
     };
-    serde_json::to_writer(&mut file, value).map_err(invalid)?;
+    write_json(&mut file, value)?;
     file.flush()?;
     file.sync_all()?;
     fs::rename(tmp, path)?;
@@ -342,7 +389,12 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
 }
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
-    serde_json::from_reader(File::open(path)?).map_err(invalid)
+    serde_json::from_slice(&fs::read(path)?).map_err(invalid)
+}
+
+fn write_json(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(invalid)?;
+    writer.write_all(&bytes)
 }
 
 pub(crate) fn mint_ms(id: Uuid) -> u64 {
@@ -352,4 +404,70 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
             s * 1000 + u64::from(n) / 1_000_000
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_serialization_uses_one_bulk_write() {
+        let value: Vec<_> = (0..10_000).map(|n| format!("record-{n}")).collect();
+        let mut writer = CountingWriter::default();
+        write_json(&mut writer, &value).unwrap();
+        assert_eq!(writer.bytes, serde_json::to_vec(&value).unwrap());
+        assert_eq!(
+            writer.writes, 1,
+            "JSON tokens must not become separate file writes"
+        );
+    }
+
+    #[test]
+    fn json_records_keep_legacy_bytes_and_private_publication_rules() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let scratch = ScratchDir::new("runner-json");
+        let path = scratch.join("record.json");
+        let mut job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        job.terminal(Outcome::Exit { code: 0 }, 456);
+        let mut legacy_bytes = Vec::new();
+        serde_json::to_writer(&mut legacy_bytes, &job).unwrap();
+        atomic_json_private(&path, &job).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let legacy_job: Job = serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+        assert_eq!(legacy_job.id, job.id);
+        assert_eq!(
+            read_json::<Job>(&path).unwrap().next_seq,
+            legacy_job.next_seq
+        );
+        assert!(!path.with_extension("tmp").exists());
+        let victim = scratch.join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, path.with_extension("tmp")).unwrap();
+        assert!(atomic_json_private(&path, &job).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+    }
 }
