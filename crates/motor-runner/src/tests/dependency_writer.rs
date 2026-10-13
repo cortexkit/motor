@@ -1112,3 +1112,96 @@ async fn restart_does_not_authorize_legacy_catalog_tips_without_descriptors() {
         "new capable request did not authorize a fill"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires trusted operator, motor-cache, motor-job, sccache, ACLs, sudo and systemd"]
+async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    fs::write(f.main.join("source.rs"), "pub fn value() -> u32 { 7 }\n").unwrap();
+    commit(&f.main, "cache ACL fixture\n");
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    config.base_commands = vec!["sccache rustc --crate-type lib --crate-name acl_cache source.rs -o \"$CARGO_TARGET_DIR/libacl_cache.rlib\" && sccache --show-stats".into()];
+    let state = config.state_dir();
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    // chmod restricts an extended ACL's mask, not its owning-group entry.
+    // Simulate a prior installation with group access hidden behind that mask.
+    let seeded = Command::new("/usr/bin/setfacl")
+        .args([
+            "-m",
+            "u:motor-job:--x,u:motor-cache:--x,g::rwx,m::rwx",
+            "--",
+        ])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let assert_private = || {
+        let output = Command::new("/usr/bin/getfacl")
+            .args(["-cp", "--"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let acl = String::from_utf8(output.stdout).unwrap();
+        for entry in [
+            "user::rwx",
+            "user:motor-job:--x",
+            "user:motor-cache:--x",
+            "group::---",
+            "mask::--x",
+            "other::---",
+        ] {
+            assert!(
+                acl.lines().any(|line| line == entry),
+                "missing {entry}:\n{acl}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o710
+        );
+    };
+    let runner = Runner::open(config).unwrap();
+    assert!(
+        runner.config().writer_account.is_some(),
+        "cache writer must be enabled"
+    );
+    assert_private();
+    let (r, bytes) = f.run("true");
+    f.submit(&runner, &r, &bytes);
+    assert_eq!(
+        terminal(&runner, r.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    base_done(&runner).await;
+    assert_eq!(
+        repository(&f, &runner).result,
+        Some(RebuildResult::Ok),
+        "{}",
+        writer_diagnostics(&f, &runner)
+    );
+    let fills = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .values()
+        .filter(|job| job.base)
+        .count();
+    assert_eq!(fills, 1, "fixture must complete one real cache fill");
+    assert_private();
+}
