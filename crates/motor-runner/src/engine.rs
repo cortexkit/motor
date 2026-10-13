@@ -382,6 +382,34 @@ struct Inner {
     pending_start_refusals: BTreeSet<Uuid>,
 }
 
+fn nested_workspace_detail(
+    inner: &Inner,
+    workspace: &str,
+    repository: &str,
+    siblings: &[SiblingSnapshot],
+) -> Option<String> {
+    // Prepared checkouts may be owned by a job account; compare path components
+    // so similarly named sibling directories remain independent workspaces.
+    let mut candidates = std::iter::once(("workspace", workspace))
+        .chain(
+            siblings
+                .iter()
+                .map(|sibling| ("sibling", sibling.canonical_path.as_str())),
+        )
+        .chain(std::iter::once(("repository", repository)));
+    candidates.find_map(|(kind, candidate)| {
+        let candidate_path = Path::new(candidate);
+        inner.catalog.workspaces.keys().find_map(|known| {
+            let known_path = Path::new(known);
+            (candidate_path != known_path && candidate_path.starts_with(known_path)).then(|| {
+                format!(
+                    "{kind} {candidate} is inside runner workspace {known}; nested workspaces aren't supported, so move it outside any remote workspace"
+                )
+            })
+        })
+    })
+}
+
 struct Reservation {
     repository: String,
     commit: String,
@@ -1333,6 +1361,13 @@ impl Runner {
                     request.cwd
                 ),
             ))
+        } else if let Some(detail) = nested_workspace_detail(
+            inner,
+            &request.workspace_key,
+            &request.repository_root,
+            &request.siblings,
+        ) {
+            Some((RefusalReason::WorkspaceSetupFailed, detail))
         } else if let Err(error) = self.validate_writer_paths_with_catalog(
             inner,
             &request.workspace_key,
@@ -2391,6 +2426,39 @@ impl Runner {
         for key in idle {
             self.discard(Path::new(&key))?;
             inner.catalog.workspaces.remove(&key);
+        }
+        let stale_repositories: Vec<_> = inner
+            .catalog
+            .repositories
+            .iter()
+            .filter_map(|(repository, record)| {
+                let has_unfinished_job = inner.jobs.values().any(|job| {
+                    job.terminal.is_none()
+                        && job.request.as_ref().is_some_and(|request| {
+                            request.repository_root.as_str() == repository.as_str()
+                        })
+                });
+                let fill_in_progress = record.result.as_ref() == Some(&RebuildResult::Building);
+                // Preserve a new descriptor until its first fill attempt reports a result.
+                let waiting_for_first_attempt = record.result.is_none()
+                    && record
+                        .requested_descriptor
+                        .as_ref()
+                        .is_some_and(|requested| {
+                            record.failed_descriptor.as_ref() != Some(requested)
+                        });
+                (!Path::new(repository).exists()
+                    && !has_unfinished_job
+                    && !fill_in_progress
+                    && !waiting_for_first_attempt
+                    && record.filled_descriptor.is_none()
+                    && record.filled_descriptors.is_empty())
+                .then(|| repository.clone())
+            })
+            .collect();
+        for repository in stale_repositories {
+            inner.catalog.repositories.remove(&repository);
+            tracing::info!(repository = %repository, "removed stale writer repository record");
         }
         let active_transfers = inner.transfers.clone();
         inner.catalog.transferred.retain(|id, t| {
