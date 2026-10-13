@@ -54,9 +54,7 @@ jobs:
           env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo nextest --version
           python3 --version
       - name: Nothing tracked under .cortexkit/ outside the allowlist
-        run: |
-          tracked=$(git ls-files -ci --exclude-standard -- .cortexkit)
-          if [ -n "$tracked" ]; then echo "$tracked"; exit 1; fi
+        run: scripts/check-cortexkit-layout.sh
       - name: Formatting
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo fmt --all --check
       - name: All-target workspace check

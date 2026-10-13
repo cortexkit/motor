@@ -38,16 +38,8 @@ failed_units() {
   systemctl list-units --all --no-legend --plain 'motor-*' | awk '$4 == "failed"' | wc -l
 }
 
-# Nothing under .cortexkit/ may be tracked except the .gitignore allowlist
-# (WORKSPACE.md "Where files go"); the command prints any violating path.
-cortexkit_layout() {
-  local tracked
-  tracked=$(git ls-files -ci --exclude-standard -- .cortexkit)
-  [ -z "$tracked" ] || { echo "tracked but ignored under .cortexkit/:"; echo "$tracked"; return 1; }
-}
-
 before=$(failed_units)
-step cortexkit-layout cortexkit_layout
+step cortexkit-layout scripts/check-cortexkit-layout.sh
 step fmt cargo fmt --all --check
 step clippy cargo clippy --workspace --all-targets --locked -- -D warnings
 for run in 1 2; do
