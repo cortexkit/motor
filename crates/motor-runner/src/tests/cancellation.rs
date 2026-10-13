@@ -116,9 +116,7 @@ impl CancellationFixture {
     }
 
     fn retry(&self, instant: Instant) {
-        self.runner
-            .enforce_kills(&mut self.runner.core.inner.lock().unwrap(), instant)
-            .unwrap();
+        self.runner.enforce_kills(instant).unwrap();
     }
 }
 

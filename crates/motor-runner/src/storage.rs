@@ -31,6 +31,34 @@ pub(crate) struct Chunk {
     pub length: u64,
 }
 
+/// Cloning a job under the state lock shares its immutable output index. An
+/// append copies that index only when it mutates the off-lock working record.
+/// Serialization remains the legacy array of chunk descriptors.
+#[derive(Clone, Default)]
+pub(crate) struct Chunks(Arc<VecDeque<Chunk>>);
+
+impl std::ops::Deref for Chunks {
+    type Target = VecDeque<Chunk>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Chunks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+impl Serialize for Chunks {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Chunks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        VecDeque::<Chunk>::deserialize(deserializer).map(|chunks| Self(Arc::new(chunks)))
+    }
+}
+
 pub(crate) const NO_QUEUE: u64 = u64::MAX;
 pub(crate) fn empty_queue_entry() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(NO_QUEUE))
@@ -58,7 +86,7 @@ pub(crate) struct Job {
     pub started: Option<Started>,
     pub process: Option<crate::platform::ProcessIdentity>,
     pub terminal: Option<TerminalRecord>,
-    pub chunks: VecDeque<Chunk>,
+    pub chunks: Chunks,
     pub next_seq: u64,
     pub output_bytes: u64,
     pub weight: u32,
@@ -162,7 +190,7 @@ impl Job {
             started: None,
             process: None,
             terminal: None,
-            chunks: VecDeque::new(),
+            chunks: Chunks::default(),
             next_seq: 0,
             output_bytes: 0,
             weight,
@@ -392,6 +420,31 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Resu
     serde_json::from_slice(&fs::read(path)?).map_err(invalid)
 }
 
+pub(crate) fn recover_output_tail(directory: &Path, job: &Job) {
+    let committed: BTreeSet<_> = job.chunks.iter().map(|chunk| chunk.seq).collect();
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(job_id = %job.id, %error, "cannot inspect uncommitted output tail");
+            return;
+        }
+    };
+    // Chunk data precedes index publication. Anything outside the persisted
+    // index is an incomplete append or retired history, not a replay record.
+    for entry in entries.flatten() {
+        let sequence = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("chunk-"))
+            .and_then(|sequence| sequence.parse::<u64>().ok());
+        if sequence.is_some_and(|sequence| !committed.contains(&sequence)) {
+            if let Err(error) = fs::remove_file(entry.path()) {
+                tracing::warn!(job_id = %job.id, %error, "cannot remove uncommitted output tail");
+            }
+        }
+    }
+}
+
 fn write_json(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(invalid)?;
     writer.write_all(&bytes)
@@ -410,6 +463,32 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn chunk_metadata_clone_shares_until_mutation_and_keeps_legacy_array_format() {
+        let mut chunks = Chunks::default();
+        chunks.push_back(Chunk {
+            seq: 0,
+            stream: OutputStream::Stdout,
+            length: 7,
+        });
+        let snapshot = chunks.clone();
+        assert!(Arc::ptr_eq(&chunks.0, &snapshot.0));
+        let bytes = serde_json::to_vec(&chunks).unwrap();
+        let legacy: VecDeque<Chunk> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].seq, 0);
+        assert_eq!(legacy[0].length, 7);
+        assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+        chunks.push_back(Chunk {
+            seq: 1,
+            stream: OutputStream::Stderr,
+            length: 9,
+        });
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(chunks.len(), 2);
+        assert!(!Arc::ptr_eq(&chunks.0, &snapshot.0));
+    }
 
     #[derive(Default)]
     struct CountingWriter {
