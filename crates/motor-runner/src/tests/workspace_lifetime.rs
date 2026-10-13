@@ -431,6 +431,35 @@ fn destination_roots_check_future_paths_symlink_cwd_and_heads() {
     assert!(workspace::validate_destinations(&[], &f.key, None, &[]).is_err());
 }
 
+#[test]
+fn destination_roots_accept_a_root_reached_through_a_symlinked_prefix() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    // Like macOS /var -> /private/var: the configured root and the request
+    // path spell the same directory differently.
+    let real = f.scratch.join("real-root");
+    fs::create_dir_all(real.join("workspace")).unwrap();
+    let alias = f.scratch.join("alias-root");
+    symlink(&real, &alias).unwrap();
+    let canonical = fs::canonicalize(real.join("workspace")).unwrap();
+    workspace::validate_destinations(std::slice::from_ref(&alias), text(&canonical), None, &[])
+        .unwrap();
+    workspace::validate_destinations(
+        &[fs::canonicalize(&real).unwrap()],
+        text(&alias.join("workspace")),
+        None,
+        &[],
+    )
+    .unwrap();
+    assert!(workspace::validate_destinations(
+        &[alias],
+        text(&f.scratch.join("elsewhere")),
+        None,
+        &[]
+    )
+    .is_err());
+}
+
 #[tokio::test]
 async fn destination_alias_is_rechecked_before_population() {
     use std::os::unix::fs::symlink;

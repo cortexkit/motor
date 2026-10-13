@@ -180,12 +180,13 @@ pub(crate) fn validate_destinations(
                     "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
                 ))
             })?;
-            if roots.iter().zip(&allowed).any(|(root, resolved)| {
-                Path::new(path).starts_with(root)
-                    && Path::new(path) != root
-                    && canonical.starts_with(resolved)
-                    && canonical != *resolved
-            }) {
+            // Compare resolved paths only: a root or a request path may reach the
+            // same directory through a symlinked prefix (macOS /var is
+            // /private/var), and what matters is where the files actually land.
+            if allowed
+                .iter()
+                .any(|resolved| canonical.starts_with(resolved) && canonical != *resolved)
+            {
                 return Ok(canonical);
             }
         }
