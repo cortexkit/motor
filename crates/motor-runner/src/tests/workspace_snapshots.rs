@@ -105,3 +105,45 @@ fn sync_workspace_stages_ignored_snapshot_inputs_on_fresh_clone() {
 fn sync_workspace_stages_ignored_snapshot_inputs_on_reuse() {
     sync_stages_ignored_snapshot_inputs(true);
 }
+
+#[tokio::test]
+async fn staged_renames_preserve_destination_paths_and_finish_ownership() {
+    let f = Fixture::new();
+    for source in ["ascii-file.rs", "abé-file.rs", "é", "a"] {
+        fs::write(f.main.join(source), "rename content\n").unwrap();
+    }
+    git(&f.main, &["add", "."]);
+    git(
+        &f.main,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "rename sources",
+        ],
+    );
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("git mv ascii-file.rs ascii-dest.rs; git mv abé-file.rs unicode-dest.rs; git mv é short-unicode.rs; git mv a short-ascii.rs");
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 });
+    let mut changes = result.workspace_changes.unwrap();
+    changes.sort();
+    assert_eq!(
+        changes,
+        [
+            "ascii-dest.rs",
+            "short-ascii.rs",
+            "short-unicode.rs",
+            "unicode-dest.rs"
+        ]
+    );
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(!inner.finalizing.contains(&request.job_id));
+    assert!(!Runner::occupied(&inner, &request.workspace_key));
+}

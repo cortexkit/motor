@@ -91,6 +91,7 @@ impl ClientFixture {
         git(&source, &["init", "-q"]);
         let mut config = Config::new(scratch.join("state"), "reader");
         config.workspace_roots = vec![scratch.join("workspaces")];
+        config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
         config.free_space_floor_bytes = 0;
         config.isolate_jobs = true;
         config.base_commands = vec![warm.into()];

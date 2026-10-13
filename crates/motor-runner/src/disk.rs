@@ -377,6 +377,7 @@ impl Runner {
                 continue;
             };
             if !workspace::absolute(key)
+                || self.validate_destinations(key, None, &[]).is_err()
                 || path.symlink_metadata()?.file_type().is_symlink()
                 || (workspace.kind != WorkspaceKind::Head
                     && (!roots
@@ -707,20 +708,26 @@ impl Runner {
                 continue;
             };
             self.long_work("disk_remove");
+            let authorization = candidate
+                .workspace
+                .as_ref()
+                .map_or(Ok(()), |key| self.validate_destinations(key, None, &[]));
             #[cfg(target_os = "linux")]
-            let access = if self.core.config.isolate_jobs {
-                if candidate.path.parent()
-                    == Some(self.core.trees.state.join("sandboxes").as_path())
-                {
-                    crate::isolation::reclaim_runtime(&candidate.path)
+            let access = authorization.and_then(|()| {
+                if self.core.config.isolate_jobs {
+                    if candidate.path.parent()
+                        == Some(self.core.trees.state.join("sandboxes").as_path())
+                    {
+                        crate::isolation::reclaim_runtime(&candidate.path)
+                    } else {
+                        crate::isolation::restore_runner_access(&candidate.path)
+                    }
                 } else {
-                    crate::isolation::restore_runner_access(&candidate.path)
+                    Ok(())
                 }
-            } else {
-                Ok(())
-            };
+            });
             #[cfg(not(target_os = "linux"))]
-            let access: io::Result<()> = Ok(());
+            let access: io::Result<()> = authorization;
             let deleted = access.and_then(|()| {
                 let bytes = allocated_bytes(&candidate.path, device)?;
                 if candidate.cache_disk {

@@ -352,3 +352,35 @@ async fn cancel_recorded_after_unit_exit_finalizes_without_signalling() {
         .iter()
         .all(|args| args[0] == "show"));
 }
+
+#[tokio::test]
+async fn pipe_output_failure_drains_verbose_child_and_releases_workspace() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    config.before_job_write = Some(Arc::new(|path| {
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chunk-")
+        {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            Ok(())
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("head -c 2097152 /dev/zero; printf completed > pipe-completed");
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert!(Path::new(&f.key).join("pipe-completed").exists());
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(!Runner::occupied(&inner, &f.key));
+    assert!(inner.jobs[&request.job_id]
+        .monitoring_error
+        .as_ref()
+        .unwrap()
+        .contains("space"));
+}

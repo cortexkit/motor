@@ -384,6 +384,7 @@ async fn javascript_snapshot_bundle_imports_and_reuses_for_second_job() {
     let workspace = workspaces.join("job");
     let mut config = Config::new(scratch.join("state"), "bundle");
     config.workspace_roots = vec![workspaces];
+    config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
     config.free_space_floor_bytes = 0;
     let socket_scratch = SocketScratch::new();
     let socket = javascript_socket_path(&socket_scratch);
@@ -473,6 +474,7 @@ async fn isolated_nested_javascript_jobs_resolve_offline_and_reuse_trusted_cache
     let workspace = workspaces.join("job");
     let mut config = Config::new(scratch.join("state"), "nested-js");
     config.workspace_roots = vec![workspaces];
+    config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
     config.free_space_floor_bytes = 0;
     config.isolate_jobs = true;
     let state = config.state_dir();

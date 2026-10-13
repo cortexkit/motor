@@ -123,6 +123,11 @@ pub(crate) struct Output {
 pub(crate) trait Execution: Send {
     fn release(&mut self) -> io::Result<()>;
     fn output(&self) -> io::Result<Output>;
+    /// Stop resources owned by this execution that backend cancellation cannot
+    /// address, before waiting or reaping the still-owned child.
+    fn abort(&self) -> io::Result<()> {
+        Ok(())
+    }
     fn wait(&mut self) -> io::Result<ExecutionOutcome>;
     fn reap(&self);
 }
@@ -283,6 +288,12 @@ pub(crate) struct HostBackend;
 impl Backend for HostBackend {
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
+        workspace::validate_destinations(
+            &config.owned_workspace_roots,
+            if s.base { &r.cwd } else { &r.workspace_key },
+            Some(&r.cwd),
+            &r.siblings,
+        )?;
         if !s.base {
             crate::writer::validate_paths(
                 config,
@@ -747,6 +758,20 @@ impl Execution for platform::Launch {
             stdout: Box::new(self.stdout.try_clone()?),
             stderr: Box::new(self.stderr.try_clone()?),
         })
+    }
+    fn abort(&self) -> io::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            // The portable backend has no restart-safe PID signalling. Here
+            // the unreaped execution still owns its child and process group.
+            if unsafe { libc::kill(-self.identity.pid, libc::SIGKILL) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
     fn wait(&mut self) -> io::Result<ExecutionOutcome> {
         self.wait().map(ExecutionOutcome::Unix)

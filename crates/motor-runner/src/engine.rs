@@ -74,6 +74,11 @@ pub struct Config {
     pub free_space_floor_bytes: u64,
     /// Only catalogued workspaces beneath these roots may be pressure-evicted.
     pub workspace_roots: Vec<PathBuf>,
+    /// Authorized destinations for caller workspaces, heads and siblings.
+    /// Independent of pressure eviction; Windows never materializes caller paths.
+    pub owned_workspace_roots: Vec<PathBuf>,
+    /// Maximum time Drop waits for existing workspace ownership to end.
+    pub drop_timeout: Duration,
     /// Probe available bytes on the filesystem containing the supplied path.
     pub free_space_probe: FreeSpaceProbe,
     /// Linux production uses systemd services under motor-job. The portable
@@ -199,6 +204,8 @@ impl Config {
             windows_prep_executable: None,
             free_space_floor_bytes: DEFAULT_FREE_SPACE_FLOOR_BYTES,
             workspace_roots: vec![PathBuf::from("/Users")],
+            owned_workspace_roots: vec![PathBuf::from("/Users")],
+            drop_timeout: Duration::from_secs(60),
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
             job_network: None,
@@ -456,6 +463,22 @@ pub struct Runner {
     core: Arc<Core>,
 }
 
+struct WorkspaceDrop {
+    runner: Runner,
+    key: String,
+}
+impl Drop for WorkspaceDrop {
+    fn drop(&mut self) {
+        self.runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .dropping
+            .remove(&self.key);
+    }
+}
+
 pub(crate) enum Admission {
     Accepted(u32),
     Refused(RefusalReason),
@@ -487,6 +510,7 @@ impl Runner {
             || config
                 .workspace_roots
                 .iter()
+                .chain(&config.owned_workspace_roots)
                 .any(|p| !workspace::absolute(&p.to_string_lossy()) || p.parent().is_none())
         {
             return Err(invalid("invalid runner configuration"));
@@ -522,6 +546,22 @@ impl Runner {
             crate::isolation::prepare_shared_read_access()?;
         }
         let state = config.state_dir();
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+            // Bind may initially inherit a loose umask. A private, owned parent
+            // prevents other users reaching the socket before its chmod.
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&state)?;
+            let metadata = fs::symlink_metadata(&state)?;
+            if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(invalid(
+                    "runner state directory must be owned by the daemon and not a symlink",
+                ));
+            }
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+        }
         fs::create_dir_all(state.join("jobs"))?;
         if config.windows_instance() {
             use std::os::unix::fs::PermissionsExt;
@@ -1396,6 +1436,23 @@ impl Runner {
         )
     }
 
+    fn validate_destinations(
+        &self,
+        key: &str,
+        cwd: Option<&str>,
+        siblings: &[SiblingSnapshot],
+    ) -> io::Result<()> {
+        if self.core.config.windows_instance() {
+            return Ok(());
+        }
+        workspace::validate_destinations(
+            &self.core.config.owned_workspace_roots,
+            key,
+            cwd,
+            siblings,
+        )
+    }
+
     fn validate_writer_paths_with_catalog(
         &self,
         inner: &Inner,
@@ -1430,12 +1487,20 @@ impl Runner {
         for request in inner
             .jobs
             .values()
-            .filter(|job| job.base)
+            .filter(|job| {
+                job.base
+                    && (job.terminal.is_none()
+                        || job
+                            .request
+                            .as_ref()
+                            .is_some_and(|r| Path::new(&r.cwd).exists()))
+            })
             .filter_map(|job| job.request.as_ref())
         {
             known.push(PathBuf::from(&request.cwd));
         }
-        crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)
+        crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
+        self.validate_destinations(workspace, cwd, siblings)
     }
 
     fn deleting(inner: &Inner, key: &str, siblings: &[SiblingSnapshot]) -> bool {
@@ -1672,6 +1737,15 @@ impl Runner {
         };
         let started = std::time::Instant::now();
         self.long_work("materialize");
+        if let Err(error) = self.validate_destinations(&r.workspace_key, None, &r.siblings) {
+            self.core
+                .inner
+                .lock()
+                .unwrap()
+                .reserved
+                .remove(&r.workspace_key);
+            return Err(error);
+        }
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs {
             let workspace_path = Path::new(&r.workspace_key);
@@ -2317,25 +2391,34 @@ impl Runner {
     /// pool: this is called from a connection's async task, and an async
     /// worker parked on the lock stops the runner answering other connections.
     pub async fn drop_workspace(&self, key: &str) -> io::Result<DropReply> {
+        self.validate_destinations(key, None, &[])?;
         let key = key.to_string();
-        let ids: Vec<_> = self
+        let (guard, ids) = self
             .off_runtime({
                 let key = key.clone();
                 move |runner| {
                     let mut inner = runner.core.inner.lock().unwrap();
-                    inner.dropping.insert(key.clone());
-                    Ok(inner
+                    if !inner.dropping.insert(key.clone()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "workspace drop already in progress",
+                        ));
+                    }
+                    let ids: Vec<_> = inner
                         .jobs
                         .values()
                         .filter(|j| j.key() == key && j.terminal.is_none())
                         .map(|j| j.id)
-                        .collect())
+                        .collect();
+                    drop(inner);
+                    Ok((WorkspaceDrop { runner, key }, ids))
                 }
             })
             .await?;
         for &id in &ids {
             self.off_runtime(move |runner| runner.cancel(id)).await?;
         }
+        let deadline = tokio::time::Instant::now() + self.core.config.drop_timeout;
         loop {
             let active = self
                 .off_runtime({
@@ -2355,10 +2438,20 @@ impl Runner {
             if !active {
                 break;
             }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "workspace owner did not stop before drop deadline",
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         self.off_runtime(move |runner| {
+            // The blocking operation owns the fence even if its async caller
+            // disconnects. Only this operation may remove its marker.
+            let _guard = guard;
             let _pressure = runner.core.disk.lock().unwrap();
+            runner.validate_destinations(&key, None, &[])?;
             let mut inner = runner.core.inner.lock().unwrap();
             let dropped = inner.catalog.workspaces.contains_key(&key);
             if dropped {
@@ -2366,7 +2459,6 @@ impl Runner {
                 inner.catalog.workspaces.remove(&key);
                 runner.catalog(&inner)?;
             }
-            inner.dropping.remove(&key);
             runner.prune_refs(&inner)?;
             Ok(DropReply::new(dropped, ids))
         })
@@ -2424,6 +2516,10 @@ impl Runner {
             .map(|(k, _)| k.clone())
             .collect();
         for key in idle {
+            if let Err(error) = self.validate_destinations(&key, None, &[]) {
+                tracing::warn!(workspace = %key, %error, "workspace expiry refused outside owned roots");
+                continue;
+            }
             self.discard(Path::new(&key))?;
             inner.catalog.workspaces.remove(&key);
         }
@@ -3073,63 +3169,46 @@ impl Runner {
         j.started = Some(started);
         j.next_seq += 1;
         if let Err(error) = self.save(j) {
-            if !self.core.config.windows_instance() {
-                // An in-memory Started is not evidence of restart recovery if
-                // the record write failed. Keep this job holding the drain.
-                j.started = None;
-                return Err(error);
-            }
-            j.process = None;
-            j.started_ms = None;
             j.started = None;
-            j.next_seq = 0;
-            j.state = JobState::Queued;
-            let mut refused = j.clone();
-            refuse_before_start(
-                &self.core.health,
-                &mut refused,
-                RefusalReason::Unknown("start_not_persisted".into()),
-                &error,
-                Some("Started could not be persisted; the Windows command was not released".into()),
-                self.now(),
-            );
-            refused.state = JobState::Tombstone;
             inner.starting.insert(id);
             inner.finalizing.insert(id);
-            // Cleanup can wait for systemd and the I/O thread. It must not hold
-            // the state lock used by status, cancellation and the next dispatch.
             drop(inner);
-            launch.execution.reap();
-            drop(launch);
-            let mut inner = self.core.inner.lock().unwrap();
-            if self.save(&refused).is_err() {
-                inner.pending_start_refusals.insert(id);
-            }
-            inner.jobs.insert(id, refused);
-            inner.starting.remove(&id);
-            inner.finalizing.remove(&id);
-            return Ok(());
+            return self.failed_launch(id, launch.execution, error, true, "start_not_persisted");
         }
+        let mut execution = launch.execution;
+        // Pipe handles must exist before the command can fill its output pipes.
+        let output = match execution.output() {
+            Ok(output) => Some(output),
+            Err(error) if launch.durable_output => {
+                tracing::warn!(job_id = %id, %error, "job CPU accounting unavailable");
+                None
+            }
+            Err(error) => {
+                inner.starting.insert(id);
+                inner.finalizing.insert(id);
+                drop(inner);
+                return self.failed_launch(id, execution, error, true, "output_unavailable");
+            }
+        };
         #[cfg(test)]
         if let Some(hook) = &self.core.config.before_gate {
             hook();
         }
-        let mut execution = launch.execution;
-        execution.release()?;
+        if let Err(error) = execution.release() {
+            inner.starting.insert(id);
+            inner.finalizing.insert(id);
+            drop(inner);
+            return self.failed_launch(id, execution, error, false, "release_failed");
+        }
         tracing::info!(job_id = %id, workspace = %r.workspace_key, base = s.base, permits = j.weight, since_ms = j.started_ms, "job started");
         drop(inner);
         if launch.durable_output {
-            match execution.output() {
-                Ok(output) => {
-                    std::thread::spawn(move || {
-                        let _ = io::copy(&mut { output.stdout }, &mut io::sink());
-                    });
-                    let runner = self.clone();
-                    std::thread::spawn(move || runner.collect_accounting(id, output.stderr));
-                }
-                Err(error) => {
-                    tracing::warn!(job_id = %id, %error, "job CPU accounting unavailable")
-                }
+            if let Some(output) = output {
+                std::thread::spawn(move || {
+                    let _ = io::copy(&mut { output.stdout }, &mut io::sink());
+                });
+                let runner = self.clone();
+                std::thread::spawn(move || runner.collect_accounting(id, output.stderr));
             }
             let runner = self.clone();
             std::thread::spawn(move || {
@@ -3139,7 +3218,7 @@ impl Runner {
             });
             return Ok(());
         }
-        let output = execution.output()?;
+        let output = output.unwrap();
         let stdout = output.stdout;
         let stderr = output.stderr;
         let runner = self.clone();
@@ -3147,21 +3226,35 @@ impl Runner {
             let reader = |mut file: Box<dyn Read + Send>, stream: OutputStream, runner: Runner| {
                 std::thread::spawn(move || {
                     let mut buffer = [0; 16384];
+                    let mut persistence_error = None;
+                    let mut dropped_bytes = 0u64;
                     loop {
                         match file.read(&mut buffer) {
                             Ok(0) => break,
                             Ok(n) => {
-                                if let Err(error) = runner.output(id, stream.clone(), &buffer[..n])
-                                {
-                                    tracing::error!(%error, "output persistence failed");
-                                    return Err(error);
+                                if persistence_error.is_none() {
+                                    if let Err(error) =
+                                        runner.output(id, stream.clone(), &buffer[..n])
+                                    {
+                                        persistence_error = Some(error);
+                                    }
+                                }
+                                // Keep the pipe flowing after storage fails; the
+                                // execution still owns another read descriptor.
+                                if persistence_error.is_some() {
+                                    dropped_bytes += n as u64;
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                             Err(error) => return Err(error),
                         }
                     }
-                    Ok(())
+                    if let Some(error) = persistence_error {
+                        tracing::error!(job_id = %id, %error, dropped_bytes, "output persistence failed; pipe drained");
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
                 })
             };
             let a = reader(stdout, OutputStream::Stdout, runner.clone());
@@ -3180,6 +3273,106 @@ impl Runner {
             }
         });
         Ok(())
+    }
+    fn failed_launch(
+        &self,
+        id: Uuid,
+        mut execution: Box<dyn backend::Execution>,
+        error: io::Error,
+        unreleased: bool,
+        reason: &str,
+    ) -> io::Result<()> {
+        let mut finished = {
+            let mut inner = self.core.inner.lock().unwrap();
+            inner.starting.insert(id);
+            inner.finalizing.insert(id);
+            inner.jobs[&id].clone()
+        };
+        self.long_work("launch-cleanup");
+        let mut delay = Duration::from_millis(50);
+        loop {
+            match self
+                .core
+                .backend
+                .cancel(&self.core.config, &finished, true)
+                .and_then(|()| execution.abort())
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(job_id = %id, %error, "launch cleanup stop failed; retaining ownership");
+                    std::thread::park_timeout(delay);
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        // Windows reap abandons the pre-Start I/O thread and joins VM cleanup.
+        // Host executions must be waited before their process is reaped.
+        if !self.core.config.windows_instance() {
+            let _ = execution.wait();
+        }
+        execution.reap();
+        drop(execution);
+        if !self.core.config.windows_instance()
+            && finished
+                .process
+                .is_some_and(|process| process.unit.is_some())
+        {
+            // Reaping the launcher does not prove its service's descendants
+            // stopped. Keep workspace ownership until systemd confirms it.
+            while self
+                .core
+                .backend
+                .unit_alive(&self.core.config, finished.process)
+                .ok()
+                != Some(Some(false))
+            {
+                let _ = self.core.backend.cancel(&self.core.config, &finished, true);
+                std::thread::park_timeout(delay);
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+        let no_start =
+            unreleased && (cfg!(target_os = "linux") || self.core.config.windows_instance());
+        if no_start {
+            finished.process = None;
+            finished.started_ms = None;
+            finished.started = None;
+            finished.next_seq = 0;
+            refuse_before_start(
+                &self.core.health,
+                &mut finished,
+                RefusalReason::Unknown(reason.into()),
+                &error,
+                Some(format!("execution gate was not opened: {reason}")),
+                self.now(),
+            );
+            finished.state = JobState::Tombstone;
+        } else {
+            // A release failure may have partially opened the gate. Do not
+            // promise that the command never ran without a backend proof.
+            finished.terminal(Outcome::OutcomeUnknown, self.now());
+        }
+        finished.monitoring_error = Some(error.to_string());
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let saved = self.save(&finished);
+            if saved.is_ok() || self.core.config.windows_instance() {
+                let mut inner = self.core.inner.lock().unwrap();
+                if saved.is_err() {
+                    inner.pending_start_refusals.insert(id);
+                }
+                inner.jobs.insert(id, finished.clone());
+                inner.starting.remove(&id);
+                inner.finalizing.remove(&id);
+                if finished.base {
+                    self.finish_base(&mut inner, finished.request.as_ref().unwrap(), false, None)?;
+                }
+                return Ok(());
+            }
+            tracing::warn!(job_id = %id, error = %saved.unwrap_err(), "launch cleanup record failed; retrying");
+            std::thread::park_timeout(delay);
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
     }
     fn output(&self, id: Uuid, stream: OutputStream, bytes: &[u8]) -> io::Result<()> {
         self.output_at(id, stream, bytes, None)

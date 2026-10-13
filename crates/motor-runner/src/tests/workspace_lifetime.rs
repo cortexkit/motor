@@ -240,3 +240,224 @@ async fn head_drop_waits_for_a_sibling_owner_before_deleting() {
     assert!(dropping.await.unwrap().unwrap().dropped);
     assert!(!path.exists());
 }
+
+#[tokio::test]
+async fn drop_failures_release_only_the_drop_fence() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    fs::create_dir_all(&f.key).unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        workspace::record_workspace(
+            &mut inner.catalog,
+            &f.key,
+            &f.root,
+            "test",
+            &[],
+            runner.now(),
+        );
+    }
+    fs::write(runner.trash(), "not a directory").unwrap();
+    assert!(runner.drop_workspace(&f.key).await.is_err());
+    assert!(!runner.core.inner.lock().unwrap().dropping.contains(&f.key));
+    assert!(Path::new(&f.key).exists());
+    fs::remove_file(runner.trash()).unwrap();
+    assert!(runner.drop_workspace(&f.key).await.unwrap().dropped);
+}
+
+#[tokio::test]
+async fn drop_timeout_and_abandoned_request_keep_live_owner_fenced() {
+    let f = Fixture::new();
+    let hold = Hold::new("drop-owner");
+    let _release = Release(hold.clone());
+    let mut config = f.config();
+    config.drop_timeout = Duration::from_millis(50);
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request.clone()).unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.jobs.get_mut(&request.job_id).unwrap().state = JobState::Running;
+        inner.finalizing.insert(request.job_id);
+    }
+    assert_eq!(
+        runner.drop_workspace(&f.key).await.unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(!runner.core.inner.lock().unwrap().dropping.contains(&f.key));
+    assert!(Runner::occupied(&runner.core.inner.lock().unwrap(), &f.key));
+    hold.arm();
+    let task = {
+        let runner = runner.clone();
+        let key = f.key.clone();
+        tokio::spawn(async move { runner.drop_workspace(&key).await })
+    };
+    reached(&hold).await;
+    assert_eq!(
+        runner.drop_workspace(&f.key).await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(runner.core.inner.lock().unwrap().dropping.contains(&f.key));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    hold.release();
+    until(|| !runner.core.inner.lock().unwrap().dropping.contains(&f.key)).await;
+    assert!(Runner::occupied(&runner.core.inner.lock().unwrap(), &f.key));
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner.finalizing.remove(&request.job_id);
+    inner
+        .jobs
+        .get_mut(&request.job_id)
+        .unwrap()
+        .terminal(Outcome::OutcomeUnknown, runner.now());
+}
+
+#[tokio::test]
+async fn cancellation_record_failure_releases_drop_marker() {
+    let f = Fixture::new();
+    let armed = Arc::new(AtomicBool::new(false));
+    let mut config = f.config();
+    config.before_job_write = Some({
+        let armed = armed.clone();
+        Arc::new(move |_| {
+            if armed.load(Ordering::SeqCst) {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let result = runner.drop_workspace(&f.key).await;
+    armed.store(false, Ordering::SeqCst);
+    assert!(result.is_err());
+    assert!(!runner.core.inner.lock().unwrap().dropping.contains(&f.key));
+}
+
+#[tokio::test]
+async fn destination_roots_refuse_run_prepare_and_drop_before_mutation() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config.clone()).unwrap();
+    let victim = f.scratch.join("unowned/victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("sentinel"), "unchanged").unwrap();
+    let (ordinary, _) = f.run("echo destructive > sentinel");
+    let alias = f.scratch.join("remote/alias");
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    symlink(&victim, &alias).unwrap();
+    let mut cases = Vec::new();
+    for path in [
+        victim.clone(),
+        f.scratch.join("remote-suffix/future"),
+        alias.join("future/child"),
+    ] {
+        let mut request = ordinary.clone();
+        request.workspace_key = text(&path).into();
+        request.cwd = request.workspace_key.clone();
+        request.siblings.clear();
+        cases.push(request);
+    }
+    let mut sibling = ordinary.clone();
+    sibling.repository_root = text(&victim.parent().unwrap().join("main")).into();
+    sibling.siblings[0].canonical_path = text(&victim).into();
+    cases.push(sibling);
+    for mut request in cases {
+        request.job_id = Uuid::now_v7();
+        assert!(matches!(
+            runner.accept(request.clone()).unwrap(),
+            Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+        ));
+        let result = terminal(&runner, request.job_id).await;
+        let detail = result.refusal_detail.unwrap();
+        assert!(detail.contains("allowed_roots="), "{detail}");
+        assert!(detail.contains("path="), "{detail}");
+        let prepare = prepare_for(&request);
+        assert!(runner.admit_prepare(&prepare).unwrap().is_err());
+        assert!(runner.fetch_prepare(&prepare, f.scratch.path()).is_err());
+        assert!(runner.prepare(&prepare, true).is_err());
+    }
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        workspace::record_workspace(
+            &mut inner.catalog,
+            text(&victim),
+            text(&victim),
+            "unused",
+            &[],
+            runner.now(),
+        );
+    }
+    assert!(runner.drop_workspace(text(&victim)).await.is_err());
+    assert_eq!(
+        fs::read_to_string(victim.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+    assert!(!runner.core.trees.mirror(&f.root).exists());
+    assert_eq!(
+        config.workspace_roots,
+        vec![f.scratch.join("remote/worktrees")]
+    );
+}
+
+#[test]
+fn destination_roots_check_future_paths_symlink_cwd_and_heads() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let roots = [f.scratch.join("remote")];
+    assert!(workspace::validate_destinations(&roots, text(&roots[0]), None, &[]).is_err());
+    workspace::validate_destinations(&roots, &f.root, Some(&f.root), &[]).unwrap();
+    let key = Path::new(&f.key);
+    fs::create_dir_all(key).unwrap();
+    fs::create_dir_all(&f.canonical).unwrap();
+    symlink(&f.canonical, key.join("cwd-alias")).unwrap();
+    assert!(workspace::validate_destinations(
+        &roots,
+        &f.key,
+        Some(text(&key.join("cwd-alias/future"))),
+        &[]
+    )
+    .is_err());
+    workspace::validate_destinations(&roots, &f.key, Some(text(&key.join("future/nested"))), &[])
+        .unwrap();
+    assert!(workspace::validate_destinations(&[], &f.key, None, &[]).is_err());
+}
+
+#[tokio::test]
+async fn destination_alias_is_rechecked_before_population() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let hold = Hold::new("materialize");
+    let _release = Release(hold.clone());
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let victim = f.scratch.join("unowned/victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("sentinel"), "unchanged").unwrap();
+    let (request, bytes) = f.run("true");
+    hold.arm();
+    f.submit(&runner, &request, &bytes);
+    reached(&hold).await;
+    fs::create_dir_all(Path::new(&f.key).parent().unwrap()).unwrap();
+    symlink(&victim, &f.key).unwrap();
+    hold.release();
+    let result = terminal(&runner, request.job_id).await;
+    assert!(matches!(result.outcome, Outcome::RefusedBeforeStart { .. }));
+    assert_eq!(result.ran, Some(Ran::None));
+    assert!(result.refusal_detail.unwrap().contains("allowed_roots="));
+    assert_eq!(
+        fs::read_to_string(victim.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+    assert!(!victim.join(".git").exists());
+}

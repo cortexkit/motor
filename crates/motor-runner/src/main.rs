@@ -204,6 +204,7 @@ fn configure_options(
                 config.free_space_floor_bytes = value.parse().map_err(io::Error::other)?
             }
             "--workspace-root" => config.workspace_roots.push(value.into()),
+            "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),
             "--vm-config" => config.vm_config = Some(value.into()),

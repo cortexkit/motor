@@ -135,6 +135,76 @@ pub(crate) fn validate(
     Ok(())
 }
 
+/// Resolve existing ancestors as well as future destinations. A missing suffix
+/// must not hide an existing symlink pointing outside an authorized root.
+fn destination(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(error);
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| invalid("destination has no parent"))?;
+            Ok(destination(parent)?.join(
+                path.file_name()
+                    .ok_or_else(|| invalid("destination has no name"))?,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn validate_destinations(
+    roots: &[PathBuf],
+    key: &str,
+    cwd: Option<&str>,
+    siblings: &[SiblingSnapshot],
+) -> io::Result<()> {
+    let allowed: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            destination(root).map_err(|error| {
+                invalid(format!(
+                    "cannot resolve owned root: path={} allowed_roots={roots:?}: {error}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<io::Result<_>>()?;
+    let resolve = |path: &str| -> io::Result<PathBuf> {
+        if absolute(path) {
+            let canonical = destination(Path::new(path)).map_err(|error| {
+                invalid(format!(
+                    "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
+                ))
+            })?;
+            if roots.iter().zip(&allowed).any(|(root, resolved)| {
+                Path::new(path).starts_with(root)
+                    && Path::new(path) != root
+                    && canonical.starts_with(resolved)
+                    && canonical != *resolved
+            }) {
+                return Ok(canonical);
+            }
+        }
+        Err(invalid(format!(
+            "destination outside runner-owned roots: path={path} allowed_roots={roots:?}"
+        )))
+    };
+    let workspace = resolve(key)?;
+    if let Some(cwd) = cwd {
+        if !resolve(cwd)?.starts_with(&workspace) {
+            return Err(invalid(format!("cwd outside workspace: {cwd}")));
+        }
+    }
+    for sibling in siblings {
+        resolve(&sibling.canonical_path)?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Trees {
     pub mirrors: PathBuf,
     pub state: PathBuf,
@@ -824,10 +894,23 @@ impl Trees {
         ) else {
             return vec![];
         };
-        status
-            .split('\0')
-            .filter(|s| s.len() >= 3)
-            .map(|s| s[3..].to_string())
-            .collect()
+        let mut records = status.split('\0');
+        let mut changes = Vec::new();
+        while let Some(record) = records.next() {
+            let Some(path) = record.get(3..) else {
+                continue;
+            };
+            let prefix = &record.as_bytes()[..3];
+            if prefix[2] != b' ' {
+                continue;
+            }
+            changes.push(path.to_string());
+            // Porcelain -z emits the destination first, then an unprefixed
+            // source path for renames and copies. The source is not a status.
+            if prefix[..2].iter().any(|b| matches!(b, b'R' | b'C')) {
+                records.next();
+            }
+        }
+        changes
     }
 }
