@@ -106,9 +106,16 @@ async fn cancel_after_monitor_lost_an_exited_process_finalizes_record() {
 }
 
 fn systemd_runner(f: &Fixture, state: &str) -> (Runner, Arc<Mutex<Vec<Vec<String>>>>) {
+    systemd_runner_with_state(f, Arc::new(Mutex::new(state.to_string())))
+}
+
+/// Like `systemd_runner`, but the reported unit state can change during the test.
+fn systemd_runner_with_state(
+    f: &Fixture,
+    state: Arc<Mutex<String>>,
+) -> (Runner, Arc<Mutex<Vec<Vec<String>>>>) {
     use std::os::unix::process::ExitStatusExt;
     let commands = Arc::new(Mutex::new(Vec::new()));
-    let state = state.to_string();
     let mut config = f.config();
     config.systemd_command = Some({
         let commands = commands.clone();
@@ -120,7 +127,7 @@ fn systemd_runner(f: &Fixture, state: &str) -> (Runner, Arc<Mutex<Vec<Vec<String
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout: if args[0] == "show" {
-                    state.as_bytes().to_vec()
+                    state.lock().unwrap().as_bytes().to_vec()
                 } else {
                     Vec::new()
                 },
@@ -282,30 +289,42 @@ async fn recovery_of_gone_unit_never_kills_and_finalizes() {
 #[test]
 fn recovery_of_stuck_active_unit_bounds_kills_with_backoff() {
     let f = Fixture::new();
-    let (runner, commands) = systemd_runner(
-        &f,
-        "LoadState=loaded\nActiveState=active\nSubState=running\n",
-    );
+    let state = Arc::new(Mutex::new(
+        "LoadState=loaded\nActiveState=active\nSubState=running\n".to_string(),
+    ));
+    let (runner, commands) = systemd_runner_with_state(&f, state.clone());
     let id = cancelled_unit(&f, &runner);
     let instant = std::time::Instant::now();
-    let mut inner = runner.core.inner.lock().unwrap();
-    for ms in 0..60_000 {
-        runner
-            .enforce_kills(&mut inner, instant + Duration::from_millis(ms))
-            .unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        for ms in 0..60_000 {
+            runner
+                .enforce_kills(&mut inner, instant + Duration::from_millis(ms))
+                .unwrap();
+        }
+        assert!(
+            inner.jobs[&id].terminal.is_none(),
+            "never release a live unit's workspace"
+        );
+        let commands = commands.lock().unwrap();
+        let kills: Vec<_> = commands.iter().filter(|args| args[0] == "kill").collect();
+        assert_eq!(kills.len(), 3);
+        assert!(
+            commands.len() < 25,
+            "inspection also needs backoff: {} commands",
+            commands.len()
+        );
     }
-    assert!(
-        inner.jobs[&id].terminal.is_none(),
-        "never release a live unit's workspace"
-    );
-    let commands = commands.lock().unwrap();
-    let kills: Vec<_> = commands.iter().filter(|args| args[0] == "kill").collect();
-    assert_eq!(kills.len(), 3);
-    assert!(
-        commands.len() < 25,
-        "inspection also needs backoff: {} commands",
-        commands.len()
-    );
+    // The fake unit never exits on its own. A runner thread can outlive this
+    // handle, and the fixture then waits for every job to end; let the unit
+    // stop so the cancelled job can finish instead of hanging teardown.
+    *state.lock().unwrap() = "LoadState=loaded\nActiveState=inactive\nSubState=dead\n".into();
+    runner
+        .enforce_kills(
+            &mut runner.core.inner.lock().unwrap(),
+            instant + Duration::from_secs(120),
+        )
+        .unwrap();
 }
 
 #[tokio::test]
