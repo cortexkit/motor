@@ -563,6 +563,7 @@ impl Runner {
     /// Delete synchronously off the state lock and probe after each tree. Rename
     /// to trash is not enough: on XFS shared extents may reclaim no free space.
     pub(super) fn ensure_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
+        self.ensure_reconciled()?;
         let _pressure = self.core.disk.lock().unwrap();
         let floor = self.core.config.free_space_floor_bytes;
         if floor == 0 {

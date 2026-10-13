@@ -122,6 +122,25 @@ fn writer_cache_acl(directory: bool) -> String {
     }
 }
 
+pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
+    // chmod on an extended ACL only closes its mask. Remove latent group grants
+    // before another named-user grant can recompute that mask and reopen them.
+    // Default ACLs must not leak access to newly created private runner files.
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "/usr/bin/setfacl",
+                "-b",
+                "-k",
+                "-m",
+                &format!("u:{USER}:--x,g::---,o::---,m::--x"),
+                "--",
+            ])
+            .arg(state),
+    )
+}
+
 pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::Result<()> {
     let root = fleet
         .parent()
@@ -173,6 +192,7 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
     }
     // State ancestors need traversal, not list or write access. ACLs on the
     // cache directories themselves give reads, including future writer entries.
+    prepare_private_state(state)?;
     for ancestor in state.ancestors() {
         checked(
             Command::new("/usr/bin/sudo")

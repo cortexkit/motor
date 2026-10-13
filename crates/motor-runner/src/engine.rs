@@ -433,6 +433,9 @@ struct Core {
     backend: Box<dyn Backend>,
     trees: Trees,
     inner: Mutex<Inner>,
+    /// Immutable until restart after operator reconciliation. Even readable
+    /// workspace metadata cannot establish a damaged job's full CPU/cache use.
+    quarantined: BTreeMap<Uuid, QuarantinedJob>,
     /// Serialize pressure cleanup, without holding the output/persistence lock.
     disk: Mutex<()>,
     health: Mutex<health::Health>,
@@ -562,6 +565,10 @@ impl Runner {
             }
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
         }
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && !config.windows_instance() {
+            crate::isolation::prepare_private_state(&state)?;
+        }
         fs::create_dir_all(state.join("jobs"))?;
         if config.windows_instance() {
             use std::os::unix::fs::PermissionsExt;
@@ -604,33 +611,87 @@ impl Runner {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&trees.mirrors, fs::Permissions::from_mode(0o700))?;
         }
-        backend.initialize(&config)?;
-        crate::network::initialize(&mut config);
-        if state.join("spools").exists() {
-            fs::remove_dir_all(state.join("spools"))?;
-        }
-        fs::create_dir_all(state.join("spools"))?;
-        if config.windows_instance() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(state.join("spools"), fs::Permissions::from_mode(0o700))?;
-        }
         let now = (config.clock)();
         let health = Mutex::new(health::Health::new(now));
         let mut jobs = BTreeMap::new();
+        let mut quarantined = BTreeMap::new();
         let mut recovered = Vec::new();
         let mut lost = Vec::new();
+        // Catalog damage cannot be treated like one damaged execution record:
+        // it is the ownership index for every retained workspace and cache.
+        let mut catalog: Catalog = match read_json(&state.join("catalog.json")) {
+            Ok(catalog) => catalog,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Catalog::default(),
+            Err(error) => return Err(invalid(format!("cannot read workspace catalog: {error}"))),
+        };
+        let quarantine_root = state.join("quarantine");
+        match fs::read_dir(&quarantine_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path.extension().is_none_or(|extension| extension != "json") {
+                        continue;
+                    }
+                    let job: QuarantinedJob = read_json(&path).map_err(|error| {
+                        invalid(format!("cannot read quarantine marker: {error}"))
+                    })?;
+                    if path.file_stem().and_then(|name| name.to_str())
+                        != Some(job.id.to_string().as_str())
+                    {
+                        return Err(invalid("quarantine identity does not match its filename"));
+                    }
+                    let record = state
+                        .join("jobs")
+                        .join(job.id.to_string())
+                        .join("record.json");
+                    job.preserve_rollback_fence(&record)?;
+                    quarantined.insert(job.id, job);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         for entry in fs::read_dir(state.join("jobs"))? {
             let path = entry?.path();
             if !path.is_dir() {
                 continue;
             }
             let record = path.join("record.json");
-            if !record.exists() {
-                fs::remove_dir_all(path)?;
+            let id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok());
+            if id.is_some_and(|id| quarantined.contains_key(&id)) {
                 continue;
             }
-            let job: Job = read_json(&record)?;
-            jobs.insert(job.id, job);
+            match read_json::<Job>(&record) {
+                Ok(job) => {
+                    jobs.insert(job.id, job);
+                }
+                Err(error) => {
+                    let id =
+                        id.ok_or_else(|| invalid("unreadable job has no directory identity"))?;
+                    let job = QuarantinedJob::inspect(id, &record, now);
+                    // Publish the fence before skipping the record. Do not move
+                    // or rewrite evidence that an older runner must still reject.
+                    atomic_json_private(&quarantine_root.join(format!("{id}.json")), &job)?;
+                    job.preserve_rollback_fence(&record)?;
+                    tracing::error!(%id, %error, "job quarantined; reconcile ownership before admitting more work");
+                    quarantined.insert(id, job);
+                }
+            }
+        }
+        if quarantined.is_empty() {
+            backend.initialize(&config)?;
+            if state.join("spools").exists() {
+                fs::remove_dir_all(state.join("spools"))?;
+            }
+        }
+        crate::network::initialize(&mut config);
+        fs::create_dir_all(state.join("spools"))?;
+        if config.windows_instance() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(state.join("spools"), fs::Permissions::from_mode(0o700))?;
         }
         let interrupted: Vec<_> = jobs
             .values()
@@ -691,7 +752,7 @@ impl Runner {
             jobs.insert(job.id, job);
         }
         #[cfg(target_os = "linux")]
-        if let Some(account) = config.writer_account {
+        if let Some(account) = config.writer_account.filter(|_| quarantined.is_empty()) {
             if let Err(error) =
                 crate::isolation::prepare_writer_cache(&config.sccache_dir(), account)
             {
@@ -734,11 +795,6 @@ impl Runner {
             }
             jobs.insert(job.id, job);
         }
-        let mut catalog: Catalog = if state.join("catalog.json").exists() {
-            read_json(&state.join("catalog.json"))?
-        } else {
-            Catalog::default()
-        };
         if config.windows_instance() {
             // Catalog entries are caller checkout paths on the build server, and
             // those checkouts belong to the Linux instance. The Windows instance
@@ -831,6 +887,7 @@ impl Runner {
                     cpu_times: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
                 }),
+                quarantined,
                 disk: Mutex::new(()),
                 health,
                 _lock: lock,
@@ -841,14 +898,16 @@ impl Runner {
         #[cfg(test)]
         tests::register_runner(&runner);
         // Deletions a previous run moved aside but did not finish.
-        if let Ok(entries) = fs::read_dir(runner.trash()) {
-            for entry in entries.flatten() {
-                runner.purge(entry.path());
+        if runner.core.quarantined.is_empty() {
+            if let Ok(entries) = fs::read_dir(runner.trash()) {
+                for entry in entries.flatten() {
+                    runner.purge(entry.path());
+                }
             }
+            runner.migrate_legacy_storage()?;
         }
-        runner.migrate_legacy_storage()?;
         let scratch = runner.core.config.writer_scratch_dir();
-        if scratch.exists() {
+        if scratch.exists() && runner.core.quarantined.is_empty() {
             #[cfg(target_os = "linux")]
             if runner.core.config.isolate_jobs {
                 crate::isolation::restore_runner_access(&scratch)?;
@@ -884,6 +943,24 @@ impl Runner {
     }
     pub fn config(&self) -> &Config {
         &self.core.config
+    }
+    fn ensure_reconciled(&self) -> io::Result<()> {
+        if self.core.quarantined.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid(
+                "quarantined job ownership must be reconciled before new work or cleanup",
+            ))
+        }
+    }
+    fn ensure_job_readable(&self, id: Uuid) -> io::Result<()> {
+        if self.core.quarantined.contains_key(&id) {
+            Err(invalid(
+                "job record is quarantined; execution outcome and ownership are unknown",
+            ))
+        } else {
+            Ok(())
+        }
     }
     pub(crate) fn safe_refusal_detail(
         &self,
@@ -1231,6 +1308,9 @@ impl Runner {
     }
 
     pub(crate) fn accept(&self, mut request: Run) -> io::Result<Admission> {
+        if self.core.quarantined.contains_key(&request.job_id) {
+            return Ok(Admission::Duplicate);
+        }
         if self.core.config.windows_instance() {
             request.weight_hint = Some(4);
         }
@@ -1332,6 +1412,9 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+        if let Err(error) = self.ensure_reconciled() {
+            return Some((RefusalReason::WorkspaceSetupFailed, error.to_string()));
+        }
         if request.network.is_some() {
             if request.network != Some(Network::Outbound) {
                 return Some((
@@ -1531,6 +1614,7 @@ impl Runner {
         reason: RefusalReason,
         error: impl std::fmt::Display,
     ) -> io::Result<()> {
+        self.ensure_job_readable(id)?;
         let mut inner = self.core.inner.lock().unwrap();
         if let Some(job) = inner
             .jobs
@@ -1826,6 +1910,7 @@ impl Runner {
         )
     }
     pub(crate) fn allow_prepare(&self) -> io::Result<()> {
+        self.ensure_reconciled()?;
         if self.core.config.windows_instance() {
             Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"))
         } else {
@@ -1845,6 +1930,7 @@ impl Runner {
             || self.core.config.windows_instance()
             || !self.core.config.writer_enabled()
             || inner.drain_deadline.is_some()
+            || !self.core.quarantined.is_empty()
         {
             return Ok(());
         }
@@ -2019,6 +2105,7 @@ impl Runner {
         from: u64,
         supports_started: bool,
     ) -> io::Result<Vec<Frame>> {
+        self.ensure_job_readable(id)?;
         let mut inner = self.core.inner.lock().unwrap();
         if let std::collections::btree_map::Entry::Vacant(entry) = inner.jobs.entry(id) {
             if self.now().saturating_sub(mint_ms(id)) >= RETENTION_MS {
@@ -2153,13 +2240,23 @@ impl Runner {
     pub fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
         let inner = self.core.inner.lock().unwrap();
         let job = inner.jobs.get(&id);
-        let process = job.and_then(|j| j.process);
+        let quarantine = self.core.quarantined.get(&id);
+        let process = job
+            .and_then(|j| j.process)
+            .or_else(|| quarantine.and_then(|j| j.process));
         Ok(JobStatusReply {
             job_id: id,
             queue_wait_ms: Self::queue_wait_ms_at(&inner, id, self.now()),
             state: job
                 .map(|j| format!("{:?}", j.state).to_lowercase())
-                .unwrap_or("not_found".into()),
+                .unwrap_or_else(|| {
+                    if quarantine.is_some() {
+                        "quarantined"
+                    } else {
+                        "not_found"
+                    }
+                    .into()
+                }),
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
                 .and_then(|p| p.unit)
@@ -2168,6 +2265,7 @@ impl Runner {
         })
     }
     pub fn cancel(&self, id: Uuid) -> io::Result<()> {
+        self.ensure_job_readable(id)?;
         let mut inner = self.core.inner.lock().unwrap();
         if self.core.config.windows_instance() && inner.starting.contains(&id) {
             self.core
@@ -2214,6 +2312,7 @@ impl Runner {
         id: Uuid,
         reason: Option<RefusalReason>,
     ) -> io::Result<WithdrawOutcome> {
+        self.ensure_job_readable(id)?;
         let mut inner = self.core.inner.lock().unwrap();
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
@@ -2391,6 +2490,7 @@ impl Runner {
     /// pool: this is called from a connection's async task, and an async
     /// worker parked on the lock stops the runner answering other connections.
     pub async fn drop_workspace(&self, key: &str) -> io::Result<DropReply> {
+        self.ensure_reconciled()?;
         self.validate_destinations(key, None, &[])?;
         let key = key.to_string();
         let (guard, ids) = self
@@ -2492,8 +2592,17 @@ impl Runner {
             .map(|j| j.id)
             .collect();
         for id in expired {
-            fs::remove_dir_all(self.record_path(id).parent().unwrap())?;
-            inner.jobs.remove(&id);
+            match fs::remove_dir_all(self.record_path(id).parent().unwrap()) {
+                Ok(()) => {
+                    inner.jobs.remove(&id);
+                }
+                Err(error) => {
+                    tracing::warn!(%id, %error, "expired job deletion failed; retaining its record and continuing maintenance")
+                }
+            }
+        }
+        if !self.core.quarantined.is_empty() {
+            return Ok(());
         }
         let idle: Vec<_> = inner
             .catalog
@@ -2520,7 +2629,10 @@ impl Runner {
                 tracing::warn!(workspace = %key, %error, "workspace expiry refused outside owned roots");
                 continue;
             }
-            self.discard(Path::new(&key))?;
+            if let Err(error) = self.discard(Path::new(&key)) {
+                tracing::warn!(workspace = %key, %error, "expired workspace deletion failed; retaining ownership and continuing maintenance");
+                continue;
+            }
             inner.catalog.workspaces.remove(&key);
         }
         // A repository inside another runner workspace can no longer be admitted,
@@ -2578,6 +2690,9 @@ impl Runner {
     }
 
     fn prune_refs(&self, inner: &Inner) -> io::Result<()> {
+        if !self.core.quarantined.is_empty() {
+            return Ok(());
+        }
         let mut known = BTreeSet::new();
         let mut held = BTreeMap::<String, BTreeSet<String>>::new();
         fn snapshot(
@@ -2872,6 +2987,9 @@ impl Runner {
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+        if !self.core.quarantined.is_empty() {
+            return Ok(());
+        }
         loop {
             let heads = self.queue_heads(inner);
             let mut next = None;
