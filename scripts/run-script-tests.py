@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 TEST_FILES = [
     "script/runner/network-check-tests.py",
+    "script/runner/test_check_nested_js.py",
     "script/runner/test_deploy.py",
     "script/runner/test_review_reaper.py",
     "script/runner/test_sync_lock.py",

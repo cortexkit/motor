@@ -597,7 +597,13 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
         copy_committed_js_fixture(&f.workspace, manager);
     }
     let tree = tracked_tree(&f.workspace);
-    prepare_javascript_dependencies(&f.state, &f.workspace, &tree).unwrap();
+    prepare_javascript_dependencies(
+        &f.state,
+        &f.workspace.to_string_lossy(),
+        &f.workspace,
+        &tree,
+    )
+    .unwrap();
     for manager in ["npm", "bun", "pnpm"] {
         let dir = f.workspace.join(manager);
         checked(
@@ -623,9 +629,14 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
     value["dependencies"]["missing"] = "file:vendor/missing".into();
     fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let tree = tracked_tree(&f.workspace);
-    let error = prepare_javascript_dependencies(&f.state, &f.workspace, &tree)
-        .unwrap_err()
-        .to_string();
+    let error = prepare_javascript_dependencies(
+        &f.state,
+        &f.workspace.to_string_lossy(),
+        &f.workspace,
+        &tree,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains("locked npm install using npm/package-lock.json failed"),
         "{error}"
@@ -700,7 +711,14 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
                 .env("JS_CALLS", &self.calls)
                 .env("JS_INTERRUPTED", &self.interrupted)
                 .env("JS_MEMBERS", &self.members);
-            cache_javascript_install(&f.state, checkout, tracked, install, &mut fake)
+            cache_javascript_install(
+                &f.state,
+                &checkout.to_string_lossy(),
+                checkout,
+                tracked,
+                install,
+                &mut fake,
+            )
         })
     }
     fn count(&self) -> usize {
@@ -717,9 +735,13 @@ fn prepare_checkouts_with_fake_manager(
     workspace_tree: &str,
     siblings: &[SiblingSnapshot],
 ) -> io::Result<()> {
-    prepare_javascript_checkouts(&f.workspace, workspace_tree, siblings, |checkout, tree| {
-        manager.prepare_checkout(f, checkout, tree)
-    })
+    prepare_javascript_checkouts(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        workspace_tree,
+        siblings,
+        |checkout, _repository, tree| manager.prepare_checkout(f, checkout, tree),
+    )
 }
 
 #[test]
@@ -806,25 +828,23 @@ fn javascript_sibling_local_dependency_escape_is_refused_like_workspace() {
 fn javascript_sibling_second_job_reuses_install_cache_for_same_tree() {
     let f = Fixture::new();
     let workspace_tree = tracked_tree(&f.workspace);
-    let first = f.scratch.join("sibling-first");
-    let second = f.scratch.join("sibling-second");
-    for sibling in [&first, &second] {
-        fs::create_dir_all(sibling).unwrap();
-        write_js_pair(sibling, "", "package-lock.json");
-    }
-    let first_tree = tracked_tree(&first);
-    let second_tree = tracked_tree(&second);
-    assert_eq!(first_tree, second_tree);
+    let sibling = f.scratch.join("sibling");
+    fs::create_dir_all(&sibling).unwrap();
+    write_js_pair(&sibling, "", "package-lock.json");
+    let tree = tracked_tree(&sibling);
     let manager = FakeJavascriptManager::new(&f);
-    let first_siblings = [sibling_snapshot(&first, &first_tree)];
-    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &first_siblings).unwrap();
-    fs::remove_dir_all(first.join("node_modules")).unwrap();
+    let siblings = [sibling_snapshot(&sibling, &tree)];
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
+    fs::remove_dir_all(sibling.join("node_modules")).unwrap();
 
-    let second_siblings = [sibling_snapshot(&second, &second_tree)];
-    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &second_siblings).unwrap();
+    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
 
-    assert_eq!(manager.count(), 1, "the second sibling must hit the cache");
-    assert!(second.join("node_modules/.bin/fixture-tool").is_file());
+    assert_eq!(
+        manager.count(),
+        1,
+        "the second sibling job must hit the cache"
+    );
+    assert!(sibling.join("node_modules/.bin/fixture-tool").is_file());
     assert_eq!(
         fs::read_dir(f.state.join("js-installs")).unwrap().count(),
         1
@@ -883,7 +903,15 @@ fn javascript_cache_key_covers_manifests_configs_lockfile_and_tool_versions() {
     let tree = tracked_tree(&f.workspace);
     let tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
-    let key = javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v1").unwrap();
+    let key = javascript_cache_key(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        &tracked,
+        install,
+        b"npm-v1",
+        b"node-v1",
+    )
+    .unwrap();
     for name in ["nested/package.json", "nested/package-lock.json"]
         .into_iter()
         .chain(input_names)
@@ -894,18 +922,42 @@ fn javascript_cache_key_covers_manifests_configs_lockfile_and_tool_versions() {
         let changed = javascript_tracked_tree(&f.workspace, &changed_tree).unwrap();
         assert_ne!(
             key,
-            javascript_cache_key(&f.workspace, &changed, install, b"npm-v1", b"node-v1").unwrap(),
+            javascript_cache_key(
+                &f.workspace,
+                &f.workspace.to_string_lossy(),
+                &changed,
+                install,
+                b"npm-v1",
+                b"node-v1"
+            )
+            .unwrap(),
             "{name} must be an input"
         );
         fs::write(f.workspace.join(name), original).unwrap();
     }
     assert_ne!(
         key,
-        javascript_cache_key(&f.workspace, &tracked, install, b"npm-v2", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &tracked,
+            install,
+            b"npm-v2",
+            b"node-v1"
+        )
+        .unwrap()
     );
     assert_ne!(
         key,
-        javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v2").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &tracked,
+            install,
+            b"npm-v1",
+            b"node-v2"
+        )
+        .unwrap()
     );
     fs::write(
         f.workspace.join("nested/package.json"),
@@ -914,7 +966,15 @@ fn javascript_cache_key_covers_manifests_configs_lockfile_and_tool_versions() {
     .unwrap();
     assert_eq!(
         key,
-        javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v1").unwrap(),
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &tracked,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap(),
         "working tree edits cannot change the captured job tree's key"
     );
 }
@@ -986,7 +1046,13 @@ fn javascript_real_npm_cache_clones_bin_into_second_workspace_and_times_hit() {
     copy_committed_js_fixture(&f.workspace, "npm");
     let tree = tracked_tree(&f.workspace);
     let cold_start = Instant::now();
-    prepare_javascript_dependencies(&f.state, &f.workspace, &tree).unwrap();
+    prepare_javascript_dependencies(
+        &f.state,
+        &f.workspace.to_string_lossy(),
+        &f.workspace,
+        &tree,
+    )
+    .unwrap();
     let cold = cold_start.elapsed();
     let second = f.scratch.join("second-workspace");
     fs::create_dir(&second).unwrap();
@@ -994,7 +1060,13 @@ fn javascript_real_npm_cache_clones_bin_into_second_workspace_and_times_hit() {
     let second_tree = tracked_tree(&second);
     assert_eq!(tree, second_tree);
     let hit_start = Instant::now();
-    prepare_javascript_dependencies(&f.state, &second, &second_tree).unwrap();
+    prepare_javascript_dependencies(
+        &f.state,
+        &f.workspace.to_string_lossy(),
+        &second,
+        &second_tree,
+    )
+    .unwrap();
     let hit = hit_start.elapsed();
     let result = Command::new(second.join("npm/node_modules/.bin/fixture-tool"))
         .current_dir(second.join("npm"))
@@ -1039,8 +1111,15 @@ fn javascript_root_cache_hits_across_unrelated_source_commits() {
     let first_tree = commit_javascript_tree(&f.workspace);
     let first = javascript_tracked_tree(&f.workspace, &first_tree).unwrap();
     let install = &discover_javascript_installs(&first.paths).unwrap()[0];
-    let first_key =
-        javascript_cache_key(&f.workspace, &first, install, b"npm-v1", b"node-v1").unwrap();
+    let first_key = javascript_cache_key(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        &first,
+        install,
+        b"npm-v1",
+        b"node-v1",
+    )
+    .unwrap();
     let manager = FakeJavascriptManager::new(&f);
     manager.prepare_tracked(&f, &first).unwrap();
     fs::remove_dir_all(f.workspace.join("node_modules")).unwrap();
@@ -1050,7 +1129,15 @@ fn javascript_root_cache_hits_across_unrelated_source_commits() {
     let second = javascript_tracked_tree(&f.workspace, &second_tree).unwrap();
     assert_eq!(
         first_key,
-        javascript_cache_key(&f.workspace, &second, install, b"npm-v1", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &second,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap()
     );
     manager.prepare_tracked(&f, &second).unwrap();
     assert_eq!(
@@ -1066,7 +1153,7 @@ fn javascript_root_cache_hits_across_unrelated_source_commits() {
         fs::read_dir(f.state.join("js-install-locks"))
             .unwrap()
             .count(),
-        1
+        2
     );
 }
 
@@ -1085,7 +1172,15 @@ fn javascript_file_dependency_directory_changes_miss_relative_to_member_manifest
     let tree = tracked_tree(&f.workspace);
     let first = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     let install = &discover_javascript_installs(&first.paths).unwrap()[0];
-    let key = javascript_cache_key(&f.workspace, &first, install, b"npm-v1", b"node-v1").unwrap();
+    let key = javascript_cache_key(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        &first,
+        install,
+        b"npm-v1",
+        b"node-v1",
+    )
+    .unwrap();
     let manager = FakeJavascriptManager::new(&f);
     manager.prepare_tracked(&f, &first).unwrap();
     fs::write(
@@ -1097,7 +1192,15 @@ fn javascript_file_dependency_directory_changes_miss_relative_to_member_manifest
     let unrelated = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     assert_eq!(
         key,
-        javascript_cache_key(&f.workspace, &unrelated, install, b"npm-v1", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &unrelated,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap()
     );
     fs::write(
         f.workspace.join("vendor/fixture-dep/index.js"),
@@ -1108,7 +1211,15 @@ fn javascript_file_dependency_directory_changes_miss_relative_to_member_manifest
     let changed = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     assert_ne!(
         key,
-        javascript_cache_key(&f.workspace, &changed, install, b"npm-v1", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &changed,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap()
     );
     manager.prepare_tracked(&f, &changed).unwrap();
     assert_eq!(
@@ -1142,8 +1253,15 @@ fn javascript_local_dependency_blob_ids_cover_file_link_and_portal_specs() {
         let tree = tracked_tree(&f.workspace);
         let tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
         let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
-        let key =
-            javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v1").unwrap();
+        let key = javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &tracked,
+            install,
+            b"npm-v1",
+            b"node-v1",
+        )
+        .unwrap();
         fs::write(
             f.workspace.join("packed dependency.tgz"),
             format!("changed archive {scheme}"),
@@ -1153,7 +1271,15 @@ fn javascript_local_dependency_blob_ids_cover_file_link_and_portal_specs() {
         let changed = javascript_tracked_tree(&f.workspace, &tree).unwrap();
         assert_ne!(
             key,
-            javascript_cache_key(&f.workspace, &changed, install, b"npm-v1", b"node-v1").unwrap(),
+            javascript_cache_key(
+                &f.workspace,
+                &f.workspace.to_string_lossy(),
+                &changed,
+                install,
+                b"npm-v1",
+                b"node-v1"
+            )
+            .unwrap(),
             "{scheme} file contents must be keyed"
         );
     }
@@ -1276,7 +1402,15 @@ fn javascript_transitive_local_dependency_changes_miss_without_keying_unrelated_
     let tree = tracked_tree(&f.workspace);
     let first = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     let install = &discover_javascript_installs(&first.paths).unwrap()[0];
-    let key = javascript_cache_key(&f.workspace, &first, install, b"npm-v1", b"node-v1").unwrap();
+    let key = javascript_cache_key(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        &first,
+        install,
+        b"npm-v1",
+        b"node-v1",
+    )
+    .unwrap();
     let manager = FakeJavascriptManager::new(&f);
     manager.prepare_tracked(&f, &first).unwrap();
     fs::write(
@@ -1288,7 +1422,15 @@ fn javascript_transitive_local_dependency_changes_miss_without_keying_unrelated_
     let unrelated = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     assert_eq!(
         key,
-        javascript_cache_key(&f.workspace, &unrelated, install, b"npm-v1", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &unrelated,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap()
     );
     manager.prepare_tracked(&f, &unrelated).unwrap();
     assert_eq!(manager.count(), 1);
@@ -1306,7 +1448,15 @@ fn javascript_transitive_local_dependency_changes_miss_without_keying_unrelated_
     );
     assert_ne!(
         key,
-        javascript_cache_key(&f.workspace, &changed, install, b"npm-v1", b"node-v1").unwrap(),
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &changed,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap(),
         "B's content must be keyed through A's manifest"
     );
     manager.prepare_tracked(&f, &changed).unwrap();
@@ -1329,10 +1479,26 @@ fn javascript_local_dependency_cycle_terminates_and_reuses_cache() {
     let tree = tracked_tree(&f.workspace);
     let tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
-    let key = javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v1").unwrap();
+    let key = javascript_cache_key(
+        &f.workspace,
+        &f.workspace.to_string_lossy(),
+        &tracked,
+        install,
+        b"npm-v1",
+        b"node-v1",
+    )
+    .unwrap();
     assert_eq!(
         key,
-        javascript_cache_key(&f.workspace, &tracked, install, b"npm-v1", b"node-v1").unwrap()
+        javascript_cache_key(
+            &f.workspace,
+            &f.workspace.to_string_lossy(),
+            &tracked,
+            install,
+            b"npm-v1",
+            b"node-v1"
+        )
+        .unwrap()
     );
     let manager = FakeJavascriptManager::new(&f);
     manager.prepare_tracked(&f, &tracked).unwrap();
@@ -1390,7 +1556,13 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
         let f = Fixture::new();
         copy_committed_js_fixture(&f.workspace, manager);
         let tree = tracked_tree(&f.workspace);
-        prepare_javascript_dependencies(&f.state, &f.workspace, &tree).unwrap();
+        prepare_javascript_dependencies(
+            &f.state,
+            &f.workspace.to_string_lossy(),
+            &f.workspace,
+            &tree,
+        )
+        .unwrap();
         let directory = f.workspace.join(manager);
         write_lock_mismatch_probe(&directory);
         let manifest = directory.join("package.json");
@@ -1399,9 +1571,14 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
         value["dependencies"]["lock-mismatch-probe"] = "file:vendor/lock-mismatch-probe".into();
         fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
         let tree = tracked_tree(&f.workspace);
-        let error = prepare_javascript_dependencies(&f.state, &f.workspace, &tree)
-            .unwrap_err()
-            .to_string();
+        let error = prepare_javascript_dependencies(
+            &f.state,
+            &f.workspace.to_string_lossy(),
+            &f.workspace,
+            &tree,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains(&format!(
                 "locked {manager} install using {manager}/{lockfile} failed"
@@ -1409,5 +1586,220 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
             "{error}"
         );
         assert!(!directory.join("lifecycle-ran").exists());
+    }
+}
+
+#[test]
+fn javascript_distinct_repositories_never_share_install_caches() {
+    let f = Fixture::new();
+    let manager = FakeJavascriptManager::new(&f);
+    for name in ["repository-a", "repository-b"] {
+        let checkout = f.scratch.join(name);
+        fs::create_dir(&checkout).unwrap();
+        write_js_pair(&checkout, "", "package-lock.json");
+        let tree = tracked_tree(&checkout);
+        manager.prepare_checkout(&f, &checkout, &tree).unwrap();
+    }
+    assert_eq!(
+        manager.count(),
+        2,
+        "different repositories must both install"
+    );
+    assert_eq!(
+        fs::read_dir(f.state.join("js-manager-caches"))
+            .unwrap()
+            .count(),
+        2,
+        "different repositories must use different manager caches"
+    );
+}
+
+#[test]
+fn javascript_manager_caches_ignore_inherited_locations() {
+    let f = Fixture::new();
+    let manager = FakeJavascriptManager::new(&f);
+    for lockfile in ["bun.lock", "package-lock.json", "pnpm-lock.yaml"] {
+        let checkout = f.scratch.join(lockfile);
+        fs::create_dir(&checkout).unwrap();
+        write_js_pair(&checkout, "", lockfile);
+        let tree = tracked_tree(&checkout);
+        let tracked = javascript_tracked_tree(&checkout, &tree).unwrap();
+        let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
+        let mut command = Command::new(&manager.executable);
+        command
+            .args(
+                javascript_install_command(&checkout, install)
+                    .unwrap()
+                    .get_args(),
+            )
+            .current_dir(&checkout)
+            .env("PATH", &manager.bin)
+            .env("JS_VERSION", &manager.version)
+            .env("JS_CALLS", &manager.calls)
+            .env("JS_INTERRUPTED", &manager.interrupted)
+            .env("JS_MEMBERS", &manager.members);
+        for name in [
+            "BUN_INSTALL",
+            "BUN_INSTALL_CACHE_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "npm_config_cache",
+            "NPM_CONFIG_CACHE",
+            "pnpm_config_store_dir",
+            "PNPM_CONFIG_STORE_DIR",
+        ] {
+            command.env(name, f.scratch.join("operator-cache"));
+        }
+        cache_javascript_install(
+            &f.state,
+            &checkout.to_string_lossy(),
+            &checkout,
+            &tracked,
+            install,
+            &mut command,
+        )
+        .unwrap();
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for name in [
+            "BUN_INSTALL",
+            "NPM_CONFIG_CACHE",
+            "pnpm_config_store_dir",
+            "PNPM_CONFIG_STORE_DIR",
+        ] {
+            assert_eq!(
+                env.get(std::ffi::OsStr::new(name)),
+                Some(&None),
+                "{name} must be stripped"
+            );
+        }
+        for name in [
+            "BUN_INSTALL_CACHE_DIR",
+            "npm_config_cache",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            let value = env
+                .get(std::ffi::OsStr::new(name))
+                .and_then(|v| *v)
+                .expect("explicit runner cache location");
+            assert!(Path::new(value).starts_with(&f.state), "{name}: {value:?}");
+        }
+        let args: Vec<_> = command.get_args().collect();
+        let cache_flag = match javascript_manager(lockfile) {
+            "bun" => "--cache-dir",
+            "npm" => "--cache",
+            _ => "--store-dir",
+        };
+        let index = args
+            .iter()
+            .position(|arg| *arg == cache_flag)
+            .expect("explicit manager cache flag");
+        assert!(Path::new(args[index + 1]).starts_with(&f.state));
+    }
+}
+
+#[test]
+fn javascript_bun_same_path_changed_tarball_installs_changed_bytes() {
+    let f = Fixture::new();
+    let producer = f.scratch.join("producer/package");
+    fs::create_dir_all(&producer).unwrap();
+    fs::write(
+        f.workspace.join("package.json"),
+        r#"{"name":"consumer","dependencies":{"local-producer":"file:producer.tgz"}}"#,
+    )
+    .unwrap();
+    for marker in ["first", "changed"] {
+        fs::write(
+            producer.join("package.json"),
+            format!(r#"{{"name":"local-producer","version":"1.0.0","marker":"{marker}"}}"#),
+        )
+        .unwrap();
+        checked(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(f.workspace.join("producer.tgz"))
+                .arg("-C")
+                .arg(producer.parent().unwrap())
+                .arg("package"),
+        )
+        .unwrap();
+        let _ = fs::remove_file(f.workspace.join("bun.lock"));
+        // Resolve the new bytes independently so the frozen install has a valid lockfile.
+        checked(
+            Command::new("bun")
+                .args(["install", "--lockfile-only", "--ignore-scripts"])
+                .current_dir(&f.workspace)
+                .env(
+                    "BUN_INSTALL_CACHE_DIR",
+                    f.scratch.join(format!("lock-cache-{marker}")),
+                ),
+        )
+        .unwrap();
+        let tree = tracked_tree(&f.workspace);
+        let tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
+        let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
+        let mut command = javascript_install_command(&f.workspace, install).unwrap();
+        // Reuse one scratch Bun cache for both tarball versions to reproduce
+        // path-keyed stale hits without writing to the operator's personal cache.
+        command.env("BUN_INSTALL_CACHE_DIR", f.scratch.join("shared-bun-cache"));
+        let _ = fs::remove_dir_all(f.workspace.join("node_modules"));
+        cache_javascript_install(
+            &f.state,
+            &f.workspace.to_string_lossy(),
+            &f.workspace,
+            &tracked,
+            install,
+            &mut command,
+        )
+        .unwrap();
+        let installed: serde_json::Value = serde_json::from_slice(
+            &fs::read(f.workspace.join("node_modules/local-producer/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed["marker"], marker,
+            "same-path tarball must install its current bytes"
+        );
+    }
+}
+
+#[test]
+fn javascript_manager_cache_reuses_registry_inputs_but_scopes_local_content() {
+    for local in [false, true] {
+        let f = Fixture::new();
+        write_js_pair(&f.workspace, "", "package-lock.json");
+        if local {
+            write_local_package_fixture(&f.workspace);
+            fs::write(
+                f.workspace.join("package.json"),
+                r#"{"dependencies":{"fixture-dep":"file:vendor/fixture-dep"}}"#,
+            )
+            .unwrap();
+        }
+        let manager = FakeJavascriptManager::new(&f);
+        let tree = tracked_tree(&f.workspace);
+        manager.prepare(&f, &tree).unwrap();
+        if local {
+            fs::write(
+                f.workspace.join("vendor/fixture-dep/index.js"),
+                "changed producer bytes",
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                f.workspace.join("package-lock.json"),
+                "changed registry lockfile",
+            )
+            .unwrap();
+        }
+        let changed = tracked_tree(&f.workspace);
+        manager.prepare(&f, &changed).unwrap();
+        assert_eq!(manager.count(), 2);
+        assert_eq!(
+            fs::read_dir(f.state.join("js-manager-caches"))
+                .unwrap()
+                .count(),
+            if local { 2 } else { 1 }
+        );
     }
 }

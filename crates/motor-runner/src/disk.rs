@@ -407,7 +407,14 @@ impl Runner {
         }
         // These are the runner's actual upload, deletion and launch staging
         // roots. Never scan /srv/build or infer ownership from directory names.
-        for kind in ["spools", "trash", "sandboxes", "git-deps", "js-installs"] {
+        for kind in [
+            "spools",
+            "trash",
+            "sandboxes",
+            "git-deps",
+            "js-installs",
+            "js-manager-caches",
+        ] {
             let root = self.core.trees.state.join(kind);
             let Ok(entries) = fs::read_dir(&root) else {
                 continue;
@@ -422,7 +429,8 @@ impl Runner {
                 let path = entry.path();
                 let metadata = match fs::symlink_metadata(&path) {
                     Err(error)
-                        if kind == "js-installs" && error.kind() == io::ErrorKind::NotFound =>
+                        if matches!(kind, "js-installs" | "js-manager-caches")
+                            && error.kind() == io::ErrorKind::NotFound =>
                     {
                         continue
                     }
@@ -432,7 +440,7 @@ impl Runner {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                let live = if kind == "js-installs" {
+                let live = if matches!(kind, "js-installs" | "js-manager-caches") {
                     javascript_entry_lock(&self.core.trees.state, &path)?.is_none()
                 } else if kind == "git-deps" {
                     dependency_roots.contains(&path) || inner.evicting_dependencies.contains(&path)
@@ -689,6 +697,8 @@ impl Runner {
             // have completed since candidate selection.
             let _javascript_guard = if candidate.path.parent()
                 == Some(self.core.trees.state.join("js-installs").as_path())
+                || candidate.path.parent()
+                    == Some(self.core.trees.state.join("js-manager-caches").as_path())
             {
                 let Some(guard) = javascript_entry_lock(&self.core.trees.state, &candidate.path)?
                 else {

@@ -560,6 +560,7 @@ impl Backend for HostBackend {
                         config.rustc_slots,
                         &routes,
                         &r.tree_hash,
+                        &r.repository_root,
                     )
                 }
                 // When a job ends, the engine checks whether systemd stopped its

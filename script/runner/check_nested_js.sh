@@ -13,8 +13,10 @@ projects=${1:-$HOME/Work/Projects/CortexKit}
 host=${RUNNER_HOST:-alfonso-runner}
 remote=/srv/build/review/motor-js-rollout
 here=$(cd -- "$(dirname -- "$0")" && pwd)
+failed=0
 
 ssh -o BatchMode=yes "$host" "rm -rf $remote && mkdir -p $remote"
+trap 'ssh -o BatchMode=yes "$host" "rm -rf $remote"' EXIT
 scp -q "$here/check_nested_js_remote.sh" "$host:$remote/run.sh"
 
 for repo in "$projects"/*/; do
@@ -40,6 +42,8 @@ for repo in "$projects"/*/; do
     git -C "$repo" bundle create -q "$tmp/$name.bundle" "$branch"
   scp -q "$tmp/$name.bundle" "$host:$remote/$name.bundle"
   rm -rf "$tmp"
-  printf '%s\n' "$dirs" | ssh -o BatchMode=yes "$host" bash "$remote/run.sh" "$remote" "$name" "$commit"
+  if ! printf '%s\n' "$dirs" | ssh -o BatchMode=yes "$host" bash "$remote/run.sh" "$remote" "$name" "$commit"; then
+    failed=1
+  fi
 done
-ssh -o BatchMode=yes "$host" "rm -rf $remote"
+exit "$failed"
