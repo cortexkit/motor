@@ -113,9 +113,9 @@ fn check_disk(storage: &mut impl CacheStorage, number: u32) -> io::Result<DiskLa
         }
     };
     if !allowed {
-        return Err(io::Error::other(
-            "cache disk has an unexpected partition layout",
-        ));
+        return Err(io::Error::other(format!(
+            "cache disk has an unexpected partition layout: {layout:?}"
+        )));
     }
     Ok(layout)
 }

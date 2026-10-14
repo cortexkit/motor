@@ -202,6 +202,7 @@ struct Transport {
     clock: Clock,
     control: Arc<Control>,
     cancelled: bool,
+    pending_cache: Option<motor_winagent::CacheTimings>,
     #[cfg(test)]
     phase_hook: Option<Arc<dyn Fn(Phase) + Send + Sync>>,
     #[cfg(test)]
@@ -238,6 +239,14 @@ impl Transport {
         let mut at = 0;
         while at < bytes.len() {
             self.check()?;
+            if matches!(frame, Frame::ReceiveTree { .. } | Frame::TreeEnd { .. }) {
+                // Mounting precedes extraction. Read diagnostics even when the
+                // guest is not consuming upload bytes, so a setup failure cannot
+                // be hidden behind a full socket's transfer deadline.
+                while let Some(frame) = self.receive()? {
+                    self.cache_diagnostic(frame)?;
+                }
+            }
             match self.stream.write(&bytes[at..]) {
                 Ok(0) => {
                     return Err(super::vm::path_error(
@@ -264,8 +273,8 @@ impl Transport {
                 }
             }
         }
-        // Uploads are one-way until TreeEnd. Completed chunks are progress, not
-        // a reason to apply a single 60-second limit to the entire snapshot.
+        // Completed chunks refresh upload inactivity, rather than imposing one
+        // 60-second limit on the entire snapshot. Cache heartbeats do not refresh it.
         if matches!(frame, Frame::ReceiveTree { .. }) {
             self.bounds.received(self.clock.now())?;
         }
@@ -290,7 +299,12 @@ impl Transport {
             if self.input.len() == wanted && wanted > 4 {
                 let frame = motor_winagent::read_frame(&mut io::Cursor::new(&self.input))?.unwrap();
                 self.protocol.accept(Peer::Agent, &frame)?;
-                self.bounds.received(self.clock.now())?;
+                if !matches!(
+                    frame,
+                    Frame::CacheProgress { .. } | Frame::CacheFailed { .. }
+                ) {
+                    self.bounds.received(self.clock.now())?;
+                }
                 self.input.clear();
                 return Ok(Some(frame));
             }
@@ -320,8 +334,27 @@ impl Transport {
             }
         }
     }
+    fn cache_diagnostic(&mut self, frame: Frame) -> io::Result<()> {
+        match frame {
+            Frame::CacheProgress { step, elapsed_ms } => {
+                tracing::info!(?step, elapsed_ms, "Windows guest cache mount progress");
+                Ok(())
+            }
+            Frame::CacheMounted { timings } => {
+                self.pending_cache = Some(timings);
+                Ok(())
+            }
+            Frame::CacheFailed { failure } => Err(invalid(failure.to_string())),
+            _ => Err(invalid("unexpected agent frame during tree upload")),
+        }
+    }
     fn reply(&mut self, vm: &mut super::vm::Resources) -> io::Result<Frame> {
         loop {
+            if let Some(timings) = self.pending_cache.take() {
+                tracing::info!(job_id = %vm.id, ?timings, "Windows guest cache mount timings");
+                #[cfg(test)]
+                vm.record_cache_timings(timings);
+            }
             if !self.cancelled
                 && self.control.cancel.load(Ordering::Acquire) == 1
                 && matches!(
@@ -334,9 +367,11 @@ impl Transport {
             }
             match self.receive() {
                 Ok(Some(Frame::CacheMounted { timings })) => {
-                    tracing::info!(job_id = %vm.id, ?timings, "Windows guest cache mount timings");
-                    #[cfg(test)]
-                    vm.record_cache_timings(timings);
+                    self.pending_cache = Some(timings);
+                    continue;
+                }
+                Ok(Some(frame @ (Frame::CacheProgress { .. } | Frame::CacheFailed { .. }))) => {
+                    self.cache_diagnostic(frame)?;
                     continue;
                 }
                 Ok(Some(frame)) => return Ok(frame),
@@ -482,6 +517,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
                 clock,
                 control: thread_control.clone(),
                 cancelled: false,
+                pending_cache: None,
                 #[cfg(test)]
                 phase_hook: thread_config.windows_phase.clone(),
                 #[cfg(test)]
@@ -636,6 +672,142 @@ mod tests {
     use std::{collections::BTreeMap, os::fd::AsRawFd};
 
     #[test]
+    fn windows_backend_cache_failure_interrupts_a_blocked_tree_upload() {
+        use motor_winagent::cache_steps::{CacheFailure, CacheStep};
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let size = 4096i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const i32).cast(),
+                    std::mem::size_of_val(&size) as _,
+                )
+            },
+            0
+        );
+        while stream.write(&[0; 4096]).is_ok() {}
+        while stream.write(&[0]).is_ok() {}
+        motor_winagent::write_frame(
+            &mut peer,
+            &Frame::CacheFailed {
+                failure: CacheFailure {
+                    step: CacheStep::DiskLayout,
+                    elapsed_ms: 12,
+                    message: "DiskLayout: device not ready (os error 21)".into(),
+                    completed: vec![],
+                },
+            },
+        )
+        .unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now = clock.clone();
+        let mut protocol = Protocol::new("nonce").unwrap();
+        protocol
+            .accept(
+                Peer::Agent,
+                &Frame::Hello {
+                    version: motor_winagent::PROTOCOL_VERSION,
+                    nonce: "nonce".into(),
+                },
+            )
+            .unwrap();
+        let mut transport = Transport {
+            stream,
+            agent_path: PathBuf::from("<cache diagnostic stream>"),
+            input: Vec::new(),
+            protocol,
+            bounds: Bounds::new(0),
+            clock: Clock {
+                origin: Instant::now(),
+                fake: Some(Arc::new(move || now.load(Ordering::SeqCst))),
+            },
+            control: Arc::new(Control::default()),
+            cancelled: false,
+            pending_cache: None,
+            phase_hook: None,
+            blocked_write: None,
+        };
+        transport.enter(Phase::Transfer).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            tx.send(transport.send(&Frame::ReceiveTree { bytes: vec![1] }))
+                .unwrap();
+        });
+        let result = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(value) => value,
+            Err(_) => {
+                clock.store(60_000, Ordering::SeqCst);
+                rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            }
+        };
+        sender.join().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("DiskLayout") && error.contains("device not ready"),
+            "{error}"
+        );
+        assert!(!error.contains("deadline exceeded"), "{error}");
+    }
+
+    #[test]
+    fn windows_backend_cache_heartbeat_does_not_extend_transfer_deadline() {
+        use motor_winagent::cache_steps::CacheStep;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now = clock.clone();
+        let mut protocol = Protocol::new("nonce").unwrap();
+        protocol
+            .accept(
+                Peer::Agent,
+                &Frame::Hello {
+                    version: motor_winagent::PROTOCOL_VERSION,
+                    nonce: "nonce".into(),
+                },
+            )
+            .unwrap();
+        let mut transport = Transport {
+            stream,
+            agent_path: PathBuf::from("<cache heartbeat stream>"),
+            input: Vec::new(),
+            protocol,
+            bounds: Bounds::new(0),
+            clock: Clock {
+                origin: Instant::now(),
+                fake: Some(Arc::new(move || now.load(Ordering::SeqCst))),
+            },
+            control: Arc::new(Control::default()),
+            cancelled: false,
+            pending_cache: None,
+            phase_hook: None,
+            blocked_write: None,
+        };
+        transport.enter(Phase::Transfer).unwrap();
+        clock.store(59_000, Ordering::SeqCst);
+        motor_winagent::write_frame(
+            &mut peer,
+            &Frame::CacheProgress {
+                step: CacheStep::DiskLayout,
+                elapsed_ms: 1_000,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            transport.receive().unwrap(),
+            Some(Frame::CacheProgress { .. })
+        ));
+        clock.store(60_000, Ordering::SeqCst);
+        assert_eq!(
+            transport.receive().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn windows_backend_blocked_start_writes_observe_deadline_and_hard_cancel() {
         for cancel in [false, true] {
             let (mut stream, _unread_peer) = UnixStream::pair().unwrap();
@@ -704,6 +876,7 @@ mod tests {
                 },
                 control: control.clone(),
                 cancelled: false,
+                pending_cache: None,
                 phase_hook: None,
                 blocked_write: Some(blocked.clone()),
             };

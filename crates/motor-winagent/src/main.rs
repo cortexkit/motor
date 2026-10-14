@@ -19,15 +19,16 @@ mod guest {
         Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
         SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
         cache::{prepare_cache, select_cache_disk, storage_serial},
-        cache_has_modify_grant, collect_changes, inventory, mapped_cwd, read_frame, unpack_tree,
-        write_frame,
+        cache_has_modify_grant,
+        cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
+        collect_changes, inventory, mapped_cwd, read_frame, unpack_tree, write_frame,
     };
     use std::{
         ffi::OsString,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
         mem::{size_of, size_of_val, zeroed},
-        os::windows::io::FromRawHandle,
+        os::windows::io::{AsRawHandle, FromRawHandle},
         path::{Path, PathBuf},
         ptr::{null, null_mut},
         sync::{Arc, mpsc},
@@ -357,6 +358,9 @@ mod guest {
         profile_handle: HANDLE,
         profile: PathBuf,
     }
+    // Token/profile handles are process-wide. Ownership moves back to the service
+    // thread only after the cache worker has finished using this profile.
+    unsafe impl Send for User {}
     impl User {
         fn logon() -> io::Result<Self> {
             // Provisioning creates this administrator-only credential file and
@@ -456,37 +460,42 @@ mod guest {
             }
         }
     }
-    fn cache_disk() -> io::Result<u32> {
+    fn cache_disk(reporter: &CacheReporter) -> io::Result<u32> {
         let mut disks = Vec::new();
         // The sealed VM has two disks. Enumerate a bounded set so unexpected
         // device topology fails closed instead of selecting an arbitrary disk.
         for number in 0..32 {
             let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
-            let raw = unsafe {
-                CreateFileW(
-                    path.as_ptr(),
-                    0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    null(),
-                    OPEN_EXISTING,
-                    0,
-                    null_mut(),
-                )
-            };
-            if raw == INVALID_HANDLE_VALUE {
-                let error = io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(2 | 3)) {
-                    continue;
+            let disk = reporter.step(CacheStep::DiskOpen, || {
+                let raw = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        0,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        null(),
+                        OPEN_EXISTING,
+                        0,
+                        null_mut(),
+                    )
+                };
+                if raw == INVALID_HANDLE_VALUE {
+                    let error = io::Error::last_os_error();
+                    if matches!(error.raw_os_error(), Some(2 | 3)) {
+                        return Ok(None);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            let disk = Handle::new(raw)?;
+                Ok(Some(Handle::new(raw)?))
+            })?;
+            let Some(disk) = disk else {
+                continue;
+            };
             // StorageDeviceProperty / PropertyStandardQuery, with no additional
             // parameters. The descriptor includes the virtio block serial.
             let query = [0u32; 3];
             let mut descriptor = [0u8; 4096];
             let mut returned = 0;
-            unsafe {
+            reporter.step(CacheStep::DiskSerial, || unsafe {
                 win32(DeviceIoControl(
                     disk.0,
                     IOCTL_STORAGE_QUERY_PROPERTY,
@@ -496,8 +505,8 @@ mod guest {
                     descriptor.len() as u32,
                     &mut returned,
                     null_mut(),
-                ))?;
-            }
+                ))
+            })?;
             disks.push((
                 number,
                 storage_serial(&descriptor[..returned as usize])?.to_owned(),
@@ -510,11 +519,14 @@ mod guest {
         )
     }
     impl Cache {
-        fn mount(user: &User) -> io::Result<Self> {
+        fn mount(user: &User, reporter: &CacheReporter) -> io::Result<Self> {
             let started = Instant::now();
-            let number = cache_disk()?;
+            let number = reporter.step(CacheStep::DiskSelection, || cache_disk(reporter))?;
             let disk_selection_ms = started.elapsed().as_millis() as u64;
-            let disk = prepare_cache(&mut crate::storage::WindowsStorage::open(number)?, number)?;
+            let disk = prepare_cache(
+                &mut crate::storage::WindowsStorage::open(number, reporter)?,
+                number,
+            )?;
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")
                 || !volume.ends_with("}\\")
@@ -523,13 +535,15 @@ mod guest {
                 return Err(invalid("invalid cache volume identity"));
             }
             let mountpoint_started = Instant::now();
-            std::fs::create_dir_all(CACHE_MOUNT)?;
-            unsafe {
+            reporter.step(CacheStep::MountDirectory, || {
+                std::fs::create_dir_all(CACHE_MOUNT)
+            })?;
+            reporter.step(CacheStep::MountPoint, || unsafe {
                 win32(SetVolumeMountPointW(
                     wide(CACHE_MOUNT).as_ptr(),
                     wide(&volume).as_ptr(),
-                ))?;
-            }
+                ))
+            })?;
             let mountpoint_ms = mountpoint_started.elapsed().as_millis();
             let mut cache = Self {
                 volume,
@@ -539,10 +553,10 @@ mod guest {
                 timings: CacheTimings::default(),
             };
             let dirty_started = Instant::now();
-            let handle = cache.open_volume()?;
+            let handle = reporter.step(CacheStep::DirtyOpen, || cache.open_volume())?;
             let mut dirty: u32 = 0;
             let mut returned = 0;
-            unsafe {
+            reporter.step(CacheStep::DirtyCheck, || unsafe {
                 win32(DeviceIoControl(
                     handle.0,
                     FSCTL_IS_VOLUME_DIRTY,
@@ -552,8 +566,8 @@ mod guest {
                     4,
                     &mut returned,
                     null_mut(),
-                ))?;
-            }
+                ))
+            })?;
             if dirty & VOLUME_IS_DIRTY != 0 {
                 return Err(invalid("cache volume has a dirty NTFS bit"));
             }
@@ -562,15 +576,18 @@ mod guest {
             // The mounted folder on C: and the target volume root are separate
             // security objects. Grant access to both; OPEN_REPARSE_POINT keeps
             // the first update on the OS folder rather than following its mount.
-            cache.mountpoint_acl_updated = Self::grant_access(
-                CACHE_MOUNT.trim_end_matches('\\'),
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                user,
-            )?;
+            cache.mountpoint_acl_updated = reporter.step(CacheStep::FolderAcl, || {
+                Self::grant_access(
+                    CACHE_MOUNT.trim_end_matches('\\'),
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    user,
+                )
+            })?;
             let folder_acl_ms = acl_started.elapsed().as_millis();
             let volume_acl_started = Instant::now();
-            cache.acl_updated =
-                Self::grant_access(&cache.volume, FILE_FLAG_BACKUP_SEMANTICS, user)?;
+            cache.acl_updated = reporter.step(CacheStep::VolumeAcl, || {
+                Self::grant_access(&cache.volume, FILE_FLAG_BACKUP_SEMANTICS, user)
+            })?;
             let volume_acl_ms = volume_acl_started.elapsed().as_millis();
             cache.timings = CacheTimings {
                 elapsed_ms: started.elapsed().as_millis() as u64,
@@ -1267,6 +1284,49 @@ mod guest {
         Ok(())
     }
 
+    fn mount_cache(protocol: &mut Protocol, port: &mut Port) -> io::Result<(User, Cache)> {
+        let (steps_tx, steps_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let reporter = CacheReporter::new(steps_tx);
+            match reporter.step(CacheStep::UserLogon, User::logon) {
+                Ok(user) => match Cache::mount(&user, &reporter) {
+                    Ok(cache) => {
+                        let _ = result_tx.send(Ok((user, cache)));
+                    }
+                    Err(error) => {
+                        // Report before profile cleanup, which may itself need I/O.
+                        let _ = result_tx.send(Err(error));
+                        drop(user);
+                    }
+                },
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                }
+            }
+        });
+        let result = watch_cache(
+            steps_rx,
+            result_rx,
+            |step, elapsed_ms| send(protocol, port, &Frame::CacheProgress { step, elapsed_ms }),
+            || unsafe {
+                // Cancel only this process's cache worker I/O. Never wait for an
+                // uncooperative driver before reporting failure; the host destroys
+                // this job VM, and a disconnected reporter prevents further steps.
+                CancelSynchronousIo(worker.as_raw_handle());
+            },
+            CacheLimits::default(),
+        );
+        match result {
+            Ok(value) => Ok(value),
+            Err(failure) => {
+                let message = failure.to_string();
+                send(protocol, port, &Frame::CacheFailed { failure })?;
+                Err(invalid(message))
+            }
+        }
+    }
+
     fn serve(stop: Arc<Handle>) -> io::Result<()> {
         for privilege in [
             "SeBackupPrivilege",
@@ -1288,8 +1348,7 @@ mod guest {
                 nonce,
             },
         )?;
-        let user = User::logon()?;
-        let mut cache = Cache::mount(&user)?;
+        let (user, mut cache) = mount_cache(&mut protocol, &mut port)?;
         send(
             &mut protocol,
             &mut port,
