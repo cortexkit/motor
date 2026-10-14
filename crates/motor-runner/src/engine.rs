@@ -3120,7 +3120,18 @@ impl Runner {
                     })
             {
                 let mut updated = job.clone();
-                updated.kill = Some((Killed::Deadline, now));
+                // Storage contention may defer this pass past the deadline.
+                // Keep the original expiry time so a late pass cannot restart
+                // the TERM-to-KILL grace period for an already-overdue command.
+                let deadline = job.started_ms.unwrap().saturating_add(
+                    job.request
+                        .as_ref()
+                        .unwrap()
+                        .timeout
+                        .unwrap()
+                        .saturating_mul(1000),
+                );
+                updated.kill = Some((Killed::Deadline, deadline));
                 drop(inner);
                 self.save(&updated)?;
                 inner = self.core.inner.lock().unwrap();

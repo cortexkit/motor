@@ -341,3 +341,48 @@ fn cancellation_retries_keep_running_job_backoff_and_attempt_limit() {
         ["cancel", "cancel", "kill", "kill", "kill"]
     );
 }
+
+#[test]
+fn overdue_deadline_keeps_its_origin_when_an_output_writer_delays_enforcement() {
+    let f = CancellationFixture::new();
+    let start = f.runner.now();
+    f.runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&f.id)
+        .unwrap()
+        .request
+        .as_mut()
+        .unwrap()
+        .timeout = Some(1);
+    let log = f.runner.job_log(f.id);
+    let write = log.write.lock().unwrap();
+    f.fixture.clock.store(start + 1000, Ordering::SeqCst);
+    f.retry(f.retry_at);
+    f.fixture.clock.store(start + 3001, Ordering::SeqCst);
+    f.retry(f.retry_at + Duration::from_millis(1));
+    drop(write);
+    f.retry(f.retry_at + Duration::from_millis(2));
+    let killed_at = f.runner.core.inner.lock().unwrap().jobs[&f.id]
+        .kill
+        .as_ref()
+        .map(|(_, at)| *at);
+    let events = f.events.lock().unwrap().clone();
+    f.exited.store(true, Ordering::SeqCst);
+    f.runner
+        .finish(f.id, Ok(std::process::ExitStatus::from_raw(0)))
+        .unwrap();
+    assert_eq!(
+        killed_at,
+        Some(start + 1000),
+        "an overdue deadline must not restart its TERM grace after storage releases"
+    );
+    assert_eq!(
+        events,
+        ["kill"],
+        "a deadline past its grace must hard-stop a TERM-ignoring group"
+    );
+}
