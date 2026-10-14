@@ -95,6 +95,17 @@ Tests: `isolated_job_uses_022_umask_and_creates_755_directories_under_loose_pare
 make its own cleanup fail. It cannot gain mounts or privileges. Changes are not
 copied back to the caller. Not covered by a test beyond 2.4 and 3.1.
 
+3.4.1. The workspace's `.git` is read-only because its objects are shared with
+the runner's mirror of the repository. Git commands that only read work; any
+command that writes the index, refs or objects fails, including `git add`,
+`git checkout -- <path>`, `git stash` and `git commit`. A tool that needs a lock
+or a scratch file puts it under `$TMPDIR` or the build folder instead. A script
+that edits a tracked file and restores it afterwards can save the original
+under `$TMPDIR` and copy it back. When it needs Git itself, a private index and
+object store work too: set `GIT_INDEX_FILE` and `GIT_OBJECT_DIRECTORY` to paths
+under `$TMPDIR`, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` to the repository's
+`.git/objects`. Not covered by a test.
+
 3.5. `/etc/hosts` contains `localhost` and IPv6 loopback names, plus the names
 a repository declares in a tracked `.motor/hosts` file. Declared names may map
 only to loopback addresses; a public address refuses the job before its sandbox
