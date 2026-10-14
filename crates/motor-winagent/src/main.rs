@@ -10,12 +10,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(windows)]
+mod storage;
+
+#[cfg(windows)]
 mod guest {
     use motor_winagent::{
         CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CHUNK_BYTES, CacheAce, CacheTimings, Command,
         Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
         SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
-        cache::{mount_script, select_cache_disk, storage_serial},
+        cache::{prepare_cache, select_cache_disk, storage_serial},
         cache_has_modify_grant, collect_changes, inventory, mapped_cwd, read_frame, unpack_tree,
         write_frame,
     };
@@ -438,12 +441,6 @@ mod guest {
         }
     }
 
-    #[derive(serde::Deserialize)]
-    struct DiskMount {
-        volume: String,
-        set_disk_ms: u64,
-        volume_ms: u64,
-    }
     struct Cache {
         volume: String,
         clean: bool,
@@ -517,10 +514,7 @@ mod guest {
             let started = Instant::now();
             let number = cache_disk()?;
             let disk_selection_ms = started.elapsed().as_millis() as u64;
-            let powershell_started = Instant::now();
-            let disk: DiskMount = serde_json::from_str(&powershell(&mount_script(number))?)
-                .map_err(|error| invalid(format!("invalid disk mount report: {error}")))?;
-            let powershell_ms = powershell_started.elapsed().as_millis() as u64;
+            let disk = prepare_cache(&mut crate::storage::WindowsStorage::open(number)?, number)?;
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")
                 || !volume.ends_with("}\\")
@@ -581,8 +575,9 @@ mod guest {
             cache.timings = CacheTimings {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 disk_selection_ms,
-                powershell_ms,
-                set_disk_ms: disk.set_disk_ms,
+                powershell_ms: disk.powershell_ms,
+                set_disk_ms: 0,
+                native_attributes_ms: disk.native_attributes_ms,
                 volume_ms: disk.volume_ms,
                 mountpoint_ms: mountpoint_ms as u64,
                 dirty_check_ms: dirty_ms as u64,

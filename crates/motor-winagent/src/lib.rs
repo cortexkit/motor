@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod cache;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -41,7 +41,10 @@ pub struct CacheTimings {
     pub elapsed_ms: u64,
     pub disk_selection_ms: u64,
     pub powershell_ms: u64,
+    /// PowerShell Set-Disk time, zero when the native path is used.
     pub set_disk_ms: u64,
+    /// Native disk attribute query/update/verification, excluding layout guards.
+    pub native_attributes_ms: u64,
     pub volume_ms: u64,
     pub mountpoint_ms: u64,
     pub dirty_check_ms: u64,
@@ -699,6 +702,13 @@ mod tests {
         let mut protocol = Protocol::new("boot-a").unwrap();
         protocol.accept(Peer::Agent, &hello()).unwrap();
         assert!(protocol.accept(Peer::Host, &frame).is_err());
+    }
+
+    #[test]
+    fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
+        let value = serde_json::to_value(CacheTimings::default()).unwrap();
+        assert!(value["native_attributes_ms"].is_u64());
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     fn command() -> Command {
