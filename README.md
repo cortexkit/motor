@@ -26,8 +26,9 @@ are separate projects.
 
 ## Build and test
 
-These need only Rust, [cargo-nextest](https://nexte.st) and Python 3; no
-running daemon, vault or build server. If your shell injects Git configuration
+The portable suite needs Rust, [cargo-nextest](https://nexte.st) and Python 3;
+some runner tests need a few more tools, listed below the commands. It needs
+no running daemon, vault or build server. If your shell injects Git configuration
 through `GIT_CONFIG_COUNT`, clear it first, because some tests compare Git
 behavior exactly:
 

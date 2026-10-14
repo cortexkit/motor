@@ -223,8 +223,9 @@ On Linux, `cargo test -p motor-vm-helper` also runs the hugepage admission tests
 inject the free-page count and need no root or hugepages.
 
 The feature-gated lanes fail, rather than skip, when a prerequisite is missing.
-Run them only on a disposable trusted Linux host, never in hosted CI or a build
-job. Prefix each with the Git-config clearing from
+They run as root, create mounts, cgroups and systemd units, and use fixed uids,
+so run them only on a disposable trusted Linux host, never in hosted CI or a
+build job. Prefix each with the Git-config clearing from
 [CONTRIBUTING.md](../CONTRIBUTING.md#prerequisites).
 
 | Command | Needs | Covers |
@@ -232,18 +233,20 @@ job. Prefix each with the Git-config clearing from
 | `sudo ... cargo test -p motor-vm-helper --features linux-root-tests --lib` | Root and `CAP_SYS_ADMIN`, scratch on a native Linux filesystem | Filesystem, credential, mount-resolution and descriptor handling |
 | `sudo ... cargo nextest run -p motor-vm-helper --features linux-service-tests --lib` with `MOTOR_VM_TEST_JAILER` and `MOTOR_VM_TEST_FIRECRACKER` | Root, systemd 254+ as PID 1 with delegation, cgroup v2, unused uid/gid 200000, the official jailer, and the static fixture built from `fixtures/firecracker.c` | Cgroup placement, restart cleanup, and the real jailer layout |
 | `cargo nextest run -p motor-vm-guest --features linux-root-tests --locked` | Root, `CAP_SYS_ADMIN`, util-linux `unshare`, mount/PID/network namespaces | Privilege drop, mounts, outside-path hiding, reaping escaped processes |
-| `cargo nextest run -p motor-vm-guest --features trusted-cargo-tests --locked` | Network access and a trusted Cargo | Real registry and local-Git fetches |
+| `cargo nextest run -p motor-vm-guest --features trusted-cargo-tests --locked` | Network access and a real Cargo (not a rustup proxy) on `PATH` | Real registry and local-Git fetches |
 | `cargo test -p motor-vm-loader --features linux-uffd-tests --locked` | `userfaultfd` permission | Real `UFFDIO_COPY` of 2 MiB pages |
 | `MOTOR_VM_LOADER_BIN=<static loader> cargo nextest run -p motor-vm-loader --features linux-root-tests --locked` | Root and the helper's seccomp support | The loader reaching its fault loop under the real sandbox |
 
 Build the jailer-layout fixture with
 `cc -static -O2 -o target/helper-fixture/firecracker crates/motor-vm-helper/fixtures/firecracker.c`.
 It is a stand-in that records its uid and root, not a VMM. Do not run two copies
-of the service lane at once.
+of the service lane at once: both use the same transient unit name and fixture
+uid.
 
-`cargo nextest list ... --features linux-root-tests` compiles a gated lane
-without privileges. Benchmarks: `cargo bench -p motor-vm-loader --bench copy --locked`
-(add `-- --uffd` on Linux for the syscall path).
+`cargo nextest list -p <crate> --features linux-root-tests --locked` compiles
+those tests without privileges. Benchmarks: `cargo bench -p motor-vm-loader --bench copy --locked`
+measures the layout and copy logic; add `-- --uffd` on Linux to measure real
+`UFFDIO_COPY` calls.
 
 Snapshot restore, the guest clock and entropy calls, the ext4 mount lifecycle,
 vsock transport and loader seccomp compatibility need real VMs on a KVM host

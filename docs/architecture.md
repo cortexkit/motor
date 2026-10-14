@@ -27,8 +27,9 @@ them. Each part's details live in the linked documents.
    `exec.run` to the CortexKit daemon, which verifies the caller and routes it to
    `ck-motor`. `ck-motor` checks the operation is allowed for that caller, the
    paths are a real checkout, and the platform and network request can be met.
-   Any failure here is a `refused_before_start` with `ran: none`, before
-   anything leaves the Mac.
+   A caller without permission is refused at the operation; a run that fails
+   the other checks ends as `refused_before_start` with `ran: none`, before any
+   snapshot is uploaded.
 2. **Snapshot.** `ck-motor` captures the checkout into a commit: `HEAD`, plus
    working-tree changes and untracked non-ignored files, under a 2 GiB cap on
    untracked content. The caller's checkout is not modified.
@@ -63,9 +64,9 @@ under disk pressure, and runs compile-cache fills when no job is waiting.
 
 ## State on the runner
 
-Everything an instance owns lives under `<state-root>/<instance>/`: the job
-table (one record per job), retained output, Git mirrors, the workspace
-catalog, sandbox runtime directories, and the compile cache (`sccache/fleet`).
+An instance's own state lives under `<state-root>/<instance>/`: the job table
+(one record per job), retained output, Git mirrors, the workspace catalog,
+sandbox runtime directories, and the compile cache (`sccache/fleet`).
 Workspaces themselves live at the callers' paths under the owned workspace
 roots (default `/Users`), on the same reflink-capable filesystem. Instances on
 one host are independent apart from machine-wide resources: CPUs, the
@@ -73,7 +74,9 @@ build-slot limit, and the Windows VM slot.
 
 ## Rules that bite
 
-These hold across the codebase. Breaking one usually passes the portable suite.
+These hold across the codebase. Breaking one often still passes the portable
+suite (the ordinary `cargo nextest run --workspace`), because many of them are
+checked only by the operator tests in the [server gate](server-gate.md).
 
 - **Never re-run a command that may have run.** Only `refused_before_start`
   proves no start. Lost acknowledgements, restarts, expired history and unknown

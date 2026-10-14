@@ -44,8 +44,9 @@ the mount is read-only.
   (`crates/motor-runner/tests/it/reader_environment.rs`, operator-only).
 - A job that does not build Rust gets no sccache environment. Test:
   `isolated_public_non_rust_job_has_no_sccache_environment` (operator-only).
-- A wrapper the job's own Cargo configuration sets keeps its documented
-  precedence. Tests: `isolated_public_reader_wrapper_precedence_matrix`
+- A `build.rustc-wrapper` set in the repository's Cargo configuration takes
+  precedence over the runner's wrapper; an empty value turns wrapping off.
+  Tests: `isolated_public_reader_wrapper_precedence_matrix`
   (operator-only), `cargo_wrapper_configuration_obeys_ancestor_and_legacy_precedence`
   (`crates/motor-runner/src/compile_cache.rs`).
 - A genuine compiler failure is not retried; an unavailable cache server runs
@@ -136,6 +137,6 @@ foreground jobs still run. Test: `unavailable_writer_account_disables_fills_and_
 
 ## Eviction
 
-The runner's disk-pressure cleanup can evict the whole cache, fenced against an
-active writer; it never deletes individual entries. See
+The runner's disk-pressure cleanup can evict the whole cache, but skips it while
+a fill is running; it never deletes individual entries. See
 [scheduling.md](scheduling.md#disk-admission).

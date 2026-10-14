@@ -42,8 +42,9 @@ runner requires of their result rather than prescribing one command.
   and `hivexregedit` from `libwin-hivex-perl` (see `script/runner/tools.txt`).
 
 The slot lock is shared with the standing Windows build VM
-(`script/windows-vm/windows-build-vm.service`). Only one of the standing VM,
-the provisioning VM and job VMs can run at a time.
+(`script/windows-vm/windows-build-vm.service`), a long-lived VM reached over
+SSH for manual Windows work; it is not used for jobs. Only one of the standing
+VM, the provisioning VM and job VMs can run at a time.
 
 ## 1. Render the setup CD
 
@@ -150,7 +151,8 @@ Install units with `script/runner/install-units.sh` and the binary with
 
 Qualification boots the real image through the real runner binary. Run it on
 the build server against the configured, otherwise idle Windows instance, with
-the standing VM stopped:
+the standing build VM (`windows-build-vm.service`, a long-lived VM for manual
+Windows work that shares the VM slot) stopped:
 
 ```sh
 cargo build -p motor-runner --bin motor-runner --release --locked

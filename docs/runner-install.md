@@ -88,20 +88,22 @@ plain name. `tools.txt` also lists the prerequisites it does not manage: Rust
 toolchains and targets (install every pinned toolchain with `rustup`), Node,
 pnpm and Bun under `/usr`, and system libraries.
 
-Build the patched sccache that compile-cache readers and the writer need:
+Build the patched sccache. Stock sccache 0.18.0 updates an entry's file times
+on every read, which fails on the read-only cache mount jobs get, so every
+lookup would miss:
 
 ```sh
 CARGO_HOME=/srv/build/cargo-home sh script/runner/build-sccache.sh
 ```
 
-It builds crates.io sccache 0.18.0 with
+`build-sccache.sh` builds crates.io sccache 0.18.0 with
 `script/runner/patches/sccache-0.18.0-read-only-hits.patch`, keeps the stock
 binary it replaces as `sccache-0.18.0-stock`, and prints both hashes. See
 [compile-cache.md](compile-cache.md).
 
 ## 4. Install the runner binary
 
-Build on the server (or any Linux host with the same toolchain):
+Build on the server, or on another x86_64 Linux host with the same Rust version:
 
 ```sh
 cargo build --release -p motor-runner --locked
@@ -119,7 +121,7 @@ the binary there with `install -m 755`. After that, always use
 bash script/runner/install-units.sh
 ```
 
-It copies `script/runner/units/` into `~/.config/systemd/user/`, showing a diff
+`install-units.sh` copies `script/runner/units/` into `~/.config/systemd/user/`, showing a diff
 and asking before replacing a file that differs, keeps a timestamped backup,
 and reloads systemd. It never restarts a runner. The units are:
 
@@ -153,7 +155,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--free-space-floor-bytes N` | 137438953472 (128 GiB) | Disk admission floor; 0 disables. |
 | `--workspace-root PATH` | `/Users` | Adds a root under which idle workspaces may be evicted. |
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
-| `--backend host\|windows-vm` | `host` | `vm` is refused in this build. |
+| `--backend host\|windows-vm` | `host` | Job backend. A third value, `vm`, is parsed but refused at startup in this build. |
 | `--vm-config FILE` | absent | Windows instance configuration. |
 | `--job-network veth` | absent | Allow outbound networking for jobs that request it. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
@@ -200,8 +202,10 @@ bash script/runner/install-review-reaper.sh
 
 It installs a root-owned timer that deletes checkouts under
 `/srv/build/review` idle for six hours. Remove it with
-`sudo systemctl disable --now motor-review-reaper.timer` and delete the three
-installed files.
+`sudo systemctl disable --now motor-review-reaper.timer` and delete
+`/usr/local/libexec/motor-review-reaper.py`,
+`/etc/systemd/system/motor-review-reaper.service` and
+`/etc/systemd/system/motor-review-reaper.timer`.
 
 ## 8. Connect the Mac
 

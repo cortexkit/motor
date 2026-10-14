@@ -163,8 +163,9 @@ its own loopback, and reach nothing else. Tests:
 6.2. Outbound access is opt-in on both sides. The caller requests
 `network: "outbound"`; `ck-motor` forwards the request only when its
 `network_routing` setting is on; the runner grants it only when started with
-`--job-network veth` and its `motor_net` firewall table is present and its
-other prerequisites check out at startup. Any missing piece refuses the job
+`--job-network veth` and, at startup, finds its `motor_net` firewall table,
+IPv4 forwarding and the `sudo` rules it needs
+(see [runner-install.md](runner-install.md#6-optional-job-networking)). Any missing piece refuses the job
 before upload with
 `network_unsupported`; access is never silently downgraded or upgraded. Tests:
 `network_admission_refuses_before_upload_with_missing_prerequisite`,

@@ -133,8 +133,8 @@ accepts an upload, and again before setup.
   `disk_eviction_skips_reserved_and_running_workspaces`,
   `disk_admission_preserves_incoming_ordinary_workspace_and_sibling`,
   `disk_admission_protects_canonical_alias_through_job_insertion`.
-- The compile cache is evicted as a whole, fenced against an active fill; single
-  entries are never deleted.
+- The compile cache is evicted as a whole, and not while a fill is running;
+  single entries are never deleted.
 
 ## Retention
 

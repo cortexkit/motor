@@ -68,8 +68,8 @@ What each check guards:
 | `test-binary-fold.py` | Each crate keeps one integration test binary (`tests/it/`) unless `scripts/test-binary-fold.allow` names a reason. |
 | `unreachable-modules.py` | Every library module is reachable from a binary, or `scripts/unreachable-modules.allow` says why not. |
 | `test-dev-binaries.py` | Tests never launch production `ck-*` executable names. |
-| `test-scratch.py` | Rust tests never use global temporary-directory constructors; they use the fenced scratch helper. |
-| `subc-daemon-env.py` | Tests never locate or spawn the CortexKit daemon outside the fenced helper. |
+| `test-scratch.py` | Rust tests never use global temporary-directory constructors such as `std::env::temp_dir()`; they use `cortexkit_test_support::scratch_root()`, which keeps scratch inside a per-test directory. |
+| `subc-daemon-env.py` | Tests never locate or spawn the CortexKit daemon except through `cortexkit_test_support::SubcDaemonBinary`, which points all of the daemon's paths into the test's scratch directory. |
 | `scripts/tests/*.py` | The fences above reject planted violations, so a fence cannot pass by seeing nothing. |
 
 ### The server gate
@@ -143,7 +143,7 @@ python3 -m unittest -v script/windows-vm/test_control.py script/windows-vm/test_
 | Repository gates and fences | `scripts/` |
 | Documentation | `docs/`, one topic per file |
 
-Tests follow these rules, which the fences above enforce:
+Tests follow these rules, which the checks in `scripts/` enforce:
 
 - Integration tests live as modules under the crate's `tests/it/`, not as new
   top-level test files.

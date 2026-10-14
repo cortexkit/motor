@@ -45,7 +45,11 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
-| `ssh_config_override`, `inject_tree_hash_mismatch`, `inject_snapshot_failure` | absent | Test controls. Refused when `runner_instance` is `main`. |
+| `ssh_config_override` | absent | Test control: an SSH config file used instead of the vault-backed identity. |
+| `inject_tree_hash_mismatch`, `inject_snapshot_failure` | `false` | Test controls that force a tree-hash mismatch or a snapshot failure. |
+
+The three test controls are refused when `runner_instance` is `main`, so a
+production configuration cannot weaken authentication or fake failures.
 
 Source: `crates/motor-module/src/config.rs`.
 
@@ -134,8 +138,9 @@ That directory holds an exclusively locked `lease` file, `state.json` (written
 atomically through `state.tmp`), transient `spools/`, and the agent's runtime
 directories. `state.json` holds:
 
-- `jobs`, keyed by job ID: the queue-wait limit, any pending cancellation, a
-  locally decided terminal, and optional attribution;
+- `jobs`, keyed by job ID: the queue-wait limit, any pending cancellation, the
+  terminal record when `ck-motor` itself ended the job (for example a refusal
+  before upload), and optional attribution (session, preset, scope);
 - `snapshots`, keyed by workspace: the commits the runner has accepted, used to
   send only missing history next time.
 
@@ -151,7 +156,8 @@ orphaned SSH master before reusing a crashed installation's storage root.
 
 `ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] -- COMMAND...`
 runs one command on the runner from a script with no agent behind it, streams
-its output, and exits with its status. It needs `admit_direct_exec`.
+its output, and exits with its status. It works only when `admit_direct_exec`
+is `true` in the configuration file ([Configuration](#configuration)).
 
 | Exit status | Meaning |
 | --- | --- |
