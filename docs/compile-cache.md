@@ -84,8 +84,9 @@ warm-commands = ["cargo nextest run --workspace --no-run"]
 `[package.metadata.motor]` works for a single-package repository. The commands
 run in order, joined with `&&`. A Cargo project that declares nothing gets
 `cargo build --workspace --all-targets`; a tree without a root `Cargo.toml` has
-nothing to warm. `serve --base-command` is not available; the `base_commands`
-override exists only in `Config` for embedding and tests.
+nothing to warm. No `serve` option overrides the warm command;
+`Config::base_commands` overrides it for code that embeds the runner, and for
+tests.
 
 ### Inputs
 

@@ -140,6 +140,8 @@ target. Test: `windows_backend_stages_a_tracked_symlink_as_a_file_holding_its_ta
 5.1. A trusted preparation step, run on the host as the `motor-prep` account,
 fetches the repository's locked Cargo dependencies for
 `x86_64-pc-windows-msvc` before the VM boots. The job then builds offline.
+Test: `windows_qualification_qemu_and_preparation_accounts_are_confined`
+(operator-only).
 
 5.2. The workspace must have a `Cargo.lock`. Path dependencies outside the
 transferred checkouts, Git dependencies over SSH, and registries other than
@@ -172,7 +174,9 @@ outcome and must treat it as `outcome_unknown`, never as proof that nothing ran.
 Source: `Outcome::WindowsExit` in `cortexkit-exec-remote-types`.
 
 6.3. A cancelled command is terminated with `0xC000013A`; the terminal record
-says `killed: cancel` or `killed: deadline`.
+says `killed: cancel` or `killed: deadline`. Not covered by a portable test;
+`windows_qualification_cancel_kills_detached_grandchild` (operator-only)
+exercises cancel.
 
 6.4. Once the runner has received the exit code, a later failure (collecting
 changes, dismounting the cache, stopping the VM) does not change it. If the VM

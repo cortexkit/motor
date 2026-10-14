@@ -76,6 +76,7 @@ left out, along with its contents. Tests:
 
 3.4. Nothing from `.git` is sent except the commits and objects the runner
 lacks. Local Git configuration, hooks and the caller's index are not sent.
+Not covered by a test.
 
 ## 4. The size cap
 
@@ -135,6 +136,7 @@ Tests: `destination_roots_refuse_run_prepare_and_drop_before_mutation`,
 
 6.3. Changes a job makes to the workspace stay on the runner. They are not
 copied back; the terminal record lists changed paths in `workspace_changes`.
+Not covered by a test in this repository.
 
 ## 7. History transfer
 

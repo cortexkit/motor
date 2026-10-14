@@ -15,8 +15,8 @@ every dependency comes from crates.io or this repository.
   and `clippy` components.
 - `cargo-nextest`, at the version CI pins.
 - Python 3, for the protocol-vector generator and the safety fences.
-- Node, npm, Bun and pnpm, for the runner's JavaScript install tests. CI pins
-  the versions that `script/runner/tools.txt` lists for the build server.
+- Node, npm, Bun and pnpm, for the runner's JavaScript install tests, at the
+  versions `.github/workflows/ci.yml` pins.
 - OpenSSH with `sshd` at `/usr/sbin/sshd`, for the real SSH transport test.
 - On Linux, a scratch directory on a reflink-capable filesystem such as XFS.
   Runner fixtures clone workspaces with `FICLONE`, which ext4 does not support.

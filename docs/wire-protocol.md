@@ -42,7 +42,8 @@ error. Test: `codec_pins_big_endian_prefix_and_detects_truncation`.
 any bytes, including split or invalid UTF-8. Other base64 forms are refused.
 Test: `byte_payloads_preserve_split_utf8_and_reject_invalid_base64`.
 
-1.5. `job_id` and `transfer_id` are UUIDv7 strings.
+1.5. `job_id` and `transfer_id` are UUIDv7 strings. The codec checks UUID
+syntax; the version is the producer's policy. Not covered by a test.
 
 ## 2. Frames
 

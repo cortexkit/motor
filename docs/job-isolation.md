@@ -19,9 +19,10 @@ the portable suite.
 (the `motor-job` account, ACL tools, delegated `sudo` rules, namespace or mount
 support) refuses startup or the job; a job never falls back to running as the
 runner's own account. Source: `crates/motor-runner/src/main.rs`
-(`config.isolate_jobs = cfg!(target_os = "linux")`). Test:
+(`config.isolate_jobs = cfg!(target_os = "linux")`). Tests:
 `host_backend_refuses_isolated_launch_without_prepared_sandbox`
-(`crates/motor-runner/src/backend_tests.rs`).
+(`crates/motor-runner/src/backend_tests.rs`) for the launch path; the startup
+refusal for each missing prerequisite is not covered by a test.
 
 1.2. `Config::new` without that flag uses an in-process backend for tests. It
 is not an isolation boundary.
@@ -33,8 +34,12 @@ non-administrative account without a login shell. Test:
 `isolated_host_backend_launch_runs_in_motor_job_service_with_022_umask`.
 
 2.2. Compile-cache fills run as `motor-cache`, a separate account; see
-[compile-cache.md](compile-cache.md). The runner itself runs as its service
-account and never executes job code as that account.
+[compile-cache.md](compile-cache.md). Each sandbox account must exist and must
+differ from root, from the runner's account and from the other sandbox account,
+and must not belong to `sudo`, `admin`, `adm`, `lxd` or `docker`. Test:
+`writer_identity_refuses_missing_aliases_and_administrative_groups`
+(`crates/motor-runner/src/isolation/writer.rs`). The runner itself runs as its
+service account and never executes job code as that account.
 
 2.3. A job has no passwordless `sudo`. Test: `isolated_job_has_no_passwordless_sudo`.
 
@@ -88,7 +93,7 @@ Tests: `isolated_job_uses_022_umask_and_creates_755_directories_under_loose_pare
 
 3.4. A job may change or delete its own workspace files, including in ways that
 make its own cleanup fail. It cannot gain mounts or privileges. Changes are not
-copied back to the caller.
+copied back to the caller. Not covered by a test beyond 2.4 and 3.1.
 
 3.5. `/etc/hosts` contains `localhost` and IPv6 loopback names, plus the names
 a repository declares in a tracked `.motor/hosts` file. Declared names may map
@@ -126,6 +131,9 @@ ignore `SIGTERM`. Test: `isolated_cancel_kills_entire_cgroup_including_term_igno
 directory. Its environment is the request's filtered variables (5.1) with the
 runner's values forced for `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
 `TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, `SHELL`, and `CARGO_NET_OFFLINE=true`.
+Test: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`
+(the temporary-directory overrides); the other forced values are not covered by
+a test.
 
 ## 5. Environment from the caller
 
@@ -203,7 +211,7 @@ terminal record carries `killed: deadline`. Test:
 
 7.4. A job's disk use is not capped per job. The runner protects the host with a
 free-space floor at admission; see [scheduling.md](scheduling.md#disk-admission).
-A job can fill the disk while it runs.
+A job can fill the disk while it runs. Not covered by a test.
 
 7.5. There is no per-job limit on the number of processes or threads beyond
 the memory cap and the host's own limits. Not covered by a test.
