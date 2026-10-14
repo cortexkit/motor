@@ -52,6 +52,7 @@ CRATE_ALIASES = {
     "motor_vm_helper": "motor-vm-helper",
     "motor_vm_guest": "motor-vm-guest",
     "motor_vm_loader": "motor-vm-loader",
+    "motor_winagent": "motor-winagent",
     "prefrontal_build_slot": "prefrontal-build-slot",
 }
 
@@ -381,6 +382,33 @@ def reexported_modules(crate: str) -> set[str]:
     return set(re.findall(r"^pub use ([a-z_][a-z0-9_]*)::", body, re.M))
 
 
+def braced_group_modules(text: str, open_brace: int) -> set[str]:
+    """Modules named at the top level of the `{...}` group opening at open_brace.
+
+    In `use crate_name::{Item, module::{a, b}, other::c}` the modules are
+    `module` and `other`; names nested deeper belong to those modules.
+    """
+    modules: set[str] = set()
+    depth = 0
+    index = open_brace
+    while index < len(text):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif depth == 1:
+            name = re.match(r"([a-z_][a-z0-9_]*)\s*::", text[index:])
+            if name and (index == 0 or not re.match(r"[A-Za-z0-9_:]", text[index - 1])):
+                modules.add(name.group(1))
+                index += len(name.group(0))
+                continue
+        index += 1
+    return modules
+
+
 def references(text: str, crate: str) -> set[tuple[str, str]]:
     """Named (crate, module) pairs; an empty module denotes a crate's root."""
     found: set[tuple[str, str]] = set()
@@ -390,6 +418,11 @@ def references(text: str, crate: str) -> set[tuple[str, str]]:
             found.add((other, ""))
         for module in re.findall(rf"\b{alias}::([a-z_][a-z0-9_]*)", text):
             found.add((other, module))
+        # `use prefrontal_core::{Item, org::{...}}` names `org` only inside the
+        # braces, so collect modules from a braced group too.
+        for group in re.finditer(rf"\b{alias}::\s*\{{", text):
+            for module in braced_group_modules(text, group.end() - 1):
+                found.add((other, module))
     # crate::org::..., self::org::..., super::org::...
     for module in re.findall(r"\b(?:crate|self|super)::([a-z_][a-z0-9_]*)", text):
         found.add((crate, module))

@@ -95,6 +95,29 @@ class UnreachableModulesTest(unittest.TestCase):
         self.assertEqual(production.returncode, 0, production.stdout + production.stderr)
         self.assertIn("every declared module is reachable", production.stdout)
 
+    def test_module_named_inside_a_braced_use_group_is_reachable(self) -> None:
+        # `use motor_protocol::{Item, feature::{run}}` names `feature` only
+        # inside the braces; the census must still count it as wired.
+        files = self.wiring_fixture("mod bridge;")
+        files["crates/motor-module/src/bridge.rs"] = (
+            "use motor_protocol::{\n    Item,\n    feature::{run},\n};\n"
+            "pub fn call() { run(); }\n"
+        )
+        result = self.run_gate(files)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("every declared module is reachable", result.stdout)
+
+        # A name nested a level deeper belongs to the outer module, not to the
+        # crate root, so it must not wire a same-named root module.
+        files["crates/motor-protocol/src/lib.rs"] = "pub mod feature;\npub mod run;\n"
+        files["crates/motor-protocol/src/run.rs"] = "pub fn go() {}\n"
+        files["crates/motor-module/src/bridge.rs"] = (
+            "use motor_protocol::{feature::{run::go}};\npub fn call() { go(); }\n"
+        )
+        nested = self.run_gate(files)
+        self.assertNotEqual(nested.returncode, 0, nested.stdout + nested.stderr)
+        self.assertIn("motor-protocol/run", nested.stderr)
+
     def test_binary_links_its_own_library_tree(self) -> None:
         # motor-module ships a library and a binary. A binary's reference to
         # its own library must seed that library's production wiring too.
