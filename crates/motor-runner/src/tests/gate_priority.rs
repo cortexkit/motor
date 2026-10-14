@@ -256,3 +256,195 @@ fn capacity_blocked_gate_still_fences_smaller_workers() {
         "the gate must reserve the next freed vCPUs from its first second"
     );
 }
+
+#[test]
+fn large_retained_table_and_blocked_heads_use_a_bounded_number_of_scheduler_scans() {
+    let f = Fixture::new();
+    let runner = runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    for number in 1..=10_000u128 {
+        let mut retained = Job::new(Uuid::from_u128(number), None, now, 0, 0);
+        retained.terminal(Outcome::Exit { code: 0 }, now);
+        inner.jobs.insert(retained.id, retained);
+    }
+    let mut holder = job(&request, &f.canonical, 2, 0, false, now);
+    holder.request.as_mut().unwrap().siblings.clear();
+    holder.state = JobState::Running;
+    holder.started_ms = Some(now);
+    holder.cpus = vec![1, 2];
+    let holder_id = holder.id;
+    inner.jobs.insert(holder_id, holder);
+    let mut blocked = Vec::new();
+    for number in 0..40 {
+        let waiting = job(
+            &request,
+            &format!("{}-{number}", f.key),
+            2,
+            number + 1,
+            true,
+            now,
+        );
+        blocked.push(waiting.id);
+        inner.jobs.insert(waiting.id, waiting);
+    }
+    let mut independent = job(&request, &f.key, 2, 100, false, now);
+    independent.request.as_mut().unwrap().siblings.clear();
+    let selected = independent.id;
+    inner.jobs.insert(selected, independent);
+    inner.scheduler_visits.store(0, Ordering::SeqCst);
+    runner.dispatch(&mut inner, now).unwrap();
+    let visits = inner.scheduler_visits.load(Ordering::SeqCst);
+    let starts = inner.starting.clone();
+    let cpus = inner.jobs[&selected].cpus.clone();
+    let blocked_stayed_queued = blocked.iter().all(|id| inner.jobs[id].setup_ms.is_none());
+    for id in blocked {
+        inner.jobs.remove(&id);
+    }
+    inner.jobs.remove(&holder_id);
+    drop(inner);
+    assert_eq!(starts, BTreeSet::from([selected]));
+    assert_eq!(cpus, vec![3, 4]);
+    assert!(blocked_stayed_queued);
+    assert!(
+        visits <= 3 * 10_042,
+        "blocked heads multiplied retained-table scans: {visits}"
+    );
+}
+
+#[test]
+fn dispatch_indexes_preserve_running_and_reserved_sibling_conflicts() {
+    let f = Fixture::new();
+    let runner = runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut active = job(&request, "/active/workspace", 2, 1, false, now);
+    active.state = JobState::Running;
+    active.started_ms = Some(now);
+    active.request.as_mut().unwrap().siblings = vec![SiblingSnapshot {
+        canonical_path: "/shared/running".into(),
+        commit: "old".into(),
+        tree_hash: String::new(),
+        base_commit: None,
+    }];
+    let mut base = job(&request, "base:/repository", 4, 2, false, now);
+    base.base = true;
+    base.state = JobState::Running;
+    base.started_ms = Some(now);
+    base.request.as_mut().unwrap().cwd = "/derived/fill".into();
+    base.request.as_mut().unwrap().siblings.clear();
+    let ids = [active.id, base.id];
+    inner.jobs.insert(active.id, active);
+    inner.jobs.insert(base.id, base);
+    let reserved = SiblingSnapshot {
+        canonical_path: "/shared/reserved".into(),
+        commit: "new".into(),
+        tree_hash: String::new(),
+        base_commit: None,
+    };
+    inner.reserved.insert(
+        "/setup/workspace".into(),
+        Reservation {
+            repository: String::new(),
+            commit: String::new(),
+            siblings: vec![reserved.clone()],
+            since_ms: now,
+        },
+    );
+    let index = DispatchIndex::build(&inner);
+    let mut results = Vec::new();
+    for key in [
+        "/active/workspace",
+        "/setup/workspace",
+        "/shared/running/child",
+        "/shared/reserved",
+        "/free",
+    ] {
+        results.push((index.occupied(key), Runner::occupied(&inner, key)));
+    }
+    for (path, commit) in [
+        ("/shared/running", "old"),
+        ("/shared/running", "different"),
+        ("/derived/fill/child", "old"),
+        ("/shared/reserved", "new"),
+        ("/free", "new"),
+    ] {
+        let siblings = vec![SiblingSnapshot {
+            canonical_path: path.into(),
+            commit: commit.into(),
+            tree_hash: String::new(),
+            base_commit: None,
+        }];
+        results.push((
+            index.siblings_blocked(&siblings, &inner.catalog.sibling_commits),
+            Runner::siblings_blocked(&inner, &siblings),
+        ));
+    }
+    let reserved_before_materialization = index.siblings_blocked(
+        std::slice::from_ref(&reserved),
+        &inner.catalog.sibling_commits,
+    );
+    inner
+        .catalog
+        .sibling_commits
+        .insert(reserved.canonical_path.clone(), reserved.commit.clone());
+    let reserved_after_materialization =
+        index.siblings_blocked(&[reserved], &inner.catalog.sibling_commits);
+    for id in ids {
+        inner.jobs.remove(&id);
+    }
+    inner.reserved.clear();
+    drop(inner);
+    assert!(
+        results
+            .iter()
+            .all(|(indexed, established)| indexed == established),
+        "indexed ownership differs from established overlap/commit rules: {results:?}"
+    );
+    assert!(reserved_before_materialization);
+    assert!(!reserved_after_materialization);
+}
+
+#[test]
+fn dispatch_indexes_add_each_starting_weight_and_cpu_claim_before_selecting_next() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    config.disable_warm_builds = true;
+    config.cpu_topology = Some(CpuTopology::new((0..65).map(|cpu| vec![cpu]).collect()).unwrap());
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut ids = Vec::new();
+    for order in 1..=3 {
+        let mut queued = job(
+            &request,
+            &format!("{}-{order}", f.key),
+            2,
+            order,
+            false,
+            now,
+        );
+        queued.request.as_mut().unwrap().siblings.clear();
+        ids.push(queued.id);
+        inner.jobs.insert(queued.id, queued);
+    }
+    runner.dispatch(&mut inner, now).unwrap();
+    let starts = inner.starting.clone();
+    let claims = [
+        inner.jobs[&ids[0]].cpus.clone(),
+        inner.jobs[&ids[1]].cpus.clone(),
+    ];
+    let third_waiting = inner.jobs[&ids[2]].setup_ms.is_none();
+    inner.jobs.remove(&ids[2]);
+    drop(inner);
+    assert_eq!(starts, BTreeSet::from([ids[0], ids[1]]));
+    assert_eq!(claims, [vec![1, 2], vec![3, 4]]);
+    assert!(
+        third_waiting,
+        "new setup reservations must consume capacity immediately"
+    );
+}

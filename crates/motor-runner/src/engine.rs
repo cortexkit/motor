@@ -361,6 +361,8 @@ struct Inner {
     drain_deadline: Option<std::time::Instant>,
     jobs: BTreeMap<Uuid, Job>,
     pending_replays: BTreeSet<Uuid>,
+    #[cfg(test)]
+    scheduler_visits: std::sync::atomic::AtomicU64,
     catalog: Catalog,
     rotation: BTreeMap<String, u64>,
     order: u64,
@@ -439,6 +441,9 @@ struct Core {
     trees: Trees,
     inner: Mutex<Inner>,
     job_logs: Mutex<BTreeMap<Uuid, Arc<JobLog>>>,
+    /// Ref mutations acquire this before the state lock, which is released
+    /// before Git runs. Keep pinning and ownership publication in one turn.
+    ref_mutation: Mutex<()>,
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
@@ -955,6 +960,8 @@ impl Runner {
                     drain_deadline: None,
                     jobs,
                     pending_replays: BTreeSet::new(),
+                    #[cfg(test)]
+                    scheduler_visits: std::sync::atomic::AtomicU64::new(0),
                     catalog,
                     order,
                     rotation: BTreeMap::new(),
@@ -977,6 +984,7 @@ impl Runner {
                     pending_start_refusals: BTreeSet::new(),
                 }),
                 job_logs: Mutex::new(BTreeMap::new()),
+                ref_mutation: Mutex::new(()),
                 quarantine_admission: Mutex::new(
                     (!quarantined.is_empty())
                         .then(|| "live unit ownership has not been inspected".into()),
@@ -1403,6 +1411,14 @@ impl Runner {
         }
     }
 
+    fn scheduler_jobs(inner: &Inner) -> impl Iterator<Item = &Job> {
+        inner.jobs.values().inspect(|_| {
+            #[cfg(test)]
+            inner
+                .scheduler_visits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
     /// A running job, or a setup in flight, owns this workspace key.
     fn occupied(inner: &Inner, key: &str) -> bool {
         inner.reserved.contains_key(key)
@@ -1410,7 +1426,7 @@ impl Runner {
                 .reserved
                 .values()
                 .any(|r| Self::workspace_uses_sibling(key, &r.siblings))
-            || inner.jobs.values().any(|j| {
+            || Self::scheduler_jobs(inner).any(|j| {
                 j.state == JobState::Running
                     && (j.key() == key
                         || j.request
@@ -1843,15 +1859,16 @@ impl Runner {
                     &request.siblings,
                 )
             })
-            .and_then(|()| trees.import_dependencies(directory, &request.git_dependencies))
-            .and_then(|()| {
-                trees.pin(
-                    &request.repository_root,
-                    &request.snapshot_commit,
-                    &request.integration_tip,
-                    &request.siblings,
-                )
-            });
+            .and_then(|()| trees.import_dependencies(directory, &request.git_dependencies));
+        let _refs = self.core.ref_mutation.lock().unwrap();
+        let fetched = fetched.and_then(|()| {
+            trees.pin(
+                &request.repository_root,
+                &request.snapshot_commit,
+                &request.integration_tip,
+                &request.siblings,
+            )
+        });
         let mut inner = self.core.inner.lock().unwrap();
         // A cancel or withdraw during the fetch already wrote the terminal.
         if !awaiting(&inner) {
@@ -1907,6 +1924,15 @@ impl Runner {
         self.core
             .trees
             .import_dependencies(directory, &request.git_dependencies)?;
+        self.long_work("pin_refs_wait");
+        let _refs = self.core.ref_mutation.lock().unwrap();
+        self.long_work("pin_refs_git");
+        self.core.trees.pin(
+            &request.repository_root,
+            &request.base_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )?;
         let mut inner = self.core.inner.lock().unwrap();
         inner.catalog.transferred.insert(
             request.transfer_id,
@@ -1918,18 +1944,10 @@ impl Runner {
                 finished_ms: self.now(),
             },
         );
-        self.catalog(&inner)?;
-        self.core.trees.pin(
-            &request.repository_root,
-            &request.base_commit,
-            &request.integration_tip,
-            &request.siblings,
-        )
+        self.catalog(&inner)
     }
     fn siblings_blocked(inner: &Inner, siblings: &[SiblingSnapshot]) -> bool {
-        inner
-            .jobs
-            .values()
+        Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Running)
             .any(|j| {
                 let Some(r) = j.request.as_ref() else { return false; };
@@ -2605,18 +2623,14 @@ impl Runner {
     }
 
     fn held_weight(inner: &Inner) -> u32 {
-        inner
-            .jobs
-            .values()
+        Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Running || inner.starting.contains(&j.id))
             .fold(0u32, |held, j| held.saturating_add(j.weight))
     }
 
     fn queue_heads(&self, inner: &Inner) -> Vec<Uuid> {
         let mut keys = BTreeMap::<&str, &Job>::new();
-        for job in inner
-            .jobs
-            .values()
+        for job in Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Queued && !inner.starting.contains(&j.id))
         {
             let head = keys.entry(job.key()).or_insert(job);
@@ -2793,7 +2807,8 @@ impl Runner {
                 inner.catalog.workspaces.remove(&key);
                 runner.catalog(&inner)?;
             }
-            runner.prune_refs(&inner)?;
+            drop(inner);
+            runner.prune_refs()?;
             Ok(DropReply::new(dropped, ids))
         })
         .await
@@ -2932,13 +2947,16 @@ impl Runner {
             active_transfers.contains(id) || self.now().saturating_sub(t.finished_ms) < RETENTION_MS
         });
         self.catalog(&inner)?;
-        self.prune_refs(&inner)
+        drop(inner);
+        self.prune_refs()
     }
 
-    fn prune_refs(&self, inner: &Inner) -> io::Result<()> {
+    fn prune_refs(&self) -> io::Result<()> {
         if !self.core.quarantined.is_empty() {
             return Ok(());
         }
+        let _refs = self.core.ref_mutation.lock().unwrap();
+        let inner = self.core.inner.lock().unwrap();
         let mut known = BTreeSet::new();
         let mut held = BTreeMap::<String, BTreeSet<String>>::new();
         fn snapshot(
@@ -3055,6 +3073,7 @@ impl Runner {
                 )
             })
             .collect();
+        drop(inner);
         // Expired records may be the last mention of a repository. Enumerate
         // mirrors too, so their unheld refs are pruned after that record expires.
         for entry in fs::read_dir(&self.core.trees.mirrors)? {
@@ -3067,6 +3086,7 @@ impl Runner {
             if !mirror.exists() {
                 continue;
             }
+            self.long_work("prune_refs_git");
             let refs = workspace::git(
                 &mirror,
                 &[
@@ -3076,9 +3096,12 @@ impl Runner {
                     "refs/tips",
                 ],
             )?;
-            for reference in refs.lines().filter(|r| !held.contains(*r)) {
-                workspace::git(&mirror, &["update-ref", "-d", reference])?;
-            }
+            let stale: Vec<_> = refs
+                .lines()
+                .filter(|reference| !held.contains(*reference))
+                .map(str::to_owned)
+                .collect();
+            workspace::delete_refs(&mirror, &stale)?;
         }
         Ok(())
     }
@@ -3267,36 +3290,35 @@ impl Runner {
         if self.ensure_admission_ownership().is_err() {
             return Ok(());
         }
+        let mut index = DispatchIndex::build(inner);
         loop {
-            let heads = self.queue_heads(inner);
             let mut next = None;
-            for id in heads {
+            for id in index.heads(inner, now) {
                 let job = &inner.jobs[&id];
-                let r = job.request.as_ref().unwrap();
+                let request = job.request.as_ref().unwrap();
                 if job.base
                     && (inner.writer.is_some()
                         || inner
                             .evicting_caches
                             .contains(&self.core.config.sccache_dir())
-                        || inner.jobs.values().any(|j| !j.base && j.pending()))
+                        || index.foreground_pending != 0)
                 {
                     continue;
                 }
                 if (!self.core.config.windows_instance()
-                    && Self::deleting(inner, job.key(), &r.siblings))
-                    || Self::occupied(inner, job.key())
-                    || Self::siblings_blocked(inner, &r.siblings)
+                    && Self::deleting(inner, job.key(), &request.siblings))
+                    || index.occupied(job.key())
+                    || index.siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
                 {
-                    // Idling unrelated CPUs cannot release a busy workspace.
+                    // A checkout conflict cannot be resolved by idling unrelated CPUs.
                     continue;
                 }
-                let weight = Self::held_weight(inner);
-                // An impossible demand must not fence the entire runner. It can
-                // still be withdrawn safely, with its capacity mismatch named.
                 if job.weight > self.core.config.max_weight {
                     continue;
                 }
-                if weight.saturating_add(job.weight) > self.core.config.max_weight {
+                if index.weight.saturating_add(job.weight) > self.core.config.max_weight {
+                    // Gates and aged heads stop backfill only for capacity,
+                    // after their checkout conflicts have already been excluded.
                     if job.gate_job()
                         || (!job.base
                             && now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
@@ -3309,10 +3331,9 @@ impl Runner {
                 next = Some(id);
                 break;
             }
-            let Some(id) = next else {
-                break;
-            };
-            self.start(inner, id)?;
+            let Some(id) = next else { break };
+            self.start(inner, id, &index.claims)?;
+            index.started(inner, id);
         }
         Ok(())
     }
@@ -3320,7 +3341,12 @@ impl Runner {
     /// Checking out a workspace and cloning a warm target can take minutes;
     /// the scheduler keeps the state lock only to reserve and, afterwards, to
     /// launch, so other jobs, transfers and requests proceed meanwhile.
-    fn start(&self, inner: &mut Inner, id: Uuid) -> io::Result<()> {
+    fn start(
+        &self,
+        inner: &mut Inner,
+        id: Uuid,
+        claims: &BTreeMap<Uuid, Vec<u32>>,
+    ) -> io::Result<()> {
         let job = inner.jobs[&id].clone();
         let r = job.request.clone().unwrap();
         // Internal warm builds bypass external admission, but share its CPU limit.
@@ -3365,7 +3391,7 @@ impl Runner {
         queued_job.cpus = self
             .core
             .cpus
-            .place(job.weight, inner.jobs.values().map(Job::claimed_cpus));
+            .place(job.weight, claims.values().map(Vec::as_slice));
         queued_job.setup_ms = Some(self.now());
         queued_job
             .queue_entry
@@ -4320,8 +4346,8 @@ impl Runner {
             }
             self.catalog(&inner)?;
         }
-        self.prune_refs(&inner)?;
         drop(inner);
+        self.prune_refs()?;
         Ok(())
     }
 
@@ -4418,5 +4444,167 @@ impl Runner {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Build from retained state once per dispatch, then update only the selected
+/// job's weight, checkout reservations and CPU claims after each start.
+#[derive(Default)]
+struct DispatchIndex {
+    weight: u32,
+    foreground_pending: usize,
+    workspaces: BTreeSet<String>,
+    sibling_paths: BTreeSet<String>,
+    running_paths: BTreeSet<String>,
+    reserved_paths: BTreeSet<String>,
+    running_siblings: BTreeMap<String, BTreeSet<String>>,
+    reserved_siblings: BTreeMap<String, BTreeSet<String>>,
+    claims: BTreeMap<Uuid, Vec<u32>>,
+    queued: BTreeMap<String, Vec<Uuid>>,
+}
+
+impl DispatchIndex {
+    fn build(inner: &Inner) -> Self {
+        let mut index = Self::default();
+        for job in Runner::scheduler_jobs(inner) {
+            if job.state == JobState::Running || inner.starting.contains(&job.id) {
+                index.weight = index.weight.saturating_add(job.weight);
+            }
+            if !job.base && job.pending() {
+                index.foreground_pending += 1;
+            }
+            if !job.claimed_cpus().is_empty() {
+                index.claims.insert(job.id, job.claimed_cpus().to_vec());
+            }
+            if job.state == JobState::Queued && !inner.starting.contains(&job.id) {
+                index
+                    .queued
+                    .entry(job.key().to_owned())
+                    .or_default()
+                    .push(job.id);
+            }
+            if job.state == JobState::Running {
+                index.workspaces.insert(job.key().to_owned());
+                if let Some(request) = &job.request {
+                    index.running_paths.insert(if job.base {
+                        request.cwd.clone()
+                    } else {
+                        request.workspace_key.clone()
+                    });
+                    for sibling in &request.siblings {
+                        index.sibling_paths.insert(sibling.canonical_path.clone());
+                        index
+                            .running_siblings
+                            .entry(sibling.canonical_path.clone())
+                            .or_default()
+                            .insert(sibling.commit.clone());
+                    }
+                }
+            }
+        }
+        for (key, reservation) in &inner.reserved {
+            index.reserve(key, &reservation.siblings);
+        }
+        for queue in index.queued.values_mut() {
+            queue.sort_by_key(|id| {
+                let job = &inner.jobs[id];
+                (!job.gate_job(), job.order)
+            });
+        }
+        index
+    }
+    fn reserve(&mut self, key: &str, siblings: &[SiblingSnapshot]) {
+        self.workspaces.insert(key.to_owned());
+        self.reserved_paths.insert(key.to_owned());
+        for sibling in siblings {
+            self.sibling_paths.insert(sibling.canonical_path.clone());
+            self.reserved_siblings
+                .entry(sibling.canonical_path.clone())
+                .or_default()
+                .insert(sibling.commit.clone());
+        }
+    }
+    fn overlap(a: &str, b: &str) -> bool {
+        Path::new(a).starts_with(b) || Path::new(b).starts_with(a)
+    }
+    fn occupied(&self, key: &str) -> bool {
+        self.workspaces.contains(key)
+            || self
+                .sibling_paths
+                .iter()
+                .any(|path| Self::overlap(key, path))
+    }
+    fn siblings_blocked(
+        &self,
+        siblings: &[SiblingSnapshot],
+        catalog: &BTreeMap<String, String>,
+    ) -> bool {
+        siblings.iter().any(|sibling| {
+            self.running_paths
+                .iter()
+                .chain(&self.reserved_paths)
+                .any(|path| Self::overlap(path, &sibling.canonical_path))
+                || self
+                    .running_siblings
+                    .get(&sibling.canonical_path)
+                    .is_some_and(|commits| commits.iter().any(|commit| commit != &sibling.commit))
+                || self
+                    .reserved_siblings
+                    .get(&sibling.canonical_path)
+                    .is_some_and(|commits| {
+                        catalog.get(&sibling.canonical_path) != Some(&sibling.commit)
+                            || commits.iter().any(|commit| commit != &sibling.commit)
+                    })
+        })
+    }
+    fn heads(&self, inner: &Inner, now: u64) -> Vec<Uuid> {
+        let mut heads: Vec<_> = self
+            .queued
+            .values()
+            .filter_map(|queue| queue.first())
+            .map(|id| {
+                let job = &inner.jobs[id];
+                if job.gate_job() {
+                    (0, job.order, 0, *id)
+                } else if job.base {
+                    (3, job.order, 0, *id)
+                } else if now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
+                    >= BACKFILL_GRACE_MS
+                {
+                    (1, job.order, 0, *id)
+                } else {
+                    (
+                        2,
+                        inner.rotation.get(job.key()).copied().unwrap_or(0),
+                        job.order,
+                        *id,
+                    )
+                }
+            })
+            .collect();
+        heads.sort();
+        heads.into_iter().map(|(_, _, _, id)| id).collect()
+    }
+    fn started(&mut self, inner: &Inner, id: Uuid) {
+        let job = &inner.jobs[&id];
+        let key = job.key();
+        let queue = self.queued.get_mut(key).unwrap();
+        queue.retain(|queued| *queued != id);
+        if queue.is_empty() {
+            self.queued.remove(key);
+        }
+        if !job.base && !job.pending() {
+            self.foreground_pending -= 1;
+        }
+        if job.claimed_cpus().is_empty() {
+            self.claims.remove(&id);
+        } else {
+            self.claims.insert(id, job.claimed_cpus().to_vec());
+        }
+        if inner.starting.contains(&id) {
+            self.weight = self.weight.saturating_add(job.weight);
+            let request = job.request.as_ref().unwrap();
+            self.reserve(key, &request.siblings);
+        }
     }
 }
