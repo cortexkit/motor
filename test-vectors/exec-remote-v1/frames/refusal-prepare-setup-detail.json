@@ -1,0 +1,6 @@
+{
+  "type": "refusal",
+  "transfer_id": "0192a64a-1234-7000-8000-000000000002",
+  "reason": "workspace_setup_failed",
+  "detail": "prepare workspace: populate workspace: destination path is not a directory"
+}

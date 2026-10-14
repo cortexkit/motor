@@ -170,7 +170,7 @@ async fn network_attach_failure_refuses_before_gate_with_network_cause() {
     let Outcome::RefusedBeforeStart { ref reason } = terminal.outcome else {
         panic!("{terminal:?}")
     };
-    assert!(String::from(reason.clone()).starts_with("workspace_setup_failed"));
+    assert_eq!(*reason, RefusalReason::WorkspaceSetupFailed);
     assert!(terminal
         .refusal_detail()
         .unwrap()

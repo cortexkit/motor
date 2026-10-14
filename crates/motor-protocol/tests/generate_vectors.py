@@ -154,7 +154,10 @@ def main():
         "refusal-prepare-bundle": {"type": "refusal", "transfer_id": TRANSFER,
                                    "reason": "bundle_rejected"},
         "refusal-prepare-setup": {"type": "refusal", "transfer_id": TRANSFER,
-                                  "reason": "workspace_setup_failed"},
+                                   "reason": "workspace_setup_failed"},
+        "refusal-prepare-setup-detail": {"type": "refusal", "transfer_id": TRANSFER,
+                                          "reason": "workspace_setup_failed",
+                                          "detail": "prepare workspace: populate workspace: destination path is not a directory"},
         "bundle_chunk": CHUNKS[0],
         "bundle_chunk-sibling": next(chunk for chunk in CHUNKS if chunk["index"] == 1),
         "output": {"type": "output", "seq": 0, "stream": "stdout", "bytes": "4g=="},
@@ -290,6 +293,21 @@ def main():
                           **extra)
         emit("outcomes", reason + "-detail", {"request": REQUEST, "stream": [record]})
 
+    for name, reason, detail in [
+        ("queue_wait_exceeded-detail", "queue_wait_exceeded", "waiting_on=permits; requested_permits=1; held_permits=0/1"),
+        ("workspace_setup_failed-detail", "workspace_setup_failed", "prepare job workspace: populate workspace: destination path is not a directory"),
+        ("transfer_interrupted-stalled-detail", "transfer_interrupted", "transfer_stalled: git fetch made no progress for 60 seconds"),
+        ("runner_full-slot-busy-detail", "runner_full", "windows_slot_busy"),
+        ("workspace_setup_failed-start-not-persisted-detail", "workspace_setup_failed", "execution gate was not opened: start_not_persisted"),
+        ("workspace_setup_failed-output-unavailable-detail", "workspace_setup_failed", "execution gate was not opened: output_unavailable"),
+    ]:
+        record = terminal({"type": "refused_before_start", "reason": reason},
+                          ran="none", refusal_detail=detail)
+        emit("outcomes", name, {"request": REQUEST, "stream": [ACCEPTED, record]})
+
+    emit("replies", "prepare-workspace_setup_failed-detail", {"transfer_id": TRANSFER,
+         "outcome": {"type": "refused_before_start", "reason": "workspace_setup_failed"},
+         "refusal_detail": "prepare workspace: populate workspace: destination path is not a directory"})
     emit("replies", "prepare-prepared", {"transfer_id": TRANSFER, "outcome": {"type": "prepared"}})
     emit("replies", "prepare-runner-draining-detail", {"transfer_id": TRANSFER,
          "outcome": {"type": "refused_before_start", "reason": "runner_draining"},

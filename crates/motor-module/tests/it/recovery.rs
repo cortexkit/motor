@@ -987,14 +987,17 @@ async fn setup_failure_has_one_terminal_and_no_queue_entry() {
     fs::write(&f.remote_key, "not a directory").unwrap();
     let records = collect(f.motor().run(f.request("echo ran >> marker")).unwrap()).await;
     assert!(matches!(records.first(), Some(StreamRecord::Accepted(_))));
-    let detail = match &terminal(&records).outcome {
+    assert_eq!(
+        terminal(&records).outcome,
         Outcome::RefusedBeforeStart {
-            reason: RefusalReason::Unknown(detail),
-        } => detail.clone(),
-        outcome => panic!("expected a detailed setup refusal, got {outcome:?}"),
-    };
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    );
+    let detail = terminal(&records)
+        .refusal_detail()
+        .expect("missing setup detail");
     assert!(
-        detail.starts_with("workspace_setup_failed: prepare job workspace: populate workspace:"),
+        detail.starts_with("prepare job workspace: populate workspace:"),
         "{detail}"
     );
     assert!(detail.contains("destination path"), "{detail}");
@@ -1074,9 +1077,14 @@ async fn zero_queue_wait_withdraws_and_cancel_is_idempotent() {
     let stream = motor.run(request).unwrap();
     let id = stream.job_id;
     let records = collect(stream).await;
-    assert!(matches!(&terminal(&records).outcome,
-        Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(detail) }
-        if detail.starts_with("queue_wait_exceeded:") && detail.contains("held_permits=0/1")));
+    assert_eq!(
+        terminal(&records).outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    let detail = terminal(&records).refusal_detail().unwrap();
+    assert!(detail.starts_with("waiting_on=") && detail.contains("held_permits=0/1"));
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     assert_eq!(
@@ -1198,17 +1206,31 @@ async fn refused_snapshot_retry_after_maintenance_sends_no_bundle() {
     request.queue_wait_limit_s = Some(0);
     let records = collect(motor.run(request.clone()).unwrap()).await;
     assert_eq!(terminal(&records).ran, Some(Ran::None));
-    assert!(matches!(&terminal(&records).outcome,
-        Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(detail) }
-        if detail.starts_with("queue_wait_exceeded:")));
+    assert_eq!(
+        terminal(&records).outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    assert!(terminal(&records)
+        .refusal_detail()
+        .unwrap()
+        .starts_with("waiting_on="));
     assert!(f.recorded_run().bundles.iter().any(|b| b.length > 0));
     f.runner.maintenance().unwrap();
     f.proxy.frames.lock().unwrap().clear();
     let records = collect(motor.run(request).unwrap()).await;
     assert_eq!(terminal(&records).ran, Some(Ran::None));
-    assert!(matches!(&terminal(&records).outcome,
-        Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(detail) }
-        if detail.starts_with("queue_wait_exceeded:")));
+    assert_eq!(
+        terminal(&records).outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    assert!(terminal(&records)
+        .refusal_detail()
+        .unwrap()
+        .starts_with("waiting_on="));
     assert!(f.recorded_run().bundles.is_empty());
 }
 
@@ -1348,4 +1370,36 @@ async fn oversized_vcpu_refusal_detail_reaches_the_run_terminal() {
         "{detail}"
     );
     assert_eq!(terminal.ran, Some(Ran::None));
+}
+
+#[tokio::test]
+async fn prepare_setup_failure_keeps_typed_reason_step_and_detail() {
+    let f = Fixture::new(Cut::None, 28).await;
+    crate::snapshot::git(&f.main, &["branch", "-m", "feature"]).unwrap();
+    fs::create_dir_all(f.remote_key.parent().unwrap()).unwrap();
+    fs::write(&f.remote_key, "not a directory").unwrap();
+    let reply = f
+        .motor()
+        .prepare(PrepareRequest::new(
+            text(&f.key),
+            text(&f.main),
+            git(&f.main, &["rev-parse", "HEAD"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.outcome,
+        PrepareOutcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    );
+    let detail = reply
+        .refusal_detail()
+        .expect("missing Prepare setup detail");
+    assert!(
+        detail.starts_with("prepare workspace: materialize prepared workspace:"),
+        "{detail}"
+    );
+    assert!(detail.contains("destination path"), "{detail}");
+    assert_eq!(reply.retry_after_ms(), None);
 }

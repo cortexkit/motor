@@ -143,7 +143,12 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
             )
             .unwrap()
     });
-    assert_refusal(&log, setup.job_id, "Unknown", "sandbox ownership denied");
+    assert_refusal(
+        &log,
+        setup.job_id,
+        "WorkspaceSetupFailed",
+        "sandbox ownership denied",
+    );
 
     let unknown = Uuid::now_v7();
     let log = logs(|| {
@@ -195,7 +200,12 @@ fn policy_and_withdrawal_refusals_log_their_diagnostics() {
             )
             .unwrap();
     });
-    assert_refusal(&log, request.job_id, "Unknown", "transfer_stalled");
+    assert_refusal(
+        &log,
+        request.job_id,
+        "TransferInterrupted",
+        "transfer_stalled",
+    );
 
     runner.begin_drain(Duration::from_secs(10), false);
     let (request, _) = f.run("true");

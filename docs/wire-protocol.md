@@ -149,38 +149,66 @@ not know, still proves no start. Test: `unknown_refusal_retains_the_before_start
 | `runner_version_mismatch` | `hello` versions differ. |
 | `snapshot_failed` | Capture failed or the untracked-size cap was exceeded; see [snapshot-contents.md](snapshot-contents.md). |
 | `workspace_key_rejected` | The workspace, repository or `cwd` paths are invalid. |
-| `runner_full` | The queue is full or the vCPU claim cannot fit the host. |
+| `runner_full` | The queue is full, the vCPU claim cannot fit the host, or the Windows VM slot is busy. |
 | `runner_draining` | The runner is draining. |
 | `runner_disk_full` | Free disk space is below the floor. |
 | `queue_wait_exceeded` | The job waited longer than its queue-wait budget. |
-| `transfer_interrupted` | The upload was cut before the runner had every bundle. |
+| `transfer_interrupted` | The upload was cut before the runner had every bundle, or an upload or fetch stalled. |
 | `tree_hash_mismatch` | The runner's checkout does not match the snapshot's tree hash. |
 | `bundle_rejected` | A bundle failed verification or fetch. |
-| `workspace_setup_failed` | The runner could not set up the workspace. |
+| `workspace_setup_failed` | Workspace setup or isolated-job launch failed, or persistence/output setup failed before the execution gate opened. |
 | `network_unsupported` | Outbound network was requested and is not available. |
 | `platform_unsupported` | The requested platform is not served. |
 
-5.4. Motor also emits these reason strings, which are not in the typed list and
-decode as unknown reasons (rule 5.2 still holds):
+5.4. The reason is a stable tag; human diagnostics belong in `refusal_detail`,
+not in the reason string. A queue-wait refusal uses `queue_wait_exceeded` and
+reports `waiting_on`, permit holders and other scheduler context in the detail.
+A setup refusal uses `workspace_setup_failed` and puts the setup step and error
+in the detail. Details are bounded and redacted as in rule 4; do not parse them
+for policy. Tests: `queue_wait_refusal_names_permit_holders_and_their_start_time`,
+`workspace_setup_refusal_preserves_step_and_error_in_fallback_terminal`,
+`setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason`,
+`oldest_production_client_keeps_typed_queue_and_setup_refusal_details`.
+
+Several diagnostic codes share an existing typed reason:
+
+| Code retained in detail | Typed wire reason | Produced when |
+| --- | --- | --- |
+| `transfer_stalled` | `transfer_interrupted` | An upload or fetch made no progress for 60 seconds, or a client withdrew an incomplete transfer with the private stalled-transfer marker. |
+| `windows_slot_busy` | `runner_full` | The host-wide Windows VM slot is held by another VM. |
+| `start_not_persisted` | `workspace_setup_failed` | Start persistence failed while the execution gate was still closed. |
+| `output_unavailable` | `workspace_setup_failed` | Output handles could not be acquired while the execution gate was still closed. |
+
+These mappings do not add retry hints. A private `withdraw` request with the
+`transfer_stalled` marker can withdraw a pending job only while it is still
+AwaitingBundles; its resulting terminal uses `transfer_interrupted`. A queue
+withdrawal instead requires a queued job whose queue-wait limit has expired.
+A release failure that may have opened the gate remains `outcome_unknown`, never a
+before-start refusal. Tests: `upload_stall_bound_ignores_heartbeats_and_empty_chunks`,
+`fetch_timeout_refusal_is_typed_and_keeps_the_stall_code`,
+`stalled_withdrawal_keeps_private_intent_and_typed_terminal`,
+`windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadline`,
+`started_write_failure_stops_and_reaps_unreleased_execution`,
+`output_handle_failure_stops_and_reaps_unreleased_execution`,
+`partial_release_failure_stops_and_reaps_without_no_start_claim`.
+
+Motor still emits the following reason strings as unknown reasons (rule 5.2
+still holds):
 
 | String | Produced when |
 | --- | --- |
-| `transfer_stalled` | An upload or fetch made no progress for 60 seconds. |
-| `lost_to_restart` | A runner restart found the job queued and never started. |
-| `windows_slot_busy` | The Windows VM slot was held by another VM. |
+| `lost_to_restart` | A runner restart found a foreground job queued and never started; internal interrupted background fills also use this tag. |
 | `prepare_unsupported` | `prepare` was sent to a Windows instance. |
 | `direct_timeout_refused` | A direct `ck motor run` asked for no timeout or one above the configured cap. |
-| `queue_wait_exceeded: <diagnostic>` | A queued job was withdrawn at its queue-wait limit. |
-| `workspace_setup_failed: <step>: <error>` | Workspace setup failed during a run. |
 | `runner_credential_*`, `runner_agent_*`, `runner_sign_*`, `runner_ssh_config_invalid` | `ck-motor` cannot authenticate to the runner; see [module.md](module.md#credential-failures). |
 
-The `queue_wait_exceeded: <diagnostic>` and `workspace_setup_failed: <step>: <error>`
-strings carry a diagnostic after the reason name, so they do not decode as the
-typed `queue_wait_exceeded` or `workspace_setup_failed`. Match on the
-prefix if you need to tell them apart. Tests:
-`zero_queue_wait_withdraws_and_cancel_is_idempotent`,
-`setup_failure_has_one_terminal_and_no_queue_entry`
-(`crates/motor-module/tests/it/recovery.rs`).
+Older runners can still send reason strings such as `queue_wait_exceeded: ...`
+or `workspace_setup_failed: step: error`, or use the specific cause codes
+`transfer_stalled`, `windows_slot_busy`, `start_not_persisted` and
+`output_unavailable` as reasons. Decoders preserve these as unknown reasons
+rather than rejecting them. Do not match their human-text prefixes for execution
+or retry decisions. Test:
+`unknown_refusal_retains_the_before_start_arm`.
 
 5.5. `retry_after_ms` is a hint that a refusal is transient (draining sends the
 time left to the drain deadline). Disk-full refusals carry no hint, because

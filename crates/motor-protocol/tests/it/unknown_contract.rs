@@ -109,9 +109,9 @@ fn sha256sums_covers_every_corpus_file() {
         }
     }
     assert_eq!(listed, actual, "missing or unchecked corpus checksums");
-    // Explicit bash runon calls retired the command matcher and its policy
-    // vectors. Every remaining runner/caller file still needs a checksum.
-    assert_eq!(listed.len(), 368);
+    // Each of 125 cases has .json, .jcs and .sha256 files. Eight published
+    // unknown-tag cases have only .jcs/.sha256 pairs; README.md adds one file.
+    assert_eq!(listed.len(), 392);
 }
 
 #[test]

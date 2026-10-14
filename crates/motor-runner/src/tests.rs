@@ -1592,13 +1592,17 @@ async fn hash_mismatch_and_materialization_failure_never_start() {
     let runner = reopen(c);
     let (r, bytes) = f.run("touch marker");
     f.submit(&runner, &r, &bytes);
-    let detail = match terminal(&runner, r.job_id).await.outcome {
+    let record = terminal(&runner, r.job_id).await;
+    assert_eq!(
+        record.outcome,
         Outcome::RefusedBeforeStart {
-            reason: RefusalReason::Unknown(detail),
-        } => detail,
-        outcome => panic!("expected a detailed materialization refusal, got {outcome:?}"),
-    };
-    assert!(detail.contains("workspace_setup_failed"), "{detail}");
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    );
+    let detail = record
+        .refusal_detail()
+        .expect("missing materialization detail");
+    assert!(detail.starts_with("prepare job workspace: "), "{detail}");
     assert!(detail.contains("materialize workspace"), "{detail}");
     assert!(
         detail.contains("injected materialization failure"),
@@ -2348,12 +2352,16 @@ async fn impossible_demand_does_not_fence_other_workspaces() {
         Outcome::Exit { code: 0 }
     );
     runner.withdraw(impossible.job_id).unwrap();
-    let Outcome::RefusedBeforeStart {
-        reason: RefusalReason::Unknown(detail),
-    } = terminal(&runner, impossible.job_id).await.outcome
-    else {
-        panic!("missing capacity diagnostic")
-    };
+    let record = terminal(&runner, impossible.job_id).await;
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    let detail = record
+        .refusal_detail()
+        .expect("missing capacity diagnostic");
     assert!(
         detail.contains("waiting_on=demand exceeds capacity"),
         "{detail}"
@@ -2405,16 +2413,16 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
         terminal(&runner, holder.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
-    let Outcome::RefusedBeforeStart {
-        reason: RefusalReason::Unknown(detail),
-    } = &record.outcome
-    else {
-        panic!("missing queue diagnostic")
-    };
-    assert!(
-        detail.starts_with("queue_wait_exceeded: waiting_on=permits"),
-        "{detail}"
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
     );
+    let detail = record.refusal_detail().expect("missing queue diagnostic");
+    assert_eq!(record.ran, Some(Ran::None));
+    assert_eq!(record.retry_after_ms(), None);
+    assert!(detail.starts_with("waiting_on=permits"), "{detail}");
     assert!(
         detail.contains("requested_permits=16; held_permits=20/28"),
         "{detail}"
@@ -2533,9 +2541,18 @@ async fn queued_withdraw_is_atomic_and_running_withdraw_reports_started() {
         runner.withdraw(r.job_id).unwrap(),
         WithdrawOutcome::Withdrawn
     );
-    assert!(matches!(terminal(&runner, r.job_id).await.outcome,
-        Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(detail) }
-        if detail.starts_with("queue_wait_exceeded:") && detail.contains("requested_permits=30")));
+    let record = terminal(&runner, r.job_id).await;
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    assert!(record.refusal_detail().unwrap().starts_with("waiting_on="));
+    assert!(record
+        .refusal_detail()
+        .unwrap()
+        .contains("requested_permits=30"));
     assert!(!Path::new(&f.key).join("marker").exists());
     base_done(&runner).await;
     let release = f.scratch.join("release");
@@ -2650,13 +2667,16 @@ async fn workspace_setup_refusal_preserves_step_and_error_in_fallback_terminal()
     f.submit(&runner, &request, &bytes);
 
     let terminal = terminal(&runner, request.job_id).await;
-    let detail = match &terminal.outcome {
+    assert_eq!(
+        terminal.outcome,
         Outcome::RefusedBeforeStart {
-            reason: RefusalReason::Unknown(detail),
-        } => detail.clone(),
-        outcome => panic!("expected a detailed workspace setup refusal, got {outcome:?}"),
-    };
-    assert!(detail.contains("workspace_setup_failed"), "{detail}");
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), None);
+    let detail = terminal.refusal_detail().expect("missing setup detail");
+    assert!(detail.starts_with("prepare job workspace: "), "{detail}");
     assert!(detail.contains("prepare job workspace"), "{detail}");
     assert!(detail.contains("materialize workspace"), "{detail}");
     assert!(
@@ -2665,7 +2685,7 @@ async fn workspace_setup_refusal_preserves_step_and_error_in_fallback_terminal()
     );
     let notice = serde_json::to_string(&Frame::Terminal(terminal.clone())).unwrap();
     assert!(
-        notice.contains(&detail),
+        notice.contains(detail),
         "caller terminal lost setup detail: {notice}"
     );
 }
@@ -4058,8 +4078,19 @@ async fn real_permit_wait_still_expires_and_names_the_other_holder() {
         WithdrawOutcome::Withdrawn
     );
     let result = terminal(&runner, waiting.job_id).await;
+    assert_eq!(
+        result.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    let detail = result.refusal_detail().unwrap();
     assert!(
-        matches!(&result.outcome, Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(detail) } if detail.contains(&holder.job_id.to_string()) && !detail.contains(&format!("job={} workspace={}", waiting.job_id, waiting.workspace_key)))
+        detail.contains(&holder.job_id.to_string())
+            && !detail.contains(&format!(
+                "job={} workspace={}",
+                waiting.job_id, waiting.workspace_key
+            ))
     );
     assert_eq!(result.ran, Some(Ran::None));
     fs::write(release, "").unwrap();
@@ -4413,4 +4444,53 @@ fn admission_failure_diagnostics_include_refusal_and_destination() {
     ] {
         assert!(message.contains(detail), "missing {detail:?} in {message}");
     }
+}
+
+#[test]
+fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (mut request, _) = f.run("true");
+    let secret = "private-error-canary";
+    request.env.insert("RUSTFLAGS".into(), secret.into());
+    runner.accept(request.clone()).unwrap();
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&request.job_id)
+        .unwrap()
+        .state = JobState::Queued;
+    let error = io::Error::other(format!("{secret}: {}", "é".repeat(1024)));
+    runner
+        .launch(
+            Setup {
+                id: request.job_id,
+                cpus: vec![1, 17],
+                request: request.clone(),
+                base: false,
+                recorded: BTreeMap::new(),
+            },
+            Err(error),
+        )
+        .unwrap();
+    let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    );
+    let detail = terminal.refusal_detail().unwrap();
+    assert!(
+        detail.starts_with("prepare job workspace: runner environment"),
+        "{detail}"
+    );
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+    assert!(detail.len() >= REFUSAL_DETAIL_MAX_BYTES - 1);
+    assert!(!serde_json::to_string(&terminal).unwrap().contains(secret));
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), None);
 }

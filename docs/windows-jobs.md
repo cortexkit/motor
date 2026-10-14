@@ -100,8 +100,7 @@ Tests: `windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_of
 
 3.7. One VM runs at a time: the instance fixes every job's weight and its
 `max_weight` at 4, and the VM takes a host-wide slot lock. If the slot is held
-(for example by the standing build VM), the job is refused before start with
-`windows_slot_busy`. Tests: `windows_weights_are_fixed_and_warm_builds_and_caller_catalog_are_disabled`,
+(for example by the standing build VM), the job is refused before start with reason `runner_full` and `windows_slot_busy` in `refusal_detail`. Tests: `windows_weights_are_fixed_and_warm_builds_and_caller_catalog_are_disabled`,
 `windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadline`,
 `windows_qualification_one_vm_slot_lock_refuses_without_boot` (operator-only).
 

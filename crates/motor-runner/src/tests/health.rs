@@ -20,12 +20,12 @@ fn health_counts_acceptance_and_each_refusal_reason_once() {
         (RefusalReason::TransferInterrupted, "transfer_interrupted"),
         (RefusalReason::TreeHashMismatch, "tree_hash_mismatch"),
         (
-            RefusalReason::Unknown("transfer_stalled".into()),
-            "transfer_stalled",
+            RefusalReason::Unknown("future_refusal".into()),
+            "future_refusal",
         ),
         (
-            RefusalReason::Unknown("workspace_setup_failed: permission denied".into()),
-            "workspace_setup_failed: permission denied",
+            RefusalReason::Unknown("future_refusal: permission denied".into()),
+            "future_refusal: permission denied",
         ),
     ];
     let mut expected = BTreeMap::new();

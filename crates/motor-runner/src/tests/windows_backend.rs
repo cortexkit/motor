@@ -763,9 +763,17 @@ async fn windows_backend_started_write_failure_destroys_unreleased_vm_and_dispat
     let (first, bytes) = request(&f);
     f.submit(&runner, &first, &bytes);
     let first_terminal = terminal(&runner, first.job_id).await;
-    assert!(
-        matches!(first_terminal.outcome,Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(ref token) } if token == "start_not_persisted")
+    assert!(matches!(
+        first_terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    ));
+    assert_eq!(
+        first_terminal.refusal_detail(),
+        Some("execution gate was not opened: start_not_persisted")
     );
+    assert_eq!(first_terminal.retry_after_ms(), None);
     assert_eq!(first_terminal.ran, Some(Ran::None));
     assert!(failed.load(Ordering::SeqCst));
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1074,9 +1082,28 @@ async fn windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadlin
         f.submit(&runner, &r, &bytes);
         let t = terminal(&runner, r.job_id).await;
         assert!(began.elapsed() < Duration::from_secs(5));
-        assert!(
-            matches!(t.outcome,Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(ref token) } if (token == "windows_slot_busy") == (code == 75))
+        assert_eq!(
+            t.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: if code == 75 {
+                    RefusalReason::RunnerFull
+                } else {
+                    RefusalReason::WorkspaceSetupFailed
+                }
+            }
         );
+        let detail = t.refusal_detail().unwrap();
+        if code == 75 {
+            assert_eq!(detail, "windows_slot_busy");
+        } else {
+            assert!(detail.starts_with("prepare job workspace: "), "{detail}");
+            assert!(
+                detail.contains("Windows VM unit exited before agent reply"),
+                "{detail}"
+            );
+        }
+        assert_eq!(t.ran, Some(Ran::None));
+        assert_eq!(t.retry_after_ms(), None);
         assert_eq!(a.clock.load(Ordering::SeqCst), 0);
         assert_eq!(a.starts.load(Ordering::SeqCst), 0);
         let vm = runner.config().windows.as_ref().unwrap();
@@ -1563,9 +1590,18 @@ async fn windows_backend_failed_refusal_persistence_retries_at_maintenance_witho
     let (r, bytes) = request(&f);
     f.submit(&runner, &r, &bytes);
     let t = terminal(&runner, r.job_id).await;
-    assert!(
-        matches!(t.outcome,Outcome::RefusedBeforeStart{reason:RefusalReason::Unknown(ref token)} if token=="start_not_persisted")
+    assert!(matches!(
+        t.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    ));
+    assert_eq!(
+        t.refusal_detail(),
+        Some("execution gate was not opened: start_not_persisted")
     );
+    assert_eq!(t.ran, Some(Ran::None));
+    assert_eq!(t.retry_after_ms(), None);
     cleaned(runner.config(), r.job_id, &a);
     assert!(!runner
         .core
@@ -1585,9 +1621,12 @@ async fn windows_backend_failed_refusal_persistence_retries_at_maintenance_witho
         .pending_start_refusals
         .is_empty());
     let durable: Job = read_json(&runner.record_path(r.job_id)).unwrap();
-    assert!(
-        matches!(durable.terminal.unwrap().outcome,Outcome::RefusedBeforeStart{reason:RefusalReason::Unknown(ref token)} if token=="start_not_persisted")
-    );
+    assert!(matches!(
+        durable.terminal.unwrap().outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed
+        }
+    ));
     assert_eq!(a.starts.load(Ordering::SeqCst), 0);
 }
 

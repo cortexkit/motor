@@ -1768,15 +1768,13 @@ async fn refusals(rig: &Rig) {
     let mut params = rig.request(&key, "echo forbidden > queue-marker");
     params["queue_wait_limit_s"] = json!(0);
     let result = rig.bus.run(params).await.finish().await;
-    let Outcome::RefusedBeforeStart {
-        reason: RefusalReason::Unknown(detail),
-    } = &result.terminal().outcome
-    else {
-        panic!("missing queue wait diagnostic")
-    };
-    assert!(detail.starts_with("queue_wait_exceeded:"), "{detail}");
+    let detail = result
+        .terminal()
+        .refusal_detail()
+        .expect("missing queue wait diagnostic");
+    assert!(detail.starts_with("waiting_on="), "{detail}");
     assert!(detail.contains("held_permits=28/28"), "{detail}");
-    result.refusal(RefusalReason::Unknown(detail.clone()), true);
+    result.refusal(RefusalReason::QueueWaitExceeded, true);
     let replay = rig.bus.attach(result.id()).await.finish().await;
     assert_eq!(replay.terminal(), result.terminal());
     marker_absent(rig, &key, "queue-marker").await;
