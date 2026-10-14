@@ -1124,22 +1124,35 @@ fn main() {{ assert_eq!(commons::helper(), 42); assert_eq!(private::helper(), 42
             "representative build job stdout/stderr:\n{output}"
         );
         assert!(output.contains("target cache is writable"), "{output}");
-        let timing = output
-            .lines()
-            .find(|line| line.starts_with("motor-winagent: Cache::mount elapsed="))
-            .unwrap_or_else(|| panic!("missing cache mount timing: {output}"));
+        assert!(
+            !output.contains("motor-winagent: Cache::mount"),
+            "service timings leaked into command output: {output}"
+        );
+        let timing = runner
+            .config()
+            .windows_runtime
+            .cache_timings
+            .lock()
+            .unwrap()
+            .get(&request.job_id)
+            .cloned()
+            .expect("missing cache mount timing frame");
         eprintln!(
-            "representative build cache mount ({}): {timing}",
+            "representative build cache mount ({}): {timing:?}",
             if with_bundle {
                 "fresh disk"
             } else {
                 "reused disk"
             }
         );
+        assert!(
+            timing.disk_selection_ms < 2_000,
+            "slow cache disk selection: {timing:?}"
+        );
         if !with_bundle {
             assert!(
-                timing.contains("ACL grant already present"),
-                "reused cache repeated its ACL propagation: {timing}"
+                !timing.volume_acl_updated,
+                "reused cache repeated its ACL propagation: {timing:?}"
             );
         }
         assert!(output.contains("dependencies_work ... ok"), "{output}");

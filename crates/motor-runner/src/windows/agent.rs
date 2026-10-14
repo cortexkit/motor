@@ -18,6 +18,8 @@ pub(crate) struct Runtime {
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
+    #[cfg(test)]
+    pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
     pub(super) fn defer_cleanup(&self, resources: super::vm::Resources) {
@@ -262,6 +264,11 @@ impl Transport {
                 }
             }
         }
+        // Uploads are one-way until TreeEnd. Completed chunks are progress, not
+        // a reason to apply a single 60-second limit to the entire snapshot.
+        if matches!(frame, Frame::ReceiveTree { .. }) {
+            self.bounds.received(self.clock.now())?;
+        }
         Ok(())
     }
     fn receive(&mut self) -> io::Result<Option<Frame>> {
@@ -326,6 +333,12 @@ impl Transport {
                 self.cancelled = true;
             }
             match self.receive() {
+                Ok(Some(Frame::CacheMounted { timings })) => {
+                    tracing::info!(job_id = %vm.id, ?timings, "Windows guest cache mount timings");
+                    #[cfg(test)]
+                    vm.record_cache_timings(timings);
+                    continue;
+                }
                 Ok(Some(frame)) => return Ok(frame),
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
@@ -425,6 +438,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
     };
     let thread_control = control.clone();
     let thread = std::thread::spawn(move || {
+        let mut exit_code = None;
         let result = (|| {
             let bounds = Bounds::new(unit_started_ms);
             #[cfg(test)]
@@ -517,7 +531,10 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
                                 .map_err(|_| invalid("Windows output consumer stalled"))?;
                         }
                     }
-                    Frame::Exit { code } => break code,
+                    Frame::Exit { code } => {
+                        exit_code = Some(code);
+                        break code;
+                    }
                     _ => return Err(invalid("unexpected running frame")),
                 }
             };
@@ -562,6 +579,15 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
                     error,
                 ))
             }
+        };
+        // Once received, the command status is independent of collection and
+        // teardown. Failed teardown still takes the discard-cache path above.
+        let result = match (exit_code, result) {
+            (Some(code), Err(error)) => {
+                tracing::warn!(job_id = %id, %error, code, "Windows post-exit cleanup failed; cache discarded or pending discard");
+                Ok(ExecutionOutcome::WindowsExit { code })
+            }
+            (_, result) => result,
         };
         if let Err(error) = &result {
             let _ = ready_tx.try_send(Err(io::Error::new(error.kind(), error.to_string())));
@@ -643,7 +669,7 @@ mod tests {
                 .accept(
                     Peer::Agent,
                     &Frame::Hello {
-                        version: 1,
+                        version: motor_winagent::PROTOCOL_VERSION,
                         nonce: "nonce".into(),
                     },
                 )

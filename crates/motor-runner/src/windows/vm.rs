@@ -282,6 +282,15 @@ impl Resources {
     }
 }
 impl Resources {
+    #[cfg(test)]
+    pub(super) fn record_cache_timings(&self, timings: motor_winagent::CacheTimings) {
+        self.config
+            .windows_runtime
+            .cache_timings
+            .lock()
+            .unwrap()
+            .insert(self.id, timings);
+    }
     fn cleanup(&mut self) -> io::Result<()> {
         if self.cleaned {
             return Ok(());
@@ -364,8 +373,8 @@ impl Resources {
     }
     pub(super) fn finalize_known(&mut self) -> io::Result<()> {
         // Keep the on-disk attachment marker until all cleanup succeeds. A
-        // cleanup failure makes the reported exit unknown, so discard its cache
-        // rather than exposing a reusable disk before finalization can fail.
+        // cleanup failure makes the cache suspect even when the command's exit
+        // is known. Do not expose a reusable disk before finalization can fail.
         self.attached = false;
         let result = self.cleanup().and_then(|()| self.complete(true));
         if result.is_err() {
@@ -481,7 +490,11 @@ pub(super) fn qemu_args(
         "-drive".into(),
         format!("file={},format=qcow2,if=virtio", overlay.display()),
         "-drive".into(),
-        format!("file={},format=qcow2,if=virtio", cache.display()),
+        format!(
+            "file={},format=qcow2,if=virtio,serial={}",
+            cache.display(),
+            motor_winagent::cache::CACHE_DISK_SERIAL
+        ),
         "-chardev".into(),
         format!(
             "socket,id=agent,path={}",

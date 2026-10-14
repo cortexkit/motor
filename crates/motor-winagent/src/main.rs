@@ -12,16 +12,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 mod guest {
     use motor_winagent::{
-        CACHE_INHERIT_FLAGS, CACHE_LABEL, CACHE_MODIFY_MASK, CHUNK_BYTES, CacheAce, Command, Frame,
-        Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME, SMBIOS_NONCE_PREFIX,
-        Stream, VIRTIO_PORT_NAME, cache_has_modify_grant, collect_changes, inventory, mapped_cwd,
-        read_frame, unpack_tree, write_frame,
+        CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CHUNK_BYTES, CacheAce, CacheTimings, Command,
+        Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
+        SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
+        cache::{mount_script, select_cache_disk, storage_serial},
+        cache_has_modify_grant, collect_changes, inventory, mapped_cwd, read_frame, unpack_tree,
+        write_frame,
     };
     use std::{
         ffi::OsString,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
-        mem::{size_of, zeroed},
+        mem::{size_of, size_of_val, zeroed},
         os::windows::io::FromRawHandle,
         path::{Path, PathBuf},
         ptr::{null, null_mut},
@@ -439,7 +441,6 @@ mod guest {
     #[derive(serde::Deserialize)]
     struct DiskMount {
         volume: String,
-        selection_ms: u64,
         set_disk_ms: u64,
         volume_ms: u64,
     }
@@ -448,7 +449,7 @@ mod guest {
         clean: bool,
         acl_updated: bool,
         mountpoint_acl_updated: bool,
-        phase_report: String,
+        timings: CacheTimings,
     }
     struct LocalSecurityBuffer(*mut std::ffi::c_void);
     impl Drop for LocalSecurityBuffer {
@@ -458,30 +459,68 @@ mod guest {
             }
         }
     }
+    fn cache_disk() -> io::Result<u32> {
+        let mut disks = Vec::new();
+        // The sealed VM has two disks. Enumerate a bounded set so unexpected
+        // device topology fails closed instead of selecting an arbitrary disk.
+        for number in 0..32 {
+            let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
+            let raw = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(2 | 3)) {
+                    continue;
+                }
+                return Err(error);
+            }
+            let disk = Handle::new(raw)?;
+            // StorageDeviceProperty / PropertyStandardQuery, with no additional
+            // parameters. The descriptor includes the virtio block serial.
+            let query = [0u32; 3];
+            let mut descriptor = [0u8; 4096];
+            let mut returned = 0;
+            unsafe {
+                win32(DeviceIoControl(
+                    disk.0,
+                    IOCTL_STORAGE_QUERY_PROPERTY,
+                    query.as_ptr().cast(),
+                    size_of_val(&query) as u32,
+                    descriptor.as_mut_ptr().cast(),
+                    descriptor.len() as u32,
+                    &mut returned,
+                    null_mut(),
+                ))?;
+            }
+            disks.push((
+                number,
+                storage_serial(&descriptor[..returned as usize])?.to_owned(),
+            ));
+        }
+        select_cache_disk(
+            disks
+                .iter()
+                .map(|(number, serial)| (*number, serial.as_str())),
+        )
+    }
     impl Cache {
         fn mount(user: &User) -> io::Result<Self> {
-            // Only the one non-system data disk is eligible. Never format an
-            // existing partition or infer a cache disk from a caller's path.
+            let started = Instant::now();
+            let number = cache_disk()?;
+            let disk_selection_ms = started.elapsed().as_millis() as u64;
             let powershell_started = Instant::now();
-            let disk: DiskMount = serde_json::from_str(&powershell(&format!(
-                r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new();
-$watch=[Diagnostics.Stopwatch]::StartNew();
-$d=@(Get-Disk | Where-Object {{ -not $_.IsBoot -and -not $_.IsSystem }});
-if($d.Count -ne 1) {{ throw 'expected one cache disk' }}; $d=$d[0];
-$selectionMs=$watch.ElapsedMilliseconds; $watch.Restart();
-# SAN policy can mark a previously initialized data disk offline and read-only
-# on every boot. Clear both attributes only on the selected non-system disk.
-$d | Set-Disk -IsReadOnly $false;
-$d | Set-Disk -IsOffline $false;
-$d=Get-Disk -Number $d.Number;
-if($d.IsOffline -or $d.IsReadOnly) {{ throw 'cache disk is not online and writable' }};
-$setDiskMs=$watch.ElapsedMilliseconds; $watch.Restart();
-if($d.PartitionStyle -eq 'RAW') {{ $d | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel '{CACHE_LABEL}' -Confirm:$false | Out-Null }};
-$v=@(Get-Partition -DiskNumber $d.Number | Get-Volume | Where-Object {{ $_.FileSystem -eq 'NTFS' -and $_.FileSystemLabel -eq '{CACHE_LABEL}' }});
-if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
-@{{volume=$v[0].Path;selection_ms=$selectionMs;set_disk_ms=$setDiskMs;volume_ms=$watch.ElapsedMilliseconds}} | ConvertTo-Json -Compress"#
-            ))?).map_err(|error| invalid(format!("invalid disk mount report: {error}")))?;
-            let powershell_ms = powershell_started.elapsed().as_millis();
+            let disk: DiskMount = serde_json::from_str(&powershell(&mount_script(number))?)
+                .map_err(|error| invalid(format!("invalid disk mount report: {error}")))?;
+            let powershell_ms = powershell_started.elapsed().as_millis() as u64;
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")
                 || !volume.ends_with("}\\")
@@ -503,7 +542,7 @@ if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
                 clean: false,
                 acl_updated: false,
                 mountpoint_acl_updated: false,
-                phase_report: String::new(),
+                timings: CacheTimings::default(),
             };
             let dirty_started = Instant::now();
             let handle = cache.open_volume()?;
@@ -539,18 +578,19 @@ if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
             cache.acl_updated =
                 Self::grant_access(&cache.volume, FILE_FLAG_BACKUP_SEMANTICS, user)?;
             let volume_acl_ms = volume_acl_started.elapsed().as_millis();
-            cache.phase_report = format!(
-                "motor-winagent: Cache::mount phases (ms): powershell_total={powershell_ms} disk_selection={} set_disk={} format_and_volume={} mountpoint={mountpoint_ms} dirty_check={dirty_ms} acl_total={} mounted_folder_acl={folder_acl_ms} volume_root_acl={volume_acl_ms}; mounted-folder grant {}\n",
-                disk.selection_ms,
-                disk.set_disk_ms,
-                disk.volume_ms,
-                acl_started.elapsed().as_millis(),
-                if cache.mountpoint_acl_updated {
-                    "updated"
-                } else {
-                    "already present"
-                }
-            );
+            cache.timings = CacheTimings {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                disk_selection_ms,
+                powershell_ms,
+                set_disk_ms: disk.set_disk_ms,
+                volume_ms: disk.volume_ms,
+                mountpoint_ms: mountpoint_ms as u64,
+                dirty_check_ms: dirty_ms as u64,
+                folder_acl_ms: folder_acl_ms as u64,
+                volume_acl_ms: volume_acl_ms as u64,
+                folder_acl_updated: cache.mountpoint_acl_updated,
+                volume_acl_updated: cache.acl_updated,
+            };
             Ok(cache)
         }
         fn grant_access(path: &str, flags: u32, user: &User) -> io::Result<bool> {
@@ -1134,21 +1174,12 @@ if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
         port: &mut Port,
         user: &User,
         command: &Command,
-        cache_mount_report: &[u8],
     ) -> io::Result<()> {
         if receive(protocol, rx, &port.stop)? != (Frame::Start {}) {
             return Err(invalid("expected the execution gate"));
         }
         let mut job = Job::start(user, command, tx, port.stop.clone())?;
         send(protocol, port, &Frame::Started {})?;
-        send(
-            protocol,
-            port,
-            &Frame::Output {
-                stream: Stream::Stderr,
-                bytes: cache_mount_report.to_vec(),
-            },
-        )?;
         let mut code = None;
         let mut closed = 0;
         loop {
@@ -1263,28 +1294,16 @@ if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
             },
         )?;
         let user = User::logon()?;
-        let cache_started = Instant::now();
         let mut cache = Cache::mount(&user)?;
-        let cache_mount_report = format!(
-            "motor-winagent: Cache::mount elapsed={} ms; volume ACL grant {}\n{}",
-            cache_started.elapsed().as_millis(),
-            if cache.acl_updated {
-                "updated"
-            } else {
-                "already present"
-            },
-            cache.phase_report,
-        );
-        let (command, before) = stage(&mut protocol, &rx, &mut port, &user)?;
-        execute(
+        send(
             &mut protocol,
-            &rx,
-            tx,
             &mut port,
-            &user,
-            &command,
-            cache_mount_report.as_bytes(),
+            &Frame::CacheMounted {
+                timings: cache.timings.clone(),
+            },
         )?;
+        let (command, before) = stage(&mut protocol, &rx, &mut port, &user)?;
+        execute(&mut protocol, &rx, tx, &mut port, &user, &command)?;
         if receive(&mut protocol, &rx, &port.stop)? != (Frame::Collect {}) {
             return Err(invalid("expected collect"));
         }
@@ -1313,7 +1332,7 @@ if($v.Count -ne 1) {{ throw 'cache is not the expected NTFS volume' }};
         )?;
         // QEMU must exit normally after the clean dismount acknowledgement. A
         // service exit alone would leave the guest running until the host's
-        // 60-second unit-exit deadline, turning a clean job into an unknown outcome.
+        // unit-exit deadline and force the host to discard the cache disk.
         let result = std::process::Command::new("C:\\Windows\\System32\\shutdown.exe")
             .args(["/s", "/t", "0"])
             .status()?;

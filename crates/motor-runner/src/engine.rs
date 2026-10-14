@@ -3830,7 +3830,7 @@ impl Runner {
             .map(|id| self.core.backend.unit_name(&self.core.config, id))
             .unwrap_or_else(|| "unrecorded".into());
         self.output(id, OutputStream::Stderr,
-            format!("runner recovery: job_id={id} outcome_unknown unit={unit} unit_alive={alive}; never rerun; query exec.status or exec.attach by job_id\n").as_bytes())
+            format!("runner recovery: job_id={id} outcome_unknown unit={unit} unit_alive={alive}; runner will not retry the job automatically; query exec.status or exec.attach by job_id\n").as_bytes())
     }
     fn follow_unit(&self, id: Uuid) -> io::Result<()> {
         use std::io::{Seek, SeekFrom};
@@ -4227,7 +4227,7 @@ impl Runner {
                 id,
                 OutputStream::Stderr,
                 format!(
-                    "runner monitoring: job_id={id} outcome_unknown error={error}; never rerun\n"
+                    "runner monitoring: job_id={id} outcome_unknown error={error}; runner will not retry the job automatically\n"
                 )
                 .as_bytes(),
             ) {

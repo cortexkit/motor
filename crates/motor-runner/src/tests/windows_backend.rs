@@ -48,10 +48,12 @@ enum Fault {
     None,
     Hello,
     Transfer,
+    SlowTransfer,
     Start,
     RejectStart,
     Collect,
     Dismount,
+    DismountOnce,
     UnitExit,
     Silent,
     Oversized,
@@ -227,6 +229,15 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
     let captured = agent.clone();
     c.windows_vm = Some(Arc::new(move |args, nonce, path| {
         captured.units.lock().unwrap().push(args.to_vec());
+        let fault = if fault == Fault::DismountOnce {
+            if captured.units.lock().unwrap().len() == 1 {
+                Fault::Dismount
+            } else {
+                Fault::None
+            }
+        } else {
+            fault
+        };
         let done = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let socket = Arc::new(Mutex::new(None));
@@ -256,7 +267,11 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     motor_winagent::write_frame(
                         &mut port,
                         &AgentFrame::Hello {
-                            version: if fault == Fault::Version { 2 } else { 1 },
+                            version: if fault == Fault::Version {
+                                motor_winagent::PROTOCOL_VERSION + 1
+                            } else {
+                                motor_winagent::PROTOCOL_VERSION
+                            },
                             nonce: if fault == Fault::Nonce {
                                 "wrong".into()
                             } else {
@@ -278,10 +293,30 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     stall(&a, &s, 1);
                     return Ok(());
                 }
-                session.send(&mut port, &AgentFrame::Hello { version: 1, nonce })?;
+                session.send(
+                    &mut port,
+                    &AgentFrame::Hello {
+                        version: motor_winagent::PROTOCOL_VERSION,
+                        nonce,
+                    },
+                )?;
+                session.send(
+                    &mut port,
+                    &AgentFrame::CacheMounted {
+                        timings: motor_winagent::CacheTimings {
+                            disk_selection_ms: 23,
+                            ..Default::default()
+                        },
+                    },
+                )?;
                 let command = loop {
                     match session.receive(&mut port)?.unwrap() {
-                        AgentFrame::ReceiveTree { bytes } => a.tree.lock().unwrap().extend(bytes),
+                        AgentFrame::ReceiveTree { bytes } => {
+                            a.tree.lock().unwrap().extend(bytes);
+                            if fault == Fault::SlowTransfer {
+                                a.clock.fetch_add(1_000, Ordering::SeqCst);
+                            }
+                        }
                         AgentFrame::TreeEnd { command } => break command,
                         _ => unreachable!(),
                     }
@@ -477,6 +512,38 @@ fn cleaned(c: &Config, id: Uuid, agent: &Agent) {
     assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn windows_backend_recovery_notice_describes_only_automatic_retry_policy() {
+    let f = Fixture::new();
+    let (c, _) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let id = Uuid::now_v7();
+    let mut job = Job::new(id, None, 0, 0, 4);
+    job.state = JobState::Running;
+    fs::create_dir_all(runner.record_path(id).parent().unwrap()).unwrap();
+    runner.core.inner.lock().unwrap().jobs.insert(id, job);
+    runner.recovery_diagnostic(id, None, false).unwrap();
+    let text = runner
+        .replay(id, 0)
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(output) => Some(String::from_utf8_lossy(&output.bytes.0).into_owned()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(text.contains("runner recovery:"), "{text}");
+    assert!(
+        text.contains("outcome_unknown unit=unrecorded unit_alive=false"),
+        "{text}"
+    );
+    assert!(
+        text.contains("runner will not retry the job automatically"),
+        "{text}"
+    );
+    assert!(!text.contains("never rerun"), "{text}");
+}
+
 #[tokio::test]
 async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wire_seam() {
     for code in [0, 256, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xC000_0005] {
@@ -527,6 +594,28 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
         assert!(replay
             .iter()
             .any(|f| matches!(f, Frame::Output(output) if output.bytes.0 == b"Windows stdout\n")));
+        let stderr = replay
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Output(output) if output.stream == OutputStream::Stderr => {
+                    Some(output.bytes.0.as_slice())
+                }
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(stderr, b"Windows stderr\n");
+        assert_eq!(
+            runner
+                .config()
+                .windows_runtime
+                .cache_timings
+                .lock()
+                .unwrap()[&r.job_id]
+                .disk_selection_ms,
+            23
+        );
         cleaned(runner.config(), r.job_id, &a);
         assert_eq!(a.starts.load(Ordering::SeqCst), 1);
         assert!(runner
@@ -616,7 +705,7 @@ async fn windows_backend_drains_final_reply_written_between_read_and_unit_exit()
 }
 
 #[tokio::test]
-async fn windows_backend_missing_final_reply_preserves_unit_exit_error() {
+async fn windows_backend_missing_dismount_reply_preserves_command_exit_and_discards_cache() {
     for fault in [Fault::ClosedAtUnitExit, Fault::TruncatedDismountAtUnitExit] {
         let f = Fixture::new();
         source(&f);
@@ -626,17 +715,17 @@ async fn windows_backend_missing_final_reply_preserves_unit_exit_error() {
         f.submit(&runner, &r, &bytes);
         assert_eq!(
             terminal(&runner, r.job_id).await.outcome,
-            Outcome::OutcomeUnknown,
+            Outcome::WindowsExit { code: 0 },
             "{fault:?}"
         );
-        let error = runner.core.inner.lock().unwrap().jobs[&r.job_id]
-            .monitoring_error
-            .clone()
-            .unwrap();
-        assert!(
-            error.starts_with("Windows VM unit exited before agent reply:"),
-            "{fault:?}: {error}"
-        );
+        assert!(!runner
+            .config()
+            .windows
+            .as_ref()
+            .unwrap()
+            .caches()
+            .disk(&r.workspace_key)
+            .exists());
         assert!(a.exit_reply.lock().unwrap().is_none());
         cleaned(runner.config(), r.job_id, &a);
     }
@@ -695,7 +784,7 @@ async fn windows_backend_started_write_failure_destroys_unreleased_vm_and_dispat
 }
 
 #[tokio::test]
-async fn windows_backend_start_rejection_and_each_post_start_bound_are_unknown_and_cleaned() {
+async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve_status() {
     for (fault, stalled) in [
         (Fault::RejectStart, 0),
         (Fault::Start, 4),
@@ -738,18 +827,107 @@ async fn windows_backend_start_rejection_and_each_post_start_bound_are_unknown_a
         }
         assert_eq!(
             terminal(&runner, r.job_id).await.outcome,
-            Outcome::OutcomeUnknown,
+            if matches!(fault, Fault::RejectStart | Fault::Start) {
+                Outcome::OutcomeUnknown
+            } else {
+                Outcome::WindowsExit { code: 0 }
+            },
             "{fault:?}"
         );
-        assert!(
+        assert_eq!(
             runner.core.inner.lock().unwrap().jobs[&r.job_id]
                 .monitoring_error
                 .is_some(),
-            "{fault:?} bypassed wait's error path"
+            matches!(fault, Fault::RejectStart | Fault::Start),
+            "{fault:?}"
         );
+        if matches!(fault, Fault::RejectStart | Fault::Start) {
+            let text = runner
+                .replay(r.job_id, 0)
+                .unwrap()
+                .iter()
+                .filter_map(|frame| {
+                    if let Frame::Output(output) = frame {
+                        Some(String::from_utf8_lossy(&output.bytes.0).into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            assert!(
+                text.contains("runner will not retry the job automatically"),
+                "{text}"
+            );
+            assert!(!text.contains("never rerun"), "{text}");
+        }
+        assert!(!runner
+            .config()
+            .windows
+            .as_ref()
+            .unwrap()
+            .caches()
+            .disk(&r.workspace_key)
+            .exists());
         cleaned(runner.config(), r.job_id, &a);
         assert_eq!(Runner::held_weight(&runner.core.inner.lock().unwrap()), 0);
     }
+}
+
+#[tokio::test]
+async fn windows_backend_active_transfer_can_exceed_one_reply_timeout() {
+    let f = Fixture::new();
+    source(&f);
+    fs::write(f.main.join("large-snapshot"), vec![42; 5 * 1024 * 1024]).unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "large snapshot"]);
+    let (c, a) = configure(&f, Fault::SlowTransfer, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    assert_eq!(
+        terminal(&runner, r.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    assert!(a.clock.load(Ordering::SeqCst) > motor_winagent::REPLY_TIMEOUT_MS);
+    cleaned(runner.config(), r.job_id, &a);
+}
+
+#[tokio::test]
+async fn windows_backend_failed_dismount_then_immediate_same_workspace_job() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::DismountOnce, 256);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (first, bytes) = request(&f);
+    f.submit(&runner, &first, &bytes);
+    phase(&a, 7).await;
+    a.clock.store(60_000, Ordering::SeqCst);
+    assert_eq!(
+        terminal(&runner, first.job_id).await.outcome,
+        Outcome::WindowsExit { code: 256 }
+    );
+    cleaned(runner.config(), first.job_id, &a);
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&first.workspace_key);
+    assert!(!disk.exists());
+    let (second, bytes) = request(&f);
+    assert_eq!(first.workspace_key, second.workspace_key);
+    f.submit(&runner, &second, &bytes);
+    assert_eq!(
+        terminal(&runner, second.job_id).await.outcome,
+        Outcome::WindowsExit { code: 256 }
+    );
+    assert!(disk.exists());
+    assert_eq!(a.starts.load(Ordering::SeqCst), 2);
+    for path in job_artifacts(runner.config(), second.job_id) {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+    assert_eq!(a.stops.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -912,6 +1090,9 @@ async fn windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_o
     terminal(&runner, r.job_id).await;
     let units = a.units.lock().unwrap();
     let args = &units[0];
+    assert!(args
+        .iter()
+        .any(|arg| arg.ends_with("if=virtio,serial=motor-cache")));
     for property in [
         "--wait",
         "--collect",
@@ -1515,7 +1696,7 @@ async fn windows_backend_cleanup_failure_discards_cache_after_known_exit() {
     f.submit(&runner, &request, &bytes);
     assert_eq!(
         terminal(&runner, request.job_id).await.outcome,
-        Outcome::OutcomeUnknown
+        Outcome::WindowsExit { code: 0 }
     );
     assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
     let disk = runner
