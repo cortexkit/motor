@@ -1,4 +1,60 @@
 use super::*;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_keeps_named_state_traversal_acl_effective_for_each_backend() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for windows in [false, true] {
+        let f = Fixture::new();
+        let config = if windows { config(&f) } else { f.config() };
+        let state = config.state_dir();
+        fs::create_dir_all(&state).unwrap();
+        let seeded = Command::new("/usr/bin/setfacl")
+            .args(["-m", "u:123456:--x,g::rwx,o::rwx,m::rwx", "--"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            seeded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let runner = if windows {
+            Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap()
+        } else {
+            Runner::open(config).unwrap()
+        };
+        let output = Command::new("/usr/bin/getfacl")
+            .args(["-cpn", "--"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let acl = String::from_utf8(output.stdout).unwrap();
+        for entry in [
+            "user::rwx",
+            "user:123456:--x",
+            "group::---",
+            "mask::--x",
+            "other::---",
+        ] {
+            assert!(
+                acl.lines().any(|line| line == entry),
+                "backend windows={windows}: missing {entry}:\n{acl}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o710
+        );
+        drop(runner);
+    }
+}
 use crate::windows::{VmConfig, WindowsBackend};
 use std::os::unix::{
     fs::{MetadataExt, PermissionsExt},

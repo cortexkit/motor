@@ -655,6 +655,43 @@ impl Runner {
                     "runner state directory must be owned by the daemon and not a symlink",
                 ));
             }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let path = std::ffi::CString::new(state.as_os_str().as_bytes())
+                    .map_err(|_| invalid("runner state path contains a NUL byte"))?;
+                let acl_size = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        c"system.posix_acl_access".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if acl_size >= 0 {
+                    // With an extended ACL, chmod changes its mask rather than
+                    // the owning-group entry. Preserve named traversal grants
+                    // while setfacl restricts the owning group and other users.
+                    let output = std::process::Command::new("/usr/bin/setfacl")
+                        .args(["-m", "u::rwx,g::---,o::---", "--"])
+                        .arg(&state)
+                        .output()?;
+                    if !output.status.success() {
+                        return Err(io::Error::other(format!(
+                            "make runner state ACL private at {}: {}",
+                            state.display(),
+                            String::from_utf8_lossy(&output.stderr)
+                        )));
+                    }
+                } else {
+                    let error = io::Error::last_os_error();
+                    if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) {
+                        return Err(error);
+                    }
+                    fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
         }
         #[cfg(target_os = "linux")]
