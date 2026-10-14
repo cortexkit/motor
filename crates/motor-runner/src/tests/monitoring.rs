@@ -540,9 +540,7 @@ fn unreadable_job_ownership_fences_cleanup_and_admission() {
     let tip = git(&mirror, &["rev-parse", "FETCH_HEAD"]);
     let reference = format!("refs/snapshots/{tip}");
     git(&mirror, &["update-ref", &reference, &tip]);
-    runner
-        .prune_refs(&runner.core.inner.lock().unwrap())
-        .unwrap();
+    runner.prune_refs().unwrap();
     assert_eq!(git(&mirror, &["rev-parse", &reference]), tip);
     assert!(scratch.join("owned").exists());
     assert!(spools.join("owned").exists());
@@ -1408,4 +1406,236 @@ fn replay_rejects_truncated_or_oversized_committed_chunk_files_without_leaking_l
     assert!(
         matches!(runner.replay(id, 0).unwrap().first(), Some(Frame::Output(output)) if output.bytes.0 == b"good")
     );
+}
+
+#[test]
+fn slow_ref_pruning_leaves_unrelated_control_operations_responsive() {
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let armed = Arc::new(AtomicBool::new(false));
+    let mut config = f.config();
+    config.long_work = Some({
+        let armed = armed.clone();
+        Arc::new(move |label| {
+            if label == "prune_refs_git" && armed.swap(false, Ordering::SeqCst) {
+                pause.block();
+            }
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    let mirror = runner.core.trees.mirror(&f.root);
+    fs::create_dir_all(&mirror).unwrap();
+    git(&mirror, &["init", "--bare"]);
+    git(&mirror, &["fetch", text(&f.main), "HEAD"]);
+    let commit = git(&mirror, &["rev-parse", "FETCH_HEAD"]);
+    git(&mirror, &["update-ref", "refs/snapshots/stale", &commit]);
+    armed.store(true, Ordering::SeqCst);
+    let pruner = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.maintenance()
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (request, _) = f.run("true");
+    let (control, reply) = responsive_controls(&runner, request);
+    let responsive = reply.recv_timeout(Duration::from_secs(1));
+    drop(release);
+    pruner.join().unwrap().unwrap();
+    control.join().unwrap();
+    assert_eq!(
+        responsive.ok(),
+        Some(true),
+        "ref pruning stalled unrelated controls"
+    );
+    assert!(git(
+        &mirror,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/snapshots/stale"
+        ]
+    )
+    .is_empty());
+}
+
+#[test]
+fn ref_pruning_cannot_delete_a_pin_published_after_its_snapshot() {
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let armed = Arc::new(AtomicBool::new(false));
+    let (waiting_send, waiting) = std::sync::mpsc::channel();
+    let (pin_send, pin_entered) = std::sync::mpsc::channel();
+    let mut config = f.config();
+    config.long_work = Some({
+        let armed = armed.clone();
+        Arc::new(move |label| {
+            if label == "prune_refs_git" && armed.swap(false, Ordering::SeqCst) {
+                pause.block();
+            }
+            if label == "pin_refs_wait" {
+                waiting_send.send(()).unwrap();
+            }
+            if label == "pin_refs_git" {
+                pin_send.send(()).unwrap();
+            }
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("true");
+    let spool = f.spool(&runner, &request, &bytes);
+    runner
+        .core
+        .trees
+        .fetch(
+            &spool.directory,
+            &request.bundles,
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )
+        .unwrap();
+    runner
+        .core
+        .trees
+        .pin(
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )
+        .unwrap();
+    let prepare = Prepare {
+        transfer_id: Uuid::now_v7(),
+        workspace_key: request.workspace_key.clone(),
+        repository_root: request.repository_root.clone(),
+        base_commit: request.snapshot_commit.clone(),
+        integration_tip: request.integration_tip.clone(),
+        siblings: request.siblings.clone(),
+        bundles: request.bundles.clone(),
+        git_dependencies: vec![],
+        workspace_kind: None,
+    };
+    armed.store(true, Ordering::SeqCst);
+    let pruner = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.maintenance()
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let pinner = std::thread::spawn({
+        let runner = runner.clone();
+        let directory = spool.directory.clone();
+        let prepare = prepare.clone();
+        move || runner.fetch_prepare(&prepare, &directory)
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let premature_pin = pin_entered.recv_timeout(Duration::from_secs(1)).is_ok();
+    drop(release);
+    pruner.join().unwrap().unwrap();
+    pinner.join().unwrap().unwrap();
+    assert!(
+        !premature_pin,
+        "pinning must wait outside shared state until the older prune completes"
+    );
+    let mirror = runner.core.trees.mirror(&request.repository_root);
+    assert_eq!(
+        git(
+            &mirror,
+            &[
+                "rev-parse",
+                &format!("refs/snapshots/{}", request.snapshot_commit)
+            ]
+        ),
+        request.snapshot_commit
+    );
+    assert_eq!(
+        git(
+            &mirror,
+            &[
+                "rev-parse",
+                &format!("refs/tips/{}", request.integration_tip)
+            ]
+        ),
+        request.integration_tip
+    );
+    assert!(runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .transferred
+        .contains_key(&prepare.transfer_id));
+    runner.maintenance().unwrap();
+    assert_eq!(
+        git(
+            &mirror,
+            &[
+                "rev-parse",
+                &format!("refs/snapshots/{}", request.snapshot_commit)
+            ]
+        ),
+        request.snapshot_commit
+    );
+}
+
+#[test]
+fn ref_pruning_batches_stale_deletions_without_dropping_held_refs() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (request, bytes) = f.run("true");
+    let spool = f.spool(&runner, &request, &bytes);
+    runner
+        .core
+        .trees
+        .fetch(
+            &spool.directory,
+            &request.bundles,
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )
+        .unwrap();
+    runner
+        .core
+        .trees
+        .pin(
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )
+        .unwrap();
+    runner.accept(request.clone()).unwrap();
+    let mirror = runner.core.trees.mirror(&request.repository_root);
+    for index in 0..128 {
+        git(
+            &mirror,
+            &[
+                "update-ref",
+                &format!("refs/snapshots/stale-{index}"),
+                &request.snapshot_commit,
+            ],
+        );
+    }
+    runner.prune_refs().unwrap();
+    let remaining = git(
+        &mirror,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/snapshots",
+            "refs/tips",
+        ],
+    );
+    assert_eq!(remaining.lines().count(), 2);
+    assert!(remaining
+        .lines()
+        .any(|reference| reference == format!("refs/snapshots/{}", request.snapshot_commit)));
+    assert!(remaining
+        .lines()
+        .any(|reference| reference == format!("refs/tips/{}", request.integration_tip)));
+    runner.cancel(request.job_id).unwrap();
 }

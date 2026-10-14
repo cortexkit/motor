@@ -55,6 +55,25 @@ pub(crate) fn git(path: &Path, args: &[&str]) -> io::Result<String> {
         .to_string())
 }
 
+pub(crate) fn delete_refs(path: &Path, references: &[String]) -> io::Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::from("start\n");
+    for reference in references {
+        input.push_str(&format!("delete {reference}\n"));
+    }
+    input.push_str("prepare\ncommit\n");
+    let mut command = git_command(path);
+    command.args(["update-ref", "--stdin"]);
+    let output = git_input(command, input.as_bytes())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(invalid(String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
 pub(crate) fn blob(path: &Path, revision: &str) -> io::Result<Vec<u8>> {
     let output = git_command(path).args(["show", revision]).output()?;
     if !output.status.success() {
