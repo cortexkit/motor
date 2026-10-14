@@ -511,22 +511,32 @@ fn discover_javascript_installs(paths: &[PathBuf]) -> io::Result<Vec<JavascriptI
     Ok(installs)
 }
 
-fn prepare_javascript_dependencies(state: &Path, workspace: &Path, tree: &str) -> io::Result<()> {
+fn prepare_javascript_dependencies(
+    state: &Path,
+    repository: &str,
+    workspace: &Path,
+    tree: &str,
+) -> io::Result<()> {
     let tracked = javascript_tracked_tree(workspace, tree)?;
     prepare_javascript_with(workspace, &tracked.paths, |install, command| {
-        cache_javascript_install(state, workspace, &tracked, install, command)
+        cache_javascript_install(state, repository, workspace, &tracked, install, command)
     })
 }
 
 fn prepare_javascript_checkouts(
     workspace: &Path,
+    repository: &str,
     tree: &str,
     siblings: &[SiblingSnapshot],
-    mut prepare: impl FnMut(&Path, &str) -> io::Result<()>,
+    mut prepare: impl FnMut(&Path, &str, &str) -> io::Result<()>,
 ) -> io::Result<()> {
-    prepare(workspace, tree)?;
+    prepare(workspace, repository, tree)?;
     for sibling in siblings {
-        prepare(Path::new(&sibling.canonical_path), &sibling.tree_hash)?;
+        prepare(
+            Path::new(&sibling.canonical_path),
+            &sibling.canonical_path,
+            &sibling.tree_hash,
+        )?;
     }
     Ok(())
 }
@@ -744,6 +754,7 @@ fn javascript_local_dependency(
 
 fn javascript_cache_key(
     workspace: &Path,
+    repository: &str,
     tracked: &JavascriptTree,
     install: &JavascriptInstall,
     manager_version: &[u8],
@@ -754,17 +765,50 @@ fn javascript_cache_key(
         hash.update(bytes);
     }
     let mut hash = sha2::Sha256::new();
-    // v3: a v2 entry could hold a workspace root's install without its members'
-    // node_modules, and restoring it gave an incomplete install. No v3 key
-    // matches a v2 entry, so those entries are never restored again and the
-    // disk guard evicts them once idle.
-    field(&mut hash, b"motor-javascript-install-v3");
+    // v3 install entries can contain stale local tarball bytes fetched from a
+    // shared manager cache. The new key domain prevents restoring those entries.
+    field(&mut hash, b"motor-javascript-install-v4");
+    field(&mut hash, repository.as_bytes());
     field(&mut hash, javascript_manager(install.lockfile).as_bytes());
     field(&mut hash, manager_version);
     field(&mut hash, node_version);
     field(&mut hash, std::env::consts::OS.as_bytes());
     field(&mut hash, std::env::consts::ARCH.as_bytes());
     field(&mut hash, install.lockfile.as_bytes());
+    let (inputs, _) = javascript_cache_inputs(workspace, tracked, install)?;
+    for path in inputs {
+        let object = &tracked.objects[&path];
+        field(&mut hash, path.as_os_str().as_bytes());
+        field(&mut hash, object.mode.as_bytes());
+        field(&mut hash, object.kind.as_bytes());
+        field(&mut hash, object.id.as_bytes());
+    }
+    // Daemon configuration can affect dependency selection even with an identical
+    // lockfile (for example NODE_ENV or npm_config_omit). Cache locations are
+    // controlled by the runner and are not dependency-selection inputs.
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            !javascript_cache_variable(&name)
+                && ["NPM_CONFIG_", "BUN_", "PNPM_", "NODE_"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    environment.sort();
+    for (name, value) in environment {
+        field(&mut hash, name.as_bytes());
+        field(&mut hash, value.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn javascript_cache_inputs(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+) -> io::Result<(std::collections::BTreeSet<PathBuf>, bool)> {
+    let mut has_local = false;
     let mut inputs: std::collections::BTreeSet<_> = tracked
         .paths
         .iter()
@@ -810,6 +854,7 @@ fn javascript_cache_key(
             }
         }
         for spec in specs {
+            has_local = true;
             for dependency in javascript_local_dependency(workspace, tracked, &path, spec)? {
                 if tracked.objects[&dependency].kind == "tree" {
                     let manifest = dependency.join("package.json");
@@ -824,33 +869,81 @@ fn javascript_cache_key(
             }
         }
     }
-    for path in inputs {
-        let object = &tracked.objects[&path];
-        field(&mut hash, path.as_os_str().as_bytes());
-        field(&mut hash, object.mode.as_bytes());
-        field(&mut hash, object.kind.as_bytes());
-        field(&mut hash, object.id.as_bytes());
-    }
-    // Daemon configuration can affect dependency selection even with an identical
-    // lockfile (for example NODE_ENV or npm_config_omit).
-    let mut environment: Vec<_> = std::env::vars_os()
-        .filter(|(name, _)| {
-            let name = name.to_string_lossy().to_ascii_uppercase();
-            ["NPM_CONFIG_", "BUN_", "PNPM_", "NODE_"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-        })
+    Ok((inputs, has_local))
+}
+
+fn javascript_cache_variable(name: &str) -> bool {
+    matches!(
+        name.replace('-', "_").as_str(),
+        "BUN_INSTALL"
+            | "BUN_INSTALL_CACHE_DIR"
+            | "BUN_INSTALL_GLOBAL_DIR"
+            | "BUN_INSTALL_BIN"
+            | "XDG_CACHE_HOME"
+            | "XDG_DATA_HOME"
+            | "PNPM_HOME"
+            | "NPM_CONFIG_CACHE"
+            | "NPM_CONFIG_STORE_DIR"
+            | "NPM_CONFIG_CACHE_DIR"
+            | "PNPM_CONFIG_STORE_DIR"
+            | "PNPM_CONFIG_CACHE_DIR"
+    )
+}
+
+fn javascript_manager_cache_key(
+    repository: &str,
+    manager: &str,
+    local_key: Option<&str>,
+) -> String {
+    workspace::name(
+        &serde_json::to_string(&(
+            "motor-javascript-manager-v1",
+            repository,
+            manager,
+            local_key,
+        ))
+        .expect("cache identity serialization"),
+    )
+}
+
+fn javascript_manager_cache_command(command: &mut Command, manager: &str, cache: &Path) {
+    // Clear both the daemon's environment and child-only overrides before
+    // selecting cache locations. HOME also confines manager-specific fallbacks.
+    let names: std::collections::BTreeSet<_> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.get_envs().map(|(name, _)| name.to_os_string()))
         .collect();
-    environment.sort();
-    for (name, value) in environment {
-        field(&mut hash, name.as_bytes());
-        field(&mut hash, value.as_bytes());
+    for name in names {
+        if javascript_cache_variable(&name.to_string_lossy().to_ascii_uppercase()) {
+            command.env_remove(name);
+        }
     }
-    Ok(format!("{:x}", hash.finalize()))
+    command
+        .env("HOME", cache.join("home"))
+        .env("XDG_CACHE_HOME", cache.join("xdg-cache"))
+        .env("XDG_DATA_HOME", cache.join("xdg-data"))
+        .env("BUN_INSTALL_CACHE_DIR", cache.join("bun"))
+        .env("npm_config_cache", cache.join("npm"));
+    match manager {
+        "bun" => {
+            command.arg("--cache-dir").arg(cache.join("bun"));
+        }
+        "npm" => {
+            command.arg("--cache").arg(cache.join("npm"));
+        }
+        _ => {
+            command
+                .arg("--store-dir")
+                .arg(cache.join("pnpm-store"))
+                .arg("--cache-dir")
+                .arg(cache.join("xdg-cache/pnpm"));
+        }
+    }
 }
 
 fn cache_javascript_install(
     state: &Path,
+    repository: &str,
     workspace: &Path,
     tracked: &JavascriptTree,
     install: &JavascriptInstall,
@@ -863,7 +956,14 @@ fn cache_javascript_install(
     } else {
         javascript_version(command, "node".as_ref())?
     };
-    let key = javascript_cache_key(workspace, tracked, install, &manager_version, &node_version)?;
+    let key = javascript_cache_key(
+        workspace,
+        repository,
+        tracked,
+        install,
+        &manager_version,
+        &node_version,
+    )?;
     let lock = platform::javascript_cache_lock(state, &key)?;
     lock.lock_exclusive()?;
     let cache = state.join("js-installs");
@@ -879,6 +979,19 @@ fn cache_javascript_install(
             .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
         return Ok(());
     }
+    let manager = javascript_manager(install.lockfile);
+    let (_, has_local) = javascript_cache_inputs(workspace, tracked, install)?;
+    // Bun keys local tarballs by path, not bytes. A content-scoped manager cache
+    // prevents a changed local input from meeting an older path-keyed entry.
+    let manager_key =
+        javascript_manager_cache_key(repository, manager, has_local.then_some(key.as_str()));
+    let manager_lock = platform::javascript_cache_lock(state, &manager_key)?;
+    manager_lock.lock_exclusive()?;
+    let manager_cache = state.join("js-manager-caches").join(&manager_key);
+    fs::create_dir_all(manager_cache.join("home"))?;
+    File::open(&manager_cache)?
+        .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+    javascript_manager_cache_command(command, manager, &manager_cache);
     run_javascript_install(
         &workspace.join(&install.directory),
         javascript_manager(install.lockfile),
@@ -1554,6 +1667,7 @@ impl Sandbox {
             limit,
             &std::collections::BTreeMap::new(),
             &tree,
+            &workspace.to_string_lossy(),
         )
     }
 
@@ -1569,6 +1683,7 @@ impl Sandbox {
         limit: u32,
         dependency_routes: &std::collections::BTreeMap<String, PathBuf>,
         tree: &str,
+        repository: &str,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -1581,6 +1696,7 @@ impl Sandbox {
             limit,
             dependency_routes,
             tree,
+            repository,
             false,
         )
     }
@@ -1608,6 +1724,7 @@ impl Sandbox {
             limit,
             dependency_routes,
             tree,
+            &workspace.to_string_lossy(),
             true,
         )
     }
@@ -1624,6 +1741,7 @@ impl Sandbox {
         limit: u32,
         dependency_routes: &BTreeMap<String, PathBuf>,
         tree: &str,
+        repository: &str,
         writer: bool,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
@@ -1661,9 +1779,15 @@ impl Sandbox {
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
         if !writer {
-            prepare_javascript_checkouts(workspace, tree, siblings, |checkout, checkout_tree| {
-                prepare_javascript_dependencies(state, checkout, checkout_tree)
-            })?;
+            prepare_javascript_checkouts(
+                workspace,
+                repository,
+                tree,
+                siblings,
+                |checkout, repository, checkout_tree| {
+                    prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
+                },
+            )?;
         }
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.

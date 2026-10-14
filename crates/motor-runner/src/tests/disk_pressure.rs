@@ -980,33 +980,76 @@ fn disk_guard_evicts_javascript_cache_by_last_use_and_skips_locked_publications(
 
 #[test]
 fn disk_guard_reclaims_interrupted_javascript_publications_after_lock_release() {
+    for root in ["js-installs", "js-manager-caches"] {
+        let f = Fixture::new();
+        let pressure = Arc::new(AtomicBool::new(false));
+        let mut config = f.config();
+        config.free_space_floor_bytes = 100;
+        let key = "d".repeat(64);
+        let temporary = config
+            .state_dir()
+            .join(root)
+            .join(format!("{key}.interrupted.tmp"));
+        let probe_path = temporary.clone();
+        let flag = pressure.clone();
+        config.free_space_probe = Arc::new(move |_| {
+            Ok(if flag.load(Ordering::SeqCst) && probe_path.exists() {
+                50
+            } else {
+                300
+            })
+        });
+        let state = config.state_dir();
+        let runner = Runner::open(config).unwrap();
+        fs::create_dir_all(&temporary).unwrap();
+        let lock = platform::javascript_cache_lock(&state, &key).unwrap();
+        lock.lock_exclusive().unwrap();
+        pressure.store(true, Ordering::SeqCst);
+        assert!(runner.ensure_disk_space().unwrap().is_some());
+        assert!(temporary.exists(), "{root} must survive while locked");
+        drop(lock);
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+        assert!(!temporary.exists(), "{root} must be reclaimed after unlock");
+    }
+}
+
+#[test]
+fn disk_soft_pressure_evicts_old_javascript_entries_but_keeps_recent_ones() {
     let f = Fixture::new();
-    let pressure = Arc::new(AtomicBool::new(false));
-    let mut config = f.config();
-    config.free_space_floor_bytes = 100;
-    let key = "d".repeat(64);
-    let temporary = config
-        .state_dir()
-        .join("js-installs")
-        .join(format!("{key}.interrupted.tmp"));
-    let probe_path = temporary.clone();
-    let flag = pressure.clone();
-    config.free_space_probe = Arc::new(move |_| {
-        Ok(if flag.load(Ordering::SeqCst) && probe_path.exists() {
-            50
-        } else {
-            300
-        })
-    });
-    let state = config.state_dir();
-    let runner = Runner::open(config).unwrap();
-    fs::create_dir_all(&temporary).unwrap();
-    let lock = platform::javascript_cache_lock(&state, &key).unwrap();
-    lock.lock_exclusive().unwrap();
-    pressure.store(true, Ordering::SeqCst);
-    assert!(runner.ensure_disk_space().unwrap().is_some());
-    assert!(temporary.exists());
-    drop(lock);
+    let state = f.config().state_dir();
+    let runner = Runner::open(config(&f, |_| Ok(150))).unwrap();
+    let now = runner.now();
+    let mut old = Vec::new();
+    let mut recent = Vec::new();
+    for root in ["js-installs", "js-manager-caches"] {
+        for (key, age, entries) in [
+            ("a".repeat(64), 31 * 60 * 1000, &mut old),
+            ("b".repeat(64), 5 * 60 * 1000, &mut recent),
+        ] {
+            let path = state.join(root).join(key);
+            fs::create_dir_all(&path).unwrap();
+            File::open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - age),
+                ))
+                .unwrap();
+            entries.push(path);
+        }
+    }
     assert!(runner.ensure_disk_space().unwrap().is_none());
-    assert!(!temporary.exists());
+    for path in old {
+        assert!(
+            !path.exists(),
+            "old cache must be evicted: {}",
+            path.display()
+        );
+    }
+    for path in recent {
+        assert!(
+            path.exists(),
+            "recent cache must survive: {}",
+            path.display()
+        );
+    }
 }
