@@ -488,7 +488,14 @@ pub(super) fn qemu_args(
         "-m".into(),
         vm.memory_mib.to_string(),
         "-drive".into(),
-        format!("file={},format=qcow2,if=virtio", overlay.display()),
+        format!(
+            "file={},format=qcow2,if=none,id=motor-os",
+            overlay.display()
+        ),
+        // Create both disks explicitly in OS/cache order. Mixing an implicit
+        // OS device with an explicit cache can make firmware boot the cache.
+        "-device".into(),
+        "virtio-blk-pci,drive=motor-os,bootindex=0".into(),
         "-drive".into(),
         format!(
             "file={},format=qcow2,if=none,id=motor-cache",

@@ -1106,6 +1106,12 @@ async fn windows_backend_qemu_cache_serial_is_a_device_property_not_a_drive_opti
     assert!(
         drives
             .iter()
+            .any(|drive| drive.ends_with("format=qcow2,if=none,id=motor-os")),
+        "OS backend must not create an implicit device: {args:?}"
+    );
+    assert!(
+        drives
+            .iter()
             .any(|drive| drive.ends_with("format=qcow2,if=none,id=motor-cache")),
         "{args:?}"
     );
@@ -1117,6 +1123,17 @@ async fn windows_backend_qemu_cache_serial_is_a_device_property_not_a_drive_opti
             ]),
         "{args:?}"
     );
+    let devices = args
+        .windows(2)
+        .filter(|pair| pair[0] == "-device")
+        .map(|pair| pair[1].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(devices, [
+        "virtio-blk-pci,drive=motor-os,bootindex=0",
+        "virtio-blk-pci,drive=motor-cache,serial=motor-cache",
+        "virtio-serial-pci",
+        "virtserialport,chardev=agent,name=org.cortexkit.motor.winagent.0",
+    ], "only the OS disk may have a bootindex; disk/serial PCI device order must stay stable: {args:?}");
     cleaned(runner.config(), r.job_id, &a);
 }
 
