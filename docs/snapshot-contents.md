@@ -31,6 +31,15 @@ workspace nested inside a known one, is refused before setup. Tests:
 
 ## 2. What goes in
 
+The optional cache-fill tip is separate from the submitted snapshot commit.
+`ck-motor` names it only after checking the local default-branch candidate's
+name and commit against the configured origin's default branch, with bounded
+successful-result caching. Local refs alone cannot authorize a fill. A failed
+check leaves the fill tip empty and does not change or refuse the snapshot.
+See [compile-cache.md](compile-cache.md#verifying-the-fill-tip). Tests:
+`local_tip_ahead_of_remote_has_no_tip`, `unreachable_remote_has_no_tip`,
+`current_client_unverified_default_tip_runs_and_prepares_without_fills`.
+
 The snapshot's tree starts from `HEAD` and then takes the working tree's
 current state:
 

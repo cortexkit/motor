@@ -5,6 +5,7 @@ mod agent;
 pub mod benchmark;
 pub mod cli;
 mod config;
+mod default_tip;
 mod diagnostics;
 pub mod logging;
 pub mod module;

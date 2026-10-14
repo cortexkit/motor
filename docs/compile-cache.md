@@ -73,6 +73,55 @@ sccache sees them, because sccache refuses to cache when either is `1`. Test:
 A fill runs the repository's warm command, as `motor-cache`, against the
 repository's default-branch tip held in the runner's Git mirror.
 
+### Verifying the fill tip
+
+`ck-motor` selects a local candidate using the branch named by `origin/HEAD`,
+or local `main`, then `master`; it never falls back to the submitted `HEAD`.
+Those refs are hints, not authority. On a verification-cache miss it runs
+`git ls-remote --symref origin HEAD` and requires the remote default branch's
+name **and** commit to equal the candidate. A local remote-tracking ref is not
+proof: an agent can change it with `update-ref`. Checking the branch name also
+prevents a forged local `origin/HEAD` from selecting a remote feature branch.
+Tests (`crates/motor-module/src/default_tip.rs`):
+`local_tip_ahead_of_remote_has_no_tip`, `equal_remote_default_branch_returns_tip`,
+`forged_origin_head_cannot_authorize_a_remote_feature_branch`.
+
+The check uses the configured `origin` fetch URL, not a pinned GitHub URL.
+Rewriting that URL can point the check at a different repository; this more
+visible configuration change is an accepted limit. Code merged to each
+repository's remote default branch is still trusted to write the shared cache.
+The module and its local store are trusted too; the runner relies on the
+client's report, not an independent remote attestation.
+
+The module's store keeps only the last successfully verified URL, branch and
+commit for each canonical Git common directory, shared across linked
+worktrees. At most 256 repositories are retained, oldest verification first,
+for at most 24 hours. Reads do not extend that age. An unchanged verified tip
+needs no network round trip, even after module restart; a changed tip, branch
+or effective origin URL requires another check. A cached success proves that
+the commit was on the remote default branch when checked, not that it remains
+the current tip after a force-push. Failures never become successful entries.
+Tests: `cache_hit_avoids_second_ls_remote`, `changed_tip_reverifies`,
+`changed_origin_url_reverifies`, `successful_verification_survives_storage_reopen`,
+`mismatch_is_not_cached_and_recovery_rechecks`,
+`verified_tip_age_is_bounded_and_future_timestamps_are_refused`,
+`verified_tips_keep_only_256_repositories_and_one_tip_each`.
+
+Git inherits the module's `HOME` and `PATH`, so existing credential helpers and
+SSH credentials remain available; no runner-vault credential is lent to Git.
+The child sets `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`,
+`GIT_SSH_COMMAND="ssh -o BatchMode=yes"`, disables askpass, and has no stdin.
+The query has a five-second hard timeout that kills Git's process group,
+including credential and SSH helpers. A failed check emits one warning with
+`repository`, `category` (`auth`, `network`, `timeout` or `mismatch`), `reason`
+(the first line of Git's stderr when present), and `elapsed_ms`. A local cache
+write error uses category `cache` and also skips the fill. No failure blocks
+the submitted job or prepare request; an empty integration tip skips fills.
+Tests: `child_is_noninteractive_and_preserves_home_and_path`,
+`auth_failure_logs_first_stderr_line_and_is_not_cached`,
+`hung_remote_times_out_and_kills_helpers`, `unreachable_remote_has_no_tip`,
+`current_client_unverified_default_tip_runs_and_prepares_without_fills`.
+
 ### What a fill builds
 
 The warm command comes from the tip's root `Cargo.toml`:

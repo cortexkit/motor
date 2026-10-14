@@ -146,6 +146,14 @@ directories. `state.json` holds:
   before upload), and optional attribution (session, preset, scope);
 - `snapshots`, keyed by workspace: the commits the runner has accepted, used to
   send only missing history next time.
+- `verified_tips`, keyed by canonical Git common directory: only the last
+  successfully checked origin URL, branch and commit per repository, with its
+  verification time. At most 256 repositories survive for at most 24 hours;
+  hits do not extend their age. Failed checks are not stored as successes. See
+  [compile-cache.md](compile-cache.md#verifying-the-fill-tip) for the credential
+  environment, timeout, warning fields and remaining trust in this local store.
+  Tests: `successful_verification_survives_storage_reopen`,
+  `verified_tips_keep_only_256_repositories_and_one_tip_each`.
 
 There is no schema version. Unknown fields are ignored and absent attribution
 loads as none; an incompatible change needs an explicit migration. Test:

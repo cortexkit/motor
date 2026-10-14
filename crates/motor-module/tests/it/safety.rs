@@ -96,6 +96,7 @@ async fn failed_bundle_deletes_temporary_refs_and_ignored_files_never_transfer()
         &f.scratch.join("spool"),
         id,
         None,
+        &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
     )
     .ok()
     .unwrap();

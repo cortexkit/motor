@@ -6,13 +6,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 // Keep routing and local refusal history for at least the runner's replay horizon,
 // starting at successful terminal delivery or the caller's latest access.
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_VERIFIED_TIPS: usize = 256;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -58,16 +59,44 @@ struct State {
     snapshots: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     snapshot_used_at_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    verified_tips: BTreeMap<String, VerifiedTip>,
     #[serde(skip)]
     active_jobs: BTreeMap<Uuid, usize>,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct VerifiedTip {
+    pub remote_url: String,
+    pub branch: String,
+    pub commit: String,
+    pub verified_at_ms: u64,
+}
+
+impl VerifiedTip {
+    fn fresh(&self, now: u64) -> bool {
+        now >= self.verified_at_ms && now - self.verified_at_ms < RETENTION_MS
+    }
+}
+
 impl State {
     fn prune(&mut self, now: u64) -> bool {
         let before = (
             self.jobs.len(),
             self.snapshots.len(),
             self.snapshot_used_at_ms.len(),
+            self.verified_tips.len(),
         );
+        self.verified_tips.retain(|_, tip| tip.fresh(now));
+        while self.verified_tips.len() > MAX_VERIFIED_TIPS {
+            let oldest = self
+                .verified_tips
+                .iter()
+                .min_by_key(|(_, tip)| tip.verified_at_ms)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            self.verified_tips.remove(&oldest);
+        }
         self.jobs.retain(|id, job| {
             self.active_jobs.contains_key(id)
                 || job.pending_cancel
@@ -92,6 +121,7 @@ impl State {
                 self.jobs.len(),
                 self.snapshots.len(),
                 self.snapshot_used_at_ms.len(),
+                self.verified_tips.len(),
             )
     }
 }
@@ -101,6 +131,7 @@ impl State {
 pub(crate) struct Storage {
     root: PathBuf,
     state: Mutex<State>,
+    tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     _lease: File,
 }
 
@@ -148,6 +179,7 @@ impl Storage {
         let storage = Self {
             root: root.into(),
             state: Mutex::new(state),
+            tip_checks: Mutex::new(BTreeMap::new()),
             _lease: lease,
         };
         if pruned {
@@ -168,6 +200,31 @@ impl Storage {
         File::open(&self.root)?.sync_all()?;
         *state = next;
         Ok(())
+    }
+    pub fn tip_check(&self, repository: &str) -> Arc<Mutex<()>> {
+        let mut checks = self.tip_checks.lock().unwrap();
+        checks.retain(|_, check| check.strong_count() > 0);
+        if let Some(check) = checks.get(repository).and_then(Weak::upgrade) {
+            return check;
+        }
+        let check = Arc::new(Mutex::new(()));
+        checks.insert(repository.into(), Arc::downgrade(&check));
+        check
+    }
+    pub fn verified_tip(&self, repository: &str) -> Option<VerifiedTip> {
+        self.state
+            .lock()
+            .unwrap()
+            .verified_tips
+            .get(repository)
+            .filter(|tip| tip.fresh(now_ms()))
+            .cloned()
+    }
+    pub fn verify_tip(&self, repository: String, mut tip: VerifiedTip) -> io::Result<()> {
+        tip.verified_at_ms = now_ms();
+        self.update(|state| {
+            state.verified_tips.insert(repository, tip);
+        })
     }
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
@@ -420,5 +477,60 @@ mod retention_tests {
         storage.cancel(id, true).unwrap();
         storage.terminal_delivered(id).unwrap();
         assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod verified_tip_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    fn record(at: u64) -> VerifiedTip {
+        VerifiedTip {
+            remote_url: "https://example.invalid/repo.git".into(),
+            branch: "refs/heads/main".into(),
+            commit: "a".repeat(40),
+            verified_at_ms: at,
+        }
+    }
+
+    #[test]
+    fn verified_tip_age_is_bounded_and_future_timestamps_are_refused() {
+        let tip = record(100);
+        assert!(!tip.fresh(99));
+        assert!(tip.fresh(100));
+        assert!(tip.fresh(100 + RETENTION_MS - 1));
+        assert!(!tip.fresh(100 + RETENTION_MS));
+        let mut state = State::default();
+        state.verified_tips.insert("expired".into(), record(100));
+        assert!(state.prune(100 + RETENTION_MS));
+        assert!(state.verified_tips.is_empty());
+    }
+
+    #[test]
+    fn verified_tips_keep_only_256_repositories_and_one_tip_each() {
+        let mut state = State::default();
+        for n in 0..258 {
+            state.verified_tips.insert(n.to_string(), record(n + 1));
+        }
+        assert!(state.prune(300));
+        assert_eq!(state.verified_tips.len(), MAX_VERIFIED_TIPS);
+        assert!(!state.verified_tips.contains_key("0"));
+        assert!(!state.verified_tips.contains_key("1"));
+        assert!(state.verified_tips.contains_key("257"));
+
+        let scratch = ScratchDir::new("motor-verified-tip-state");
+        let storage = Storage::open(&scratch).unwrap();
+        storage.verify_tip("repo".into(), record(0)).unwrap();
+        let mut next = record(0);
+        next.commit = "b".repeat(40);
+        storage.verify_tip("repo".into(), next).unwrap();
+        assert_eq!(storage.state.lock().unwrap().verified_tips.len(), 1);
+        let verified = storage.verified_tip("repo").unwrap();
+        assert_eq!(verified.commit, "b".repeat(40));
+        assert_eq!(
+            storage.verified_tip("repo").unwrap().verified_at_ms,
+            verified.verified_at_ms
+        );
     }
 }
