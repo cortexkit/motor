@@ -155,6 +155,13 @@ directories. `state.json` holds:
   Tests: `successful_verification_survives_storage_reopen`,
   `verified_tips_keep_only_256_repositories_and_one_tip_each`.
 
+Failed tip checks are cached only in memory for 60 seconds, keyed by repository,
+effective origin URL, branch and local commit, with at most 256 entries. Hits
+return no tip without another remote query or warning, and do not extend the
+TTL. A changed key or an expired entry rechecks. These entries never enter
+`state.json`; restarting the module forgets them. Tests:
+`negative_cache_is_not_persisted`, `negative_cache_rechecks_after_ttl`.
+
 There is no schema version. Unknown fields are ignored and absent attribution
 loads as none; an incompatible change needs an explicit migration. Test:
 `older_state_loads_without_attribution_and_keeps_cancel_intent`.

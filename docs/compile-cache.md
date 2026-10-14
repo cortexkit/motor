@@ -103,9 +103,25 @@ the commit was on the remote default branch when checked, not that it remains
 the current tip after a force-push. Failures never become successful entries.
 Tests: `cache_hit_avoids_second_ls_remote`, `changed_tip_reverifies`,
 `changed_origin_url_reverifies`, `successful_verification_survives_storage_reopen`,
-`mismatch_is_not_cached_and_recovery_rechecks`,
+`mismatch_is_never_cached_as_success_and_recovers_after_ttl`,
 `verified_tip_age_is_bounded_and_future_timestamps_are_refused`,
 `verified_tips_keep_only_256_repositories_and_one_tip_each`.
+
+Failures have a separate, memory-only negative cache. A mismatch, authentication
+failure, network failure or timeout suppresses another query for the same
+repository, effective origin URL, branch and local commit for 60 seconds. A hit
+returns no fill tip and emits no repeated warning; it does not extend the TTL.
+A changed key checks immediately, and expiration permits another check and
+warning if the failure continues. This avoids charging every gate job for a
+local merge that has not been pushed yet, or for an unavailable remote. At most
+256 failed keys are retained, oldest failure first. Negative entries disappear
+on module restart and are never persisted or treated as successful verification.
+Tests: `negative_cache_skips_second_query_and_warning_within_ttl`,
+`negative_cache_rechecks_after_ttl`,
+`negative_cache_changed_local_commit_rechecks_immediately`,
+`negative_cache_changed_origin_url_rechecks_immediately`,
+`negative_cache_is_not_persisted`,
+`negative_cache_keys_all_verification_inputs_and_is_bounded`.
 
 Git inherits the module's `HOME` and `PATH`, so existing credential helpers and
 SSH credentials remain available; no runner-vault credential is lent to Git.
@@ -118,7 +134,7 @@ including credential and SSH helpers. A failed check emits one warning with
 write error uses category `cache` and also skips the fill. No failure blocks
 the submitted job or prepare request; an empty integration tip skips fills.
 Tests: `child_is_noninteractive_and_preserves_home_and_path`,
-`auth_failure_logs_first_stderr_line_and_is_not_cached`,
+`auth_failure_is_negative_cached_and_logs_first_stderr_line_once`,
 `hung_remote_times_out_and_kills_helpers`, `unreachable_remote_has_no_tip`,
 `current_client_unverified_default_tip_runs_and_prepares_without_fills`.
 

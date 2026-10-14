@@ -1,6 +1,6 @@
 use crate::{
     snapshot,
-    storage::{Storage, VerifiedTip},
+    storage::{Storage, VerificationKey, VerifiedTip},
 };
 use std::{
     fs::{self, File, OpenOptions},
@@ -39,8 +39,18 @@ fn tip_with_timeout(
     scratch: &Path,
     timeout: Duration,
 ) -> Option<String> {
+    tip_with_clock(root, storage, scratch, timeout, Instant::now)
+}
+
+fn tip_with_clock(
+    root: &Path,
+    storage: &Storage,
+    scratch: &Path,
+    timeout: Duration,
+    clock: impl Fn() -> Instant,
+) -> Option<String> {
     let started = Instant::now();
-    match verify(root, storage, scratch, timeout) {
+    match verify(root, storage, scratch, timeout, &clock) {
         Ok(tip) => tip,
         Err(error) => {
             tracing::warn!(repository = %root.display(), category = error.category,
@@ -57,6 +67,7 @@ fn verify(
     storage: &Storage,
     scratch: &Path,
     timeout: Duration,
+    clock: &impl Fn() -> Instant,
 ) -> Result<Option<String>, Failure> {
     let common = snapshot::git(
         root,
@@ -81,36 +92,51 @@ fn verify(
     }) {
         return Ok(Some(commit));
     }
-    let advertised = remote_head(root, scratch, timeout)?;
-    let mut remote_branch = None;
-    let mut remote_commit = None;
-    for line in advertised.lines() {
-        if let Some((value, "HEAD")) = line.split_once('\t') {
-            if let Some(reference) = value.strip_prefix("ref: ") {
-                remote_branch = Some(reference);
-            } else {
-                remote_commit = Some(value);
+    let key = VerificationKey {
+        repository: repository.clone(),
+        remote_url: remote_url.clone(),
+        branch: branch.clone(),
+        commit: commit.clone(),
+    };
+    if storage.tip_failed_recently(&key, clock()) {
+        return Ok(None);
+    }
+    let result = (|| {
+        let advertised = remote_head(root, scratch, timeout)?;
+        let mut remote_branch = None;
+        let mut remote_commit = None;
+        for line in advertised.lines() {
+            if let Some((value, "HEAD")) = line.split_once('\t') {
+                if let Some(reference) = value.strip_prefix("ref: ") {
+                    remote_branch = Some(reference);
+                } else {
+                    remote_commit = Some(value);
+                }
             }
         }
+        if remote_branch != Some(branch.as_str()) || remote_commit != Some(commit.as_str()) {
+            return Err(Failure::new(
+                "mismatch",
+                "local default branch and commit do not match origin HEAD",
+            ));
+        }
+        if let Err(error) = storage.verify_tip(
+            repository,
+            VerifiedTip {
+                remote_url,
+                branch,
+                commit: commit.clone(),
+                verified_at_ms: 0,
+            },
+        ) {
+            return Err(Failure::new("cache", error));
+        }
+        Ok(Some(commit))
+    })();
+    if result.is_err() {
+        storage.tip_failed(key, clock());
     }
-    if remote_branch != Some(branch.as_str()) || remote_commit != Some(commit.as_str()) {
-        return Err(Failure::new(
-            "mismatch",
-            "local default branch and commit do not match origin HEAD",
-        ));
-    }
-    if let Err(error) = storage.verify_tip(
-        repository,
-        VerifiedTip {
-            remote_url,
-            branch,
-            commit: commit.clone(),
-            verified_at_ms: 0,
-        },
-    ) {
-        return Err(Failure::new("cache", error));
-    }
-    Ok(Some(commit))
+    result
 }
 
 fn read_output(path: &Path) -> io::Result<String> {
@@ -296,6 +322,16 @@ mod tests {
             tip(&self.root, &self.storage, &self.spool)
         }
 
+        fn tip_at(&self, now: Instant) -> Option<String> {
+            tip_with_clock(
+                &self.root,
+                &self.storage,
+                &self.spool,
+                REMOTE_TIMEOUT,
+                || now,
+            )
+        }
+
         fn calls(&self) -> usize {
             fs::read_to_string(&self.calls)
                 .unwrap_or_default()
@@ -329,6 +365,8 @@ mod tests {
         let f = Fixture::new();
         fs::rename(&f.remote, f.remote.with_extension("offline")).unwrap();
         assert_eq!(f.tip(), None);
+        assert_eq!(f.tip(), None);
+        assert_eq!(f.calls(), 1);
     }
 
     #[test]
@@ -360,6 +398,42 @@ mod tests {
         let next = f.commit("merged");
         f.push();
         assert_eq!(f.tip(), Some(next));
+        assert_eq!(f.calls(), 2);
+    }
+
+    #[test]
+    fn negative_cache_skips_second_query_and_warning_within_ttl() {
+        let f = Fixture::new();
+        f.commit("ahead of remote");
+        let now = Instant::now();
+        let captured = crate::logging::Captured::default();
+        let _guard = crate::logging::scoped(captured.clone());
+        assert_eq!(f.tip_at(now), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(59)), None);
+        assert_eq!(f.calls(), 1);
+        assert_eq!(captured.text().lines().count(), 1);
+    }
+
+    #[test]
+    fn negative_cache_rechecks_after_ttl() {
+        let f = Fixture::new();
+        f.commit("ahead of remote");
+        let now = Instant::now();
+        assert_eq!(f.tip_at(now), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(30)), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(60)), None);
+        assert_eq!(f.calls(), 2);
+    }
+
+    #[test]
+    fn negative_cache_changed_local_commit_rechecks_immediately() {
+        let f = Fixture::new();
+        f.commit("ahead of remote");
+        let now = Instant::now();
+        assert_eq!(f.tip_at(now), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(1)), None);
+        f.commit("another local commit");
+        assert_eq!(f.tip_at(now + Duration::from_secs(2)), None);
         assert_eq!(f.calls(), 2);
     }
 
@@ -405,14 +479,59 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_is_not_cached_and_recovery_rechecks() {
+    fn mismatch_is_never_cached_as_success_and_recovers_after_ttl() {
         let f = Fixture::new();
         let next = f.commit("not yet pushed");
-        assert_eq!(f.tip(), None);
-        assert_eq!(f.tip(), None);
+        let now = Instant::now();
+        assert_eq!(f.tip_at(now), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(1)), None);
         f.push();
-        assert_eq!(f.tip(), Some(next));
-        assert_eq!(f.calls(), 3);
+        assert_eq!(f.tip_at(now + Duration::from_secs(2)), None);
+        assert_eq!(f.tip_at(now + Duration::from_secs(60)), Some(next));
+        assert_eq!(f.calls(), 2);
+    }
+
+    #[test]
+    fn negative_cache_changed_origin_url_rechecks_immediately() {
+        let f = Fixture::new();
+        let next = f.commit("ahead of remote");
+        let now = Instant::now();
+        assert_eq!(f.tip_at(now), None);
+        let other = f._scratch.join("other.git");
+        git(
+            &f.root,
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                f.root.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(&other, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(
+            &f.root,
+            &["remote", "set-url", "origin", other.to_str().unwrap()],
+        );
+        assert_eq!(f.tip_at(now + Duration::from_secs(1)), Some(next));
+        assert_eq!(f.calls(), 2);
+    }
+
+    #[test]
+    fn negative_cache_is_not_persisted() {
+        let f = Fixture::new();
+        assert!(f.tip().is_some());
+        f.commit("ahead of remote");
+        assert_eq!(f.tip(), None);
+        assert_eq!(f.tip(), None);
+        let store = f._scratch.join("store");
+        let calls = f.calls.clone();
+        let state = fs::read_to_string(store.join("state.json")).unwrap();
+        assert!(!state.contains("failed_tips"));
+        drop(f.storage);
+        let storage = Storage::open(&store).unwrap();
+        assert_eq!(tip(&f.root, &storage, &f.spool), None);
+        assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 3);
     }
 
     #[test]
@@ -455,16 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_logs_first_stderr_line_and_is_not_cached() {
+    fn auth_failure_is_negative_cached_and_logs_first_stderr_line_once() {
         let f = Fixture::new();
-        fs::write(&f.upload, "#!/bin/sh\necho 'fatal: Authentication failed for origin' >&2\necho 'not the first line' >&2\nexit 1\n").unwrap();
+        fs::write(&f.upload, format!("#!/bin/sh\nprintf 'call\\n' >> '{}'\necho 'fatal: Authentication failed for origin' >&2\necho 'not the first line' >&2\nexit 1\n", f.calls.display())).unwrap();
         let captured = crate::logging::Captured::default();
         let _guard = crate::logging::scoped(captured.clone());
         assert_eq!(f.tip(), None);
         assert_eq!(f.tip(), None);
         let text = captured.text();
         let lines: Vec<_> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(f.calls(), 1);
+        assert_eq!(lines.len(), 1, "{text}");
         for line in lines {
             assert!(line.contains("category=auth"), "{line}");
             assert!(
@@ -487,8 +607,8 @@ mod tests {
         fs::write(
             &f.upload,
             format!(
-                "#!/bin/sh\n(sleep 1; touch '{}') &\necho 'waiting for remote' >&2\nwait\n",
-                escaped.display()
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\n(sleep 1; touch '{}') &\necho 'waiting for remote' >&2\nwait\n",
+                f.calls.display(), escaped.display()
             ),
         )
         .unwrap();
@@ -499,6 +619,11 @@ mod tests {
             tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(100)),
             None
         );
+        assert_eq!(
+            tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(f.calls(), 1);
         assert!(started.elapsed() < Duration::from_secs(2));
         let text = captured.text();
         assert_eq!(text.lines().count(), 1, "{text}");

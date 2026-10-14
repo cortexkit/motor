@@ -87,7 +87,9 @@ the host as a third account, `motor-prep`, before the VM boots.
   checks are cached for at most 24 hours; changing the local tip or origin URL
   requires another check. Moving local branches or remote-tracking refs alone
   no longer authorizes a fill. A mismatch or failed check skips the fill, not
-  the job. Tests: `local_tip_ahead_of_remote_has_no_tip`,
+  the job. Failures suppress repeat queries and warnings for the same repository,
+  URL, branch and commit for 60 seconds in memory only; they never authorize a
+  fill. Tests: `local_tip_ahead_of_remote_has_no_tip`,
   `forged_origin_head_cannot_authorize_a_remote_feature_branch`,
   `current_client_unverified_default_tip_runs_and_prepares_without_fills`.
   Code admitted to the remote default branch, including build scripts, still

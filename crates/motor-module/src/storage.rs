@@ -7,13 +7,15 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 // Keep routing and local refusal history for at least the runner's replay horizon,
 // starting at successful terminal delivery or the caller's latest access.
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_VERIFIED_TIPS: usize = 256;
+const MAX_FAILED_TIPS: usize = 256;
+const FAILED_TIP_TTL: Duration = Duration::from_secs(60);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -71,6 +73,14 @@ pub(crate) struct VerifiedTip {
     pub branch: String,
     pub commit: String,
     pub verified_at_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct VerificationKey {
+    pub repository: String,
+    pub remote_url: String,
+    pub branch: String,
+    pub commit: String,
 }
 
 impl VerifiedTip {
@@ -132,6 +142,7 @@ pub(crate) struct Storage {
     root: PathBuf,
     state: Mutex<State>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
     _lease: File,
 }
 
@@ -180,6 +191,7 @@ impl Storage {
             root: root.into(),
             state: Mutex::new(state),
             tip_checks: Mutex::new(BTreeMap::new()),
+            failed_tips: Mutex::new(BTreeMap::new()),
             _lease: lease,
         };
         if pruned {
@@ -219,6 +231,26 @@ impl Storage {
             .get(repository)
             .filter(|tip| tip.fresh(now_ms()))
             .cloned()
+    }
+    pub fn tip_failed_recently(&self, key: &VerificationKey, now: Instant) -> bool {
+        let mut failed = self.failed_tips.lock().unwrap();
+        failed.retain(|_, at| {
+            now.checked_duration_since(*at)
+                .is_some_and(|age| age < FAILED_TIP_TTL)
+        });
+        failed.contains_key(key)
+    }
+    pub fn tip_failed(&self, key: VerificationKey, now: Instant) {
+        let mut failed = self.failed_tips.lock().unwrap();
+        failed.insert(key, now);
+        while failed.len() > MAX_FAILED_TIPS {
+            let oldest = failed
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            failed.remove(&oldest);
+        }
     }
     pub fn verify_tip(&self, repository: String, mut tip: VerifiedTip) -> io::Result<()> {
         tip.verified_at_ms = now_ms();
@@ -532,5 +564,37 @@ mod verified_tip_tests {
             storage.verified_tip("repo").unwrap().verified_at_ms,
             verified.verified_at_ms
         );
+    }
+
+    #[test]
+    fn negative_cache_keys_all_verification_inputs_and_is_bounded() {
+        let scratch = ScratchDir::new("motor-failed-tip-state");
+        let storage = Storage::open(&scratch).unwrap();
+        let now = Instant::now();
+        let key = VerificationKey {
+            repository: "repo".into(),
+            remote_url: "origin".into(),
+            branch: "refs/heads/main".into(),
+            commit: "a".repeat(40),
+        };
+        storage.tip_failed(key.clone(), now);
+        assert!(storage.tip_failed_recently(&key, now));
+        for field in 0..4 {
+            let mut changed = key.clone();
+            match field {
+                0 => changed.repository.push_str("-other"),
+                1 => changed.remote_url.push_str("-other"),
+                2 => changed.branch.push_str("-other"),
+                _ => changed.commit = "b".repeat(40),
+            }
+            assert!(!storage.tip_failed_recently(&changed, now));
+        }
+        for n in 0..MAX_FAILED_TIPS {
+            let mut next = key.clone();
+            next.repository = n.to_string();
+            storage.tip_failed(next, now + Duration::from_millis(n as u64 + 1));
+        }
+        assert_eq!(storage.failed_tips.lock().unwrap().len(), MAX_FAILED_TIPS);
+        assert!(!storage.tip_failed_recently(&key, now + Duration::from_secs(1)));
     }
 }
