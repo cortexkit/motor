@@ -5,6 +5,7 @@ job VM (the job seed carries the agent source and no SSH keys). They also run
 the standing VM's launcher against a real flock on the shared slot lock, so it
 boots only while no job VM holds the lock and names the holder when one does.
 """
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
@@ -24,10 +26,12 @@ def load(name, filename):
     spec = importlib.util.spec_from_file_location(name, HERE / filename)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
+media = load("powershell_archive", "powershell_archive.py")
 prepare = load("prepare_seed", "prepare-seed.py")
 holder = load("slot_holder", "slot-holder.py")
 
@@ -39,11 +43,14 @@ class SeedTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.pins = self.root / "trusted-fingerprints"
         self.pins.write_text("\n".join(TEST_PINS) + "\n")
-        (self.root / "autounattend.xml").write_text(
-            '<answer><!-- __BOOTSTRAP_PASSWORD__ -->' +
-            '<password>__BOOTSTRAP_PASSWORD__</password>' * 3 + '</answer>')
-        for name in ("bootstrap.ps1", "setup-guest.ps1", "setup-job-baseline.ps1", "dev-shell.ps1", "smoke.ps1"):
+        shutil.copyfile(HERE / "autounattend.xml", self.root / "autounattend.xml")
+        for name in ("bootstrap.ps1", "setup-guest.ps1", "setup-job-baseline.ps1", "install-powershell.ps1",
+                     "register-job-bootstrap.ps1", "finalize-job-baseline.ps1", "dev-shell.ps1", "smoke.ps1"):
             shutil.copyfile(HERE / name, self.root / name)
+        (self.root / media.ARCHIVE_NAME).write_bytes(b"test PowerShell media")
+        self.hash_patch = patch.object(media, "ARCHIVE_SHA256", hashlib.sha256(b"test PowerShell media").hexdigest())
+        self.hash_patch.start()
+        self.addCleanup(self.hash_patch.stop)
         self.agent = self.root / "agent"
         shutil.copytree(HERE.parents[1] / "crates/motor-winagent", self.agent,
                         ignore=shutil.ignore_patterns("target"))
@@ -67,15 +74,33 @@ class SeedTests(unittest.TestCase):
         seed = self.root / "seed"
         self.assertEqual({p.name for p in seed.iterdir()},
                          {"autounattend.xml", "job-baseline", "bootstrap.ps1", "setup-guest.ps1",
-                          "setup-job-baseline.ps1", "motor-winagent"})
+                           "setup-job-baseline.ps1", "install-powershell.ps1", "register-job-bootstrap.ps1",
+                           "finalize-job-baseline.ps1", media.ARCHIVE_NAME, "motor-winagent"})
+        self.assertEqual((seed / media.ARCHIVE_NAME).read_bytes(), b"test PowerShell media")
         for name in ("Cargo.toml", "Cargo.lock", "src/main.rs", "src/lib.rs"):
             self.assertEqual((seed / "motor-winagent" / name).read_bytes(), (self.agent / name).read_bytes())
         answer = (seed / "autounattend.xml").read_text()
         self.assertNotIn("__BOOTSTRAP_PASSWORD__", answer)
-        self.assertEqual(answer.count("Aa1!"), 4)
+        self.assertEqual(answer.count("Aa1!"), 3)
+        tree = ET.fromstring(answer)
+        ns = {"u": prepare.NAMESPACE}
+        self.assertIsNone(tree.find(".//u:FirstLogonCommands", ns))
+        path = tree.find("u:settings[@pass='specialize']/u:component[@name='Microsoft-Windows-Deployment']/u:RunSynchronous/u:RunSynchronousCommand/u:Path", ns)
+        self.assertIn(r"-File D:\register-job-bootstrap.ps1", path.text)
         self.assertEqual((seed.stat().st_mode & 0o777), 0o700)
         self.assertFalse((seed / "motor-winagent/target").exists())
         self.assertFalse((seed / "motor-winagent/.cargo").exists())
+
+    def test_job_seed_rejects_missing_or_wrong_powershell_before_writing(self):
+        archive = self.root / media.ARCHIVE_NAME
+        for missing in (False, True):
+            if missing:
+                archive.unlink()
+            else:
+                archive.write_bytes(b"wrong media")
+            with self.assertRaisesRegex(SystemExit, "Cannot stage pinned PowerShell ZIP"):
+                self.render("--job-baseline", "--agent-source", str(self.agent))
+            self.assertFalse((self.root / "seed").exists())
 
     def test_job_seed_requires_standalone_lockfile_before_writing(self):
         (self.agent / "Cargo.lock").unlink()
@@ -93,6 +118,8 @@ class SeedTests(unittest.TestCase):
                 patch.object(prepare.subprocess, "check_output", return_value=fingerprints):
             self.render("--key-fingerprints", str(self.pins))
         seed = self.root / "seed"
+        self.assertIn("FirstLogonCommands", (seed / "autounattend.xml").read_text())
+        self.assertNotIn("register-job-bootstrap.ps1", (seed / "autounattend.xml").read_text())
         self.assertEqual((seed / "authorized_keys").read_text(), keys)
         self.assertEqual({p.name for p in seed.iterdir()},
                          {"autounattend.xml", "authorized_keys", "bootstrap.ps1", "setup-guest.ps1", "dev-shell.ps1", "smoke.ps1"})
@@ -159,6 +186,32 @@ class BaselineInputsTests(unittest.TestCase):
                          "SetEnvironmentVariable('RUSTUP_HOME', $env:RUSTUP_HOME, 'Machine')",
                          "'C:\\rust' /inheritance:r", ':(OI)(CI)RX'):
             self.assertIn(expected, source)
+
+    def test_baseline_installs_pinned_protected_powershell(self):
+        source = (HERE / "install-powershell.ps1").read_text()
+        for expected in ("7.6.7", "d2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7",
+                         "C:\\Program Files\\PowerShell\\7", "Get-FileHash", "Expand-Archive",
+                         "/inheritance:r", "*S-1-5-32-545:(OI)(CI)RX", "/reset /T /C /L /Q",
+                         "GetAccessRules", "PowerShell ACL inheritance reset failed",
+                         "-NoProfile -Command '$PSVersionTable.PSVersion.ToString()'"):
+            self.assertIn(expected, source)
+        self.assertIn('& "$PSScriptRoot\\install-powershell.ps1"', (HERE / "setup-job-baseline.ps1").read_text())
+        self.assertIn('PowerShell-7.6.7-win-x64.zip', (HERE / "bootstrap.ps1").read_text())
+
+    def test_job_bootstrap_schedules_system_finalization_and_records_license(self):
+        register = (HERE / "register-job-bootstrap.ps1").read_text()
+        bootstrap = (HERE / "bootstrap.ps1").read_text()
+        finalize = (HERE / "finalize-job-baseline.ps1").read_text()
+        for expected in ("New-ScheduledTaskTrigger -AtLogOn", "-User SYSTEM -RunLevel Highest", "MotorBootstrap"):
+            self.assertIn(expected, register)
+        for expected in ("Unregister-ScheduledTask -TaskName MotorBootstrap", "'/dlv', '/xpr'",
+                         "New-ScheduledTaskTrigger -AtStartup", "-User SYSTEM -RunLevel Highest",
+                         "Start-ScheduledTask -TaskName MotorFinalize"):
+            self.assertIn(expected, bootstrap)
+        for expected in ("ResultCode -ne 2", "HResult -ne 0", "Microsoft.Update.SystemInfo",
+                         "Updates did not settle within five", "Set-Content $complete",
+                         "Set-Content C:\\build\\provision\\FAILED.txt"):
+            self.assertIn(expected, finalize)
 
     def test_baseline_inputs_include_driver_identity_service_and_hardening(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()

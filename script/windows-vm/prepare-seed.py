@@ -9,7 +9,36 @@ import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 
+from powershell_archive import ARCHIVE_NAME, verify_archive
+
 ROOT = Path("/srv/build/windows-vm/provision")
+NAMESPACE = "urn:schemas-microsoft-com:unattend"
+WCM = "http://schemas.microsoft.com/WMIConfig/2002/State"
+
+
+def job_answer(answer):
+    """Register elevated bootstrap during Setup, not from the interactive account."""
+    tag = lambda name: f"{{{NAMESPACE}}}{name}"
+    tree = ET.fromstring(answer)
+    shell = tree.find(f"{tag('settings')}[@pass='oobeSystem']/{tag('component')}[@name='Microsoft-Windows-Shell-Setup']")
+    first_logon = shell.find(tag("FirstLogonCommands"))
+    shell.remove(first_logon)
+    specialize = tree.find(f"{tag('settings')}[@pass='specialize']")
+    component = ET.SubElement(specialize, tag("component"), {
+        "name": "Microsoft-Windows-Deployment", "processorArchitecture": "amd64",
+        "publicKeyToken": "31bf3856ad364e35", "language": "neutral", "versionScope": "nonSxS",
+    })
+    synchronous = ET.SubElement(component, tag("RunSynchronous"))
+    command = ET.SubElement(synchronous, tag("RunSynchronousCommand"), {f"{{{WCM}}}action": "add"})
+    ET.SubElement(command, tag("Order")).text = "1"
+    ET.SubElement(command, tag("Description")).text = "Register SYSTEM job-image bootstrap"
+    ET.SubElement(command, tag("Path")).text = (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "
+        r"-NoProfile -ExecutionPolicy Bypass -File D:\register-job-bootstrap.ps1"
+    )
+    ET.register_namespace("", NAMESPACE)
+    ET.register_namespace("wcm", WCM)
+    return ET.tostring(tree, encoding="unicode")
 
 
 def main():
@@ -26,6 +55,10 @@ def main():
         raise SystemExit("Setup CD already exists; remove it deliberately before rendering again")
     lines = []
     if args.job_baseline:
+        try:
+            verify_archive(ROOT / ARCHIVE_NAME)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot stage pinned PowerShell ZIP: {error}") from error
         for name in ("Cargo.toml", "Cargo.lock", "src"):
             if not (args.agent_source / name).exists():
                 raise SystemExit(f"Missing motor-winagent {name}; supply --agent-source with the standalone crate")
@@ -53,6 +86,8 @@ def main():
         raise SystemExit("Unexpected unattended template")
     password = "Aa1!" + secrets.token_urlsafe(36)
     answer = template.replace("__BOOTSTRAP_PASSWORD__", password)
+    if args.job_baseline:
+        answer = job_answer(answer)
     ET.fromstring(answer)
     seed = ROOT / "seed"
     seed.mkdir(mode=0o700)
@@ -60,7 +95,10 @@ def main():
     if args.job_baseline:
         # Tell bootstrap to omit SSH even when the unattended command has no mode flag.
         (seed / "job-baseline").touch()
-        scripts = ("bootstrap.ps1", "setup-guest.ps1", "setup-job-baseline.ps1")
+        scripts = ("bootstrap.ps1", "setup-guest.ps1", "setup-job-baseline.ps1", "install-powershell.ps1",
+                   "register-job-bootstrap.ps1", "finalize-job-baseline.ps1")
+        shutil.copyfile(ROOT / ARCHIVE_NAME, seed / ARCHIVE_NAME)
+        verify_archive(seed / ARCHIVE_NAME)
         agent = seed / "motor-winagent"
         agent.mkdir()
         for name in ("Cargo.toml", "Cargo.lock"):

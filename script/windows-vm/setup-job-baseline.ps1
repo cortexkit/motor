@@ -9,6 +9,8 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
     throw 'Job baseline setup must run elevated'
 }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Job baseline requires x64 Windows' }
+& "$PSScriptRoot\install-powershell.ps1"
+if (-not $?) { throw 'Machine-wide PowerShell installation failed' }
 
 $toolchain = '1.99.0'
 $hostTriple = 'x86_64-pc-windows-msvc'
@@ -95,16 +97,11 @@ public static class MotorProfile {
 }
 $jobProfile = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty $profileKey).ProfileImagePath)
 $jobCargo = Join-Path $jobProfile '.cargo'
-New-Item $jobCargo,'C:\m',"$motor\cache" -ItemType Directory -Force | Out-Null
+New-Item $jobCargo,'C:\m','C:\t' -ItemType Directory -Force | Out-Null
 & icacls 'C:\m' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
 if ($LASTEXITCODE -ne 0) { throw 'Job source directory ACL setup failed' }
 & icacls $jobCargo /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
 if ($LASTEXITCODE -ne 0) { throw 'Job cargo home ACL setup failed' }
-# Let the job account list and enter C:\ProgramData\Motor (no inheritance
-# flags), so it can reach the cache folder below it. The grant applies to the
-# folder itself only, so the password file stays unreadable to the job.
-& icacls $motor /grant:r "*${jobSid}:RX"
-if ($LASTEXITCODE -ne 0) { throw 'Motor traversal ACL setup failed' }
 
 $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\vioserial\2k22\amd64\vioser.inf") } | Select-Object -First 1
 if (-not $drivers) { throw 'Official virtio-win CD with the Server 2022 serial driver not found' }

@@ -7,7 +7,7 @@ function Assert($condition, [string]$message) {
 }
 
 $checks = 0
-foreach ($name in @('bootstrap.ps1', 'setup-guest.ps1', 'setup-job-baseline.ps1')) {
+foreach ($name in @('bootstrap.ps1', 'setup-guest.ps1', 'setup-job-baseline.ps1', 'install-powershell.ps1', 'register-job-bootstrap.ps1', 'finalize-job-baseline.ps1')) {
     $tokens = $null
     $errors = $null
     $null = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Scripts $name), [ref]$tokens, [ref]$errors)
@@ -44,12 +44,20 @@ if ($env:OS -ne 'Windows_NT') {
         Set-Content S:\motor-winagent\Cargo.lock 'source lock'
         Set-Content S:\motor-winagent\src\main.rs 'source main'
         Set-Content S:\setup-guest.ps1 'param([switch]$JobBaseline); if (-not $JobBaseline) { throw "mode not forwarded" }; Set-Content C:\build\provision\guest-called yes'
+        Set-Content S:\PowerShell-7.6.7-win-x64.zip 'media fixture'
+        Set-Content S:\finalize-job-baseline.ps1 'finalizer fixture'
         Set-Content S:\setup-job-baseline.ps1 'Set-Content C:\build\provision\baseline-called yes'
         # No authorized_keys exists. Entering any of the SSH setup block is a failure.
         function Get-Volume { [pscustomobject]@{ DriveLetter = 'S' } }
         function Get-NetAdapter { [pscustomobject]@{ InterfaceDescription = 'VirtIO'; Status = 'Up' } }
         function Set-LocalUser {}
         function Disable-LocalUser {}
+        function Unregister-ScheduledTask {}
+        function New-ScheduledTaskAction {}
+        function New-ScheduledTaskTrigger {}
+        function Register-ScheduledTask { Set-Content C:\build\provision\finalizer-registered yes }
+        function Start-ScheduledTask { Set-Content C:\build\provision\finalizer-started yes }
+        function cscript.exe { $global:LASTEXITCODE = 0 }
         function Set-ItemProperty {}
         function Remove-ItemProperty {}
         function New-ItemProperty {}
@@ -66,6 +74,10 @@ if ($env:OS -ne 'Windows_NT') {
             Assert (Test-Path C:\build\provision\guest-called) "bootstrap_$mode did not call shared setup"
             Assert (Test-Path C:\build\provision\baseline-called) "bootstrap_$mode did not call baseline setup"
             Assert (Test-Path C:\build\provision\motor-winagent\Cargo.lock) "bootstrap_$mode lost agent lockfile"
+            Assert (Test-Path C:\build\provision\PowerShell-7.6.7-win-x64.zip) "bootstrap_$mode lost PowerShell media"
+            Assert (Test-Path C:\build\provision\finalize-job-baseline.ps1) "bootstrap_$mode lost finalizer"
+            Assert (Test-Path C:\build\provision\finalizer-registered) "bootstrap_$mode did not register finalizer"
+            Assert (Test-Path C:\build\provision\finalizer-started) "bootstrap_$mode did not start finalizer"
             Assert (-not (Test-Path C:\build\provision\ssh-ready)) "bootstrap_$mode enabled SSH"
             Remove-Item C:\build\provision -Recurse -Force
             $checks++
