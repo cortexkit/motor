@@ -1,4 +1,4 @@
-use crate::Config;
+use crate::{storage::Storage, Config};
 use motor_protocol::*;
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,7 +15,7 @@ use std::{
 const INDEX_LOCK_WAIT: Duration = Duration::from_secs(10);
 const INDEX_LOCK_POLL: Duration = Duration::from_millis(50);
 
-fn command(path: &Path) -> Command {
+pub(crate) fn command(path: &Path) -> Command {
     let mut cmd = Command::new("git");
     // Ignore ambient repository/index selectors and AFT's injected hook path.
     for name in [
@@ -271,9 +271,9 @@ fn snapshot(
     snapshot_with_hook(path, repository, spool, index_number, inject, |_| {})
 }
 
-fn default_branch_tip(root: &Path) -> Option<String> {
-    // origin/HEAD names the default branch, but its remote-tracking commit can
-    // lag behind locally merged work. Resolve only the corresponding local head.
+pub(crate) fn local_default_branch(root: &Path) -> Option<(String, String)> {
+    // Local refs choose the branch and commit to check against origin. Agents can
+    // rewrite them, so default_tip verifies both with the remote before a cache fill.
     let advertised = git(
         root,
         &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
@@ -285,7 +285,7 @@ fn default_branch_tip(root: &Path) -> Option<String> {
             .map(str::to_owned)
     })
     .map(|branch| format!("refs/heads/{branch}"));
-    let tip = advertised
+    let candidate = advertised
         .iter()
         .map(String::as_str)
         .chain(["refs/heads/main", "refs/heads/master"])
@@ -295,8 +295,9 @@ fn default_branch_tip(root: &Path) -> Option<String> {
                 &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
             )
             .ok()
+            .map(|tip| (reference.to_owned(), tip))
         });
-    tip
+    candidate
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -765,6 +766,7 @@ fn snapshot_with_hook_and_timeout(
 }
 
 impl Snapshots {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: &Config,
         key: &str,
@@ -773,6 +775,7 @@ impl Snapshots {
         parent: &Path,
         id: Uuid,
         base: Option<&str>,
+        storage: &Storage,
     ) -> Result<Self, Failure> {
         let spool = Spool::new(parent, id).map_err(|_| Failure {
             tree_hash: None,
@@ -790,7 +793,7 @@ impl Snapshots {
             config.inject_snapshot_failure,
         )?;
         let hash = Some(main.tree_hash.clone());
-        main.tip = default_branch_tip(Path::new(root));
+        main.tip = crate::default_tip::tip(Path::new(root), storage, &spool.0);
         if let Some(base) = base {
             // prepare warms the caller's base, not uncommitted main-tree edits.
             main.commit = git(
@@ -1292,6 +1295,7 @@ mod tests {
     }
 
     fn build_snapshots(checkout: &Path, root: &Path, spool: &Path) -> Snapshots {
+        let storage = Storage::open(&spool.join("store")).unwrap();
         Snapshots::build(
             &Config::default(),
             text(checkout).unwrap(),
@@ -1300,8 +1304,33 @@ mod tests {
             spool,
             Uuid::now_v7(),
             None,
+            &storage,
         )
         .unwrap_or_else(|failure| panic!("{}", failure.check))
+    }
+
+    fn origin(checkout: &Path, remote: &Path) {
+        git(
+            checkout,
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                text(checkout).unwrap(),
+                text(remote).unwrap(),
+            ],
+        )
+        .unwrap();
+        git(remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        git(
+            checkout,
+            &["remote", "add", "origin", text(remote).unwrap()],
+        )
+        .unwrap();
+    }
+
+    fn local_tip(root: &Path) -> Option<String> {
+        local_default_branch(root).map(|(_, commit)| commit)
     }
 
     #[test]
@@ -1322,6 +1351,7 @@ mod tests {
         .unwrap();
         let root = fs::canonicalize(&checkout).unwrap();
         let sibling = fs::canonicalize(gate.join("sibling")).unwrap();
+        let storage = Storage::open(&spool.join("store")).unwrap();
 
         let failure = Snapshots::build(
             &Config::default(),
@@ -1331,6 +1361,7 @@ mod tests {
             &spool,
             Uuid::now_v7(),
             None,
+            &storage,
         )
         .err()
         .expect("a sibling beside the linked worktree, not its main checkout, must refuse");
@@ -1346,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn default_branch_tip_prefers_origin_name_but_uses_local_commit() {
+    fn local_default_branch_prefers_origin_name_but_uses_local_commit() {
         let (_scratch, checkout, _spool, head) = repository();
         git(&checkout, &["branch", "-m", "feature"]).unwrap();
         let local = prepare_commit(&checkout, &head);
@@ -1371,18 +1402,18 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(default_branch_tip(&checkout), Some(local));
+        assert_eq!(local_tip(&checkout), Some(local));
     }
 
     #[test]
-    fn default_branch_tip_falls_back_to_main_then_master_never_head() {
+    fn local_default_branch_falls_back_to_main_then_master_never_head() {
         let (_scratch, checkout, _spool, head) = repository();
         git(&checkout, &["branch", "-m", "feature"]).unwrap();
-        assert_eq!(default_branch_tip(&checkout), None);
+        assert_eq!(local_tip(&checkout), None);
         let main = prepare_commit(&checkout, &head);
         git(&checkout, &["update-ref", "refs/heads/main", &main]).unwrap();
         git(&checkout, &["update-ref", "refs/heads/master", &head]).unwrap();
-        assert_eq!(default_branch_tip(&checkout), Some(main.clone()));
+        assert_eq!(local_tip(&checkout), Some(main.clone()));
         git(
             &checkout,
             &[
@@ -1392,22 +1423,23 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(default_branch_tip(&checkout), Some(main));
+        assert_eq!(local_tip(&checkout), Some(main));
         git(&checkout, &["update-ref", "-d", "refs/heads/main"]).unwrap();
-        assert_eq!(default_branch_tip(&checkout), Some(head.clone()));
+        assert_eq!(local_tip(&checkout), Some(head.clone()));
         git(&checkout, &["update-ref", "-d", "refs/heads/master"]).unwrap();
         git(
             &checkout,
             &["update-ref", "refs/remotes/origin/missing", &head],
         )
         .unwrap();
-        assert_eq!(default_branch_tip(&checkout), None);
+        assert_eq!(local_tip(&checkout), None);
     }
 
     #[test]
     fn default_branch_tip_is_shared_by_root_and_linked_feature_worktree() {
         let (scratch, checkout, spool, head) = repository();
         git(&checkout, &["branch", "-m", "main"]).unwrap();
+        origin(&checkout, &scratch.join("origin.git"));
         let linked = scratch.join("linked");
         git(
             &checkout,
@@ -1439,6 +1471,7 @@ mod tests {
         fs::write(checkout.join("Cargo.lock"), "# unmerged lockfile\n").unwrap();
         let feature = prepare_commit(&checkout, &head);
         git(&checkout, &["reset", "--hard", &feature]).unwrap();
+        origin(&checkout, &scratch.join("origin.git"));
         let snapshots = build_snapshots(&checkout, &checkout, &spool);
         assert_eq!(snapshots.main.commit, feature);
         assert_eq!(snapshots.main.tip, Some(reviewed.clone()));

@@ -94,6 +94,7 @@ async fn run_and_prepare_lockfile_source_is_commit_not_worktree() {
             &f.scratch.join("spool"),
             Uuid::now_v7(),
             prepare.then_some(base.as_str()),
+            &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
         )
         .unwrap_or_else(|_| panic!("snapshot failed"));
         fs::write(f.key.join("Cargo.lock"), lock(&[format!("git+{url}#{b}")])).unwrap();

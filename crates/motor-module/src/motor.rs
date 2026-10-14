@@ -279,6 +279,7 @@ impl Motor {
         let config = self.config.clone();
         let r = request.clone();
         let parent = self.spool_root.clone();
+        let storage = self.storage.clone();
         let snapshots = tokio::task::spawn_blocking(move || {
             Snapshots::build(
                 &config,
@@ -288,6 +289,7 @@ impl Motor {
                 &parent,
                 id,
                 None,
+                &storage,
             )
         })
         .await
@@ -836,6 +838,7 @@ impl Motor {
         let config = self.config.clone();
         let r = request.clone();
         let parent = self.spool_root.clone();
+        let storage = self.storage.clone();
         let snapshots = tokio::task::spawn_blocking(move || {
             Snapshots::build(
                 &config,
@@ -845,6 +848,7 @@ impl Motor {
                 &parent,
                 id,
                 Some(&r.base_commit),
+                &storage,
             )
         })
         .await

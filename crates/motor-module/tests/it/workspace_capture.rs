@@ -443,6 +443,7 @@ async fn head_snapshot_leaves_head_branch_real_index_and_working_files_untouched
         &f.scratch.join("capture"),
         Uuid::now_v7(),
         None,
+        &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
     )
     .unwrap();
     assert_eq!(before, state());

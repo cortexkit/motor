@@ -81,15 +81,26 @@ the host as a third account, `motor-prep`, before the VM boots.
   the shared filesystem while it runs. Admission refuses new work below a
   free-space floor, but does not stop a running job. When the host is
   oversubscribed, CPU sets overlap.
-- **The default branch, for the compile cache.** Cache fills build the
-  repository's default-branch tip, as the caller's `ck-motor` reports it from
-  the caller's local default branch, as the `motor-cache` account with write
-  access to the cache. Code on that branch, including build scripts, can write
-  any cache entry that later jobs of other workspaces may read. The cache
-  defends against jobs and branch-only changes, not against a caller who
-  commits to its local default branch. Callers sharing an instance must trust
-  each other's default branches. This is a property of the design and is not
-  covered by a test.
+- **Merged default-branch code, for the compile cache.** Before reporting a
+  fill tip, `ck-motor` confirms that the local default branch's name and commit
+  match the default branch advertised by the configured `origin`. Successful
+  checks are cached for at most 24 hours; changing the local tip or origin URL
+  requires another check. Moving local branches or remote-tracking refs alone
+  no longer authorizes a fill. A mismatch or failed check skips the fill, not
+  the job. Failures suppress repeat queries and warnings for the same repository,
+  URL, branch and commit for 60 seconds in memory only; they never authorize a
+  fill. Tests: `local_tip_ahead_of_remote_has_no_tip`,
+  `forged_origin_head_cannot_authorize_a_remote_feature_branch`,
+  `current_client_unverified_default_tip_runs_and_prepares_without_fills`.
+  Code admitted to the remote default branch, including build scripts, still
+  runs as `motor-cache` and can write cache entries other repositories read.
+  Callers sharing an instance must trust each other's merged default-branch
+  code. The configured origin URL is not pinned: an agent that rewrites it can
+  point verification elsewhere. That more visible configuration change is an
+  accepted limit. The local module, its stored verification results and Git
+  credential configuration remain trusted; the runner does not independently
+  attest the tip or protect against a modified client. See
+  [compile-cache.md](docs/compile-cache.md#verifying-the-fill-tip).
 - **The SSH key holder.** Anyone holding the runner account's SSH access
   controls the runner: the protocol has no per-caller authorization below SSH,
   and the same socket accepts `drain` and `resume`. Caller authorization happens

@@ -28,6 +28,7 @@ subc-os = { workspace = true }
 subc-jsonc = { workspace = true }
 base64 = "0.22"
 fs2 = "0.4"
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
@@ -38,7 +39,6 @@ uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 subc-transport = { workspace = true }
-libc = "0.2"
 motor-runner = { path = "../motor-runner" }
 cortexkit-test-support = "=0.1.0"
 rand = "0.8"

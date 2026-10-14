@@ -283,7 +283,7 @@ async fn idle(f: &Fixture) {
 }
 
 #[tokio::test]
-async fn current_client_root_and_linked_branch_fill_only_local_default_tip() {
+async fn current_client_root_and_linked_branch_fill_only_remote_confirmed_default_tip() {
     let f = Fixture::with_runner_config(Cut::None, 28, None, |config| {
         config.base_commands = vec!["test \"$(cat Cargo.lock)\" = '# reviewed lockfile'".into()];
     })
@@ -291,6 +291,24 @@ async fn current_client_root_and_linked_branch_fill_only_local_default_tip() {
     crate::snapshot::git(&f.main, &["branch", "-m", "main"]).unwrap();
     fs::write(f.main.join("Cargo.lock"), "# reviewed lockfile\n").unwrap();
     let tip = commit_checkout(&f.main);
+    let remote = f.scratch.join("origin.git");
+    crate::snapshot::git(
+        &f.main,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            f.main.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    crate::snapshot::git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+    crate::snapshot::git(
+        &f.main,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )
+    .unwrap();
     crate::snapshot::git(&f.main, &["checkout", "-b", "unmerged"]).unwrap();
     fs::write(f.main.join("Cargo.lock"), "# unmerged lockfile\n").unwrap();
     let root_feature = commit_checkout(&f.main);
@@ -379,6 +397,67 @@ async fn current_client_without_default_branch_sends_empty_tips_and_never_fills(
     assert!(f.proxy.frames.lock().unwrap().iter().any(
         |frame| matches!(frame, Frame::Prepare(request) if request.integration_tip.is_empty())
     ));
+    idle(&f).await;
+    assert!(f.jobs().iter().all(|job| job["base"] != true));
+}
+
+#[tokio::test]
+async fn current_client_unverified_default_tip_runs_and_prepares_without_fills() {
+    let f = Fixture::new(Cut::None, 28).await;
+    crate::snapshot::git(&f.main, &["branch", "-m", "main"]).unwrap();
+    let remote = f.scratch.join("origin.git");
+    crate::snapshot::git(
+        &f.main,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            f.main.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    crate::snapshot::git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+    crate::snapshot::git(
+        &f.main,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )
+    .unwrap();
+    fs::write(f.main.join("Cargo.lock"), "# unmerged lockfile\n").unwrap();
+    let ahead = commit_checkout(&f.main);
+    crate::snapshot::git(&f.main, &["update-ref", "refs/remotes/origin/main", &ahead]).unwrap();
+    let motor = f.motor();
+    let base = crate::snapshot::git(&f.key, &["rev-parse", "HEAD"]).unwrap();
+    for offline in [false, true] {
+        if offline {
+            fs::rename(&remote, remote.with_extension("offline")).unwrap();
+        }
+        successful_run(&motor, f.request("true")).await;
+        assert_eq!(f.recorded_run().integration_tip, "");
+        let prepared = motor
+            .prepare(PrepareRequest::new(
+                f.key.to_str().unwrap(),
+                f.main.to_str().unwrap(),
+                base.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(prepared.outcome, PrepareOutcome::Prepared);
+    }
+    {
+        let frames = f.proxy.frames.lock().unwrap();
+        let prepares: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Prepare(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prepares.len(), 2);
+        assert!(prepares
+            .iter()
+            .all(|request| request.integration_tip.is_empty()));
+    }
     idle(&f).await;
     assert!(f.jobs().iter().all(|job| job["base"] != true));
 }

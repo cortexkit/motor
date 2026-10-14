@@ -86,9 +86,21 @@ the original bytes. Test: `hello_without_started_capability_keeps_legacy_wire_by
 | Field | Meaning when set |
 | --- | --- |
 | `started: true` | The client accepts `started` records (section 6). |
-| `default_branch_tip: true` | The client's integration tip is its local default branch, so the runner may use it for cache fills. Test: `hello_default_branch_tip_capability_is_additive`. |
+| `default_branch_tip: true` | The client distinguishes the default-branch fill tip from the submitted snapshot. The runner may use a nonempty integration tip for cache fills. Test: `hello_default_branch_tip_capability_is_additive`. |
 | `gate_jobs: true` | The peer understands `run.gate_job`; see [scheduling.md](scheduling.md#queue-order). Test: `gate_capability_and_mark_are_additive_motor_only_fields`. |
 | `platforms: ["windows"]` | The runner serves Windows jobs; see [windows-jobs.md](windows-jobs.md). Test: `windows_hello_advertises_explicit_platforms`. |
+
+Current `ck-motor` clients report a nonempty `run.integration_tip` or
+`prepare.integration_tip` only after confirming the local candidate against
+the configured origin's default branch, or reusing a bounded successful check.
+A mismatch or unavailable remote leaves that tip empty without refusing normal
+work. Tests: `current_client_root_and_linked_branch_fill_only_remote_confirmed_default_tip`,
+`current_client_unverified_default_tip_runs_and_prepares_without_fills`
+(`crates/motor-module/tests/it/compatibility.rs`). See
+[compile-cache.md](compile-cache.md#verifying-the-fill-tip) for verification,
+credentials, caching and the accepted origin-URL limit. This is a client policy,
+not a new wire field or a remote attestation; older clients that advertise this
+capability still need upgrading to enforce it.
 
 3.3. Unknown object fields in any frame are ignored. Test:
 `all_frame_and_reply_types_ignore_unknown_fields`.
