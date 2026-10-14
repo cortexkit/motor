@@ -279,16 +279,7 @@ pub(crate) fn systemctl(config: &Config, args: &[&str]) -> io::Result<std::proce
     if let Some(run) = &config.systemd_command {
         return run(args);
     }
-    if config.windows_instance() || config.isolate_jobs {
-        std::process::Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/systemctl"])
-            .args(args)
-            .output()
-    } else {
-        std::process::Command::new("/usr/bin/systemctl")
-            .args(args)
-            .output()
-    }
+    crate::systemd::systemctl(args, config.windows_instance() || config.isolate_jobs)
 }
 
 #[cfg(any(target_os = "linux", test))]

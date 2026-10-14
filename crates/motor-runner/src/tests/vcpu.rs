@@ -657,7 +657,7 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
         let mut config = f.config();
         config.systemd_command = Some(Arc::new(|args| {
             let text = match args {
-                ["show", "--property=LoadState", "--property=ActiveState", "--property=SubState", _] => {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
                     "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
                 }
                 ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => {

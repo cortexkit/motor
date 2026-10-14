@@ -3854,8 +3854,10 @@ impl Runner {
         }
         let mut alive = true;
         let mut inspect_at = std::time::Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut polling = crate::systemd::PollBackoff::monitoring();
         loop {
-            // Output is tailed frequently, but spawning sudo/systemctl for
+            // Output is tailed frequently, but spawning systemctl for
             // every tail read would turn quiet jobs into a busy polling load.
             if std::time::Instant::now() >= inspect_at {
                 alive = match self.unit_alive(process) {
@@ -3866,7 +3868,11 @@ impl Runner {
                         continue;
                     }
                 };
-                inspect_at = std::time::Instant::now() + Duration::from_millis(500);
+                #[cfg(target_os = "linux")]
+                let delay = polling.next_delay();
+                #[cfg(not(target_os = "linux"))]
+                let delay = Duration::from_millis(500);
+                inspect_at = std::time::Instant::now() + delay;
             }
             if durable {
                 for (name, stream) in [

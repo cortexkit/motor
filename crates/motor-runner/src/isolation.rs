@@ -28,7 +28,7 @@ pub(crate) const WRITER_USER: &str = "motor-cache";
 const JOB_HOSTS: &str = "127.0.0.1\tlocalhost\n::1\tip6-localhost\tip6-loopback\n";
 
 fn checked(command: &mut Command) -> io::Result<()> {
-    let output = command.output()?;
+    let output = crate::systemd::output(command)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "{command:?}: {}",
@@ -66,7 +66,7 @@ pub(crate) fn validate_writer_account() -> io::Result<WriterAccount> {
 }
 
 fn account_uid(user: &str) -> io::Result<Option<u32>> {
-    let output = Command::new("/usr/bin/id").args(["-u", user]).output()?;
+    let output = crate::systemd::output(Command::new("/usr/bin/id").args(["-u", user]))?;
     Ok(output
         .status
         .success()
@@ -75,7 +75,7 @@ fn account_uid(user: &str) -> io::Result<Option<u32>> {
 }
 
 fn account_groups(user: &str) -> io::Result<Option<String>> {
-    let output = Command::new("/usr/bin/id").args(["-nG", user]).output()?;
+    let output = crate::systemd::output(Command::new("/usr/bin/id").args(["-nG", user]))?;
     Ok(output
         .status
         .success()
@@ -963,35 +963,25 @@ fn run_javascript_install(
 /// pre-step cannot do this: under RootDirectory it runs in the sandbox root
 /// without the unit's mount namespace, where /proc is an empty directory.
 fn allow_low_ports(id: Uuid) -> io::Result<()> {
-    let output = Command::new("/usr/bin/sudo")
-        .args([
-            "-n",
-            "/usr/bin/systemctl",
-            "show",
-            "--property=MainPID",
-            "--value",
-            &unit(id),
-        ])
-        .output()?;
+    let output = systemctl(&["show", "--property=MainPID", "--value", &unit(id)])?;
     let pid = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<u32>()
         .ok()
         .filter(|pid| *pid != 0)
         .ok_or_else(|| io::Error::other("job unit has no main process"))?;
-    let status = Command::new("/usr/bin/sudo")
-        .args([
-            "-n",
-            "/usr/bin/nsenter",
-            "--target",
-            &pid.to_string(),
-            "--net",
-            "/usr/sbin/sysctl",
-            "-q",
-            "-w",
-            "net.ipv4.ip_unprivileged_port_start=0",
-        ])
-        .status()?;
+    let status = crate::systemd::output(Command::new("/usr/bin/sudo").args([
+        "-n",
+        "/usr/bin/nsenter",
+        "--target",
+        &pid.to_string(),
+        "--net",
+        "/usr/sbin/sysctl",
+        "-q",
+        "-w",
+        "net.ipv4.ip_unprivileged_port_start=0",
+    ]))?
+    .status;
     if !status.success() {
         return Err(io::Error::other(format!(
             "cannot allow low ports in the job's network namespace: {status}"
@@ -1009,10 +999,7 @@ pub(crate) fn unit_alive(id: Uuid) -> io::Result<bool> {
 }
 
 fn systemctl(args: &[&str]) -> io::Result<std::process::Output> {
-    Command::new("/usr/bin/sudo")
-        .args(["-n", "/usr/bin/systemctl"])
-        .args(args)
-        .output()
+    crate::systemd::systemctl(args, true)
 }
 
 pub(crate) fn signal(id: Uuid, hard: bool) {
@@ -1080,6 +1067,10 @@ fn bind(source: &Path, destination: &Path) -> io::Result<String> {
 }
 
 fn grant(path: &Path) -> io::Result<()> {
+    grant_paths(&[path])
+}
+
+fn grant_paths(paths: &[&Path]) -> io::Result<()> {
     // Grant the job account access without following symlinks. Remove default
     // ACLs so new private files keep the job's normal umask-derived permissions;
     // restore daemon access only after the job has stopped.
@@ -1087,7 +1078,7 @@ fn grant(path: &Path) -> io::Result<()> {
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-k", "-m", &acl, "--"])
-            .arg(path),
+            .args(paths),
     )
 }
 
@@ -1099,7 +1090,7 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
             path.display()
         )));
     }
-    let uid = Command::new("/usr/bin/id").args(["-u", USER]).output()?;
+    let uid = crate::systemd::output(Command::new("/usr/bin/id").args(["-u", USER]))?;
     if !uid.status.success() {
         return Err(io::Error::other(format!(
             "cannot resolve job account for target {}: {}",
@@ -1158,29 +1149,42 @@ fn create_sandbox_root(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn set_sandbox_directory_owner_mode(path: &Path, owner: &str, mode: &str) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::other(format!(
-            "sandbox mount ancestor is not a physical directory: {}",
-            path.display()
-        )));
+fn set_sandbox_directory_owner_modes(groups: &[(&[PathBuf], &str)]) -> io::Result<()> {
+    let paths: Vec<_> = groups.iter().flat_map(|(paths, _)| paths.iter()).collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Validate the entire batch before changing any directory. The private
+    // runtime tree is not exposed to a job until preparation has finished.
+    for path in &paths {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::other(format!(
+                "sandbox mount ancestor is not a physical directory: {}",
+                path.display()
+            )));
+        }
     }
     checked(
         Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chown", owner, "--"])
-            .arg(path),
+            .args(["-n", "/usr/bin/chown", "-h", "root:root", "--"])
+            .args(&paths),
     )?;
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/setfacl", "-b", "-k", "--"])
-            .arg(path),
+            .args(&paths),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", mode, "--"])
-            .arg(path),
-    )
+    for (paths, mode) in groups {
+        if !paths.is_empty() {
+            checked(
+                Command::new("/usr/bin/sudo")
+                    .args(["-n", "/usr/bin/chmod", mode, "--"])
+                    .args(*paths),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn prepare_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<()> {
@@ -1221,7 +1225,7 @@ fn prepare_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Re
     Ok(())
 }
 
-fn secure_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<()> {
+fn root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<Vec<PathBuf>> {
     let components = destination
         .components()
         .filter_map(|component| match component {
@@ -1236,16 +1240,17 @@ fn secure_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Res
         })
         .collect::<io::Result<Vec<_>>>()?;
     let mut current = root.to_path_buf();
+    let mut paths = Vec::new();
     for component in components.iter().take(components.len().saturating_sub(1)) {
         current.push(component);
-        set_sandbox_directory_owner_mode(&current, "root:root", "0755")?;
+        paths.push(current.clone());
     }
-    Ok(())
+    Ok(paths)
 }
 
-fn prepare_private_tmp(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    set_sandbox_directory_owner_mode(path, "root:root", "1777")
+#[cfg(test)]
+fn secure_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Result<()> {
+    set_sandbox_directory_owner_modes(&[(&root_owned_mount_ancestors(root, destination)?, "0755")])
 }
 
 fn prepare_job_home(path: &Path) -> io::Result<()> {
@@ -1360,10 +1365,23 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     )
 }
 
-pub(crate) fn prepare_writer_tree(path: &Path, account: WriterAccount) -> io::Result<()> {
-    let _access = crate::tree_access::lock(path);
+fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<()> {
+    // Use the same canonical path order for every batch, so concurrent batches
+    // cannot acquire overlapping tree guards in opposite orders.
+    let mut guard_paths: Vec<_> = paths
+        .iter()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+        .collect();
+    guard_paths.sort();
+    guard_paths.dedup();
+    let _access: Vec<_> = guard_paths
+        .iter()
+        .map(|path| crate::tree_access::lock(path))
+        .collect();
     #[cfg(test)]
-    crate::test_cleanup::record_checkout_work("prepare_writer_tree", path);
+    for path in paths {
+        crate::test_cleanup::record_checkout_work("prepare_writer_tree", path);
+    }
     checked(
         Command::new("/usr/bin/sudo")
             .args([
@@ -1374,17 +1392,17 @@ pub(crate) fn prepare_writer_tree(path: &Path, account: WriterAccount) -> io::Re
                 &writer_cache_owner(account),
                 "--",
             ])
-            .arg(path),
+            .args(paths),
     )?;
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
-            .arg(path),
+            .args(paths),
     )?;
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .arg(path),
+            .args(paths),
     )?;
     Ok(())
 }
@@ -1668,18 +1686,19 @@ impl Sandbox {
         create_sandbox_root(&root)?;
         let host_home = runtime.0.join("home");
         let tmp = runtime.0.join("tmp");
-        prepare_private_tmp(&tmp)?;
+        fs::create_dir_all(&tmp)?;
         let home = PathBuf::from("/motor-home");
         // Only existing output inodes are writable, never the directory. A job
         // must not replace a log with a symlink that the trusted reader follows.
         let output = runtime.0.join("output");
         fs::create_dir_all(&output)?;
+        let mut grant_paths = Vec::new();
+        let mut writer_grants = Vec::new();
         for name in ["stdout", "stderr", "exit", "cache-stats"] {
             let file = output.join(name);
             fs::write(&file, "")?;
-            grant(&file)?;
+            grant_paths.push(file);
         }
-        set_sandbox_directory_owner_mode(&output, "root:root", "0755")?;
         // Supply only the default names and validated repository loopback
         // aliases: the job root has no resolver or host /etc/hosts to inherit.
         let hosts = runtime.0.join("hosts");
@@ -1891,19 +1910,9 @@ impl Sandbox {
                     .truncate(false)
                     .write(true)
                     .open(&path)?;
-                grant(&path)?;
+                grant_paths.push(path.clone());
                 if writer {
-                    checked(
-                        Command::new("/usr/bin/sudo")
-                            .args([
-                                "-n",
-                                "/usr/bin/setfacl",
-                                "-m",
-                                &format!("u:{WRITER_USER}:rw"),
-                                "--",
-                            ])
-                            .arg(&path),
-                    )?;
+                    writer_grants.push(path.clone());
                 }
                 let slot_destination = Path::new("/motor-slots").join(name);
                 read_write.push(bind(&path, &slot_destination)?);
@@ -1915,38 +1924,44 @@ impl Sandbox {
         };
         // Build the full destination tree before root owns it; the trusted
         // daemon cannot create deeper mount ancestors after changing a parent.
+        let mut root_owned = std::collections::BTreeSet::from([root.clone(), output.clone()]);
         for destination in &mount_destinations {
             prepare_root_owned_mount_ancestors(&root, destination)?;
+            root_owned.extend(root_owned_mount_ancestors(&root, destination)?);
         }
-        set_sandbox_directory_owner_mode(&root, "root:root", "0755")?;
-        for destination in &mount_destinations {
-            secure_root_owned_mount_ancestors(&root, destination)?;
-        }
-        grant(workspace)?;
-        prepare_job_checkout_root(workspace)?;
-        grant(&tmp)?;
+        let mut root_owned: Vec<_> = root_owned.into_iter().collect();
+        root_owned.sort_by_key(|path| path.components().count());
+        set_sandbox_directory_owner_modes(&[
+            (&root_owned, "0755"),
+            (std::slice::from_ref(&tmp), "1777"),
+        ])?;
+        // Target repair changes owner permissions only. Complete it before the
+        // shared ACL grant, then restore the checkout root's final ACL mask with
+        // chmod, just as for an individual workspace grant.
         prepare_job_writable_target(state, target)
             .map_err(|error| io::Error::other(format!("prepare job target: {error}")))?;
+        grant_paths.extend([workspace.to_path_buf(), tmp.clone()]);
         if !target.starts_with(workspace) {
-            grant(target)?;
+            grant_paths.push(target.to_path_buf());
         }
+        self::grant_paths(&grant_paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())?;
+        prepare_job_checkout_root(workspace)?;
         if let Some(account) = writer_account {
-            for private in [workspace, target, &host_home, &tmp] {
-                prepare_writer_tree(private, account)?;
-            }
+            prepare_writer_trees(&[workspace, target, &host_home, &tmp], account)?;
             for name in ["stdout", "stderr", "exit", "cache-stats"] {
-                checked(
-                    Command::new("/usr/bin/sudo")
-                        .args([
-                            "-n",
-                            "/usr/bin/setfacl",
-                            "-m",
-                            &format!("u:{WRITER_USER}:rw"),
-                            "--",
-                        ])
-                        .arg(output.join(name)),
-                )?;
+                writer_grants.push(output.join(name));
             }
+            checked(
+                Command::new("/usr/bin/sudo")
+                    .args([
+                        "-n",
+                        "/usr/bin/setfacl",
+                        "-m",
+                        &format!("u:{WRITER_USER}:rw"),
+                        "--",
+                    ])
+                    .args(writer_grants),
+            )?;
         }
         Ok(Self {
             // Caller job IDs can be reused in a different runner instance.
@@ -2214,29 +2229,18 @@ impl Sandbox {
             .process_group(0)
             .spawn()?;
         let started = Instant::now();
-        loop {
-            let active = Command::new("/usr/bin/sudo")
-                .args([
-                    "-n",
-                    "/usr/bin/systemctl",
-                    "is-active",
-                    "--quiet",
-                    &unit(self.id),
-                ])
-                .status()?;
-            if active.success() {
-                break;
-            }
-            if child.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(15) {
-                discard_unstarted(self.id);
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                return Err(io::Error::other(format!(
-                    "sandbox did not start: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if !crate::systemd::wait_until_active(
+            &unit(self.id),
+            || Ok(child.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(15)),
+            std::thread::sleep,
+        )? {
+            discard_unstarted(self.id);
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Err(io::Error::other(format!(
+                "sandbox did not start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
         let active_at = Instant::now();
         if let Err(error) = allow_low_ports(self.id) {

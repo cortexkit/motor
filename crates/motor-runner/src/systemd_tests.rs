@@ -72,3 +72,182 @@ fn missing_or_invalid_main_status_never_becomes_success() {
     .unwrap_err();
     assert!(error.to_string().contains("unit not loaded"));
 }
+
+#[test]
+fn queries_are_unprivileged_and_mutations_keep_sudo() {
+    with_process_hook(
+        Box::new(|command| {
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            if command.get_program() == "/usr/bin/sudo" {
+                assert_eq!(&args[..2], &["-n", "/usr/bin/systemctl"]);
+                assert!([
+                    "start",
+                    "stop",
+                    "kill",
+                    "reset-failed",
+                    "restart",
+                    "unknown-verb"
+                ]
+                .contains(&args[2]));
+            } else {
+                assert_eq!(command.get_program(), "/usr/bin/systemctl");
+                assert!([
+                    "show",
+                    "is-active",
+                    "is-failed",
+                    "list-units",
+                    "list-unit-files",
+                    "status",
+                    "cat",
+                    "help",
+                    "list-jobs",
+                    "show-environment",
+                    "list-dependencies",
+                    "is-enabled",
+                    "get-default",
+                    "is-system-running"
+                ]
+                .contains(&args[0]));
+            }
+            Ok(output(""))
+        }),
+        || {
+            let mut config = crate::engine::Config::new("unused", "main");
+            config.isolate_jobs = true;
+            for verb in [
+                "show",
+                "is-active",
+                "is-failed",
+                "list-units",
+                "list-unit-files",
+                "status",
+                "cat",
+                "help",
+                "list-jobs",
+                "show-environment",
+                "list-dependencies",
+                "is-enabled",
+                "get-default",
+                "is-system-running",
+                "start",
+                "stop",
+                "kill",
+                "reset-failed",
+                "restart",
+                "unknown-verb",
+            ] {
+                crate::backend::systemctl(&config, &[verb, "motor-job-test.service"]).unwrap();
+            }
+            config.systemd_command = Some(std::sync::Arc::new(|args| {
+                assert_eq!(args, ["show", "motor-job-test.service"]);
+                Ok(output("hook"))
+            }));
+            assert_eq!(
+                crate::backend::systemctl(&config, &["show", "motor-job-test.service"])
+                    .unwrap()
+                    .stdout,
+                b"hook"
+            );
+        },
+    );
+}
+
+#[test]
+fn activation_backoff_preserves_fast_starts_and_caps_slow_polling() {
+    let mut backoff = PollBackoff::activation();
+    let delays: Vec<_> = (0..20).map(|_| backoff.next_delay().as_millis()).collect();
+    assert_eq!(
+        &delays[..11],
+        &[10, 10, 10, 10, 10, 10, 20, 40, 80, 160, 200]
+    );
+    assert!(delays[11..].iter().all(|delay| *delay == 200));
+    let latency = |ready_ms| {
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u128));
+        let clock = elapsed.clone();
+        with_process_hook(
+            Box::new(move |command| {
+                assert_eq!(command.get_program(), "/usr/bin/systemctl");
+                let mut reply = output("");
+                if clock.get() < ready_ms {
+                    reply.status = std::process::ExitStatus::from_raw(3 << 8);
+                }
+                Ok(reply)
+            }),
+            || {
+                assert!(wait_until_active(
+                    "motor-job-test.service",
+                    || Ok(false),
+                    |delay| elapsed.set(elapsed.get() + delay.as_millis())
+                )
+                .unwrap());
+            },
+        );
+        elapsed.get()
+    };
+    for ready in [0u128, 1, 10, 11, 20, 21, 23, 30, 40, 50] {
+        assert_eq!(ready.div_ceil(10) * 10, latency(ready));
+    }
+    assert_eq!(latency(300), 360);
+    println!("activation latency with a virtual clock and zero-cost command seam: ready=0ms before=0ms after=0ms; ready=23ms before=30ms after=30ms; ready=50ms before=50ms after=50ms; ready=300ms before=300ms after=360ms");
+}
+
+#[test]
+fn slow_activation_timeout_bounds_query_count() {
+    let elapsed = std::cell::Cell::new(Duration::ZERO);
+    let queries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = queries.clone();
+    with_process_hook(
+        Box::new(move |command| {
+            assert_eq!(command.get_program(), "/usr/bin/systemctl");
+            count.set(count.get() + 1);
+            let mut reply = output("");
+            reply.status = std::process::ExitStatus::from_raw(3 << 8);
+            Ok(reply)
+        }),
+        || {
+            assert!(!wait_until_active(
+                "motor-job-test.service",
+                || Ok(elapsed.get() >= Duration::from_secs(15)),
+                |delay| elapsed.set(elapsed.get() + delay)
+            )
+            .unwrap());
+        },
+    );
+    assert!((15_000..=15_200).contains(&elapsed.get().as_millis()));
+    assert!(queries.get() < 90, "{} activation queries", queries.get());
+}
+
+#[test]
+fn monitoring_backoff_caps_queries_and_preserves_gone_unit_detection() {
+    let mut polling = PollBackoff::monitoring();
+    let delays: Vec<_> = (0..12).map(|_| polling.next_delay().as_millis()).collect();
+    assert_eq!(&delays[..6], &[50, 100, 200, 400, 800, 1000]);
+    assert!(delays[6..].iter().all(|delay| *delay == 1000));
+    with_process_hook(
+        Box::new(|command| {
+            assert_eq!(command.get_program(), "/usr/bin/systemctl");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    "show",
+                    "--property=LoadState",
+                    "--property=ActiveState",
+                    "motor-job-test.service"
+                ]
+            );
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: b"LoadState=not-found\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }),
+        || assert!(!alive("motor-job-test.service", |args| systemctl(args, true)).unwrap()),
+    );
+}
