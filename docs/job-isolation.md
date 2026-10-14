@@ -169,7 +169,7 @@ before upload with
 6.3. A job granted outbound access gets a veth pair into its namespace (its
 side is `eth0`, IPv4 only) and reaches the internet through NAT. The runner
 checks at startup that the `motor_net` nftables table is present; the operator
-installs it (see [runner-install.md](runner-install.md#job-network)). The table
+installs it (see [runner-install.md](runner-install.md#6-optional-job-networking)). The table
 (`script/runner/motor-net.nft`) lets the job open connections only to public
 IPv4 addresses: private, loopback, link-local, carrier-grade NAT,
 documentation, multicast and reserved ranges are rejected, as are connections

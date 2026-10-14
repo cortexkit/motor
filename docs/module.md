@@ -26,7 +26,7 @@ components. They do not ship in this repository.
   development storage fallback. No runner secret is passed in the environment.
 - The manifest's `capabilities.provides` is exactly `["exec-remote/v1"]`.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
-  `workspace.prepare`, `workspace.drop`, plus a read-only health report.
+  `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
 
 `ck-motor --ck-domain` prints one line for the `ck` launcher, and
 `ck motor run` (`ck-motor run`) submits one job from a script; see
@@ -58,7 +58,7 @@ operation separately. Binding to the module grants nothing by itself.
 | --- | --- |
 | AFT, the agent tool (`reserved:aft`) | `exec.run`, `exec.attach`, `exec.cancel`, `exec.status` |
 | The CortexKit core (`reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
-| Basal's health flow | The read-only health report |
+| Basal's health flow | `runner.health` only |
 | A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its own route started |
 | Any other reserved, direct, unverified or absent principal | Nothing; refused by name |
 
