@@ -1139,7 +1139,17 @@ async fn resume_answers_a_pending_drain_request() {
     let (socket, server) = listener(&f, &runner);
     let mut drain = open_drain(&socket, 1200, false).await;
     wait_for(|| runner.drain_retry_after_ms().is_some()).await;
-    let mut second_drain = open_drain(&socket, 1200, true).await;
+    // The second request asks for a shorter deadline, which the runner adopts
+    // only once it has registered that request. Waiting for it keeps Resume
+    // from arriving first, which would leave the second request to start a
+    // fresh drain that nothing ever answers.
+    let mut second_drain = open_drain(&socket, 600, true).await;
+    wait_for(|| {
+        runner
+            .drain_retry_after_ms()
+            .is_some_and(|ms| ms <= 600_000)
+    })
+    .await;
 
     let mut resume = connect(&socket).await;
     write_frame_async(&mut resume, &Frame::Resume)
