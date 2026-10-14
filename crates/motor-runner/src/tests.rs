@@ -2436,10 +2436,22 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
         detail.contains("requested_permits=16; held_permits=20/28"),
         "{detail}"
     );
+    // Refusal details redact runner-internal paths, and a fixture's scratch can
+    // live under the runner's state root, so match the workspace by its
+    // fixture-relative tail rather than its full path.
+    let holder_workspace = Path::new(&holder.workspace_key);
+    let tail = holder_workspace
+        .strip_prefix(holder_workspace.ancestors().nth(3).unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        detail.contains(&format!("job={} workspace=", holder.job_id)),
+        "{detail}"
+    );
     assert!(
         detail.contains(&format!(
-            "job={} workspace={} permits=20 phase=running since_ms={started}",
-            holder.job_id, holder.workspace_key
+            "{tail} permits=20 phase=running since_ms={started}"
         )),
         "{detail}"
     );

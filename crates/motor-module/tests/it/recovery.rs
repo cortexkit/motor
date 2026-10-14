@@ -1006,10 +1006,16 @@ async fn setup_failure_has_one_terminal_and_no_queue_entry() {
         "{detail}"
     );
     assert!(detail.contains("destination path"), "{detail}");
-    assert!(
-        detail.contains(&f.remote_key.display().to_string()),
-        "{detail}"
-    );
+    // Refusal details redact runner-internal paths, and the fixture's scratch
+    // can live under the runner's state root, so match the workspace by its
+    // fixture-relative tail rather than its full path.
+    let tail = f
+        .remote_key
+        .strip_prefix(f.remote_key.ancestors().nth(3).unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(detail.contains(&tail), "{detail}");
     // The failed job leaves no queue entry. The background warm build it
     // queued is excluded: it is set up on its own thread and may still be
     // queued while this terminal is delivered.

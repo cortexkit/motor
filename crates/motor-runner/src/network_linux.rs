@@ -218,6 +218,10 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
     let unit = crate::backend::host_unit_name(id);
     // A separate host-namespace service is bound to the job's unit lifetime.
     // ExecStop runs even when the daemon is replaced or dies during attachment.
+    // Its delete usually finds the link already gone: ending the job destroys
+    // its network namespace, which removes the peer and with it the whole veth
+    // pair. The leading `-` keeps that expected miss from leaving a failed
+    // unit; a link that does survive is removed by startup reconciliation.
     sudo(
         "/usr/bin/systemd-run",
         &[
@@ -228,7 +232,7 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
             &format!("--property=BindsTo={unit}"),
             &format!("--property=After={unit}"),
             "--property=RemainAfterExit=yes",
-            &format!("--property=ExecStop={IP} link delete dev {name}"),
+            &format!("--property=ExecStop=-{IP} link delete dev {name}"),
             "/usr/bin/true",
         ],
     )?;

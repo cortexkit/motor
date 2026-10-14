@@ -34,8 +34,20 @@ step() {
     status=1
   fi
 }
+failed_unit_names() {
+  systemctl list-units --all --no-legend --plain 'motor-*' | awk '$4 == "failed" { print $1 }' | sort
+}
+# A production job that fails is briefly a failed unit until its runner
+# unloads it, so on a shared server one sample can count another job's normal
+# failure. Count only units still failed in two samples 30 seconds apart: a
+# unit the gate's tests leaked stays failed.
 failed_units() {
-  systemctl list-units --all --no-legend --plain 'motor-*' | awk '$4 == "failed"' | wc -l
+  local first second
+  first=$(failed_unit_names)
+  [ -z "$first" ] && { echo 0; return; }
+  sleep 30
+  second=$(failed_unit_names)
+  comm -12 <(printf '%s\n' "$first") <(printf '%s\n' "$second") | grep -c . || true
 }
 
 before=$(failed_units)
