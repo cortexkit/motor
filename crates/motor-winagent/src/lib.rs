@@ -1173,8 +1173,7 @@ mod tests {
     #[test]
     fn collection_builder_rejects_oversized_output() {
         let scratch = Scratch::new();
-        let file = std::fs::File::create(scratch.0.join("large")).unwrap();
-        file.set_len(MAX_COLLECT_BYTES as u64).unwrap();
+        std::fs::write(scratch.0.join("large"), vec![1; MAX_COLLECT_BYTES]).unwrap();
         assert!(
             collect_changes(&scratch.0, &Inventory::new())
                 .unwrap_err()
