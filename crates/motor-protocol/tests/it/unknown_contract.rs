@@ -109,9 +109,9 @@ fn sha256sums_covers_every_corpus_file() {
         }
     }
     assert_eq!(listed, actual, "missing or unchecked corpus checksums");
-    // Each of 125 cases has .json, .jcs and .sha256 files. Eight published
-    // unknown-tag cases have only .jcs/.sha256 pairs; README.md adds one file.
-    assert_eq!(listed.len(), 392);
+    // Each of 131 cases has .json, .jcs and .sha256 files. Eleven published
+    // cases have only .jcs/.sha256 pairs; README.md adds one file.
+    assert_eq!(listed.len(), 416);
 }
 
 #[test]
@@ -315,5 +315,50 @@ fn malformed_known_tags_and_invalid_unknown_sequences_still_fail() {
             json!({"type": "future_record", "seq": seq})
         )
         .is_err());
+    }
+}
+
+#[test]
+fn published_grouped_refusal_vectors_are_complete_and_typed() {
+    let cases = [
+        (
+            "crate-local-lost-to-restart",
+            RefusalReason::LostToRestart,
+            None,
+        ),
+        (
+            "crate-local-request-rejected",
+            RefusalReason::RequestRejected,
+            Some("direct_timeout_refused"),
+        ),
+        (
+            "crate-local-runner-authentication-failed",
+            RefusalReason::RunnerAuthenticationFailed,
+            Some("credentials_unavailable"),
+        ),
+    ];
+    let expected: BTreeSet<_> = cases
+        .iter()
+        .flat_map(|(name, _, _)| [format!("{name}.jcs"), format!("{name}.sha256")])
+        .collect();
+    let actual: BTreeSet<_> = fs::read_dir(root().join("outcomes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| {
+            name.starts_with("crate-local-") && !name.starts_with("crate-local-unknown-")
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    for (name, reason, detail) in cases {
+        let stem = root().join("outcomes").join(name);
+        let bytes = fs::read(stem.with_extension("jcs")).unwrap();
+        let hash = fs::read_to_string(stem.with_extension("sha256")).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), hash, "{name}");
+        assert_eq!(round_trip::<OutcomeCase>(&bytes), bytes, "{name}");
+        let t = terminal(name);
+        assert_eq!(t.outcome, Outcome::RefusedBeforeStart { reason });
+        assert_eq!(t.refusal_detail(), detail);
+        assert_eq!(t.ran, Some(Ran::None));
+        assert_eq!(t.retry_after_ms(), None);
     }
 }

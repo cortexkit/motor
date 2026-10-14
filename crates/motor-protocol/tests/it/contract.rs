@@ -43,6 +43,7 @@ const FRAME_CASES: &[&str] = &[
     "refusal-prepare-bundle",
     "refusal-prepare-setup",
     "refusal-prepare-setup-detail",
+    "refusal-prepare-request-rejected-detail",
     "bundle_chunk",
     "bundle_chunk-sibling",
     "output",
@@ -115,6 +116,9 @@ const OUTCOME_CASES: &[&str] = &[
     "runner_full-slot-busy-detail",
     "workspace_setup_failed-start-not-persisted-detail",
     "workspace_setup_failed-output-unavailable-detail",
+    "lost_to_restart-detail",
+    "request_rejected-direct-timeout-detail",
+    "runner_authentication_failed-detail",
 ];
 const REPLY_CASES: &[&str] = &[
     "prepare-prepared",
@@ -128,6 +132,8 @@ const REPLY_CASES: &[&str] = &[
     "prepare-bundle_rejected",
     "prepare-workspace_setup_failed",
     "prepare-workspace_setup_failed-detail",
+    "prepare-request_rejected-detail",
+    "prepare-runner_authentication_failed-detail",
     "drop-existing",
     "drop-missing",
     "status",
@@ -247,7 +253,7 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 125);
+    assert_eq!(count, 131);
 }
 
 #[test]
@@ -374,6 +380,7 @@ fn outcome_vectors_pin_before_start_proofs_and_nullability() {
                     "network_unsupported"
                 } else {
                     match *name {
+                        "request_rejected-direct-timeout-detail" => "request_rejected",
                         "transfer_interrupted-stalled-detail" => "transfer_interrupted",
                         "runner_full-slot-busy-detail" => "runner_full",
                         "workspace_setup_failed-start-not-persisted-detail"
@@ -389,6 +396,11 @@ fn outcome_vectors_pin_before_start_proofs_and_nullability() {
                 assert_eq!(
                     record.tree_hash.is_none(),
                     matches!(tag, "workspace_key_rejected" | "network_unsupported")
+                        || matches!(
+                            *name,
+                            "request_rejected-direct-timeout-detail"
+                                | "runner_authentication_failed-detail"
+                        )
                 );
                 let accepted = matches!(stream.first(), Some(StreamRecord::Accepted(_)));
                 assert_eq!(
@@ -401,6 +413,7 @@ fn outcome_vectors_pin_before_start_proofs_and_nullability() {
                             | "bundle_rejected"
                             | "workspace_setup_failed"
                             | "transfer_stalled"
+                            | "lost_to_restart-detail"
                             | "queue_wait_exceeded-detail"
                             | "workspace_setup_failed-detail"
                             | "transfer_interrupted-stalled-detail"
@@ -1191,4 +1204,64 @@ fn typed_refusal_detail_vectors_preserve_codes_and_before_start_proof() {
     );
     assert_eq!(reply.refusal_detail(), Some(detail));
     assert_eq!(reply.retry_after_ms(), None);
+}
+
+#[test]
+fn grouped_refusal_detail_vectors_keep_specific_human_codes() {
+    for (name, reason, detail) in [
+        (
+            "lost_to_restart-detail",
+            RefusalReason::LostToRestart,
+            "runner restarted before the job could start",
+        ),
+        (
+            "request_rejected-direct-timeout-detail",
+            RefusalReason::RequestRejected,
+            "direct_timeout_refused: timeout 101 seconds exceeds the direct-job cap of 100 seconds",
+        ),
+        (
+            "runner_authentication_failed-detail",
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_credential_missing",
+        ),
+    ] {
+        let value = vector("outcomes", name);
+        let records: Vec<StreamRecord> = serde_json::from_value(value["stream"].clone()).unwrap();
+        let Some(StreamRecord::Terminal(t)) = records.last() else {
+            panic!("missing terminal in {name}")
+        };
+        assert_eq!(t.outcome, Outcome::RefusedBeforeStart { reason }, "{name}");
+        assert_eq!(t.refusal_detail(), Some(detail), "{name}");
+        assert_eq!(t.ran, Some(Ran::None), "{name}");
+        assert_eq!(t.retry_after_ms(), None, "{name}");
+    }
+    for (name, reason, detail) in [
+        (
+            "prepare-request_rejected-detail",
+            RefusalReason::RequestRejected,
+            "prepare_unsupported: Prepare is unsupported by the Windows instance",
+        ),
+        (
+            "prepare-runner_authentication_failed-detail",
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_credential_missing",
+        ),
+    ] {
+        let reply: PrepareReply = serde_json::from_value(vector("replies", name)).unwrap();
+        assert_eq!(reply.outcome, PrepareOutcome::RefusedBeforeStart { reason });
+        assert_eq!(reply.refusal_detail(), Some(detail));
+        assert_eq!(reply.retry_after_ms(), None);
+    }
+    let Frame::Refusal(refusal) =
+        serde_json::from_value(vector("frames", "refusal-prepare-request-rejected-detail"))
+            .unwrap()
+    else {
+        panic!("missing Prepare refusal")
+    };
+    assert_eq!(refusal.reason, RefusalReason::RequestRejected);
+    assert_eq!(
+        refusal.detail.as_deref(),
+        Some("prepare_unsupported: Prepare is unsupported by the Windows instance")
+    );
+    assert_eq!(refusal.retry_after_ms, None);
 }

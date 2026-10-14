@@ -558,14 +558,16 @@ async fn direct_runs_need_a_timeout_within_the_cap_and_aft_runs_do_not() {
         assert_eq!(
             terminal.outcome,
             Outcome::RefusedBeforeStart {
-                reason: motor_protocol::RefusalReason::Unknown(
-                    module::DIRECT_TIMEOUT_REFUSED.into()
-                )
+                reason: motor_protocol::RefusalReason::RequestRejected
             }
         );
         assert_eq!(terminal.ran, Some(motor_protocol::Ran::None));
         let refusal = terminal.refusal_detail.as_deref().unwrap();
-        assert!(refusal.starts_with(detail), "{refusal}");
+        assert!(
+            refusal.starts_with(&format!("direct_timeout_refused: {detail}")),
+            "{refusal}"
+        );
+        assert_eq!(terminal.retry_after_ms(), None);
         assert!(
             refusal.contains("can't re-attach to or cancel its job"),
             "{refusal}"
@@ -689,7 +691,7 @@ async fn cli_returns_the_refused_code_with_the_reason_and_detail() {
     let err = terminal.text("err");
     assert!(
         err.starts_with(&format!(
-            "ck motor run: refused before start: direct_timeout_refused: timeout {over} seconds exceeds"
+            "ck motor run: refused before start: request_rejected: direct_timeout_refused: timeout {over} seconds exceeds"
         )),
         "{err}"
     );

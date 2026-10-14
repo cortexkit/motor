@@ -1,0 +1,8 @@
+{
+  "transfer_id": "0192a64a-1234-7000-8000-000000000002",
+  "outcome": {
+    "type": "refused_before_start",
+    "reason": "runner_authentication_failed"
+  },
+  "refusal_detail": "runner_credential_missing"
+}

@@ -1,0 +1,8 @@
+{
+  "transfer_id": "0192a64a-1234-7000-8000-000000000002",
+  "outcome": {
+    "type": "refused_before_start",
+    "reason": "request_rejected"
+  },
+  "refusal_detail": "prepare_unsupported: Prepare is unsupported by the Windows instance"
+}

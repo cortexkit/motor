@@ -122,10 +122,13 @@ impl Runner {
             return Ok(Err(Refusal {
                 job_id: None,
                 transfer_id: Some(r.transfer_id),
-                reason: RefusalReason::Unknown("prepare_unsupported".into()),
+                reason: RefusalReason::RequestRejected,
                 retry_after_ms: None,
                 disk_full: None,
-                detail: Some(error.to_string()),
+                detail: Some(self.safe_refusal_detail(
+                    format!("prepare_unsupported: {error}"),
+                    std::iter::empty(),
+                )),
             }));
         }
         workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings)?;

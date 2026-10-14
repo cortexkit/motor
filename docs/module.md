@@ -111,7 +111,10 @@ signature from an unexpected key ID is refused.
 ### Credential failures
 
 Health reports these codes, and `exec.run` refuses before taking a snapshot or
-opening a connection, so the caller can fall back to running locally.
+opening a connection, so the caller can fall back to running locally. Caller
+run and Prepare refusals use the typed `runner_authentication_failed` reason;
+`refusal_detail` retains the specific safe code. Health and background credential
+recovery continue to distinguish the codes below.
 
 | Code | Cause |
 | --- | --- |

@@ -857,9 +857,12 @@ fn windows_qualification_runner_sigkill_reconciles_boot_and_started_jobs() {
         if started {
             assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
         } else {
-            assert!(
-                matches!(terminal.outcome,Outcome::RefusedBeforeStart{reason:RefusalReason::Unknown(ref reason)} if reason=="lost_to_restart")
-            );
+            assert!(matches!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::LostToRestart
+                }
+            ));
         }
         let vm = VmConfig::load(config.vm_config.as_ref().unwrap()).unwrap();
         assert!(!vm

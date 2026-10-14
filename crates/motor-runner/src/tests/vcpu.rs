@@ -231,7 +231,7 @@ fn cpu_reservations_release_on_terminal() {
                 refuse_before_start(
                     &runner.core.health,
                     inner.jobs.get_mut(&request.job_id).unwrap(),
-                    RefusalReason::Unknown("lost_to_restart".into()),
+                    RefusalReason::LostToRestart,
                     "restart before launch",
                     Some("restart before launch".into()),
                     runner.now(),

@@ -822,8 +822,17 @@ fn startup_marks_awaiting_and_queued_lost_and_retains_terminals() {
     let runner = reopen(config);
     for id in [r.job_id, q.job_id] {
         assert!(
-            matches!(runner.replay(id,0).unwrap().last(), Some(Frame::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("lost_to_restart".into()) } && t.ran == Some(Ran::None))
+            matches!(runner.replay(id,0).unwrap().last(), Some(Frame::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::LostToRestart } && t.ran == Some(Ran::None))
         );
+        let replay = runner.replay(id, 0).unwrap();
+        let Some(Frame::Terminal(t)) = replay.last() else {
+            panic!("missing recovery terminal")
+        };
+        assert_eq!(
+            t.refusal_detail(),
+            Some("runner restarted before the job could start")
+        );
+        assert_eq!(t.retry_after_ms(), None);
     }
     assert!(
         matches!(runner.replay(cancel,0).unwrap().last(), Some(Frame::Terminal(t)) if t.outcome == Outcome::Cancelled)

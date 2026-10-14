@@ -158,6 +158,9 @@ def main():
         "refusal-prepare-setup-detail": {"type": "refusal", "transfer_id": TRANSFER,
                                           "reason": "workspace_setup_failed",
                                           "detail": "prepare workspace: populate workspace: destination path is not a directory"},
+        "refusal-prepare-request-rejected-detail": {"type": "refusal", "transfer_id": TRANSFER,
+                                                     "reason": "request_rejected",
+                                                     "detail": "prepare_unsupported: Prepare is unsupported by the Windows instance"},
         "bundle_chunk": CHUNKS[0],
         "bundle_chunk-sibling": next(chunk for chunk in CHUNKS if chunk["index"] == 1),
         "output": {"type": "output", "seq": 0, "stream": "stdout", "bytes": "4g=="},
@@ -304,6 +307,21 @@ def main():
         record = terminal({"type": "refused_before_start", "reason": reason},
                           ran="none", refusal_detail=detail)
         emit("outcomes", name, {"request": REQUEST, "stream": [ACCEPTED, record]})
+
+    for name, reason, detail, accepted in [
+        ("lost_to_restart-detail", "lost_to_restart", "runner restarted before the job could start", True),
+        ("request_rejected-direct-timeout-detail", "request_rejected", "direct_timeout_refused: timeout 101 seconds exceeds the direct-job cap of 100 seconds", False),
+        ("runner_authentication_failed-detail", "runner_authentication_failed", "runner_credential_missing", False),
+    ]:
+        record = terminal({"type": "refused_before_start", "reason": reason}, ran="none",
+                          tree_hash=TREE if accepted else None, refusal_detail=detail)
+        emit("outcomes", name, {"request": REQUEST, "stream": [*([ACCEPTED] if accepted else []), record]})
+    for reason, detail in [
+        ("request_rejected", "prepare_unsupported: Prepare is unsupported by the Windows instance"),
+        ("runner_authentication_failed", "runner_credential_missing"),
+    ]:
+        emit("replies", "prepare-" + reason + "-detail", {"transfer_id": TRANSFER,
+             "outcome": {"type": "refused_before_start", "reason": reason}, "refusal_detail": detail})
 
     emit("replies", "prepare-workspace_setup_failed-detail", {"transfer_id": TRANSFER,
          "outcome": {"type": "refused_before_start", "reason": "workspace_setup_failed"},

@@ -171,7 +171,7 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
     let log = logs(|| {
         let _runner = reopen(f.config());
     });
-    assert_refusal(&log, restart.job_id, "Unknown", "runner restarted");
+    assert_refusal(&log, restart.job_id, "LostToRestart", "runner restarted");
 }
 
 #[test]

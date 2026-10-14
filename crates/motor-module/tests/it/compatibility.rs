@@ -775,3 +775,69 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
         bridge.abort();
     }
 }
+
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production client"]
+async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail() {
+    let helper =
+        std::env::var_os("MOTOR_COMPAT_CLIENT").expect("run python3 scripts/mixed-version.py");
+    let f = Fixture::new(Cut::None, 28).await;
+    for (reason, tag, detail) in [
+        (
+            RefusalReason::LostToRestart,
+            "lost_to_restart",
+            "runner restarted before the job could start",
+        ),
+        (
+            RefusalReason::RequestRejected,
+            "request_rejected",
+            "prepare_unsupported: Prepare is unsupported by the Windows instance",
+        ),
+        (
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_authentication_failed",
+            "runner_sign_missing",
+        ),
+    ] {
+        let path = f.scratch.join(format!("{tag}.json"));
+        let terminal = TerminalRecord::new(
+            Uuid::now_v7(),
+            Outcome::RefusedBeforeStart { reason },
+            0,
+            0,
+            0,
+        )
+        .with_refusal_detail(detail)
+        .with_ran(Ran::None);
+        fs::write(
+            &path,
+            serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap(),
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&helper)
+                .arg("--decode-refusal")
+                .arg(&path)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let old: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            old["unknown"], true,
+            "the pinned helper must use its own older reason enum"
+        );
+        assert_eq!(old["reason"], tag);
+        assert_eq!(old["refusal_detail"], detail);
+        assert_eq!(old["ran"], "none");
+        assert_eq!(old["retry_after_ms"], serde_json::Value::Null);
+    }
+}

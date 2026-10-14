@@ -875,7 +875,7 @@ impl Runner {
             refuse_before_start(
                 &health,
                 &mut job,
-                RefusalReason::Unknown("lost_to_restart".into()),
+                RefusalReason::LostToRestart,
                 "runner restarted during a background fill",
                 Some("runner restarted during a background fill".into()),
                 now,
@@ -915,7 +915,7 @@ impl Runner {
                 refuse_before_start(
                     &health,
                     &mut job,
-                    RefusalReason::Unknown("lost_to_restart".into()),
+                    RefusalReason::LostToRestart,
                     "runner restarted before the job could start",
                     Some("runner restarted before the job could start".into()),
                     now,
