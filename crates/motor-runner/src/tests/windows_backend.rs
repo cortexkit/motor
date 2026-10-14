@@ -660,6 +660,8 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
         let mut launch = WindowsBackend
             .launch(runner.config(), &runner.core.trees, &setup, &prepared, 4)
             .unwrap();
+        launch.execution =
+            super::windows_instance::direct_execution(runner.config(), setup.id, launch.execution);
         assert!(!launch.durable_output);
         drop(prepared);
         assert_eq!(a.stops.load(Ordering::SeqCst), 0);
@@ -681,6 +683,13 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
         launch.execution.reap();
         drop(launch);
         cleaned(runner.config(), setup.id, &a);
+        let config = runner.config().clone();
+        drop(runner);
+        let reopened = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+        assert!(
+            reopened.core.quarantined.is_empty(),
+            "direct backend collections must not become unreadable jobs on restart"
+        );
     }
 }
 

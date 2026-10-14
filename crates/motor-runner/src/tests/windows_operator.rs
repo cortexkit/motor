@@ -91,6 +91,8 @@ fn launch(runner: &Runner, f: &Fixture, command: &str) -> (Setup, backend::Launc
     let mut launch = WindowsBackend
         .launch(runner.config(), &runner.core.trees, &setup, &prepared, 4)
         .unwrap();
+    launch.execution =
+        super::windows_instance::direct_execution(runner.config(), setup.id, launch.execution);
     drop(prepared);
     launch.execution.release().unwrap();
     (setup, launch)
