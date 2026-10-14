@@ -1,7 +1,9 @@
 #[path = "server_activity.rs"]
 mod activity;
 use crate::{
-    engine::{transfer_refusal, workspace_setup_refusal, Admission, QueueProgress},
+    engine::{
+        transfer_refusal, transfer_refusal_detail, workspace_setup_detail, Admission, QueueProgress,
+    },
     spool::Upload,
     Runner,
 };
@@ -384,7 +386,10 @@ async fn session(
                         .await
                         .map_err(io::Error::other)?
                         .map_err(|error| {
-                            let detail = runner.safe_refusal_detail(&error, std::iter::empty());
+                            let detail = runner.safe_refusal_detail(
+                                transfer_refusal_detail(&error),
+                                std::iter::empty(),
+                            );
                             (transfer_refusal(&error), detail)
                         })
                     }
@@ -409,11 +414,11 @@ async fn session(
                                 tokio::time::sleep(Duration::from_millis(25)).await
                             }
                             Err(error) => {
-                                let detail = runner.safe_refusal_detail(&error, std::iter::empty());
-                                break Err((
-                                    workspace_setup_refusal("prepare workspace", &error),
-                                    detail,
-                                ));
+                                let detail = runner.safe_refusal_detail(
+                                    workspace_setup_detail("prepare workspace", &error),
+                                    std::iter::empty(),
+                                );
+                                break Err((RefusalReason::WorkspaceSetupFailed, detail));
                             }
                         }
                     }
@@ -554,20 +559,21 @@ async fn upload(
             .unwrap_or(progress_at);
         let frame = tokio::select! {
             frame = tokio::time::timeout_at(active_at + Duration::from_secs(60), next(rx)) =>
-                frame.map_err(|error| (RefusalReason::Unknown("transfer_stalled".into()), io::Error::new(io::ErrorKind::TimedOut, error)))?,
+                frame.map_err(|error| (RefusalReason::TransferInterrupted, io::Error::new(io::ErrorKind::TimedOut, format!("transfer_stalled: {error}"))))?,
             _ = async { if let Some(rx) = wire_progress.as_mut() { let _ = rx.changed().await; } else { std::future::pending::<()>().await; } } => continue,
         };
         let Some(frame) = frame else {
             return Err((
-                if tokio::time::Instant::now().duration_since(active_at) >= Duration::from_secs(60)
-                {
-                    RefusalReason::Unknown("transfer_stalled".into())
-                } else {
-                    RefusalReason::TransferInterrupted
-                },
+                RefusalReason::TransferInterrupted,
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "bundle upload stream ended before completion",
+                    if tokio::time::Instant::now().duration_since(active_at)
+                        >= Duration::from_secs(60)
+                    {
+                        "transfer_stalled: bundle upload stream ended before completion"
+                    } else {
+                        "bundle upload stream ended before completion"
+                    },
                 ),
             ));
         };

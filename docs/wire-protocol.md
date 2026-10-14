@@ -149,38 +149,90 @@ not know, still proves no start. Test: `unknown_refusal_retains_the_before_start
 | `runner_version_mismatch` | `hello` versions differ. |
 | `snapshot_failed` | Capture failed or the untracked-size cap was exceeded; see [snapshot-contents.md](snapshot-contents.md). |
 | `workspace_key_rejected` | The workspace, repository or `cwd` paths are invalid. |
-| `runner_full` | The queue is full or the vCPU claim cannot fit the host. |
+| `runner_full` | The queue is full, the vCPU claim cannot fit the host, or the Windows VM slot is busy. |
 | `runner_draining` | The runner is draining. |
 | `runner_disk_full` | Free disk space is below the floor. |
 | `queue_wait_exceeded` | The job waited longer than its queue-wait budget. |
-| `transfer_interrupted` | The upload was cut before the runner had every bundle. |
+| `transfer_interrupted` | The upload was cut before the runner had every bundle, or an upload or fetch stalled. |
 | `tree_hash_mismatch` | The runner's checkout does not match the snapshot's tree hash. |
 | `bundle_rejected` | A bundle failed verification or fetch. |
-| `workspace_setup_failed` | The runner could not set up the workspace. |
+| `workspace_setup_failed` | Workspace setup or isolated-job launch failed, or persistence/output setup failed before the execution gate opened. |
 | `network_unsupported` | Outbound network was requested and is not available. |
 | `platform_unsupported` | The requested platform is not served. |
+| `lost_to_restart` | Runner recovery lost an unstarted foreground admission; internal interrupted background-fill history also uses this tag. |
+| `request_rejected` | The operation or parameters are not permitted: Windows Prepare or a direct run without an allowed timeout. |
+| `runner_authentication_failed` | Credentials, a grant, an agent, SSH configuration or signing prevented authentication to the runner. |
 
-5.4. Motor also emits these reason strings, which are not in the typed list and
-decode as unknown reasons (rule 5.2 still holds):
+5.4. The reason is a stable tag; human diagnostics belong in `refusal_detail`,
+not in the reason string. A queue-wait refusal uses `queue_wait_exceeded` and
+reports `waiting_on`, permit holders and other scheduler context in the detail.
+A setup refusal uses `workspace_setup_failed` and puts the setup step and error
+in the detail. Details are bounded and redacted as in rule 4; do not parse them
+for policy. Tests: `queue_wait_refusal_names_permit_holders_and_their_start_time`,
+`workspace_setup_refusal_preserves_step_and_error_in_fallback_terminal`,
+`setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason`,
+`oldest_production_client_keeps_typed_queue_and_setup_refusal_details`.
 
-| String | Produced when |
-| --- | --- |
-| `transfer_stalled` | An upload or fetch made no progress for 60 seconds. |
-| `lost_to_restart` | A runner restart found the job queued and never started. |
-| `windows_slot_busy` | The Windows VM slot was held by another VM. |
-| `prepare_unsupported` | `prepare` was sent to a Windows instance. |
-| `direct_timeout_refused` | A direct `ck motor run` asked for no timeout or one above the configured cap. |
-| `queue_wait_exceeded: <diagnostic>` | A queued job was withdrawn at its queue-wait limit. |
-| `workspace_setup_failed: <step>: <error>` | Workspace setup failed during a run. |
-| `runner_credential_*`, `runner_agent_*`, `runner_sign_*`, `runner_ssh_config_invalid` | `ck-motor` cannot authenticate to the runner; see [module.md](module.md#credential-failures). |
+Several diagnostic codes share an existing typed reason:
 
-The `queue_wait_exceeded: <diagnostic>` and `workspace_setup_failed: <step>: <error>`
-strings carry a diagnostic after the reason name, so they do not decode as the
-typed `queue_wait_exceeded` or `workspace_setup_failed`. Match on the
-prefix if you need to tell them apart. Tests:
-`zero_queue_wait_withdraws_and_cancel_is_idempotent`,
-`setup_failure_has_one_terminal_and_no_queue_entry`
-(`crates/motor-module/tests/it/recovery.rs`).
+| Code retained in detail | Typed wire reason | Produced when |
+| --- | --- | --- |
+| `transfer_stalled` | `transfer_interrupted` | An upload or fetch made no progress for 60 seconds, or a client withdrew an incomplete transfer with the private stalled-transfer marker. |
+| `windows_slot_busy` | `runner_full` | The host-wide Windows VM slot is held by another VM. |
+| `start_not_persisted` | `workspace_setup_failed` | Start persistence failed while the execution gate was still closed. |
+| `output_unavailable` | `workspace_setup_failed` | Output handles could not be acquired while the execution gate was still closed. |
+| `prepare_unsupported` | `request_rejected` | The Windows instance does not support Prepare. |
+| `direct_timeout_refused` | `request_rejected` | A direct run omitted its timeout or exceeded the configured cap. |
+
+These mappings do not add retry hints. A private `withdraw` request with the
+`transfer_stalled` marker can withdraw a pending job only while it is still
+AwaitingBundles; its resulting terminal uses `transfer_interrupted`. A queue
+withdrawal instead requires a queued job whose queue-wait limit has expired.
+A release failure that may have opened the gate remains `outcome_unknown`, never a
+before-start refusal. Tests: `upload_stall_bound_ignores_heartbeats_and_empty_chunks`,
+`fetch_timeout_refusal_is_typed_and_keeps_the_stall_code`,
+`stalled_withdrawal_keeps_private_intent_and_typed_terminal`,
+`windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadline`,
+`started_write_failure_stops_and_reaps_unreleased_execution`,
+`output_handle_failure_stops_and_reaps_unreleased_execution`,
+`partial_release_failure_stops_and_reaps_without_no_start_claim`.
+
+Authentication refusals use `runner_authentication_failed` and put the exact
+safe fault code in detail. The known codes are `runner_credential_unavailable`,
+`runner_credential_missing`, `runner_credential_grant_refused`,
+`runner_agent_start_failed`, `runner_agent_stopped`, `runner_ssh_config_invalid`,
+`runner_sign_invalid_response`, `runner_sign_missing`,
+`runner_sign_grant_refused` and `runner_sign_unavailable`. Health still reports
+these specific codes and retains its credential-recovery behavior. Raw vault
+or handshake errors are not exposed as caller refusal detail. Unknown future
+connector codes remain unknown reasons rather than being classified by a prefix.
+Tests: the `has_grouped_reason_and_detail` cases in
+`crates/motor-module/tests/it/recovery.rs`,
+`authentication_fault_after_connect_keeps_safe_code_in_run_refusal`,
+`future_connector_fault_keeps_unknown_reason_without_private_cause`,
+`refused_sign_returns_agent_failure_typed_run_refusal_and_failing_health`.
+
+Request rejection retains the specific code and explanation in detail; callers
+should correct or avoid the request rather than retrying it unchanged. The
+Prepare admission helper also uses `prepare_unsupported` when its preceding
+ownership check fails; this existing classification does not grant permission
+or bypass that check. Tests:
+`windows_prepare_is_refused_before_validation_reservation_or_filesystem_work`,
+`direct_runs_need_a_timeout_within_the_cap_and_aft_runs_do_not`.
+
+The three reasons added in types version 0.2.8 decode as `Unknown(tag)` in the
+pinned 0.2.7 client, which keeps detail and the before-start outcome. Test:
+`oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
+The tag `lost_to_restart` alone is not a no-start proof; use the outcome arm as
+in rules 5.1 and 5.2. No new retry hints accompany these mappings.
+
+Older runners can still send reason strings such as `queue_wait_exceeded: ...`
+or `workspace_setup_failed: step: error`, or use the specific cause codes
+`transfer_stalled`, `windows_slot_busy`, `start_not_persisted` and
+`output_unavailable` as reasons. Decoders preserve these as unknown reasons
+rather than rejecting them. Do not match their human-text prefixes for execution
+or retry decisions. Test:
+`unknown_refusal_retains_the_before_start_arm`.
 
 5.5. `retry_after_ms` is a hint that a refusal is transient (draining sends the
 time left to the drain deadline). Disk-full refusals carry no hint, because

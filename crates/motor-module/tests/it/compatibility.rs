@@ -697,3 +697,147 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
         .is_some_and(|version| !version.is_empty()));
     bridge.abort();
 }
+
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production client"]
+async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() {
+    let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
+        .expect("run python3 scripts/mixed-version.py to build the real pinned client");
+    for setup_failure in [false, true] {
+        let f = Fixture::new(Cut::None, if setup_failure { 28 } else { 0 }).await;
+        crate::snapshot::git(&f.main, &["branch", "-m", "feature"]).unwrap();
+        if setup_failure {
+            fs::create_dir_all(f.remote_key.parent().unwrap()).unwrap();
+            fs::write(&f.remote_key, "not a directory").unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let proxy = f.proxy.clone();
+        let bridge = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut upstream = proxy.connect(Uuid::nil()).await.unwrap();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+                });
+            }
+        });
+        let config = f.scratch.join("legacy-config.json");
+        let request_path = f.scratch.join("legacy-request.json");
+        fs::write(&config, serde_json::to_vec(&f.config).unwrap()).unwrap();
+        let mut request = f.request("echo forbidden > typed-refusal-marker");
+        if !setup_failure {
+            request.queue_wait_limit_s = Some(0);
+        }
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let invoke = |mode: &str, argument: &str| {
+            let mut command = Command::new(&helper);
+            command
+                .args([&address, config.to_str().unwrap()])
+                .arg(f.scratch.join("legacy-state"))
+                .args([mode, argument, "0"])
+                .kill_on_drop(true);
+            command
+        };
+        let live = records(invoke("run", request_path.to_str().unwrap())).await;
+        let terminal = super::recovery::terminal(&live);
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: if setup_failure {
+                    RefusalReason::WorkspaceSetupFailed
+                } else {
+                    RefusalReason::QueueWaitExceeded
+                }
+            }
+        );
+        let detail = terminal
+            .refusal_detail()
+            .expect("old client lost refusal detail");
+        if setup_failure {
+            assert!(
+                detail.starts_with("prepare job workspace: populate workspace:"),
+                "{detail}"
+            );
+            assert!(detail.contains("destination path"), "{detail}");
+        } else {
+            assert!(detail.starts_with("waiting_on="), "{detail}");
+            assert!(detail.contains("held_permits=0/1"), "{detail}");
+        }
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert_eq!(terminal.retry_after_ms(), None);
+        assert!(!live
+            .iter()
+            .any(|record| matches!(record, StreamRecord::Started(_) | StreamRecord::Output(_))));
+        assert!(!f.remote_key.join("typed-refusal-marker").exists());
+        let replay = records(invoke("attach", &terminal.job_id.to_string())).await;
+        assert_eq!(super::recovery::terminal(&replay), terminal);
+        bridge.abort();
+    }
+}
+
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production client"]
+async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail() {
+    let helper =
+        std::env::var_os("MOTOR_COMPAT_CLIENT").expect("run python3 scripts/mixed-version.py");
+    let f = Fixture::new(Cut::None, 28).await;
+    for (reason, tag, detail) in [
+        (
+            RefusalReason::LostToRestart,
+            "lost_to_restart",
+            "runner restarted before the job could start",
+        ),
+        (
+            RefusalReason::RequestRejected,
+            "request_rejected",
+            "prepare_unsupported: Prepare is unsupported by the Windows instance",
+        ),
+        (
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_authentication_failed",
+            "runner_sign_missing",
+        ),
+    ] {
+        let path = f.scratch.join(format!("{tag}.json"));
+        let terminal = TerminalRecord::new(
+            Uuid::now_v7(),
+            Outcome::RefusedBeforeStart { reason },
+            0,
+            0,
+            0,
+        )
+        .with_refusal_detail(detail)
+        .with_ran(Ran::None);
+        fs::write(
+            &path,
+            serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap(),
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&helper)
+                .arg("--decode-refusal")
+                .arg(&path)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let old: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            old["unknown"], true,
+            "the pinned helper must use its own older reason enum"
+        );
+        assert_eq!(old["reason"], tag);
+        assert_eq!(old["refusal_detail"], detail);
+        assert_eq!(old["ran"], "none");
+        assert_eq!(old["retry_after_ms"], serde_json::Value::Null);
+    }
+}

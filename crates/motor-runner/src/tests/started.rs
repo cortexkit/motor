@@ -435,7 +435,21 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
     let result = terminal(&runner, request.job_id).await;
     assert!(reaped.load(Ordering::SeqCst));
     if cfg!(target_os = "linux") && stage != "release" {
-        assert!(matches!(result.outcome, Outcome::RefusedBeforeStart { .. }));
+        assert_eq!(
+            result.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::WorkspaceSetupFailed
+            }
+        );
+        assert_eq!(
+            result.refusal_detail(),
+            Some(if stage == "save" {
+                "execution gate was not opened: start_not_persisted"
+            } else {
+                "execution gate was not opened: output_unavailable"
+            })
+        );
+        assert_eq!(result.retry_after_ms(), None);
         assert_eq!(result.ran, Some(Ran::None));
         assert_eq!(
             runner.replay(request.job_id, 0).unwrap(),

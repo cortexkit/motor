@@ -32,8 +32,11 @@ Eight `crate-local-unknown-*` additions (six outcomes and two replies) are copie
 byte-identically from the published 0.2.0 crate as `.jcs`/`.sha256` pairs, without
 pretty `.json` copies. They pin unknown refusal, outcome, stream record, killed,
 ran, output stream, prepare outcome, and rebuild result tags. The generator does
-not regenerate these published files. `SHA256SUMS` inventories every corpus file
-except itself and is refreshed by the generator.
+not regenerate these published files. Three additional `.jcs`/`.sha256` pairs
+from the published 0.2.8 crate pin the typed `lost_to_restart`, `request_rejected`
+and `runner_authentication_failed` reasons. Existing vector files retain their
+original bytes. `SHA256SUMS` inventories every corpus file except itself and is
+refreshed by the generator.
 
 Hello carries `protocol_version` and the optional `started` capability. Missing
 or false `started` is the legacy byte-identical Hello; true opts in to sequenced

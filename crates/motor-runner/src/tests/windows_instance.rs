@@ -455,10 +455,9 @@ fn windows_prepare_is_refused_before_validation_reservation_or_filesystem_work()
             .unwrap()
             .err()
             .expect("refused before upload");
-        assert_eq!(
-            refusal.reason,
-            RefusalReason::Unknown("prepare_unsupported".into())
-        );
+        assert_eq!(refusal.reason, RefusalReason::RequestRejected);
+        assert_eq!(refusal.detail.as_deref(), Some("prepare_unsupported: Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"));
+        assert_eq!(refusal.retry_after_ms, None);
         assert!(runner
             .prepare(&request, true)
             .unwrap_err()
@@ -712,9 +711,12 @@ fn windows_reconcile_stops_orphan_units_and_uses_windows_names_for_status() {
     }
     let runner = Runner::open_with_backend(c, Box::new(InProcessWindows)).unwrap();
     let inner = runner.core.inner.lock().unwrap();
-    assert!(
-        matches!(inner.jobs[&booting.id].terminal.as_ref().unwrap().outcome, Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(ref s) } if s == "lost_to_restart")
-    );
+    assert!(matches!(
+        inner.jobs[&booting.id].terminal.as_ref().unwrap().outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    ));
     assert_eq!(
         inner.jobs[&started.id].terminal.as_ref().unwrap().outcome,
         Outcome::OutcomeUnknown

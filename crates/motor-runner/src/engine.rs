@@ -139,14 +139,23 @@ pub(crate) async fn net_operator_case(mode: &str) {
 
 pub(crate) fn transfer_refusal(error: &io::Error) -> RefusalReason {
     if error.kind() == io::ErrorKind::TimedOut {
-        RefusalReason::Unknown("transfer_stalled".into())
+        RefusalReason::TransferInterrupted
     } else {
         RefusalReason::BundleRejected
     }
 }
 
-pub(crate) fn workspace_setup_refusal(step: &str, error: &io::Error) -> RefusalReason {
-    RefusalReason::Unknown(format!("workspace_setup_failed: {step}: {error}"))
+pub(crate) fn transfer_refusal_detail(error: &io::Error) -> String {
+    let detail = error.to_string();
+    if error.kind() == io::ErrorKind::TimedOut && !detail.starts_with("transfer_stalled:") {
+        format!("transfer_stalled: {detail}")
+    } else {
+        detail
+    }
+}
+
+pub(crate) fn workspace_setup_detail(step: &str, error: &io::Error) -> String {
+    format!("{step}: {error}")
 }
 
 /// Request environment values shorter than this stay visible in refusal details.
@@ -866,7 +875,7 @@ impl Runner {
             refuse_before_start(
                 &health,
                 &mut job,
-                RefusalReason::Unknown("lost_to_restart".into()),
+                RefusalReason::LostToRestart,
                 "runner restarted during a background fill",
                 Some("runner restarted during a background fill".into()),
                 now,
@@ -906,7 +915,7 @@ impl Runner {
                 refuse_before_start(
                     &health,
                     &mut job,
-                    RefusalReason::Unknown("lost_to_restart".into()),
+                    RefusalReason::LostToRestart,
                     "runner restarted before the job could start",
                     Some("runner restarted before the job could start".into()),
                     now,
@@ -1912,7 +1921,10 @@ impl Runner {
         }
         let job = inner.jobs.get_mut(&id).unwrap();
         if let Err(error) = fetched {
-            let detail = self.safe_refusal_detail(&error, request.env.values().cloned());
+            let detail = self.safe_refusal_detail(
+                transfer_refusal_detail(&error),
+                request.env.values().cloned(),
+            );
             refuse_before_start(
                 &self.core.health,
                 job,
@@ -2645,7 +2657,11 @@ impl Runner {
             refuse_before_start(
                 &self.core.health,
                 job,
-                RefusalReason::Unknown(detail.clone()),
+                if stalled {
+                    RefusalReason::TransferInterrupted
+                } else {
+                    RefusalReason::QueueWaitExceeded
+                },
                 &detail,
                 Some(safe_detail),
                 self.now(),
@@ -2704,7 +2720,7 @@ impl Runner {
     /// the client need not have journal access to explain a local fallback.
     fn queue_wait_detail(&self, inner: &Inner, id: Uuid) -> String {
         let Some(job) = inner.jobs.get(&id) else {
-            return "queue_wait_exceeded: unknown job".into();
+            return "unknown job".into();
         };
         let holders: Vec<_> = inner
             .jobs
@@ -2765,7 +2781,7 @@ impl Runner {
         } else {
             "workspace FIFO / admission priority"
         };
-        format!("queue_wait_exceeded: waiting_on={phase}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
+        format!("waiting_on={phase}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
             job.weight, Self::held_weight(inner), self.core.config.max_weight, job.accepted_ms,
             holders.join("; "), reservations.join("; "), pending_ahead.join("; "))
     }
@@ -3549,11 +3565,11 @@ impl Runner {
                 } else if error.to_string().starts_with("runner_disk_full:") {
                     (RefusalReason::RunnerDiskFull, Some(error.to_string()))
                 } else if error.to_string() == "windows_slot_busy" {
-                    (RefusalReason::Unknown("windows_slot_busy".into()), None)
+                    (RefusalReason::RunnerFull, None)
                 } else {
                     (
-                        workspace_setup_refusal("prepare job workspace", &error),
-                        None,
+                        RefusalReason::WorkspaceSetupFailed,
+                        Some(workspace_setup_detail("prepare job workspace", &error)),
                     )
                 };
                 if live {
@@ -3592,8 +3608,8 @@ impl Runner {
             Err(error) => {
                 return refuse(
                     &mut inner,
-                    workspace_setup_refusal("launch isolated job", &error),
-                    None,
+                    RefusalReason::WorkspaceSetupFailed,
+                    Some(workspace_setup_detail("launch isolated job", &error)),
                     &error,
                 );
             }
@@ -3800,7 +3816,7 @@ impl Runner {
             refuse_before_start(
                 &self.core.health,
                 &mut finished,
-                RefusalReason::Unknown(reason.into()),
+                RefusalReason::WorkspaceSetupFailed,
                 &error,
                 Some(format!("execution gate was not opened: {reason}")),
                 self.now(),

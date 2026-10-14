@@ -90,14 +90,22 @@ async fn upload_stall_bound_ignores_heartbeats_and_empty_chunks() {
         Ok(Err(failure)) => failure,
         _ => panic!("expected the transfer stall bound to refuse the job"),
     };
-    assert_eq!(reason, RefusalReason::Unknown("transfer_stalled".into()));
+    assert_eq!(reason, RefusalReason::TransferInterrupted);
     assert_eq!(start.elapsed(), Duration::from_secs(60));
     runner.refuse(request.job_id, reason, error).unwrap();
     let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
     assert_eq!(terminal.ran, Some(Ran::None));
-    assert!(
-        matches!(terminal.outcome, Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown(ref tag) } if tag == "transfer_stalled")
-    );
+    assert!(matches!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::TransferInterrupted
+        }
+    ));
+    assert!(terminal
+        .refusal_detail()
+        .unwrap()
+        .starts_with("transfer_stalled: "));
+    assert_eq!(terminal.retry_after_ms(), None);
     sender.abort();
 }
 
@@ -189,4 +197,53 @@ async fn a_single_slow_fragmented_chunk_keeps_moving_beyond_300_seconds() {
     assert!(start.elapsed() > Duration::from_secs(300));
     sender.await.unwrap();
     reader.abort();
+}
+
+#[test]
+fn fetch_timeout_refusal_is_typed_and_keeps_the_stall_code() {
+    let (_scratch, runner, request, _) = fixture();
+    let error = io::Error::new(
+        io::ErrorKind::TimedOut,
+        "transfer_stalled: git fetch made no progress for 60 seconds",
+    );
+    let reason = transfer_refusal(&error);
+    assert_eq!(reason, RefusalReason::TransferInterrupted);
+    runner.refuse(request.job_id, reason, &error).unwrap();
+    let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.refusal_detail(),
+        Some("transfer_stalled: git fetch made no progress for 60 seconds")
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), None);
+}
+
+#[test]
+fn stalled_withdrawal_keeps_private_intent_and_typed_terminal() {
+    let (_scratch, runner, request, _) = fixture();
+    assert_eq!(
+        runner
+            .withdraw_for(request.job_id, Some(RefusalReason::TransferInterrupted))
+            .unwrap(),
+        motor_protocol::WithdrawOutcome::Started
+    );
+    assert_eq!(
+        runner
+            .withdraw_for(
+                request.job_id,
+                Some(RefusalReason::Unknown("transfer_stalled".into()))
+            )
+            .unwrap(),
+        motor_protocol::WithdrawOutcome::Withdrawn
+    );
+    let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::TransferInterrupted
+        }
+    );
+    assert_eq!(terminal.refusal_detail(), Some("transfer_stalled"));
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), None);
 }

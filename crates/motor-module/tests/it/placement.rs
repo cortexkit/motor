@@ -774,9 +774,11 @@ async fn assert_credential_refusal(class: CredentialErrorClass, reason: &str) {
     assert_eq!(
         terminal.outcome,
         Outcome::RefusedBeforeStart {
-            reason: motor_protocol::RefusalReason::Unknown(reason.into())
+            reason: motor_protocol::RefusalReason::RunnerAuthenticationFailed
         }
     );
+    assert_eq!(terminal.refusal_detail(), Some(reason));
+    assert_eq!(terminal.retry_after_ms(), None);
     assert!(!rig.root.join("spools").exists());
     rig.stop().await;
 }
@@ -1080,9 +1082,11 @@ async fn refused_sign_returns_agent_failure_typed_run_refusal_and_failing_health
     assert_eq!(
         terminal.outcome,
         Outcome::RefusedBeforeStart {
-            reason: motor_protocol::RefusalReason::Unknown("runner_sign_grant_refused".into())
+            reason: motor_protocol::RefusalReason::RunnerAuthenticationFailed
         }
     );
+    assert_eq!(terminal.refusal_detail(), Some("runner_sign_grant_refused"));
+    assert_eq!(terminal.retry_after_ms(), None);
     assert!(!rig.root.join("spools").exists());
     assert_eq!(
         agent_packet(&socket, &sign_packet(&key, b"retry")).await,

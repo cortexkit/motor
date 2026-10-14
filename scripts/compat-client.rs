@@ -1,7 +1,9 @@
 // This executable links only the archived client and its archived protocol.
 // The current runner lives in the separate integration-test process.
 use motor_module::{Config, Connector, Duplex, Motor};
-use motor_protocol::{AttachRequest, PrepareRequest, RunRequest, StreamRecord};
+use motor_protocol::{
+    AttachRequest, Outcome, PrepareRequest, RefusalReason, RunRequest, StreamRecord,
+};
 use std::{future::Future, io, path::Path, pin::Pin, sync::Arc};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -12,15 +14,33 @@ impl Connector for TcpConnector {
         &self,
         _id: Uuid,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
-        Box::pin(async move {
-            Ok(Box::new(TcpStream::connect(&self.0).await?) as Box<dyn Duplex>)
-        })
+        Box::pin(async move { Ok(Box::new(TcpStream::connect(&self.0).await?) as Box<dyn Duplex>) })
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--decode-refusal") {
+        let record: StreamRecord = serde_json::from_slice(&std::fs::read(&args[2])?)?;
+        let StreamRecord::Terminal(terminal) = record else {
+            return Err("expected terminal".into());
+        };
+        let Outcome::RefusedBeforeStart { reason } = &terminal.outcome else {
+            return Err("expected refusal".into());
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "unknown": matches!(reason, RefusalReason::Unknown(_)),
+                "reason": reason,
+                "refusal_detail": terminal.refusal_detail(),
+                "ran": terminal.ran,
+                "retry_after_ms": terminal.retry_after_ms(),
+            })
+        );
+        return Ok(());
+    }
     let config: Config = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     let motor = Motor::with_connector(
         config,

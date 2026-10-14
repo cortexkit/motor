@@ -253,10 +253,9 @@ impl Motor {
                 )
                 .await;
         }
-        if let Some(reason) = connector.refusal() {
-            return self
-                .refused(id, RefusalReason::Unknown(reason.into()), None, None, tx)
-                .await;
+        if let Some(code) = connector.refusal() {
+            let (reason, detail) = request_refusal_fields(RefusalReason::Unknown(code.into()));
+            return self.refused(id, reason, None, detail, tx).await;
         }
         let config = self.config.clone();
         let r = request.clone();
@@ -308,11 +307,17 @@ impl Motor {
                     .await;
             }
         };
-        let mut channel = match Channel::open(connector.as_ref(), id).await {
+        let mut channel = match open_for_request(connector.as_ref(), id).await {
             Ok(c) => c,
-            Err(reason) => {
+            Err((reason, detail)) => {
                 return self
-                    .refused(id, reason, Some(snapshots.main.tree_hash.clone()), None, tx)
+                    .refused(
+                        id,
+                        reason,
+                        Some(snapshots.main.tree_hash.clone()),
+                        detail,
+                        tx,
+                    )
                     .await
             }
         };
@@ -852,9 +857,13 @@ impl Motor {
                     .with_refusal_detail(bounded_detail(f.check.to_string())));
             }
         };
-        let mut channel = match Channel::open(self.connector.as_ref(), id).await {
+        let mut channel = match open_for_request(self.connector.as_ref(), id).await {
             Ok(c) => c,
-            Err(r) => return Ok(prepare_refused(id, r)),
+            Err((reason, detail)) => {
+                let mut reply = prepare_refused(id, reason);
+                reply.refusal_detail = detail.map(bounded_detail);
+                return Ok(reply);
+            }
         };
         let held = match self
             .have(
@@ -935,6 +944,38 @@ impl Motor {
         Ok(self.connector_for_target(target))
     }
 }
+fn request_refusal_fields(reason: RefusalReason) -> (RefusalReason, Option<String>) {
+    match reason {
+        RefusalReason::Unknown(code)
+            if matches!(
+                code.as_str(),
+                "runner_credential_unavailable"
+                    | "runner_credential_missing"
+                    | "runner_credential_grant_refused"
+                    | "runner_agent_start_failed"
+                    | "runner_ssh_config_invalid"
+                    | "runner_agent_stopped"
+                    | "runner_sign_invalid_response"
+                    | "runner_sign_missing"
+                    | "runner_sign_grant_refused"
+                    | "runner_sign_unavailable"
+            ) =>
+        {
+            (RefusalReason::RunnerAuthenticationFailed, Some(code))
+        }
+        reason => (reason, None),
+    }
+}
+
+async fn open_for_request(
+    connector: &dyn Connector,
+    id: Uuid,
+) -> Result<Channel, (RefusalReason, Option<String>)> {
+    Channel::open(connector, id)
+        .await
+        .map_err(request_refusal_fields)
+}
+
 fn prepare_refused(id: Uuid, reason: RefusalReason) -> PrepareReply {
     PrepareReply::new(id, PrepareOutcome::RefusedBeforeStart { reason })
 }

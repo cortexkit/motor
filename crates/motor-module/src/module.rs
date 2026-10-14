@@ -351,8 +351,8 @@ impl Handler {
                     self.config.direct_exec_max_timeout_secs,
                 ) {
                     let stream = motor.refuse_before_start(
-                        RefusalReason::Unknown(DIRECT_TIMEOUT_REFUSED.into()),
-                        Some(detail),
+                        RefusalReason::RequestRejected,
+                        Some(format!("{DIRECT_TIMEOUT_REFUSED}: {detail}")),
                     )?;
                     pump_direct(&ctx, stream).await?;
                     return Ok(HandlerOutcome::Streamed);
