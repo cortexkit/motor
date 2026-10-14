@@ -1152,6 +1152,18 @@ fn main() {{ assert_eq!(commons::helper(), 42); assert_eq!(private::helper(), 42
             "slow cache disk selection: {timing:?}"
         );
         if !with_bundle {
+            assert_eq!(
+                timing.powershell_ms, 0,
+                "reused cache launched PowerShell: {timing:?}"
+            );
+            assert_eq!(
+                timing.set_disk_ms, 0,
+                "reused cache used Set-Disk: {timing:?}"
+            );
+            assert!(
+                timing.elapsed_ms < 3_000,
+                "slow reused cache mount: {timing:?}"
+            );
             assert!(
                 !timing.volume_acl_updated,
                 "reused cache repeated its ACL propagation: {timing:?}"

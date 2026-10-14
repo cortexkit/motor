@@ -10,8 +10,9 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 pub mod cache;
+pub mod cache_steps;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -41,7 +42,10 @@ pub struct CacheTimings {
     pub elapsed_ms: u64,
     pub disk_selection_ms: u64,
     pub powershell_ms: u64,
+    /// PowerShell Set-Disk time, zero when the native path is used.
     pub set_disk_ms: u64,
+    /// Native disk attribute query/update/verification, excluding layout guards.
+    pub native_attributes_ms: u64,
     pub volume_ms: u64,
     pub mountpoint_ms: u64,
     pub dirty_check_ms: u64,
@@ -56,21 +60,48 @@ pub struct CacheTimings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
-    Hello { version: u32, nonce: String },
-    CacheMounted { timings: CacheTimings },
-    ReceiveTree { bytes: Vec<u8> },
-    TreeEnd { command: Command },
+    Hello {
+        version: u32,
+        nonce: String,
+    },
+    CacheMounted {
+        timings: CacheTimings,
+    },
+    CacheProgress {
+        step: cache_steps::CacheStep,
+        elapsed_ms: u64,
+    },
+    CacheFailed {
+        failure: cache_steps::CacheFailure,
+    },
+    ReceiveTree {
+        bytes: Vec<u8>,
+    },
+    TreeEnd {
+        command: Command,
+    },
     TreeReceived {},
     Start {},
     Started {},
-    Output { stream: Stream, bytes: Vec<u8> },
-    Exit { code: u32 },
+    Output {
+        stream: Stream,
+        bytes: Vec<u8>,
+    },
+    Exit {
+        code: u32,
+    },
     Cancel {},
     Collect {},
-    Collected { bytes: Vec<u8> },
-    CollectEnd { deleted: Vec<String> },
+    Collected {
+        bytes: Vec<u8>,
+    },
+    CollectEnd {
+        deleted: Vec<String>,
+    },
     Dismount {},
-    Dismounted { clean: bool },
+    Dismounted {
+        clean: bool,
+    },
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -158,6 +189,7 @@ pub struct Protocol {
     state: State,
     collected_bytes: usize,
     cache_reported: bool,
+    cache_progress_frames: u32,
 }
 
 impl Protocol {
@@ -171,6 +203,7 @@ impl Protocol {
             state: State::AwaitHello,
             collected_bytes: 0,
             cache_reported: false,
+            cache_progress_frames: 0,
         })
     }
 
@@ -220,6 +253,18 @@ impl Protocol {
             {
                 self.cache_reported = true;
                 self.state
+            }
+            (ReceivingTree | AwaitTreeReceived, Agent, CacheProgress { .. })
+                if !self.cache_reported && self.cache_progress_frames < 64 =>
+            {
+                self.cache_progress_frames += 1;
+                self.state
+            }
+            (ReceivingTree | AwaitTreeReceived, Agent, CacheFailed { failure })
+                if !self.cache_reported =>
+            {
+                failure.validate()?;
+                Failed
             }
             (ReceivingTree, Host, TreeEnd { command }) => {
                 command.validate()?;
@@ -699,6 +744,85 @@ mod tests {
         let mut protocol = Protocol::new("boot-a").unwrap();
         protocol.accept(Peer::Agent, &hello()).unwrap();
         assert!(protocol.accept(Peer::Host, &frame).is_err());
+    }
+
+    #[test]
+    fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
+        let value = serde_json::to_value(CacheTimings::default()).unwrap();
+        assert!(value["native_attributes_ms"].is_u64());
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn cache_failure_is_a_bounded_terminal_pre_start_diagnostic() {
+        use cache_steps::{CacheFailure, CacheStep};
+        let frame = Frame::CacheFailed {
+            failure: CacheFailure {
+                step: CacheStep::DiskLayout,
+                elapsed_ms: 3_000,
+                message: "DiskLayout: device not ready (os error 21)".into(),
+                completed: vec![],
+            },
+        };
+        for tree_end in [false, true] {
+            let mut protocol = Protocol::new("boot-a").unwrap();
+            protocol.accept(Peer::Agent, &hello()).unwrap();
+            if tree_end {
+                protocol
+                    .accept(Peer::Host, &Frame::TreeEnd { command: command() })
+                    .unwrap();
+            }
+            protocol.accept(Peer::Agent, &frame).unwrap();
+            assert_eq!(protocol.state(), State::Failed);
+            assert!(protocol.accept(Peer::Host, &Frame::Start {}).is_err());
+        }
+        for case in 0..3 {
+            let mut invalid_frame = frame.clone();
+            if let Frame::CacheFailed { failure } = &mut invalid_frame {
+                match case {
+                    0 => failure.message = "x".repeat(1025),
+                    1 => failure.message = "forged\nlog line".into(),
+                    _ => {
+                        failure.completed = vec![
+                            cache_steps::StepTiming {
+                                step: CacheStep::DiskOpen,
+                                elapsed_ms: 0
+                            };
+                            33
+                        ]
+                    }
+                }
+            }
+            let mut protocol = Protocol::new("boot-a").unwrap();
+            protocol.accept(Peer::Agent, &hello()).unwrap();
+            assert!(protocol.accept(Peer::Agent, &invalid_frame).is_err());
+        }
+    }
+
+    #[test]
+    fn cache_heartbeats_are_bounded_and_cannot_arrive_after_mount() {
+        use cache_steps::CacheStep;
+        let frame = Frame::CacheProgress {
+            step: CacheStep::DiskLayout,
+            elapsed_ms: 1_000,
+        };
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        protocol.accept(Peer::Agent, &hello()).unwrap();
+        for _ in 0..64 {
+            protocol.accept(Peer::Agent, &frame).unwrap();
+        }
+        assert!(protocol.accept(Peer::Agent, &frame).is_err());
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        protocol.accept(Peer::Agent, &hello()).unwrap();
+        protocol
+            .accept(
+                Peer::Agent,
+                &Frame::CacheMounted {
+                    timings: CacheTimings::default(),
+                },
+            )
+            .unwrap();
+        assert!(protocol.accept(Peer::Agent, &frame).is_err());
     }
 
     fn command() -> Command {
