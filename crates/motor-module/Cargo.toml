@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 [dev-dependencies]
 subc-transport = { workspace = true }
 motor-runner = { path = "../motor-runner" }
-cortexkit-test-support = "=0.1.0"
+cortexkit-test-support = "=0.1.7"
 rand = "0.8"
 ed25519-dalek = { workspace = true }
 ssh-key = { workspace = true }

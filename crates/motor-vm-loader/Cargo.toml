@@ -21,4 +21,4 @@ harness = false
 
 [dev-dependencies]
 motor-vm-helper = { path = "../motor-vm-helper" }
-cortexkit-test-support = "=0.1.0"
+cortexkit-test-support = "=0.1.7"

@@ -18,4 +18,4 @@ serde_json = { workspace = true }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
-cortexkit-test-support = "=0.1.0"
+cortexkit-test-support = "=0.1.7"
