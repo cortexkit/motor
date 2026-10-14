@@ -43,10 +43,27 @@ trap cleanup EXIT
 sudo -n qemu-nbd --format=qcow2 --connect="$device" "$candidate"
 connected=1
 sudo -n partprobe "$device" 2>/dev/null || true
-# Partition nodes can appear after qemu-nbd returns, and udev's cached
-# filesystem type can be empty; wait for the nodes and probe each directly.
+# Partition nodes can appear after qemu-nbd returns, and udev can remove and
+# recreate them while it processes the rescan, so a node seen once may be gone
+# a moment later. Let udev finish, then require the nodes to be block devices
+# on two checks in a row before probing. udev's cached filesystem type can be
+# empty, so each node is probed directly below.
+partition_nodes_present() {
+  local part
+  for part in "${device}"p*; do
+    [ -b "$part" ] && return 0
+  done
+  return 1
+}
+stable=0
 for _ in $(seq 1 30); do
-  compgen -G "${device}p*" >/dev/null && break
+  udevadm settle --timeout=5 2>/dev/null || true
+  if partition_nodes_present; then
+    stable=$((stable + 1))
+    [ "$stable" -ge 2 ] && break
+  else
+    stable=0
+  fi
   sleep 1
 done
 
