@@ -1337,7 +1337,29 @@ fn replay_is_inclusive_durable_and_truncates_at_64_mib() {
     for _ in 0..65 {
         runner.output(id, OutputStream::Stdout, &megabyte).unwrap();
     }
-    let replay = runner.replay(id, 0).unwrap();
+    let mut replay = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = runner.replay(id, cursor).unwrap();
+        let terminal = page.iter().any(|frame| matches!(frame, Frame::Terminal(_)));
+        let next = page
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Output(output) => Some(output.seq + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(cursor);
+        replay.extend(page);
+        if terminal {
+            break;
+        }
+        assert!(
+            next > cursor,
+            "retained pages must advance the inclusive cursor"
+        );
+        cursor = next;
+    }
     assert_eq!(replay.len(), 65);
     assert!(
         matches!(&replay[0], Frame::Output(o) if o.seq == 1 && o.truncated_before_seq == Some(1))

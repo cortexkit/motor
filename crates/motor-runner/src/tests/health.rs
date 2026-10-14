@@ -415,12 +415,15 @@ async fn isolated_forged_job_summary_never_enters_launcher_accounting() {
         terminal(&runner, request.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
-    until(|| {
-        read_json::<Job>(&runner.record_path(request.job_id))
-            .unwrap()
-            .reservation_use
-            .is_some()
-    })
+    until_with_diagnostics(
+        || {
+            read_json::<Job>(&runner.record_path(request.job_id))
+                .unwrap()
+                .reservation_use
+                .is_some()
+        },
+        || launcher_accounting_diagnostics(&runner, request.job_id, &reports),
+    )
     .await;
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
     let usage = job.reservation_use.unwrap();
@@ -445,10 +448,15 @@ async fn isolated_forged_job_summary_never_enters_launcher_accounting() {
 #[ignore = "requires trusted operator, motor-job account, sudo and real systemd CPU accounting"]
 async fn isolated_short_successful_unit_records_cpu_accounting() {
     let f = Fixture::new();
+    let reports = Arc::new(Mutex::new(Vec::new()));
     let mut config = f.config();
     config.isolate_jobs = true;
     config.cpu_topology = None;
     config.disable_warm_builds = true;
+    config.accounting_report = Some({
+        let reports = reports.clone();
+        Arc::new(move |id, report| reports.lock().unwrap().push((id, report.to_vec())))
+    });
     config.clock = Arc::new(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -463,12 +471,15 @@ async fn isolated_short_successful_unit_records_cpu_accounting() {
         terminal(&runner, request.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
-    until(|| {
-        read_json::<Job>(&runner.record_path(request.job_id))
-            .unwrap()
-            .reservation_use
-            .is_some()
-    })
+    until_with_diagnostics(
+        || {
+            read_json::<Job>(&runner.record_path(request.job_id))
+                .unwrap()
+                .reservation_use
+                .is_some()
+        },
+        || launcher_accounting_diagnostics(&runner, request.job_id, &reports),
+    )
     .await;
     let disk: Job = read_json(&runner.record_path(request.job_id)).unwrap();
     assert_ne!(disk.process.unwrap().unit.unwrap(), request.job_id);
@@ -481,4 +492,42 @@ async fn isolated_short_successful_unit_records_cpu_accounting() {
         usage.average_use_ppm,
         usage.cpu_time_ns / (usage.wall_ms * 2)
     );
+}
+
+#[cfg(target_os = "linux")]
+fn launcher_accounting_diagnostics(
+    runner: &Runner,
+    id: Uuid,
+    reports: &Mutex<Vec<(Uuid, Vec<u8>)>>,
+) -> String {
+    let (job, pending_cpu, finalizing) = {
+        let inner = runner.core.inner.lock().unwrap();
+        (
+            inner.jobs.get(&id).cloned(),
+            inner.cpu_times.get(&id).copied(),
+            inner.finalizing.contains(&id),
+        )
+    };
+    let writer_busy = runner.job_log(id).write.try_lock().is_err();
+    let disk = read_json::<Job>(&runner.record_path(id))
+        .map(|job| serde_json::to_string_pretty(&job).unwrap());
+    let report = reports
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(job, _)| *job == id)
+        .map(|(_, report)| report.clone());
+    let parsed = report.as_ref().map(|report| {
+        let unit = job
+            .as_ref()
+            .and_then(|job| job.process)
+            .and_then(|process| process.unit)
+            .map(|unit| runner.core.backend.unit_name(&runner.core.config, unit))
+            .unwrap_or_default();
+        accounting::read_cpu_time_ns(report.as_slice(), &unit)
+    });
+    format!("job={id} finalizing={finalizing} writer_busy={writer_busy} pending_cpu_ns={pending_cpu:?}\nmemory={}\ndisk={disk:?}\nlauncher_parse={parsed:?}\nlauncher_report={}\n{}",
+        serde_json::to_string_pretty(&job).unwrap(),
+        report.map(|report| String::from_utf8_lossy(&report).into_owned()).unwrap_or_else(|| "not yet captured".into()),
+        runner_diagnostics(runner))
 }

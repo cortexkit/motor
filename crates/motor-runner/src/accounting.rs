@@ -22,7 +22,15 @@ fn parse_cpu_time_ns(report: &[u8], unit: &str) -> io::Result<u64> {
     let text = std::str::from_utf8(report).map_err(io::Error::other)?;
     let lines: Vec<_> = text.lines().map(str::trim).collect();
     let expected = format!("Running as unit: {unit}");
-    if !lines.iter().any(|line| *line == expected) {
+    // A successful invocation-ID lookup adds a suffix to the native header.
+    // Match the exact launch unit, never a prefix or an arbitrary trailing tag.
+    if !lines.iter().any(|line| {
+        *line == expected
+            || line
+                .strip_prefix(expected.as_str())
+                .and_then(|suffix| suffix.strip_prefix("; invocation ID: "))
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }) {
         return Err(io::Error::other(
             "systemd-run accounting report has no matching launch unit",
         ));
@@ -111,6 +119,41 @@ mod tests {
     const UNIT: &str = "motor-windows-windows-prep-01a13491-9d14-731c-bf08-474191c34215.service";
     // Captured from systemd-run 259 on a cgroup-v2 host.
     const REPORT: &str = "Running as unit: motor-windows-windows-prep-01a13491-9d14-731c-bf08-474191c34215.service\n          Finished with result: exit-code\nMain processes terminated with: code=exited, status=1/FAILURE\n               Service runtime: 62ms\n             CPU time consumed: 56ms\n                   Memory peak: 16.5M (swap: 0B)\n";
+
+    const SHORT_UNIT: &str = "motor-job-01a137aa-a8f0-71fd-a2e3-924b6d95e6e6.service";
+    const INVOCATION_REPORT: &str = "Running as unit: motor-job-01a137aa-a8f0-71fd-a2e3-924b6d95e6e6.service; invocation ID: a7ad6ff018994eb4b96f81c0ca2798c8\n          Finished with result: success\nMain processes terminated with: code=exited, status=0/SUCCESS\n               Service runtime: 118ms\n             CPU time consumed: 95ms\n                   Memory peak: 4.2M (swap: 0B)\n";
+
+    #[test]
+    fn native_systemd_259_invocation_header_keeps_exact_unit_identity() {
+        assert_eq!(
+            read_cpu_time_ns(INVOCATION_REPORT.as_bytes(), SHORT_UNIT).unwrap(),
+            95_000_000
+        );
+        assert!(read_cpu_time_ns(
+            INVOCATION_REPORT.as_bytes(),
+            "motor-job-01a137aa-a5f9-7719-8cff-074dcbc679e4.service"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invocation_header_rejects_wrong_units_and_malformed_identifiers() {
+        for id in [
+            "",
+            "a7ad6ff018994eb4b96f81c0ca2798c",
+            "a7ad6ff018994eb4b96f81c0ca2798c8x",
+            "z7ad6ff018994eb4b96f81c0ca2798c8",
+            "a7ad6ff018994eb4b96f81c0ca2798c8; forged",
+        ] {
+            let report = INVOCATION_REPORT.replace("a7ad6ff018994eb4b96f81c0ca2798c8", id);
+            assert!(
+                read_cpu_time_ns(report.as_bytes(), SHORT_UNIT).is_err(),
+                "invalid invocation ID: {id:?}"
+            );
+        }
+        let report = INVOCATION_REPORT.replace(SHORT_UNIT, &format!("{SHORT_UNIT}-forged"));
+        assert!(read_cpu_time_ns(report.as_bytes(), SHORT_UNIT).is_err());
+    }
 
     #[test]
     fn native_systemd_259_report_and_compound_timespans() {

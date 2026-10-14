@@ -113,6 +113,8 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) before_job_write: Option<JobWriteHook>,
     #[cfg(test)]
+    pub(crate) before_replay_read: Option<JobWriteHook>,
+    #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
     #[cfg(test)]
     pub(crate) accounting_report: Option<AccountingReportHook>,
@@ -235,6 +237,8 @@ impl Config {
             #[cfg(test)]
             before_job_write: None,
             #[cfg(test)]
+            before_replay_read: None,
+            #[cfg(test)]
             systemd_command: None,
             #[cfg(test)]
             accounting_report: None,
@@ -356,6 +360,7 @@ struct Inner {
     cache_fills: BTreeMap<Uuid, crate::writer::CacheFill>,
     drain_deadline: Option<std::time::Instant>,
     jobs: BTreeMap<Uuid, Job>,
+    pending_replays: BTreeSet<Uuid>,
     catalog: Catalog,
     rotation: BTreeMap<String, u64>,
     order: u64,
@@ -433,6 +438,7 @@ struct Core {
     backend: Box<dyn Backend>,
     trees: Trees,
     inner: Mutex<Inner>,
+    job_logs: Mutex<BTreeMap<Uuid, Arc<JobLog>>>,
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
@@ -445,6 +451,85 @@ struct Core {
     _lock: File,
     rustc_version: String,
     cpus: CpuTopology,
+}
+
+const REPLAY_PAGE_BYTES: u64 = 1024 * 1024;
+const REPLAY_PAGE_CHUNKS: usize = 64;
+
+#[derive(Default)]
+struct JobLog {
+    /// Acquire before the state lock, never while waiting under it. Serializes
+    /// output/index commits with cancellation, deadlines and terminal commits.
+    write: Mutex<()>,
+    retention: Mutex<ReplayRetention>,
+}
+
+#[derive(Default)]
+struct ReplayRetention {
+    readers: usize,
+    pinned: BTreeMap<PathBuf, usize>,
+    retired: Vec<PathBuf>,
+}
+
+struct ReplayLease {
+    log: Arc<JobLog>,
+    paths: Vec<PathBuf>,
+}
+
+fn delete_retired_chunks(paths: Vec<PathBuf>) {
+    for path in paths {
+        if let Err(error) = fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), %error, "retired output cleanup failed");
+        }
+    }
+}
+
+impl JobLog {
+    fn lease(self: &Arc<Self>, paths: Vec<PathBuf>) -> ReplayLease {
+        let mut retention = self.retention.lock().unwrap();
+        retention.readers += 1;
+        for path in &paths {
+            *retention.pinned.entry(path.clone()).or_default() += 1;
+        }
+        ReplayLease {
+            log: self.clone(),
+            paths,
+        }
+    }
+    fn retire(&self, paths: Vec<PathBuf>) {
+        let mut retention = self.retention.lock().unwrap();
+        let mut deletable = Vec::new();
+        for path in paths {
+            if retention.pinned.contains_key(&path) {
+                retention.retired.push(path);
+            } else {
+                deletable.push(path);
+            }
+        }
+        drop(retention);
+        delete_retired_chunks(deletable);
+    }
+}
+
+impl Drop for ReplayLease {
+    fn drop(&mut self) {
+        let mut retention = self.log.retention.lock().unwrap();
+        retention.readers -= 1;
+        for path in &self.paths {
+            let count = retention.pinned.get_mut(path).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                retention.pinned.remove(path);
+            }
+        }
+        let retired = std::mem::take(&mut retention.retired);
+        let (pinned, retired): (Vec<_>, Vec<_>) = retired
+            .into_iter()
+            .partition(|path| retention.pinned.contains_key(path));
+        retention.retired = pinned;
+        drop(retention);
+        delete_retired_chunks(retired);
+    }
 }
 
 #[derive(Clone)]
@@ -668,6 +753,7 @@ impl Runner {
             }
             match read_json::<Job>(&record) {
                 Ok(job) => {
+                    recover_output_tail(&path, &job);
                     jobs.insert(job.id, job);
                 }
                 Err(error) => {
@@ -868,6 +954,7 @@ impl Runner {
                     cache_fills: BTreeMap::new(),
                     drain_deadline: None,
                     jobs,
+                    pending_replays: BTreeSet::new(),
                     catalog,
                     order,
                     rotation: BTreeMap::new(),
@@ -889,6 +976,7 @@ impl Runner {
                     cpu_times: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
                 }),
+                job_logs: Mutex::new(BTreeMap::new()),
                 quarantine_admission: Mutex::new(
                     (!quarantined.is_empty())
                         .then(|| "live unit ownership has not been inspected".into()),
@@ -951,6 +1039,15 @@ impl Runner {
     }
     pub fn config(&self) -> &Config {
         &self.core.config
+    }
+    fn job_log(&self, id: Uuid) -> Arc<JobLog> {
+        self.core
+            .job_logs
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .clone()
     }
     fn refresh_quarantine_admission(&self, force: bool) {
         if self.core.quarantined.is_empty() {
@@ -1375,7 +1472,9 @@ impl Runner {
         }
         let (_admission, initial_refusal) = {
             let mut inner = self.core.inner.lock().unwrap();
-            if inner.jobs.contains_key(&request.job_id) {
+            if inner.jobs.contains_key(&request.job_id)
+                || inner.pending_replays.contains(&request.job_id)
+            {
                 return Ok(Admission::Duplicate);
             }
             let refusal = self.run_refusal(&inner, &request);
@@ -1390,7 +1489,9 @@ impl Runner {
         };
         self.long_work("admission_record");
         let mut inner = self.core.inner.lock().unwrap();
-        if inner.jobs.contains_key(&request.job_id) {
+        if inner.jobs.contains_key(&request.job_id)
+            || inner.pending_replays.contains(&request.job_id)
+        {
             return Ok(Admission::Duplicate);
         }
         let depth = inner.jobs.values().filter(|j| j.pending()).count();
@@ -1674,6 +1775,8 @@ impl Runner {
         error: impl std::fmt::Display,
     ) -> io::Result<()> {
         self.ensure_job_readable(id)?;
+        let log = self.job_log(id);
+        let _write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
         if let Some(job) = inner
             .jobs
@@ -2165,8 +2268,69 @@ impl Runner {
         supports_started: bool,
     ) -> io::Result<Vec<Frame>> {
         self.ensure_job_readable(id)?;
-        let mut inner = self.core.inner.lock().unwrap();
-        if let std::collections::btree_map::Entry::Vacant(entry) = inner.jobs.entry(id) {
+        let log = self.job_log(id);
+        let (started, terminal, chunks, earliest, output_from, shift, _lease) = loop {
+            let mut inner = self.core.inner.lock().unwrap();
+            if let Some(job) = inner.jobs.get(&id) {
+                let shift = if let (false, Some(started)) = (supports_started, &job.started) {
+                    if started.seq != 0 || job.chunks.iter().any(|chunk| chunk.seq == 0) {
+                        return Err(invalid("Started must be sequence zero for legacy replay"));
+                    }
+                    1
+                } else {
+                    0
+                };
+                let from = from.checked_add(shift).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "legacy replay cursor overflow")
+                })?;
+                let started = job
+                    .started
+                    .as_ref()
+                    .filter(|started| supports_started && started.seq >= from)
+                    .cloned();
+                let output_from = started.as_ref().map_or(from, |started| started.seq + 1);
+                let earliest = job.chunks.front().map_or(job.next_seq, |chunk| chunk.seq);
+                let mut chunks = Vec::new();
+                let mut bytes = 0u64;
+                let mut more = false;
+                let beginning = job.chunks.partition_point(|chunk| chunk.seq < from);
+                for chunk in job.chunks.iter().skip(beginning) {
+                    if chunks.len() == REPLAY_PAGE_CHUNKS
+                        || bytes.saturating_add(chunk.length) > REPLAY_PAGE_BYTES
+                    {
+                        if chunks.is_empty() {
+                            return Err(invalid("retained output chunk exceeds replay page limit"));
+                        }
+                        more = true;
+                        break;
+                    }
+                    bytes += chunk.length;
+                    chunks.push(chunk.clone());
+                }
+                let terminal = if more { None } else { job.terminal.clone() };
+                // Take the lease under the index lock: neither retention nor
+                // expiry may unlink this snapshot's files before the read ends.
+                let lease = log.lease(
+                    chunks
+                        .iter()
+                        .map(|chunk| {
+                            self.record_path(id)
+                                .parent()
+                                .unwrap()
+                                .join(format!("chunk-{}", chunk.seq))
+                        })
+                        .collect(),
+                );
+                break (
+                    started,
+                    terminal,
+                    chunks,
+                    earliest,
+                    output_from,
+                    shift,
+                    lease,
+                );
+            }
             if self.now().saturating_sub(mint_ms(id)) >= RETENTION_MS {
                 let mut job = Job::new(id, None, self.now(), 0, 0);
                 job.terminal(Outcome::HistoryExpired, self.now());
@@ -2174,6 +2338,17 @@ impl Runner {
                 terminal.ran = None;
                 return Ok(vec![Frame::Terminal(terminal)]);
             }
+            drop(inner);
+            let _write = log.write.lock().unwrap();
+            inner = self.core.inner.lock().unwrap();
+            if inner.jobs.contains_key(&id) {
+                continue;
+            }
+            // Block a concurrent Run for this ID before releasing the state
+            // lock. Only the durable tombstone authorizes replying that this
+            // ID never started; a failed write must not expose that reply.
+            inner.pending_replays.insert(id);
+            drop(inner);
             let mut job = Job::new(id, None, self.now(), 0, 0);
             refuse_before_start(
                 &self.core.health,
@@ -2184,53 +2359,42 @@ impl Runner {
                 self.now(),
             );
             job.state = JobState::Tombstone;
-            self.save(&job)?;
-            entry.insert(job);
-        }
-        let job = &inner.jobs[&id];
-        // Legacy callers never saw Started, so the replay shown to them must
-        // still begin output and the replay cursor at zero. Rewrite the sequence
-        // numbers while holding the job lock: a queued job may record Started
-        // between attach polls, but not partway through this replay.
-        let shift = match (supports_started, &job.started) {
-            (false, Some(started)) => {
-                if started.seq != 0 || job.chunks.iter().any(|c| c.seq == 0) {
-                    tracing::error!(%id, "cannot project legacy replay: Started is not the first sequenced record");
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Started must be sequence zero for legacy replay",
-                    ));
-                }
-                1
-            }
-            _ => 0,
+            let saved = self.save(&job);
+            inner = self.core.inner.lock().unwrap();
+            inner.pending_replays.remove(&id);
+            saved?;
+            inner.jobs.insert(id, job);
         };
-        let from = from.checked_add(shift).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "legacy replay cursor overflow")
-        })?;
-        let earliest = job.chunks.front().map(|c| c.seq).unwrap_or(job.next_seq);
         let mut frames = Vec::new();
-        let mut output_from = from;
-        if let Some(started) = &job.started {
-            if supports_started && started.seq >= from {
-                frames.push(Frame::Started {
-                    job_id: id,
-                    seq: started.seq,
-                    queue_wait_ms: started.queue_wait_ms,
-                    started_at_ms: started.started_at_ms,
-                    path_mapping: started.path_mapping.clone(),
-                });
-                output_from = started.seq + 1;
-            }
+        if let Some(started) = started {
+            frames.push(Frame::Started {
+                job_id: id,
+                seq: started.seq,
+                queue_wait_ms: started.queue_wait_ms,
+                started_at_ms: started.started_at_ms,
+                path_mapping: started.path_mapping,
+            });
         }
-        for chunk in job.chunks.iter().filter(|c| c.seq >= from) {
-            let bytes = fs::read(
-                self.record_path(id)
-                    .parent()
-                    .unwrap()
-                    .join(format!("chunk-{}", chunk.seq)),
-            )?;
-            let output = Output::new(chunk.seq - shift, chunk.stream.clone(), BytePayload(bytes));
+        for chunk in chunks {
+            let path = self
+                .record_path(id)
+                .parent()
+                .unwrap()
+                .join(format!("chunk-{}", chunk.seq));
+            #[cfg(test)]
+            if let Some(read) = &self.core.config.before_replay_read {
+                read(&path)?;
+            }
+            let mut bytes = Vec::with_capacity(chunk.length as usize);
+            File::open(&path)?
+                .take(chunk.length + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != chunk.length {
+                return Err(invalid(
+                    "retained output chunk length differs from its committed index",
+                ));
+            }
+            let output = Output::new(chunk.seq - shift, chunk.stream, BytePayload(bytes));
             let output = if chunk.seq == earliest && output_from < earliest {
                 output.with_truncated_before_seq(earliest - shift)
             } else {
@@ -2238,10 +2402,8 @@ impl Runner {
             };
             frames.push(Frame::Output(output));
         }
-        if let Some(terminal) = &job.terminal {
-            // TerminalRecord in the pinned exec-remote types has no sequence
-            // fields; only Output and its truncation boundary need projection.
-            frames.push(Frame::Terminal(terminal.clone()));
+        if let Some(terminal) = terminal {
+            frames.push(Frame::Terminal(terminal));
         }
         Ok(frames)
     }
@@ -2325,6 +2487,8 @@ impl Runner {
     }
     pub fn cancel(&self, id: Uuid) -> io::Result<()> {
         self.ensure_job_readable(id)?;
+        let log = self.job_log(id);
+        let write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
         if self.core.config.windows_instance() && inner.starting.contains(&id) {
             self.core
@@ -2343,10 +2507,19 @@ impl Runner {
         }
         if job.state == JobState::Running {
             if job.kill.is_none() {
-                job.kill = Some((Killed::Cancel, self.now()));
-                self.save(job)?;
+                let mut updated = job.clone();
+                updated.kill = Some((Killed::Cancel, self.now()));
+                drop(inner);
+                self.save(&updated)?;
+                inner = self.core.inner.lock().unwrap();
+                inner.jobs.insert(id, updated);
+                if inner.finalizing.contains(&id) {
+                    return Ok(());
+                }
+                let job = &inner.jobs[&id];
                 if job.process.is_none() || self.unit_alive(job.process)? == Some(false) {
                     drop(inner);
+                    drop(write);
                     return self.finish(
                         id,
                         Err(io::Error::other("cancel recorded after unit exited")),
@@ -2372,6 +2545,8 @@ impl Runner {
         reason: Option<RefusalReason>,
     ) -> io::Result<WithdrawOutcome> {
         self.ensure_job_readable(id)?;
+        let log = self.job_log(id);
+        let _write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
@@ -2651,6 +2826,13 @@ impl Runner {
             .map(|j| j.id)
             .collect();
         for id in expired {
+            let log = self.job_log(id);
+            let Ok(_write) = log.write.try_lock() else {
+                continue;
+            };
+            if log.retention.lock().unwrap().readers != 0 {
+                continue;
+            }
             match fs::remove_dir_all(self.record_path(id).parent().unwrap()) {
                 Ok(()) => {
                     inner.jobs.remove(&id);
@@ -2660,6 +2842,11 @@ impl Runner {
                 }
             }
         }
+        self.core.job_logs.lock().unwrap().retain(|id, log| {
+            inner.jobs.contains_key(id)
+                || inner.pending_replays.contains(id)
+                || Arc::strong_count(log) > 1
+        });
         if !self.core.quarantined.is_empty() {
             return Ok(());
         }
@@ -2896,50 +3083,82 @@ impl Runner {
         Ok(())
     }
 
-    fn enforce_kills(&self, inner: &mut Inner, instant: std::time::Instant) -> io::Result<()> {
+    fn enforce_kills(&self, instant: std::time::Instant) -> io::Result<()> {
         let now = self.now();
-        for job in inner
+        let ids: Vec<_> = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
             .jobs
-            .values_mut()
-            .filter(|j| j.state == JobState::Running)
-        {
+            .values()
+            .filter(|job| job.state == JobState::Running)
+            .map(|job| job.id)
+            .collect();
+        for id in ids {
+            let log = self.job_log(id);
+            // A pending output commit owns this record. Retry next tick instead
+            // of waiting for its storage while holding the shared state lock.
+            let Ok(_write) = log.write.try_lock() else {
+                continue;
+            };
+            let mut inner = self.core.inner.lock().unwrap();
+            let Some(job) = inner
+                .jobs
+                .get(&id)
+                .filter(|job| job.state == JobState::Running)
+            else {
+                continue;
+            };
             if job.kill.is_none()
                 && job
                     .request
                     .as_ref()
-                    .and_then(|r| r.timeout)
-                    .is_some_and(|s| {
-                        now.saturating_sub(job.started_ms.unwrap()) >= s.saturating_mul(1000)
+                    .and_then(|request| request.timeout)
+                    .is_some_and(|seconds| {
+                        now.saturating_sub(job.started_ms.unwrap()) >= seconds.saturating_mul(1000)
                     })
             {
-                job.kill = Some((Killed::Deadline, now));
-                self.save(job)?;
+                let mut updated = job.clone();
+                // Storage contention may defer this pass past the deadline.
+                // Keep the original expiry time so a late pass cannot restart
+                // the TERM-to-KILL grace period for an already-overdue command.
+                let deadline = job.started_ms.unwrap().saturating_add(
+                    job.request
+                        .as_ref()
+                        .unwrap()
+                        .timeout
+                        .unwrap()
+                        .saturating_mul(1000),
+                );
+                updated.kill = Some((Killed::Deadline, deadline));
+                drop(inner);
+                self.save(&updated)?;
+                inner = self.core.inner.lock().unwrap();
+                inner.jobs.insert(id, updated);
             }
+            if inner.finalizing.contains(&id) {
+                continue;
+            }
+            let job = inner.jobs[&id].clone();
             let Some((_, killed_at)) = job.kill.as_ref() else {
                 continue;
             };
-            if inner.finalizing.contains(&job.id) {
-                continue;
-            }
-            let retry = inner.kill_retries.entry(job.id).or_insert((0, instant));
+            let retry = inner.kill_retries.entry(id).or_insert((0, instant));
             if instant < retry.1 {
                 continue;
             }
-            // An exited unit needs a terminal, not another sudo/kill invocation.
             let gone = match self.unit_alive(job.process) {
                 Ok(alive) => job.process.is_none() || alive == Some(false),
                 Err(error) => {
-                    tracing::warn!(job_id = %job.id, %error, "cannot inspect cancelled unit; retrying");
+                    tracing::warn!(job_id = %id, %error, "cannot inspect cancelled unit; retrying");
                     retry.1 = instant + Duration::from_secs(5);
                     continue;
                 }
             };
             if gone {
-                // The spawned finish call claims finalization itself. Back off
-                // until it can take the lock, rather than spawning every tick.
                 retry.1 = instant + Duration::from_secs(5);
                 let runner = self.clone();
-                let id = job.id;
                 std::thread::spawn(move || {
                     if let Err(error) =
                         runner.finish(id, Err(io::Error::other("cancelled unit already exited")))
@@ -2950,14 +3169,12 @@ impl Runner {
                 continue;
             }
             let hard = now.saturating_sub(*killed_at) >= 2000;
-            // One TERM/stop and at most three KILL attempts, with monotonic
-            // backoff. Keep inspecting after exhaustion so exit is still noticed.
             if hard && retry.0 < 3 {
-                self.core.backend.cancel(&self.core.config, job, true)?;
+                self.core.backend.cancel(&self.core.config, &job, true)?;
                 retry.0 += 1;
                 retry.1 = instant + Duration::from_millis(500 * (1 << retry.0));
             } else if !hard && retry.0 == 0 {
-                self.core.backend.cancel(&self.core.config, job, false)?;
+                self.core.backend.cancel(&self.core.config, &job, false)?;
                 retry.1 = instant + Duration::from_secs(2);
             } else {
                 retry.1 = instant + Duration::from_secs(5);
@@ -2967,6 +3184,7 @@ impl Runner {
     }
     fn tick(&self) -> io::Result<()> {
         self.refresh_quarantine_admission(false);
+        self.enforce_kills(std::time::Instant::now())?;
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
         let now = self.now();
@@ -2976,7 +3194,6 @@ impl Runner {
             self.maintenance()?;
             inner = self.core.inner.lock().unwrap();
         }
-        self.enforce_kills(&mut inner, std::time::Instant::now())?;
         if inner.drain_deadline.is_some() {
             // Do not start queued commands during a deploy. Refuse them durably
             // before acknowledging the drain so callers can retry without the
@@ -3213,6 +3430,8 @@ impl Runner {
     /// launch it unless setup failed or it was cancelled or withdrawn meanwhile.
     fn launch(&self, s: Setup, prepared: io::Result<Prepared>) -> io::Result<()> {
         let id = s.id;
+        let log = self.job_log(id);
+        let _write = log.write.lock().unwrap();
         let r = s.request.clone();
         let mut inner = self.core.inner.lock().unwrap();
         inner.starting.remove(&id);
@@ -3730,55 +3949,68 @@ impl Runner {
         bytes: &[u8],
         offset: Option<u64>,
     ) -> io::Result<()> {
-        let mut inner = self.core.inner.lock().unwrap();
-        let job = inner.jobs.get_mut(&id).unwrap();
-        let path = self
-            .record_path(id)
-            .parent()
-            .unwrap()
-            .join(format!("chunk-{}", job.next_seq));
-        #[cfg(test)]
-        if let Some(write) = &self.core.config.before_job_write {
-            write(&path)?;
-        }
-        let mut file = File::create(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        job.chunks.push_back(Chunk {
-            seq: job.next_seq,
-            stream: stream.clone(),
-            length: bytes.len() as u64,
-        });
-        job.next_seq += 1;
-        job.output_bytes += bytes.len() as u64;
-        if let Some(offset) = offset {
-            if stream == OutputStream::Stdout {
-                job.stdout_offset = offset;
-            } else {
-                job.stderr_offset = offset;
+        let log = self.job_log(id);
+        let _write = log.write.lock().unwrap();
+        let directory = self.record_path(id).parent().unwrap().to_owned();
+        let mut consumed = 0usize;
+        for bytes_part in bytes.chunks(REPLAY_PAGE_BYTES as usize) {
+            let mut job = self
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .jobs
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "output job expired"))?;
+            let path = directory.join(format!("chunk-{}", job.next_seq));
+            #[cfg(test)]
+            if let Some(write) = &self.core.config.before_job_write {
+                write(&path)?;
             }
-        }
-        let mut removed = Vec::new();
-        while job.output_bytes > REPLAY_BYTES {
-            let chunk = job.chunks.pop_front().unwrap();
-            job.output_bytes -= chunk.length;
-            removed.push(chunk.seq);
-        }
-        self.save(job)?;
-        for seq in removed {
-            fs::remove_file(
-                self.record_path(id)
-                    .parent()
-                    .unwrap()
-                    .join(format!("chunk-{seq}")),
-            )?;
+            let mut file = File::create(&path)?;
+            file.write_all(bytes_part)?;
+            file.sync_all()?;
+            job.chunks.push_back(Chunk {
+                seq: job.next_seq,
+                stream: stream.clone(),
+                length: bytes_part.len() as u64,
+            });
+            job.next_seq += 1;
+            job.output_bytes += bytes_part.len() as u64;
+            consumed += bytes_part.len();
+            if let Some(end) = offset {
+                let committed_offset = end.saturating_sub((bytes.len() - consumed) as u64);
+                if stream == OutputStream::Stdout {
+                    job.stdout_offset = committed_offset;
+                } else {
+                    job.stderr_offset = committed_offset;
+                }
+            }
+            let mut retired = Vec::new();
+            while job.output_bytes > REPLAY_BYTES {
+                let chunk = job.chunks.pop_front().unwrap();
+                job.output_bytes -= chunk.length;
+                retired.push(directory.join(format!("chunk-{}", chunk.seq)));
+            }
+            // The index is the commit boundary for both replay sequences and
+            // durable stream offsets. A failed index save leaves an unreferenced
+            // tail, never a visible cursor pointing at uncommitted data.
+            self.save(&job)?;
+            let previous = self.core.inner.lock().unwrap().jobs.insert(id, job);
+            drop(previous);
+            log.retire(retired);
         }
         Ok(())
     }
     fn retry_start_refusals(&self, inner: &mut Inner) {
-        inner
-            .pending_start_refusals
-            .retain(|id| self.save(&inner.jobs[id]).is_err());
+        inner.pending_start_refusals.retain(|id| {
+            let log = self.job_log(*id);
+            let Ok(_write) = log.write.try_lock() else {
+                return true;
+            };
+            self.save(&inner.jobs[id]).is_err()
+        });
     }
     fn finish(&self, id: Uuid, status: io::Result<std::process::ExitStatus>) -> io::Result<()> {
         self.finish_execution(id, status.map(backend::ExecutionOutcome::Unix))
@@ -3813,6 +4045,8 @@ impl Runner {
     }
 
     fn record_cpu_time(&self, id: Uuid, cpu_time_ns: u64) -> io::Result<()> {
+        let log = self.job_log(id);
+        let _write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
         let Some(job) = inner.jobs.get(&id) else {
             return Ok(());
@@ -3821,7 +4055,9 @@ impl Runner {
             if let Some(ended_ms) = job.execution_ended_ms {
                 let mut updated = job.clone();
                 updated.record_reservation_use(cpu_time_ns, ended_ms);
+                drop(inner);
                 self.save(&updated)?;
+                inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
             }
         } else {
@@ -3951,13 +4187,31 @@ impl Runner {
             } else {
                 None
             };
-        let (mut inner, success, monitoring_error) = loop {
+        if let Some(exit) = self.core.inner.lock().unwrap().exit_statuses.get(&id) {
+            status = Ok(*exit);
+        }
+        if let Err(error) = &status {
+            if let Err(write_error) = self.output(
+                id,
+                OutputStream::Stderr,
+                format!(
+                    "runner monitoring: job_id={id} outcome_unknown error={error}; never rerun\n"
+                )
+                .as_bytes(),
+            ) {
+                tracing::warn!(%id, %write_error, "monitoring error retained in job record; replay diagnostic unavailable");
+            }
+        }
+        let log = self.job_log(id);
+        let (mut inner, success) = loop {
+            let write = log.write.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
                 return Ok(());
             }
             // A monitor that lost the claim can still supply the real status.
-            // Recheck on every persistence attempt, under the same lock as save.
+            // Check it on every attempt and after disk I/O, before exposing the
+            // terminal snapshot to replay readers.
             if let Some(exit) = inner.exit_statuses.get(&id) {
                 status = Ok(*exit);
             }
@@ -3986,7 +4240,18 @@ impl Runner {
             if let Some(changes) = &changes {
                 finished.terminal.as_mut().unwrap().workspace_changes = Some(changes.clone());
             }
-            match self.save(&finished) {
+            drop(inner);
+            let saved = self.save(&finished);
+            inner = self.core.inner.lock().unwrap();
+            if saved.is_ok()
+                && inner
+                    .exit_statuses
+                    .get(&id)
+                    .is_some_and(|exit| exit.wire() != finished.terminal.as_ref().unwrap().outcome)
+            {
+                continue;
+            }
+            match saved {
                 Ok(()) => {
                     inner.jobs.insert(id, finished);
                     if oom_stopped {
@@ -4002,13 +4267,14 @@ impl Runner {
                     inner.finalizing.remove(&id);
                     inner.exit_statuses.remove(&id);
                     inner.cpu_times.remove(&id);
-                    break (inner, success, monitoring_error);
+                    break (inner, success);
                 }
                 Err(error) => {
                     tracing::warn!(%id, %error, "terminal persistence failed; retrying");
                     // Backoff belongs to this job's monitor, never the scheduler
                     // or the state lock used by admission and other jobs.
                     drop(inner);
+                    drop(write);
                     std::thread::park_timeout(delay);
                     delay = (delay * 2).min(Duration::from_secs(5));
                 }
@@ -4056,18 +4322,6 @@ impl Runner {
         }
         self.prune_refs(&inner)?;
         drop(inner);
-        if let Some(error) = monitoring_error {
-            if let Err(write_error) = self.output(
-                id,
-                OutputStream::Stderr,
-                format!(
-                    "runner monitoring: job_id={id} outcome_unknown error={error}; never rerun\n"
-                )
-                .as_bytes(),
-            ) {
-                tracing::warn!(%id, %write_error, "monitoring error retained in job record; replay diagnostic unavailable");
-            }
-        }
         Ok(())
     }
 

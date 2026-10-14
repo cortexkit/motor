@@ -266,12 +266,7 @@ async fn recovery_of_gone_unit_never_kills_and_finalizes() {
         let f = Fixture::new();
         let (runner, commands) = systemd_runner(&f, state);
         let id = cancelled_unit(&f, &runner);
-        runner
-            .enforce_kills(
-                &mut runner.core.inner.lock().unwrap(),
-                std::time::Instant::now(),
-            )
-            .unwrap();
+        runner.enforce_kills(std::time::Instant::now()).unwrap();
         let result = terminal(&runner, id).await;
         assert_eq!(result.outcome, Outcome::OutcomeUnknown);
         assert_eq!(result.killed, Some(Killed::Cancel));
@@ -296,12 +291,12 @@ fn recovery_of_stuck_active_unit_bounds_kills_with_backoff() {
     let id = cancelled_unit(&f, &runner);
     let instant = std::time::Instant::now();
     {
-        let mut inner = runner.core.inner.lock().unwrap();
         for ms in 0..60_000 {
             runner
-                .enforce_kills(&mut inner, instant + Duration::from_millis(ms))
+                .enforce_kills(instant + Duration::from_millis(ms))
                 .unwrap();
         }
+        let inner = runner.core.inner.lock().unwrap();
         assert!(
             inner.jobs[&id].terminal.is_none(),
             "never release a live unit's workspace"
@@ -320,10 +315,7 @@ fn recovery_of_stuck_active_unit_bounds_kills_with_backoff() {
     // stop so the cancelled job can finish instead of hanging teardown.
     *state.lock().unwrap() = "LoadState=loaded\nActiveState=inactive\nSubState=dead\n".into();
     runner
-        .enforce_kills(
-            &mut runner.core.inner.lock().unwrap(),
-            instant + Duration::from_secs(120),
-        )
+        .enforce_kills(instant + Duration::from_secs(120))
         .unwrap();
 }
 
@@ -913,4 +905,507 @@ fn portable_host_backend_cannot_prove_quarantined_execution_is_idle() {
         .live_units(&f.config())
         .unwrap()
         .is_none());
+}
+
+struct IoPause {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    released: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl IoPause {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+        let (send, recv) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                entered: Mutex::new(Some(send)),
+                released: Mutex::new(false),
+                ready: std::sync::Condvar::new(),
+            }),
+            recv,
+        )
+    }
+    fn block(&self) {
+        if let Some(send) = self.entered.lock().unwrap().take() {
+            send.send(()).unwrap();
+        }
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.ready.wait(released).unwrap();
+        }
+    }
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.ready.notify_all();
+    }
+}
+
+struct ReleaseIo(Arc<IoPause>);
+impl Drop for ReleaseIo {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn responsive_controls(
+    runner: &Runner,
+    request: Run,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<bool>) {
+    let runner = runner.clone();
+    let (send, recv) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _ = runner.status();
+        let admitted = matches!(
+            runner.accept(request.clone()).unwrap(),
+            Admission::Accepted(_)
+        );
+        runner.cancel(request.job_id).unwrap();
+        send.send(admitted).unwrap();
+    });
+    (thread, recv)
+}
+
+#[test]
+fn slow_output_persistence_leaves_unrelated_control_operations_responsive() {
+    for index_write in [false, true] {
+        let f = Fixture::new();
+        let (pause, entered) = IoPause::new();
+        let release = ReleaseIo(pause.clone());
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut config = f.config();
+        config.before_job_write = Some({
+            let armed = armed.clone();
+            Arc::new(move |path| {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let selected = if index_write {
+                    filename == "record.json"
+                } else {
+                    filename.starts_with("chunk-")
+                };
+                if selected && armed.swap(false, Ordering::SeqCst) {
+                    pause.block();
+                }
+                Ok(())
+            })
+        });
+        let runner = Runner::open(config).unwrap();
+        let id = Uuid::now_v7();
+        runner.cancel(id).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let writer = std::thread::spawn({
+            let runner = runner.clone();
+            move || runner.output(id, OutputStream::Stdout, b"durable output")
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (request, _) = f.run("true");
+        let (control, reply) = responsive_controls(&runner, request);
+        let responsive = reply.recv_timeout(Duration::from_secs(1));
+        drop(release);
+        writer.join().unwrap().unwrap();
+        control.join().unwrap();
+        assert_eq!(
+            responsive.ok(),
+            Some(true),
+            "output storage stalled unrelated controls (index_write={index_write})"
+        );
+        assert!(
+            matches!(runner.replay(id, 0).unwrap().first(), Some(Frame::Output(o)) if o.bytes.0 == b"durable output")
+        );
+    }
+}
+
+#[test]
+fn slow_replay_reads_leave_unrelated_control_operations_responsive() {
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let mut config = f.config();
+    config.before_replay_read = Some(Arc::new(move |_| {
+        pause.block();
+        Ok(())
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    runner
+        .output(id, OutputStream::Stdout, b"replayed output")
+        .unwrap();
+    let reader = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.replay(id, 0)
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (request, _) = f.run("true");
+    let (control, reply) = responsive_controls(&runner, request);
+    let responsive = reply.recv_timeout(Duration::from_secs(1));
+    drop(release);
+    let frames = reader.join().unwrap().unwrap();
+    control.join().unwrap();
+    assert_eq!(
+        responsive.ok(),
+        Some(true),
+        "replay storage stalled unrelated controls"
+    );
+    assert!(matches!(frames.first(), Some(Frame::Output(o)) if o.bytes.0 == b"replayed output"));
+}
+
+fn synthetic_running(f: &Fixture, runner: &Runner) -> Uuid {
+    let (request, _) = f.run("true");
+    let mut job = Job::new(request.job_id, Some(request), runner.now(), 1, 2);
+    job.state = JobState::Running;
+    job.started_ms = Some(runner.now());
+    runner.save(&job).unwrap();
+    let id = job.id;
+    runner.core.inner.lock().unwrap().jobs.insert(id, job);
+    id
+}
+
+#[test]
+fn replay_pages_keep_inclusive_contiguous_cursors_and_defer_terminal() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    for sequence in 0..70u8 {
+        runner
+            .output(id, OutputStream::Stdout, &[sequence; 16384])
+            .unwrap();
+    }
+    let first = runner.replay(id, 0).unwrap();
+    assert_eq!(first.len(), 64);
+    assert!(!first
+        .iter()
+        .any(|frame| matches!(frame, Frame::Terminal(_))));
+    for (sequence, frame) in first.iter().enumerate() {
+        assert!(
+            matches!(frame, Frame::Output(output) if output.seq == sequence as u64 && output.bytes.0 == [sequence as u8; 16384])
+        );
+    }
+    let last = runner.replay(id, 64).unwrap();
+    assert_eq!(last.len(), 7);
+    assert!(matches!(last.first(), Some(Frame::Output(output)) if output.seq == 64));
+    assert!(matches!(last.last(), Some(Frame::Terminal(_))));
+    assert!(
+        matches!(runner.replay(id, 7).unwrap().first(), Some(Frame::Output(output)) if output.seq == 7)
+    );
+}
+
+#[test]
+fn replay_leases_pin_only_the_page_during_eviction_and_keep_terminal_snapshot() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let mut config = f.config();
+    config.before_replay_read = Some(Arc::new(move |_| {
+        pause.block();
+        Ok(())
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = synthetic_running(&f, &runner);
+    let megabyte = vec![b'x'; 1024 * 1024];
+    runner.output(id, OutputStream::Stdout, &megabyte).unwrap();
+    let reader = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.replay(id, 0)
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    for _ in 0..128 {
+        runner.output(id, OutputStream::Stdout, &megabyte).unwrap();
+    }
+    runner
+        .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+        .unwrap();
+    let directory = runner.record_path(id).parent().unwrap().to_owned();
+    assert!(directory.join("chunk-0").exists());
+    let disk: u64 = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("chunk-"))
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum();
+    assert_eq!(
+        disk,
+        65 * 1024 * 1024,
+        "only this page, not all evicted history, remains leased"
+    );
+    drop(release);
+    let frames = reader.join().unwrap().unwrap();
+    assert_eq!(
+        frames.len(),
+        1,
+        "the pre-terminal snapshot must not acquire a later terminal"
+    );
+    assert!(
+        matches!(frames.first(), Some(Frame::Output(output)) if output.seq == 0 && output.bytes.0 == megabyte)
+    );
+    assert!(!directory.join("chunk-0").exists());
+    let latest = runner.replay(id, 0).unwrap();
+    assert!(
+        matches!(latest.first(), Some(Frame::Output(output)) if output.seq == 65 && output.truncated_before_seq == Some(65))
+    );
+}
+
+#[test]
+fn replay_lease_defers_expiry_until_page_read_finishes() {
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let mut config = f.config();
+    config.before_replay_read = Some(Arc::new(move |_| {
+        pause.block();
+        Ok(())
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    runner
+        .output(id, OutputStream::Stdout, b"retained")
+        .unwrap();
+    let reader = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.replay(id, 0)
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    f.clock
+        .store(runner.now() + RETENTION_MS + 1000, Ordering::SeqCst);
+    runner.maintenance().unwrap();
+    assert!(runner.record_path(id).exists());
+    drop(release);
+    let frames = reader.join().unwrap().unwrap();
+    assert!(matches!(frames.first(), Some(Frame::Output(output)) if output.bytes.0 == b"retained"));
+    runner.maintenance().unwrap();
+    assert!(!runner.record_path(id).exists());
+}
+
+#[test]
+fn unknown_id_publication_fences_admission_without_holding_state_lock() {
+    let f = Fixture::new();
+    let id = Uuid::now_v7();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let mut config = f.config();
+    config.before_job_write = Some(Arc::new(move |path| {
+        if path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            == id.to_string()
+        {
+            pause.block();
+        }
+        Ok(())
+    }));
+    let runner = Runner::open(config.clone()).unwrap();
+    let writer = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.replay(id, 0)
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (mut late, _) = f.run("true");
+    late.job_id = id;
+    let (other, _) = f.run("true");
+    let (send, reply) = std::sync::mpsc::channel();
+    let control = std::thread::spawn({
+        let runner = runner.clone();
+        let late = late.clone();
+        move || {
+            let duplicate = matches!(runner.accept(late).unwrap(), Admission::Duplicate);
+            let _ = runner.status();
+            let admitted = matches!(
+                runner.accept(other.clone()).unwrap(),
+                Admission::Accepted(_)
+            );
+            runner.cancel(other.job_id).unwrap();
+            send.send(duplicate && admitted).unwrap();
+        }
+    });
+    let responsive = reply.recv_timeout(Duration::from_secs(1));
+    drop(release);
+    assert!(
+        matches!(writer.join().unwrap().unwrap().last(), Some(Frame::Terminal(terminal)) if terminal.ran == Some(Ran::None))
+    );
+    control.join().unwrap();
+    assert_eq!(responsive.ok(), Some(true));
+    drop(runner);
+    let runner = reopen(config);
+    assert!(matches!(runner.accept(late).unwrap(), Admission::Duplicate));
+}
+
+#[test]
+fn failed_unknown_id_publication_releases_handoff_without_a_no_start_proof() {
+    let f = Fixture::new();
+    let armed = Arc::new(AtomicBool::new(true));
+    let mut config = f.config();
+    config.before_job_write = Some(Arc::new(move |_| {
+        if armed.swap(false, Ordering::SeqCst) {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        } else {
+            Ok(())
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    assert!(runner.replay(request.job_id, 0).is_err());
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    runner.cancel(request.job_id).unwrap();
+}
+
+#[test]
+fn failed_output_index_keeps_committed_cursor_and_restart_discards_incomplete_tail() {
+    let f = Fixture::new();
+    let armed = Arc::new(AtomicBool::new(false));
+    let mut config = f.config();
+    config.before_job_write = Some({
+        let armed = armed.clone();
+        Arc::new(move |path| {
+            if path.file_name().unwrap() == "record.json" && armed.swap(false, Ordering::SeqCst) {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let runner = Runner::open(config.clone()).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    assert!(runner
+        .output_at(id, OutputStream::Stdout, b"uncommitted", Some(11))
+        .is_err());
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(job.next_seq, 0);
+    assert_eq!(job.stdout_offset, 0);
+    let visible_sequence = runner.core.inner.lock().unwrap().jobs[&id].next_seq;
+    assert_eq!(visible_sequence, 0);
+    assert!(matches!(
+        runner.replay(id, 0).unwrap().as_slice(),
+        [Frame::Terminal(_)]
+    ));
+    let directory = runner.record_path(id).parent().unwrap().to_owned();
+    fs::write(directory.join("chunk-99"), b"partial tail").unwrap();
+    drop(runner);
+    let runner = reopen(config);
+    assert!(!directory.join("chunk-0").exists());
+    assert!(!directory.join("chunk-99").exists());
+    runner
+        .output_at(id, OutputStream::Stdout, b"committed", Some(9))
+        .unwrap();
+    assert!(
+        matches!(runner.replay(id, 0).unwrap().first(), Some(Frame::Output(output)) if output.seq == 0 && output.bytes.0 == b"committed")
+    );
+    let legacy: Job = serde_json::from_reader(File::open(runner.record_path(id)).unwrap()).unwrap();
+    assert_eq!(legacy.next_seq, 1);
+    assert_eq!(legacy.stdout_offset, 9);
+}
+
+#[test]
+fn terminal_commit_waits_for_pending_output_index_publication() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    let mut config = f.config();
+    config.before_job_write = Some(Arc::new(move |path| {
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chunk-")
+        {
+            pause.block();
+        }
+        Ok(())
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = synthetic_running(&f, &runner);
+    let writer = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.output(id, OutputStream::Stdout, b"last output")
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let finisher = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+    });
+    assert!(poll(Duration::from_secs(5), || runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .finalizing
+        .contains(&id)));
+    let terminal_visible = runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .is_some();
+    assert!(!terminal_visible);
+    drop(release);
+    writer.join().unwrap().unwrap();
+    finisher.join().unwrap().unwrap();
+    let replay = runner.replay(id, 0).unwrap();
+    assert!(
+        matches!(replay.as_slice(), [Frame::Output(output), Frame::Terminal(terminal)] if output.seq == 0 && output.bytes.0 == b"last output" && terminal.outcome == Outcome::Exit { code: 0 })
+    );
+}
+
+#[test]
+fn output_splits_large_appends_at_page_boundaries_with_committed_offsets() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    let bytes = vec![b'a'; 2 * 1024 * 1024 + 19];
+    runner
+        .output_at(
+            id,
+            OutputStream::Stdout,
+            &bytes,
+            Some(2 * 1024 * 1024 + 219),
+        )
+        .unwrap();
+    for sequence in 0..2 {
+        let page = runner.replay(id, sequence).unwrap();
+        assert!(
+            matches!(page.as_slice(), [Frame::Output(output)] if output.seq == sequence && output.bytes.0.len() == 1024 * 1024)
+        );
+    }
+    let tail = runner.replay(id, 2).unwrap();
+    assert!(
+        matches!(tail.as_slice(), [Frame::Output(output), Frame::Terminal(_)] if output.seq == 2 && output.bytes.0 == [b'a'; 19])
+    );
+    let legacy: Job = serde_json::from_reader(File::open(runner.record_path(id)).unwrap()).unwrap();
+    assert_eq!(legacy.next_seq, 3);
+    assert_eq!(legacy.stdout_offset, 2 * 1024 * 1024 + 219);
+    assert!(legacy
+        .chunks
+        .iter()
+        .all(|chunk| chunk.length <= 1024 * 1024));
+}
+
+#[test]
+fn replay_rejects_truncated_or_oversized_committed_chunk_files_without_leaking_leases() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = Uuid::now_v7();
+    runner.cancel(id).unwrap();
+    runner.output(id, OutputStream::Stdout, b"good").unwrap();
+    let path = runner.record_path(id).parent().unwrap().join("chunk-0");
+    for bytes in [b"bad".as_slice(), b"good-extra".as_slice()] {
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            runner.replay(id, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let readers = runner.job_log(id).retention.lock().unwrap().readers;
+        assert_eq!(readers, 0);
+    }
+    fs::write(&path, b"good").unwrap();
+    assert!(
+        matches!(runner.replay(id, 0).unwrap().first(), Some(Frame::Output(output)) if output.bytes.0 == b"good")
+    );
 }
