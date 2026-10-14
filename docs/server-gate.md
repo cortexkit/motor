@@ -53,6 +53,7 @@ A failed step does not stop later steps.
 | `operator-it` | `cargo nextest run -p motor-runner --test it --locked --run-ignored only` with the filter `test(serve_writes_its_tracing_events_to_stderr) \| test(/::isolated_/)` |
 | `mixed-version` | `python3 scripts/mixed-version.py` |
 | `subc-daemon-env`, `test-binary-fold`, `test-dev-binaries`, `test-scratch`, `unreachable-modules` | `python3 scripts/<name>.py` |
+| `script-tests` | `python3 scripts/run-script-tests.py`: the Python tests of those fences and of the operator scripts under `script/` |
 
 Before the first step and after the last, the script counts systemd units
 matching `motor-*` in the `failed` state.

@@ -56,6 +56,7 @@ step mixed-version python3 scripts/mixed-version.py
 for gate in subc-daemon-env test-binary-fold test-dev-binaries test-scratch unreachable-modules; do
   step "$gate" python3 "scripts/$gate.py"
 done
+step script-tests python3 scripts/run-script-tests.py
 after=$(failed_units)
 echo "== failed motor units: before=$before after=$after"
 if [ "$after" -gt "$before" ]; then

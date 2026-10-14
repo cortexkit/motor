@@ -54,7 +54,7 @@ python3 scripts/unreachable-modules.py
 python3 scripts/test-dev-binaries.py
 python3 scripts/test-scratch.py
 python3 scripts/subc-daemon-env.py
-python3 -m unittest -v scripts/tests/test_test_binary_fold.py scripts/tests/test_unreachable_modules.py scripts/tests/test_safety_fences.py
+python3 scripts/run-script-tests.py
 ```
 
 What each check guards:
@@ -70,7 +70,7 @@ What each check guards:
 | `test-dev-binaries.py` | Tests never launch production `ck-*` executable names. |
 | `test-scratch.py` | Rust tests never use global temporary-directory constructors such as `std::env::temp_dir()`; they use `cortexkit_test_support::scratch_root()`, which keeps scratch inside a per-test directory. |
 | `subc-daemon-env.py` | Tests never locate or spawn the CortexKit daemon except through `cortexkit_test_support::SubcDaemonBinary`, which points all of the daemon's paths into the test's scratch directory. |
-| `scripts/tests/*.py` | The fences above reject planted violations, so a fence cannot pass by seeing nothing. |
+| `run-script-tests.py` | The Python tests of the fences above (they reject planted violations, so a fence cannot pass by seeing nothing) and of the operator scripts under `script/`. Some need Linux tools such as `flock`; CI runs them on Linux. |
 
 ### The server gate
 
@@ -99,16 +99,9 @@ passing portable suite does not establish the boundaries they check.
 Operator lanes fail on a missing prerequisite instead of counting a skip as a
 pass.
 
-The scripts under `script/` carry their own Python tests. CI does not run them;
-run the ones next to a script you change:
-
-```sh
-python3 -m unittest -v script/runner/test_deploy.py
-python3 -m unittest -v script/runner/test_review_reaper.py
-python3 -m unittest -v script/runner/test_sync_lock.py    # Linux only
-python3 script/runner/network-check-tests.py
-python3 -m unittest -v script/windows-vm/test_control.py script/windows-vm/test_provisioning.py
-```
+The scripts under `script/` carry their own Python tests next to them. CI and the
+server gate run them all through `scripts/run-script-tests.py`; a new test file
+is added to the list in that script.
 
 ## Committing
 
