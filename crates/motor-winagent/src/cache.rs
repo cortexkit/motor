@@ -47,7 +47,10 @@ pub fn storage_serial(descriptor: &[u8]) -> io::Result<&str> {
 #[derive(Clone, Debug)]
 pub enum DiskLayout {
     Raw,
-    Mbr,
+    Mbr {
+        partition_count: u32,
+        signature: u32,
+    },
     Gpt(Vec<PartitionKind>),
 }
 
@@ -92,12 +95,20 @@ fn check_disk(storage: &mut impl CacheStorage, number: u32) -> io::Result<DiskLa
     if windows.is_empty() || windows.contains(&number) {
         return Err(io::Error::other("cache disk may hold running Windows"));
     }
-    let layout = storage.layout()?;
+    // Windows can describe a virgin disk as MBR with neither partitions nor a
+    // disk signature. Only that exact empty shape is equivalent to RAW.
+    let layout = match storage.layout()? {
+        DiskLayout::Mbr {
+            partition_count: 0,
+            signature: 0,
+        } => DiskLayout::Raw,
+        layout => layout,
+    };
     // Windows BIOS system disks are MBR; UEFI system disks contain an EFI
     // partition. Accept only the GPT data/MSR layout created for our caches.
     let allowed = match &layout {
         DiskLayout::Raw => true,
-        DiskLayout::Mbr => false,
+        DiskLayout::Mbr { .. } => false,
         DiskLayout::Gpt(parts) => {
             parts
                 .iter()
@@ -226,22 +237,66 @@ mod tests {
 
     #[test]
     fn native_cache_rejects_running_windows_disk_before_mutation() {
-        let mut fake = FakeStorage {
-            windows_disks: vec![0, 7],
-            ..Default::default()
-        };
-        assert!(prepare_cache(&mut fake, 7).is_err());
-        assert_eq!(fake.mutations, 0);
+        for layout in [
+            DiskLayout::Raw,
+            DiskLayout::Mbr {
+                partition_count: 0,
+                signature: 0,
+            },
+            DiskLayout::Gpt(vec![PartitionKind::BasicData]),
+        ] {
+            let mut fake = FakeStorage {
+                windows_disks: vec![0, 7],
+                layout,
+                ..Default::default()
+            };
+            assert!(prepare_cache(&mut fake, 7).is_err());
+            assert_eq!(fake.mutations, 0);
+            assert_eq!(fake.formats, 0);
+        }
     }
 
     #[test]
-    fn native_cache_rejects_mbr_before_mutation() {
+    fn native_cache_rejects_partitioned_mbr_before_mutation() {
         let mut fake = FakeStorage {
-            layout: DiskLayout::Mbr,
+            layout: DiskLayout::Mbr {
+                partition_count: 1,
+                signature: 0,
+            },
             ..Default::default()
         };
         assert!(prepare_cache(&mut fake, 7).is_err());
         assert_eq!(fake.mutations, 0);
+        assert_eq!(fake.formats, 0);
+    }
+
+    #[test]
+    fn native_cache_rejects_signed_empty_mbr_before_mutation() {
+        let mut fake = FakeStorage {
+            layout: DiskLayout::Mbr {
+                partition_count: 0,
+                signature: 0x1234,
+            },
+            ..Default::default()
+        };
+        assert!(prepare_cache(&mut fake, 7).is_err());
+        assert_eq!(fake.mutations, 0);
+        assert_eq!(fake.formats, 0);
+    }
+
+    #[test]
+    fn native_cache_initializes_zero_partition_zero_signature_mbr() {
+        let mut fake = FakeStorage {
+            layout: DiskLayout::Mbr {
+                partition_count: 0,
+                signature: 0,
+            },
+            ..Default::default()
+        };
+        let prepared = prepare_cache(&mut fake, 7).unwrap();
+        assert_eq!(prepared.volume, fake.volumes[0].path);
+        assert_eq!(fake.mutations, 1);
+        assert_eq!(fake.formats, 1);
     }
 
     #[test]

@@ -351,7 +351,14 @@ impl CacheStorage for WindowsStorage {
         )?;
         match style {
             PARTITION_STYLE_RAW if count == 0 => Ok(DiskLayout::Raw),
-            PARTITION_STYLE_MBR => Ok(DiskLayout::Mbr),
+            PARTITION_STYLE_MBR => {
+                let mbr: DRIVE_LAYOUT_INFORMATION_MBR =
+                    value(&bytes, offset_of!(DRIVE_LAYOUT_INFORMATION_EX, Anonymous))?;
+                Ok(DiskLayout::Mbr {
+                    partition_count: count,
+                    signature: mbr.Signature,
+                })
+            }
             PARTITION_STYLE_GPT => {
                 if count > 128 {
                     return Err(invalid("too many disk partitions"));
