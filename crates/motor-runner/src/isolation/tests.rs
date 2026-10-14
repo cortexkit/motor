@@ -4,6 +4,9 @@ use std::io::Read;
 #[path = "writer.rs"]
 mod writer;
 
+#[path = "privilege.rs"]
+mod privilege;
+
 #[test]
 fn memory_max_scales_per_vcpu_with_a_sixteen_gib_floor() {
     for vcpus in 1..=4 {

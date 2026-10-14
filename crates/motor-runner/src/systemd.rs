@@ -1,7 +1,131 @@
-use std::{io, process::Output};
+use std::{
+    io,
+    process::{Command, Output},
+    time::Duration,
+};
 
 #[cfg(test)]
 pub(crate) type CommandHook = std::sync::Arc<dyn Fn(&[&str]) -> io::Result<Output> + Send + Sync>;
+
+#[cfg(test)]
+type ProcessHook = Box<dyn Fn(&mut Command) -> io::Result<Output>>;
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_HOOK: std::cell::RefCell<Option<ProcessHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn output(command: &mut Command) -> io::Result<Output> {
+    #[cfg(test)]
+    if let Some(result) = PROCESS_HOOK.with(|hook| hook.borrow().as_ref().map(|run| run(command))) {
+        return result;
+    }
+    command.output()
+}
+
+#[cfg(test)]
+pub(crate) fn with_process_hook<T>(run: ProcessHook, test: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROCESS_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    PROCESS_HOOK.with(|hook| {
+        assert!(hook.borrow().is_none());
+        *hook.borrow_mut() = Some(run);
+    });
+    let _reset = Reset;
+    test()
+}
+
+pub(crate) fn systemctl(args: &[&str], privileged: bool) -> io::Result<Output> {
+    // Only known read-only verbs bypass sudo; new state-changing verbs remain
+    // privileged until they are explicitly classified.
+    let query = args.first().is_some_and(|verb| {
+        matches!(
+            *verb,
+            "show"
+                | "is-active"
+                | "is-failed"
+                | "list-units"
+                | "list-unit-files"
+                | "status"
+                | "cat"
+                | "help"
+                | "list-jobs"
+                | "show-environment"
+                | "list-dependencies"
+                | "is-enabled"
+                | "get-default"
+                | "is-system-running"
+        )
+    });
+    let mut command = if privileged && !query {
+        let mut command = Command::new("/usr/bin/sudo");
+        command.args(["-n", "/usr/bin/systemctl"]);
+        command
+    } else {
+        Command::new("/usr/bin/systemctl")
+    };
+    output(command.args(args))
+}
+
+pub(crate) struct PollBackoff {
+    delay: Duration,
+    maximum: Duration,
+    fast_polls: u32,
+}
+
+impl PollBackoff {
+    pub(crate) fn activation() -> Self {
+        Self {
+            delay: Duration::from_millis(10),
+            maximum: Duration::from_millis(200),
+            // Preserve the first 50 ms of launch polling for normal starts.
+            fast_polls: 5,
+        }
+    }
+
+    pub(crate) fn monitoring() -> Self {
+        Self {
+            delay: Duration::from_millis(50),
+            maximum: Duration::from_secs(1),
+            fast_polls: 0,
+        }
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = self.delay;
+        if self.fast_polls > 0 {
+            self.fast_polls -= 1;
+        } else {
+            self.delay = (self.delay * 2).min(self.maximum);
+        }
+        delay
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn wait_until_active(
+    unit: &str,
+    mut expired: impl FnMut() -> io::Result<bool>,
+    mut wait: impl FnMut(Duration),
+) -> io::Result<bool> {
+    let mut polling = PollBackoff::activation();
+    loop {
+        if systemctl(&["is-active", "--quiet", unit], true)?
+            .status
+            .success()
+        {
+            return Ok(true);
+        }
+        if expired()? {
+            return Ok(false);
+        }
+        wait(polling.next_delay());
+    }
+}
 
 pub(crate) fn failed_job_units(
     pattern: &str,
@@ -41,7 +165,6 @@ pub(crate) fn alive(unit: &str, run: impl Fn(&[&str]) -> io::Result<Output>) -> 
         "show",
         "--property=LoadState",
         "--property=ActiveState",
-        "--property=SubState",
         unit,
     ])?;
     let text = String::from_utf8_lossy(&output.stdout);

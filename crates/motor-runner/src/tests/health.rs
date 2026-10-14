@@ -180,7 +180,7 @@ fn long_eight_vcpu_job_under_one_core_is_persisted_and_reported() {
                     assert_eq!(*unit, crate::backend::host_unit_name(launch_id));
                     b"Result=success\n".to_vec()
                 }
-                ["show", "--property=LoadState", "--property=ActiveState", "--property=SubState", _] => {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
                     b"LoadState=not-found\n".to_vec()
                 }
                 ["reset-failed", _] | ["list-units", ..] => vec![],
@@ -309,7 +309,7 @@ fn blocked_or_invalid_accounting_never_delays_or_changes_terminal() {
         config.systemd_command = Some(Arc::new(|args| {
             let stdout = match args {
                 ["show", "--property=Result", _] => b"Result=success\n".to_vec(),
-                ["show", "--property=LoadState", "--property=ActiveState", "--property=SubState", _] => {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
                     b"LoadState=not-found\n".to_vec()
                 }
                 ["reset-failed", _] | ["list-units", ..] => vec![],
