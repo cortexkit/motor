@@ -1080,6 +1080,47 @@ async fn windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadlin
 }
 
 #[tokio::test]
+async fn windows_backend_qemu_cache_serial_is_a_device_property_not_a_drive_option() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    assert_eq!(
+        terminal(&runner, r.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    let units = a.units.lock().unwrap();
+    let args = &units[0];
+    let drives = args
+        .windows(2)
+        .filter(|pair| pair[0] == "-drive")
+        .map(|pair| &pair[1])
+        .collect::<Vec<_>>();
+    assert_eq!(drives.len(), 2, "{args:?}");
+    assert!(
+        drives.iter().all(|drive| !drive.contains("serial=")),
+        "serial is not a block backend option: {args:?}"
+    );
+    assert!(
+        drives
+            .iter()
+            .any(|drive| drive.ends_with("format=qcow2,if=none,id=motor-cache")),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2).any(|pair| pair
+            == [
+                "-device",
+                "virtio-blk-pci,drive=motor-cache,serial=motor-cache"
+            ]),
+        "{args:?}"
+    );
+    cleaned(runner.config(), r.job_id, &a);
+}
+
+#[tokio::test]
 async fn windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_offline_devices() {
     let f = Fixture::new();
     source(&f);
@@ -1090,9 +1131,6 @@ async fn windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_o
     terminal(&runner, r.job_id).await;
     let units = a.units.lock().unwrap();
     let args = &units[0];
-    assert!(args
-        .iter()
-        .any(|arg| arg.ends_with("if=virtio,serial=motor-cache")));
     for property in [
         "--wait",
         "--collect",

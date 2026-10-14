@@ -491,8 +491,12 @@ pub(super) fn qemu_args(
         format!("file={},format=qcow2,if=virtio", overlay.display()),
         "-drive".into(),
         format!(
-            "file={},format=qcow2,if=virtio,serial={}",
-            cache.display(),
+            "file={},format=qcow2,if=none,id=motor-cache",
+            cache.display()
+        ),
+        "-device".into(),
+        format!(
+            "virtio-blk-pci,drive=motor-cache,serial={}",
             motor_winagent::cache::CACHE_DISK_SERIAL
         ),
         "-chardev".into(),
