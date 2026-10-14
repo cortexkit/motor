@@ -1,5 +1,119 @@
 use super::*;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_keeps_named_state_traversal_acl_effective_for_each_backend() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for windows in [false, true] {
+        let f = Fixture::new();
+        let config = if windows { config(&f) } else { f.config() };
+        let state = config.state_dir();
+        fs::create_dir_all(&state).unwrap();
+        let seeded = Command::new("/usr/bin/setfacl")
+            .args(["-m", "u:123456:--x,g::rwx,o::rwx,m::rwx", "--"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            seeded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let runner = if windows {
+            Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap()
+        } else {
+            Runner::open(config).unwrap()
+        };
+        let output = Command::new("/usr/bin/getfacl")
+            .args(["-cpn", "--"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let acl = String::from_utf8(output.stdout).unwrap();
+        for entry in [
+            "user::rwx",
+            "user:123456:--x",
+            "group::---",
+            "mask::--x",
+            "other::---",
+        ] {
+            assert!(
+                acl.lines().any(|line| line == entry),
+                "backend windows={windows}: missing {entry}:\n{acl}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o710
+        );
+        drop(runner);
+    }
+}
 use crate::windows::{VmConfig, WindowsBackend};
+
+#[cfg(target_os = "linux")]
+#[test]
+fn windows_startup_quarantine_preserves_private_state_tree_traversal_acls() {
+    let f = Fixture::new();
+    let config = config(&f);
+    let state = config.state_dir();
+    for name in ["", "jobs", "mirrors", "spools"] {
+        let path = state.join(name);
+        fs::create_dir_all(&path).unwrap();
+        let output = Command::new("/usr/bin/setfacl")
+            .args(["-m", "u:123456:r-x,g::rwx,o::rwx,m::rwx", "--"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let id = Uuid::now_v7();
+    atomic_json_private(
+        &state.join("quarantine").join(format!("{id}.json")),
+        &QuarantinedJob {
+            id,
+            request: None,
+            process: None,
+            observed_ms: 1,
+        },
+    )
+    .unwrap();
+    let runner = Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap();
+    for name in ["", "jobs", "mirrors", "spools"] {
+        let path = state.join(name);
+        let output = Command::new("/usr/bin/getfacl")
+            .args(["-cpn", "--"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let acl = String::from_utf8(output.stdout).unwrap();
+        for entry in [
+            "user::rwx",
+            "user:123456:r-x",
+            "group::---",
+            "mask::r-x",
+            "other::---",
+        ] {
+            assert!(
+                acl.lines().any(|line| line == entry),
+                "{}: missing {entry}:\n{acl}",
+                path.display()
+            );
+        }
+    }
+    drop(runner);
+}
 use std::os::unix::{
     fs::{MetadataExt, PermissionsExt},
     process::ExitStatusExt,
@@ -39,6 +153,73 @@ fn output(text: &str) -> std::process::Output {
         stdout: text.as_bytes().to_vec(),
         stderr: Vec::new(),
     }
+}
+
+pub(super) fn direct_execution(
+    config: &Config,
+    id: Uuid,
+    inner: Box<dyn backend::Execution>,
+) -> Box<dyn backend::Execution> {
+    Box::new(DirectExecution {
+        inner: Some(inner),
+        collection: config.state_dir().join("jobs").join(id.to_string()),
+    })
+}
+
+struct DirectExecution {
+    inner: Option<Box<dyn backend::Execution>>,
+    collection: PathBuf,
+}
+impl backend::Execution for DirectExecution {
+    fn release(&mut self) -> io::Result<()> {
+        self.inner.as_mut().unwrap().release()
+    }
+    fn output(&self) -> io::Result<backend::Output> {
+        self.inner.as_ref().unwrap().output()
+    }
+    fn abort(&self) -> io::Result<()> {
+        self.inner.as_ref().unwrap().abort()
+    }
+    fn wait(&mut self) -> io::Result<backend::ExecutionOutcome> {
+        self.inner.as_mut().unwrap().wait()
+    }
+    fn reap(&self) {
+        self.inner.as_ref().unwrap().reap();
+    }
+}
+impl Drop for DirectExecution {
+    fn drop(&mut self) {
+        // Direct backend tests have no accepted Job record. Join teardown before
+        // removing their collection-only directory from the durable job tree.
+        drop(self.inner.take());
+        if fs::symlink_metadata(self.collection.join("record.json"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            match fs::remove_dir_all(&self.collection) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!(
+                    "remove direct backend collection {}: {error}",
+                    self.collection.display()
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_collection_cleanup_preserves_existing_job_records() {
+    let f = Fixture::new();
+    let config = config(&f);
+    let id = Uuid::now_v7();
+    let directory = config.state_dir().join("jobs").join(id.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("record.json"), b"existing record evidence").unwrap();
+    drop(direct_execution(&config, id, Box::new(FakeExecution)));
+    assert_eq!(
+        fs::read(directory.join("record.json")).unwrap(),
+        b"existing record evidence"
+    );
 }
 
 // A portable execution fake creates only runner-owned staging. It deliberately

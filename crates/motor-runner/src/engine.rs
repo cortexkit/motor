@@ -581,6 +581,45 @@ pub(crate) enum Admission {
     DiskFull(RunnerDiskFull),
 }
 
+fn private_state_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| invalid("runner state path contains a NUL byte"))?;
+        let acl_size = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                c"system.posix_acl_access".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if acl_size >= 0 {
+            // chmod changes an extended ACL's mask, disabling named grants.
+            // Restrict owning-group/other access and retain the named entries.
+            let output = std::process::Command::new("/usr/bin/setfacl")
+                .args(["-m", "u::rwx,g::---,o::---", "--"])
+                .arg(path)
+                .output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "make runner state ACL private at {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) {
+            return Err(error);
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
 impl Runner {
     /// Opening a table performs crash recovery before any channel is served.
     /// An exclusive instance lock prevents a second daemon from recovering live jobs.
@@ -642,7 +681,7 @@ impl Runner {
         }
         let state = config.state_dir();
         {
-            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
             // Bind may initially inherit a loose umask. A private, owned parent
             // prevents other users reaching the socket before its chmod.
             fs::DirBuilder::new()
@@ -655,7 +694,7 @@ impl Runner {
                     "runner state directory must be owned by the daemon and not a symlink",
                 ));
             }
-            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+            private_state_directory(&state)?;
         }
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
@@ -663,8 +702,7 @@ impl Runner {
         }
         fs::create_dir_all(state.join("jobs"))?;
         if config.windows_instance() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(state.join("jobs"), fs::Permissions::from_mode(0o700))?;
+            private_state_directory(&state.join("jobs"))?;
         }
         let lock = OpenOptions::new()
             .create(true)
@@ -700,8 +738,7 @@ impl Runner {
         };
         fs::create_dir_all(&trees.mirrors)?;
         if config.windows_instance() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&trees.mirrors, fs::Permissions::from_mode(0o700))?;
+            private_state_directory(&trees.mirrors)?;
         }
         let now = (config.clock)();
         let health = Mutex::new(health::Health::new(now));
@@ -783,8 +820,7 @@ impl Runner {
         crate::network::initialize(&mut config);
         fs::create_dir_all(state.join("spools"))?;
         if config.windows_instance() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(state.join("spools"), fs::Permissions::from_mode(0o700))?;
+            private_state_directory(&state.join("spools"))?;
         }
         let interrupted: Vec<_> = jobs
             .values()
@@ -3830,7 +3866,7 @@ impl Runner {
             .map(|id| self.core.backend.unit_name(&self.core.config, id))
             .unwrap_or_else(|| "unrecorded".into());
         self.output(id, OutputStream::Stderr,
-            format!("runner recovery: job_id={id} outcome_unknown unit={unit} unit_alive={alive}; never rerun; query exec.status or exec.attach by job_id\n").as_bytes())
+            format!("runner recovery: job_id={id} outcome_unknown unit={unit} unit_alive={alive}; runner will not retry the job automatically; query exec.status or exec.attach by job_id\n").as_bytes())
     }
     fn follow_unit(&self, id: Uuid) -> io::Result<()> {
         use std::io::{Seek, SeekFrom};
@@ -4227,7 +4263,7 @@ impl Runner {
                 id,
                 OutputStream::Stderr,
                 format!(
-                    "runner monitoring: job_id={id} outcome_unknown error={error}; never rerun\n"
+                    "runner monitoring: job_id={id} outcome_unknown error={error}; runner will not retry the job automatically\n"
                 )
                 .as_bytes(),
             ) {

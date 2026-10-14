@@ -9,7 +9,9 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub mod cache;
+
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -31,12 +33,31 @@ pub enum Stream {
     Stderr,
 }
 
+/// Service diagnostics, never subprocess output. Fixed fields keep guest-provided
+/// log data bounded and prevent arbitrary messages from entering the host log.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheTimings {
+    pub elapsed_ms: u64,
+    pub disk_selection_ms: u64,
+    pub powershell_ms: u64,
+    pub set_disk_ms: u64,
+    pub volume_ms: u64,
+    pub mountpoint_ms: u64,
+    pub dirty_check_ms: u64,
+    pub folder_acl_ms: u64,
+    pub volume_acl_ms: u64,
+    pub folder_acl_updated: bool,
+    pub volume_acl_updated: bool,
+}
+
 /// Tree and collection payloads are chunks of tar archives, not guest paths.
 /// Chunk sizes must account for JSON encoding overhead within the frame cap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
     Hello { version: u32, nonce: String },
+    CacheMounted { timings: CacheTimings },
     ReceiveTree { bytes: Vec<u8> },
     TreeEnd { command: Command },
     TreeReceived {},
@@ -136,6 +157,7 @@ pub struct Protocol {
     nonce: String,
     state: State,
     collected_bytes: usize,
+    cache_reported: bool,
 }
 
 impl Protocol {
@@ -148,6 +170,7 @@ impl Protocol {
             nonce,
             state: State::AwaitHello,
             collected_bytes: 0,
+            cache_reported: false,
         })
     }
 
@@ -192,6 +215,12 @@ impl Protocol {
                 ReceivingTree
             }
             (ReceivingTree, Host, ReceiveTree { .. }) => ReceivingTree,
+            (ReceivingTree | AwaitTreeReceived, Agent, CacheMounted { .. })
+                if !self.cache_reported =>
+            {
+                self.cache_reported = true;
+                self.state
+            }
             (ReceivingTree, Host, TreeEnd { command }) => {
                 command.validate()?;
                 AwaitTreeReceived
@@ -645,6 +674,33 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn cache_timings_are_bounded_service_frames_not_command_output() {
+        let frame = Frame::CacheMounted {
+            timings: CacheTimings {
+                disk_selection_ms: 17,
+                ..Default::default()
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        assert!(bytes.len() < 1024);
+        assert_eq!(read_frame(&mut &bytes[..]).unwrap(), Some(frame.clone()));
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        protocol.accept(Peer::Agent, &hello()).unwrap();
+        protocol.accept(Peer::Agent, &frame).unwrap();
+        assert_eq!(protocol.state(), State::ReceivingTree);
+        assert!(
+            protocol.accept(Peer::Agent, &frame).is_err(),
+            "duplicate diagnostics must not extend setup indefinitely"
+        );
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        assert!(protocol.accept(Peer::Agent, &frame).is_err());
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        protocol.accept(Peer::Agent, &hello()).unwrap();
+        assert!(protocol.accept(Peer::Host, &frame).is_err());
+    }
+
     fn command() -> Command {
         Command {
             command: "cargo test --locked".into(),
@@ -813,7 +869,7 @@ mod tests {
                 .accept(
                     Peer::Agent,
                     &Frame::Hello {
-                        version: 1,
+                        version: PROTOCOL_VERSION,
                         nonce: "different-boot".into()
                     }
                 )
@@ -1173,8 +1229,7 @@ mod tests {
     #[test]
     fn collection_builder_rejects_oversized_output() {
         let scratch = Scratch::new();
-        let file = std::fs::File::create(scratch.0.join("large")).unwrap();
-        file.set_len(MAX_COLLECT_BYTES as u64).unwrap();
+        std::fs::write(scratch.0.join("large"), vec![1; MAX_COLLECT_BYTES]).unwrap();
         assert!(
             collect_changes(&scratch.0, &Inventory::new())
                 .unwrap_err()
