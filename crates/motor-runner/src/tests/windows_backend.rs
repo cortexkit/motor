@@ -56,6 +56,7 @@ enum Fault {
     DismountOnce,
     UnitExit,
     Silent,
+    FloodOutput,
     Oversized,
     Malformed,
     Nonce,
@@ -346,20 +347,34 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     stall(&a, &s, 5);
                     return Ok(());
                 }
-                session.send(
-                    &mut port,
-                    &AgentFrame::Output {
-                        stream: Stream::Stdout,
-                        bytes: b"Windows stdout\n".to_vec(),
-                    },
-                )?;
-                session.send(
-                    &mut port,
-                    &AgentFrame::Output {
-                        stream: Stream::Stderr,
-                        bytes: b"Windows stderr\n".to_vec(),
-                    },
-                )?;
+                if fault == Fault::FloodOutput {
+                    for sequence in 0..96 {
+                        for stream in [Stream::Stdout, Stream::Stderr] {
+                            session.send(
+                                &mut port,
+                                &AgentFrame::Output {
+                                    stream,
+                                    bytes: vec![sequence; 256],
+                                },
+                            )?;
+                        }
+                    }
+                } else {
+                    session.send(
+                        &mut port,
+                        &AgentFrame::Output {
+                            stream: Stream::Stdout,
+                            bytes: b"Windows stdout\n".to_vec(),
+                        },
+                    )?;
+                    session.send(
+                        &mut port,
+                        &AgentFrame::Output {
+                            stream: Stream::Stderr,
+                            bytes: b"Windows stderr\n".to_vec(),
+                        },
+                    )?;
+                }
                 session.send(&mut port, &AgentFrame::Exit { code })?;
                 assert!(matches!(
                     session.receive(&mut port)?,
@@ -628,6 +643,69 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             .exists());
         assert!(!Path::new(&r.workspace_key).exists());
     }
+}
+
+#[tokio::test]
+async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut c, a) = configure(&f, Fault::FloodOutput, 0xC000_0005);
+    let (pause, entered) = super::monitoring::IoPause::new();
+    let release = super::monitoring::ReleaseIo(pause.clone());
+    c.before_job_write = Some(Arc::new(move |path| {
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chunk-")
+        {
+            pause.block();
+        }
+        Ok(())
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runner.config().windows_runtime.output_blocked(r.job_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A delay while the host writes storage must not count as the guest failing
+    // to reply, even when it exceeds the reply timeout.
+    a.clock
+        .store(10 * motor_winagent::REPLY_TIMEOUT_MS, Ordering::SeqCst);
+    drop(release);
+    let result = terminal(&runner, r.job_id).await;
+    assert_eq!(result.outcome, Outcome::WindowsExit { code: 0xC000_0005 });
+    let mut streams = [Vec::new(), Vec::new()];
+    let mut cursor = 0;
+    loop {
+        let page = runner.replay(r.job_id, cursor).unwrap();
+        for frame in &page {
+            if let Frame::Started { seq, .. } = frame {
+                assert_eq!(*seq, cursor);
+                cursor += 1;
+            }
+            if let Frame::Output(output) = frame {
+                assert_eq!(output.seq, cursor);
+                cursor += 1;
+                let index = usize::from(output.stream == OutputStream::Stderr);
+                streams[index].extend_from_slice(&output.bytes.0);
+            }
+        }
+        if matches!(page.last(), Some(Frame::Terminal(_))) {
+            break;
+        }
+        assert!(!page.is_empty());
+    }
+    let expected: Vec<u8> = (0..96).flat_map(|sequence| [sequence; 256]).collect();
+    assert_eq!(streams[0], expected);
+    assert_eq!(streams[1], expected);
+    cleaned(runner.config(), r.job_id, &a);
 }
 
 #[tokio::test]
