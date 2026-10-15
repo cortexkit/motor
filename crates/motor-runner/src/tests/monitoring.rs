@@ -750,13 +750,22 @@ impl Backend for EnumeratingBackend {
     }
 }
 
+struct EnumeratedUnits {
+    listing: String,
+    failed: bool,
+    pause: Option<Arc<IoPause>>,
+}
+
 fn enumerated_quarantine(
     f: &Fixture,
     listing: &str,
     failed: bool,
-) -> (Runner, Uuid, Arc<Mutex<(String, bool)>>) {
+) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>) {
     use std::os::unix::process::ExitStatusExt;
     let mut config = f.config();
+    // A forced refresh bypasses throttling, not a busy probe. These fixtures
+    // control each observation, so only explicit ticks may refresh the fence.
+    config.manual_tick = true;
     let id = Uuid::now_v7();
     let record = config
         .state_dir()
@@ -765,18 +774,28 @@ fn enumerated_quarantine(
         .join("record.json");
     fs::create_dir_all(record.parent().unwrap()).unwrap();
     fs::write(record, b"{broken job}").unwrap();
-    let state = Arc::new(Mutex::new((listing.to_string(), failed)));
+    let state = Arc::new(Mutex::new(EnumeratedUnits {
+        listing: listing.to_string(),
+        failed,
+        pause: None,
+    }));
     config.systemd_command = Some({
         let state = state.clone();
         Arc::new(move |args| {
             assert_eq!(args[0], "list-units");
             assert!(args.contains(&"--all"));
             assert_eq!(args.last(), Some(&"motor-job-*"));
-            let state = state.lock().unwrap();
+            let (listing, failed, pause) = {
+                let mut state = state.lock().unwrap();
+                (state.listing.clone(), state.failed, state.pause.take())
+            };
+            if let Some(pause) = pause {
+                pause.block();
+            }
             Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(if state.1 { 1 << 8 } else { 0 }),
-                stdout: state.0.as_bytes().to_vec(),
-                stderr: if state.1 {
+                status: std::process::ExitStatus::from_raw(if failed { 1 << 8 } else { 0 }),
+                stdout: listing.into_bytes(),
+                stderr: if failed {
                     b"enumeration unavailable".to_vec()
                 } else {
                     vec![]
@@ -832,7 +851,7 @@ fn quarantine_unaccounted_unit_fences_until_it_exits() {
         runner.accept(request).unwrap(),
         Admission::Refused(RefusalReason::WorkspaceSetupFailed)
     ));
-    state.lock().unwrap().0 = format!("{name} loaded inactive dead exited\n");
+    state.lock().unwrap().listing = format!("{name} loaded inactive dead exited\n");
     runner.refresh_quarantine_admission(true);
     let (request, _) = f.run("true");
     assert!(matches!(
@@ -857,14 +876,14 @@ fn quarantine_matches_readable_process_launch_units_not_job_ids() {
         unit: Some(launch),
     });
     runner.core.inner.lock().unwrap().jobs.insert(job_id, job);
-    state.lock().unwrap().0 = format!(
+    state.lock().unwrap().listing = format!(
         "{} loaded active running command\n",
         backend::host_unit_name(launch)
     );
     runner.refresh_quarantine_admission(true);
     assert!(runner.ensure_admission_ownership().is_ok());
     let wrong = backend::host_unit_name(job_id);
-    state.lock().unwrap().0 = format!("{wrong} loaded active running command\n");
+    state.lock().unwrap().listing = format!("{wrong} loaded active running command\n");
     runner.refresh_quarantine_admission(true);
     assert!(runner
         .ensure_admission_ownership()
@@ -872,6 +891,39 @@ fn quarantine_matches_readable_process_launch_units_not_job_ids() {
         .to_string()
         .contains(&wrong));
     runner.core.inner.lock().unwrap().jobs.remove(&job_id);
+}
+
+#[test]
+fn quarantine_refresh_serializes_enumeration_and_publication() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    let (pause, entered) = IoPause::new();
+    let release = ReleaseIo(pause.clone());
+    state.lock().unwrap().pause = Some(pause);
+    *runner.core.quarantine_probe.lock().unwrap() = None;
+    let older = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.tick()
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(runner.core.quarantine_probe.try_lock().is_err());
+    let unknown = backend::host_unit_name(Uuid::now_v7());
+    state.lock().unwrap().listing = format!("{unknown} loaded active running command\n");
+
+    // The older enumeration owns the probe through publication. A concurrent
+    // forced call skips it rather than observing the changed listing out of order.
+    runner.refresh_quarantine_admission(true);
+    assert!(runner.ensure_admission_ownership().is_ok());
+    drop(release);
+    older.join().unwrap().unwrap();
+    assert!(runner.ensure_admission_ownership().is_ok());
+
+    runner.refresh_quarantine_admission(true);
+    assert!(runner
+        .ensure_admission_ownership()
+        .unwrap_err()
+        .to_string()
+        .contains(&unknown));
 }
 
 #[test]
