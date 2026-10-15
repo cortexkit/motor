@@ -100,6 +100,10 @@ pub struct Config {
     /// maintenance: draining also refuses accepted jobs that are still queued.
     #[cfg(test)]
     pub(crate) disable_warm_builds: bool,
+    /// Let fixtures advance the scheduler explicitly when observations must not
+    /// be consumed by a concurrent background tick.
+    #[cfg(test)]
+    pub(crate) manual_tick: bool,
     #[cfg(test)]
     pub(crate) writer_unavailable: bool,
     #[cfg(test)]
@@ -233,6 +237,8 @@ impl Config {
             base_commands: Vec::new(),
             #[cfg(test)]
             disable_warm_builds: false,
+            #[cfg(test)]
+            manual_tick: false,
             #[cfg(test)]
             writer_unavailable: false,
             #[cfg(test)]
@@ -1075,6 +1081,10 @@ impl Runner {
                     .tracking(runner.core.background_deletes.clone());
                 runner.monitor_unit(id);
             });
+        }
+        #[cfg(test)]
+        if runner.core.config.manual_tick {
+            return Ok(runner);
         }
         let weak = Arc::downgrade(&runner.core);
         std::thread::spawn(move || loop {
