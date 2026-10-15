@@ -957,14 +957,14 @@ fn portable_host_backend_cannot_prove_quarantined_execution_is_idle() {
         .is_none());
 }
 
-struct IoPause {
+pub(super) struct IoPause {
     entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     released: Mutex<bool>,
     ready: std::sync::Condvar,
 }
 
 impl IoPause {
-    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+    pub(super) fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
         let (send, recv) = std::sync::mpsc::channel();
         (
             Arc::new(Self {
@@ -975,7 +975,7 @@ impl IoPause {
             recv,
         )
     }
-    fn block(&self) {
+    pub(super) fn block(&self) {
         if let Some(send) = self.entered.lock().unwrap().take() {
             send.send(()).unwrap();
         }
@@ -990,7 +990,7 @@ impl IoPause {
     }
 }
 
-struct ReleaseIo(Arc<IoPause>);
+pub(super) struct ReleaseIo(pub(super) Arc<IoPause>);
 impl Drop for ReleaseIo {
     fn drop(&mut self) {
         self.0.release();

@@ -22,6 +22,14 @@ pub(crate) struct Runtime {
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    #[cfg(test)]
+    pub(crate) fn output_blocked(&self, id: Uuid) -> bool {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|control| control.output_blocked.load(Ordering::Acquire))
+    }
     pub(super) fn defer_cleanup(&self, resources: super::vm::Resources) {
         self.cleanup_ids.lock().unwrap().insert(resources.id);
         self.cleanups.lock().unwrap().push_back(resources);
@@ -53,6 +61,7 @@ impl Runtime {
             control
                 .cancel
                 .fetch_max(if hard { 2 } else { 1 }, Ordering::Release);
+            control.wake();
             true
         } else {
             false
@@ -98,13 +107,28 @@ impl Drop for Registration {
 
 // Atomic flags record start, cancellation and owner-drop requests without
 // waiting for the guest socket. Repeated requests update the same flags instead
-// of growing a queue. The I/O thread checks them even while a socket write blocks.
+// of growing a queue. The I/O thread checks them while socket writes or output
+// forwarding are blocked.
 #[derive(Default)]
 struct Control {
     release: AtomicBool,
     cancel: AtomicU8,
     abandoned: AtomicBool,
     done: AtomicBool,
+    worker: std::sync::OnceLock<std::thread::Thread>,
+    #[cfg(test)]
+    output_blocked: AtomicBool,
+}
+impl Control {
+    fn wake(&self) {
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
+    }
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+        self.wake();
+    }
 }
 struct ChannelReader {
     receiver: mpsc::Receiver<Vec<u8>>,
@@ -138,7 +162,7 @@ pub(crate) struct PreparedVm {
 }
 impl Drop for PreparedVm {
     fn drop(&mut self) {
-        self.control.abandoned.store(true, Ordering::Release);
+        self.control.abandon();
     }
 }
 impl Execution for PreparedVm {
@@ -163,7 +187,7 @@ impl Execution for PreparedVm {
             .unwrap_or_else(|_| Err(io::Error::other("Windows I/O thread stopped")))
     }
     fn reap(&self) {
-        self.control.abandoned.store(true, Ordering::Release);
+        self.control.abandon();
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
         }
@@ -348,6 +372,44 @@ impl Transport {
             _ => Err(invalid("unexpected agent frame during tree upload")),
         }
     }
+    fn cancel_if_requested(&mut self) -> io::Result<()> {
+        if !self.cancelled
+            && self.control.cancel.load(Ordering::Acquire) == 1
+            && matches!(
+                self.protocol.state(),
+                motor_winagent::State::AwaitStarted | motor_winagent::State::Running
+            )
+        {
+            self.send(&Frame::Cancel {})?;
+            self.cancelled = true;
+        }
+        Ok(())
+    }
+    fn forward_output(
+        &mut self,
+        tx: &mpsc::SyncSender<Vec<u8>>,
+        mut bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        // Output is forwarded only in Running, which has no guest deadline.
+        // Keep the frame until storage catches up, without reading more socket
+        // data. Collect's inactivity deadline starts after the exit is read.
+        loop {
+            self.check()?;
+            self.cancel_if_requested()?;
+            match tx.try_send(bytes) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(pending)) => {
+                    bytes = pending;
+                    #[cfg(test)]
+                    self.control.output_blocked.store(true, Ordering::Release);
+                    self.idle()?;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(invalid("Windows output consumer disconnected"));
+                }
+            }
+        }
+    }
     fn reply(&mut self, vm: &mut super::vm::Resources) -> io::Result<Frame> {
         loop {
             if let Some(timings) = self.pending_cache.take() {
@@ -355,16 +417,7 @@ impl Transport {
                 #[cfg(test)]
                 vm.record_cache_timings(timings);
             }
-            if !self.cancelled
-                && self.control.cancel.load(Ordering::Acquire) == 1
-                && matches!(
-                    self.protocol.state(),
-                    motor_winagent::State::AwaitStarted | motor_winagent::State::Running
-                )
-            {
-                self.send(&Frame::Cancel {})?;
-                self.cancelled = true;
-            }
+            self.cancel_if_requested()?;
             match self.receive() {
                 Ok(Some(Frame::CacheMounted { timings })) => {
                     self.pending_cache = Some(timings);
@@ -473,6 +526,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
     };
     let thread_control = control.clone();
     let thread = std::thread::spawn(move || {
+        let _ = thread_control.worker.set(std::thread::current());
         let mut exit_code = None;
         let result = (|| {
             let bounds = Bounds::new(unit_started_ms);
@@ -563,8 +617,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
                             Stream::Stderr => &stderr_tx,
                         };
                         if !bytes.is_empty() {
-                            tx.try_send(bytes)
-                                .map_err(|_| invalid("Windows output consumer stalled"))?;
+                            io.forward_output(tx, bytes)?;
                         }
                     }
                     Frame::Exit { code } => {
@@ -670,6 +723,116 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, os::fd::AsRawFd};
+
+    fn running_transport(stream: UnixStream, control: Arc<Control>) -> Transport {
+        let mut protocol = Protocol::new("nonce").unwrap();
+        for (peer, frame) in [
+            (
+                Peer::Agent,
+                Frame::Hello {
+                    version: motor_winagent::PROTOCOL_VERSION,
+                    nonce: "nonce".into(),
+                },
+            ),
+            (
+                Peer::Host,
+                Frame::TreeEnd {
+                    command: motor_winagent::Command {
+                        command: "true".into(),
+                        cwd: "/w".into(),
+                        workspace: "/w".into(),
+                        source_commit: "abc".into(),
+                        env: BTreeMap::new(),
+                    },
+                },
+            ),
+            (Peer::Agent, Frame::TreeReceived {}),
+            (Peer::Host, Frame::Start {}),
+            (Peer::Agent, Frame::Started {}),
+        ] {
+            protocol.accept(peer, &frame).unwrap();
+        }
+        let mut bounds = Bounds::new(0);
+        bounds.enter(Phase::Running, 0).unwrap();
+        Transport {
+            stream,
+            agent_path: PathBuf::from("<backpressured output stream>"),
+            input: Vec::new(),
+            protocol,
+            bounds,
+            clock: Clock {
+                origin: Instant::now(),
+                fake: Some(Arc::new(|| 600_000)),
+            },
+            control,
+            cancelled: false,
+            pending_cache: None,
+            phase_hook: None,
+            blocked_write: None,
+        }
+    }
+
+    #[test]
+    fn windows_backend_output_backpressure_wakes_for_cancel_and_abandon() {
+        for abandon in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let control = Arc::new(Control::default());
+            let mut transport = running_transport(stream, control.clone());
+            let (tx, _unread) = mpsc::sync_channel(1);
+            tx.send(vec![1]).unwrap();
+            let (done, result) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = transport.control.worker.set(std::thread::current());
+                done.send(transport.forward_output(&tx, vec![2])).unwrap();
+            });
+            let began = Instant::now();
+            while !control.output_blocked.load(Ordering::Acquire) {
+                assert!(began.elapsed() < Duration::from_secs(1));
+                std::thread::yield_now();
+            }
+            if abandon {
+                control.abandon();
+            } else {
+                control.cancel.store(1, Ordering::Release);
+                control.wake();
+                assert_eq!(
+                    motor_winagent::read_frame(&mut peer).unwrap(),
+                    Some(Frame::Cancel {})
+                );
+                assert!(result.try_recv().is_err(), "soft cancel discarded output");
+                control.cancel.store(2, Ordering::Release);
+                control.wake();
+            }
+            let error = result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+            worker.join().unwrap();
+            assert!(error.to_string().contains("cancellation or owner drop"));
+        }
+    }
+
+    #[test]
+    fn windows_backend_output_backpressure_retains_pending_frame_after_soft_cancel() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let control = Arc::new(Control::default());
+        control.cancel.store(1, Ordering::Release);
+        let mut transport = running_transport(stream, control);
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(vec![1]).unwrap();
+        let worker = std::thread::spawn(move || transport.forward_output(&tx, vec![2]));
+        assert_eq!(
+            motor_winagent::read_frame(&mut peer).unwrap(),
+            Some(Frame::Cancel {})
+        );
+        assert_eq!(rx.recv().unwrap(), [1]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), [2]);
+        worker.join().unwrap().unwrap();
+    }
 
     #[test]
     fn windows_backend_cache_failure_interrupts_a_blocked_tree_upload() {
