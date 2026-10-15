@@ -44,6 +44,96 @@ fn staged_target_paths_never_enter_the_tree_hash() {
     }
 }
 
+#[test]
+fn committed_top_level_target_is_excluded_but_nested_target_is_captured() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.main.join("target")).unwrap();
+    fs::create_dir_all(f.main.join("src/target")).unwrap();
+    fs::write(f.main.join("target/committed"), "build output").unwrap();
+    let (_, head_tree) = commit(&f.main, "first\n");
+    git(&f.main, &["rm", "--cached", "target/committed"]);
+    let expected = git(&f.main, &["write-tree"]);
+    fs::write(f.main.join("target/committed"), "changed output").unwrap();
+    fs::write(f.main.join("target/untracked"), "untracked output").unwrap();
+    let runner = Runner::open(f.config()).unwrap();
+    assert_ne!(expected, head_tree);
+    assert_eq!(runner.core.trees.tree_hash(&f.main).unwrap(), expected);
+    fs::write(f.main.join("src/target/input"), "source input").unwrap();
+    git(&f.main, &["add", "src/target/input"]);
+    let nested = git(&f.main, &["write-tree"]);
+    assert_ne!(nested, expected);
+    assert_eq!(runner.core.trees.tree_hash(&f.main).unwrap(), nested);
+}
+
+#[tokio::test]
+async fn mismatch_refusal_names_computed_tree_and_bounded_differing_paths() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    for n in 0..7 {
+        let name = format!("different-{n}-secret-mismatch-value");
+        fs::write(f.main.join(&name), "different").unwrap();
+    }
+    let (_, expected) = commit(&f.main, "first\n");
+    for n in 0..7 {
+        git(
+            &f.main,
+            &["rm", &format!("different-{n}-secret-mismatch-value")],
+        );
+    }
+    commit(&f.main, "second\n");
+    let (mut request, bytes) = f.run("touch marker");
+    let computed = request.tree_hash.clone();
+    request.tree_hash = expected;
+    request
+        .env
+        .insert("LANG".into(), "secret-mismatch-value".into());
+    f.submit(&runner, &request, &bytes);
+    let record = terminal(&runner, request.job_id).await;
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::TreeHashMismatch
+        }
+    );
+    let detail = record.refusal_detail().expect("missing mismatch detail");
+    assert!(detail.contains(&computed), "{detail}");
+    assert!(detail.contains("different-0"), "{detail}");
+    assert!(detail.contains("different-4"), "{detail}");
+    assert!(!detail.contains("different-5"), "{detail}");
+    assert!(detail.contains("3 more"), "{detail}");
+    assert!(detail.contains("runner environment"), "{detail}");
+    assert!(!detail.contains("secret-mismatch-value"), "{detail}");
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+    assert!(!Path::new(&f.key).join("marker").exists());
+}
+
+#[test]
+fn mismatch_detail_redacts_whole_paths_before_truncation() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let computed = git(&f.main, &["rev-parse", "HEAD^{tree}"]);
+    let secret = format!("{}\nprivate", "secret-".repeat(20));
+    let prefix = "p".repeat(80);
+    for n in 0..7 {
+        let name = format!("{n}-{prefix}-{secret}");
+        fs::write(f.main.join(&name), "different").unwrap();
+        git(&f.main, &["add", &name]);
+    }
+    let expected = git(&f.main, &["write-tree"]);
+    let error = Trees::tree_hash_mismatch(&f.main, &expected, &computed);
+    let bounded = runner.safe_refusal_detail(&error, []);
+    assert_eq!(bounded.len(), REFUSAL_DETAIL_MAX_BYTES);
+    assert!(bounded.contains("2 more"), "{bounded}");
+    let detail = runner.safe_refusal_detail(&error, [secret]);
+    assert!(detail.contains(&computed), "{detail}");
+    assert!(detail.contains("2 more"), "{detail}");
+    assert!(detail.contains("runner environment"), "{detail}");
+    assert!(!detail.contains("secret-"), "{detail}");
+    assert!(!detail.contains("private"), "{detail}");
+    assert!(!detail.contains(&format!("5-{prefix}")), "{detail}");
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+}
+
 fn sync_stages_ignored_snapshot_inputs(reuse: bool) {
     let f = Fixture::new();
     fs::write(f.main.join(".gitignore"), "inputs/\n").unwrap();

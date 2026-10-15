@@ -166,7 +166,7 @@ not know, still proves no start. Test: `unknown_refusal_retains_the_before_start
 | `runner_disk_full` | Free disk space is below the floor. |
 | `queue_wait_exceeded` | The job waited longer than its queue-wait budget. |
 | `transfer_interrupted` | The upload was cut before the runner had every bundle, or an upload or fetch stalled. |
-| `tree_hash_mismatch` | The runner's checkout does not match the snapshot's tree hash. |
+| `tree_hash_mismatch` | The runner's checkout does not match the snapshot's tree hash. The diagnostic detail names its computed tree and at most five differing paths, with a count of the rest (or says the caller tree cannot be compared). |
 | `bundle_rejected` | A bundle failed verification or fetch. |
 | `workspace_setup_failed` | Workspace setup or isolated-job launch failed, or persistence/output setup failed before the execution gate opened. |
 | `network_unsupported` | Outbound network was requested and is not available. |

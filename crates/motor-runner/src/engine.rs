@@ -3542,12 +3542,13 @@ impl Runner {
             let detail = detail.unwrap_or_else(|| error.to_string());
             let safe_detail = self.safe_refusal_detail(detail, r.env.values().cloned());
             let j = inner.jobs.get_mut(&id).unwrap();
+            // Logs must not bypass the redaction and size limit applied to the wire detail.
             refuse_before_start(
                 &self.core.health,
                 j,
                 reason,
-                error,
-                Some(safe_detail),
+                &safe_detail,
+                Some(safe_detail.clone()),
                 self.now(),
             );
             j.state = JobState::Tombstone;
@@ -3560,7 +3561,9 @@ impl Runner {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                let (reason, detail) = if error.to_string() == "tree_hash_mismatch" {
+                let (reason, detail) = if error.to_string() == "tree_hash_mismatch"
+                    || error.to_string().starts_with("tree_hash_mismatch:")
+                {
                     (RefusalReason::TreeHashMismatch, None)
                 } else if error.to_string().starts_with("runner_disk_full:") {
                     (RefusalReason::RunnerDiskFull, Some(error.to_string()))

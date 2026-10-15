@@ -339,8 +339,13 @@ pub(crate) fn execute_with_fetch(
                 snapshot,
                 &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)],
             )?;
-            if String::from_utf8_lossy(&tree.stdout).trim() != plan.tree_hash {
-                return Err(invalid("tree_hash_mismatch"));
+            let computed = String::from_utf8_lossy(&tree.stdout);
+            if computed.trim() != plan.tree_hash {
+                return Err(Trees::tree_hash_mismatch(
+                    &snapshot.mirror,
+                    &plan.tree_hash,
+                    computed.trim(),
+                ));
             }
         }
         fs::create_dir_all(&root)?;
