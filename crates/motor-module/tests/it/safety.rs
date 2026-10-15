@@ -74,12 +74,67 @@ async fn snapshots_preserve_head_real_index_status_and_refs_on_success_and_failu
         }
     );
     assert!(terminal(&records).tree_hash.is_some());
-    assert_eq!(
-        terminal(&records).refusal_detail(),
-        Some("snapshot capture failed")
+    let detail = terminal(&records).refusal_detail().unwrap();
+    assert!(
+        detail.starts_with("snapshot capture failed: fatal:"),
+        "{detail}"
     );
+    assert!(detail.contains("invalid-tree"), "{detail}");
+    assert!(!detail.contains('\n'), "{detail}");
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+    let prepare = serde_json::from_value(serde_json::json!({
+        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": []
+    }))
+    .unwrap();
+    let reply = failed.prepare(prepare).await.unwrap();
+    assert_eq!(reply.refusal_detail(), Some(detail));
     assert_eq!(before, state(&f.key));
     assert_eq!(sibling_before, state(&f.sibling));
+    assert!(!f.remote_key.join("marker").exists());
+}
+
+#[tokio::test]
+async fn failed_git_add_reports_first_stderr_line_with_request_secrets_redacted() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let attributes = git(
+        &f.key,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/attributes",
+        ],
+    );
+    fs::write(attributes, "source filter=snapshot-error\n").unwrap();
+    git(
+        &f.key,
+        &[
+            "config",
+            "filter.snapshot-error.clean",
+            "printf 'clean failed secret-stderr-value\\nsecond stderr line\\n' >&2; exit 1",
+        ],
+    );
+    git(
+        &f.key,
+        &["config", "filter.snapshot-error.required", "true"],
+    );
+    fs::write(f.key.join("source"), "changed input").unwrap();
+    let mut request = f.request("touch marker");
+    request
+        .env
+        .insert("RUSTFLAGS".into(), "secret-stderr-value".into());
+    let records = collect(f.motor().run(request).unwrap()).await;
+    let record = terminal(&records);
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::SnapshotFailed
+        }
+    );
+    assert_eq!(
+        record.refusal_detail(),
+        Some("snapshot capture failed: clean failed client environment")
+    );
     assert!(!f.remote_key.join("marker").exists());
 }
 #[tokio::test]

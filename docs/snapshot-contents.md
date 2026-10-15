@@ -58,6 +58,13 @@ as long as it still exists in the working tree. Tests:
 `tree_hash_includes_force_added_ignored_inputs_from_the_real_index`
 (`crates/motor-runner/src/tests/workspace_snapshots.rs`).
 
+Tracked files inside ignored directories remain source inputs; ignored,
+untracked siblings stay out. Capture uses recursive `git add -A -- .`, not an
+explicit list of positive pathspecs, because Git can reject an explicitly named
+ignored directory even when it contains tracked files. Test:
+`tracked_file_under_ignored_directory_is_captured_without_ignored_sibling`
+(`snapshot.rs`).
+
 2.4. A tracked submodule stays a gitlink at its recorded commit. Test:
 `tracked_submodule_gitlink_is_preserved_in_snapshot` (`workspace_capture.rs`).
 
@@ -82,6 +89,7 @@ restored as source inputs. Tests:
 `workspace_and_sibling_exclude_all_top_level_target_but_keep_nested_target`,
 `staged_file_under_target_is_not_sent_and_does_not_block_the_job` (`safety.rs`),
 `untracked_top_level_target_does_not_change_snapshot_or_fingerprint`,
+`top_level_target_file_symlink_and_repository_are_excluded`,
 `nested_target_is_source_but_committed_top_level_target_is_not`,
 `untracked_size_cap_excludes_only_top_level_target` (`snapshot.rs`),
 `staged_target_paths_never_enter_the_tree_hash`,
@@ -126,6 +134,15 @@ attempts, then refuses with `snapshot_failed`. Tests:
 `one_checkout_change_retries_then_captures_the_quiet_state`,
 `capture_fingerprint_detects_transient_untracked_files_and_head_changes`,
 `fingerprint_includes_ignored_ignore_and_attribute_files`.
+
+A failed Git command includes its first stderr line in the snapshot refusal
+and log. Request and process environment values of at least eight bytes and
+snapshot state paths are redacted before selecting the line and applying the
+1024-byte limit. Tests:
+`failed_git_add_reports_first_stderr_line_with_request_secrets_redacted`,
+`snapshots_preserve_head_real_index_status_and_refs_on_success_and_failure`
+(`safety.rs`), `snapshot_refusal_keeps_first_error_line_and_redacts_before_bounding`
+(`motor.rs`).
 
 5.2. Capture never changes the caller's checkout: `HEAD`, the branch, the real
 index, working files and refs stay as they were, on success and on failure.

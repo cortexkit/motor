@@ -170,6 +170,20 @@ fn runner_owned(name: &[u8]) -> bool {
     name == b"target" || name.starts_with(b"target/")
 }
 
+fn target_is_ignored(path: &Path) -> io::Result<bool> {
+    let ignored = command(path)
+        .args(["check-ignore", "--no-index", "--quiet", "--", "target"])
+        .output()?;
+    match ignored.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(io::Error::other(format!(
+            "git check-ignore: {}",
+            String::from_utf8_lossy(&ignored.stderr)
+        ))),
+    }
+}
+
 pub(crate) fn check_untracked_content<'a>(
     paths: impl Iterator<Item = &'a Path>,
     spool: &Path,
@@ -383,11 +397,16 @@ fn untracked_directories(
         let ignored = command(root)
             .args(["check-ignore", "--quiet", "--"])
             .arg(&child)
-            .status()?;
-        match ignored.code() {
+            .output()?;
+        match ignored.status.code() {
             Some(0) => {}
             Some(1) => untracked_directories(root, &child, head_gitlinks, paths)?,
-            _ => return Err(io::Error::other("cannot enumerate snapshot directories")),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "cannot enumerate snapshot directories: {}",
+                    String::from_utf8_lossy(&ignored.stderr)
+                )))
+            }
         }
     }
     Ok(())
@@ -408,9 +427,10 @@ fn force_add_staged_ignored(path: &Path, index: &Index) -> io::Result<()> {
         ])
         .output()?;
     if !listed.status.success() {
-        return Err(io::Error::other(
-            "cannot list staged ignored snapshot files",
-        ));
+        return Err(io::Error::other(format!(
+            "cannot list staged ignored snapshot files: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        )));
     }
     let mut paths = Vec::new();
     for name in listed.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
@@ -475,7 +495,10 @@ fn fingerprint(path: &Path, index: &Index) -> io::Result<Fingerprint> {
         ])
         .output()?;
     if !listed.status.success() {
-        return Err(io::Error::other("cannot enumerate snapshot files"));
+        return Err(io::Error::other(format!(
+            "cannot enumerate snapshot files: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        )));
     }
     let mut paths = BTreeSet::from([PathBuf::new()]);
     for name in listed.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
@@ -504,7 +527,10 @@ fn fingerprint(path: &Path, index: &Index) -> io::Result<Fingerprint> {
         ])
         .output()?;
     if !directories.status.success() {
-        return Err(io::Error::other("cannot enumerate snapshot directories"));
+        return Err(io::Error::other(format!(
+            "cannot enumerate snapshot directories: {}",
+            String::from_utf8_lossy(&directories.stderr)
+        )));
     }
     // Empty untracked directories can gain and lose files during git add. Their
     // timestamps catch that race even when both file inventories are identical.
@@ -633,6 +659,7 @@ fn snapshot_with_hook_and_timeout(
             let index = Index(spool.join(format!("index-{index_number}")));
             let before = match fingerprint(path, &index) {
                 Ok(f) => f,
+                Err(error) if attempt == 2 => return Err(error),
                 Err(_) => continue,
             };
             let head = before.head.clone();
@@ -642,21 +669,15 @@ fn snapshot_with_hook_and_timeout(
             // HEAD as a gitlink. Exclude untracked repositories that have no
             // commit from git add.
             let others = command(path)
-                .env("GIT_INDEX_FILE", &index.0)
-                .args([
-                    "ls-files",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "-z",
-                ])
+                .args(["ls-files", "--others", "--exclude-standard", "-z"])
                 .output()?;
             if !others.status.success() {
-                return Err(io::Error::other(
-                    "cannot enumerate untracked snapshot files",
-                ));
+                return Err(io::Error::other(format!(
+                    "cannot enumerate untracked snapshot files: {}",
+                    String::from_utf8_lossy(&others.stderr)
+                )));
             }
-            let mut add_paths = Vec::new();
+            let mut excludes = Vec::new();
             for name in others.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
                 if runner_owned(name) {
                     continue;
@@ -668,37 +689,35 @@ fn snapshot_with_hook_and_timeout(
                         let has_commit =
                             git(&path.join(rel), &["rev-parse", "--verify", "HEAD"]).is_ok();
                         if !has_commit {
-                            continue;
+                            excludes.push(clean.to_vec());
                         }
                     }
                 }
-                add_paths.extend_from_slice(name);
-                add_paths.push(0);
             }
-            // Enumerate literal source paths rather than using a negative target
-            // pathspec: git add rejects an ignored target even when excluded.
-            if !add_paths.is_empty() {
-                let mut child = command(path)
-                    .env("GIT_INDEX_FILE", &index.0)
-                    .args([
-                        "--literal-pathspecs",
-                        "add",
-                        "-A",
-                        "--pathspec-from-file=-",
-                        "--pathspec-file-nul",
-                    ])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()?;
-                child.stdin.take().unwrap().write_all(&add_paths)?;
-                let added = child.wait_with_output()?;
-                if !added.status.success() {
-                    return Err(io::Error::other(
-                        String::from_utf8_lossy(&added.stderr).into_owned(),
-                    ));
-                }
+            let mut cmd = command(path);
+            cmd.env("GIT_INDEX_FILE", &index.0)
+                .args(["add", "-A", "--", "."]);
+            // Git rejects even a negative pathspec when target is ignored.
+            // Recursive add already skips it; cached removal below also
+            // drops any committed entries from the temporary index.
+            if !target_is_ignored(path)? {
+                cmd.arg(":(top,exclude)target");
             }
+            for exclude in &excludes {
+                let mut arg = std::ffi::OsString::from(":(exclude,literal)");
+                arg.push(std::ffi::OsStr::from_bytes(exclude));
+                cmd.arg(arg);
+            }
+            output(&mut cmd)?;
+            output(command(path).env("GIT_INDEX_FILE", &index.0).args([
+                "rm",
+                "-r",
+                "--cached",
+                "--quiet",
+                "--ignore-unmatch",
+                "--",
+                ":(top)target",
+            ]))?;
             // Git tracks a path once it is in the caller's index, even when it
             // matches .gitignore. The snapshot index starts from HEAD, so `add -A`
             // above skips such a path when it is staged but not yet committed.
@@ -706,22 +725,23 @@ fn snapshot_with_hook_and_timeout(
             force_add_staged_ignored(path, &index)?;
             // Untracked nested repositories and linked worktrees are added as
             // mode 160000 gitlinks by git add -A when they have a commit checked out.
-            // Remove new gitlinks and all runner-owned paths inherited from HEAD.
+            // Remove every mode-160000 entry whose path is not a gitlink in HEAD.
             let listed = command(path)
                 .env("GIT_INDEX_FILE", &index.0)
                 .args(["ls-files", "-s", "-z"])
                 .output()?;
             if !listed.status.success() {
-                return Err(io::Error::other("cannot inspect snapshot index"));
+                return Err(io::Error::other(format!(
+                    "cannot inspect snapshot index: {}",
+                    String::from_utf8_lossy(&listed.stderr)
+                )));
             }
             let mut remove_paths = Vec::new();
             for entry in listed.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
                 if let Some(tab) = entry.iter().position(|b| *b == b'\t') {
                     let entry_path = &entry[tab + 1..];
                     let rel = Path::new(std::ffi::OsStr::from_bytes(entry_path));
-                    if runner_owned(entry_path)
-                        || (entry.starts_with(b"160000 ") && !head_gitlinks.contains(rel))
-                    {
+                    if entry.starts_with(b"160000 ") && !head_gitlinks.contains(rel) {
                         remove_paths.extend_from_slice(entry_path);
                         remove_paths.push(0);
                     }
@@ -756,8 +776,10 @@ fn snapshot_with_hook_and_timeout(
             // A moving checkout must never publish the temporary index's mixed tree.
             // Rebuild the index on each retry and compare HEAD and the complete path
             // inventory, including newly created untracked files and symlink metadata.
-            if !fingerprint(path, &index).is_ok_and(|after| before == after) {
-                continue;
+            match fingerprint(path, &index) {
+                Ok(after) if before == after => {}
+                Err(error) if attempt == 2 => return Err(error),
+                _ => continue,
             }
             tree_hash = Some(tree.clone());
             let head_tree = git(path, &["rev-parse", &format!("{head}^{{tree}}")])?;
@@ -797,7 +819,7 @@ fn snapshot_with_hook_and_timeout(
             {
                 detail
             } else {
-                "snapshot capture failed".into()
+                format!("snapshot capture failed: {detail}")
             },
         }
     })
@@ -1373,18 +1395,118 @@ mod tests {
 
     #[test]
     fn untracked_top_level_target_does_not_change_snapshot_or_fingerprint() {
+        for ignore in ["", "target/\n"] {
+            let (_scratch, checkout, spool, head) = repository();
+            fs::write(checkout.join(".gitignore"), ignore).unwrap();
+            let head = prepare_commit(&checkout, &head);
+            git(&checkout, &["reset", "--hard", &head]).unwrap();
+            fs::create_dir_all(checkout.join("target/build")).unwrap();
+            let index = Index(spool.join("fingerprint-index"));
+            let before = fingerprint(&checkout, &index).unwrap();
+            fs::write(checkout.join("target/build/artifact"), "build output").unwrap();
+            let captured = snapshot(&checkout, "test".into(), &spool, 0, false).unwrap();
+            assert_eq!(
+                captured.tree_hash,
+                git(&checkout, &["rev-parse", "HEAD^{tree}"]).unwrap()
+            );
+            assert_eq!(captured.commit, head);
+            assert_eq!(fingerprint(&checkout, &index).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn tracked_file_under_ignored_directory_is_captured_without_ignored_sibling() {
         let (_scratch, checkout, spool, head) = repository();
-        fs::create_dir_all(checkout.join("target/build")).unwrap();
-        let index = Index(spool.join("fingerprint-index"));
-        let before = fingerprint(&checkout, &index).unwrap();
-        fs::write(checkout.join("target/build/artifact"), "build output").unwrap();
+        fs::write(checkout.join(".gitignore"), "inputs/\n").unwrap();
+        fs::create_dir_all(checkout.join("inputs")).unwrap();
+        fs::write(checkout.join("inputs/tracked"), "committed input").unwrap();
+        git(&checkout, &["add", "-f", "inputs/tracked"]).unwrap();
+        let head = prepare_commit(&checkout, &head);
+        git(&checkout, &["reset", "--hard", &head]).unwrap();
+        fs::write(checkout.join("inputs/tracked"), "changed input").unwrap();
+        fs::write(checkout.join("inputs/ignored"), "ignored sibling").unwrap();
+        let before = git(&checkout, &["status", "--porcelain=v1"]).unwrap();
         let captured = snapshot(&checkout, "test".into(), &spool, 0, false).unwrap();
         assert_eq!(
-            captured.tree_hash,
-            git(&checkout, &["rev-parse", "HEAD^{tree}"]).unwrap()
+            git(
+                &checkout,
+                &["show", &format!("{}:inputs/tracked", captured.tree_hash)]
+            )
+            .unwrap(),
+            "changed input"
         );
-        assert_eq!(captured.commit, head);
-        assert_eq!(fingerprint(&checkout, &index).unwrap(), before);
+        assert_eq!(
+            git(
+                &checkout,
+                &["ls-tree", "-r", "--name-only", &captured.tree_hash]
+            )
+            .unwrap(),
+            ".gitignore\ninputs/tracked\nsource.txt"
+        );
+        assert_eq!(
+            git(&checkout, &["status", "--porcelain=v1"]).unwrap(),
+            before
+        );
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).unwrap(), head);
+    }
+
+    #[test]
+    fn top_level_target_file_symlink_and_repository_are_excluded() {
+        for kind in [
+            "file",
+            "symlink",
+            "unborn repository",
+            "committed repository",
+        ] {
+            let (_scratch, checkout, spool, _) = repository();
+            let target = checkout.join("target");
+            match kind {
+                "file" => {
+                    fs::write(&target, "build output").unwrap();
+                }
+                "symlink" => {
+                    std::os::unix::fs::symlink("source.txt", &target).unwrap();
+                }
+                _ => {
+                    fs::create_dir(&target).unwrap();
+                    git(&target, &["init", "-q"]).unwrap();
+                    if kind == "committed repository" {
+                        fs::write(target.join("source.txt"), "nested input").unwrap();
+                        git(&target, &["add", "."]).unwrap();
+                        git(
+                            &target,
+                            &[
+                                "-c",
+                                "user.name=Test",
+                                "-c",
+                                "user.email=test@example.invalid",
+                                "commit",
+                                "-m",
+                                "nested input",
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            let captured = snapshot(&checkout, "test".into(), &spool, 0, false).unwrap();
+            assert_eq!(
+                git(
+                    &checkout,
+                    &["ls-tree", "-r", "--name-only", &captured.tree_hash]
+                )
+                .unwrap(),
+                "source.txt",
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_ignore_probe_reports_git_errors() {
+        let scratch = ScratchDir::new("motor-snapshot-ignore-error");
+        let error = target_is_ignored(&scratch).unwrap_err().to_string();
+        assert!(error.starts_with("git check-ignore: fatal:"), "{error}");
     }
 
     #[test]

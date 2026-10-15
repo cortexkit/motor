@@ -297,13 +297,18 @@ impl Motor {
         let snapshots = match snapshots {
             Ok(s) => s,
             Err(f) => {
-                tracing::warn!(job_id = %id, check = f.check, "snapshot refused");
+                let detail = snapshot_refusal_detail(
+                    f.check,
+                    &self.spool_root,
+                    request.env.values().cloned(),
+                );
+                tracing::warn!(job_id = %id, check = detail, "snapshot refused");
                 return self
                     .refused(
                         id,
                         RefusalReason::SnapshotFailed,
                         f.tree_hash,
-                        Some(f.check.to_string()),
+                        Some(detail),
                         tx,
                     )
                     .await;
@@ -856,9 +861,11 @@ impl Motor {
         let snapshots = match snapshots {
             Ok(s) => s,
             Err(f) => {
-                tracing::warn!(transfer_id = %id, check = f.check, "snapshot refused");
-                return Ok(prepare_refused(id, RefusalReason::SnapshotFailed)
-                    .with_refusal_detail(bounded_detail(f.check.to_string())));
+                let detail = snapshot_refusal_detail(f.check, &self.spool_root, []);
+                tracing::warn!(transfer_id = %id, check = detail, "snapshot refused");
+                return Ok(
+                    prepare_refused(id, RefusalReason::SnapshotFailed).with_refusal_detail(detail)
+                );
             }
         };
         let mut channel = match open_for_request(self.connector.as_ref(), id).await {
@@ -990,6 +997,63 @@ fn bounded_detail(mut detail: String) -> String {
     }
     detail.truncate(end);
     detail
+}
+
+fn snapshot_refusal_detail(
+    mut detail: String,
+    spool_root: &Path,
+    environment_values: impl IntoIterator<Item = String>,
+) -> String {
+    // Skip short environment values such as "0" so redaction does not replace
+    // unrelated diagnostic text.
+    let mut redactions: Vec<_> = environment_values
+        .into_iter()
+        .chain(std::env::vars_os().filter_map(|(_, value)| value.into_string().ok()))
+        .filter(|value| value.len() >= 8)
+        .map(|value| (value, "client environment"))
+        .collect();
+    for path in [Some(spool_root), spool_root.parent()]
+        .into_iter()
+        .flatten()
+    {
+        if path != Path::new("/") && !path.as_os_str().is_empty() {
+            redactions.push((path.to_string_lossy().into_owned(), "snapshot state"));
+        }
+    }
+    redactions.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    for (value, replacement) in redactions {
+        detail = detail.replace(&value, replacement);
+    }
+    // Redact before taking a line or truncating so a multiline secret cannot
+    // leave an exposed prefix in the diagnostic.
+    bounded_detail(detail.lines().next().unwrap_or_default().to_owned())
+}
+
+#[cfg(test)]
+mod snapshot_detail_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_refusal_keeps_first_error_line_and_redacts_before_bounding() {
+        let secret = "private-first-line\nprivate-second-line";
+        let state = Path::new("/snapshot-test-state/spools");
+        let detail = snapshot_refusal_detail(
+            format!("snapshot capture failed: fatal: {secret} at /snapshot-test-state/spools/index\nsecond stderr line"),
+            state,
+            [secret.to_owned()],
+        );
+        assert_eq!(
+            detail,
+            "snapshot capture failed: fatal: client environment at snapshot state/index"
+        );
+        let long = snapshot_refusal_detail(
+            format!("snapshot capture failed: {}", "é".repeat(1000)),
+            state,
+            [],
+        );
+        assert!(long.len() <= REFUSAL_DETAIL_MAX_BYTES);
+        assert!(long.len() >= REFUSAL_DETAIL_MAX_BYTES - 1);
+    }
 }
 fn runner_refusal_fields(refusal: &Refusal) -> (RefusalReason, Option<String>) {
     if let Some(full) = &refusal.disk_full {
