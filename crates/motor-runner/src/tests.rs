@@ -639,15 +639,23 @@ fn require_reflink_scratch(scratch: &Path) {
 }
 
 fn runner_diagnostics(runner: &Runner) -> String {
+    let config = format!("allowed_roots={:?}", runner.config().owned_workspace_roots);
+    // Diagnostics may run while the caller holds the state lock. Keep live
+    // state best-effort, but never hide configuration behind that lock.
     let Ok(inner) = runner.core.inner.try_lock() else {
-        return "runner state lock unavailable".into();
+        return format!("{config}; runner state lock unavailable");
     };
     let jobs: Vec<_> = inner.jobs.values().map(|job| {
         format!("id={} base={} state={:?} key={} cwd={:?} process={:?} started_ms={:?} monitoring_error={:?} terminal={:?}",
             job.id, job.base, job.state, job.key(), job.request.as_ref().map(|r| &r.cwd), job.process, job.started_ms, job.monitoring_error, job.terminal)
     }).collect();
-    format!("jobs={jobs:#?}; starting={:?}; finalizing={:?}; reserved={:?}; dropping={:?}; owned_roots={:?}",
-        inner.starting, inner.finalizing, inner.reserved.keys().collect::<Vec<_>>(), inner.dropping, runner.config().owned_workspace_roots)
+    format!(
+        "{config}; jobs={jobs:#?}; starting={:?}; finalizing={:?}; reserved={:?}; dropping={:?}",
+        inner.starting,
+        inner.finalizing,
+        inner.reserved.keys().collect::<Vec<_>>(),
+        inner.dropping
+    )
 }
 
 fn assert_run_accepted(runner: &Runner, request: &Run) {
@@ -4452,6 +4460,22 @@ fn runner_socket_parent_is_private_before_binding() {
             .mode()
             & 0o777,
         0o700
+    );
+}
+
+#[test]
+fn admission_failure_diagnostics_include_config_while_state_is_locked() {
+    let f = Fixture::new();
+    let config = f.config();
+    let roots = format!("allowed_roots={:?}", config.owned_workspace_roots);
+    let runner = Runner::open(config).unwrap();
+    let state = runner.core.inner.lock().unwrap();
+    let message = runner_diagnostics(&runner);
+    drop(state);
+    assert!(message.contains(&roots), "missing {roots:?} in {message}");
+    assert!(
+        message.contains("runner state lock unavailable"),
+        "{message}"
     );
 }
 
