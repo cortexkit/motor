@@ -2484,6 +2484,69 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
         .exists());
 }
 
+/// A job that would fit, held behind an older head that is past its backfill
+/// grace and still waiting for enough free permits, names that head as the
+/// reason instead of a generic queue label.
+#[tokio::test]
+async fn queue_wait_refusal_names_the_aged_head_that_blocks_a_fitting_job() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    warm(&f, &runner).await;
+    let release = f.scratch.join("release");
+    let (mut holder, bytes) = job_at(
+        &f,
+        "holder",
+        &format!(
+            "while test ! -e '{}'; do sleep .02; done",
+            release.display()
+        ),
+    );
+    holder.weight_hint = Some(20);
+    f.submit(&runner, &holder, &bytes);
+    until(|| {
+        runner
+            .status()
+            .running_jobs
+            .iter()
+            .any(|j| j.job_id == holder.job_id)
+    })
+    .await;
+    let (mut head, bytes) = f.run("true");
+    head.weight_hint = Some(16);
+    f.submit(&runner, &head, &bytes);
+    f.clock.fetch_add(61_000, Ordering::SeqCst);
+    let (mut small, bytes) = job_at(&f, "small", "touch must-not-run");
+    small.weight_hint = Some(4);
+    f.submit(&runner, &small, &bytes);
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.withdraw(small.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let record = terminal(&runner, small.job_id).await;
+    assert_eq!(
+        runner.withdraw(head.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    fs::write(release, "").unwrap();
+    terminal(&runner, holder.job_id).await;
+    let detail = record.refusal_detail().expect("missing queue diagnostic");
+    assert!(
+        detail.starts_with(&format!(
+            "waiting_on=older job ahead needs more free permits; blocked_by=job={} permits=16;",
+            head.job_id
+        )),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("requested_permits=4; held_permits=20/28"),
+        "{detail}"
+    );
+    assert!(!Path::new(&small.workspace_key)
+        .join("must-not-run")
+        .exists());
+}
+
 #[tokio::test]
 async fn conflicting_sibling_snapshots_serialize_and_stay_immutable() {
     let f = Fixture::new();

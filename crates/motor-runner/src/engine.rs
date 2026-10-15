@@ -2690,6 +2690,27 @@ impl Runner {
             .fold(0u32, |held, j| held.saturating_add(j.weight))
     }
 
+    /// The first queue head ahead of `id` that stops later heads from being
+    /// started for capacity, with whether it is a gate job. It mirrors the
+    /// scheduler's stop rule: a gate job, or a non-base job queued past
+    /// BACKFILL_GRACE_MS, that doesn't fit in the free permits.
+    fn blocking_head(&self, inner: &Inner, heads: &[Uuid], id: Uuid) -> Option<(Uuid, bool)> {
+        let now = self.now();
+        let held = Self::held_weight(inner);
+        heads
+            .iter()
+            .take_while(|head| **head != id)
+            .map(|head| &inner.jobs[head])
+            .find(|head| {
+                let aged = !head.base
+                    && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms))
+                        >= BACKFILL_GRACE_MS;
+                (head.gate_job() || aged)
+                    && held.saturating_add(head.weight) > self.core.config.max_weight
+            })
+            .map(|head| (head.id, head.gate_job()))
+    }
+
     fn queue_heads(&self, inner: &Inner) -> Vec<Uuid> {
         let mut keys = BTreeMap::<&str, &Job>::new();
         for job in Self::scheduler_jobs(inner)
@@ -2769,6 +2790,7 @@ impl Runner {
                 )
             })
             .collect();
+        let mut blocking_head = None;
         let phase = if job.state == JobState::AwaitingBundles {
             "bundle upload/fetch"
         } else if inner.starting.contains(&id) {
@@ -2789,9 +2811,26 @@ impl Runner {
         {
             "permits"
         } else {
-            "workspace FIFO / admission priority"
+            // This job would fit, so a job ahead of it holds the queue: a gate
+            // job, or an older job past its backfill grace that is waiting for
+            // enough free permits (the scheduler stops smaller jobs overtaking
+            // it so it cannot starve). Name that job.
+            blocking_head = self.blocking_head(inner, &heads, id);
+            match blocking_head {
+                Some((_, true)) => "gate job ahead",
+                Some((_, false)) => "older job ahead needs more free permits",
+                None => "queue order",
+            }
         };
-        format!("waiting_on={phase}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
+        let blocking = blocking_head
+            .map(|(head, _)| {
+                format!(
+                    "; blocked_by=job={head} permits={}",
+                    inner.jobs[&head].weight
+                )
+            })
+            .unwrap_or_default();
+        format!("waiting_on={phase}{blocking}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
             job.weight, Self::held_weight(inner), self.core.config.max_weight, job.accepted_ms,
             holders.join("; "), reservations.join("; "), pending_ahead.join("; "))
     }
