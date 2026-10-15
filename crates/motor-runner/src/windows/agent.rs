@@ -754,6 +754,61 @@ mod tests {
     }
 
     #[test]
+    fn windows_backend_upload_progress_refreshes_only_the_inactivity_deadline() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now = clock.clone();
+        let mut protocol = Protocol::new("nonce").unwrap();
+        protocol
+            .accept(
+                Peer::Agent,
+                &Frame::Hello {
+                    version: motor_winagent::PROTOCOL_VERSION,
+                    nonce: "nonce".into(),
+                },
+            )
+            .unwrap();
+        let mut transport = Transport {
+            stream,
+            agent_path: PathBuf::from("<active upload stream>"),
+            input: Vec::new(),
+            protocol,
+            bounds: Bounds::new(0),
+            clock: Clock {
+                origin: Instant::now(),
+                fake: Some(Arc::new(move || now.load(Ordering::SeqCst))),
+            },
+            control: Arc::new(Control::default()),
+            cancelled: false,
+            pending_cache: None,
+            phase_hook: None,
+            blocked_write: None,
+        };
+        transport.enter(Phase::Transfer).unwrap();
+        // Small, synchronously drained frames separate protocol time from socket
+        // throughput and make every completed send's deadline refresh observable.
+        for chunk in 1..=4 {
+            clock.store(
+                chunk * motor_winagent::REPLY_TIMEOUT_MS / 2,
+                Ordering::SeqCst,
+            );
+            let frame = Frame::ReceiveTree { bytes: vec![42] };
+            transport.send(&frame).unwrap();
+            assert_eq!(motor_winagent::read_frame(&mut peer).unwrap(), Some(frame));
+        }
+        assert!(clock.load(Ordering::SeqCst) > motor_winagent::REPLY_TIMEOUT_MS);
+        clock.fetch_add(motor_winagent::REPLY_TIMEOUT_MS, Ordering::SeqCst);
+        assert_eq!(
+            transport
+                .send(&Frame::ReceiveTree { bytes: vec![42] })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn windows_backend_cache_heartbeat_does_not_extend_transfer_deadline() {
         use motor_winagent::cache_steps::CacheStep;
         let (stream, mut peer) = UnixStream::pair().unwrap();

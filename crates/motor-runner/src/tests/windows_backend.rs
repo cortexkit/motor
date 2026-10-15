@@ -314,7 +314,7 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                         AgentFrame::ReceiveTree { bytes } => {
                             a.tree.lock().unwrap().extend(bytes);
                             if fault == Fault::SlowTransfer {
-                                a.clock.fetch_add(1_000, Ordering::SeqCst);
+                                a.clock.fetch_add(5_000, Ordering::SeqCst);
                             }
                         }
                         AgentFrame::TreeEnd { command } => break command,
@@ -894,7 +894,9 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
 async fn windows_backend_active_transfer_can_exceed_one_reply_timeout() {
     let f = Fixture::new();
     source(&f);
-    fs::write(f.main.join("large-snapshot"), vec![42; 5 * 1024 * 1024]).unwrap();
+    // Advance simulated time faster instead of serializing a multi-megabyte
+    // snapshot just to cross the reply deadline under the terminal poll's bound.
+    fs::write(f.main.join("large-snapshot"), vec![42; 1024 * 1024]).unwrap();
     git(&f.main, &["add", "."]);
     git(&f.main, &["commit", "-m", "large snapshot"]);
     let (c, a) = configure(&f, Fault::SlowTransfer, 0);
