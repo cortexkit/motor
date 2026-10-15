@@ -1080,10 +1080,14 @@ async fn windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadlin
         c.windows_vm = Some(Arc::new(move |_, _, _| Ok(Box::new(ExitedChild(code)))));
         let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
         let (r, bytes) = request(&f);
-        let began = std::time::Instant::now();
         f.submit(&runner, &r, &bytes);
         let t = terminal(&runner, r.job_id).await;
-        assert!(began.elapsed() < Duration::from_secs(5));
+        // The agent link reads the fixture's fake clock, which nothing advances
+        // here, so a terminal outcome while it still reads below the reply
+        // deadline proves the exit was noticed without waiting for that
+        // deadline. Wall time isn't asserted: under a loaded parallel suite,
+        // setup alone can take seconds.
+        assert!(a.clock.load(Ordering::SeqCst) < motor_winagent::REPLY_TIMEOUT_MS);
         assert_eq!(
             t.outcome,
             Outcome::RefusedBeforeStart {
