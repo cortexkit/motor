@@ -974,10 +974,14 @@ fn requested_threads_and_enforced_offline() {
         matches!(&replay[0], Frame::Started { path_mapping: Some(mapping), .. }
         if mapping == &PathMapping::new("/", r"C:\m"))
     );
+    // Read stdout alone: cargo writes its progress lines to stderr, and joining
+    // both streams can split the test harness's "... ok" line in two.
     let output: String = replay
         .iter()
         .filter_map(|frame| match frame {
-            Frame::Output(output) => Some(String::from_utf8_lossy(&output.bytes.0)),
+            Frame::Output(output) if output.stream == OutputStream::Stdout => {
+                Some(String::from_utf8_lossy(&output.bytes.0))
+            }
             _ => None,
         })
         .collect();
