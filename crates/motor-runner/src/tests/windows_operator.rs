@@ -1226,7 +1226,14 @@ fn main() {{ assert_eq!(commons::helper(), 42); assert_eq!(private::helper(), 42
                 "reused cache repeated its ACL propagation: {timing:?}"
             );
         }
-        assert!(output.contains("dependencies_work ... ok"), "{output}");
+        // The test harness writes its "... ok" line to stdout, while cargo and
+        // PowerShell progress go to stderr and can land between its halves in
+        // the combined output, so match it in stdout alone.
+        let stdout = replay_stdout(&runner, request.job_id);
+        assert!(
+            stdout.contains("dependencies_work ... ok"),
+            "{stdout}\n--- combined:\n{output}"
+        );
         if !with_bundle {
             for fresh in ["Fresh itoa v1.0.18", "Fresh private v0.1.0"] {
                 assert!(output.contains(fresh), "missing {fresh}: {output}");
@@ -1299,6 +1306,19 @@ fn submit_dependency(runner: &Runner, request: &Run, bytes: &[Vec<u8>], dependen
             .unwrap();
     }
     runner.fetch_run(request, &upload.directory, true).unwrap();
+}
+fn replay_stdout(runner: &Runner, id: Uuid) -> String {
+    runner
+        .replay(id, 0)
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(output) if output.stream == OutputStream::Stdout => {
+                Some(String::from_utf8_lossy(&output.bytes.0))
+            }
+            _ => None,
+        })
+        .collect()
 }
 fn replay_output(runner: &Runner, id: Uuid) -> String {
     runner
