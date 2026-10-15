@@ -604,10 +604,14 @@ mod tests {
     fn hung_remote_times_out_and_kills_helpers() {
         let f = Fixture::new();
         let escaped = f._scratch.join("helper-survived");
+        // The helper sleeps far longer than the timeout, so the timeout always
+        // fires. The timeout itself is long enough for the shell to start and
+        // write its first lines on a loaded host; 100 ms was not, and the
+        // helper was sometimes killed before it recorded the call.
         fs::write(
             &f.upload,
             format!(
-                "#!/bin/sh\nprintf 'call\\n' >> '{}'\n(sleep 1; touch '{}') &\necho 'waiting for remote' >&2\nwait\n",
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\n(sleep 5; touch '{}') &\necho 'waiting for remote' >&2\nwait\n",
                 f.calls.display(), escaped.display()
             ),
         )
@@ -616,20 +620,20 @@ mod tests {
         let _guard = crate::logging::scoped(captured.clone());
         let started = Instant::now();
         assert_eq!(
-            tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(100)),
+            tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(1500)),
             None
         );
         assert_eq!(
-            tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(100)),
+            tip_with_timeout(&f.root, &f.storage, &f.spool, Duration::from_millis(1500)),
             None
         );
         assert_eq!(f.calls(), 1);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4));
         let text = captured.text();
         assert_eq!(text.lines().count(), 1, "{text}");
         assert!(text.contains("category=timeout"), "{text}");
         assert!(text.contains("reason=waiting for remote"), "{text}");
-        thread::sleep(Duration::from_millis(1200));
+        thread::sleep(Duration::from_millis(5200));
         assert!(
             !escaped.exists(),
             "timeout must kill the helper process group"
