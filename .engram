@@ -1,0 +1,15 @@
+# Paths engram backs up nightly because git doesn't hold them (format v1:
+# one repo-relative file or folder per line; folders are recursive).
+.cortexkit/internal-docs/
+.cortexkit/windows-vm/
+.cortexkit/flows/
+.cortexkit/scripts/spike/
+.cortexkit/scripts/bench/sccache/
+# The Boat benchmark minus its node_modules, which bun.lock reproduces.
+.cortexkit/scripts/bench/boat/src/
+.cortexkit/scripts/bench/boat/test/
+.cortexkit/scripts/bench/boat/results/
+.cortexkit/scripts/bench/boat/README.md
+.cortexkit/scripts/bench/boat/bun.lock
+.cortexkit/scripts/bench/boat/package.json
+.cortexkit/scripts/bench/boat/tsconfig.json
