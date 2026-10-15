@@ -87,8 +87,12 @@ with the agent's values forced, case-insensitively, for `PATH`, `RUSTUP_HOME`,
 (`crates/motor-winagent/src/lib.rs`).
 
 3.5. The toolchain is the baseline's machine-wide Rust for
-`x86_64-pc-windows-msvc`, with MSVC Build Tools, Git and Bun. The job can read
-it but not change it. Test: `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build`
+`x86_64-pc-windows-msvc`, with MSVC Build Tools, Git, Bun and PowerShell
+7.6.7 at `C:\Program Files\PowerShell\7`. The job can read and execute the
+PowerShell installation but cannot write files or create entries anywhere in it.
+Its directory precedes Windows PowerShell 5.1 in the forced `PATH`; 5.1 remains
+available. Tests: `job_path_has_powershell_7_before_windows_powershell` and
+`windows_qualification_baseline_machine_wide_toolchain_and_msvc_build`
 (operator-only).
 
 3.6. The VM process on the host runs as the `motor-qemu` account in a transient
@@ -209,8 +213,21 @@ See [drain-and-rollback.md](drain-and-rollback.md).
 ## Cache disks
 
 Each workspace has its own 40 GiB build-cache disk, attached to the VM as a
-second drive with the serial `motor-cache`; the guest points the workspace's
-`target` directory at it. A disk is keyed by the workspace, the baseline name
+second drive with the serial `motor-cache`; the guest mounts it at `C:\t\`
+and junctions the workspace's `target` directory to that same volume root.
+Unless the caller sets `CARGO_TARGET_DIR` (case-insensitively), the agent defaults
+it to `C:\t`, keeping MSVC linker output paths short even for a long checkout.
+Default builds still persist on that workspace's cache disk, and reading
+`target/debug/...` in the checkout still works through the junction. An explicit
+caller target directory may bypass this cache, just as before. The new environment
+default overrides Cargo's `build.target-dir` configuration; a caller environment
+value or Cargo's `--target-dir` selects a different path. Tests:
+`job_target_dir_defaults_to_short_cache_mount`,
+`caller_target_dir_wins_case_insensitively`, and
+`windows_qualification_baseline_machine_wide_toolchain_and_msvc_build`
+(operator-only for the last test).
+
+A disk is keyed by the workspace, the baseline name
 and the toolchain version, so a new baseline or toolchain starts cold.
 
 A disk is kept for the next job only when the command reached a known outcome

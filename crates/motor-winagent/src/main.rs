@@ -15,8 +15,8 @@ mod storage;
 #[cfg(windows)]
 mod guest {
     use motor_winagent::{
-        CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CHUNK_BYTES, CacheAce, CacheTimings, Command,
-        Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
+        CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CACHE_MOUNT, CHUNK_BYTES, CacheAce, CacheTimings,
+        Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
         SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
         cache::{prepare_cache, select_cache_disk, storage_serial},
         cache_has_modify_grant,
@@ -54,7 +54,6 @@ mod guest {
     };
 
     const SOURCE_ROOT: &str = "C:\\m";
-    const CACHE_MOUNT: &str = "C:\\ProgramData\\Motor\\cache\\";
     const PASSWORD_FILE: &str = "C:\\ProgramData\\Motor\\job-password.txt";
     const BASH: &str = "C:\\Program Files\\Git\\bin\\bash.exe";
 

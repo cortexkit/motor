@@ -49,7 +49,12 @@ VM, the provisioning VM and job VMs can run at a time.
 ## 1. Render the setup CD
 
 Stop the standing VM if it runs, then render the job-image seed. Run from a
-checkout so the guest agent's source is found:
+checkout so the guest agent's source is found. Stage the official
+`PowerShell-7.6.7-win-x64.zip` in `/srv/build/windows-vm/provision/` first.
+The helper requires SHA-256
+`d2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7`
+and verifies the copied seed archive too. Keep `powershell_archive.py` next to
+`prepare-seed.py` when copying helpers to the host:
 
 ```sh
 sudo systemctl stop windows-build-vm.service
@@ -58,7 +63,12 @@ python3 script/windows-vm/prepare-seed.py --job-baseline
 
 This writes `/srv/build/windows-vm/provision/seed/` and `seed.iso` (volume
 label `CKSETUP`): an unattended-setup answer file with a random one-time
-password, the guest setup scripts, and the `crates/motor-winagent` source. The
+password, the guest setup scripts, the pinned PowerShell ZIP, and the
+`crates/motor-winagent` source. For job images only, the rendered answer replaces
+`FirstLogonCommands` with a specialize-pass command that registers `MotorBootstrap`
+as a SYSTEM logon task. The one temporary builder logon starts it without a UAC
+consent prompt; bootstrap removes the task immediately. The standing VM's answer
+keeps its existing first-logon behavior. The
 job image gets no SSH server and no authorized keys. The script refuses to run
 when a previous `seed/` or `seed.iso` exists. Delete both after provisioning:
 they contain the one-time password.
@@ -83,11 +93,14 @@ NAT network card without port forwarding (provisioning downloads updates and
 toolchains; job VMs later boot with no network card at all). It takes the slot
 lock and exits with status 75 if another VM holds it, naming the holder.
 
-On first logon the guest runs `bootstrap.ps1`, which disables the built-in
+The SYSTEM bootstrap task disables the built-in
 administrator, randomizes local passwords and runs, in order:
 
 1. `setup-guest.ps1 -JobBaseline`: Git, Bun and MSVC Build Tools.
-2. `setup-job-baseline.ps1`: the standard `motor-job` user and its batch-logon
+2. `setup-job-baseline.ps1`: PowerShell 7.6.7 installed natively by the elevated
+   `install-powershell.ps1` at `C:\Program Files\PowerShell\7`, protected with
+   SYSTEM/Administrators full control and Users read/execute; the standard
+   `motor-job` user and its batch-logon
    right, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
    `C:\rust` (read-only to the job user), the virtio-serial driver, and the
    guest agent built from the seed's source with
@@ -101,10 +114,24 @@ Success writes `C:\build\provision\provisioned`; failure writes
 `python3 script/windows-vm/control.py screenshot` and send keys with
 `script/windows-vm/console.py`.
 
-`script/windows-vm/finalize-job-baseline.ps1` installs pending Windows updates,
-rebooting up to five times, then powers the guest off. It is not on the default
-seed; run it in the guest when the image should carry current updates, and
-check its `finalize.log` for remaining updates before sealing.
+`bootstrap.ps1` also records `slmgr.vbs /dlv` and `/xpr` in its transcript,
+registers `MotorFinalize` as a SYSTEM startup task, and starts the first pass after
+closing the setup transcript. `finalize-job-baseline.ps1` scans and installs
+Windows updates, checking search/download/installation results. It reboots and
+reruns until no software updates and no pending reboot remain, at most five
+passes. Success removes the task, writes `C:\build\provision\finalized` and
+shuts down; failure writes `FAILED.txt`, removes the task and shuts down without
+a success marker. Inspect `bootstrap.log`, `finalize.log`, `provisioned` and
+`finalized`, and require no `FAILED.txt` before sealing. Shutdown alone is not
+success. The seed includes the finalizer; no manual PowerShell checklist or task
+registration is required for the normal job-image rebuild.
+
+Use a fresh empty provisioning disk. A populated disk may still cause the
+installation CD's “press any key” prompt; recreate the disposable disk or send
+Enter with `control.py` if that occurs. Setup/install/update failures need
+operator diagnosis, possibly at the console. Media verification, host launch,
+inspection of logs/licensing and clean QMP shutdown, sealing, and qualification
+remain operator steps; portable tests do not prove unattended Windows execution.
 
 Shut the guest down cleanly (`python3 script/windows-vm/control.py shutdown`
 waits for a guest-initiated shutdown) before sealing.
@@ -168,7 +195,7 @@ binary must come from the same commit. The lane runs, from
 
 | Test | Checks |
 | --- | --- |
-| `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | The baseline toolchain builds an MSVC binary. |
+| `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | Standard-user PowerShell 7.6.7 execution and recursive write denial; a long-checkout MSVC build uses `C:\t` and is readable through checkout `target/`. |
 | `windows_qualification_no_network_but_loopback_works` | No network beyond loopback. |
 | `windows_qualification_qemu_and_preparation_accounts_are_confined` | `motor-qemu` and `motor-prep` confinement. |
 | `windows_qualification_one_vm_slot_lock_refuses_without_boot` | A held slot refuses without booting. |
@@ -201,6 +228,12 @@ candidate with `qemu-nbd`, overwrites the agent in place (keeping its NTFS
 permissions), and verifies the SHA-256 after remounting read-only. It never
 opens the sealed original. Seal the candidate under a new name (step 3) and
 qualify it (step 5) before using it.
+
+This remains an agent-only update path. Adding PowerShell requires the full
+job-image rebuild above, not copying a tree offline or installing a temporary
+service helper. Linux NTFS creation is not proof of native Windows ACLs; the
+PowerShell installation and its protections are established by elevated Windows
+setup and then checked as the standard job user during qualification.
 
 ## Switch or roll back a baseline
 

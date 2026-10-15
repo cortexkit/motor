@@ -10,6 +10,7 @@ $JobBaseline = $JobBaseline -or (Test-Path "$($seed.DriveLetter):\job-baseline")
 New-Item C:\build\provision -ItemType Directory -Force | Out-Null
 Copy-Item "$($seed.DriveLetter):\*.ps1" C:\build\provision -Force
 if ($JobBaseline) {
+    Copy-Item "$($seed.DriveLetter):\PowerShell-7.6.7-win-x64.zip" C:\build\provision -Force
     Copy-Item "$($seed.DriveLetter):\motor-winagent" C:\build\provision -Recurse -Force
 } else {
     Copy-Item "$($seed.DriveLetter):\authorized_keys" C:\build\provision -Force
@@ -19,6 +20,7 @@ Get-ChildItem C:\build\provision -File -Recurse | ForEach-Object { $_.IsReadOnly
 Start-Transcript C:\build\provision\bootstrap.log -Append
 Remove-Item C:\build\provision\FAILED.txt -Force -ErrorAction SilentlyContinue
 try {
+    if ($JobBaseline) { Unregister-ScheduledTask -TaskName MotorBootstrap -Confirm:$false -ErrorAction SilentlyContinue }
     # Provisioning needs a NIC for Windows Update and official tool installers.
     $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
     if (-not $nic) {
@@ -99,6 +101,13 @@ Match Group administrators
     if ($JobBaseline) {
         & C:\build\provision\setup-job-baseline.ps1
         if (-not $?) { throw 'Job baseline setup failed' }
+        foreach ($option in @('/dlv', '/xpr')) {
+            & cscript.exe //nologo C:\Windows\System32\slmgr.vbs $option
+            if ($LASTEXITCODE -ne 0) { throw "Licensing status collection failed: $option" }
+        }
+        $action = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\build\provision\finalize-job-baseline.ps1'
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        Register-ScheduledTask -TaskName MotorFinalize -Action $action -Trigger $trigger -User SYSTEM -RunLevel Highest -Force | Out-Null
     }
     Set-Content C:\build\provision\provisioned (Get-Date -Format o)
 } catch {
@@ -107,3 +116,5 @@ Match Group administrators
 } finally {
     Stop-Transcript
 }
+# Start only after successful setup and a closed transcript; later passes run at startup.
+if ($JobBaseline) { Start-ScheduledTask -TaskName MotorFinalize }

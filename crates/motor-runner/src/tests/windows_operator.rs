@@ -168,23 +168,73 @@ fn no_units(runner: &Runner) {
     );
 }
 
-/// Break check: provision Rust only in the administrator's profile. The
-/// non-administrator command must then fail version lookup or the MSVC build.
+/// The standard job user must execute the machine-wide tools but cannot modify
+/// PowerShell. A long checkout must build through the short cache mount.
 #[test]
 #[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
 fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let runner = operator();
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    f.key = format!(
+        "/windows-qualification/{}/main",
+        ["long_checkout_component_01234567890123456789012345"; 4].join("/")
+    );
     source(&f);
+    let probe = powershell(&baseline_environment_script());
     let output = run(
         &runner,
         &f,
-        "set -e; rustc -vV; cargo --version; git --version; cargo run --offline",
+        &format!("set -e; rustc -vV; cargo --version; git --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
+    );
+    assert!(
+        output.lines().any(|line| line.trim() == "7.6.7"),
+        "{output}"
+    );
+    assert!(
+        output.contains("PowerShell installation is read-only"),
+        "{output}"
+    );
+    assert!(
+        output.contains("short target cache is writable"),
+        "{output}"
     );
     assert!(output.contains("release: 1.99.0"));
     assert!(output.contains("host: x86_64-pc-windows-msvc"));
     assert!(output.contains("MSVC binary ran"));
     no_units(&runner);
+}
+
+fn baseline_environment_script() -> String {
+    r#"
+$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
+if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
+$install='C:\Program Files\PowerShell\7'
+if((Get-Command pwsh.exe -ErrorAction Stop).Source -cne "$install\pwsh.exe"){throw 'pwsh resolves outside the protected installation'}
+$directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)
+foreach($directory in $directories) {
+ $probe=Join-Path $directory.FullName ('motor-write-probe-'+[Guid]::NewGuid().ToString())
+ $denied=$false
+ try {$file=[IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write);$file.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
+ if(-not $denied){Remove-Item -LiteralPath $probe;throw "PowerShell directory is writable: $($directory.FullName)"}
+}
+foreach($file in Get-ChildItem -LiteralPath $install -File -Recurse -Force -ErrorAction Stop) {
+ $denied=$false
+ try {$handle=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$handle.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
+ if(-not $denied){throw "PowerShell file is writable: $($file.FullName)"}
+}
+Write-Output 'PowerShell installation is read-only'
+if($env:CARGO_TARGET_DIR -cne 'C:\t'){throw "unexpected target dir: $env:CARGO_TARGET_DIR"}
+$longOutput=Join-Path (Get-Location) 'target\debug\deps\motor_qualification-0123456789abcdef.exe'
+if($longOutput.Length -lt 260){throw "checkout fixture is not long enough: $longOutput"}
+$probe=Join-Path $env:CARGO_TARGET_DIR ('motor-cache-probe-'+[Guid]::NewGuid().ToString())
+[IO.File]::WriteAllText($probe,'same cache')
+$checkoutProbe=Join-Path (Join-Path (Get-Location) 'target') ([IO.Path]::GetFileName($probe))
+if([IO.File]::ReadAllText($checkoutProbe) -cne 'same cache'){throw 'checkout target does not reach the short cache mount'}
+Remove-Item -LiteralPath $probe
+Write-Output 'short target cache is writable'
+"#.into()
 }
 
 /// Break check: add a NIC to the job VM. Successful external DNS, TCP, UDP or
@@ -1476,6 +1526,13 @@ fn offline_canary_generated_powershell_has_balanced_braces() {
             command.len()
         );
     }
+}
+
+#[test]
+fn baseline_environment_generated_powershell_has_balanced_braces() {
+    let script = baseline_environment_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
+    assert!(powershell(&script).len() < 8000);
 }
 
 #[test]

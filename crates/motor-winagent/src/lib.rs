@@ -16,6 +16,9 @@ pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Both the checkout's target junction and Cargo's default point at this cache volume.
+pub const CACHE_MOUNT: &str = "C:\\t\\";
+
 /// Staged with the tree, but executed only after the separate Start frame.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -490,7 +493,7 @@ impl Command {
         let forced = [
             (
                 "PATH",
-                "C:\\rust\\cargo\\bin;C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\usr\\bin;C:\\Windows\\System32;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Windows"
+                "C:\\rust\\cargo\\bin;C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\usr\\bin;C:\\Windows\\System32;C:\\Program Files\\PowerShell\\7;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Windows"
                     .to_string(),
             ),
             ("RUSTUP_HOME", "C:\\rust\\rustup".into()),
@@ -521,6 +524,8 @@ impl Command {
         for (key, value) in forced {
             env.insert(key.into(), value);
         }
+        env.entry("CARGO_TARGET_DIR".into())
+            .or_insert_with(|| CACHE_MOUNT.trim_end_matches('\\').into());
         for key in [
             "CARGO_BUILD_JOBS",
             "RUST_TEST_THREADS",
@@ -1199,6 +1204,54 @@ mod tests {
                 env["PATH"].split(';').any(|entry| entry == directory),
                 "missing Windows tools directory {directory}: {}",
                 env["PATH"]
+            );
+        }
+    }
+
+    #[test]
+    fn job_path_has_powershell_7_before_windows_powershell() {
+        let env = command().environment("C:\\Users\\motor-job").unwrap();
+        let paths: Vec<_> = env["PATH"].split(';').collect();
+        let pwsh = paths
+            .iter()
+            .position(|path| *path == "C:\\Program Files\\PowerShell\\7")
+            .expect("PowerShell 7 must be available to the job user");
+        let legacy = paths
+            .iter()
+            .position(|path| *path == "C:\\Windows\\System32\\WindowsPowerShell\\v1.0")
+            .expect("Windows PowerShell 5.1 must remain available");
+        assert!(pwsh < legacy);
+    }
+
+    #[test]
+    fn job_target_dir_defaults_to_short_cache_mount() {
+        let env = command().environment("C:\\Users\\motor-job").unwrap();
+        assert_eq!(
+            env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("C:\\t")
+        );
+    }
+
+    #[test]
+    fn caller_target_dir_wins_case_insensitively() {
+        let mut command = command();
+        assert_eq!(
+            command
+                .environment("C:\\Users\\motor-job")
+                .unwrap()
+                .get("CARGO_TARGET_DIR")
+                .map(String::as_str),
+            Some("C:\\t")
+        );
+        for key in ["CARGO_TARGET_DIR", "cargo_target_dir", "Cargo_Target_Dir"] {
+            command.env = BTreeMap::from([(key.into(), "C:\\custom-target".into())]);
+            let env = command.environment("C:\\Users\\motor-job").unwrap();
+            assert_eq!(env["CARGO_TARGET_DIR"], "C:\\custom-target");
+            assert_eq!(
+                env.keys()
+                    .filter(|key| key.eq_ignore_ascii_case("CARGO_TARGET_DIR"))
+                    .count(),
+                1
             );
         }
     }
