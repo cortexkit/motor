@@ -827,11 +827,8 @@ impl Trees {
             }
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         };
-        // Target belongs to this runner, not to the synced source snapshot. A
-        // warm clone must not enter the tree hash even in a minimal repository
-        // that has no target entry in its ignore rules. Force-added target paths
-        // in the real index are excluded too: staging cannot turn runner-owned
-        // build artifacts into source inputs.
+        // Exclude the root target entry and all its descendants regardless of Git
+        // tracking or ignore status; nested directories such as src/target are source.
         let result = (|| {
             run(&["read-tree", "HEAD"])?;
             // git add reports an ignored target as an error even when a
@@ -871,6 +868,7 @@ impl Trees {
                 return Err(invalid(String::from_utf8_lossy(&ignored.stderr)));
             }
             let mut paths = Vec::new();
+            let mut remove_paths = Vec::new();
             for name in listed
                 .stdout
                 .split(|b| *b == 0)
@@ -880,6 +878,24 @@ impl Trees {
                 if name != b"target" && !name.starts_with(b"target/") {
                     paths.extend_from_slice(name);
                     paths.push(0);
+                } else {
+                    remove_paths.extend_from_slice(name);
+                    remove_paths.push(0);
+                }
+            }
+            // Skipping updates alone would retain committed target entries from
+            // read-tree HEAD. Remove them from the temporary index as well.
+            if !remove_paths.is_empty() {
+                let mut remove = git_command(path);
+                remove.env("GIT_INDEX_FILE", &index).args([
+                    "update-index",
+                    "--force-remove",
+                    "-z",
+                    "--stdin",
+                ]);
+                let removed = git_input(remove, &remove_paths)?;
+                if !removed.status.success() {
+                    return Err(invalid(String::from_utf8_lossy(&removed.stderr)));
                 }
             }
             // --remove records tracked deletions and omits force-added ignored
@@ -907,6 +923,50 @@ impl Trees {
         let _ = fs::remove_file(index);
         result
     }
+
+    pub(crate) fn tree_hash_mismatch(path: &Path, expected: &str, computed: &str) -> io::Error {
+        let diff = git_command(path)
+            .args([
+                "diff-tree",
+                "--no-renames",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                "--end-of-options",
+                expected,
+                computed,
+                "--",
+            ])
+            .output();
+        let paths = match diff {
+            Ok(diff) if diff.status.success() => {
+                let names: Vec<_> = diff
+                    .stdout
+                    .split(|b| *b == 0)
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                // Keep complete path text until refusal redaction runs; cutting
+                // a path here could expose a prefix of an environment secret.
+                let mut shown = names
+                    .iter()
+                    .take(5)
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if names.len() > 5 {
+                    // Keep the count visible even if long paths reach the detail limit.
+                    shown = format!("({} more) {shown}", names.len() - 5);
+                }
+                shown
+            }
+            _ => "unavailable (caller tree cannot be compared)".into(),
+        };
+        invalid(format!(
+            "tree_hash_mismatch: computed_tree={computed}; differing paths: {paths}"
+        ))
+    }
+
     pub fn changes(&self, path: &Path) -> Vec<String> {
         let Ok(status) = git(
             path,

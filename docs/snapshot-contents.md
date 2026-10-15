@@ -71,11 +71,22 @@ on the Linux path; on Windows see [windows-jobs.md](windows-jobs.md#4-paths).
 machine. Test: `failed_bundle_deletes_temporary_refs_and_ignored_files_never_transfer`
 (`safety.rs`).
 
-3.2. A path under the top-level `target/` is never sent, even if it is
-tracked or staged; the runner owns that directory as the job's build output.
-Tests: `staged_file_under_target_is_not_sent_and_does_not_block_the_job`
-(`safety.rs`), `staged_target_paths_never_enter_the_tree_hash`
-(`workspace_snapshots.rs`).
+3.2. Exclude the root `target` entry and all its descendants regardless of Git
+tracking or ignore status; nested directories such as `src/target` are source.
+The runner owns the top-level directory as the job's build output. Both capture
+and runner verification remove entries inherited from `HEAD`, not just staged
+and untracked files. Fingerprinting and the untracked size cap use the same
+exclusion, for the workspace and every sibling. Committed target files can
+still travel in Git history, but are absent from the snapshot tree and are not
+restored as source inputs. Tests:
+`workspace_and_sibling_exclude_all_top_level_target_but_keep_nested_target`,
+`staged_file_under_target_is_not_sent_and_does_not_block_the_job` (`safety.rs`),
+`untracked_top_level_target_does_not_change_snapshot_or_fingerprint`,
+`nested_target_is_source_but_committed_top_level_target_is_not`,
+`untracked_size_cap_excludes_only_top_level_target` (`snapshot.rs`),
+`staged_target_paths_never_enter_the_tree_hash`,
+`committed_top_level_target_is_excluded_but_nested_target_is_captured`
+(`crates/motor-runner/src/tests/workspace_snapshots.rs`).
 
 3.3. An untracked nested repository or linked worktree inside the checkout is
 left out, along with its contents. Tests:
@@ -126,8 +137,14 @@ hour are pruned. Tests:
 
 5.3. The runner recomputes the tree hash of what it checked out and refuses
 with `tree_hash_mismatch` when it differs from the hash `ck-motor` sent; the
-command does not start. Test: `hash_mismatch_and_materialization_failure_never_start`
-(`crates/motor-runner/src/tests.rs`).
+command does not start. The logged refusal and `refusal_detail` include the
+computed tree and up to five differing paths from `git diff-tree`, plus the
+number of remaining paths. If the caller's tree cannot be read, the detail
+says that comparison is unavailable. Details retain the usual redaction and
+1024-byte bound. Tests: `hash_mismatch_and_materialization_failure_never_start`
+(`crates/motor-runner/src/tests.rs`),
+`mismatch_refusal_names_computed_tree_and_bounded_differing_paths`
+(`crates/motor-runner/src/tests/workspace_snapshots.rs`).
 
 ## 6. Where it lands
 

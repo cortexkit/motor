@@ -1603,14 +1603,19 @@ async fn hash_mismatch_and_materialization_failure_never_start() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
     let (mut r, bytes) = f.run("touch marker");
+    let computed = r.tree_hash.clone();
     r.tree_hash = "bad".into();
     f.submit(&runner, &r, &bytes);
+    let record = terminal(&runner, r.job_id).await;
     assert_eq!(
-        terminal(&runner, r.job_id).await.outcome,
+        record.outcome,
         Outcome::RefusedBeforeStart {
             reason: RefusalReason::TreeHashMismatch
         }
     );
+    let detail = record.refusal_detail().expect("missing mismatch detail");
+    assert!(detail.contains(&computed), "{detail}");
+    assert!(detail.contains("unavailable"), "{detail}");
     assert!(!Path::new(&f.key).join("marker").exists());
     base_done(&runner).await;
     drop(runner);

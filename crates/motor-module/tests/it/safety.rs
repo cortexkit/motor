@@ -191,6 +191,51 @@ async fn staged_file_under_target_is_not_sent_and_does_not_block_the_job() {
     .await;
     assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
 }
+
+#[tokio::test]
+async fn workspace_and_sibling_exclude_all_top_level_target_but_keep_nested_target() {
+    let f = Fixture::new(Cut::None, 28).await;
+    for path in [&f.key, &f.sibling] {
+        fs::write(path.join(".gitignore"), "").unwrap();
+        fs::create_dir_all(path.join("target")).unwrap();
+        fs::write(path.join("target/committed"), "committed output").unwrap();
+        git(path, &["add", "-f", ".gitignore", "target/committed"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "track build output",
+            ],
+        );
+        fs::write(path.join("target/staged"), "staged output").unwrap();
+        git(path, &["add", "target/staged"]);
+        fs::write(path.join("target/untracked"), "untracked output").unwrap();
+        fs::create_dir_all(path.join("src/target")).unwrap();
+        fs::write(path.join("src/target/input"), "source input").unwrap();
+    }
+    let before = state(&f.key);
+    let sibling_before = state(&f.sibling);
+    let records = collect(
+        f.motor()
+            .run(f.request(
+                "for dir in . ../commons; do \
+         test ! -e \"$dir/target/committed\" && \
+         test ! -e \"$dir/target/staged\" && \
+         test ! -e \"$dir/target/untracked\" && \
+         test \"$(cat \"$dir/src/target/input\")\" = 'source input' || exit 1; done",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
+    assert_eq!(before, state(&f.key));
+    assert_eq!(sibling_before, state(&f.sibling));
+}
 fn serialized_frame_metadata(frames: &[Frame]) -> String {
     let metadata: Vec<_> = frames
         .iter()

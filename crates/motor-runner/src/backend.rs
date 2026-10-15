@@ -447,8 +447,9 @@ impl Backend for HostBackend {
                 ),
             )?;
         }
-        if setup_step("verify workspace tree", trees.tree_hash(&path))? != r.tree_hash {
-            return Err(invalid("tree_hash_mismatch"));
+        let computed = setup_step("verify workspace tree", trees.tree_hash(&path))?;
+        if computed != r.tree_hash {
+            return Err(Trees::tree_hash_mismatch(&path, &r.tree_hash, &computed));
         }
         let cwd = setup_step("resolve job cwd", fs::canonicalize(&r.cwd))?;
         if !cwd.starts_with(setup_step(
