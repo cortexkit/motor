@@ -202,6 +202,28 @@ def main():
         "cancel-unknown": {"type": "cancel", "job_id": UNKNOWN},
         "cancel_reply": {"type": "cancel_reply", "job_id": UNKNOWN},
     }
+    health_status = {
+        "type": "status_reply", "queue_depth": 0, "running_jobs": [],
+        "server_reachable": True, "repositories": [],
+        "rustc_version": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+    }
+    health = {
+        "runner_version": "0.1.0", "since_ms": 1000, "window_minutes": 60,
+        "free_bytes": 1024, "queue_depth": 0, "running": [],
+        "counts": {"accepted": 0, "refusals": {}, "evictions": 0,
+                   "eviction_bytes": 0, "eviction_failures": 0,
+                   "soft_goal_unmet_passes": 0, "skipped_recent": 0,
+                   "oom_stops": 0},
+    }
+    frames["status-health-absent"] = {**health_status, "health": health}
+    frames["status-health-repository-usage"] = {
+        **health_status,
+        "health": {**health, "repository_usage": {
+            "prefrontal": {"reserved_vcpu_seconds": 7200, "job_count": 12,
+                           "jobs_by_vcpu_size": {"4": 8, "8": 4},
+                           "queue_wait_refusals": 1},
+        }},
+    }
     for name, frame in frames.items():
         emit("frames", name, frame)
     new_have = {**frames["have"], "git_dependencies": [DEP_URL]}

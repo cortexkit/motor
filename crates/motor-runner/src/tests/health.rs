@@ -1,4 +1,174 @@
+use super::super::health as runner_health;
 use super::*;
+
+fn recorded_job(
+    repository: &str,
+    workspace: &str,
+    weight: u32,
+    started_ms: Option<u64>,
+    finished_ms: u64,
+    outcome: Outcome,
+) -> Job {
+    let id = Uuid::now_v7();
+    let request = Run {
+        job_id: id,
+        gate_job: false,
+        network: None,
+        platform: None,
+        workspace_key: workspace.to_owned(),
+        workspace_kind: None,
+        repository_root: format!("/checkouts/{repository}"),
+        cwd: workspace.to_owned(),
+        command: "true".into(),
+        env: BTreeMap::new(),
+        weight_hint: Some(weight),
+        timeout: None,
+        queue_wait_limit_s: 300,
+        snapshot_commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        integration_tip: "c".repeat(40),
+        siblings: Vec::new(),
+        bundles: Vec::new(),
+        git_dependencies: Vec::new(),
+        base_commit: None,
+    };
+    let mut job = Job::new(id, Some(request), finished_ms, 1, weight);
+    job.started_ms = started_ms;
+    job.terminal(outcome, finished_ms);
+    job
+}
+
+#[test]
+fn repository_usage_tallies_fake_finished_records_by_repository() {
+    let now = 2_000_000;
+    let jobs = [
+        recorded_job(
+            "prefrontal",
+            "/workers/head/worktree",
+            4,
+            Some(now - 5_000),
+            now,
+            Outcome::Exit { code: 0 },
+        ),
+        recorded_job(
+            "prefrontal",
+            "/workers/task/worktree",
+            8,
+            Some(now - 10_000),
+            now - 1_000,
+            Outcome::Exit { code: 1 },
+        ),
+        recorded_job(
+            "prefrontal",
+            "/workers/queued/worktree",
+            2,
+            None,
+            now - 500,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::QueueWaitExceeded,
+            },
+        ),
+        recorded_job(
+            "magic-context",
+            "/workers/another/worktree",
+            4,
+            Some(now - 2_000),
+            now,
+            Outcome::Exit { code: 0 },
+        ),
+    ];
+    let mut usage = runner_health::RepositoryUsage::from_jobs(jobs.iter(), now);
+
+    assert_eq!(
+        usage.snapshot(now),
+        BTreeMap::from([
+            (
+                "magic-context".into(),
+                HealthRepositoryUsage {
+                    reserved_vcpu_seconds: 8,
+                    job_count: 1,
+                    jobs_by_vcpu_size: BTreeMap::from([("4".into(), 1)]),
+                    queue_wait_refusals: 0,
+                },
+            ),
+            (
+                "prefrontal".into(),
+                HealthRepositoryUsage {
+                    reserved_vcpu_seconds: 92,
+                    job_count: 3,
+                    jobs_by_vcpu_size: BTreeMap::from([
+                        ("2".into(), 1),
+                        ("4".into(), 1),
+                        ("8".into(), 1)
+                    ]),
+                    queue_wait_refusals: 1,
+                },
+            ),
+        ])
+    );
+}
+
+#[test]
+fn repository_usage_expires_at_the_exact_24_hour_boundary() {
+    let now = 4 * runner_health::REPOSITORY_WINDOW_MS;
+    let jobs = [
+        recorded_job(
+            "expired",
+            "/workers/expired",
+            4,
+            Some(now - runner_health::REPOSITORY_WINDOW_MS),
+            now - runner_health::REPOSITORY_WINDOW_MS,
+            Outcome::Exit { code: 0 },
+        ),
+        recorded_job(
+            "recent",
+            "/workers/recent",
+            2,
+            Some(now - runner_health::REPOSITORY_WINDOW_MS + 1),
+            now - runner_health::REPOSITORY_WINDOW_MS + 1,
+            Outcome::Exit { code: 0 },
+        ),
+    ];
+    let mut usage = runner_health::RepositoryUsage::from_jobs(jobs.iter(), now);
+    let report = usage.snapshot(now);
+    assert!(!report.contains_key("expired"));
+    assert_eq!(report["recent"].job_count, 1);
+
+    assert!(usage.snapshot(now + 1).is_empty());
+}
+
+#[test]
+fn repository_usage_rebuilds_from_retained_records_after_restart() {
+    let f = Fixture::new();
+    let now = 2_000_000;
+    f.clock.store(now, Ordering::SeqCst);
+    let config = f.config();
+    let runner = Runner::open(config.clone()).unwrap();
+    let job = recorded_job(
+        "prefrontal",
+        "/workers/head/worktree",
+        4,
+        Some(now - 3_000),
+        now,
+        Outcome::Exit { code: 0 },
+    );
+    let record = runner.record_path(job.id);
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    atomic_json(&record, &job).unwrap();
+    drop(runner);
+
+    let runner = Runner::open(config).unwrap();
+    let usage = runner.runner_status().health.unwrap().repository_usage;
+    assert_eq!(
+        usage["prefrontal"],
+        HealthRepositoryUsage {
+            reserved_vcpu_seconds: 12,
+            job_count: 1,
+            jobs_by_vcpu_size: BTreeMap::from([("4".into(), 1)]),
+            queue_wait_refusals: 0,
+        }
+    );
+}
 
 #[test]
 fn health_counts_acceptance_and_each_refusal_reason_once() {
@@ -232,6 +402,8 @@ fn long_eight_vcpu_job_under_one_core_is_persisted_and_reported() {
         assert_eq!(usage.wall_ms, 600_001);
         assert_eq!(usage.average_use_ppm, 62_499);
         let report = runner.runner_status().health.unwrap();
+        assert_eq!(report.repository_usage["main"].reserved_vcpu_seconds, 4_800);
+        assert_eq!(report.repository_usage["main"].job_count, 1);
         assert_eq!(
             report.underused_reservations,
             vec![HealthUnderusedReservation {

@@ -69,6 +69,8 @@ const FRAME_CASES: &[&str] = &[
     "resume",
     "resume_reply",
     "status_reply",
+    "status-health-absent",
+    "status-health-repository-usage",
     "cancel",
     "cancel-unknown",
     "cancel_reply",
@@ -253,7 +255,7 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 131);
+    assert_eq!(count, 133);
 }
 
 #[test]
@@ -307,10 +309,18 @@ fn network_vectors_pin_requests_refusals_and_offline_acceptance() {
 fn add_unknown_fields(value: &mut Value) {
     match value {
         Value::Object(object) => {
-            // env is an intentionally open name/value map, not a typed object.
+            // These fields are open maps, not typed objects; don't add a fake key.
             for (key, child) in object.iter_mut() {
-                if key != "env" {
-                    add_unknown_fields(child);
+                match key.as_str() {
+                    "env" | "refusals" | "jobs_by_vcpu_size" => {}
+                    "repository_usage" => {
+                        if let Value::Object(repositories) = child {
+                            for usage in repositories.values_mut() {
+                                add_unknown_fields(usage);
+                            }
+                        }
+                    }
+                    _ => add_unknown_fields(child),
                 }
             }
             object.insert("future_extension".into(), json!({"version": 2}));

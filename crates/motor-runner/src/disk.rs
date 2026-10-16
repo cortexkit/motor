@@ -270,6 +270,8 @@ impl Runner {
                     })
             })
             .collect();
+        let now = self.now();
+        let repository_usage = self.core.repository_usage.lock().unwrap().snapshot(now);
         let health = {
             let mut counters = self.core.health.lock().unwrap();
             RunnerHealth {
@@ -280,8 +282,9 @@ impl Runner {
                 queue_depth,
                 running,
                 failed_job_units,
-                counts: counters.counts(self.now()),
+                counts: counters.counts(now),
                 underused_reservations,
+                repository_usage,
             }
         };
         RunnerStatusReply {

@@ -478,6 +478,7 @@ struct Core {
     /// Serialize pressure cleanup, without holding the output/persistence lock.
     disk: Mutex<()>,
     health: Mutex<health::Health>,
+    repository_usage: Mutex<health::RepositoryUsage>,
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
@@ -1018,6 +1019,7 @@ impl Runner {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?
         };
+        let repository_usage = health::RepositoryUsage::from_jobs(jobs.values(), now);
         let runner = Self {
             core: Arc::new(Core {
                 draining: std::sync::atomic::AtomicBool::new(false),
@@ -1066,6 +1068,7 @@ impl Runner {
                 quarantined,
                 disk: Mutex::new(()),
                 health,
+                repository_usage: Mutex::new(repository_usage),
                 _lock: lock,
                 rustc_version,
                 cpus,
@@ -1382,7 +1385,13 @@ impl Runner {
         if let Some(write) = &self.core.config.before_job_write {
             write(&self.record_path(job.id))?;
         }
-        atomic_json(&self.record_path(job.id), job)
+        atomic_json(&self.record_path(job.id), job)?;
+        self.core
+            .repository_usage
+            .lock()
+            .unwrap()
+            .record_job(job, self.now());
+        Ok(())
     }
     fn catalog(&self, inner: &Inner) -> io::Result<()> {
         if self.core.config.windows_instance() {
