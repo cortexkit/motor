@@ -225,6 +225,9 @@ impl Fixture {
     fn config(&self) -> Config {
         let mut c = Config::new(self.scratch.join("state"), "e2e");
         c.free_space_floor_bytes = 0;
+        let cargo_home = self.scratch.join("cargo-home");
+        fs::create_dir_all(&cargo_home).unwrap();
+        c.fixture_cargo_home = Some(cargo_home);
         c.test_processes = Some(self.cleanup.0.clone());
         c.cpu_topology =
             Some(CpuTopology::new((0..16).map(|cpu| vec![cpu, cpu + 16]).collect()).unwrap());
