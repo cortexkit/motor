@@ -24,7 +24,11 @@ while IFS= read -r -d '' -u 3 file; do
   else
     echo "(new file)"
   fi
-  read -r -p "Install $rel? [y/N] " answer
+  # End of input counts as "no" for this and later files. Under set -e a
+  # failing read would otherwise exit here, skipping the daemon-reload below
+  # for files already installed, and the next restart would run the old unit.
+  answer=
+  read -r -p "Install $rel? [y/N] " answer || true
   [ "$answer" = y ] || { echo "skipped $rel"; continue; }
   mkdir -p "$(dirname "$target")"
   [ -f "$target" ] && cp -p "$target" "$target.bak-$(date -u +%Y%m%dT%H%M%SZ)"
