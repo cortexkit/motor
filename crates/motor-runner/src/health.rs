@@ -83,8 +83,9 @@ impl RepositoryUsage {
         usage
     }
 
+    /// Called on every job record save, often under the state lock, so it does
+    /// only a map lookup; expired entries are dropped when a snapshot is taken.
     pub fn record_job(&mut self, job: &Job, now: u64) {
-        self.prune(now);
         self.jobs.remove(&job.id);
         let Some(finished_ms) = job.finished_ms else {
             return;
