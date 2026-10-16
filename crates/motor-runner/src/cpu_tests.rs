@@ -260,8 +260,10 @@ fn isolated_windows_slot_observation_tracks_flock_and_recreated_inode() {
 
 #[cfg(target_os = "linux")]
 #[test]
+// Not named isolated_*: the operator lane runs every ignored isolated_ test,
+// and this one needs a Windows job VM running at the time, so it is run by hand.
 #[ignore = "requires a running Windows job VM; set MOTOR_TEST_WINDOWS_SLOT_LOCK and MOTOR_TEST_WINDOWS_CPUS to the Linux runner's flag values"]
-fn isolated_active_windows_vm_excludes_its_physical_cores() {
+fn windows_vm_running_linux_placement_avoids_its_cores() {
     let slot =
         PathBuf::from(std::env::var_os("MOTOR_TEST_WINDOWS_SLOT_LOCK").expect("slot-lock path"));
     let cpus =

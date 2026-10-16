@@ -189,7 +189,7 @@ not a reservation against a Windows VM starting concurrently. The portable tests
 `windows_start_does_not_move_existing_job_or_exempt_cache_fills` cover placement;
 `isolated_windows_slot_observation_tracks_flock_and_recreated_inode` checks the
 real host lock table on an operator host.
-The ignored test `isolated_active_windows_vm_excludes_its_physical_cores` checks
+The ignored test `windows_vm_running_linux_placement_avoids_its_cores` (run by hand, not by the operator lane) checks
 that the Linux runner can see QEMU's lock, not just a lock created by the test
 process. Leave a Windows job VM running on the dedicated server and run the test
 as the Linux runner's user in its PID namespace; the test checks real systemd
