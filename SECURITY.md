@@ -105,6 +105,23 @@ the host as a third account, `motor-prep`, before the VM boots.
   controls the runner: the protocol has no per-caller authorization below SSH,
   and the same socket accepts `drain` and `resume`. Caller authorization happens
   in `ck-motor`, which relies on the CortexKit daemon to verify callers.
+- **Direct-job secrets.** When direct execution is enabled, each direct job
+  gets a one-time secret with 256 bits of OS randomness. Its holder may attach,
+  check status or cancel only that job; the original route needs no secret.
+  Only the SHA-256 hash is kept in `state.json`, for the lifetime of the job,
+  and fixed-length digests are compared in constant time. Invalid credentials
+  and unknown job IDs receive identical refusals without runner I/O. The
+  plaintext is sent only on the live submitting direct route, never in replay,
+  status, runner frames or module logs. AFT and Basal are unchanged. The CLI
+  prints the secret once on stderr unless `run --secret-file PATH` creates a
+  new `0600` file instead; keep both secrets and captured stderr private.
+  `attach` reads stdin or `--secret-file`, never argv or environment variables.
+  File permissions do not protect against a hostile same-uid process that can
+  read the file or process memory; this is a bearer capability, not a new user
+  isolation boundary. See [direct runs](docs/module.md#direct-runs). Tests:
+  `direct_secret_reattaches_replays_and_never_leaks`,
+  `secret_file_is_private_new_and_never_overwrites`,
+  `attach_never_accepts_an_argv_secret_or_echoes_it`.
 - **The operator and the runner account.** They are trusted. A compromise of
   either compromises every job on the server.
 - **Side channels.** Jobs share CPU caches, memory bandwidth and the host's

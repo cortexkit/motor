@@ -78,7 +78,15 @@ impl Daemon {
             .unwrap();
         // The motor is opened here against the in-process runner, so the
         // handler never opens storage or SSH from the hello acknowledgement.
-        let handler = Handler::new(config).with_motor(f.motor());
+        let motor = super::reopen_motor(|| {
+            crate::Motor::with_connector(
+                f.config.clone(),
+                &f.scratch.join("module-state"),
+                Arc::new(f.proxy.clone()),
+            )
+        })
+        .await;
+        let handler = Handler::new(config).with_motor(motor);
         let boot = tokio::spawn(async move {
             subc_client_rs::serve_with_handle(&path, module::manifest("ck-motor"), handler).await
         });
@@ -245,15 +253,38 @@ impl ExecClient for WireClient {
             .await;
         Ok(Box::new(WireStream(frames)))
     }
-    async fn cancel(&self, job_id: Uuid) -> Result<(), String> {
-        let reply = self
+    async fn attach(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<Box<dyn RecordStream>, SubmitError> {
+        let frames = self.daemon.send(self.channel, json!({"op":"exec.attach", "params":AttachRequest::new(job_id, 0), "direct_secret":secret})).await;
+        Ok(Box::new(WireStream(frames)))
+    }
+    async fn status(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<motor_protocol::JobStatusReply, SubmitError> {
+        let mut frames = self
             .daemon
-            .request(
+            .send(
                 self.channel,
-                "exec.cancel",
-                serde_json::to_value(CancelRequest::new(job_id)).unwrap(),
+                json!({"op":"exec.status", "params":{"job_id":job_id}, "direct_secret":secret}),
             )
             .await;
+        let reply = next(&mut frames).await;
+        if reply.header.ty == FrameType::Response {
+            Ok(serde_json::from_slice(&reply.body).unwrap())
+        } else {
+            Err(SubmitError::NotSent(
+                error(&reply)["message"].as_str().unwrap().into(),
+            ))
+        }
+    }
+    async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String> {
+        let mut frames = self.daemon.send(self.channel, json!({"op":"exec.cancel", "params":CancelRequest::new(job_id), "direct_secret":secret})).await;
+        let reply = next(&mut frames).await;
         match reply.header.ty {
             FrameType::Response => Ok(()),
             _ => Err(body(&reply)),
@@ -367,6 +398,396 @@ fn last_terminal(records: &[StreamRecord]) -> &motor_protocol::TerminalRecord {
     match records.last() {
         Some(StreamRecord::Terminal(terminal)) => terminal,
         other => panic!("expected a terminal record last, got {other:?}"),
+    }
+}
+
+async fn direct_submission(
+    daemon: &Daemon,
+    request: RunRequest,
+) -> (Uuid, String, mpsc::UnboundedReceiver<Frame>) {
+    let mut frames = daemon
+        .send(DIRECT_CHANNEL, json!({"op":"exec.run", "params":request}))
+        .await;
+    let first = next(&mut frames).await;
+    assert_eq!(first.header.ty, FrameType::StreamData, "{}", body(&first));
+    let value: Value = serde_json::from_slice(&first.body).unwrap();
+    let id =
+        serde_json::from_value(value["direct_job"]["job_id"].clone()).expect("one-time job id");
+    let secret = value["direct_job"]["secret"]
+        .as_str()
+        .expect("one-time secret")
+        .to_owned();
+    assert_eq!(secret.len(), 64);
+    (id, secret, frames)
+}
+
+async fn collect_frames(frames: &mut mpsc::UnboundedReceiver<Frame>) -> Vec<Frame> {
+    let mut result = Vec::new();
+    loop {
+        let frame = next(frames).await;
+        assert_eq!(frame.header.ty, FrameType::StreamData, "{}", body(&frame));
+        let terminal = matches!(
+            serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+            StreamRecord::Terminal(_)
+        );
+        result.push(frame);
+        if terminal {
+            return result;
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_secret_reattaches_replays_and_never_leaks() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let logs = Terminal::default();
+    let _logging = crate::logging::scoped(Side("log", logs.clone()));
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    let (id, secret, mut original) = direct_submission(
+        &daemon,
+        timed(&f, "printf first; printf second; exit 17", 60),
+    )
+    .await;
+    let original = collect_frames(&mut original).await;
+    assert!(original
+        .iter()
+        .all(|frame| !body(frame).contains(&secret) && !body(frame).contains("direct_job")));
+    let mut own = daemon
+        .send(
+            DIRECT_CHANNEL,
+            json!({"op":"exec.attach", "params":AttachRequest::new(id, 0)}),
+        )
+        .await;
+    assert!(collect_frames(&mut own)
+        .await
+        .iter()
+        .all(|frame| !body(frame).contains(&secret) && !body(frame).contains("direct_job")));
+    drop(daemon);
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    for op in ["exec.attach", "exec.status", "exec.cancel"] {
+        let runner_frames = f.proxy.frames.lock().unwrap().len();
+        let mut refused = Vec::new();
+        for (job, presented) in [
+            (id, Value::Null),
+            (id, json!("f".repeat(64))),
+            (id, json!({"secret":secret})),
+            (Uuid::now_v7(), json!(secret)),
+        ] {
+            let mut frames = daemon
+                .send(
+                    OTHER_DIRECT_CHANNEL,
+                    json!({"op":op,"params":{"job_id":job,"from_seq":0},"direct_secret":presented}),
+                )
+                .await;
+            let reply = next(&mut frames).await;
+            assert_eq!(error(&reply)["code"], "motor_job_not_found");
+            refused.push(reply.body);
+        }
+        assert!(refused.windows(2).all(|pair| pair[0] == pair[1]), "{op}");
+        assert_eq!(
+            f.proxy.frames.lock().unwrap().len(),
+            runner_frames,
+            "a refused secret must not contact the runner"
+        );
+    }
+    let status = daemon
+        .send(
+            OTHER_DIRECT_CHANNEL,
+            json!({"op":"exec.status","params":{"job_id":id},"direct_secret":secret}),
+        )
+        .await;
+    let mut status = status;
+    let status = next(&mut status).await;
+    assert_eq!(status.header.ty, FrameType::Response, "{}", body(&status));
+    assert!(!body(&status).contains(&secret));
+    let mut attached = daemon
+        .send(
+            OTHER_DIRECT_CHANNEL,
+            json!({"op":"exec.attach","params":{"job_id":id,"from_seq":0},"direct_secret":secret}),
+        )
+        .await;
+    let replay = collect_frames(&mut attached).await;
+    let mut output = Vec::new();
+    for frame in &replay {
+        assert!(!body(frame).contains(&secret));
+        assert!(!body(frame).contains("direct_job"));
+        match serde_json::from_slice(&frame.body).unwrap() {
+            StreamRecord::Output(record) => output.extend(record.bytes.0),
+            StreamRecord::Terminal(terminal) => assert_eq!(cli::exit_code(&terminal), 17),
+            _ => {}
+        }
+    }
+    assert_eq!(output, b"firstsecond");
+    assert!(!logs.text("log").contains(&secret));
+    assert!(
+        !logs.text("log").is_empty(),
+        "log capture must observe the handler"
+    );
+    let state = fs::read_to_string(f.scratch.join("module-state/state.json")).unwrap();
+    assert!(!state.contains(&secret));
+    let mut agent = daemon
+        .send(
+            AFT_CHANNEL,
+            json!({"op":"exec.run", "params":timed(&f, "true", 60)}),
+        )
+        .await;
+    let agent = collect_frames(&mut agent).await;
+    assert!(agent
+        .iter()
+        .all(|frame| !body(frame).contains("direct_job") && !body(frame).contains(&secret)));
+    fn scan(path: &std::path::Path, secret: &str) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            if ty.is_dir() {
+                scan(&entry.path(), secret);
+            } else if ty.is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "secret persisted in {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    scan(&f.scratch, &secret);
+    assert!(!format!("{:?}", f.proxy.frames.lock().unwrap()).contains(&secret));
+}
+
+#[tokio::test]
+async fn direct_secret_attach_streams_a_running_job_and_original_route_needs_no_secret() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut original) = direct_submission(
+        &daemon,
+        timed(&f, "printf first; sleep 1; printf last; exit 23", 60),
+    )
+    .await;
+    loop {
+        let frame = next(&mut original).await;
+        if matches!(
+            serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+            StreamRecord::Output(_)
+        ) {
+            break;
+        }
+    }
+    let own = daemon
+        .request(DIRECT_CHANNEL, "exec.status", json!({"job_id":id}))
+        .await;
+    assert_eq!(own.header.ty, FrameType::Response);
+    let client = WireClient {
+        daemon: daemon.clone(),
+        channel: OTHER_DIRECT_CHANNEL,
+    };
+    let args = cli::AttachArgs {
+        job_id: id,
+        secret_file: None,
+        status: false,
+    };
+    let terminal = Terminal::default();
+    let (_tx, mut interrupts) = mpsc::channel(1);
+    let code = cli::drive_attach(
+        &client,
+        &args,
+        &secret,
+        &mut Side("out", terminal.clone()),
+        &mut Side("err", terminal.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, 23);
+    assert_eq!(terminal.text("out"), "firstlast");
+    assert!(!terminal.text("err").contains(&secret));
+}
+
+#[tokio::test]
+async fn attached_cli_cancels_with_secret_and_status_is_read_only() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut original) =
+        direct_submission(&daemon, timed(&f, "echo started; exec sleep 30", 60)).await;
+    loop {
+        let frame = next(&mut original).await;
+        if matches!(
+            serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+            StreamRecord::Output(_)
+        ) {
+            break;
+        }
+    }
+    let client = WireClient {
+        daemon: daemon.clone(),
+        channel: OTHER_DIRECT_CHANNEL,
+    };
+    let mut args = cli::AttachArgs {
+        job_id: id,
+        secret_file: None,
+        status: true,
+    };
+    let terminal = Terminal::default();
+    let (tx, mut interrupts) = mpsc::channel(1);
+    let code = cli::drive_attach(
+        &client,
+        &args,
+        &secret,
+        &mut Side("out", terminal.clone()),
+        &mut Side("err", terminal.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, 0);
+    let status: motor_protocol::JobStatusReply =
+        serde_json::from_str(&terminal.text("out")).unwrap();
+    assert!(status.terminal.is_none());
+    assert!(!terminal.text("out").contains(&secret));
+    args.status = false;
+    let attached = Terminal::default();
+    tx.send(()).await.unwrap();
+    let code = cli::drive_attach(
+        &client,
+        &args,
+        &secret,
+        &mut Side("out", attached.clone()),
+        &mut Side("err", attached.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, cli::EXIT_CANCELLED);
+    assert!(!attached.text("err").contains(&secret));
+}
+
+#[tokio::test]
+async fn direct_secret_grants_only_its_job_and_no_additional_operations() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    let (first, secret, mut frames) = direct_submission(&daemon, timed(&f, "true", 60)).await;
+    collect_frames(&mut frames).await;
+    let (second, other_secret, mut frames) =
+        direct_submission(&daemon, timed(&f, "true", 60)).await;
+    collect_frames(&mut frames).await;
+    assert_ne!(secret, other_secret);
+    let agent = run_records(&daemon, AFT_CHANNEL, timed(&f, "true", 60)).await;
+    let agent = last_terminal(&agent).job_id;
+    for id in [second, agent] {
+        for op in ["exec.attach", "exec.status", "exec.cancel"] {
+            let mut frames = daemon
+                .send(
+                    OTHER_DIRECT_CHANNEL,
+                    json!({"op":op, "params":{"job_id":id,"from_seq":0}, "direct_secret":secret}),
+                )
+                .await;
+            assert_eq!(
+                error(&next(&mut frames).await)["code"],
+                "motor_job_not_found"
+            );
+        }
+    }
+    let mut frames = daemon
+        .send(
+            OTHER_DIRECT_CHANNEL,
+            json!({"op":"runner.health", "params":{}, "direct_secret":secret}),
+        )
+        .await;
+    assert_eq!(
+        error(&next(&mut frames).await)["code"],
+        "motor_op_not_permitted_for_principal"
+    );
+    let mut frames = daemon
+        .send(
+            OTHER_DIRECT_CHANNEL,
+            json!({"op":"exec.status", "params":{"job_id":first}, "direct_secret":secret}),
+        )
+        .await;
+    assert_eq!(next(&mut frames).await.header.ty, FrameType::Response);
+}
+
+#[tokio::test]
+async fn cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let client = WireClient {
+        daemon: daemon.clone(),
+        channel: DIRECT_CHANNEL,
+    };
+    let terminal = Terminal::default();
+    let path = f.scratch.join("reattach.key");
+    let file = cli::SecretFile::create(&path).unwrap();
+    let (_tx, mut interrupts) = mpsc::channel(1);
+    let code = cli::drive_run(
+        &client,
+        &timed(&f, "exit 19", 60),
+        Some(file),
+        &mut Side("out", terminal.clone()),
+        &mut Side("err", terminal.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, 19);
+    let secret = fs::read_to_string(&path).unwrap();
+    let secret = secret.trim();
+    assert_eq!(secret.len(), 64);
+    assert!(!terminal.text("err").contains(secret));
+    assert!(terminal.text("err").contains(path.to_str().unwrap()));
+    let id: Uuid = terminal
+        .text("err")
+        .split("job_id=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let client = WireClient {
+        daemon,
+        channel: OTHER_DIRECT_CHANNEL,
+    };
+    for status in [false, true] {
+        let mut errors = Vec::new();
+        for (job_id, presented) in [
+            (id, ""),
+            (id, "malformed"),
+            (id, &"f".repeat(64)),
+            (Uuid::now_v7(), secret),
+        ] {
+            let args = cli::AttachArgs {
+                job_id,
+                secret_file: None,
+                status,
+            };
+            let refused = Terminal::default();
+            let code = cli::drive_attach(
+                &client,
+                &args,
+                presented,
+                &mut Side("out", refused.clone()),
+                &mut Side("err", refused.clone()),
+                &mut interrupts,
+            )
+            .await;
+            assert_eq!(code, cli::EXIT_REFUSED);
+            assert_eq!(refused.text("out"), "");
+            errors.push(refused.text("err"));
+        }
+        assert!(errors.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
 
@@ -569,7 +990,7 @@ async fn direct_runs_need_a_timeout_within_the_cap_and_aft_runs_do_not() {
         );
         assert_eq!(terminal.retry_after_ms(), None);
         assert!(
-            refusal.contains("can't re-attach to or cancel its job"),
+            refusal.contains("disconnected direct caller may not return with its secret"),
             "{refusal}"
         );
     }
@@ -654,7 +1075,12 @@ async fn cli_streams_both_outputs_in_order_and_exits_with_the_commands_code() {
     let code = drive(&daemon, timed(&f, command, 600), &terminal, &mut interrupts).await;
     assert_eq!(code, 3, "{:?}", terminal.lines());
     assert_eq!(terminal.text("out"), "out1\nout2\n");
-    assert_eq!(terminal.text("err"), "err1\nerr2\n");
+    let err = terminal.text("err");
+    let mut lines = err.lines();
+    let credential = lines.next().unwrap();
+    assert!(credential.starts_with("ck motor run: job_id="));
+    assert!(credential.contains(" secret="));
+    assert_eq!(lines.collect::<Vec<_>>(), ["err1", "err2"]);
     let log = captured.text();
     let submitted = log
         .lines()
@@ -690,7 +1116,7 @@ async fn cli_returns_the_refused_code_with_the_reason_and_detail() {
     assert_eq!(code, cli::EXIT_REFUSED);
     let err = terminal.text("err");
     assert!(
-        err.starts_with(&format!(
+        err.contains(&format!(
             "ck motor run: refused before start: request_rejected: direct_timeout_refused: timeout {over} seconds exceeds"
         )),
         "{err}"

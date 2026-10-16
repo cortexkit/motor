@@ -29,7 +29,8 @@ components. They do not ship in this repository.
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
 
 `ck-motor --ck-domain` prints one line for the `ck` launcher, and
-`ck motor run` (`ck-motor run`) submits one job from a script; see
+`ck motor run` (`ck-motor run`) submits one job from a script, and
+`ck motor attach JOB_ID` reconnects to it; see
 [Direct runs](#direct-runs).
 
 ## Configuration
@@ -63,7 +64,7 @@ operation separately. Binding to the module grants nothing by itself.
 | AFT, the agent tool (`reserved:aft`) | `exec.run`, `exec.attach`, `exec.cancel`, `exec.status` |
 | The CortexKit core (`reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
 | Basal's health flow | `runner.health` only |
-| A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its own route started |
+| A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its route started or whose secret it holds |
 | Any other reserved, direct, unverified or absent principal | Nothing; refused by name |
 
 Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
@@ -143,7 +144,8 @@ directories. `state.json` holds:
 
 - `jobs`, keyed by job ID: the queue-wait limit, any pending cancellation, the
   terminal record when `ck-motor` itself ended the job (for example a refusal
-  before upload), and optional attribution (session, preset, scope);
+  before upload), optional attribution (session, preset, scope), and an optional
+  `direct_secret_hash` (SHA-256 of a direct job's secret, never the secret itself);
 - `snapshots`, keyed by workspace: the commits the runner has accepted, used to
   send only missing history next time.
 - `verified_tips`, keyed by canonical Git common directory: only the last
@@ -166,13 +168,22 @@ There is no schema version. Unknown fields are ignored and absent attribution
 loads as none; an incompatible change needs an explicit migration. Test:
 `older_state_loads_without_attribution_and_keeps_cancel_intent`.
 
+The optional direct-secret hash defaults to absent and is omitted for other
+jobs. It expires with the retained job record, not when a route disconnects.
+The ck-motor `state.json` reader at revision `7274b0b` ignores the new hash
+field and can load a store written by this version;
+if that older module rewrites the store, it drops the hash, so upgrading again
+does not recover reattachment to those jobs. Tests:
+`direct_secret_hash_survives_reopen_and_expires_with_its_job`,
+`direct_secret_reattaches_replays_and_never_leaks`.
+
 On shutdown `ck-motor` stops its SSH control master before stopping the agent
 and removing its runtime directory. A force-kill skips that cleanup: stop any
 orphaned SSH master before reusing a crashed installation's storage root.
 
 ## Direct runs
 
-`ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] -- COMMAND...`
+`ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...`
 runs one command on the runner from a script with no agent behind it, streams
 its output, and exits with its status. It works only when `admit_direct_exec`
 is `true` in the configuration file ([Configuration](#configuration)).
@@ -181,14 +192,63 @@ is `true` in the configuration file ([Configuration](#configuration)).
 | --- | --- |
 | The command's own code | The command exited. |
 | 128 + N | Signal N killed the command. |
-| 200 | Refused before start; nothing ran. |
+| 200 | Run refused before start (see the printed reason), or attach refused (unknown job or invalid secret). |
 | 201 | Outcome unknown, or the connection was lost. The job ID is printed. |
 | 202 | The runner stopped the command at its timeout. |
 | 203 | The job was cancelled. |
 | 204 | Bad arguments; nothing was submitted. |
 
-Every direct run has a timeout (default 3600 seconds), because a direct caller
-that loses its connection cannot reattach to or cancel its job. Direct runs get
+Every direct run has a timeout (default 3600 seconds), because a disconnected
+caller may never reconnect. Direct runs get
 a 30-minute queue-wait budget and, when the runner supports it, run ahead of
 agent jobs; see [scheduling.md](scheduling.md). Source:
 `crates/motor-module/src/cli.rs`.
+
+### Reattaching after a disconnect
+
+At submission `ck-motor` generates 32 random bytes with the OS CSPRNG, encoded
+as 64 lowercase hex characters. `run` prints one stderr line with the job ID
+and secret. Keep the secret private: possession grants attach, status and cancel for
+that job, not submission or access to any other job. For scripts, prefer a new
+file outside the checkout and captured command logs:
+
+```sh
+ck motor run --secret-file /private/job.key -- 'cargo test'
+ck motor attach JOB_ID --secret-file /private/job.key
+ck motor attach JOB_ID --secret-file /private/job.key --status
+```
+
+`--secret-file` on `run` creates a new file with mode `0600`, refuses an existing
+file (including a symlink), and prints its path instead of the secret. Without
+`--secret-file`, `attach` reads one line from stdin. Never place the secret in
+argv or an environment variable; neither is an accepted input channel. Do not
+enable shell tracing while handling it. Delete the file when no longer needed.
+
+`attach` replays output from the start in order, then follows a still-running
+job to its terminal outcome. It has the same exit-code contract as `run`.
+`--status` instead prints a JSON state/outcome reply without streaming, exiting
+0 while running or with the terminal exit code when complete. Ctrl-C or SIGTERM
+requests cancellation and waits for the terminal (203); a second interrupt
+stops waiting (201). A lost connection does not cancel the job.
+
+The route that submitted the job can still attach, check and cancel without a secret. A new
+direct route sends `direct_secret` beside `op` and `params` in ck-motor's JSON
+envelope. The first live direct submission record alone carries a `direct_job`
+object with `job_id` and `secret`. This is not a shared exec type or a runner
+frame: it is added after persistence, never replayed, logged, returned by
+status, or sent to AFT or Basal. The module hashes the presented secret and
+compares fixed-size digests in constant time before contacting the runner.
+Wrong, missing and malformed secrets receive the same refusal bytes and exit
+code as an unknown job ID; refused credentials do not cause runner I/O. AFT and
+Basal admission and operations are unchanged.
+
+The following tests cover replay after a module restart, live streaming,
+secret non-disclosure, per-job authorization, cancellation, status and CLI
+refusal equivalence (`crates/motor-module/tests/it/operator_cli.rs`):
+`direct_secret_reattaches_replays_and_never_leaks`,
+`direct_secret_attach_streams_a_running_job_and_original_route_needs_no_secret`,
+`attached_cli_cancels_with_secret_and_status_is_read_only`,
+`direct_secret_grants_only_its_job_and_no_additional_operations`,
+`cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret`.
+CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
+`attach_never_accepts_an_argv_secret_or_echoes_it`.

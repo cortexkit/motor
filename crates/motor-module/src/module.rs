@@ -150,8 +150,8 @@ pub struct Handler {
     routes: Arc<Mutex<HashMap<RouteHandle, RouteBindRequest>>>,
     /// Jobs started by direct routes, keyed to the route that started them. The
     /// route handle is the daemon's own stamp for a bound route on this
-    /// connection, so a direct caller can't name another route's jobs by
-    /// anything it puts in a request body.
+    /// connection. This fast path needs no secret; other direct routes must
+    /// prove access with the per-job secret whose hash is in storage.
     direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
     run_count: Arc<std::sync::atomic::AtomicUsize>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -291,12 +291,10 @@ impl Handler {
 pub const DIRECT_TIMEOUT_REFUSED: &str = "direct_timeout_refused";
 
 /// Why a direct run's timeout is unacceptable, or `None` when it is within the
-/// cap. Ownership of a direct job is tied to the route that started it, so a
-/// caller that loses its connection can neither re-attach nor cancel: the job
-/// has to end on its own, and the runner's deadline is what ends it. The CLI
-/// prints the same text when it refuses a timeout locally.
+/// cap. A disconnected caller may never return with its secret, so the runner's
+/// deadline still bounds the job. The CLI uses the same refusal text locally.
 pub fn direct_timeout_refusal(timeout: Option<u64>, cap: u64) -> Option<String> {
-    const WHY: &str = "a direct caller that loses its connection can't re-attach to or cancel its job, so the job must end on its own";
+    const WHY: &str = "a disconnected direct caller may not return with its secret, so the job must have a deadline";
     match timeout {
         None => Some(format!(
             "a direct exec.run needs a timeout of at most {cap} seconds: {WHY}"
@@ -319,9 +317,10 @@ fn direct_job_not_found() -> HandlerOutcome {
 }
 
 impl Handler {
-    /// Requests on a route the daemon attested as `Principal::Direct`, admitted
-    /// only while `admit_direct_exec` is on. A direct caller may start jobs and
-    /// attach to, cancel or check the jobs its own route started; nothing else.
+    /// Requests on a route the daemon attested as `Principal::Direct`. Enabling
+    /// `admit_direct_exec` permits these local non-agent callers to start jobs and
+    /// attach to, cancel or check jobs their route started or whose secret they
+    /// hold; nothing else.
     async fn handle_direct(
         &self,
         ctx: RequestCtx,
@@ -346,6 +345,7 @@ impl Handler {
             "exec.run" => {
                 let request: RunRequest = parse(envelope.params)?;
                 let motor = self.initialized()?;
+                let secret = crate::direct_secret::DirectSecret::mint()?;
                 if let Some(detail) = direct_timeout_refusal(
                     request.timeout,
                     self.config.direct_exec_max_timeout_secs,
@@ -354,40 +354,62 @@ impl Handler {
                         RefusalReason::RequestRejected,
                         Some(format!("{DIRECT_TIMEOUT_REFUSED}: {detail}")),
                     )?;
-                    pump_direct(&ctx, stream).await?;
+                    motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
+                    pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
                 let _permit = match RunPermit::acquire(&self.run_count) {
                     Some(permit) => permit,
                     None => {
-                        pump_direct(&ctx, motor.refuse_capacity()?).await?;
+                        let stream = motor.refuse_capacity()?;
+                        motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
+                        pump_direct_secret(&ctx, stream, Some(secret)).await?;
                         return Ok(HandlerOutcome::Streamed);
                     }
                 };
                 let stream = motor.run_direct(request, self.attribution(route, envelope.preset))?;
+                motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
                 self.direct_jobs
                     .lock()
                     .unwrap()
                     .insert(stream.job_id, route);
                 tracing::info!(caller = "direct", job_id = %stream.job_id, "direct job submitted");
-                pump_direct(&ctx, stream)
+                pump_direct_secret(&ctx, stream, Some(secret))
                     .await
                     .map(|()| HandlerOutcome::Streamed)
             }
             "exec.attach" => {
-                let request: AttachRequest = parse(envelope.params)?;
-                if !owned(request.job_id) {
+                let motor = self.initialized()?;
+                let id = envelope
+                    .params
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse().ok());
+                let Some(id) = id else {
+                    return Ok(direct_job_not_found());
+                };
+                if !owned(id) && !motor.direct_authorized(id, envelope.direct_secret.as_str()) {
                     return Ok(direct_job_not_found());
                 }
+                let request: AttachRequest = parse(envelope.params)?;
                 pump_direct(&ctx, self.initialized()?.attach(request)?)
                     .await
                     .map(|()| HandlerOutcome::Streamed)
             }
             "exec.cancel" => {
-                let request: CancelRequest = parse(envelope.params)?;
-                if !owned(request.job_id) {
+                let motor = self.initialized()?;
+                let id = envelope
+                    .params
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse().ok());
+                let Some(id) = id else {
+                    return Ok(direct_job_not_found());
+                };
+                if !owned(id) && !motor.direct_authorized(id, envelope.direct_secret.as_str()) {
                     return Ok(direct_job_not_found());
                 }
+                let request: CancelRequest = parse(envelope.params)?;
                 tracing::info!(caller = "direct", job_id = %request.job_id, "direct job cancel requested");
                 response(self.initialized()?.cancel(request).await?)
             }
@@ -400,8 +422,14 @@ impl Handler {
                         message: "ck-motor refuses exec.status without a job_id for direct; a direct caller may check only its own jobs".into(),
                     });
                 };
-                let id: Uuid = parse(id.clone())?;
-                if !owned(id) {
+                let Some(id) = id.as_str().and_then(|id| id.parse().ok()) else {
+                    return Ok(direct_job_not_found());
+                };
+                if !owned(id)
+                    && !self
+                        .initialized()?
+                        .direct_authorized(id, envelope.direct_secret.as_str())
+                {
                     return Ok(direct_job_not_found());
                 }
                 response(self.initialized()?.job_status(id).await?)
@@ -431,6 +459,10 @@ struct Envelope {
     op: String,
     #[serde(default)]
     params: Value,
+    // Kept as JSON until authorization, so malformed credentials receive the
+    // same refusal as missing ones rather than a deserializer's error text.
+    #[serde(default)]
+    direct_secret: Value,
     /// AFT's selected preset is attribution, not a policy input to motor.
     #[serde(default)]
     preset: Option<String>,
@@ -504,7 +536,7 @@ impl ModuleHandler for Handler {
     async fn on_route_gone(&self, handle: &RouteHandle) {
         self.routes.lock().unwrap().remove(handle);
         // A closed route's jobs keep running on the runner until they finish or
-        // reach their timeout; no later route may claim them.
+        // reach their timeout; a later route must present the job's secret.
         self.direct_jobs
             .lock()
             .unwrap()
@@ -718,6 +750,14 @@ async fn pump(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
 /// `pump` for a direct caller, writing each direct job's acceptance and
 /// terminal outcome to ck-motor's log with `caller=direct`.
 async fn pump_direct(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
+    pump_direct_secret(ctx, stream, None).await
+}
+
+async fn pump_direct_secret(
+    ctx: &RequestCtx,
+    stream: JobStream,
+    mut secret: Option<crate::direct_secret::DirectSecret>,
+) -> io::Result<()> {
     let id = stream.job_id;
     let mut terminal = false;
     let result = forward(ctx.cancelled(), stream, |record| {
@@ -732,7 +772,19 @@ async fn pump_direct(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
             }
             _ => {}
         }
-        reply(ctx, record)
+        // Add the job's secret only to the live submission reply, after the
+        // job records have left persistence. Replays must never disclose it
+        // to another caller, including an agent that can attach to any job.
+        let direct_job = secret
+            .take()
+            .map(|secret| serde_json::json!({"job_id": id, "secret": secret.expose()}));
+        async move {
+            let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
+            if let Some(direct_job) = direct_job {
+                value["direct_job"] = direct_job;
+            }
+            reply(ctx, value).await
+        }
     })
     .await;
     if !terminal {

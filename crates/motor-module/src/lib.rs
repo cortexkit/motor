@@ -21,6 +21,7 @@ pub use transport::{RUNNER_CREDENTIAL_CATEGORY, RUNNER_CREDENTIAL_ID};
 
 pub use motor_protocol::allowed_env;
 
+mod direct_secret;
 #[cfg(test)]
 #[path = "../tests/it/mod.rs"]
 mod tests;

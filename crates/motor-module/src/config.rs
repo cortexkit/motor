@@ -24,17 +24,17 @@ pub struct Config {
     /// Admit plain local clients of the subc daemon (`Principal::Direct`, which
     /// is any process running as this user, agent shells included) for their
     /// own jobs: `exec.run`, and `exec.attach`, `exec.cancel` and `exec.status`
-    /// of jobs their route started. Off by default; when off, ck-motor refuses
-    /// direct binds on these routes.
+    /// of jobs their route started or whose secret they hold. Off by default;
+    /// when off, ck-motor refuses direct binds on these routes.
     // Omitted from serialized configs at its default so
     // a config written by this version still loads in an older ck-motor, whose
-    // Config rejects unknown fields. scripts/mixed-version.py runs the pinned
-    // production ck-motor against a config written by this version to prove it.
+    // Config rejects unknown fields. scripts/mixed-version.py checks that the
+    // pinned production ck-motor can load a config written by this version.
     #[serde(skip_serializing_if = "is_false")]
     pub admit_direct_exec: bool,
     /// The longest timeout, in seconds, a direct `exec.run` may ask for. A
-    /// direct caller that loses its connection can't re-attach to or cancel its
-    /// job, so every direct job must end on its own: ck-motor refuses a direct
+    /// disconnected caller may never return with its secret, so every direct
+    /// job must end on its own: ck-motor refuses a direct
     /// run with no timeout or a longer one before anything is uploaded.
     #[serde(skip_serializing_if = "is_default_direct_timeout")]
     pub direct_exec_max_timeout_secs: u64,

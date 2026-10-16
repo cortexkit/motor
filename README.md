@@ -15,7 +15,7 @@ are separate projects.
 
 | Crate | Role |
 | --- | --- |
-| [`motor-module`](crates/motor-module/README.md) | `ck-motor`, the client module: caller admission, snapshots, SSH transport, `ck motor run`. |
+| [`motor-module`](crates/motor-module/README.md) | `ck-motor`, the client module: caller admission, snapshots, SSH transport, `ck motor run` and `attach`. |
 | `motor-protocol` | The framed client-runner protocol and codec; re-exports the caller types from `cortexkit-exec-remote-types`. |
 | [`motor-runner`](crates/motor-runner/README.md) | The build-server daemon: admission, scheduling, workspaces, Linux sandbox, Windows VM backend, compile cache. |
 | `motor-winagent` | The guest agent inside each Windows job VM. A standalone crate outside the workspace. |

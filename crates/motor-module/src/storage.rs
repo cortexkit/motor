@@ -28,6 +28,8 @@ fn now_ms() -> u64 {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_job: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +263,21 @@ impl Storage {
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
     }
+    pub fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().direct_secret_hash = Some(hash);
+        })
+    }
+    pub fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
+        let hash = self
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .and_then(|job| job.direct_secret_hash);
+        crate::direct_secret::matches(hash, secret)
+    }
     pub fn lease_job(self: &Arc<Self>, id: Uuid) -> JobLease {
         *self
             .state
@@ -374,6 +391,46 @@ impl Storage {
 
 #[cfg(test)]
 mod retention_tests {
+    #[test]
+    fn direct_secret_hash_survives_reopen_and_expires_with_its_job() {
+        use super::*;
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-direct-retention");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        let secret = crate::direct_secret::DirectSecret::mint().unwrap();
+        storage.create(id, 60, None, None, true).unwrap();
+        storage.set_direct_secret_hash(id, secret.hash()).unwrap();
+        assert!(storage.direct_authorized(id, Some(secret.expose())));
+        assert!(!storage.direct_authorized(id, None));
+        assert!(!storage.direct_authorized(Uuid::now_v7(), Some(secret.expose())));
+        drop(storage);
+        let storage = Storage::open(&scratch).unwrap();
+        assert!(storage.direct_authorized(id, Some(secret.expose())));
+        storage.terminal_observed(id).unwrap();
+        storage.terminal_delivered(id).unwrap();
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&id)
+            .unwrap()
+            .retain_until_ms = Some(1);
+        storage.update(|_| {}).unwrap();
+        assert!(storage.job(id).is_none());
+        assert!(!storage.direct_authorized(id, Some(secret.expose())));
+        let state = fs::read_to_string(scratch.join("state.json")).unwrap();
+        assert!(!state.contains("direct_secret_hash"));
+        assert!(!state.contains(secret.expose()));
+        let legacy: Job = serde_json::from_str(
+            r#"{"queue_wait_limit_s":60,"pending_cancel":false,"local_terminal":null}"#,
+        )
+        .unwrap();
+        assert!(legacy.direct_secret_hash.is_none());
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("direct_secret_hash"));
+    }
     use super::*;
     use serde_json::json;
 
