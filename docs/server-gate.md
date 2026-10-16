@@ -3,8 +3,9 @@
 `script/runner/server-gate.sh` is motor's full pre-push gate. It runs what
 hosted CI and remote build jobs cannot: the operator-only isolation tests, which
 start real `motor-job` sandboxes, and the tests that need a real SSH server or
-`openat2` outside a sandbox. It also runs the workspace suite twice to surface
-flaky tests. [CONTRIBUTING.md](../CONTRIBUTING.md#the-gate) explains how it
+`openat2` outside a sandbox. Each suite runs once; set `GATE_RUNS=2` or more to
+repeat the workspace and operator suites when hunting a flaky test.
+[CONTRIBUTING.md](../CONTRIBUTING.md#the-gate) explains how it
 relates to hosted CI.
 
 ## Before you start
@@ -48,8 +49,8 @@ A failed step does not stop later steps.
 | `cortexkit-layout` | `scripts/check-cortexkit-layout.sh` |
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
-| `workspace-1`, `workspace-2` | `cargo nextest run --workspace --locked --no-fail-fast` |
-| `operator-lib-1`, `operator-lib-2` | `cargo nextest run -p motor-runner --lib --locked --run-ignored only` with the filter `test(/::isolated_/) \| test(=engine::tests::cancellation_deadline_and_drop_kill_even_term_ignoring_groups)` |
+| `workspace-1` (up to `workspace-N` with `GATE_RUNS=N`) | `cargo nextest run --workspace --locked --no-fail-fast` |
+| `operator-lib-1` (up to `operator-lib-N`) | `cargo nextest run -p motor-runner --lib --locked --run-ignored only` with the filter `test(/::isolated_/) \| test(=engine::tests::cancellation_deadline_and_drop_kill_even_term_ignoring_groups)` |
 | `operator-it` | `cargo nextest run -p motor-runner --test it --locked --run-ignored only` with the filter `test(serve_writes_its_tracing_events_to_stderr) \| test(/::isolated_/)` |
 | `mixed-version` | `python3 scripts/mixed-version.py` |
 | `subc-daemon-env`, `test-binary-fold`, `test-dev-binaries`, `test-scratch`, `unreachable-modules` | `python3 scripts/<name>.py` |

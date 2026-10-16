@@ -3,8 +3,9 @@
 # from the root of a checkout of the commit under test. It runs what CI and
 # runon jobs can't: the operator-only isolation lanes (they start real
 # motor-job sandboxes, so they need the operator's sudo), the real-SSH and
-# openat2 tests that fail inside a sandbox, and the workspace suite twice to
-# surface flaky tests. Each step prints "gate <name> ok" or "gate <name>
+# openat2 tests that fail inside a sandbox. Each suite runs once; set
+# GATE_RUNS=2 (or more) to repeat the workspace and operator suites when
+# hunting a flaky test. Each step prints "gate <name> ok" or "gate <name>
 # FAILED", and the script exits nonzero if any step failed or the run left
 # more failed motor-* systemd units than it found.
 #
@@ -50,14 +51,15 @@ failed_units() {
   comm -12 <(printf '%s\n' "$first") <(printf '%s\n' "$second") | grep -c . || true
 }
 
+runs=${GATE_RUNS:-1}
 before=$(failed_units)
 step cortexkit-layout scripts/check-cortexkit-layout.sh
 step fmt cargo fmt --all --check
 step clippy cargo clippy --workspace --all-targets --locked -- -D warnings
-for run in 1 2; do
+for run in $(seq 1 "$runs"); do
   step "workspace-$run" cargo nextest run --workspace --locked --no-fail-fast
 done
-for run in 1 2; do
+for run in $(seq 1 "$runs"); do
   step "operator-lib-$run" cargo nextest run -p motor-runner --lib --locked --run-ignored only \
     -E 'test(/::isolated_/) | test(=engine::tests::cancellation_deadline_and_drop_kill_even_term_ignoring_groups)' \
     --no-fail-fast

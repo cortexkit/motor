@@ -76,8 +76,8 @@ What each check guards:
 
 `script/runner/server-gate.sh` is the full pre-push gate. It runs on a dedicated
 Linux build server as the trusted operator, because it starts real `motor-job`
-sandboxes. It adds the operator-only lanes CI cannot run, and runs the workspace
-suite twice to surface flaky tests. [docs/server-gate.md](docs/server-gate.md)
+sandboxes. It adds the operator-only lanes CI cannot run; `GATE_RUNS=2` repeats
+the suites when hunting a flaky test. [docs/server-gate.md](docs/server-gate.md)
 lists its steps and how to read its result.
 
 ### Tests that need an operator host
