@@ -99,7 +99,8 @@ administrator, randomizes local passwords and runs, in order:
 1. `setup-guest.ps1 -JobBaseline`: Git, Bun and MSVC Build Tools.
 2. `setup-job-baseline.ps1`: PowerShell 7.6.7 installed natively by the elevated
    `install-powershell.ps1` at `C:\Program Files\PowerShell\7`, protected with
-   SYSTEM/Administrators full control and Users read/execute; the standard
+   SYSTEM/Administrators full control and Users read/execute and added to machine
+   `PATH` so native tools rebuilding their environment also find it; the standard
    `motor-job` user and its batch-logon
    right, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
    `C:\rust` (read-only to the job user), the virtio-serial driver, and the
@@ -196,6 +197,7 @@ binary must come from the same commit. The lane runs, from
 | Test | Checks |
 | --- | --- |
 | `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | Standard-user PowerShell 7.6.7 execution and recursive write denial; a long-checkout MSVC build uses `C:\t` and is readable through checkout `target/`. |
+| `windows_qualification_standard_user_environment` | Windows' full machine `PATHEXT`, PowerShell on machine `PATH`, native command lookup from Git Bash and PowerShell, writable user application-data folders, and accepted request overrides. |
 | `windows_qualification_no_network_but_loopback_works` | No network beyond loopback. |
 | `windows_qualification_qemu_and_preparation_accounts_are_confined` | `motor-qemu` and `motor-prep` confinement. |
 | `windows_qualification_one_vm_slot_lock_refuses_without_boot` | A held slot refuses without booting. |

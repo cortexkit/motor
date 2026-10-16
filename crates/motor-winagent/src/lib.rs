@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod cache;
 pub mod cache_steps;
+pub mod environment;
 
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -486,15 +487,23 @@ impl Command {
         Ok(())
     }
 
-    /// Windows environment keys are case-insensitive; discard case variants of
-    /// protected keys before setting the agent-owned values.
-    pub fn environment(&self, profile: &str) -> io::Result<BTreeMap<String, String>> {
+    /// Overlay the loaded user's Windows environment without inheriting service variables.
+    /// Agent-owned values still take precedence over accepted request values.
+    pub fn environment(
+        &self,
+        profile: &str,
+        base: BTreeMap<String, String>,
+        git_bin: &str,
+    ) -> io::Result<BTreeMap<String, String>> {
         self.validate()?;
+        let mut env: BTreeMap<_, _> = base
+            .into_iter()
+            .map(|(key, value)| (key.to_uppercase(), value))
+            .collect();
         let forced = [
             (
                 "PATH",
-                "C:\\rust\\cargo\\bin;C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\usr\\bin;C:\\Windows\\System32;C:\\Program Files\\PowerShell\\7;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Windows"
-                    .to_string(),
+                environment::job_path(env.get("PATH").map_or("", String::as_str), git_bin),
             ),
             ("RUSTUP_HOME", "C:\\rust\\rustup".into()),
             ("HOME", profile.into()),
@@ -504,34 +513,34 @@ impl Command {
             ("TEMP", format!("{profile}\\AppData\\Local\\Temp")),
             ("CARGO_NET_OFFLINE", "true".into()),
             ("CK_REMOTE_SOURCE_COMMIT", self.source_commit.clone()),
-            ("SystemRoot", "C:\\Windows".into()),
-            ("SystemDrive", "C:".into()),
+            ("SYSTEMROOT", "C:\\Windows".into()),
+            ("SYSTEMDRIVE", "C:".into()),
         ];
-        let mut env = BTreeMap::new();
+        let mut request = BTreeMap::new();
         for (key, value) in &self.env {
             if !forced
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(key))
             {
                 let canonical = key.to_uppercase();
-                if env.insert(canonical, value.clone()).is_some() {
+                if request.insert(canonical, value.clone()).is_some() {
                     return Err(invalid(format!(
                         "duplicate case-insensitive environment key: {key}"
                     )));
                 }
             }
         }
+        env.extend(request);
+        for (key, value) in [
+            ("CARGO_TARGET_DIR", CACHE_MOUNT.trim_end_matches('\\')),
+            ("CARGO_BUILD_JOBS", "4"),
+            ("RUST_TEST_THREADS", "4"),
+            ("NEXTEST_TEST_THREADS", "4"),
+        ] {
+            env.entry(key.into()).or_insert_with(|| value.into());
+        }
         for (key, value) in forced {
             env.insert(key.into(), value);
-        }
-        env.entry("CARGO_TARGET_DIR".into())
-            .or_insert_with(|| CACHE_MOUNT.trim_end_matches('\\').into());
-        for key in [
-            "CARGO_BUILD_JOBS",
-            "RUST_TEST_THREADS",
-            "NEXTEST_TEST_THREADS",
-        ] {
-            env.entry(key.into()).or_insert_with(|| "4".into());
         }
         Ok(env)
     }
@@ -1181,6 +1190,93 @@ mod tests {
         }
     }
 
+    fn base_environment() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("Path".into(), "C:\\Windows\\System32;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Windows;C:\\Users\\motor-job\\bin".into()),
+            ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC".into()),
+            ("APPDATA".into(), "C:\\Users\\motor-job\\AppData\\Roaming".into()),
+            ("LOCALAPPDATA".into(), "C:\\Users\\motor-job\\AppData\\Local".into()),
+            ("USERNAME".into(), "motor-job".into()),
+            ("PSModulePath".into(), "%ProgramFiles%\\WindowsPowerShell\\Modules".into()),
+        ])
+    }
+
+    #[test]
+    fn standard_user_environment_survives_job_overrides() {
+        let base = base_environment();
+        let env = command()
+            .environment(
+                "C:\\Users\\motor-job",
+                base.clone(),
+                "C:\\Program Files\\Git\\ucrt64\\bin",
+            )
+            .unwrap();
+        for (key, value) in base {
+            if key != "Path" {
+                assert_eq!(env[&key.to_uppercase()], value, "lost base variable {key}");
+            }
+        }
+        assert_eq!(env["TEMP"], "C:\\Users\\motor-job\\AppData\\Local\\Temp");
+        assert_eq!(env["TMP"], env["TEMP"]);
+        assert_eq!(env["HOME"], "C:\\Users\\motor-job");
+        assert_eq!(env["USERPROFILE"], env["HOME"]);
+        assert!(!env.contains_key("HOMEDRIVE"));
+        assert!(!env.contains_key("HOMEPATH"));
+    }
+
+    #[test]
+    fn request_overrides_base_but_not_agent_owned_values() {
+        let mut base = base_environment();
+        base.insert("rust_test_threads".into(), "9".into());
+        base.insert("TEMP".into(), "C:\\Windows\\Temp".into());
+        let mut command = command();
+        command.env = BTreeMap::from([
+            ("RUST_TEST_THREADS".into(), "2".into()),
+            ("CI".into(), "request-marker".into()),
+            ("temp".into(), "C:\\untrusted".into()),
+        ]);
+        let env = command
+            .environment(
+                "C:\\Users\\motor-job",
+                base,
+                "C:\\Program Files\\Git\\ucrt64\\bin",
+            )
+            .unwrap();
+        assert_eq!(env["RUST_TEST_THREADS"], "2");
+        assert_eq!(env["CI"], "request-marker");
+        assert_eq!(env["TEMP"], "C:\\Users\\motor-job\\AppData\\Local\\Temp");
+        assert_eq!(env["CK_REMOTE_SOURCE_COMMIT"], command.source_commit);
+    }
+
+    #[test]
+    fn defaults_only_fill_missing_merged_values_and_request_duplicates_are_rejected() {
+        let mut base = base_environment();
+        base.insert("CARGO_BUILD_JOBS".into(), "3".into());
+        let mut command = command();
+        let env = command
+            .environment(
+                "C:\\Users\\motor-job",
+                base,
+                "C:\\Program Files\\Git\\ucrt64\\bin",
+            )
+            .unwrap();
+        assert_eq!(env["CARGO_BUILD_JOBS"], "3");
+        assert_eq!(env["NEXTEST_TEST_THREADS"], "4");
+        command.env = BTreeMap::from([
+            ("RUST_TEST_THREADS".into(), "1".into()),
+            ("rust_test_threads".into(), "2".into()),
+        ]);
+        assert!(
+            command
+                .environment(
+                    "C:\\Users\\motor-job",
+                    base_environment(),
+                    "C:\\Program Files\\Git\\ucrt64\\bin"
+                )
+                .is_err()
+        );
+    }
+
     #[test]
     fn forced_environment_wins_case_insensitively_and_thread_counts_survive() {
         let mut command = command();
@@ -1189,7 +1285,13 @@ mod tests {
             ("path".into(), "bad".into()),
             ("rust_test_threads".into(), "1".into()),
         ]);
-        let env = command.environment("C:\\Users\\motor-job").unwrap();
+        let env = command
+            .environment(
+                "C:\\Users\\motor-job",
+                base_environment(),
+                "C:\\Program Files\\Git\\mingw64\\bin",
+            )
+            .unwrap();
         assert_eq!(env["CARGO_NET_OFFLINE"], "true");
         assert_eq!(env["RUST_TEST_THREADS"], "1");
         assert_eq!(env["CARGO_BUILD_JOBS"], "4");
@@ -1210,7 +1312,13 @@ mod tests {
 
     #[test]
     fn job_path_has_powershell_7_before_windows_powershell() {
-        let env = command().environment("C:\\Users\\motor-job").unwrap();
+        let env = command()
+            .environment(
+                "C:\\Users\\motor-job",
+                base_environment(),
+                "C:\\Program Files\\Git\\mingw64\\bin",
+            )
+            .unwrap();
         let paths: Vec<_> = env["PATH"].split(';').collect();
         let pwsh = paths
             .iter()
@@ -1225,7 +1333,13 @@ mod tests {
 
     #[test]
     fn job_target_dir_defaults_to_short_cache_mount() {
-        let env = command().environment("C:\\Users\\motor-job").unwrap();
+        let env = command()
+            .environment(
+                "C:\\Users\\motor-job",
+                base_environment(),
+                "C:\\Program Files\\Git\\mingw64\\bin",
+            )
+            .unwrap();
         assert_eq!(
             env.get("CARGO_TARGET_DIR").map(String::as_str),
             Some("C:\\t")
@@ -1237,7 +1351,11 @@ mod tests {
         let mut command = command();
         assert_eq!(
             command
-                .environment("C:\\Users\\motor-job")
+                .environment(
+                    "C:\\Users\\motor-job",
+                    base_environment(),
+                    "C:\\Program Files\\Git\\mingw64\\bin"
+                )
                 .unwrap()
                 .get("CARGO_TARGET_DIR")
                 .map(String::as_str),
@@ -1245,7 +1363,13 @@ mod tests {
         );
         for key in ["CARGO_TARGET_DIR", "cargo_target_dir", "Cargo_Target_Dir"] {
             command.env = BTreeMap::from([(key.into(), "C:\\custom-target".into())]);
-            let env = command.environment("C:\\Users\\motor-job").unwrap();
+            let env = command
+                .environment(
+                    "C:\\Users\\motor-job",
+                    base_environment(),
+                    "C:\\Program Files\\Git\\mingw64\\bin",
+                )
+                .unwrap();
             assert_eq!(env["CARGO_TARGET_DIR"], "C:\\custom-target");
             assert_eq!(
                 env.keys()

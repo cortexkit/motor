@@ -237,6 +237,85 @@ Write-Output 'short target cache is writable'
 "#.into()
 }
 
+/// Standard-user jobs need Windows' executable extensions, writable user folders,
+/// and native command lookup. Removing the Windows base block or the provisioned
+/// PowerShell machine PATH entry must make this test fail.
+#[tokio::test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+async fn windows_qualification_standard_user_environment() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    fs::write(
+        f.main.join("standard-user-environment.ps1"),
+        standard_user_environment_script(),
+    )
+    .unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "qualification user environment"]);
+    let (mut request, bytes) = f.run(
+        r#"set -e
+cmd //c "echo ok"
+pwsh -NoProfile -Command "git --version"
+powershell.exe -NoLogo -NoProfile -NonInteractive -File ./standard-user-environment.ps1 -JobPathExt "$PATHEXT"
+"#,
+    );
+    request.platform = Some(Platform::Windows);
+    request.env.insert("RUST_TEST_THREADS".into(), "2".into());
+    request.env.insert("CI".into(), "request-marker".into());
+    f.submit(&runner, &request, &bytes);
+    let terminal = operator_terminal(&runner, request.job_id).await;
+    let output = replay_output(&runner, request.job_id);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::WindowsExit { code: 0 },
+        "{output}"
+    );
+    assert!(output.lines().any(|line| line.trim() == "ok"), "{output}");
+    assert!(output.contains("git version "), "{output}");
+    assert!(
+        output.contains("normal Windows user environment passed"),
+        "{output}"
+    );
+    no_units(&runner);
+}
+
+fn standard_user_environment_script() -> String {
+    r#"
+param([Parameter(Mandatory=$true)][string]$JobPathExt)
+$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
+if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
+# PowerShell appends .CPL to its own PATHEXT; compare the value captured by Bash.
+$expected='.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC'
+$machinePathExt=[Environment]::GetEnvironmentVariable('PATHEXT','Machine')
+if($machinePathExt -cne $expected){throw "unexpected machine PATHEXT: $machinePathExt"}
+if($JobPathExt -cne $machinePathExt){throw "job PATHEXT differs from the machine: $JobPathExt"}
+$install='C:\Program Files\PowerShell\7'
+$machinePaths=[Environment]::GetEnvironmentVariable('Path','Machine') -split ';'
+if(-not ($machinePaths | Where-Object {$_.Trim().Trim('"').TrimEnd('\') -ieq $install})){throw 'PowerShell 7 is absent from machine PATH'}
+$found=@(& where.exe pwsh)
+if($LASTEXITCODE -ne 0 -or $found -notcontains "$install\pwsh.exe"){throw "where.exe pwsh failed: $found"}
+foreach($name in @('LOCALAPPDATA','APPDATA','TEMP','TMP')) {
+ $directory=[Environment]::GetEnvironmentVariable($name,'Process')
+ if([string]::IsNullOrWhiteSpace($directory)){throw "$name is unset"}
+ if($directory -notmatch '^(?:[A-Za-z]:\\|\\\\)'){throw "$name is not a native Windows path: $directory"}
+ if(-not (Test-Path -LiteralPath $directory -PathType Container)){throw "$name directory is missing: $directory"}
+ $probe=Join-Path $directory ('motor-env-probe-'+[Guid]::NewGuid().ToString('N'))
+ $stream=[IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try {$stream.WriteByte(7)} finally {$stream.Dispose();[IO.File]::Delete($probe)}
+ Write-Output "$name is writable: $directory"
+}
+if($env:RUST_TEST_THREADS -cne '2'){throw "request thread override was lost: $env:RUST_TEST_THREADS"}
+if($env:CI -cne 'request-marker'){throw 'request CI marker was lost'}
+& pwsh -NoProfile -Command 'cmd /c exit 7'
+if($LASTEXITCODE -ne 7){throw "pwsh could not resolve cmd or preserve exit 7: $LASTEXITCODE"}
+Write-Output 'normal Windows user environment passed'
+exit 0
+"#.into()
+}
+
 /// Break check: add a NIC to the job VM. Successful external DNS, TCP, UDP or
 /// IPv6 routing makes this check fail; guest loopback must remain usable.
 #[test]
@@ -1557,6 +1636,12 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
     let script = baseline_environment_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
     assert!(powershell(&script).len() < 8000);
+}
+
+#[test]
+fn standard_user_environment_generated_powershell_has_balanced_braces() {
+    let script = standard_user_environment_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
 }
 
 #[test]
