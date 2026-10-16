@@ -2143,6 +2143,7 @@ impl Sandbox {
         env: &[(String, String)],
         durable: bool,
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<Command> {
         let user = self.user;
         let mut cmd = Command::new("/usr/bin/sudo");
@@ -2206,10 +2207,12 @@ impl Sandbox {
                 "--property=AllowedCPUs={}",
                 crate::cpu::format_list(cpus)
             ));
+            // Placement can shrink to avoid Windows cores without reducing the
+            // memory budget associated with the job's requested vCPU count.
             #[cfg(test)]
-            let memory_max = crate::backend::memory_max(cpus.len() as u32, self.memory_floor_gib);
+            let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
             #[cfg(not(test))]
-            let memory_max = crate::backend::memory_max(cpus.len() as u32);
+            let memory_max = crate::backend::memory_max(requested_vcpus);
             cmd.arg(format!("--property=MemoryMax={memory_max}"));
         }
         cmd.arg(format!("--property=User={user}"))
@@ -2293,7 +2296,7 @@ impl Sandbox {
         cwd: &Path,
         env: &[(String, String)],
     ) -> io::Result<platform::Launch> {
-        self.launch_inner(command, cwd, env, false, &[])
+        self.launch_inner(command, cwd, env, false, &[], 0)
     }
     pub(crate) fn launch_durable(
         &self,
@@ -2301,8 +2304,9 @@ impl Sandbox {
         cwd: &Path,
         env: &[(String, String)],
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
-        self.launch_inner(command, cwd, env, true, cpus)
+        self.launch_inner(command, cwd, env, true, cpus, requested_vcpus)
     }
     fn launch_inner(
         &self,
@@ -2311,6 +2315,7 @@ impl Sandbox {
         env: &[(String, String)],
         durable: bool,
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
         #[cfg(test)]
         crate::test_cleanup::record_unit(self.id, cwd);
@@ -2341,7 +2346,7 @@ impl Sandbox {
             None
         };
         let mut child = self
-            .command(command, cwd, env, durable, cpus)?
+            .command(command, cwd, env, durable, cpus, requested_vcpus)?
             .env_clear()
             .stdin(if durable {
                 Stdio::null()

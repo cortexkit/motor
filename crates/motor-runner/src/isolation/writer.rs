@@ -412,7 +412,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         writer: false,
     };
     let command = sandbox
-        .command(CacheServer::script(), &f.workspace, &[], false, &[])
+        .command(CacheServer::script(), &f.workspace, &[], false, &[], 0)
         .unwrap();
     let args: Vec<_> = command
         .get_args()
@@ -457,7 +457,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
     assert!(script.contains("trap '\"$MOTOR_TEST_SCCACHE\" --stop-server' EXIT"));
     sandbox.user = USER;
     let job = sandbox
-        .command("true", &f.workspace, &[], false, &[])
+        .command("true", &f.workspace, &[], false, &[], 0)
         .unwrap();
     let job_args: Vec<_> = job.get_args().map(|arg| arg.to_str().unwrap()).collect();
     for property in [

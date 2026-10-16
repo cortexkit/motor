@@ -362,7 +362,7 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
     let legacy_inode = fs::symlink_metadata(&legacy.checkout).unwrap().ino();
     let mut live = sandbox.launch_durable(
         "trap 'if test -f target/keep; then echo storage-present-at-stop; fi; exit 0' TERM; echo live; while :; do sleep 0.1; done",
-        &legacy.checkout, &[], &[]).unwrap();
+        &legacy.checkout, &[], &[], base.weight).unwrap();
     base.process = Some(live.identity);
     base.durable_output = live.durable_output;
     let record = config

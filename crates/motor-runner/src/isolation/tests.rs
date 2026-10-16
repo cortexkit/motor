@@ -49,30 +49,10 @@ fn test_memory_floor_override_changes_the_computed_limit() {
 #[test]
 fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
     let f = Fixture::new();
-    let sandbox = Sandbox {
-        id: Uuid::now_v7(),
-        root: f.scratch.join("root"),
-        home: PathBuf::from("/motor-home"),
-        cargo: PathBuf::from("/motor-home/cargo"),
-        rustup: PathBuf::from("/toolchain"),
-        path: "/usr/bin:/bin".into(),
-        read_only: Vec::new(),
-        read_write: Vec::new(),
-        wrapper: None,
-        runtime: std::sync::Arc::new(RuntimeDir(
-            f.scratch.join("unprepared"),
-            std::sync::OnceLock::new(),
-        )),
-        retain_failed: false,
-        network: false,
-        parent_umask: 0o022,
-        memory_floor_gib: None,
-        user: USER,
-        writer: false,
-    };
+    let sandbox = f.command_sandbox();
     for cpus in [&[1, 2, 17, 18][..], &[7][..], &[1, 2, 3, 17, 18][..]] {
         let command = sandbox
-            .command("nproc", &f.workspace, &[], true, cpus)
+            .command("nproc", &f.workspace, &[], true, cpus, cpus.len() as u32)
             .unwrap();
         let args: Vec<_> = command
             .get_args()
@@ -108,6 +88,30 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
         }
         assert!(!args.iter().any(|arg| arg.contains("CPUQuota")));
     }
+}
+
+#[test]
+fn capped_cpu_placement_keeps_requested_memory_limit() {
+    let f = Fixture::new();
+    let sandbox = f.command_sandbox();
+    let requested_vcpus = 30;
+    let cpus: Vec<_> = (1..12).chain(17..28).collect();
+    assert_eq!(cpus.len(), 22);
+    assert!(requested_vcpus > cpus.len() as u32);
+    let command = sandbox
+        .command("nproc", &f.workspace, &[], true, &cpus, requested_vcpus)
+        .unwrap();
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    assert!(
+        args.contains(&"--property=MemoryMax=112742891520"),
+        "{args:?}"
+    );
+    assert!(args.contains(
+        &"--property=AllowedCPUs=1,2,3,4,5,6,7,8,9,10,11,17,18,19,20,21,22,23,24,25,26,27"
+    ));
 }
 
 struct Fixture {
@@ -147,6 +151,29 @@ impl Fixture {
             1,
         )
         .unwrap()
+    }
+    fn command_sandbox(&self) -> Sandbox {
+        Sandbox {
+            id: Uuid::now_v7(),
+            root: self.scratch.join("root"),
+            home: PathBuf::from("/motor-home"),
+            cargo: PathBuf::from("/motor-home/cargo"),
+            rustup: PathBuf::from("/toolchain"),
+            path: "/usr/bin:/bin".into(),
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            wrapper: None,
+            runtime: std::sync::Arc::new(RuntimeDir(
+                self.scratch.join("unprepared"),
+                std::sync::OnceLock::new(),
+            )),
+            retain_failed: false,
+            network: false,
+            parent_umask: 0o022,
+            memory_floor_gib: None,
+            user: USER,
+            writer: false,
+        }
     }
 }
 impl Drop for Fixture {
@@ -273,7 +300,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
     let env =
         ["TMPDIR", "TMP", "TEMP"].map(|key| (key.to_string(), "/tmp/caller-shared".to_string()));
     let command = sandbox
-        .command(source, &f.workspace, &env, false, &[])
+        .command(source, &f.workspace, &env, false, &[], 0)
         .unwrap();
     let args: Vec<_> = command
         .get_args()
@@ -286,7 +313,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
     assert!(!args.contains(&"--property=CollectMode=inactive"));
     let retained = sandbox.retaining_failed_units();
     let command = retained
-        .command(source, &f.workspace, &env, false, &[])
+        .command(source, &f.workspace, &env, false, &[], 0)
         .unwrap();
     let retained_args: Vec<_> = command
         .get_args()
@@ -1192,6 +1219,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
                     &[("SCCACHE_DIR".into(), "/motor-cache".into())],
                     true,
                     &[],
+                    0,
                 )
                 .unwrap();
             let args: Vec<_> = command.get_args().collect();

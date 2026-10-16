@@ -157,12 +157,44 @@ stay up (`loginctl enable-linger <operator>`).
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
 | `--backend host\|windows-vm` | `host` | Job backend. A third value, `vm`, is parsed but refused at startup in this build. |
 | `--vm-config FILE` | absent | Windows instance configuration. |
+| `--windows-cpus LIST` | absent | Linux placement avoidance: Windows VM host CPUs in CPU-list syntax; their online SMT siblings are included. Requires `--windows-slot-lock`. |
+| `--windows-slot-lock PATH` | absent | Absolute path to the shared Windows QEMU slot lock; requires `--windows-cpus`. Read-only observation, never acquires the lock. |
 | `--job-network veth` | absent | Allow outbound networking for jobs that request it. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
 
 `motor-runner --version` prints the version. Other subcommands are `connect`
 (the SSH bridge `ck-motor` runs), `drain` and `resume`
 ([drain-and-rollback.md](drain-and-rollback.md)).
+
+The main runner unit configures Windows CPU avoidance. Each new placement,
+including background cache fills, stats the slot-lock file and reads `/proc/locks`
+to check for its exclusive flock. This requires the host PID namespace's lock
+table; acquiring or releasing a flock does not generate an inotify event. While
+the slot is held, new jobs overlap only within the other allocatable CPUs. A
+claim larger than that set gets the whole remaining set, without changing its
+admission weight or resource quotas. The maximum claim and daemon-only core do
+not change, and existing jobs keep their recorded CPU sets. After the slot is
+released, new placements can use those cores again.
+The test `capped_cpu_placement_keeps_requested_memory_limit` verifies that
+`MemoryMax` follows the requested vCPU count even when `AllowedCPUs` is smaller.
+
+A missing lock file is treated as no active Windows VM. Observation errors,
+malformed lock entries, or a configuration that leaves no eligible CPUs fail
+open to ordinary placement, with at most one warning per minute. Placement logs
+include the observed Windows activity, excluded CPUs, selected CPUs, job ID, and
+whether the job is a cache fill; health and job-record wire formats are unchanged.
+Observation is a snapshot,
+not a reservation against a Windows VM starting concurrently. The portable tests
+`active_windows_excludes_siblings_and_overlaps_only_remaining_cpus` and
+`windows_start_does_not_move_existing_job_or_exempt_cache_fills` cover placement;
+`isolated_windows_slot_observation_tracks_flock_and_recreated_inode` checks the
+real host lock table on an operator host.
+The ignored test `isolated_active_windows_vm_excludes_its_physical_cores` checks
+that the Linux runner can see QEMU's lock, not just a lock created by the test
+process. Leave a Windows job VM running on the dedicated server and run the test
+as the Linux runner's user in its PID namespace; the test checks real systemd
+activity before checking placement. Set `MOTOR_TEST_WINDOWS_SLOT_LOCK` and
+`MOTOR_TEST_WINDOWS_CPUS` to the Linux runner's flag values before running it.
 
 ## 6. Optional: job networking
 

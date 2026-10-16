@@ -89,7 +89,7 @@ fn ordinary_job_privileged_invocations_are_bounded() {
             // its arguments. Only process execution is replaced by the seam.
             checked(
                 &mut sandbox
-                    .command("true", &workspace, &[], true, &[0, 1])
+                    .command("true", &workspace, &[], true, &[0, 1], 2)
                     .unwrap(),
             )
             .unwrap();

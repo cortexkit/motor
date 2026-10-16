@@ -91,6 +91,7 @@ pub(crate) trait IsolationLauncher: Send + Sync {
         cwd: &std::path::Path,
         env: &[(String, String)],
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<platform::Launch>;
 }
 
@@ -102,8 +103,9 @@ impl IsolationLauncher for crate::isolation::Sandbox {
         cwd: &std::path::Path,
         env: &[(String, String)],
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
-        self.launch_durable(command, cwd, env, cpus)
+        self.launch_durable(command, cwd, env, cpus, requested_vcpus)
     }
 }
 
@@ -717,7 +719,7 @@ impl Backend for HostBackend {
                 .sandbox
                 .as_ref()
                 .ok_or_else(|| io::Error::other("isolated job has no prepared sandbox"))?;
-            sandbox.launch(&s.request.command, &prepared.cwd, &env, &s.cpus)
+            sandbox.launch(&s.request.command, &prepared.cwd, &env, &s.cpus, weight)
         } else {
             // The non-isolated host backend is development-only and does not pin CPUs.
             platform::launch(&s.request.command, &prepared.cwd, &env)
