@@ -175,6 +175,8 @@ claim larger than that set gets the whole remaining set, without changing its
 admission weight or resource quotas. The maximum claim and daemon-only core do
 not change, and existing jobs keep their recorded CPU sets. After the slot is
 released, new placements can use those cores again.
+The test `capped_cpu_placement_keeps_requested_memory_limit` verifies that
+`MemoryMax` follows the requested vCPU count even when `AllowedCPUs` is smaller.
 
 A missing lock file is treated as no active Windows VM. Observation errors,
 malformed lock entries, or a configuration that leaves no eligible CPUs fail

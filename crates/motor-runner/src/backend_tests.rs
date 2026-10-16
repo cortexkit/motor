@@ -53,6 +53,7 @@ struct LaunchCall {
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     cpus: Vec<u32>,
+    requested_vcpus: u32,
 }
 
 /// Records dispatch through the same IsolationLauncher boundary as systemd.
@@ -67,12 +68,14 @@ impl IsolationLauncher for ObservedIsolationLauncher {
         cwd: &Path,
         env: &[(String, String)],
         cpus: &[u32],
+        requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
         *self.0.lock().unwrap() = Some(LaunchCall {
             command: command.into(),
             cwd: cwd.into(),
             env: env.iter().cloned().collect(),
             cpus: cpus.to_vec(),
+            requested_vcpus,
         });
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -119,6 +122,7 @@ fn host_backend_launch_uses_isolation_launcher() {
         .expect("isolation launcher must be invoked");
     assert_eq!(call.command, "exit 0");
     assert_eq!(call.cpus, setup.cpus);
+    assert_eq!(call.requested_vcpus, 8);
     assert_eq!(call.cwd, scratch.path());
     assert_eq!(
         call.env["CARGO_TARGET_DIR"],
