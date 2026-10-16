@@ -251,6 +251,11 @@ async fn windows_qualification_standard_user_environment() {
         standard_user_environment_script(),
     )
     .unwrap();
+    fs::write(
+        f.main.join("standard-user-command-resolution.ps1"),
+        super::windows_environment::command_resolution_script(),
+    )
+    .unwrap();
     git(&f.main, &["add", "."]);
     git(&f.main, &["commit", "-m", "qualification user environment"]);
     let (mut request, bytes) = f.run(
@@ -309,7 +314,7 @@ foreach($name in @('LOCALAPPDATA','APPDATA','TEMP','TMP')) {
 }
 if($env:RUST_TEST_THREADS -cne '2'){throw "request thread override was lost: $env:RUST_TEST_THREADS"}
 if($env:CI -cne 'request-marker'){throw 'request CI marker was lost'}
-& pwsh -NoProfile -Command 'if(-not (Get-Command cmd -ErrorAction Stop).Source.EndsWith("\System32\cmd.exe",[StringComparison]::OrdinalIgnoreCase)){throw "cmd resolves outside System32"}; cmd /c exit 7; exit $LASTEXITCODE'
+& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'standard-user-command-resolution.ps1')
 if($LASTEXITCODE -ne 7){throw "pwsh could not resolve cmd or preserve exit 7: $LASTEXITCODE"}
 Write-Output 'normal Windows user environment passed'
 exit 0
@@ -1641,6 +1646,12 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
 #[test]
 fn standard_user_environment_generated_powershell_has_balanced_braces() {
     let script = standard_user_environment_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
+}
+
+#[test]
+fn standard_user_command_resolution_generated_powershell_has_balanced_braces() {
+    let script = super::windows_environment::command_resolution_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
 }
 

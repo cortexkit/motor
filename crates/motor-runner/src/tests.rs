@@ -43,6 +43,8 @@ mod tip_capability;
 mod vcpu;
 #[path = "tests/windows_backend.rs"]
 mod windows_backend;
+#[path = "tests/windows_environment.rs"]
+mod windows_environment;
 #[path = "tests/windows_instance.rs"]
 mod windows_instance;
 #[cfg(target_os = "linux")]
