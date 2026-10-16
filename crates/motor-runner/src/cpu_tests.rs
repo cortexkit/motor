@@ -87,3 +87,223 @@ fn small_hosts_keep_every_cpu_allocatable() {
     assert_eq!(build_server.capacity(), 30);
     assert!(!build_server.place(30, std::iter::empty()).contains(&0));
 }
+
+fn windows_topology(probe: ActivityProbe) -> CpuTopology {
+    let mut topology = CpuTopology::new((0..16).map(|cpu| vec![cpu, cpu + 16]).collect())
+        .unwrap()
+        .avoid_windows(&[12, 13, 14, 15], PathBuf::from("/windows/slot.lock"))
+        .unwrap();
+    topology.set_windows_probe(probe);
+    topology
+}
+
+#[test]
+fn active_windows_excludes_siblings_and_overlaps_only_remaining_cpus() {
+    let topology = windows_topology(Arc::new(|| Ok(true)));
+    let remaining: Vec<_> = (1..12).chain(17..28).collect();
+    let placement = topology.place_with_status(30, std::iter::empty());
+    assert_eq!(placement.windows_active, Some(true));
+    assert_eq!(
+        placement.avoided_cpus,
+        [12, 13, 14, 15, 28, 29, 30, 31].into_iter().collect()
+    );
+    assert_eq!(topology.capacity(), 30);
+    assert_eq!(topology.place(30, std::iter::empty()), remaining);
+    assert_eq!(
+        topology.place(30, std::iter::once(remaining.as_slice())),
+        remaining
+    );
+    assert_eq!(
+        topology.place(4, [remaining.as_slice(), [1, 17].as_slice()].into_iter()),
+        [2, 3, 18, 19]
+    );
+    assert_eq!(topology.place(3, std::iter::empty()), [1, 2, 17]);
+}
+
+#[test]
+fn inactive_windows_keeps_all_cpus_available() {
+    let topology = windows_topology(Arc::new(|| Ok(false)));
+    let placement = topology.place_with_status(30, std::iter::empty());
+    assert_eq!(placement.windows_active, Some(false));
+    assert!(placement.avoided_cpus.is_empty());
+    assert_eq!(
+        topology.place(30, std::iter::empty()),
+        (1..16).chain(17..32).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn failed_windows_check_fails_open_and_rate_limits_warnings() {
+    let topology = windows_topology(Arc::new(|| Err(io::Error::other("lock table unreadable"))));
+    let placement = topology.place_with_status(30, std::iter::empty());
+    assert_eq!(placement.windows_active, None);
+    assert!(placement.avoided_cpus.is_empty());
+    assert_eq!(
+        topology.place(30, std::iter::empty()),
+        (1..16).chain(17..32).collect::<Vec<_>>()
+    );
+    let windows = topology.windows.as_ref().unwrap();
+    let last = windows.last_warning.lock().unwrap().unwrap();
+    assert!(!windows.warning_due(last + Duration::from_secs(59)));
+    assert!(windows.warning_due(last + Duration::from_secs(60)));
+    assert!(!windows.warning_due(last + Duration::from_secs(61)));
+}
+
+#[test]
+fn windows_reservation_expands_actual_sibling_groups_not_cpu_number_offsets() {
+    let mut topology = CpuTopology::new(vec![vec![0, 8], vec![2, 19], vec![5, 31], vec![7, 23]])
+        .unwrap()
+        .avoid_windows(&[19], PathBuf::from("/windows/slot.lock"))
+        .unwrap();
+    topology.set_windows_probe(Arc::new(|| Ok(true)));
+    assert_eq!(topology.place(6, std::iter::empty()), [5, 7, 23, 31]);
+    assert_eq!(topology.capacity(), 6);
+}
+
+#[test]
+fn windows_covering_all_allocatable_cpus_fails_open() {
+    let mut topology = topology()
+        .avoid_windows(&[1, 2, 3], PathBuf::from("/windows/slot.lock"))
+        .unwrap();
+    topology.set_windows_probe(Arc::new(|| Ok(true)));
+    assert_eq!(topology.place(6, std::iter::empty()), [1, 2, 3, 5, 6, 7]);
+    assert!(topology
+        .windows
+        .as_ref()
+        .unwrap()
+        .last_warning
+        .lock()
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn lock_table_matches_device_inode_and_only_granted_exclusive_flocks() {
+    let entry = "1: FLOCK ADVISORY WRITE 101 08:1a:1234 0 EOF\n";
+    assert!(flock_is_held(entry, 8, 26, 1234).unwrap());
+    assert!(!flock_is_held(entry, 8, 25, 1234).unwrap());
+    assert!(!flock_is_held(entry, 9, 26, 1234).unwrap());
+    assert!(!flock_is_held(entry, 8, 26, 1235).unwrap());
+    for entry in [
+        "1: -> FLOCK ADVISORY WRITE 101 08:1a:1234 0 EOF\n",
+        "1: POSIX ADVISORY WRITE 101 08:1a:1234 0 EOF\n",
+        "1: OFDLCK ADVISORY WRITE -1 08:1a:1234 0 EOF\n",
+        "1: FLOCK ADVISORY READ 101 08:1a:1234 0 EOF\n",
+        "",
+    ] {
+        assert!(!flock_is_held(entry, 8, 26, 1234).unwrap(), "{entry}");
+    }
+    for entry in [
+        "garbage",
+        "1: FLOCK ADVISORY WRITE 101 bad 0 EOF",
+        "1: FLOCK ADVISORY WRITE 101 08:1a:no 0 EOF",
+    ] {
+        assert!(flock_is_held(entry, 8, 26, 1234).is_err(), "{entry}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slot_observation_restats_inode_and_fails_on_unreadable_or_malformed_table() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = ScratchDir::new("motor-slot-observation");
+    let slot = scratch.join("slot.lock");
+    let locks = scratch.join("locks");
+    assert!(!slot_active_from(&slot, &locks).unwrap());
+    std::fs::write(&slot, "").unwrap();
+    assert!(slot_active_from(&slot, &locks).is_err());
+    let metadata = std::fs::metadata(&slot).unwrap();
+    std::fs::write(
+        &locks,
+        format!(
+            "1: FLOCK ADVISORY WRITE 101 {:x}:{:x}:{} 0 EOF\n",
+            libc::major(metadata.dev()),
+            libc::minor(metadata.dev()),
+            metadata.ino()
+        ),
+    )
+    .unwrap();
+    assert!(slot_active_from(&slot, &locks).unwrap());
+    std::fs::rename(&slot, scratch.join("old-slot.lock")).unwrap();
+    std::fs::write(&slot, "").unwrap();
+    assert!(!slot_active_from(&slot, &locks).unwrap());
+    std::fs::write(&locks, "malformed").unwrap();
+    assert!(slot_active_from(&slot, &locks).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires operator validation of the host PID namespace and /proc/locks visibility"]
+fn isolated_windows_slot_observation_tracks_flock_and_recreated_inode() {
+    use fs2::FileExt;
+
+    let scratch = ScratchDir::new("motor-real-slot-observation");
+    let slot = scratch.join("slot.lock");
+    let file = std::fs::File::create(&slot).unwrap();
+    assert!(!windows_slot_active(&slot).unwrap());
+    file.try_lock_exclusive().unwrap();
+    let started = Instant::now();
+    assert!(windows_slot_active(&slot).unwrap());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    FileExt::unlock(&file).unwrap();
+    assert!(!windows_slot_active(&slot).unwrap());
+    file.try_lock_exclusive().unwrap();
+    std::fs::rename(&slot, scratch.join("old-slot.lock")).unwrap();
+    let replacement = std::fs::File::create(&slot).unwrap();
+    assert!(!windows_slot_active(&slot).unwrap());
+    replacement.try_lock_exclusive().unwrap();
+    assert!(windows_slot_active(&slot).unwrap());
+    FileExt::unlock(&replacement).unwrap();
+    assert!(!windows_slot_active(&slot).unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a running Windows job VM; set MOTOR_TEST_WINDOWS_SLOT_LOCK and MOTOR_TEST_WINDOWS_CPUS to the Linux runner's flag values"]
+fn isolated_active_windows_vm_excludes_its_physical_cores() {
+    let slot =
+        PathBuf::from(std::env::var_os("MOTOR_TEST_WINDOWS_SLOT_LOCK").expect("slot-lock path"));
+    let cpus =
+        parse_list(&std::env::var("MOTOR_TEST_WINDOWS_CPUS").expect("Windows CPU list")).unwrap();
+    let units = std::process::Command::new("systemctl")
+        .args([
+            "list-units",
+            "--all",
+            "--no-legend",
+            "--plain",
+            "--state=active",
+            "motor-windows-windows-*.service",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        units.status.success(),
+        "{}",
+        String::from_utf8_lossy(&units.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&units.stdout)
+            .lines()
+            .any(|line| line.contains("motor-windows-windows-")),
+        "start a Windows job VM before running this test"
+    );
+    assert!(
+        windows_slot_active(&slot).unwrap(),
+        "the Linux runner must see the QEMU slot's flock in its PID namespace"
+    );
+    let topology = CpuTopology::read()
+        .unwrap()
+        .avoid_windows(&cpus, slot)
+        .unwrap();
+    let excluded = &topology.windows.as_ref().unwrap().cpus;
+    let remaining = topology.place(topology.capacity(), std::iter::empty());
+    assert!(!remaining.is_empty());
+    assert!(remaining.iter().all(|cpu| !excluded.contains(cpu)));
+    assert!(topology
+        .cores
+        .iter()
+        .take(topology.reserved)
+        .flatten()
+        .all(|cpu| !remaining.contains(cpu)));
+}

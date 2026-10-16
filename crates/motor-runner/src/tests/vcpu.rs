@@ -279,6 +279,94 @@ fn recorded_live_cpu_sets_reregister_after_restart() {
     assert!(old.claimed_cpus().is_empty());
 }
 
+#[test]
+fn windows_avoidance_options_require_a_valid_pair() {
+    let f = Fixture::new();
+    for (cpus, lock) in [
+        (Some("12-15"), None),
+        (None, Some("/windows/slot.lock")),
+        (Some(""), Some("/windows/slot.lock")),
+        (Some("32"), Some("/windows/slot.lock")),
+        (Some("12-15"), Some("relative/slot.lock")),
+    ] {
+        let mut config = f.config();
+        config.windows_cpus = cpus.map(String::from);
+        config.windows_slot_lock = lock.map(PathBuf::from);
+        assert!(Runner::open(config).is_err(), "{cpus:?} {lock:?}");
+    }
+    let mut config = f.config();
+    config.windows_cpus = Some("12-15".into());
+    config.windows_slot_lock = Some("/windows/slot.lock".into());
+    assert_eq!(Runner::open(config).unwrap().core.cpus.capacity(), 30);
+}
+
+#[tokio::test]
+async fn windows_start_does_not_move_existing_job_or_exempt_cache_fills() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cpus = config
+        .cpu_topology
+        .take()
+        .unwrap()
+        .avoid_windows(&[1], PathBuf::from("/windows/slot.lock"))
+        .unwrap();
+    let observed = active.clone();
+    cpus.set_windows_probe(Arc::new(move || Ok(observed.load(Ordering::SeqCst))));
+    config.cpu_topology = Some(cpus);
+    let runner = Runner::open(config).unwrap();
+    let release = f.scratch.join("release-before-windows");
+    let (first, bytes) = f.run(&format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    ));
+    f.submit(&runner, &first, &bytes);
+    until(|| {
+        runner
+            .status()
+            .running_jobs
+            .iter()
+            .any(|job| job.job_id == first.job_id)
+    })
+    .await;
+    let original = runner.core.inner.lock().unwrap().jobs[&first.job_id]
+        .cpus
+        .clone();
+    assert_eq!(original, [1, 17]);
+
+    active.store(true, Ordering::SeqCst);
+    let (second, bytes) = job_at(&f, "after-windows", "true");
+    f.submit(&runner, &second, &bytes);
+    assert_eq!(
+        terminal(&runner, second.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].cpus,
+        original
+    );
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&second.job_id].cpus,
+        [2, 18]
+    );
+    fs::write(release, "").unwrap();
+    assert_eq!(
+        terminal(&runner, first.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    base_done(&runner).await;
+    let inner = runner.core.inner.lock().unwrap();
+    let fills: Vec<_> = inner.jobs.values().filter(|job| job.base).collect();
+    assert!(!fills.is_empty());
+    for fill in fills {
+        assert_eq!(fill.cpus.len(), 4);
+        assert!(fill.cpus.iter().all(|cpu| ![0, 1, 16, 17].contains(cpu)));
+    }
+    let recorded: Job = read_json(&runner.record_path(first.job_id)).unwrap();
+    assert_eq!(recorded.cpus, original);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd cpuset support"]

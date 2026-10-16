@@ -208,6 +208,8 @@ fn configure_options(
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),
             "--vm-config" => config.vm_config = Some(value.into()),
+            "--windows-cpus" => config.windows_cpus = Some(value),
+            "--windows-slot-lock" => config.windows_slot_lock = Some(value.into()),
             "--job" => job = value.parse::<motor_protocol::Uuid>().ok(),
             "--drain-timeout-s" => {
                 drain_timeout_s = value.parse::<u64>().map_err(io::Error::other)?
@@ -312,6 +314,30 @@ mod tests {
             assert_eq!(config.backend, BackendKind::Vm);
             assert_eq!(config.vm_config, Some("vm.toml".into()));
         }
+    }
+
+    #[test]
+    fn windows_avoidance_flags_are_opt_in_and_preserve_the_cpu_list() {
+        let mut config = Config::new("unused", "main");
+        assert!(config.windows_cpus.is_none());
+        assert!(config.windows_slot_lock.is_none());
+        configure_options(
+            &mut config,
+            [
+                "--windows-cpus",
+                "12-15",
+                "--windows-slot-lock",
+                "/srv/build/motor-windows/slot.lock",
+            ]
+            .map(String::from)
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(config.windows_cpus.as_deref(), Some("12-15"));
+        assert_eq!(
+            config.windows_slot_lock,
+            Some("/srv/build/motor-windows/slot.lock".into())
+        );
     }
 
     #[test]

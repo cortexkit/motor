@@ -53,6 +53,10 @@ pub struct Config {
     pub(crate) writer_account: Option<crate::isolation::WriterAccount>,
     pub backend: BackendKind,
     pub vm_config: Option<PathBuf>,
+    /// Host CPUs used by the Windows job VM, in CPU-list syntax. Linux placements
+    /// also avoid their SMT siblings while the shared slot lock is held.
+    pub windows_cpus: Option<String>,
+    pub windows_slot_lock: Option<PathBuf>,
     pub(crate) windows: Option<Arc<crate::windows::VmConfig>>,
     pub(crate) windows_runtime: Arc<crate::windows::Runtime>,
     #[cfg(test)]
@@ -206,6 +210,8 @@ impl Config {
             writer_account: None,
             backend: BackendKind::Host,
             vm_config: None,
+            windows_cpus: None,
+            windows_slot_lock: None,
             windows: None,
             windows_runtime: Arc::new(crate::windows::Runtime::default()),
             #[cfg(test)]
@@ -682,6 +688,17 @@ impl Runner {
             CpuTopology::fixed(vm.cpu_set.clone())?
         } else {
             cpus
+        };
+        let cpus = match (&config.windows_cpus, &config.windows_slot_lock) {
+            (None, None) => cpus,
+            (Some(list), Some(path)) if config.windows.is_none() => {
+                cpus.avoid_windows(&crate::cpu::parse_list(list)?, path.clone())?
+            }
+            _ => {
+                return Err(invalid(
+                    "--windows-cpus and --windows-slot-lock must be supplied together on the Linux runner",
+                ));
+            }
         };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
@@ -3494,10 +3511,14 @@ impl Runner {
             }
         }
         let mut queued_job = job.clone();
-        queued_job.cpus = self
+        let placement = self
             .core
             .cpus
-            .place(job.weight, claims.values().map(Vec::as_slice));
+            .place_with_status(job.weight, claims.values().map(Vec::as_slice));
+        tracing::info!(job_id = %id, cache_fill = job.base, requested_cpus = job.weight,
+            cpus = ?placement.cpus, windows_active = ?placement.windows_active,
+            avoided_cpus = ?placement.avoided_cpus, "placed job CPUs");
+        queued_job.cpus = placement.cpus;
         queued_job.setup_ms = Some(self.now());
         queued_job
             .queue_entry
