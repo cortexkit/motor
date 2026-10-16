@@ -162,3 +162,9 @@ lists retained jobs that ran over ten minutes below 25% of their reservation.
 Missing accounting is absent, never zero, and never delays the terminal record.
 Tests: `long_eight_vcpu_job_under_one_core_is_persisted_and_reported`,
 `blocked_or_invalid_accounting_never_delays_or_changes_terminal`.
+
+`runner.health` also reports each repository's reserved vCPU-seconds, finished
+job count, jobs grouped by requested vCPU size, and queue-wait refusals in the
+rolling 24-hour window.
+Repositories are grouped by the basename of their main checkout, so its worktrees
+share one total; the report is rebuilt from retained job records after restart.

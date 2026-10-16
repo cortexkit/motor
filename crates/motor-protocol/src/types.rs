@@ -165,7 +165,8 @@ pub struct RunnerStatusReply {
     pub health: Option<RunnerHealth>,
 }
 
-/// Read-only runner telemetry. Counts are in-memory and reset on restart.
+/// Read-only runner telemetry. In-memory counters reset on restart; repository
+/// usage is rebuilt from retained records.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerHealth {
     pub runner_version: String,
@@ -182,6 +183,21 @@ pub struct RunnerHealth {
     /// Persisted job measurements survive restarts, unlike the in-memory counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub underused_reservations: Vec<HealthUnderusedReservation>,
+    /// Finished job records in the rolling 24-hour window, grouped by repository basename.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repository_usage: BTreeMap<String, HealthRepositoryUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthRepositoryUsage {
+    /// Reserved CPU time from each job's recorded start to finish.
+    pub reserved_vcpu_seconds: u64,
+    /// Finished job records in the reporting window.
+    pub job_count: u64,
+    /// Finished jobs grouped by requested CPU reservation size; keys are decimal vCPU counts.
+    pub jobs_by_vcpu_size: BTreeMap<String, u64>,
+    /// Jobs refused because they exceeded their queue-wait budget.
+    pub queue_wait_refusals: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
