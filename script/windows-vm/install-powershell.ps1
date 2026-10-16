@@ -42,4 +42,10 @@ foreach ($item in $items) {
 }
 $version = & "$destination\pwsh.exe" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 if ($LASTEXITCODE -ne 0 -or $version -cne '7.6.7') { throw "Unexpected PowerShell version: $version" }
+# Native tools may rebuild PATH from the registry instead of inheriting the agent's PATH.
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $destination) {
+    [Environment]::SetEnvironmentVariable('Path', "$destination;$machinePath", 'Machine')
+}
+$env:Path = "$destination;" + $env:Path
 Write-Host "Installed PowerShell $version with protected job-user read/execute access"

@@ -198,6 +198,13 @@ class BaselineInputsTests(unittest.TestCase):
         self.assertIn('& "$PSScriptRoot\\install-powershell.ps1"', (HERE / "setup-job-baseline.ps1").read_text())
         self.assertIn('PowerShell-7.6.7-win-x64.zip', (HERE / "bootstrap.ps1").read_text())
 
+    def test_powershell_machine_and_process_path_commands_are_present(self):
+        source = (HERE / "install-powershell.ps1").read_text()
+        self.assertIn("[Environment]::GetEnvironmentVariable('Path', 'Machine')", source)
+        self.assertIn("-notcontains $destination", source)
+        self.assertIn("[Environment]::SetEnvironmentVariable('Path', \"$destination;$machinePath\", 'Machine')", source)
+        self.assertIn('$env:Path = "$destination;" + $env:Path', source)
+
     def test_job_bootstrap_schedules_system_finalization_and_records_license(self):
         register = (HERE / "register-job-bootstrap.ps1").read_text()
         bootstrap = (HERE / "bootstrap.ps1").read_text()

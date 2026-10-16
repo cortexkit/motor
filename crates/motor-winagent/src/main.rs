@@ -21,7 +21,9 @@ mod guest {
         cache::{prepare_cache, select_cache_disk, storage_serial},
         cache_has_modify_grant,
         cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
-        collect_changes, inventory, mapped_cwd, read_frame, unpack_tree, write_frame,
+        collect_changes,
+        environment::{encode_block, git_native_bin, read_user_environment},
+        inventory, mapped_cwd, read_frame, unpack_tree, write_frame,
     };
     use std::{
         ffi::OsString,
@@ -49,7 +51,7 @@ mod guest {
         Security::Authorization::*,
         Security::*,
         Storage::FileSystem::*,
-        System::{IO::*, Ioctl::*, JobObjects::*, Pipes::*, Threading::*},
+        System::{Environment::*, IO::*, Ioctl::*, JobObjects::*, Pipes::*, Threading::*},
         UI::Shell::{GetUserProfileDirectoryW, LoadUserProfileW, PROFILEINFOW, UnloadUserProfile},
     };
 
@@ -440,6 +442,38 @@ mod guest {
             // Continuing with an unexpected identity is unsafe even inside a VM.
             if unsafe { RevertToSelf() } == 0 {
                 std::process::abort();
+            }
+        }
+    }
+
+    struct UserEnvironment(*mut std::ffi::c_void);
+    impl UserEnvironment {
+        fn create(token: HANDLE) -> io::Result<Self> {
+            let mut block = null_mut();
+            unsafe {
+                win32(CreateEnvironmentBlock(&mut block, token, 0))?;
+            }
+            Ok(Self(block))
+        }
+    }
+    impl AsRef<[u16]> for UserEnvironment {
+        fn as_ref(&self) -> &[u16] {
+            // CreateEnvironmentBlock owns a double-NUL-terminated UTF-16 block
+            // which stays valid until DestroyEnvironmentBlock in Drop.
+            unsafe {
+                let block = self.0.cast::<u16>();
+                let mut length = 0;
+                while *block.add(length) != 0 || *block.add(length + 1) != 0 {
+                    length += 1;
+                }
+                std::slice::from_raw_parts(block, length + 2)
+            }
+        }
+    }
+    impl Drop for UserEnvironment {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyEnvironmentBlock(self.0);
             }
         }
     }
@@ -943,12 +977,10 @@ mod guest {
                 .profile
                 .to_str()
                 .ok_or_else(|| invalid("job profile is not UTF-8"))?;
-            let env = command.environment(profile)?;
-            let mut environment = Vec::<u16>::new();
-            for (key, value) in env {
-                environment.extend(wide(&format!("{key}={value}")));
-            }
-            environment.push(0);
+            let base = read_user_environment(|| UserEnvironment::create(user.token.0))?;
+            let git_bin = git_native_bin(|path| Path::new(path).is_dir())?;
+            let env = command.environment(profile, base, git_bin)?;
+            let environment = encode_block(&env)?;
             let mut line = wide(&format!(
                 "{} -c {}",
                 motor_winagent::quote_windows_arg(BASH),

@@ -78,20 +78,40 @@ user, through Git Bash (`bash -c <command>`), inside a Windows Job Object that
 is killed as a whole on cancel. The guest agent refuses an elevated token. Test:
 `windows_qualification_cancel_kills_detached_grandchild` (operator-only).
 
-3.4. The environment is the request's filtered variables (the same predicate as
+3.4. The environment starts with Windows' `CreateEnvironmentBlock` for the job
+user, after loading that user's profile, without inheriting the agent service's
+environment. Failure to obtain the block refuses the job before launch. The
+request's filtered variables are applied over this base (the same predicate as
 Linux; see [job-isolation.md](job-isolation.md#5-environment-from-the-caller)),
 with the agent's values forced, case-insensitively, for `PATH`, `RUSTUP_HOME`,
 `HOME`, `USERPROFILE`, `CARGO_HOME`, `TMP`, `TEMP`, `SystemRoot`, `SystemDrive`,
-`CK_REMOTE_SOURCE_COMMIT`, and `CARGO_NET_OFFLINE=true`. Test:
+`CK_REMOTE_SOURCE_COMMIT`, and `CARGO_NET_OFFLINE=true`. Standard Windows values
+such as `PATHEXT`, `APPDATA` and `LOCALAPPDATA` survive. The agent does not
+synthesize `HOMEDRIVE` or `HOMEPATH` if Windows omits them. Tests:
+`standard_user_environment_survives_job_overrides`,
+`request_overrides_base_but_not_agent_owned_values`,
+`environment_source_failure_propagates_and_owned_blocks_are_always_released`,
 `forced_environment_wins_case_insensitively_and_thread_counts_survive`
-(`crates/motor-winagent/src/lib.rs`).
+(`crates/motor-winagent`), and `windows_qualification_standard_user_environment`
+(operator-only).
+
+The initial native `PATH` puts Rust's `cargo\bin`, Git's `cmd`, the installed
+Git `ucrt64\bin` (or `mingw64\bin`), Git's `usr\bin`, and PowerShell 7 before
+Windows' machine-then-user `PATH`. Equivalent case-insensitive path entries are
+deduplicated, keeping the first; managed tools win executable-name conflicts.
+Git Bash may prepend its own normal shell directories. A caller cannot replace
+`PATH` through the request allowlist. Test:
+`managed_paths_win_and_windows_machine_then_user_paths_survive`.
 
 3.5. The toolchain is the baseline's machine-wide Rust for
 `x86_64-pc-windows-msvc`, with MSVC Build Tools, Git, Bun and PowerShell
 7.6.7 at `C:\Program Files\PowerShell\7`. The job can read and execute the
 PowerShell installation but cannot write files or create entries anywhere in it.
-Its directory precedes Windows PowerShell 5.1 in the forced `PATH`; 5.1 remains
-available. Tests: `job_path_has_powershell_7_before_windows_powershell` and
+Its directory is provisioned on machine `PATH` and precedes Windows PowerShell
+5.1 in the job `PATH`; 5.1 remains available. Native children receive Windows
+`TEMP`/`TMP` paths even when Git Bash displays a POSIX form. Tests:
+`job_path_has_powershell_7_before_windows_powershell`,
+`windows_qualification_standard_user_environment`, and
 `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build`
 (operator-only).
 
