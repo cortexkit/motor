@@ -636,6 +636,17 @@ impl Backend for HostBackend {
                 env.insert(k.clone(), v.clone());
             }
         }
+        #[cfg(test)]
+        if !config.isolate_jobs {
+            if let Some(cargo_home) = &config.fixture_cargo_home {
+                // Fixture Cargo jobs must not load configuration from the developer's home.
+                env.insert(
+                    "CARGO_HOME".into(),
+                    cargo_home.to_string_lossy().into_owned(),
+                );
+                env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+            }
+        }
         // Match test and compile concurrency to the permits reserved for this job, not to
         // the host's CPU count or an unrelated daemon's worker budget.
         for key in [

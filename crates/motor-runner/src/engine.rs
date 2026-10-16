@@ -124,6 +124,9 @@ pub struct Config {
     pub(crate) accounting_report: Option<AccountingReportHook>,
     #[cfg(test)]
     pub(crate) test_processes: Option<Arc<Mutex<crate::test_cleanup::Processes>>>,
+    /// Cargo home used by fixture jobs in the non-isolated host test backend.
+    #[cfg(test)]
+    pub(crate) fixture_cargo_home: Option<PathBuf>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
     #[cfg(test)]
@@ -259,6 +262,8 @@ impl Config {
             accounting_report: None,
             #[cfg(test)]
             test_processes: None,
+            #[cfg(test)]
+            fixture_cargo_home: None,
             #[cfg(test)]
             long_work: None,
             #[cfg(all(test, target_os = "linux"))]
