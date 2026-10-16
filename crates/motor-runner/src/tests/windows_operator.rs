@@ -309,7 +309,7 @@ foreach($name in @('LOCALAPPDATA','APPDATA','TEMP','TMP')) {
 }
 if($env:RUST_TEST_THREADS -cne '2'){throw "request thread override was lost: $env:RUST_TEST_THREADS"}
 if($env:CI -cne 'request-marker'){throw 'request CI marker was lost'}
-& pwsh -NoProfile -Command 'cmd /c exit 7'
+& pwsh -NoProfile -Command 'if(-not (Get-Command cmd -ErrorAction Stop).Source.EndsWith("\System32\cmd.exe",[StringComparison]::OrdinalIgnoreCase)){throw "cmd resolves outside System32"}; cmd /c exit 7; exit $LASTEXITCODE'
 if($LASTEXITCODE -ne 7){throw "pwsh could not resolve cmd or preserve exit 7: $LASTEXITCODE"}
 Write-Output 'normal Windows user environment passed'
 exit 0
