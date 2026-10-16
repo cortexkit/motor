@@ -1,5 +1,5 @@
-//! `ck motor run`: submit one remote job through the subc daemon, stream its
-//! output and exit with its exit code. It lets a script with no agent behind
+//! `ck motor run` / `attach`: submit or reattach through the subc daemon, stream
+//! output and exit with the job's exit code. It lets a script with no agent behind
 //! it (a deploy gate, for example) use the build server.
 //!
 //! The `ck` launcher reaches this as `ck-motor run ...`: it finds `ck-motor`
@@ -10,13 +10,15 @@
 //! through to the caller; submission or transport failures exit unsuccessfully.
 use crate::{config::DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS, module::direct_timeout_refusal};
 use motor_protocol::{
-    CancelRequest, Killed, Outcome, OutputStream, RunRequest, StreamRecord, TerminalRecord, Uuid,
+    AttachRequest, CancelRequest, JobStatusReply, Killed, Outcome, OutputStream, RunRequest,
+    StreamRecord, TerminalRecord, Uuid,
 };
 use serde_json::json;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{BufRead, Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use subc_client_rs::{
@@ -40,7 +42,7 @@ pub const EXIT_CANCELLED: u8 = 203;
 pub const EXIT_USAGE: u8 = 204;
 
 /// The timeout sent when `--timeout` is omitted. Every job from this command
-/// has one, because a caller that loses its connection can't cancel its job.
+/// has one, so a disconnected caller cannot leave an unbounded job behind.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 
 /// The line `ck` shows for this domain in its help. `ck` requires exactly one
@@ -50,13 +52,14 @@ pub const HEADLINE: &str = "run a command on the remote build server (ck motor r
 /// What `ck motor`, `ck motor --help` and `ck motor help` print.
 pub const TOP_HELP: &str = "\
 usage: ck motor run [OPTIONS] -- COMMAND...
+       ck motor attach JOB_ID [--secret-file PATH] [--status]
 
 Runs COMMAND on the remote build server and streams its output here.
 See `ck motor run --help` for the options and exit statuses.";
 
 pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
-                    [--timeout SECONDS] [--cwd PATH] -- COMMAND...
+                    [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
 that contains --cwd (default: the current directory), and streams its stdout
@@ -71,6 +74,7 @@ and stderr here as they arrive.
   --timeout SECONDS   stop the command after this long (default 3600, at most
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
+  --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
 
 The words after -- are joined with single spaces into one command line, which
 bash runs on the runner (bash -c). Quote shell syntax as one argument:
@@ -82,8 +86,9 @@ Exit status: the command's own exit code; 128+N when a signal N killed it;
 
 Ctrl-C or SIGTERM cancels the job and waits for its outcome; a second one stops
 waiting. If the connection drops, the job keeps running until it ends or its
-timeout stops it: a new connection can't attach to it or cancel it. The job ID
-is printed so an operator can check it. Keep one connection per job, and run
+timeout stops it. Save the one-time job ID and secret printed on stderr, or use
+--secret-file. Reconnect with `ck motor attach JOB_ID`, reading the secret from
+stdin, or `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job, and run
 parallel jobs from separate checkouts: the runner runs one job per workspace at
 a time.";
 
@@ -102,6 +107,7 @@ pub struct RunArgs {
     pub timeout: u64,
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
+    pub secret_file: Option<PathBuf>,
 }
 
 /// Parse the words after `ck motor run`. An option takes its value as the
@@ -129,7 +135,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         };
         if !matches!(
             name,
-            "--vcpus" | "--sibling" | "--env" | "--timeout" | "--cwd"
+            "--vcpus" | "--sibling" | "--env" | "--timeout" | "--cwd" | "--secret-file"
         ) {
             return Err(if word.starts_with('-') {
                 format!("unknown option {word}")
@@ -167,6 +173,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             }
             "--sibling" => parsed.siblings.push(PathBuf::from(value)),
             "--cwd" => parsed.cwd = Some(PathBuf::from(value)),
+            "--secret-file" => parsed.secret_file = Some(PathBuf::from(value)),
             _ => {
                 let (key, val) = value
                     .split_once('=')
@@ -177,6 +184,90 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
     }
     Err("missing -- before the command".into())
+}
+
+pub const ATTACH_HELP: &str = "\
+usage: ck motor attach JOB_ID [--secret-file PATH] [--status]
+
+Reads the job's secret from one line of stdin, or from --secret-file PATH.
+Secrets are never accepted as arguments or from environment variables.
+Replays output from the start, then streams until the job ends. --status prints
+the current state and outcome as JSON without streaming (exit 0 while running).
+The terminal exit statuses and interrupt behavior are the same as `ck motor run`.";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AttachArgs {
+    pub job_id: Uuid,
+    pub secret_file: Option<PathBuf>,
+    pub status: bool,
+}
+
+pub fn parse_attach_args(args: &[String]) -> Result<Option<AttachArgs>, String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        return Ok(None);
+    }
+    let mut parsed = AttachArgs {
+        job_id: args
+            .first()
+            .and_then(|id| id.parse().ok())
+            .ok_or("attach needs a job ID")?,
+        secret_file: None,
+        status: false,
+    };
+    let mut words = args[1..].iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--status" if !parsed.status => parsed.status = true,
+            "--secret-file" if parsed.secret_file.is_none() => {
+                parsed.secret_file = Some(words.next().ok_or("--secret-file needs a path")?.into());
+            }
+            _ if word.starts_with("--secret-file=") && parsed.secret_file.is_none() => {
+                parsed.secret_file = Some(word[14..].into());
+            }
+            // Do not echo an unrecognized word: it might be a misplaced secret.
+            _ => return Err("attach accepts only JOB_ID, --secret-file PATH and --status".into()),
+        }
+    }
+    Ok(Some(parsed))
+}
+
+pub struct SecretFile {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl SecretFile {
+    pub fn create(path: &Path) -> std::io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        Ok(Self {
+            file,
+            path: path.into(),
+        })
+    }
+
+    fn save(&mut self, secret: &str) -> std::io::Result<()> {
+        writeln!(self.file, "{secret}")?;
+        self.file.sync_all()
+    }
+}
+
+fn read_secret(reader: impl Read) -> String {
+    let mut bytes = Vec::new();
+    let mut reader = std::io::BufReader::new(reader.take(67));
+    if reader.read_until(b'\n', &mut bytes).is_err() {
+        return String::new();
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// The command line the runner hands to `bash -c`: the words joined by single
@@ -267,9 +358,15 @@ pub trait ExecClient: Send + Sync {
     /// Start `exec.run`. Records arrive as the serialized `StreamRecord`
     /// bodies ck-motor emits.
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError>;
+    async fn attach(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<Box<dyn RecordStream>, SubmitError>;
+    async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError>;
     /// Send `exec.cancel`. Its reply is only an acknowledgement; the job's
     /// terminal still arrives on its run stream.
-    async fn cancel(&self, job_id: Uuid) -> Result<(), String>;
+    async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String>;
 }
 
 // async_trait marks each boxed future #[must_use] on top of the future's own.
@@ -298,6 +395,17 @@ pub async fn drive<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
+    drive_run(client, request, None, out, err, interrupts).await
+}
+
+pub async fn drive_run<C: ExecClient + ?Sized>(
+    client: &C,
+    request: &RunRequest,
+    secret_file: Option<SecretFile>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
     let mut stream = match client.run(request).await {
         Ok(stream) => stream,
         Err(SubmitError::NotSent(message)) => {
@@ -312,7 +420,90 @@ pub async fn drive<C: ExecClient + ?Sized>(
             return EXIT_UNKNOWN;
         }
     };
-    let mut job_id = None;
+    consume(
+        client,
+        stream.as_mut(),
+        Session {
+            job_id: None,
+            secret: None,
+            secret_file,
+        },
+        out,
+        err,
+        interrupts,
+    )
+    .await
+}
+
+struct Session {
+    job_id: Option<Uuid>,
+    secret: Option<String>,
+    secret_file: Option<SecretFile>,
+}
+
+pub async fn drive_attach<C: ExecClient + ?Sized>(
+    client: &C,
+    args: &AttachArgs,
+    secret: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    if args.status {
+        return match client.status(args.job_id, secret).await {
+            Ok(status) => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&status).expect("serializable status")
+                );
+                status.terminal.as_ref().map_or(0, exit_code)
+            }
+            Err(failure) => attach_failure(failure, err),
+        };
+    }
+    let mut stream = match client.attach(args.job_id, secret).await {
+        Ok(stream) => stream,
+        Err(failure) => return attach_failure(failure, err),
+    };
+    consume(
+        client,
+        stream.as_mut(),
+        Session {
+            job_id: Some(args.job_id),
+            secret: Some(secret.into()),
+            secret_file: None,
+        },
+        out,
+        err,
+        interrupts,
+    )
+    .await
+}
+
+fn attach_failure(failure: SubmitError, err: &mut dyn Write) -> u8 {
+    let (message, code) = match failure {
+        SubmitError::NotSent(message) => (message, EXIT_REFUSED),
+        SubmitError::Unknown(message) => (message, EXIT_UNKNOWN),
+    };
+    let _ = writeln!(err, "ck motor attach: {message}");
+    code
+}
+
+async fn consume<C: ExecClient + ?Sized>(
+    client: &C,
+    stream: &mut dyn RecordStream,
+    mut session: Session,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    let name = if session.job_id.is_some() {
+        "attach"
+    } else {
+        "run"
+    };
+    let mut job_id = session.job_id;
     let mut received = false;
     let mut cancel_wanted = false;
     let mut cancel_sent = false;
@@ -321,14 +512,14 @@ pub async fn drive<C: ExecClient + ?Sized>(
             next = stream.next() => next,
             Some(()) = interrupts.recv() => {
                 if cancel_wanted {
-                    let _ = writeln!(err, "ck motor run: stopped waiting; a cancel was requested. {}", job_hint(job_id));
+                    let _ = writeln!(err, "ck motor {name}: stopped waiting; a cancel was requested. {}", job_hint(job_id));
                     return EXIT_UNKNOWN;
                 }
                 cancel_wanted = true;
-                let _ = writeln!(err, "ck motor run: cancelling; waiting for the job to stop (interrupt again to stop waiting)");
+                let _ = writeln!(err, "ck motor {name}: cancelling; waiting for the job to stop (interrupt again to stop waiting)");
                 if let Some(id) = job_id {
                     cancel_sent = true;
-                    send_cancel(client, id, err).await;
+                    send_cancel(client, id, session.secret.as_deref(), name, err).await;
                 }
                 continue;
             }
@@ -338,12 +529,18 @@ pub async fn drive<C: ExecClient + ?Sized>(
             Ok(None) => {
                 let _ = writeln!(
                     err,
-                    "ck motor run: outcome unknown: the stream ended without an outcome. {}",
+                    "ck motor {name}: outcome unknown: the stream ended without an outcome. {}",
                     job_hint(job_id)
                 );
                 return EXIT_UNKNOWN;
             }
             Err(failure) => {
+                if !received && failure.code.as_deref() == Some("motor_job_not_found") {
+                    return attach_failure(
+                        SubmitError::NotSent("ck-motor has no such job for this caller".into()),
+                        err,
+                    );
+                }
                 if !received
                     && failure
                         .code
@@ -352,14 +549,14 @@ pub async fn drive<C: ExecClient + ?Sized>(
                 {
                     let _ = writeln!(
                         err,
-                        "ck motor run: refused before start: {}",
+                        "ck motor {name}: refused before start: {}",
                         failure.message
                     );
                     return EXIT_REFUSED;
                 }
                 let _ = writeln!(
                     err,
-                    "ck motor run: outcome unknown: {}. {}",
+                    "ck motor {name}: outcome unknown: {}. {}",
                     failure.message,
                     job_hint(job_id)
                 );
@@ -367,10 +564,50 @@ pub async fn drive<C: ExecClient + ?Sized>(
             }
         };
         received = true;
-        let record: StreamRecord = match serde_json::from_slice(&bytes) {
+        let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = writeln!(err, "ck motor: skipped an unreadable record");
+                continue;
+            }
+        };
+        if let Some(direct_job) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("direct_job"))
+        {
+            if session.secret.is_none() {
+                if let (Some(id), Some(secret)) = (
+                    direct_job["job_id"].as_str().and_then(|id| id.parse().ok()),
+                    direct_job["secret"].as_str(),
+                ) {
+                    job_id = Some(id);
+                    session.secret = Some(secret.into());
+                    if let Some(file) = session.secret_file.as_mut() {
+                        if file.save(secret).is_err() {
+                            let _ = writeln!(
+                                err,
+                                "ck motor run: could not save the reattach secret for job_id={id}"
+                            );
+                            return EXIT_UNKNOWN;
+                        }
+                        let _ = writeln!(
+                            err,
+                            "ck motor run: job_id={id} secret-file={}",
+                            file.path.display()
+                        );
+                    } else {
+                        let _ = writeln!(err, "ck motor run: job_id={id} secret={secret}");
+                    }
+                }
+            }
+        }
+        let record: StreamRecord = match serde_json::from_value(value) {
             Ok(record) => record,
             Err(error) => {
-                let _ = writeln!(err, "ck motor run: skipped an unreadable record: {error}");
+                let _ = writeln!(
+                    err,
+                    "ck motor {name}: skipped an unreadable record: {error}"
+                );
                 continue;
             }
         };
@@ -380,13 +617,20 @@ pub async fn drive<C: ExecClient + ?Sized>(
                 if let Some(names) = accepted.env_not_forwarded.filter(|n| !n.is_empty()) {
                     let _ = writeln!(
                         err,
-                        "ck motor run: not forwarded to the job: {}",
+                        "ck motor {name}: not forwarded to the job: {}",
                         names.join(", ")
                     );
                 }
                 if cancel_wanted && !cancel_sent {
                     cancel_sent = true;
-                    send_cancel(client, accepted.job_id, err).await;
+                    send_cancel(
+                        client,
+                        accepted.job_id,
+                        session.secret.as_deref(),
+                        name,
+                        err,
+                    )
+                    .await;
                 }
             }
             StreamRecord::Output(output) => {
@@ -396,17 +640,23 @@ pub async fn drive<C: ExecClient + ?Sized>(
                     _ => out.write_all(bytes).and_then(|()| out.flush()),
                 };
             }
-            StreamRecord::Terminal(terminal) => return settle(&terminal, err),
+            StreamRecord::Terminal(terminal) => return settle_named(&terminal, name, err),
             _ => {}
         }
     }
 }
 
-async fn send_cancel<C: ExecClient + ?Sized>(client: &C, id: Uuid, err: &mut dyn Write) {
-    if let Err(error) = client.cancel(id).await {
+async fn send_cancel<C: ExecClient + ?Sized>(
+    client: &C,
+    id: Uuid,
+    secret: Option<&str>,
+    name: &str,
+    err: &mut dyn Write,
+) {
+    if let Err(error) = client.cancel(id, secret).await {
         let _ = writeln!(
             err,
-            "ck motor run: cancel request for job_id={id} failed: {error}"
+            "ck motor {name}: cancel request for job_id={id} failed: {error}"
         );
     }
 }
@@ -423,6 +673,10 @@ fn job_hint(job_id: Option<Uuid>) -> String {
 /// The exit status for a terminal record, after reporting any outcome that is
 /// not the command's own exit to `err`.
 pub fn settle(terminal: &TerminalRecord, err: &mut dyn Write) -> u8 {
+    settle_named(terminal, "run", err)
+}
+
+fn settle_named(terminal: &TerminalRecord, name: &str, err: &mut dyn Write) -> u8 {
     let id = terminal.job_id;
     let message = match (&terminal.killed, &terminal.outcome) {
         (_, Outcome::RefusedBeforeStart { reason }) => {
@@ -450,7 +704,7 @@ pub fn settle(terminal: &TerminalRecord, err: &mut dyn Write) -> u8 {
         (_, outcome) => Some(format!("outcome unknown ({outcome:?}) for job_id={id}")),
     };
     if let Some(message) = message {
-        let _ = writeln!(err, "ck motor run: {message}");
+        let _ = writeln!(err, "ck motor {name}: {message}");
     }
     exit_code(terminal)
 }
@@ -486,13 +740,21 @@ pub struct SubcClient {
 
 impl SubcClient {
     pub async fn connect(workspace: &Path) -> Result<Self, String> {
+        Self::connect_classified(workspace)
+            .await
+            .map_err(|failure| match failure {
+                SubmitError::NotSent(message) | SubmitError::Unknown(message) => message,
+            })
+    }
+
+    async fn connect_classified(workspace: &Path) -> Result<Self, SubmitError> {
         let consumer = SubcConsumer::connect_default(ConsumerOptions::default())
             .await
-            .map_err(|e| format!("connect to the subc daemon: {e}"))?;
+            .map_err(|e| SubmitError::Unknown(format!("connect to the subc daemon: {e}")))?;
         let module_id = consumer
             .resolve_provider(crate::module::CAPABILITY)
             .await
-            .map_err(|e| format!("find ck-motor: {e}"))?;
+            .map_err(connection_error)?;
         let identity = BindIdentity::new(
             workspace,
             "ck-motor-run",
@@ -505,35 +767,26 @@ impl SubcClient {
                 CallOptions::default(),
             )
             .await
-            .map_err(|e| format!("open a route to ck-motor: {e}"))?;
+            .map_err(connection_error)?;
         Ok(Self { consumer, route })
     }
-}
 
-fn envelope(op: &str, params: impl serde::Serialize) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "op": op, "params": params })).expect("serializable request")
-}
-
-#[async_trait]
-impl ExecClient for SubcClient {
-    async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+    async fn subscribe(
+        &self,
+        op: &str,
+        params: impl serde::Serialize,
+        secret: Option<&str>,
+    ) -> Result<Box<dyn RecordStream>, SubmitError> {
         let mut subscription = self
             .consumer
             .subscribe_route(
                 &self.route,
-                envelope("exec.run", request),
+                direct_envelope(op, params, secret),
                 SubscribeOptions::default(),
             )
             .await
-            .map_err(|error| match error {
-                CallError::NotSent(_) | CallError::StaleRouteHandle(_) => {
-                    SubmitError::NotSent(error.to_string())
-                }
-                _ => SubmitError::Unknown(error.to_string()),
-            })?;
-        // The SDK ends a subscription whose bounded event channel fills up. A
-        // slow reader of this command's stdout must not cost the job's
-        // outcome, so a task drains the events into an unbounded queue.
+            .map_err(submit_error)?;
+        // Drain the SDK's bounded channel even when the terminal's stdout is slow.
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(bytes) = subscription.events().recv().await {
@@ -550,12 +803,70 @@ impl ExecClient for SubcClient {
         });
         Ok(Box::new(QueuedStream(rx)))
     }
+}
 
-    async fn cancel(&self, job_id: Uuid) -> Result<(), String> {
+fn direct_envelope(op: &str, params: impl serde::Serialize, secret: Option<&str>) -> Vec<u8> {
+    let mut value = json!({"op":op,"params":params});
+    if let Some(secret) = secret {
+        value["direct_secret"] = json!(secret);
+    }
+    serde_json::to_vec(&value).expect("serializable request")
+}
+
+fn submit_error(error: CallError) -> SubmitError {
+    match error {
+        CallError::NotSent(_) | CallError::StaleRouteHandle(_) => {
+            SubmitError::NotSent(error.to_string())
+        }
+        _ if error.code() == Some("motor_job_not_found") => {
+            SubmitError::NotSent("ck-motor has no such job for this caller".into())
+        }
+        _ => SubmitError::Unknown(error.to_string()),
+    }
+}
+
+fn connection_error(error: CallError) -> SubmitError {
+    if error.code().is_some() {
+        SubmitError::NotSent(error.to_string())
+    } else {
+        SubmitError::Unknown(error.to_string())
+    }
+}
+
+#[async_trait]
+impl ExecClient for SubcClient {
+    async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.subscribe("exec.run", request, None).await
+    }
+
+    async fn attach(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.subscribe("exec.attach", AttachRequest::new(job_id, 0), Some(secret))
+            .await
+    }
+
+    async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError> {
+        let bytes = self
+            .consumer
+            .request(
+                &self.route,
+                direct_envelope("exec.status", json!({"job_id":job_id}), Some(secret)),
+                CallOptions::default(),
+            )
+            .await
+            .map_err(submit_error)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| SubmitError::Unknown("unreadable job status".into()))
+    }
+
+    async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String> {
         self.consumer
             .request(
                 &self.route,
-                envelope("exec.cancel", CancelRequest::new(job_id)),
+                direct_envelope("exec.cancel", CancelRequest::new(job_id), secret),
                 CallOptions::default(),
             )
             .await
@@ -601,6 +912,18 @@ pub async fn main(args: &[String]) -> u8 {
             return EXIT_REFUSED;
         }
     };
+    let secret_file = match args
+        .secret_file
+        .as_deref()
+        .map(SecretFile::create)
+        .transpose()
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("ck motor run: cannot create secret file: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let mut interrupts = match interrupt_signals() {
         Ok(interrupts) => interrupts,
         Err(error) => {
@@ -624,7 +947,60 @@ pub async fn main(args: &[String]) -> u8 {
     };
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    drive(&client, &request, &mut out, &mut err, &mut interrupts).await
+    drive_run(
+        &client,
+        &request,
+        secret_file,
+        &mut out,
+        &mut err,
+        &mut interrupts,
+    )
+    .await
+}
+
+pub async fn attach_main(args: &[String]) -> u8 {
+    let args = match parse_attach_args(args) {
+        Ok(Some(args)) => args,
+        Ok(None) => {
+            println!("{ATTACH_HELP}");
+            return 0;
+        }
+        Err(message) => {
+            eprintln!("ck motor attach: {message}\n\n{ATTACH_HELP}");
+            return EXIT_USAGE;
+        }
+    };
+    let secret = match &args.secret_file {
+        Some(path) => fs::File::open(path).map(read_secret).unwrap_or_default(),
+        None => read_secret(std::io::stdin().lock()),
+    };
+    let workspace = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("ck motor attach: current directory unavailable");
+            return EXIT_USAGE;
+        }
+    };
+    let mut interrupts = match interrupt_signals() {
+        Ok(interrupts) => interrupts,
+        Err(_) => {
+            eprintln!("ck motor attach: signal handlers unavailable");
+            return EXIT_UNKNOWN;
+        }
+    };
+    let client = match SubcClient::connect_classified(&workspace).await {
+        Ok(client) => client,
+        Err(failure) => return attach_failure(failure, &mut std::io::stderr()),
+    };
+    drive_attach(
+        &client,
+        &args,
+        &secret,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+        &mut interrupts,
+    )
+    .await
 }
 
 /// One message per SIGINT or SIGTERM. Installing the handlers replaces the
@@ -651,6 +1027,57 @@ fn interrupt_signals() -> std::io::Result<mpsc::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_file_is_private_new_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-secret");
+        let path = scratch.join("secret");
+        let mut file = super::SecretFile::create(&path).unwrap();
+        file.save(&"a".repeat(64)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            super::SecretFile::create(&path).err().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", "a".repeat(64))
+        );
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(super::SecretFile::create(&link).is_err());
+    }
+
+    #[test]
+    fn attach_never_accepts_an_argv_secret_or_echoes_it() {
+        let id = motor_protocol::Uuid::now_v7().to_string();
+        let secret = "a".repeat(64);
+        for args in [
+            vec![id.clone(), secret.clone()],
+            vec![id.clone(), "--secret".into(), secret.clone()],
+            vec![id.clone(), format!("--secret={secret}")],
+        ] {
+            let error = super::parse_attach_args(&args).unwrap_err();
+            assert!(!error.contains(&secret));
+        }
+        let args = vec![id, "--status".into(), "--secret-file=key".into()];
+        let args = super::parse_attach_args(&args).unwrap().unwrap();
+        assert!(args.status);
+        assert_eq!(args.secret_file.unwrap(), std::path::Path::new("key"));
+        assert_eq!(super::read_secret(format!("{secret}\n").as_bytes()), secret);
+        assert_eq!(super::read_secret(&b""[..]), "");
+    }
+    #[test]
+    fn run_accepts_secret_file_without_putting_secret_in_arguments() {
+        let words: Vec<String> = ["--secret-file", "job.key", "--", "true"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(super::parse_args(&words).is_ok());
+    }
     use super::*;
     use motor_protocol::RefusalReason;
 
@@ -677,6 +1104,7 @@ mod tests {
                 timeout: 90,
                 cwd: Some("/w".into()),
                 command: words("cargo test -p x"),
+                secret_file: None,
             }
         );
         assert_eq!(command_line(&args.command), "cargo test -p x");

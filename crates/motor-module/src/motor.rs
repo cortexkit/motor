@@ -85,6 +85,12 @@ impl Motor {
     ) -> io::Result<JobStream> {
         self.run_classified(request, attribution, true)
     }
+    pub(crate) fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
+        self.storage.set_direct_secret_hash(id, hash)
+    }
+    pub(crate) fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
+        self.storage.direct_authorized(id, secret)
+    }
     fn run_classified(
         &self,
         mut request: RunRequest,

@@ -222,7 +222,8 @@ journalctl --user -u motor-runner.service -n 50   # "motor-runner serving" with 
 ```
 
 Then run a job from the Mac, for example `ck motor run -- uname -a` (with
-`admit_direct_exec` enabled), and the [server gate](server-gate.md) from a
+`admit_direct_exec` enabled; save its one-time secret for
+[`ck motor attach JOB_ID`](module.md#reattaching-after-a-disconnect)), and the [server gate](server-gate.md) from a
 checkout on the server.
 
 ## Uninstall
