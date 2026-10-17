@@ -7,6 +7,7 @@ pub mod cli;
 mod config;
 mod default_tip;
 mod diagnostics;
+mod hosted;
 pub mod logging;
 pub mod module;
 mod motor;
@@ -14,7 +15,8 @@ mod snapshot;
 mod storage;
 mod transport;
 
-pub use config::Config;
+pub use config::{BrokerTokenSource, Config};
+pub use hosted::{BillingStatus, HostedJobState};
 pub use motor::{JobStream, Motor};
 pub use transport::{Connector, Duplex, SshConnector};
 pub use transport::{RUNNER_CREDENTIAL_CATEGORY, RUNNER_CREDENTIAL_ID};

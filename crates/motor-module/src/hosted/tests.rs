@@ -1,0 +1,593 @@
+use super::*;
+
+#[test]
+fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
+    let config = Config::default();
+    let json = serde_json::to_value(&config).unwrap();
+    for key in ["hosted_runners", "broker_url", "broker_token_source"] {
+        assert!(json.get(key).is_none(), "{key}");
+    }
+    let mut config = config;
+    config.broker_token_source = BrokerTokenSource::Fake;
+    assert!(config.validate().is_err());
+    config.runner_instance = "test".into();
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn hosted_paths_are_component_bounded() {
+    for path in ["/Users/a/repo", "/home/a/repo"] {
+        assert!(allowed_path(Path::new(path)));
+    }
+    for path in [
+        "/Users2/repo",
+        "/home2/repo",
+        "/tmp/repo",
+        "home/repo",
+        "/home/../etc",
+    ] {
+        assert!(!allowed_path(Path::new(path)), "{path}");
+    }
+}
+
+#[test]
+fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
+    for (error, reason, code) in [
+        (
+            Error::Auth,
+            RefusalReason::RunnerAuthenticationFailed,
+            "hosted_auth",
+        ),
+        (
+            Error::Expired,
+            RefusalReason::RunnerAuthenticationFailed,
+            "hosted_expired",
+        ),
+        (
+            Error::Spki,
+            RefusalReason::RunnerAuthenticationFailed,
+            "hosted_spki_mismatch",
+        ),
+        (
+            Error::HostFull,
+            RefusalReason::RunnerFull,
+            "hosted_host_full",
+        ),
+        (
+            Error::Capacity,
+            RefusalReason::RunnerFull,
+            "hosted_capacity",
+        ),
+        (
+            Error::Connect,
+            RefusalReason::Unreachable,
+            "hosted_connect_failed",
+        ),
+        (
+            Error::Broker,
+            RefusalReason::Unreachable,
+            "hosted_broker_unreachable",
+        ),
+        (
+            Error::NoTimeout,
+            RefusalReason::RequestRejected,
+            "hosted_no_timeout",
+        ),
+        (
+            Error::Short,
+            RefusalReason::RequestRejected,
+            "hosted_max_s_too_short",
+        ),
+        (
+            Error::Path,
+            RefusalReason::RequestRejected,
+            "hosted_path_outside_roots",
+        ),
+    ] {
+        assert_eq!(error.reason(), reason);
+        assert_eq!(error.code(), code);
+    }
+    assert!(!Error::Auth.replaceable());
+    assert!(!Error::Expired.replaceable());
+}
+
+#[test]
+fn hosted_billing_seconds_keep_three_decimals() {
+    let mut state = HostedJobState::default();
+    assert_eq!(state.billed_line(), "billed: pending");
+    state.billing = BillingStatus::Unavailable;
+    assert_eq!(state.billed_line(), "billed: unavailable");
+    state.billed_vcpu_ms = Some(6001);
+    assert_eq!(state.billed_line(), "billed: 6.001 vCPU-s");
+}
+
+mod harness;
+use harness::*;
+use motor_protocol::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn stored(scratch: &Scratch, id: Uuid, route: HostedJobState) -> Arc<Storage> {
+    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    storage
+        .create(id, 30, None, Some("test".into()), false)
+        .unwrap();
+    storage.hosted_route(id, route).unwrap();
+    storage
+}
+
+#[tokio::test]
+async fn hosted_self_signed_pin_challenge_and_protocol_work() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let storage = stored(&scratch, id, h.route.clone());
+    let (channel, lease) = Client::new(h.route.clone())
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .unwrap();
+    assert_eq!(lease.max_s, 30);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(channel.platforms, vec!["linux"]);
+}
+
+#[tokio::test]
+async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    // Keep the token bound to the same requester key, but replace the expected
+    // certificate identity in endpoint_spki_sha256 with a different digest.
+    let key = requester().unwrap();
+    let client = Client::new(h.route.clone());
+    let salt = [9; 32];
+    let mut lease: motor_lease::LeaseResponse = client
+        .post(
+            "/v1/leases",
+            &motor_lease::LeaseRequest {
+                job_id: id.to_string(),
+                vcpus: 2,
+                mem_mib: motor_lease::memory_max_mib(2),
+                platform: "linux".into(),
+                net: false,
+                workspace_key_hash: keyed_hash(&salt, "ck-ws-v1", scratch.0.to_str().unwrap())
+                    .unwrap(),
+                repo_hash: keyed_hash(&salt, "ck-repo-v1", scratch.0.to_str().unwrap()).unwrap(),
+                placement_hint: None,
+                timeout_s: 30,
+                requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
+            },
+        )
+        .await
+        .unwrap();
+    lease.endpoint_spki_sha256 = motor_lease::base64url(&[0; 32]);
+    assert_eq!(
+        super::tls::connect(id, &lease, &key, motor_lease::Purpose::Run)
+            .await
+            .err(),
+        Some(Error::Spki)
+    );
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 0);
+    assert_eq!(h.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn hosted_capacity_replaces_three_times_but_auth_and_expiry_do_not() {
+    for (reason, error, count) in [
+        ("host_full", Error::HostFull, 3),
+        ("capacity", Error::Capacity, 3),
+        ("auth", Error::Auth, 1),
+        ("expired", Error::Expired, 1),
+    ] {
+        let h = Harness::new(Behavior::Refuse(reason)).await;
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let storage = stored(&scratch, id, h.route.clone());
+        assert_eq!(
+            Client::new(h.route.clone())
+                .run(id, &Harness::request(&scratch.0), &storage)
+                .await
+                .err(),
+            Some(error)
+        );
+        assert_eq!(h.requests.lock().unwrap().len(), count);
+        assert_eq!(h.tokens.load(Ordering::SeqCst), count);
+        assert!(h
+            .iats
+            .lock()
+            .unwrap()
+            .windows(2)
+            .all(|pair| pair[1] > pair[0]));
+    }
+}
+
+#[tokio::test]
+async fn hosted_wrong_challenge_host_is_terminal_auth() {
+    let h = Harness::new(Behavior::WrongHost).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let storage = stored(&scratch, id, h.route.clone());
+    assert_eq!(
+        Client::new(h.route.clone())
+            .run(id, &Harness::request(&scratch.0), &storage)
+            .await
+            .err(),
+        Some(Error::Auth)
+    );
+    assert_eq!(h.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn hosted_lost_lease_response_rerequests_and_short_cap_stops_before_upload() {
+    let h = Harness::new(Behavior::Normal).await;
+    h.drop_lease.store(true, Ordering::SeqCst);
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let storage = stored(&scratch, id, h.route.clone());
+    let (channel, _) = Client::new(h.route.clone())
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .unwrap();
+    drop(channel);
+    assert_eq!(h.requests.lock().unwrap().len(), 2);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    h.broker.lock().unwrap().knobs.max_s = Some(5);
+    let id2 = Uuid::now_v7();
+    storage
+        .create(id2, 30, None, Some("test".into()), false)
+        .unwrap();
+    storage.hosted_route(id2, h.route.clone()).unwrap();
+    assert_eq!(
+        Client::new(h.route.clone())
+            .run(id2, &Harness::request(&scratch.0), &storage)
+            .await
+            .err(),
+        Some(Error::Short)
+    );
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    Client::new(h.route.clone()).release(id2).await.unwrap();
+    assert!(h
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .ends_with("/release"));
+}
+
+#[test]
+fn hosted_salt_persists_private_and_domain_separated_hashes() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new();
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    let salt = storage.hosted_salt().unwrap();
+    let ws = keyed_hash(&salt, "ck-ws-v1", scratch.0.to_str().unwrap()).unwrap();
+    let repo = keyed_hash(&salt, "ck-repo-v1", scratch.0.to_str().unwrap()).unwrap();
+    assert_eq!(ws.len(), 43);
+    assert_ne!(ws, repo);
+    assert_eq!(
+        std::fs::metadata(scratch.0.join("state/hosted-salt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    drop(storage);
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    assert_eq!(storage.hosted_salt().unwrap(), salt);
+    assert_eq!(
+        keyed_hash(&salt, "ck-ws-v1", &format!("{}/.", scratch.0.display())).unwrap(),
+        ws
+    );
+}
+
+async fn seed_running(h: &Harness, scratch: &Scratch, terminal: Option<TerminalRecord>, id: Uuid) {
+    let storage = stored(scratch, id, h.route.clone());
+    let (_, lease) = Client::new(h.route.clone())
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .unwrap();
+    storage
+        .hosted_update(id, |s| {
+            s.lease(&lease);
+            s.terminal = terminal;
+        })
+        .unwrap();
+}
+
+async fn terminal(mut stream: crate::JobStream) -> TerminalRecord {
+    let record = tokio::time::timeout(Duration::from_secs(30), stream.records.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match record {
+        StreamRecord::Terminal(t) => t,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn hosted_route_survives_switch_flip_restart_cancel_status_and_attach() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let config = Config {
+        runner_instance: "other".into(),
+        ..Config::default()
+    };
+    let motor =
+        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+    let state = motor.hosted_state(id).unwrap();
+    assert_eq!(state.billing, BillingStatus::Available);
+    assert_eq!(state.billed_vcpu_ms, Some(6001));
+    assert_eq!(
+        motor
+            .job_status(id)
+            .await
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        t.outcome
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .all(|p| p.ends_with("/reattach")));
+}
+
+#[tokio::test]
+async fn hosted_terminal_disconnect_reattaches_three_times_and_preserves_exit_pending() {
+    let h = Harness::new(Behavior::DropTerminal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Pending
+    );
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/reattach"))
+            .count(),
+        3
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    h.finished.store(true, Ordering::SeqCst);
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
+            .await
+            .outcome,
+        t.outcome
+    );
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn hosted_finished_without_terminal_is_outcome_unknown() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    h.finished.store(true, Ordering::SeqCst);
+    let motor = crate::Motor::with_connector(
+        h.config(),
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
+            .await
+            .outcome,
+        Outcome::OutcomeUnknown
+    );
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    for (request, code) in [
+        (
+            RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true"),
+            "hosted_no_timeout",
+        ),
+        (
+            RunRequest::new("/tmp/missing", "/tmp/missing", "/tmp/missing", "true")
+                .with_timeout(30),
+            "hosted_path_outside_roots",
+        ),
+    ] {
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        assert!(matches!(
+            terminal(stream).await.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        ));
+        let state = motor.hosted_state(id).unwrap();
+        assert!(state.hosted_no_fallback);
+        assert_eq!(state.hosted_code.as_deref(), Some(code));
+    }
+    let reply = motor
+        .prepare(PrepareRequest::new("/tmp/missing", "/tmp/missing", "base"))
+        .await
+        .unwrap();
+    assert!(reply.refusal_detail.unwrap().contains("hosted_no_fallback"));
+    assert!(motor
+        .drop_workspace(DropRequest::new("/tmp/missing"))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("hosted_no_fallback"));
+    motor.status().await;
+    assert_eq!(h.requests.lock().unwrap().len(), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+// This ignored test snapshots a real repository below the current checkout.
+// Hosted workspace paths must be under /Users or /home, so it requires a checkout
+// in one of those roots; the ordinary tests work from any checkout location.
+#[tokio::test]
+#[ignore = "requires checkout under /Users or /home"]
+async fn hosted_real_snapshot_lost_run_ack_never_resubmits_and_refusals_release() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("hosted-fixture-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&path).unwrap();
+    let scratch = Scratch(path);
+    assert!(allowed_path(&std::fs::canonicalize(&scratch.0).unwrap()));
+    let repo = scratch.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--initial-branch=main"]);
+    std::fs::write(repo.join("source"), "hello\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "initial",
+    ]);
+    for behavior in [
+        Behavior::DropRunAck,
+        Behavior::Refuse("host_full"),
+        Behavior::Refuse("auth"),
+        Behavior::Refuse("capacity"),
+        Behavior::ConnectFailure,
+        Behavior::DropHave,
+        Behavior::Normal,
+    ] {
+        let h = Harness::new(behavior).await;
+        if matches!(behavior, Behavior::Refuse("capacity")) {
+            h.release_admitted.store(true, Ordering::SeqCst);
+        }
+        if matches!(behavior, Behavior::DropRunAck) {
+            h.broker.lock().unwrap().knobs.max_s = Some(30);
+        }
+        if matches!(behavior, Behavior::Normal) {
+            h.broker.lock().unwrap().knobs.max_s = Some(5);
+        }
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let root = scratch.0.join(format!("state-{}", Uuid::now_v7()));
+        let motor = crate::Motor::with_connector(h.config(), &root, ssh.clone()).unwrap();
+        let stream = motor
+            .run(Harness::request(&repo).with_timeout(120))
+            .unwrap();
+        let id = stream.job_id;
+        let t = terminal(stream).await;
+        let state = motor.hosted_state(id).unwrap();
+        if matches!(behavior, Behavior::DropRunAck) {
+            assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+            assert_eq!(state.billing, BillingStatus::Available);
+            assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+            let frames = h.frames.lock().unwrap();
+            let run = frames
+                .iter()
+                .find_map(|f| if let Frame::Run(r) = f { Some(r) } else { None })
+                .unwrap();
+            assert_eq!(run.timeout, Some(30));
+            assert_eq!(run.weight_hint, Some(2));
+            drop(frames);
+            assert_eq!(
+                h.frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| matches!(f, Frame::Run(_)))
+                    .count(),
+                1
+            );
+            assert!(!h
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.ends_with("/release")));
+        } else if matches!(behavior, Behavior::Refuse("capacity")) {
+            assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+            assert_eq!(state.billing, BillingStatus::Available);
+            assert!(!state.hosted_no_fallback);
+            assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+            assert!(h
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.ends_with("/reattach")));
+        } else {
+            assert!(
+                matches!(t.outcome, Outcome::RefusedBeforeStart { .. }),
+                "{t:?}"
+            );
+            assert!(state.hosted_no_fallback);
+            if matches!(behavior, Behavior::ConnectFailure | Behavior::DropHave) {
+                assert_eq!(
+                    h.requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|p| p.as_str() == "/v1/leases")
+                        .count(),
+                    3
+                );
+                assert_eq!(state.hosted_code.as_deref(), Some("hosted_connect_failed"));
+            }
+            assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+            assert!(h
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .ends_with("/release"));
+        }
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    }
+}
