@@ -27,6 +27,7 @@ def meminfo():
 def ready():
     return {"uptime": Path("/proc/uptime").read_text().split()[0],
             "cached_bytes": meminfo()["Cached"],
+            "modules_disabled": Path("/proc/sys/kernel/modules_disabled").read_text().strip(),
             "tenant_mounted": os.path.ismount("/tenant"),
             "runner_active": command("systemctl", "is-active", "spike-runner")
             if Path(RUNNER).exists() else "not-started"}

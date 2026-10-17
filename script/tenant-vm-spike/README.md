@@ -35,6 +35,9 @@ absolute paths; the Firecracker executable must be named `firecracker`.
   the rootfs. Inputs/config/digests are retained. To verify the complete config
   recipe without a kernel compile, pass `--config-only` as the builder's second
   argument, using a new output directory.
+- The rootfs irreversibly sets `kernel.modules_disabled=1` during systemd boot
+  and reports that value in readiness evidence. It masks the unused ttyS0
+  serial getty so PID 1 does not wait for that device to appear.
 - Allow **128 GiB peak incremental disk** including Cargo/kernel build scratch,
   rootfs copies, fully allocated 1/20/24 GiB XFS disks and two 18 GiB memory
   snapshots. Allow 22 GiB available host RAM and four build CPUs. Once inputs
@@ -118,10 +121,11 @@ extra interfaces remain a failure, not an exception added to the probe.
   Firecracker's UDS `CONNECT 54\n`; guest vsock port 52 bridges the host probe's
   length-prefixed JSON job frames to `/tenant/state/spike/runner.sock`.
 - `base_snapshot_create`: `PATCH /vm {state:Paused}`, then `PUT /snapshot/create`
-  with `snapshot_type:Full`, `snapshot_path`, `mem_file_path`; includes fsync of
+  with `snapshot_type:Full`, `snapshot_path`, `mem_file_path` and
+  `snapshot_files_sync:false`; includes host-side fsync of
   both files and their directory. The guest is synced before pause. Snapshot
   creation is timed separately from preparation/stop; `snapshot_timing` raw
-  events separate the API phase (including memory-file writes) from **each**
+  events separate the API dump phase (including memory-file writes) from **each**
   subsequent memory-file, VM-state-file and directory fsync. VMM `/proc/PID/io`
   deltas and memory-file length/allocated bytes are also recorded. API timing
   includes Firecracker's internal serialization, not just pure write syscalls;
@@ -167,6 +171,29 @@ functional probes succeeded, and suspend restore p50 is **<=5 s**. Any transport
 drive, network or FICLONE failure, missing run or >5 s p50 is **replan**. Extra
 memory headroom is also a replan, not a silent cap change. Record the operator's
 real data and exact command in hosted-runners design section 6 before advancing.
+
+### Snapshot writeback-pressure experiment
+
+Firecracker 1.17.0 writes the memory file itself using buffered file I/O. Its
+API has no direct-I/O or external-writer/FD setting. By default it also syncs
+the files inside the API call. The spike now disables that internal sync using
+the supported `snapshot_files_sync` flag and explicitly fsyncs both files and
+their directory from the operator process **while the VM remains paused**.
+This preserves the durable suspend boundary and makes the write/durability
+phases separately measurable; earlier default-sync API samples are not pure
+write-time samples. File ownership does not transfer page-cache charges.
+
+Run 09 OOM-killed the VMM during a cache-heavy snapshot at the unchanged
+18.5 GiB hard cap. An optional `--snapshot-memory-high-mib 16384` experiment
+sets a **16 GiB `memory.high` only while taking a paused snapshot**, with the
+same 18.5 GiB `memory.max`. It restores the previous high threshold even on
+failure and records memory current/peak/stat/events before and after. The
+2.5 GiB high-to-max gap is an experimental writeback cushion, not extra RAM
+headroom or a guaranteed OOM fix. Normal running/restoring VMs retain the
+default high threshold. Snapshot HTTP timeout is 300 s so throttling time is
+measured rather than mistaken for a transport error. A result with this option
+must name the option and its workload; it does not qualify arbitrary full-RAM
+guests or prove a general production throttle policy.
 
 Portable plumbing tests (not VM qualification):
 

@@ -66,8 +66,8 @@ class Evidence:
 
 
 class UnixHTTP(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=120)
+    def __init__(self, path, timeout=120):
+        super().__init__("localhost", timeout=timeout)
         self.path = path
 
     def connect(self):
@@ -185,9 +185,9 @@ class VM:
         if readonly:
             self.e.run("mount", "-o", "remount,bind,ro", target)
 
-    def api(self, method, path, body=None):
+    def api(self, method, path, body=None, timeout=120):
         self.e.record("api_request", method=method, path=path, body=body)
-        with closing(UnixHTTP(self.socket_root / "api.sock")) as client:
+        with closing(UnixHTTP(self.socket_root / "api.sock", timeout)) as client:
             client.request(method, path, None if body is None else json.dumps(body),
                            {"Content-Type": "application/json"})
             response = client.getresponse()
@@ -245,10 +245,31 @@ class VM:
         return result
 
     def snapshot(self, name):
+        high_mib = self.h.snapshot_memory_high_mib
+        if not high_mib:
+            return self._snapshot(name)
+        high = self.cgroup / "memory.high"
+        previous = high.read_text().strip()
+        self.e.record("snapshot_memory_before", name=name, high_mib=high_mib, **self.memory_state())
+        high.write_text(str(high_mib * 1024**2))
+        try:
+            return self._snapshot(name)
+        finally:
+            try:
+                self.e.record("snapshot_memory_after", name=name, high_mib=high_mib, **self.memory_state())
+            finally:
+                high.write_text(previous)
+
+    def memory_state(self):
+        return {name.replace(".", "_"): (self.cgroup / name).read_text().strip()
+                for name in ["memory.current", "memory.peak", "memory.events", "memory.stat"]}
+
+    def _snapshot(self, name):
         before = self.io_counters()
         started = time.monotonic_ns()
         result = self.api("PUT", "/snapshot/create", {"snapshot_type": "Full",
-                          "snapshot_path": f"/state/{name}.vmstate", "mem_file_path": f"/state/{name}.mem"})
+                          "snapshot_path": f"/state/{name}.vmstate", "mem_file_path": f"/state/{name}.mem",
+                          "snapshot_files_sync": False}, timeout=300)
         responded = time.monotonic_ns()
         after = self.io_counters()
         phases = {}
@@ -337,6 +358,7 @@ class Harness:
         self.firecracker = str(Path(os.environ["FIRECRACKER"]).resolve())
         self.jailer = str(Path(os.environ["JAILER"]).resolve())
         self.uid = args.uid
+        self.snapshot_memory_high_mib = args.snapshot_memory_high_mib
         token = uuid.uuid4().hex[:8]
         self.netns = "msp-" + token
         self.group = "motor-spike-" + token
@@ -617,6 +639,8 @@ def preflight(args):
             raise RuntimeError(f"missing prerequisite: {tool}")
     if not os.access("/dev/kvm", os.R_OK | os.W_OK):
         raise RuntimeError("missing readable/writable /dev/kvm")
+    if not 0 <= args.snapshot_memory_high_mib < RAM_MIB + HEADROOM_MIB:
+        raise RuntimeError("snapshot memory.high must be 0 (unchanged) or below the unchanged memory.max")
     if not Path("/dev/net/tun").exists():
         raise RuntimeError("missing /dev/net/tun (load tun)")
     for variable in ["FIRECRACKER", "JAILER"]:
@@ -664,6 +688,8 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--rootfs", type=Path, required=True)
     parser.add_argument("--uid", type=int, default=290000)
+    parser.add_argument("--snapshot-memory-high-mib", type=int, default=0,
+                        help="experimental paused-snapshot writeback throttle; 0 leaves memory.high unchanged")
     args = parser.parse_args()
     preflight(args)
     args.results.mkdir(mode=0o700)
@@ -706,6 +732,7 @@ def main():
     summary = summarize(evidence.samples, error)
     summary.update({"command": shlex.join(sys.argv), "runs": 5, "guest_ram_mib": RAM_MIB,
                     "headroom_mib": HEADROOM_MIB, "work": str(harness.work),
+                    "snapshot_memory_high_mib": args.snapshot_memory_high_mib,
                     "results": str(args.results.resolve())})
     (args.results / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     evidence.raw.close()

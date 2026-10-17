@@ -213,19 +213,39 @@ class HostedSpikeTests(unittest.TestCase):
         vm.io_counters = Mock(return_value={"wchar": 0, "write_bytes": 0})
         vm.api = Mock(return_value={"status": 204})
         with tempfile.TemporaryDirectory() as directory:
-            vm.h = Mock(state=Path(directory))
+            vm.h = Mock(state=Path(directory), snapshot_memory_high_mib=0)
             for name in ["base.mem", "base.vmstate"]:
                 (Path(directory) / name).touch()
             with patch.object(spike.os, "fsync") as sync:
                 self.assertEqual(vm.snapshot("base"), {"status": 204})
                 self.assertEqual(sync.call_count, 3)
         vm.api.assert_called_once_with("PUT", "/snapshot/create", {"snapshot_type": "Full",
-            "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem"})
+            "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem",
+            "snapshot_files_sync": False}, timeout=300)
         self.assertEqual(vm.e.record.call_args.args[0], "snapshot_timing")
         self.assertGreaterEqual(vm.e.record.call_args.kwargs["api_ms"], 0)
         self.assertGreaterEqual(vm.e.record.call_args.kwargs["fsync_ms"], 0)
         for name in ["memory_file_fsync_ms", "vmstate_file_fsync_ms", "directory_fsync_ms"]:
             self.assertGreaterEqual(vm.e.record.call_args.kwargs[name], 0)
+
+    def test_snapshot_memory_high_is_restored_even_when_snapshot_fails(self):
+        vm = spike.VM.__new__(spike.VM)
+        vm.h = Mock(snapshot_memory_high_mib=17920)
+        vm.e = Mock()
+        vm.memory_state = Mock(return_value={"memory_events": "high 1\noom_kill 0"})
+        with tempfile.TemporaryDirectory() as directory:
+            vm.cgroup = Path(directory)
+            (vm.cgroup / "memory.high").write_text("max")
+
+            def snapshot(_name):
+                self.assertEqual((vm.cgroup / "memory.high").read_text(), str(17920 * 1024**2))
+                raise RuntimeError("snapshot failed")
+
+            vm._snapshot = snapshot
+            with self.assertRaisesRegex(RuntimeError, "snapshot failed"):
+                vm.snapshot("suspend")
+            self.assertEqual((vm.cgroup / "memory.high").read_text(), "max")
+            self.assertEqual(vm.memory_state.call_count, 2)
 
     def test_network_override_requires_packets_on_replacement_tap(self):
         harness = spike.Harness.__new__(spike.Harness)

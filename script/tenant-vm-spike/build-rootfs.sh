@@ -60,6 +60,8 @@ cat > "$root/etc/hosts" <<'EOF'
 ::1 localhost ip6-localhost ip6-loopback
 EOF
 echo 'LANG=C.UTF-8' > "$root/etc/default/locale"
+mkdir -p "$root/etc/sysctl.d"
+echo 'kernel.modules_disabled=1' > "$root/etc/sysctl.d/99-spike-modules.conf"
 cat > "$root/etc/fstab" <<'EOF'
 /dev/vda / ext4 defaults 0 1
 tmpfs /tmp tmpfs mode=1777 0 0
@@ -87,7 +89,7 @@ Environment=RUSTUP_HOME=/tenant/home/.rustup
 ExecStart=/usr/local/bin/motor-runner serve --backend host --instance spike --state-root /tenant/state --workspace-root /tenant/work --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648
 EOF
 chroot "$root" systemctl enable spike-agent.service
-chroot "$root" systemctl mask systemd-networkd.service systemd-resolved.service apt-daily.timer apt-daily-upgrade.timer
+chroot "$root" systemctl mask systemd-networkd.service systemd-resolved.service apt-daily.timer apt-daily-upgrade.timer serial-getty@ttyS0.service
 chroot "$root" apt-get clean
 sync
 cleanup
