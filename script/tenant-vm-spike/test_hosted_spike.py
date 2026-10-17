@@ -85,6 +85,7 @@ class HostedSpikeTests(unittest.TestCase):
 
     def test_snapshot_create_is_full_and_fsyncs_both_files_and_directory(self):
         vm = spike.VM.__new__(spike.VM)
+        vm.e = Mock()
         vm.api = Mock(return_value={"status": 204})
         with tempfile.TemporaryDirectory() as directory:
             vm.h = Mock(state=Path(directory))
@@ -95,6 +96,9 @@ class HostedSpikeTests(unittest.TestCase):
                 self.assertEqual(sync.call_count, 3)
         vm.api.assert_called_once_with("PUT", "/snapshot/create", {"snapshot_type": "Full",
             "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem"})
+        self.assertEqual(vm.e.record.call_args.args[0], "snapshot_timing")
+        self.assertGreaterEqual(vm.e.record.call_args.kwargs["api_ms"], 0)
+        self.assertGreaterEqual(vm.e.record.call_args.kwargs["fsync_ms"], 0)
 
     def test_network_override_requires_packets_on_replacement_tap(self):
         harness = spike.Harness.__new__(spike.Harness)

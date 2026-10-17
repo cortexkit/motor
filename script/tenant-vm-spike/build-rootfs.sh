@@ -35,12 +35,16 @@ truncate -s 4G "$out/rootfs.ext4"
 mkfs.ext4 -F "$out/rootfs.ext4"
 mount -o loop "$out/rootfs.ext4" "$root"
 debootstrap --arch=amd64 --variant=minbase \
-    --include=systemd-sysv,dbus,python3,sudo,acl,xfsprogs,iproute2,iputils-ping,nftables,git,ca-certificates,util-linux,procps \
+    --include=systemd-sysv,dbus,python3,sudo,acl,xfsprogs,iproute2,iputils-ping,nftables,git,ca-certificates,util-linux,procps,rustc,cargo,build-essential \
     "$suite" "$root" https://archive.ubuntu.com/ubuntu
 install -D -m 0755 "$MOTOR_RUNNER" "$root/usr/local/bin/motor-runner"
 here=$(cd "$(dirname "$0")" && pwd -P)
 install -D -m 0755 "$here/guest.py" "$root/opt/spike/guest.py"
 chroot "$root" /usr/local/bin/motor-runner --version
+# Runner startup probes rustc even for shell jobs; isolated launchers also need a native linker.
+chroot "$root" /usr/bin/rustc --version
+chroot "$root" /usr/bin/cargo --version
+chroot "$root" /usr/bin/cc --version
 chroot "$root" /usr/lib/systemd/systemd --version
 sysver=$(chroot "$root" /usr/lib/systemd/systemd --version | head -n 1)
 [[ ${sysver#systemd } =~ ^(25[7-9]|2[6-9][0-9]|[3-9][0-9][0-9]) ]] || { echo 'need systemd >=257 for runner PrivatePIDs'; exit 1; }
@@ -50,6 +54,12 @@ done
 echo 'motor-spike ALL=(root) NOPASSWD: ALL' > "$root/etc/sudoers.d/motor-spike"
 chmod 0440 "$root/etc/sudoers.d/motor-spike"
 echo tenant-vm-spike > "$root/etc/hostname"
+cat > "$root/etc/hosts" <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 tenant-vm-spike
+::1 localhost ip6-localhost ip6-loopback
+EOF
+echo 'LANG=C.UTF-8' > "$root/etc/default/locale"
 cat > "$root/etc/fstab" <<'EOF'
 /dev/vda / ext4 defaults 0 1
 tmpfs /tmp tmpfs mode=1777 0 0

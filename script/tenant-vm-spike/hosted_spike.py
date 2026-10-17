@@ -228,14 +228,18 @@ class VM:
         return result
 
     def snapshot(self, name):
+        started = time.monotonic_ns()
         result = self.api("PUT", "/snapshot/create", {"snapshot_type": "Full",
                           "snapshot_path": f"/state/{name}.vmstate", "mem_file_path": f"/state/{name}.mem"})
+        responded = time.monotonic_ns()
         for path in [self.h.state / f"{name}.vmstate", self.h.state / f"{name}.mem", self.h.state]:
             fd = os.open(path, os.O_RDONLY)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+        self.e.record("snapshot_timing", name=name, api_ms=(responded - started) / 1e6,
+                      fsync_ms=(time.monotonic_ns() - responded) / 1e6)
         return result
 
     def load(self, name, tap):

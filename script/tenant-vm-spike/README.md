@@ -20,7 +20,9 @@ absolute paths; the Firecracker executable must be named `firecracker`.
 - The rootfs builder reads `/etc/os-release` for the operator host's **Ubuntu
   release**, recording its suite, packages/build log and runner SHA. This avoids pairing a host-built
   executable with an older glibc. It refuses systemd older than 257 and checks
-  that the supplied runner actually executes in the chroot.
+  that the supplied runner actually executes in the chroot. The guest includes
+  distro Rust/Cargo and a native C toolchain: startup always probes `rustc`, and
+  isolation compiles native launchers even when the submitted job is a shell.
 - The kernel builder pins Linux 6.1.128 and its kernel.org SHA-256. It builds
   XFS, virtio-blk/net/vsock, namespaces, cgroups and nftables into the ELF kernel;
   it uses ordinary pages, not hugepages. Inputs/config/digests are retained.
@@ -95,7 +97,8 @@ root vsock test agent are for this throwaway image only, not production policy.
 - `base_snapshot_create`: `PATCH /vm {state:Paused}`, then `PUT /snapshot/create`
   with `snapshot_type:Full`, `snapshot_path`, `mem_file_path`; includes fsync of
   both files and their directory. The guest is synced before pause. Snapshot
-  creation is timed separately from preparation/stop.
+  creation is timed separately from preparation/stop; `snapshot_timing` raw
+  events separate API request duration from the following fsync interval.
 - `base_restore_{20,24}g`: new jailer/cgroup, `PUT /snapshot/load` using
   `mem_backend:{backend_type:File,backend_path}`, `resume_vm:false`,
   `enable_diff_snapshots:false` and
