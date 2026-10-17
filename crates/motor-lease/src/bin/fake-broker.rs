@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("listening {}", listener.local_addr()?);
     io::stdout().flush()?;
     loop {
-        broker.settle_host_lost(now_ms());
+        broker.settle_due(now_ms());
         match listener.accept() {
             Ok((stream, _)) => {
                 // A client can disappear after acceptance; settlement remains in the model.

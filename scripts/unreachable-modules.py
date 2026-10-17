@@ -21,6 +21,8 @@ Two refinements prevent false positives and false negatives:
 
 A dormant module is allowed, but as a decision someone made rather than an
 omission nobody noticed: record it in the allowlist with its reason.
+
+Requires Python 3.11 or newer for standard-library TOML parsing.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import tomllib
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,26 +38,54 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWLIST = ROOT / "scripts" / "unreachable-modules.allow"
 
-# Crates that produce a running binary. Reachability is measured from these.
-BINARY_CRATES = {
-    "motor-module",
-    "motor-runner",
-    "motor-vm-helper",
-    "motor-vm-guest",
-    "motor-vm-loader",
-    "prefrontal-build-slot",
-}
+@dataclass(frozen=True)
+class CrateTargets:
+    alias: str
+    binaries: tuple[Path, ...]
 
-CRATE_ALIASES = {
-    "motor_module": "motor-module",
-    "motor_protocol": "motor-protocol",
-    "motor_runner": "motor-runner",
-    "motor_vm_helper": "motor-vm-helper",
-    "motor_vm_guest": "motor-vm-guest",
-    "motor_vm_loader": "motor-vm-loader",
-    "motor_winagent": "motor-winagent",
-    "prefrontal_build_slot": "prefrontal-build-slot",
-}
+
+def discover_crates() -> dict[str, CrateTargets]:
+    """Read package identities and Cargo binary targets, including feature-gated ones."""
+    crates = {}
+    # Include independently built packages (for example platform agents) as well
+    # as workspace members: the source census covers every crates/* package.
+    for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+        config = tomllib.loads(manifest.read_text())
+        package = config.get("package")
+        if package is None:
+            continue
+        directory = manifest.parent
+        name = package["name"]
+        explicit = config.get("bin", [])
+        targets = {}
+        for binary in explicit:
+            target_name = binary.get("name", name)
+            path = binary.get("path")
+            if path is None:
+                candidates = [directory / "src/bin" / f"{target_name}.rs",
+                              directory / "src/bin" / target_name / "main.rs"]
+                if target_name == name:
+                    candidates.insert(0, directory / "src/main.rs")
+                path = next((p for p in candidates if p.is_file()), None)
+                if path is None:
+                    raise ValueError(f"{manifest}: cannot find binary {target_name}")
+            else:
+                path = directory / path
+            if not path.resolve().is_relative_to(ROOT):
+                raise ValueError(f"{manifest}: binary path escapes repository: {path}")
+            targets[target_name] = path.resolve()
+        auto = package.get("autobins", not explicit or package.get("edition", "2015") != "2015")
+        if auto:
+            main = directory / "src/main.rs"
+            if main.is_file():
+                targets.setdefault(name, main.resolve())
+            for entry in sorted((directory / "src/bin").glob("*.rs")):
+                targets.setdefault(entry.stem, entry.resolve())
+            for entry in sorted((directory / "src/bin").glob("*/main.rs")):
+                targets.setdefault(entry.parent.name, entry.resolve())
+        alias = config.get("lib", {}).get("name", name).replace("-", "_")
+        crates[directory.name] = CrateTargets(alias, tuple(sorted(set(targets.values()))))
+    return crates
 
 MODULE_DECLARATION = re.compile(
     r"^\s*(?P<attrs>(?:#\s*\[[^]]*\]\s*)*)"
@@ -215,11 +246,12 @@ def resolve_declaration(
     name: str,
     path_attribute: str | None,
     inline_modules: tuple[str, ...],
+    binary_entry: bool = False,
 ) -> Path | None:
     if path_attribute is not None:
         candidates = [declaring_file.parent / path_attribute]
     else:
-        base = module_directory(declaring_file).joinpath(*inline_modules)
+        base = (declaring_file.parent if binary_entry else module_directory(declaring_file)).joinpath(*inline_modules)
         candidates = [base / f"{name}.rs", base / name / "mod.rs"]
     for candidate in candidates:
         if candidate.is_file():
@@ -227,7 +259,7 @@ def resolve_declaration(
     return None
 
 
-def declarations_in(path: Path) -> tuple[list[ModuleDeclaration], bool]:
+def declarations_in(path: Path, binary_entry: bool = False, crate: str | None = None) -> tuple[list[ModuleDeclaration], bool]:
     text = path.read_text(errors="ignore")
     structural = structural_source(text)
     file_test_only = bool(FILE_CFG_TEST_ATTRIBUTE.search(structural))
@@ -235,7 +267,8 @@ def declarations_in(path: Path) -> tuple[list[ModuleDeclaration], bool]:
     pending_attributes: list[str] = []
     inline_modules: list[tuple[int, str, bool]] = []
     depth = 0
-    crate = path.relative_to(ROOT / "crates").parts[0]
+    if crate is None:
+        crate = path.relative_to(ROOT / "crates").parts[0]
 
     original_lines = text.splitlines()
     structural_lines = join_wrapped_declarations(structural.splitlines())
@@ -279,6 +312,7 @@ def declarations_in(path: Path) -> tuple[list[ModuleDeclaration], bool]:
                     name,
                     path_match.group(1) if path_match else None,
                     tuple(module for _, module, _ in inline_modules),
+                    binary_entry,
                 )
             declaration = ModuleDeclaration(
                 crate=crate,
@@ -328,31 +362,51 @@ def join_wrapped_declarations(lines: list[str]) -> list[str]:
 
 
 def collect_declarations(
-    sources: list[Path],
+    sources: list[Path], binary_entries: set[Path], source_crates: dict[Path, str],
 ) -> tuple[list[ModuleDeclaration], set[Path]]:
     declarations: list[ModuleDeclaration] = []
     test_only_files: set[Path] = set()
     for path in sources:
-        found, file_test_only = declarations_in(path)
+        found, file_test_only = declarations_in(path, path in binary_entries, source_crates[path])
         declarations.extend(found)
         if file_test_only:
             test_only_files.add(path.resolve())
     return declarations, test_only_files
 
 
-def tracked_sources() -> list[Path]:
-    # Only each crate's own src tree is a module tree. Without the glob magic,
-    # git's `*` spans slashes and `crates/*/src/**` also matched the standalone
-    # compile-probe crates under a crate's tests/ directory (tests/.../src/main.rs),
-    # which are not modules of anything and were refused as undeclared.
+def tracked_sources(binary_owners: dict[Path, str]) -> tuple[list[Path], dict[Path, str]]:
     out = subprocess.run(
-        ["git", "ls-files", ":(glob)crates/*/src/**/*.rs"],
+        ["git", "ls-files", ":(glob)**/*.rs"],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=True,
     )
-    return [ROOT / line for line in out.stdout.splitlines() if line]
+    tracked = {(ROOT / line).resolve() for line in out.stdout.splitlines() if line}
+    # Keep the ordinary src census, not standalone compile probes under tests/.
+    source_crates = {}
+    for path in tracked:
+        if path.is_relative_to(ROOT / "crates"):
+            parts = path.relative_to(ROOT / "crates").parts
+            if len(parts) >= 3 and parts[1] == "src":
+                source_crates[path] = parts[0]
+    sources = set(source_crates)
+    queue = deque(binary_owners.items())
+    visited = set()
+    while queue:
+        path, crate = queue.popleft()
+        if path in visited:
+            continue
+        visited.add(path)
+        if path not in tracked:
+            raise ValueError(f"binary source is missing or not tracked by git: {path}")
+        sources.add(path)
+        source_crates[path] = crate
+        declarations, _ = declarations_in(path, path in binary_owners, crate)
+        for declaration in declarations:
+            if declaration.production_eligible and declaration.target is not None:
+                queue.append((declaration.target, crate))
+    return sorted(sources), source_crates
 
 
 
@@ -391,6 +445,7 @@ def braced_group_modules(text: str, open_brace: int) -> set[str]:
     modules: set[str] = set()
     depth = 0
     index = open_brace
+    item_start = True
     while index < len(text):
         char = text[index]
         if char == "{":
@@ -399,21 +454,24 @@ def braced_group_modules(text: str, open_brace: int) -> set[str]:
             depth -= 1
             if depth == 0:
                 break
-        elif depth == 1:
-            name = re.match(r"([a-z_][a-z0-9_]*)\s*::", text[index:])
-            if name and (index == 0 or not re.match(r"[A-Za-z0-9_:]", text[index - 1])):
+        elif depth == 1 and char == ",":
+            item_start = True
+        elif depth == 1 and item_start and not char.isspace():
+            name = re.match(r"([a-z_][a-z0-9_]*)\b", text[index:])
+            if name:
                 modules.add(name.group(1))
-                index += len(name.group(0))
-                continue
+                index += len(name.group(0)) - 1
+            # Renamed imports do not wire a module named after their alias.
+            item_start = False
         index += 1
     return modules
 
 
-def references(text: str, crate: str) -> set[tuple[str, str]]:
+def references(text: str, crate: str, aliases: dict[str, str]) -> set[tuple[str, str]]:
     """Named (crate, module) pairs; an empty module denotes a crate's root."""
     found: set[tuple[str, str]] = set()
     # prefrontal_core::org::... and prefrontal_core::org;
-    for alias, other in CRATE_ALIASES.items():
+    for alias, other in aliases.items():
         if re.search(rf"\b{alias}::", text):
             found.add((other, ""))
         for module in re.findall(rf"\b{alias}::([a-z_][a-z0-9_]*)", text):
@@ -426,6 +484,9 @@ def references(text: str, crate: str) -> set[tuple[str, str]]:
     # crate::org::..., self::org::..., super::org::...
     for module in re.findall(r"\b(?:crate|self|super)::([a-z_][a-z0-9_]*)", text):
         found.add((crate, module))
+    for group in re.finditer(r"\b(?:crate|self|super)::\s*\{", text):
+        for module in braced_group_modules(text, group.end() - 1):
+            found.add((crate, module))
     # bare `use org::...` inside the declaring crate
     for module in re.findall(r"^\s*use ([a-z_][a-z0-9_]*)::", text, re.M):
         found.add((crate, module))
@@ -457,26 +518,24 @@ def allowlisted() -> dict[str, str]:
 
 
 def undeclared_module_files(
-    sources: list[Path], declarations: list[ModuleDeclaration]
+    sources: list[Path], declarations: list[ModuleDeclaration], binary_entries: set[Path], source_crates: dict[Path, str]
 ) -> list[str]:
     """Return tracked Rust files with no resolved declaration or include in their crate."""
     declared_by_crate: dict[str, set[Path]] = defaultdict(set)
     for declaration in declarations:
         if declaration.target is None:
             continue
-        try:
-            target_parts = declaration.target.relative_to(ROOT / "crates").parts
-        except ValueError:
-            continue
-        target_crate = target_parts[0]
-        if target_crate == declaration.crate:
+        target_crate = source_crates.get(declaration.target)
+        if target_crate is not None and target_crate == declaration.crate:
             declared_by_crate[target_crate].add(declaration.target)
 
     missing: list[str] = []
     for path in sources:
-        relative = path.relative_to(ROOT / "crates")
-        crate = relative.parts[0]
-        crate_relative = Path(*relative.parts[1:])
+        if path in binary_entries:
+            continue
+        crate = source_crates[path]
+        directory = ROOT / "crates" / crate
+        crate_relative = path.relative_to(directory) if path.is_relative_to(directory) else path.relative_to(ROOT)
         if crate_relative in {Path("src/lib.rs"), Path("src/main.rs")}:
             continue
         # Cargo discovers `src/bin/<name>.rs` and `src/bin/<name>/main.rs` as
@@ -545,12 +604,20 @@ def production_subtree(
 
 
 def main() -> int:
-    sources = [path.resolve() for path in tracked_sources()]
+    try:
+        targets = discover_crates()
+        binary_owners = {entry: crate for crate, target in targets.items() for entry in target.binaries}
+        binary_entries = set(binary_owners)
+        sources, source_crates = tracked_sources(binary_owners)
+    except (OSError, ValueError) as error:
+        print(f"cannot discover Cargo binary targets: {error}", file=sys.stderr)
+        return 1
+    aliases = {target.alias: crate for crate, target in targets.items()}
     source_text = {path: path.read_text(errors="ignore") for path in sources}
     reference_text = {
         path: production_source(text) for path, text in source_text.items()
     }
-    declarations, test_only_files = collect_declarations(sources)
+    declarations, test_only_files = collect_declarations(sources, binary_entries, source_crates)
 
     duplicates = duplicate_declarations(declarations)
     if duplicates:
@@ -565,7 +632,7 @@ def main() -> int:
                 print(f"    {declaration.site()}", file=sys.stderr)
         return 1
 
-    undeclared = undeclared_module_files(sources, declarations)
+    undeclared = undeclared_module_files(sources, declarations, binary_entries, source_crates)
     if undeclared:
         print(
             "module files with no `mod` declaration or include! anywhere in their crate:",
@@ -588,8 +655,8 @@ def main() -> int:
     # Every library node owns the references in its production module subtree.
     edges: dict[tuple[str, str], set[tuple[str, str]]] = {}
     node_files: dict[tuple[str, str], set[Path]] = {}
-    crates = {path.relative_to(ROOT / "crates").parts[0] for path in sources}
-    for crate in crates - BINARY_CRATES:
+    crates = set(source_crates.values())
+    for crate in crates:
         lib = (ROOT / "crates" / crate / "src" / "lib.rs").resolve()
         # Naming any library symbol reaches its root's own production code,
         # even through another library. Declarations alone do not reach every
@@ -598,20 +665,18 @@ def main() -> int:
             root_modules = {
                 declaration.name
                 for declaration in declarations_by_file.get(lib, [])
-                if declaration.public
-                and declaration.top_level
+                if declaration.top_level
                 and declaration.production_eligible
             }
             root_text = reference_text[lib]
             edges[(crate, "")] = (
-                references(root_text, crate)
+                references(root_text, crate, aliases)
                 | {(crate, module) for module in reexported_modules(crate)}
                 | local_module_path_references(root_text, crate, root_modules)
             )
         for declaration in declarations_by_file.get(lib, []):
             if not (
-                declaration.public
-                and declaration.top_level
+                declaration.top_level
                 and declaration.production_eligible
             ):
                 continue
@@ -631,35 +696,17 @@ def main() -> int:
                     print(f"declared module file is not tracked by git: {path.relative_to(ROOT)}", file=sys.stderr)
                     return 1
                 edges.setdefault(node, set()).update(
-                    references(reference_text[path], crate)
+                    references(reference_text[path], crate, aliases)
                 )
 
-    # A binary contributes roots only from files reachable from its main.rs in a
+    # A binary contributes roots only from files reachable from its entry in a
     # production build. Test-only declarations and their descendants stay out.
     roots: set[tuple[str, str]] = set()
-    for crate in BINARY_CRATES:
-        entry = (ROOT / "crates" / crate / "src" / "main.rs").resolve()
-        included = production_subtree(entry, declarations_by_file, test_only_files)
-        # A crate that ships both a library and a binary links the library into
-        # the binary when main.rs names its own crate (`use motor_module::`),
-        # so the library's production tree runs in the binary too. Its references
-        # are roots on the same terms as main.rs's own subtree: production
-        # declarations only, test-only subtrees excluded.
-        lib = (ROOT / "crates" / crate / "src" / "lib.rs").resolve()
-        own_alias = next(
-            (alias for alias, target in CRATE_ALIASES.items() if target == crate), None
-        )
-        main_text = "\n".join(
-            reference_text[path] for path in included if path in reference_text
-        )
-        if (
-            lib in source_text
-            and own_alias is not None
-            and re.search(rf"\b{own_alias}::", main_text)
-        ):
-            included |= production_subtree(lib, declarations_by_file, test_only_files)
-        for path in included:
-            roots |= references(reference_text[path], crate)
+    for crate, target in targets.items():
+        for entry in target.binaries:
+            included = production_subtree(entry, declarations_by_file, test_only_files)
+            for path in included:
+                roots |= references(reference_text[path], crate, aliases)
 
     # Breadth-first over the module graph from the binaries.
     reachable: set[tuple[str, str]] = set()
@@ -687,7 +734,6 @@ def main() -> int:
     declared_by_crate = {
         crate: declared_modules(crate, declarations)
         for crate in crates
-        if crate not in BINARY_CRATES
     }
     fixture_broken: list[str] = []
     for key in allow:
@@ -709,8 +755,6 @@ def main() -> int:
 
     offenders: list[tuple[str, int, str]] = []
     for crate in sorted(crates):
-        if crate in BINARY_CRATES:
-            continue
         for module in sorted(declared_by_crate.get(crate, set())):
             if (crate, module) in reachable:
                 continue

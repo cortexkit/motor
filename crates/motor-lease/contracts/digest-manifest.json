@@ -5,6 +5,10 @@
       "sha256": "192e0cd05f204f7041e938f861ee71115f0e367c19678803822fba3963d99a7a"
     },
     {
+      "path": "lease-details.txt",
+      "sha256": "919e5b75785dfe9610908c801e319a0ad5754186f247e9bf1486de625e1e423b"
+    },
+    {
       "path": "vectors/interim.json",
       "sha256": "3865ea73160cc1f253e23c5f2d260e49cf9bcb271c10deb5ced3fd4a1b8785ae"
     }
@@ -13,6 +17,7 @@
     "canonical_contract": "docs/runners-contract.md",
     "canonical_repository": "cortexkit-cloud",
     "canonical_vectors": "test-vectors/runners/",
+    "confirmed_details": "lease-details.txt",
     "date": "2026-10-17",
     "kind": "reviewed-interim-pins",
     "replacement_required_before": "hosted client integration",

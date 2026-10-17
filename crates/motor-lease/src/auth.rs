@@ -6,7 +6,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Challenge, Claims, RequesterJwk, CLOCK_SKEW_S, ISSUER};
+use crate::{Challenge, Claims, Purpose, RequesterJwk, CLOCK_SKEW_S, ISSUER, MAX_TOKEN_LIFETIME_S};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthError {
@@ -77,9 +77,12 @@ impl RequesterJwk {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JwksKey {
+    #[serde(default)]
     pub kid: String,
     pub kty: String,
+    #[serde(default)]
     pub crv: String,
+    #[serde(default)]
     pub x: String,
 }
 impl JwksKey {
@@ -99,7 +102,8 @@ pub struct Jwks {
     pub keys: Vec<JwksKey>,
 }
 
-/// A supplied JWKS cache. A failed/empty refresh never destroys the last good set.
+/// A supplied JWKS cache. Refreshes retain usable, unambiguous Ed25519 keys;
+/// unsupported or invalid entries are skipped. An empty result keeps the old set.
 #[derive(Default)]
 pub struct KeySet {
     keys: BTreeMap<String, VerifyingKey>,
@@ -107,23 +111,32 @@ pub struct KeySet {
 impl KeySet {
     pub fn refresh(&mut self, fetched: Result<Jwks, AuthError>) -> Result<(), AuthError> {
         let jwks = fetched?;
-        if jwks.keys.is_empty() {
-            return Err(AuthError::Auth);
-        }
         let mut keys = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
         for key in jwks.keys {
-            if key.kid.is_empty() {
-                return Err(AuthError::Auth);
+            if key.kty != "OKP" || key.crv != "Ed25519" || key.kid.is_empty() {
+                continue;
             }
-            let public = RequesterJwk {
+            let Ok(public) = (RequesterJwk {
                 kty: key.kty,
                 crv: key.crv,
                 x: key.x,
+            })
+            .verifying_key() else {
+                continue;
+            };
+            if keys
+                .insert(key.kid.clone(), public)
+                .is_some_and(|previous| previous != public)
+            {
+                conflicts.insert(key.kid);
             }
-            .verifying_key()?;
-            if keys.insert(key.kid, public).is_some() {
-                return Err(AuthError::Auth);
-            }
+        }
+        for kid in conflicts {
+            keys.remove(&kid);
+        }
+        if keys.is_empty() {
+            return Err(AuthError::Auth);
         }
         self.keys = keys;
         Ok(())
@@ -155,12 +168,14 @@ pub fn sign_token(claims: &Claims, kid: &str, key: &SigningKey) -> Result<String
     ))
 }
 
-/// Verify at connect time. `expected_job` binds a token when a job is already known.
+/// Verify at connect time for the required credential purpose. `expected_job`
+/// additionally binds a token when the caller already knows the job id.
 pub fn verify_token(
     token: &str,
     keys: &KeySet,
     host_id: &str,
     expected_job: Option<&str>,
+    required_purpose: Purpose,
     now_s: u64,
 ) -> Result<Claims, AuthError> {
     let parts: Vec<_> = token.split('.').collect();
@@ -192,9 +207,11 @@ pub fn verify_token(
         || claims.placement.vm.is_empty()
         || claims.jti.is_empty()
         || expected_job.is_some_and(|job| job != claims.jti)
+        || claims.purpose != required_purpose
         || !valid_subject(&claims.sub)
         || claims.iat > now_s.saturating_add(CLOCK_SKEW_S)
         || claims.exp <= claims.iat
+        || claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_S
         || claims.vcpus == 0
         || claims.mem_mib != crate::memory_max_mib(claims.vcpus)
         || claims.max_s == 0
@@ -265,9 +282,18 @@ pub fn sign_challenge(
 /// The host retains this replay set across connections, not one set per socket.
 #[derive(Default)]
 pub struct Nonces {
-    used: BTreeSet<String>,
+    used: BTreeMap<String, u64>,
 }
 impl Nonces {
+    /// Keep twice the accepted clock-skew window so pruning cannot reopen a
+    /// replay while its challenge timestamp could still pass verification.
+    pub fn prune(&mut self, now_s: u64) -> usize {
+        let before = self.used.len();
+        self.used
+            .retain(|_, ts| now_s.saturating_sub(*ts) <= 2 * CLOCK_SKEW_S);
+        before - self.used.len()
+    }
+
     pub fn verify(
         &mut self,
         challenge: &Challenge,
@@ -276,7 +302,8 @@ impl Nonces {
         signature: &str,
         now_s: u64,
     ) -> Result<(), AuthError> {
-        if now_s.abs_diff(challenge.ts) > CLOCK_SKEW_S || self.used.contains(&challenge.nonce) {
+        self.prune(now_s);
+        if now_s.abs_diff(challenge.ts) > CLOCK_SKEW_S || self.used.contains_key(&challenge.nonce) {
             return Err(AuthError::Auth);
         }
         bind_requester(claims, requester)?
@@ -285,7 +312,7 @@ impl Nonces {
                 &Signature::from_bytes(&decode(signature)?),
             )
             .map_err(|_| AuthError::Auth)?;
-        self.used.insert(challenge.nonce.clone());
+        self.used.insert(challenge.nonce.clone(), challenge.ts);
         Ok(())
     }
 }

@@ -4,6 +4,7 @@ pub const ISSUER: &str = "https://runners.cortexkit.io";
 pub const JWKS_URL: &str = "https://runners.cortexkit.io/.well-known/jwks.json";
 pub const WORKER_AUDIENCE: &str = "cortexkit-runners";
 pub const CLOCK_SKEW_S: u64 = 60;
+pub const MAX_TOKEN_LIFETIME_S: u64 = 300;
 
 /// The runner's per-job kill cap, not an admission RAM reservation.
 pub fn memory_max_mib(vcpus: u32) -> u64 {
@@ -61,7 +62,9 @@ pub struct LeaseRequest {
     pub mem_mib: u64,
     pub platform: String,
     pub net: bool,
+    /// Opaque base64url HMAC-SHA256 from the caller's per-machine salt.
     pub workspace_key_hash: String,
+    /// Opaque base64url HMAC-SHA256 from the caller's per-machine salt.
     pub repo_hash: String,
     pub placement_hint: Option<Placement>,
     pub timeout_s: u64,
@@ -71,6 +74,27 @@ pub struct LeaseRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReattachRequest {
     pub requester_jwk: RequesterJwk,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReleaseRequest {}
+
+impl<'de> Deserialize<'de> for ReleaseRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let body = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        if !body.is_empty() {
+            return Err(serde::de::Error::custom(
+                "release body must be an empty object",
+            ));
+        }
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseReply {
+    pub job_id: String,
+    pub release_at_ms: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

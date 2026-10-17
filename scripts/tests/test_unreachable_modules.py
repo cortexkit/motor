@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,16 +18,13 @@ class UnreachableModulesTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="unreachable-modules-") as temporary:
             fixture = Path(temporary)
-            # Synthetic library hops exercise transitive wiring without adding
-            # nonexistent crate aliases to the production motor gate.
-            script = SCRIPT.read_text().replace(
-                'if __name__ == "__main__":',
-                'CRATE_ALIASES.update({"example_bridge": "example-bridge", '
-                '"example_transitive": "example-transitive"})\n'
-                'if __name__ == "__main__":',
-            )
-            self.write(fixture, "scripts/unreachable-modules.py", script)
+            self.write(fixture, "scripts/unreachable-modules.py", SCRIPT.read_text())
             self.write(fixture, "scripts/unreachable-modules.allow", allowlist)
+            packages = {Path(path).parts[1] for path in files if path.startswith("crates/")}
+            for package in packages:
+                manifest = f"crates/{package}/Cargo.toml"
+                if manifest not in files:
+                    self.write(fixture, manifest, f'[package]\nname = "{package}"\nversion = "0.1.0"\nedition = "2021"\n')
             for relative, contents in files.items():
                 self.write(fixture, relative, contents)
             subprocess.run(
@@ -61,6 +59,119 @@ class UnreachableModulesTest(unittest.TestCase):
                 "pub fn run() { motor_protocol::feature::run(); }\n"
             ),
         }
+
+    def test_manifest_automatic_binary_entries_reach_only_imported_library_modules(self) -> None:
+        for entry in ["src/main.rs", "src/bin/control.rs", "src/bin/control/main.rs"]:
+            with self.subTest(entry=entry):
+                files = {
+                    "crates/new-worker/src/lib.rs": "pub mod feature;\npub mod dormant;\n",
+                    "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+                    "crates/new-worker/src/dormant.rs": "pub fn run() {}\n",
+                    f"crates/new-worker/{entry}": "use new_worker::feature;\nfn main() { feature::run(); }\n",
+                }
+                unlinked = self.run_gate(files)
+                self.assertNotEqual(unlinked.returncode, 0, unlinked.stdout + unlinked.stderr)
+                self.assertIn("new-worker/dormant", unlinked.stderr)
+                self.assertNotIn("new-worker/feature", unlinked.stderr)
+                files[f"crates/new-worker/{entry}"] = "use new_worker::{feature, dormant};\nfn main() { feature::run(); dormant::run(); }\n"
+                linked = self.run_gate(files)
+                self.assertEqual(linked.returncode, 0, linked.stdout + linked.stderr)
+
+    def test_src_bin_removing_import_leaves_library_module_unreachable(self) -> None:
+        files = {
+            "crates/new-worker/src/lib.rs": "pub mod feature;\n",
+            "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+            "crates/new-worker/src/bin/control.rs": "fn main() {}\n",
+        }
+        result = self.run_gate(files)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new-worker/feature", result.stderr)
+
+    def test_reachable_submodule_grouped_local_import_reaches_its_sibling(self) -> None:
+        files = {
+            "crates/new-worker/src/lib.rs": "pub mod fetch;\npub mod runtime;\n",
+            "crates/new-worker/src/fetch.rs": "pub struct Policy;\n",
+            "crates/new-worker/src/runtime.rs": "use crate::{fetch::Policy};\npub fn run() { let _ = Policy; }\n",
+            "crates/new-worker/src/main.rs": "fn main() { new_worker::runtime::run(); }\n",
+        }
+        result = self.run_gate(files)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_renamed_grouped_import_does_not_reach_a_module_named_like_its_alias(self) -> None:
+        files = {
+            "crates/new-worker/src/lib.rs": "pub mod feature;\npub mod dormant;\n",
+            "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+            "crates/new-worker/src/dormant.rs": "pub fn run() {}\n",
+            "crates/new-worker/src/bin/control.rs": "use new_worker::{feature as dormant};\nfn main() { dormant::run(); }\n",
+        }
+        result = self.run_gate(files)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new-worker/dormant", result.stderr)
+        self.assertNotIn("new-worker/feature", result.stderr)
+
+    def test_explicit_feature_gated_binary_outside_src_and_package_alias(self) -> None:
+        files = {
+            "crates/worker-directory/Cargo.toml": '[package]\nname = "new-worker"\nversion = "0.1.0"\nedition = "2021"\nautobins = false\n[[bin]]\nname = "control"\npath = "tools/entry.rs"\nrequired-features = ["control"]\n',
+            "crates/worker-directory/src/lib.rs": "pub mod feature;\n",
+            "crates/worker-directory/src/feature.rs": "pub fn run() {}\n",
+            "crates/worker-directory/tools/entry.rs": "mod bridge;\nfn main() { bridge::run(); }\n",
+            "crates/worker-directory/tools/bridge.rs": "pub fn run() { new_worker::feature::run(); }\n",
+            "crates/worker-directory/tests/probe/src/main.rs": "fn main() {}\n",
+        }
+        result = self.run_gate(files)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_explicit_binary_without_path_uses_cargo_conventions(self) -> None:
+        for entry in ["src/bin/control.rs", "src/bin/control/main.rs"]:
+            with self.subTest(entry=entry):
+                files = {
+                    "crates/new-worker/Cargo.toml": '[package]\nname = "new-worker"\nversion = "0.1.0"\nedition = "2021"\nautobins = false\n[[bin]]\nname = "control"\n',
+                    "crates/new-worker/src/lib.rs": "pub mod feature;\n",
+                    "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+                    f"crates/new-worker/{entry}": "fn main() { new_worker::feature::run(); }\n",
+                }
+                result = self.run_gate(files)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_explicit_binary_outside_package_keeps_its_package_identity(self) -> None:
+        result = self.run_gate({
+            "crates/new-worker/Cargo.toml": '[package]\nname = "new-worker"\nversion = "0.1.0"\nedition = "2021"\n[[bin]]\nname = "control"\npath = "../../support/entry.rs"\n',
+            "crates/new-worker/src/lib.rs": "pub mod feature;\n",
+            "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+            "support/entry.rs": "mod bridge;\nfn main() { bridge::run(); }\n",
+            "support/bridge.rs": "pub fn run() { new_worker::feature::run(); }\n",
+        })
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_autobins_false_does_not_seed_automatic_entries(self) -> None:
+        files = {
+            "crates/new-worker/Cargo.toml": '[package]\nname = "new-worker"\nversion = "0.1.0"\nedition = "2021"\nautobins = false\n',
+            "crates/new-worker/src/lib.rs": "pub mod feature;\n",
+            "crates/new-worker/src/feature.rs": "pub fn run() {}\n",
+            "crates/new-worker/src/bin/control.rs": "fn main() { new_worker::feature::run(); }\n",
+        }
+        result = self.run_gate(files)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new-worker/feature", result.stderr)
+
+    def test_missing_explicit_binary_is_not_a_clean_census(self) -> None:
+        result = self.run_gate({
+            "crates/new-worker/Cargo.toml": '[package]\nname = "new-worker"\nversion = "0.1.0"\n[[bin]]\nname = "control"\npath = "tools/missing.rs"\n',
+        })
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("missing or not tracked", result.stderr)
+
+    def test_existing_repository_binaries_are_discovered_from_manifests(self) -> None:
+        inventory = runpy.run_path(str(SCRIPT))["discover_crates"]()
+        existing = {"motor-module", "motor-runner", "motor-vm-helper", "motor-vm-guest", "motor-vm-loader", "prefrontal-build-slot"}
+        self.assertTrue(existing.issubset(inventory))
+        for crate in existing | {"motor-winagent", "motor-lease"}:
+            with self.subTest(crate=crate):
+                self.assertTrue(inventory[crate].binaries, crate)
+                self.assertTrue(all(entry.is_file() for entry in inventory[crate].binaries))
+                self.assertEqual(inventory[crate].alias, crate.replace("-", "_"))
+        self.assertIn((ROOT / "crates/motor-lease/src/bin/fake-broker.rs").resolve(), inventory["motor-lease"].binaries)
+        self.assertIn((ROOT / "scripts/bench-client.rs").resolve(), inventory["motor-module"].binaries)
 
     def test_test_only_wiring_is_rejected(self) -> None:
         test_only = self.run_gate(
@@ -131,7 +242,7 @@ class UnreachableModulesTest(unittest.TestCase):
                 "crates/motor-module/src/lib.rs": (
                     f"pub mod runtime;\n{lib_declaration}\n"
                 ),
-                "crates/motor-module/src/runtime.rs": "pub fn run() {}\n",
+                "crates/motor-module/src/runtime.rs": "pub fn run() { crate::bridge::run(); }\n",
                 "crates/motor-module/src/bridge.rs": (
                     "pub fn run() { motor_protocol::feature::run(); }\n"
                 ),

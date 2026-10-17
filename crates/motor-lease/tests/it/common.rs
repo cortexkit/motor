@@ -121,7 +121,7 @@ pub fn issued(b: &mut FakeBroker, request: &LeaseRequest, now: u64) -> LeaseResp
     assert_eq!(reply.status, 201, "{}", reply.body);
     serde_json::from_value(reply.body).unwrap()
 }
-pub fn verified(b: &FakeBroker, response: &LeaseResponse, now: u64) -> Claims {
+pub fn verified(b: &FakeBroker, response: &LeaseResponse, purpose: Purpose, now: u64) -> Claims {
     let mut keys = KeySet::default();
     keys.refresh(Ok(b.jwks())).unwrap();
     verify_token(
@@ -129,6 +129,7 @@ pub fn verified(b: &FakeBroker, response: &LeaseResponse, now: u64) -> Claims {
         &keys,
         HOST,
         Some(&response.job_id),
+        purpose,
         now / 1000,
     )
     .unwrap()

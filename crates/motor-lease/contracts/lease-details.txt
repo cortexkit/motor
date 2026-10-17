@@ -1,0 +1,37 @@
+- *Lease details (CLOUD, 2026-10-17)*: until a heartbeat reports `admitted` or
+  `started`, a job counts as `reserved`, including before any heartbeat named
+  it, so a lease re-request returns a fresh `run` token on the same
+  reservation. `workspace_key_hash` and `repo_hash` are opaque keyed hashes:
+  base64url (no padding) of HMAC-SHA256(salt, input), where the salt is a random
+  32 bytes ck-motor creates once per machine and keeps locally; inputs are
+  `ck-ws-v1\n<absolute workspace key path>` and `ck-repo-v1\n<absolute repository
+  root path>`. The broker only compares them and checks their shape.
+  `placement_hint` is null or the previous lease's `{host, vm}`, a hint only.
+  `mem_peak_mib` and `egress_bytes` may be null (not measured), never 0 for
+  unknown; settlement uses only `vcpus` and the start and end times. Hosts
+  refetch the JWKS every 10 minutes, and at once (at most once a minute) when a
+  token names an unknown `kid`; they keep the last good set on failure and never
+  accept an empty one. `mem_peak_mib` and `egress_bytes` are null only when an
+  overlapping lease makes them unattributable. `endpoint` is `<host>:<port>`
+  (IPv6 literals in brackets), dialled with TLS and pinned by
+  `endpoint_spki_sha256`, with no name check.
+- *Release*: `POST /v1/leases/{job_id}/release` (machine worker token for the
+  same tenant, body `{}`) after a final pre-admission refusal. Reply 202
+  `{job_id, release_at_ms}`, with `release_at_ms = token_expires_at_ms + 60 s`,
+  because the `run` token stays valid until it expires. At `release_at_ms` the
+  broker settles the job at 0 with reason `released`, only if no heartbeat ever
+  reported it `admitted` or `started`; otherwise the release is cancelled and
+  the job bills normally. Idempotent; 409 `job_admitted` once admitted, 409
+  `job_finished` after settlement; reattach is refused with 409 `job_released`
+  while a release is pending. A refused job holds its reservation for about
+  6 minutes, not its whole timeout.
+
+Confirmed release clarifications supplied during review:
+
+Return 409 job_released while pending. Computing release_at_ms from the latest
+run-token expiry, ignoring attach tokens, is right too.
+
+A release is final for its job_id. After the job settles at 0 with reason
+`released`, a `POST /v1/leases` for the same job_id keeps getting 409 `job_released`
+and never a new reservation, so a new run needs a new job_id. A repeat release
+returns the stored `release_at_ms` unchanged.

@@ -28,6 +28,11 @@ fn every_mirrored_token_vector() {
             &keys(),
             "test-host",
             Some("test-job"),
+            if case["name"] == "valid_attach" {
+                Purpose::Attach
+            } else {
+                Purpose::Run
+            },
             case["now_s"].as_u64().unwrap(),
         );
         let actual = match result {
@@ -45,25 +50,25 @@ fn key_rotation_cache_keeps_last_good_and_removes_retired_keys() {
     let token = fixture["token_cases"][0]["token"].as_str().unwrap();
     let mut cache = KeySet::default();
     assert_eq!(
-        verify_token(token, &cache, "test-host", None, 1700000000),
+        verify_token(token, &cache, "test-host", None, Purpose::Run, 1700000000),
         Err(AuthError::Auth)
     );
     let jwks: Jwks = serde_json::from_value(fixture["jwks"].clone()).unwrap();
     cache.refresh(Ok(jwks.clone())).unwrap();
     cache.refresh(Err(AuthError::Auth)).unwrap_err();
     cache.refresh(Ok(Jwks { keys: vec![] })).unwrap_err();
-    assert!(verify_token(token, &cache, "test-host", None, 1700000000).is_ok());
+    assert!(verify_token(token, &cache, "test-host", None, Purpose::Run, 1700000000).is_ok());
     let mut malformed = jwks.clone();
     malformed.keys[1].x = "bad".into();
-    cache.refresh(Ok(malformed)).unwrap_err();
-    assert!(verify_token(token, &cache, "test-host", None, 1700000000).is_ok());
+    cache.refresh(Ok(malformed)).unwrap();
+    assert!(verify_token(token, &cache, "test-host", None, Purpose::Run, 1700000000).is_ok());
     cache
         .refresh(Ok(Jwks {
             keys: vec![jwks.keys[1].clone()],
         }))
         .unwrap();
     assert_eq!(
-        verify_token(token, &cache, "test-host", None, 1700000000),
+        verify_token(token, &cache, "test-host", None, Purpose::Run, 1700000000),
         Err(AuthError::Auth)
     );
     let next = fixture["token_cases"]
@@ -77,6 +82,7 @@ fn key_rotation_cache_keeps_last_good_and_removes_retired_keys() {
         &cache,
         "test-host",
         None,
+        Purpose::Run,
         1700000000
     )
     .is_ok());
@@ -86,7 +92,7 @@ fn key_rotation_cache_keeps_last_good_and_removes_retired_keys() {
 fn token_shape_signature_integer_and_resource_constraints() {
     let key = SigningKey::from_bytes(&[1; 32]);
     for token in ["", "a.b", "a.b.c.d", "e30.e30.bad", "=.x.y"] {
-        assert!(verify_token(token, &keys(), "test-host", None, 1700000000).is_err());
+        assert!(verify_token(token, &keys(), "test-host", None, Purpose::Run, 1700000000).is_err());
     }
     for mutate in [
         |c: &mut Claims| c.vcpus = 0,
@@ -99,7 +105,7 @@ fn token_shape_signature_integer_and_resource_constraints() {
         mutate(&mut c);
         let token = sign_token(&c, "current", &key).unwrap();
         assert_eq!(
-            verify_token(&token, &keys(), "test-host", None, 1700000000),
+            verify_token(&token, &keys(), "test-host", None, Purpose::Run, 1700000000),
             Err(AuthError::Auth)
         );
     }
@@ -111,8 +117,147 @@ fn token_shape_signature_integer_and_resource_constraints() {
     c.vcpus = 5;
     c.mem_mib = 17920;
     let token = sign_token(&c, "current", &key).unwrap();
-    assert!(verify_token(&token, &keys(), "test-host", None, c.iat).is_ok());
-    assert!(verify_token(&token, &keys(), "other-host", None, c.iat).is_err());
+    assert!(verify_token(&token, &keys(), "test-host", None, Purpose::Run, c.iat).is_ok());
+    assert!(verify_token(&token, &keys(), "other-host", None, Purpose::Run, c.iat).is_err());
+}
+
+#[test]
+fn token_lifetime_is_at_most_five_minutes() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    for lifetime in [299, 300, 301, 86400] {
+        let mut c = claims();
+        c.exp = c.iat + lifetime;
+        let token = sign_token(&c, "current", &key).unwrap();
+        let verified = verify_token(&token, &keys(), "test-host", None, Purpose::Run, c.iat);
+        assert_eq!(verified.is_ok(), lifetime <= 300, "lifetime {lifetime}");
+    }
+}
+
+#[test]
+fn token_purpose_must_match_the_callers_required_credential() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    for purpose in [Purpose::Run, Purpose::Attach] {
+        let mut c = claims();
+        c.purpose = purpose;
+        let token = sign_token(&c, "current", &key).unwrap();
+        for required in [Purpose::Run, Purpose::Attach] {
+            let verified = verify_token(&token, &keys(), "test-host", None, required, c.iat);
+            assert_eq!(verified.is_ok(), purpose == required);
+        }
+    }
+}
+
+#[test]
+fn jwks_skips_unsupported_or_invalid_keys_and_retains_cache_if_no_usable_key_remains() {
+    let mut fixture = vectors();
+    fixture["jwks"]["keys"].as_array_mut().unwrap().extend([
+        json!({"kty":"RSA","kid":"future-rsa","n":"modulus","e":"AQAB"}),
+        json!({"kty":"future-type"}),
+        json!({"kty":"OKP","kid":"other-curve","crv":"X25519","x":"unused"}),
+        json!({"kty":"OKP","kid":"bad-ed25519","crv":"Ed25519","x":"bad"}),
+    ]);
+    let mut cache = KeySet::default();
+    cache
+        .refresh(Ok(serde_json::from_value(fixture["jwks"].clone()).unwrap()))
+        .unwrap();
+    for name in ["valid_run", "announced_next"] {
+        let vector = fixture["token_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        assert!(verify_token(
+            vector["token"].as_str().unwrap(),
+            &cache,
+            "test-host",
+            None,
+            Purpose::Run,
+            1700000000
+        )
+        .is_ok());
+    }
+    for key in [
+        json!({"kty":"RSA","kid":"future-rsa"}),
+        json!({"kty":"OKP","kid":"bad-ed25519","crv":"Ed25519","x":"bad"}),
+    ] {
+        cache
+            .refresh(Ok(serde_json::from_value(json!({"keys":[key]})).unwrap()))
+            .unwrap_err();
+        assert!(verify_token(
+            fixture["token_cases"][0]["token"].as_str().unwrap(),
+            &cache,
+            "test-host",
+            None,
+            Purpose::Run,
+            1700000000
+        )
+        .is_ok());
+    }
+    fixture["jwks"]["keys"].as_array_mut().unwrap().remove(0);
+    cache
+        .refresh(Ok(serde_json::from_value(fixture["jwks"].clone()).unwrap()))
+        .unwrap();
+    assert!(verify_token(
+        fixture["token_cases"][0]["token"].as_str().unwrap(),
+        &cache,
+        "test-host",
+        None,
+        Purpose::Run,
+        1700000000
+    )
+    .is_err());
+    let next = fixture["token_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "announced_next")
+        .unwrap();
+    assert!(verify_token(
+        next["token"].as_str().unwrap(),
+        &cache,
+        "test-host",
+        None,
+        Purpose::Run,
+        1700000000
+    )
+    .is_ok());
+}
+
+#[test]
+fn jwks_conflicting_kids_are_not_trusted_but_do_not_block_other_keys() {
+    let mut jwks: Jwks = serde_json::from_value(vectors()["jwks"].clone()).unwrap();
+    jwks.keys.push(JwksKey::from_key(
+        "current",
+        &SigningKey::from_bytes(&[9; 32]).verifying_key(),
+    ));
+    let mut cache = KeySet::default();
+    cache.refresh(Ok(jwks)).unwrap();
+    let fixture = vectors();
+    assert!(verify_token(
+        fixture["token_cases"][0]["token"].as_str().unwrap(),
+        &cache,
+        "test-host",
+        None,
+        Purpose::Run,
+        1700000000
+    )
+    .is_err());
+    let next = fixture["token_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "announced_next")
+        .unwrap();
+    assert!(verify_token(
+        next["token"].as_str().unwrap(),
+        &cache,
+        "test-host",
+        None,
+        Purpose::Run,
+        1700000000
+    )
+    .is_ok());
 }
 
 #[test]
@@ -141,6 +286,58 @@ fn requester_thumbprint_and_challenge_vectors() {
         nonces.verify(&challenge, &claims(), &requester, &sig, 1700000000),
         Err(AuthError::Auth)
     );
+}
+
+#[test]
+fn nonce_pruning_does_not_reopen_replay_inside_the_skew_window() {
+    let c = claims();
+    let key = SigningKey::from_bytes(&[3; 32]);
+    let jwk = RequesterJwk::from_key(&key.verifying_key());
+    let mut challenge: Challenge = serde_json::from_value(vectors()["challenge"].clone()).unwrap();
+    let sig = sign_challenge(&challenge, &c, &key, c.iat).unwrap();
+    let mut nonces = Nonces::default();
+    nonces.verify(&challenge, &c, &jwk, &sig, c.iat).unwrap();
+    assert_eq!(nonces.prune(c.iat + CLOCK_SKEW_S), 0);
+    assert!(nonces
+        .verify(&challenge, &c, &jwk, &sig, c.iat + CLOCK_SKEW_S)
+        .is_err());
+    challenge.ts += CLOCK_SKEW_S;
+    let fresh_sig = sign_challenge(&challenge, &c, &key, challenge.ts).unwrap();
+    assert!(nonces
+        .verify(&challenge, &c, &jwk, &fresh_sig, challenge.ts)
+        .is_err());
+    assert_eq!(nonces.prune(c.iat + 2 * CLOCK_SKEW_S), 0);
+    assert_eq!(nonces.prune(c.iat + 2 * CLOCK_SKEW_S + 1), 1);
+    assert!(nonces
+        .verify(
+            &challenge,
+            &c,
+            &jwk,
+            &fresh_sig,
+            c.iat + 2 * CLOCK_SKEW_S + 1
+        )
+        .is_err());
+}
+
+#[test]
+fn nonce_verification_automatically_prunes_old_entries() {
+    let c = claims();
+    let key = SigningKey::from_bytes(&[3; 32]);
+    let jwk = RequesterJwk::from_key(&key.verifying_key());
+    let mut challenge: Challenge = serde_json::from_value(vectors()["challenge"].clone()).unwrap();
+    let mut nonces = Nonces::default();
+    let first_sig = sign_challenge(&challenge, &c, &key, c.iat).unwrap();
+    nonces
+        .verify(&challenge, &c, &jwk, &first_sig, c.iat)
+        .unwrap();
+    challenge.nonce = "cd".repeat(32);
+    challenge.ts += 2 * CLOCK_SKEW_S + 1;
+    let second_sig = sign_challenge(&challenge, &c, &key, challenge.ts).unwrap();
+    nonces
+        .verify(&challenge, &c, &jwk, &second_sig, challenge.ts)
+        .unwrap();
+    assert_eq!(nonces.prune(challenge.ts), 0);
+    assert_eq!(nonces.prune(challenge.ts + 2 * CLOCK_SKEW_S + 1), 1);
 }
 
 #[test]

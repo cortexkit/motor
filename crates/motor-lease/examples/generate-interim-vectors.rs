@@ -123,12 +123,16 @@ fn main() {
     std::fs::create_dir_all(root.join("vectors")).unwrap();
     let vector_bytes = format!("{}\n", serde_json::to_string_pretty(&vectors).unwrap());
     std::fs::write(root.join("vectors/interim.json"), vector_bytes).unwrap();
-    let files: Vec<_> = ["interim-pins.txt", "vectors/interim.json"]
-        .iter()
-        .map(|path| json!({"path":path,"sha256":hex(std::fs::read(root.join(path)).unwrap())}))
-        .collect();
+    let files: Vec<_> = [
+        "interim-pins.txt",
+        "lease-details.txt",
+        "vectors/interim.json",
+    ]
+    .iter()
+    .map(|path| json!({"path":path,"sha256":hex(std::fs::read(root.join(path)).unwrap())}))
+    .collect();
     let manifest = json!({
-        "source":{"kind":"reviewed-interim-pins", "date":"2026-10-17", "canonical_repository":"cortexkit-cloud", "canonical_contract":"docs/runners-contract.md", "canonical_vectors":"test-vectors/runners/", "revision":null, "replacement_required_before":"hosted client integration"},
+        "source":{"kind":"reviewed-interim-pins", "date":"2026-10-17", "canonical_repository":"cortexkit-cloud", "canonical_contract":"docs/runners-contract.md", "canonical_vectors":"test-vectors/runners/", "revision":null, "replacement_required_before":"hosted client integration", "confirmed_details":"lease-details.txt"},
         "files":files
     });
     std::fs::write(
@@ -137,6 +141,6 @@ fn main() {
     )
     .unwrap();
     println!(
-        "generated 19 token vectors, requester and host signing vectors; hashed 2 mirror files"
+        "generated 19 token vectors, requester and host signing vectors; hashed 3 mirror files"
     );
 }

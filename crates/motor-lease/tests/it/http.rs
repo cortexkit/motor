@@ -50,7 +50,7 @@ impl Server {
         let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
-                broker.settle_host_lost(now_ms());
+                broker.settle_due(now_ms());
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let _ = super::serve_connection(stream, &mut broker);
@@ -171,6 +171,7 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
         &keys,
         HOST,
         Some("test-job"),
+        Purpose::Run,
         now_ms() / 1000,
     )
     .unwrap();
@@ -189,6 +190,7 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
             &keys,
             HOST,
             Some("test-job"),
+            Purpose::Attach,
             now_ms() / 1000
         )
         .unwrap()
@@ -262,4 +264,74 @@ fn fake_binary_refusal_and_shortening_flags_work_over_http() {
     assert_eq!(status, 201);
     assert_eq!(body["max_s"], 5);
     assert_eq!(body["reserved_vcpu_ms"], 200000);
+}
+
+#[test]
+fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
+    let server = Server::start(&[]);
+    let (status, body) = server.post("/v1/leases", &lease_request());
+    assert_eq!(status, 201);
+    let lease: LeaseResponse = serde_json::from_value(body).unwrap();
+    let first = server.post("/v1/leases/test-job/release", &ReleaseRequest {});
+    assert_eq!(
+        first,
+        (
+            202,
+            json!({"job_id":"test-job", "release_at_ms":lease.token_expires_at_ms + 60000})
+        )
+    );
+    assert_eq!(
+        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        first
+    );
+    assert_eq!(
+        server.post("/v1/leases", &lease_request()),
+        (409, json!({"error":"job_released"}))
+    );
+    assert_eq!(
+        server.post(
+            "/v1/leases/test-job/reattach",
+            &ReattachRequest {
+                requester_jwk: lease_request().requester_jwk
+            }
+        ),
+        (409, json!({"error":"job_released"}))
+    );
+    let (_, jwks) = server.request("GET", "/.well-known/jwks.json", &[], false, None);
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(serde_json::from_value(jwks).unwrap()))
+        .unwrap();
+    verify_token(
+        &lease.job_token,
+        &keys,
+        HOST,
+        Some("test-job"),
+        Purpose::Run,
+        now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(
+        server
+            .host_post("heartbeat", &heartbeat(JobState::Admitted, 0), 1, now_ms())
+            .0,
+        200
+    );
+    assert_eq!(
+        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        (409, json!({"error":"job_admitted"}))
+    );
+    let mut u = usage();
+    u.started_at_ms = now_ms() - 3000;
+    u.ended_at_ms = u.started_at_ms + 3000;
+    assert_eq!(
+        server.host_post("usage", &u, 2, now_ms()),
+        (
+            200,
+            json!({"job_id":"test-job", "settled_vcpu_ms":6000, "released_vcpu_ms":14000})
+        )
+    );
+    assert_eq!(
+        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        (409, json!({"error":"job_finished"}))
+    );
 }

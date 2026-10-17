@@ -59,12 +59,14 @@ struct Reservation {
     run_iat: u64,
     state: JobState,
     elapsed_ms: u64,
+    release: Option<ReleaseReply>,
     settlement: Option<Settlement>,
 }
 
 enum Settlement {
     Usage { body: Vec<u8>, reply: UsageReply },
     HostLost(UsageReply),
+    Released(UsageReply),
 }
 
 pub struct FakeBroker {
@@ -103,7 +105,7 @@ impl FakeBroker {
 
     /// `now_ms` is supplied by the transport or a deterministic test clock.
     pub fn handle(&mut self, request: BrokerRequest<'_>, now_ms: u64) -> BrokerReply {
-        self.settle_host_lost(now_ms);
+        self.settle_due(now_ms);
         if request.method == "GET" && request.path == "/.well-known/jwks.json" {
             return BrokerReply::json(200, self.jwks());
         }
@@ -117,6 +119,16 @@ impl FakeBroker {
             if request.path == "/v1/leases" {
                 return match serde_json::from_slice(request.body) {
                     Ok(body) => self.lease(body, now_ms / 1000),
+                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                };
+            }
+            if let Some(job_id) = request
+                .path
+                .strip_prefix("/v1/leases/")
+                .and_then(|p| p.strip_suffix("/release"))
+            {
+                return match serde_json::from_slice::<ReleaseRequest>(request.body) {
+                    Ok(_) => self.release(job_id),
                     Err(_) => BrokerReply::error(400, "invalid_request"),
                 };
             }
@@ -170,15 +182,23 @@ impl FakeBroker {
         if request.requester_jwk.verifying_key().is_err()
             || request.job_id.is_empty()
             || request.job_id.contains('/')
+            || !valid_keyed_hash(&request.workspace_key_hash)
+            || !valid_keyed_hash(&request.repo_hash)
         {
             return BrokerReply::error(400, "invalid_request");
         }
         if let Some(job) = self.jobs.get(&request.job_id) {
+            if matches!(job.settlement, Some(Settlement::Released(_))) {
+                return BrokerReply::error(409, "job_released");
+            }
             if job.settlement.is_some() {
                 return BrokerReply::error(409, "job_finished");
             }
             if job.state != JobState::Reserved {
                 return BrokerReply::error(409, "job_admitted");
+            }
+            if job.release.is_some() {
+                return BrokerReply::error(409, "job_released");
             }
             let mut comparable = request.clone();
             comparable.requester_jwk = job.request.requester_jwk.clone();
@@ -214,6 +234,7 @@ impl FakeBroker {
                     run_iat: now_s,
                     state: JobState::Reserved,
                     elapsed_ms: 0,
+                    release: None,
                     settlement: None,
                 },
             );
@@ -234,10 +255,43 @@ impl FakeBroker {
         if job.settlement.is_some() {
             return BrokerReply::error(409, "job_finished");
         }
+        if job.release.is_some() {
+            return BrokerReply::error(409, "job_released");
+        }
         if request.requester_jwk.verifying_key().is_err() {
             return BrokerReply::error(400, "invalid_request");
         }
         self.issue(job_id, &request.requester_jwk, Purpose::Attach, now_s, 200)
+    }
+
+    fn release(&mut self, job_id: &str) -> BrokerReply {
+        let Some(job) = self.jobs.get_mut(job_id) else {
+            return BrokerReply::error(404, "job_unknown");
+        };
+        if matches!(job.settlement, Some(Settlement::Released(_))) {
+            return BrokerReply::json(
+                202,
+                job.release
+                    .as_ref()
+                    .expect("released job retains release reply"),
+            );
+        }
+        if job.settlement.is_some() {
+            return BrokerReply::error(409, "job_finished");
+        }
+        if job.state != JobState::Reserved {
+            return BrokerReply::error(409, "job_admitted");
+        }
+        // Only run-token expiry matters: attach tokens cannot admit execution.
+        let reply = job.release.get_or_insert_with(|| ReleaseReply {
+            job_id: job_id.into(),
+            release_at_ms: job
+                .run_iat
+                .saturating_add(MAX_TOKEN_LIFETIME_S)
+                .saturating_mul(1000)
+                .saturating_add(CLOCK_SKEW_S * 1000),
+        });
+        BrokerReply::json(202, reply)
     }
 
     fn issue(
@@ -251,7 +305,7 @@ impl FakeBroker {
         let job = self.jobs.get_mut(job_id).expect("reservation exists");
         let iat = now_s.max(job.last_token_iat.saturating_add(1));
         let Some(exp) = iat
-            .checked_add(300)
+            .checked_add(MAX_TOKEN_LIFETIME_S)
             .filter(|exp| exp.checked_mul(1000).is_some())
         else {
             return BrokerReply::error(400, "invalid_request");
@@ -311,6 +365,9 @@ impl FakeBroker {
                     if job.state == JobState::Reserved || running.state == JobState::Started {
                         job.state = running.state;
                     }
+                    if running.state != JobState::Reserved {
+                        job.release = None;
+                    }
                     job.elapsed_ms = running.elapsed_ms;
                 }
                 _ => ignored.push(running.job_id),
@@ -328,7 +385,9 @@ impl FakeBroker {
             return BrokerReply::error(404, "job_unknown");
         };
         match &job.settlement {
-            Some(Settlement::HostLost(_)) => return BrokerReply::error(409, "job_settled"),
+            Some(Settlement::HostLost(_) | Settlement::Released(_)) => {
+                return BrokerReply::error(409, "job_settled")
+            }
             Some(Settlement::Usage {
                 body: original,
                 reply,
@@ -359,14 +418,29 @@ impl FakeBroker {
         BrokerReply::json(200, reply)
     }
 
-    pub fn settle_host_lost(&mut self, now_ms: u64) {
+    pub fn settle_due(&mut self, now_ms: u64) {
         for (job_id, job) in &mut self.jobs {
+            if job.settlement.is_some() {
+                continue;
+            }
+            if job
+                .release
+                .as_ref()
+                .is_some_and(|release| now_ms >= release.release_at_ms)
+            {
+                job.settlement = Some(Settlement::Released(UsageReply {
+                    job_id: job_id.clone(),
+                    settled_vcpu_ms: 0,
+                    released_vcpu_ms: job.reserved,
+                }));
+                continue;
+            }
             let deadline_ms = job
                 .run_iat
                 .saturating_add(job.max_s)
                 .saturating_add(600)
                 .saturating_mul(1000);
-            if job.settlement.is_none() && now_ms >= deadline_ms {
+            if now_ms >= deadline_ms {
                 let settled = u64::from(job.request.vcpus)
                     .saturating_mul(job.elapsed_ms)
                     .min(job.reserved);
@@ -384,6 +458,14 @@ impl FakeBroker {
         match self.jobs.get(job_id)?.settlement.as_ref()? {
             Settlement::Usage { reply, .. } => Some((reply, "usage")),
             Settlement::HostLost(reply) => Some((reply, "host_lost")),
+            Settlement::Released(reply) => Some((reply, "released")),
         }
     }
+}
+
+fn valid_keyed_hash(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
