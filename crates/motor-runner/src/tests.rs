@@ -3932,6 +3932,9 @@ async fn live_isolated_runner_wire_smoke() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "tests/isolated_shm.rs"]
+mod isolated_shm;
+#[cfg(target_os = "linux")]
 #[path = "tests/isolated_targets.rs"]
 mod isolated_targets;
 fn job_output(runner: &Runner, id: Uuid) -> String {

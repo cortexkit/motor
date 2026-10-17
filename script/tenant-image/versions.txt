@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "debian_suite": "trixie",
+  "debian_snapshot": "20261016T000000Z",
+  "rootfs_gib": 32,
+  "kernel": "6.1.128",
+  "kernel_gcc": "13.4.0",
+  "kernel_sha256": "874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3",
+  "rustup": "1.28.2",
+  "packages": [
+    "systemd-sysv", "dbus", "python3", "sudo", "acl", "xfsprogs",
+    "iproute2", "iputils-ping", "nftables", "util-linux", "procps",
+    "build-essential", "clang", "lld", "pkg-config", "libssl-dev",
+    "sqlite3", "libsqlite3-dev", "git", "rsync", "curl", "jq",
+    "ca-certificates", "unzip", "xz-utils", "unattended-upgrades", "ufw",
+    "binaryen", "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
+    "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch"
+  ],
+  "runner_inputs_sha256": {
+    "script/runner/tools.txt": "6e36f896c685e3c002b7efb16e500229fcfcf28839405f042c6621f189731583",
+    "script/runner/install-tools.sh": "4e7cc41499433a0a90ce448a558d05a8dab1c9d51a96f809dbdb87c230933a37",
+    "script/runner/build-sccache.sh": "35e89b323cd3914279fa772052ed6992fb271231c5cece7a6fe683fa38229541",
+    "script/runner/motor-net.nft": "5f5c17a38e49eb6f6fbdb3c66362a14940cff99976b453e259e0d6d903b3efd7",
+    "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870"
+  },
+  "captured_at": "2026-10-17T08:17:09+00:00",
+  "rust_default": "1.99.0",
+  "rust_toolchains": {
+    "1.91.0": ["x86_64-unknown-linux-gnu"],
+    "1.96.0": ["x86_64-unknown-linux-gnu"],
+    "1.99.0": [
+      "aarch64-pc-windows-msvc",
+      "wasm32-unknown-unknown",
+      "wasm32-wasip1",
+      "x86_64-pc-windows-gnu",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl"
+    ]
+  },
+  "node": "24.21.0",
+  "npm": "11.19.0",
+  "bun": "1.4.2",
+  "pnpm": "11.1.2"
+}

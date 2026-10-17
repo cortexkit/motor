@@ -68,12 +68,18 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
                 .unwrap(),
             cpus
         );
-        let expected = if cpus.len() == 5 {
-            "--property=MemoryMax=18790481920"
+        let memory_max = if cpus.len() == 5 {
+            18_790_481_920_u64
         } else {
-            "--property=MemoryMax=17179869184"
+            17_179_869_184_u64
         };
-        assert!(args.contains(&expected));
+        assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+        assert!(args.contains(
+            &format!(
+                "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+            )
+            .as_str()
+        ));
         assert!(!args.iter().any(|arg| arg.contains("CPUAccounting=")));
         assert!(!args.contains(&"--pipe"));
         assert!(!args.contains(&"--quiet"));
@@ -132,6 +138,30 @@ fn hosted_job_cannot_open_vsock() {
         "python3 -c 'import socket,errno;\ntry: socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM)\nexcept OSError as e: assert e.errno in (errno.EPERM,errno.EAFNOSUPPORT); print(\"blocked\")\nelse: raise AssertionError(\"AF_VSOCK admitted\")'", &f.workspace);
     assert!(status.success(), "{stderr}");
     assert_eq!(stdout.trim(), "blocked");
+}
+
+#[test]
+fn systemd_job_command_bounds_shm_without_cpu_placement() {
+    let f = Fixture::new();
+    let sandbox = f.command_sandbox();
+    let command = sandbox
+        .command("nproc", &f.workspace, &[], true, &[], 1)
+        .unwrap();
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    let memory_max = 17_179_869_184_u64;
+    assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+    assert!(args.contains(
+        &format!(
+            "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+        )
+        .as_str()
+    ));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("--property=AllowedCPUs=")));
 }
 
 #[test]

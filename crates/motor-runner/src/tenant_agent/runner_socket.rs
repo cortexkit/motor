@@ -100,17 +100,33 @@ pub(super) fn wait(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
     use std::{fs, os::unix::net::UnixListener};
+
+    /// A socket node no process listens on, like one left by a previous boot.
+    /// Binding and dropping a listener isn't reliable in a multithreaded test
+    /// process: a child another test is forking holds a copy of the listening
+    /// fd until it execs, so connects can still succeed after the drop.
+    pub(in crate::tenant_agent) fn leftover_socket_node(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mode = libc::S_IFSOCK | 0o600;
+        assert_eq!(
+            unsafe { libc::mknod(c.as_ptr(), mode as libc::mode_t, 0) },
+            0,
+            "mknod {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        );
+    }
 
     #[test]
     fn leftover_socket_is_not_ready_until_current_main_pid_listens() {
         let root = ScratchDir::new("motor-tenant-socket-ready");
         let path = root.join("runner.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        drop(listener);
+        leftover_socket_node(&path);
         let pid = std::process::id();
         assert!(!ready(&path, &mut || Ok(Some(pid))).unwrap());
         fs::remove_file(&path).unwrap();

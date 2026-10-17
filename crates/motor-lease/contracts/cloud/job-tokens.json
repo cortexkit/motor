@@ -1,0 +1,70 @@
+{
+  "key_id": "runner_2026_10",
+  "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "clock_ms": 1792195200123,
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "kid": "runner_2026_10",
+        "alg": "EdDSA",
+        "use": "sig"
+      }
+    ]
+  },
+  "requester_jkt": "p2ZtcmFExdJWiVZOjwClSusjyts5z4UC_Rgtdn249Mg",
+  "tokens": {
+    "run": {
+      "input": {
+        "tenant_id": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "mem_mib": 4096,
+        "platform": "linux-x64",
+        "net": true,
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "max_s": 12,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrJJC7iSmA0Q"
+        },
+        "purpose": "run"
+      },
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"runner_2026_10\",\"typ\":\"ck-job+jwt\"}",
+      "claims": "{\"iss\":\"https://runners.cortexkit.io\",\"aud\":\"host-a\",\"sub\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"jti\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"iat\":1792195200,\"exp\":1792195500,\"vcpus\":2,\"mem_mib\":4096,\"platform\":\"linux-x64\",\"net\":true,\"placement\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"max_s\":12,\"cnf\":{\"jkt\":\"p2ZtcmFExdJWiVZOjwClSusjyts5z4UC_Rgtdn249Mg\"},\"purpose\":\"run\"}",
+      "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEyLCJjbmYiOnsiamt0IjoicDJadGNtRkV4ZEpXaVZaT2p3Q2xTdXNqeXRzNXo0VUNfUmd0ZG4yNDlNZyJ9LCJwdXJwb3NlIjoicnVuIn0.IgObjoVnCCoZ5ZZh_s2CIL98TTLV-q7k1gBtB8nVayj3GqrF62JrEcnHG_yZhKS5kY1ZrA0X8X0WTGkZZn-iBg",
+      "token_expires_at_ms": 1792195500000
+    },
+    "attach": {
+      "input": {
+        "tenant_id": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "mem_mib": 4096,
+        "platform": "linux-x64",
+        "net": true,
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "max_s": 12,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrJJC7iSmA0Q"
+        },
+        "purpose": "attach"
+      },
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"runner_2026_10\",\"typ\":\"ck-job+jwt\"}",
+      "claims": "{\"iss\":\"https://runners.cortexkit.io\",\"aud\":\"host-a\",\"sub\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"jti\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"iat\":1792195200,\"exp\":1792195500,\"vcpus\":2,\"mem_mib\":4096,\"platform\":\"linux-x64\",\"net\":true,\"placement\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"max_s\":12,\"cnf\":{\"jkt\":\"p2ZtcmFExdJWiVZOjwClSusjyts5z4UC_Rgtdn249Mg\"},\"purpose\":\"attach\"}",
+      "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEyLCJjbmYiOnsiamt0IjoicDJadGNtRkV4ZEpXaVZaT2p3Q2xTdXNqeXRzNXo0VUNfUmd0ZG4yNDlNZyJ9LCJwdXJwb3NlIjoiYXR0YWNoIn0.W6AxUugt4Q3Vq9T_r093XZPEeKPfsK98YDA_lE8eQ9Z-DrqyXqAn4V7kZFK2fOlbmGMOgr4x6yDYg305bQ0OBQ",
+      "token_expires_at_ms": 1792195500000
+    }
+  }
+}

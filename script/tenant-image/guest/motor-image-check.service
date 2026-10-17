@@ -1,0 +1,10 @@
+[Unit]
+Description=Operator-only tenant image boot inventory
+After=motor-tenant-agent.service
+Requires=motor-tenant-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/hosted_image_check.py
+StandardOutput=journal+console
+StandardError=journal+console

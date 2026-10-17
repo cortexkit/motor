@@ -2,6 +2,8 @@ pub mod cgroup;
 pub mod fs;
 pub mod process;
 pub mod server;
+pub mod tenant;
+mod tenant_network;
 
 use crate::{
     config::{Config, SnapshotRecord},
@@ -37,6 +39,7 @@ pub struct LinuxMachine {
     base_path: PathBuf,
     cgroups: cgroup::Cgroups,
     running: BTreeMap<usize, Running>,
+    tenants: crate::tenant::Controller<tenant::LinuxTenants>,
 }
 impl LinuxMachine {
     pub fn new(config: Config) -> Result<Self> {
@@ -73,12 +76,15 @@ impl LinuxMachine {
         }
         fs::trusted(&std::fs::symlink_metadata(&jail)?)?;
         let cgroups = cgroup::Cgroups::discover()?;
+        let tenants =
+            crate::tenant::Controller(tenant::LinuxTenants::new(&config, cgroups.root.clone()));
         Ok(Self {
             config,
             base,
             base_path: PathBuf::from(BUILD_ROOT),
             cgroups,
             running: BTreeMap::new(),
+            tenants,
         })
     }
     fn boundary(&self, slot: usize) -> PathBuf {
@@ -368,7 +374,8 @@ impl Machine for LinuxMachine {
                 }
             }
         }
-        self.cgroups.enable()
+        self.cgroups.enable()?;
+        self.tenants.0.reconcile()
     }
     fn start(&mut self, slot: usize, lease: &Lease, kind: Kind) -> Result<Vec<OwnedFd>> {
         let base = self.base.try_clone()?;
@@ -450,6 +457,9 @@ impl Machine for LinuxMachine {
         self.running.get_mut(&slot).is_some_and(|r| {
             matches!(r.loader.try_wait(), Ok(None)) && matches!(r.jailer.try_wait(), Ok(None))
         })
+    }
+    fn tenant(&mut self, tenant: &str, op: crate::tenant::Operation) -> Result<crate::Response> {
+        self.tenants.handle(tenant, op)
     }
 }
 fn inputs(kind: Kind) -> &'static [(&'static str, &'static str)] {

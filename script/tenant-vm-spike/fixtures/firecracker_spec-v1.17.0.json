@@ -1,0 +1,2384 @@
+{
+  "basePath": "/",
+  "consumes": [
+    "application/json"
+  ],
+  "definitions": {
+    "ArmRegisterModifier": {
+      "description": "Modifier for an ARM register (aarch64)",
+      "properties": {
+        "addr": {
+          "description": "64-bit register address as hex, binary, or decimal string (e.g., \"0x0\", \"0b0\", \"0\")",
+          "type": "string"
+        },
+        "bitmap": {
+          "description": "128-bit bitmap string defining which bits to modify. Format is \"0b\" followed by up to 128 characters where '0' = clear bit, '1' = set bit, 'x' = don't modify. Underscores can be used for readability. Example \"0b0000000000000000000000000000000000000000000000000000000000000001\"",
+          "type": "string"
+        }
+      },
+      "required": [
+        "addr",
+        "bitmap"
+      ],
+      "type": "object"
+    },
+    "Balloon": {
+      "description": "Balloon device descriptor.",
+      "properties": {
+        "amount_mib": {
+          "description": "Target balloon size in MiB.",
+          "type": "integer"
+        },
+        "deflate_on_oom": {
+          "description": "Whether the balloon should deflate when the guest has memory pressure.",
+          "type": "boolean"
+        },
+        "free_page_hinting": {
+          "description": "Whether the free page hinting feature is enabled.",
+          "type": "boolean"
+        },
+        "free_page_reporting": {
+          "description": "Whether the free page reporting feature is enabled.",
+          "type": "boolean"
+        },
+        "stats_polling_interval_s": {
+          "description": "Interval in seconds between refreshing statistics. A non-zero value will enable the statistics. Defaults to 0.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "amount_mib",
+        "deflate_on_oom"
+      ],
+      "type": "object"
+    },
+    "BalloonHintingStatus": {
+      "description": "Describes the free page hinting status.",
+      "properties": {
+        "guest_cmd": {
+          "description": "The last command provided by the guest.",
+          "type": "integer"
+        },
+        "host_cmd": {
+          "description": "The last command issued by the host.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host_cmd"
+      ],
+      "type": "object"
+    },
+    "BalloonStartCmd": {
+      "description": "Command used to start a free page hinting run.",
+      "properties": {
+        "acknowledge_on_stop": {
+          "description": "If Firecracker should automatically acknowledge when the guest submits a done cmd.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BalloonStats": {
+      "description": "Describes the balloon device statistics.",
+      "properties": {
+        "actual_mib": {
+          "description": "Actual amount of memory (in MiB) the device is holding.",
+          "type": "integer"
+        },
+        "actual_pages": {
+          "description": "Actual number of pages the device is holding.",
+          "type": "integer"
+        },
+        "alloc_stall": {
+          "description": "Counter of Allocation enter a slow path to gain more memory page. The reclaim/scan metrics can reveal what is actually happening.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "async_reclaim": {
+          "description": "Amount of memory reclaimed asynchronously.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "async_scan": {
+          "description": "Amount of memory scanned asynchronously.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "available_memory": {
+          "description": "An estimate of how much memory is available (in bytes) for starting new applications, without pushing the system to swap.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "direct_reclaim": {
+          "description": "Amount of memory reclaimed directly.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "direct_scan": {
+          "description": "Amount of memory scanned directly.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "disk_caches": {
+          "description": "The amount of memory, in bytes, that can be quickly reclaimed without additional I/O. Typically these pages are used for caching files from disk.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "free_memory": {
+          "description": "The amount of memory not being used for any purpose (in bytes).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "hugetlb_allocations": {
+          "description": "The number of successful hugetlb page allocations in the guest.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "hugetlb_failures": {
+          "description": "The number of failed hugetlb page allocations in the guest.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "major_faults": {
+          "description": "The number of major page faults that have occurred.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "minor_faults": {
+          "description": "The number of minor page faults that have occurred.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "oom_kill": {
+          "description": "OOM killer invocations, indicating critical memory pressure.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "swap_in": {
+          "description": "The amount of memory that has been swapped in (in bytes).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "swap_out": {
+          "description": "The amount of memory that has been swapped out to disk (in bytes).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "target_mib": {
+          "description": "Target amount of memory (in MiB) the device aims to hold.",
+          "type": "integer"
+        },
+        "target_pages": {
+          "description": "Target number of pages the device aims to hold.",
+          "type": "integer"
+        },
+        "total_memory": {
+          "description": "The total amount of memory available (in bytes).",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target_pages",
+        "actual_pages",
+        "target_mib",
+        "actual_mib"
+      ],
+      "type": "object"
+    },
+    "BalloonStatsUpdate": {
+      "description": "Update the statistics polling interval, with the first statistics update scheduled immediately. Statistics cannot be turned on/off after boot.",
+      "properties": {
+        "stats_polling_interval_s": {
+          "description": "Interval in seconds between refreshing statistics.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "stats_polling_interval_s"
+      ],
+      "type": "object"
+    },
+    "BalloonUpdate": {
+      "description": "Balloon device descriptor.",
+      "properties": {
+        "amount_mib": {
+          "description": "Target balloon size in MiB.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "amount_mib"
+      ],
+      "type": "object"
+    },
+    "BlockTopology": {
+      "description": "Block device topology exposed to the guest via VIRTIO_BLK_F_TOPOLOGY. When value is present, it is used instead of Firecracker defaults. All I/O size fields are expressed in units of logical blocks. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+      "properties": {
+        "alignment_offset": {
+          "description": "Offset of the first aligned logical block.",
+          "type": "integer"
+        },
+        "min_io_size": {
+          "description": "Suggested minimum I/O size, in units of logical blocks.",
+          "type": "integer"
+        },
+        "opt_io_size": {
+          "description": "Suggested optimal (maximum) I/O size, in units of logical blocks.",
+          "type": "integer"
+        },
+        "physical_block_exp": {
+          "description": "log2 of the number of logical blocks per physical block.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "BootSource": {
+      "description": "Boot source descriptor.",
+      "properties": {
+        "boot_args": {
+          "description": "Kernel boot arguments",
+          "type": "string"
+        },
+        "initrd_path": {
+          "description": "Host level path to the initrd image used to boot the guest",
+          "type": "string"
+        },
+        "kernel_image_path": {
+          "description": "Host level path to the kernel image used to boot the guest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kernel_image_path"
+      ],
+      "type": "object"
+    },
+    "CpuConfig": {
+      "description": "The CPU configuration template defines a set of bit maps as modifiers of flags accessed by register to be disabled/enabled for the microvm.",
+      "properties": {
+        "cpuid_modifiers": {
+          "description": "A collection of CPUID leaf modifiers (x86_64 only)",
+          "items": {
+            "$ref": "#/definitions/CpuidLeafModifier"
+          },
+          "type": "array"
+        },
+        "kvm_capabilities": {
+          "description": "A collection of KVM capabilities to be added or removed (both x86_64 and aarch64)",
+          "items": {
+            "description": "KVM capability as a numeric string. Prefix with '!' to remove capability. Example \"121\" (add) or \"!121\" (remove)",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "msr_modifiers": {
+          "description": "A collection of model specific register modifiers (x86_64 only)",
+          "items": {
+            "$ref": "#/definitions/MsrModifier"
+          },
+          "type": "array"
+        },
+        "reg_modifiers": {
+          "description": "A collection of register modifiers (aarch64 only)",
+          "items": {
+            "$ref": "#/definitions/ArmRegisterModifier"
+          },
+          "type": "array"
+        },
+        "vcpu_features": {
+          "description": "A collection of vCPU features to be modified (aarch64 only)",
+          "items": {
+            "$ref": "#/definitions/VcpuFeatures"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "CpuTemplate": {
+      "default": "None",
+      "description": "The CPU Template defines a set of flags to be disabled from the microvm so that the features exposed to the guest are the same as in the selected instance type. This parameter has been deprecated and it will be removed in future Firecracker release.",
+      "enum": [
+        "C3",
+        "T2",
+        "T2S",
+        "T2CL",
+        "T2A",
+        "V1N1",
+        "None"
+      ],
+      "type": "string"
+    },
+    "CpuidLeafModifier": {
+      "description": "Modifier for a CPUID leaf and subleaf (x86_64)",
+      "properties": {
+        "flags": {
+          "description": "KVM feature flags for this leaf-subleaf",
+          "format": "int32",
+          "type": "integer"
+        },
+        "leaf": {
+          "description": "CPUID leaf index as hex, binary, or decimal string (e.g., \"0x0\", \"0b0\", \"0\"))",
+          "type": "string"
+        },
+        "modifiers": {
+          "description": "Register modifiers for this CPUID leaf",
+          "items": {
+            "$ref": "#/definitions/CpuidRegisterModifier"
+          },
+          "type": "array"
+        },
+        "subleaf": {
+          "description": "CPUID subleaf index as hex, binary, or decimal string (e.g., \"0x0\", \"0b0\", \"0\")",
+          "type": "string"
+        }
+      },
+      "required": [
+        "leaf",
+        "subleaf",
+        "flags",
+        "modifiers"
+      ],
+      "type": "object"
+    },
+    "CpuidRegisterModifier": {
+      "description": "Modifier for a specific CPUID register within a leaf (x86_64)",
+      "properties": {
+        "bitmap": {
+          "description": "32-bit bitmap string defining which bits to modify. Format is \"0b\" followed by 32 characters where '0' = clear bit, '1' = set bit, 'x' = don't modify. Example \"0b00000000000000000000000000000001\" or \"0bxxxxxxxxxxxxxxxxxxxxxxxxxxxx0001\"",
+          "type": "string"
+        },
+        "register": {
+          "description": "Target CPUID register name",
+          "enum": [
+            "eax",
+            "ebx",
+            "ecx",
+            "edx"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "register",
+        "bitmap"
+      ],
+      "type": "object"
+    },
+    "Drive": {
+      "properties": {
+        "blk_size": {
+          "default": 512,
+          "description": "Logical block size advertised to the guest via VIRTIO_BLK_F_BLK_SIZE. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "type": "integer"
+        },
+        "cache_type": {
+          "default": "Unsafe",
+          "description": "Represents the caching strategy for the block device.",
+          "enum": [
+            "Unsafe",
+            "Writeback"
+          ],
+          "type": "string"
+        },
+        "discard": {
+          "default": false,
+          "description": "Enables virtio-blk discard support. When enabled, the guest can issue discard/TRIM requests for this drive. Only supported for writable virtio-block devices using the Sync IO engine. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "type": "boolean"
+        },
+        "drive_id": {
+          "type": "string"
+        },
+        "io_engine": {
+          "default": "Sync",
+          "description": "Type of the IO engine used by the device. \"Async\" is supported on host kernels newer than 5.10.51. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "enum": [
+            "Sync",
+            "Async"
+          ],
+          "type": "string"
+        },
+        "is_read_only": {
+          "description": "Is block read only. This field is required for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "type": "boolean"
+        },
+        "is_root_device": {
+          "type": "boolean"
+        },
+        "partuuid": {
+          "description": "Represents the unique id of the boot partition of this device. It is optional and it will be taken into account only if the is_root_device field is true.",
+          "type": "string"
+        },
+        "path_on_host": {
+          "description": "Host level path for the guest drive. This field is required for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "type": "string"
+        },
+        "rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        },
+        "socket": {
+          "description": "Path to the socket of vhost-user-block backend. This field is required for vhost-user-block config should be omitted for virtio-block configuration.",
+          "type": "string"
+        },
+        "topology": {
+          "$ref": "#/definitions/BlockTopology"
+        }
+      },
+      "required": [
+        "drive_id",
+        "is_root_device"
+      ],
+      "type": "object"
+    },
+    "EntropyDevice": {
+      "description": "Defines an entropy device.",
+      "properties": {
+        "rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        }
+      },
+      "type": "object"
+    },
+    "Error": {
+      "properties": {
+        "fault_message": {
+          "description": "A description of the error condition",
+          "readOnly": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "FirecrackerVersion": {
+      "description": "Describes the Firecracker version.",
+      "properties": {
+        "firecracker_version": {
+          "description": "Firecracker build version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "firecracker_version"
+      ],
+      "type": "object"
+    },
+    "FullVmConfiguration": {
+      "properties": {
+        "balloon": {
+          "$ref": "#/definitions/Balloon"
+        },
+        "boot-source": {
+          "$ref": "#/definitions/BootSource"
+        },
+        "cpu-config": {
+          "$ref": "#/definitions/CpuConfig"
+        },
+        "drives": {
+          "description": "Configurations for all block devices.",
+          "items": {
+            "$ref": "#/definitions/Drive"
+          },
+          "type": "array"
+        },
+        "entropy": {
+          "$ref": "#/definitions/EntropyDevice"
+        },
+        "logger": {
+          "$ref": "#/definitions/Logger"
+        },
+        "machine-config": {
+          "$ref": "#/definitions/MachineConfiguration"
+        },
+        "memory-hotplug": {
+          "$ref": "#/definitions/MemoryHotplugConfig"
+        },
+        "metrics": {
+          "$ref": "#/definitions/Metrics"
+        },
+        "mmds-config": {
+          "$ref": "#/definitions/MmdsConfig"
+        },
+        "network-interfaces": {
+          "description": "Configurations for all net devices.",
+          "items": {
+            "$ref": "#/definitions/NetworkInterface"
+          },
+          "type": "array"
+        },
+        "pmem": {
+          "description": "Configurations for all pmem devices.",
+          "items": {
+            "$ref": "#/definitions/Pmem"
+          },
+          "type": "array"
+        },
+        "vsock": {
+          "$ref": "#/definitions/Vsock"
+        }
+      },
+      "type": "object"
+    },
+    "InstanceActionInfo": {
+      "description": "Variant wrapper containing the real action.",
+      "properties": {
+        "action_type": {
+          "description": "Enumeration indicating what type of action is contained in the payload",
+          "enum": [
+            "FlushMetrics",
+            "InstanceStart",
+            "SendCtrlAltDel"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_type"
+      ],
+      "type": "object"
+    },
+    "InstanceInfo": {
+      "description": "Describes MicroVM instance information.",
+      "properties": {
+        "app_name": {
+          "description": "Application name.",
+          "type": "string"
+        },
+        "id": {
+          "description": "MicroVM / instance ID.",
+          "type": "string"
+        },
+        "state": {
+          "description": "The current detailed state (Not started, Running, Paused) of the Firecracker instance. This value is read-only for the control-plane.",
+          "enum": [
+            "Not started",
+            "Running",
+            "Paused"
+          ],
+          "type": "string"
+        },
+        "vmm_version": {
+          "description": "MicroVM hypervisor build version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "app_name",
+        "id",
+        "state",
+        "vmm_version"
+      ],
+      "type": "object"
+    },
+    "Logger": {
+      "description": "Describes the configuration option for the logging capability.",
+      "properties": {
+        "level": {
+          "default": "Info",
+          "description": "Set the level. The possible values are case-insensitive.",
+          "enum": [
+            "Error",
+            "Warning",
+            "Info",
+            "Debug",
+            "Trace",
+            false
+          ],
+          "type": "string"
+        },
+        "log_path": {
+          "description": "Path to the named pipe or file for the human readable log output.",
+          "type": "string"
+        },
+        "module": {
+          "description": "The module path to filter log messages by.",
+          "example": "api_server::request",
+          "type": "string"
+        },
+        "show_level": {
+          "default": false,
+          "description": "Whether or not to output the level in the logs.",
+          "type": "boolean"
+        },
+        "show_log_origin": {
+          "default": false,
+          "description": "Whether or not to include the file path and line number of the log's origin.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "MachineConfiguration": {
+      "description": "Describes the number of vCPUs, memory size, SMT capabilities, huge page configuration and the CPU template.",
+      "properties": {
+        "cpu_template": {
+          "$ref": "#/definitions/CpuTemplate"
+        },
+        "huge_pages": {
+          "default": "None",
+          "description": "Which huge pages configuration should be used to back guest memory. \"None\" uses regular 4K pages. \"Transparent\" enables THP via madvise(MADV_HUGEPAGE). \"2M\" uses explicit hugetlbfs 2MB pages.",
+          "enum": [
+            "None",
+            "Transparent",
+            "2M"
+          ],
+          "type": "string"
+        },
+        "mem_size_mib": {
+          "description": "Memory size of VM",
+          "type": "integer"
+        },
+        "smt": {
+          "default": false,
+          "description": "Flag for enabling/disabling simultaneous multithreading. Can be enabled only on x86.",
+          "type": "boolean"
+        },
+        "track_dirty_pages": {
+          "default": false,
+          "description": "Enable dirty page tracking. If this is enabled, then incremental guest memory snapshots can be created. These belong to diff snapshots, which contain, besides the microVM state, only the memory dirtied since a previous snapshot. Full snapshots each contain a full copy of the guest memory.",
+          "type": "boolean"
+        },
+        "vcpu_count": {
+          "description": "Number of vCPUs (either 1 or an even number)",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mem_size_mib",
+        "vcpu_count"
+      ],
+      "type": "object"
+    },
+    "MemoryBackend": {
+      "properties": {
+        "backend_path": {
+          "description": "Based on 'backend_type' it is either 1) Path to the file that contains the guest memory to be loaded 2) Path to the UDS where a process is listening for a UFFD initialization control payload and open file descriptor that it can use to serve this process's guest memory page faults",
+          "type": "string"
+        },
+        "backend_type": {
+          "enum": [
+            "File",
+            "Uffd"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_type",
+        "backend_path"
+      ],
+      "type": "object"
+    },
+    "MemoryHotplugConfig": {
+      "description": "The configuration of the hotpluggable memory device (virtio-mem)",
+      "properties": {
+        "block_size_mib": {
+          "default": 2,
+          "description": "(Logical) Block size for the hotpluggable memory in MiB. This will determine the logical granularity of hot-plug memory for the guest. Refer to the device documentation on how to tune this value.",
+          "maximum": 4294967295,
+          "minimum": 2,
+          "type": "integer"
+        },
+        "slot_size_mib": {
+          "default": 128,
+          "description": "Slot size for the hotpluggable memory in MiB. This will determine the granularity of hot-plug memory from the host. Refer to the device documentation on how to tune this value.",
+          "maximum": 4294967295,
+          "minimum": 128,
+          "type": "integer"
+        },
+        "total_size_mib": {
+          "description": "Total size of the hotpluggable memory in MiB.",
+          "maximum": 4294967295,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MemoryHotplugSizeUpdate": {
+      "description": "An update to the size of the hotpluggable memory region.",
+      "properties": {
+        "requested_size_mib": {
+          "description": "New target region size.",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MemoryHotplugStatus": {
+      "description": "The status of the hotpluggable memory device (virtio-mem)",
+      "properties": {
+        "block_size_mib": {
+          "description": "(Logical) Block size for the hotpluggable memory in MiB.",
+          "type": "integer"
+        },
+        "plugged_size_mib": {
+          "description": "Plugged size for the hotpluggable memory in MiB.",
+          "type": "integer"
+        },
+        "requested_size_mib": {
+          "description": "Requested size for the hotpluggable memory in MiB.",
+          "type": "integer"
+        },
+        "slot_size_mib": {
+          "description": "Slot size for the hotpluggable memory in MiB.",
+          "type": "integer"
+        },
+        "total_size_mib": {
+          "description": "Total size of the hotpluggable memory in MiB.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Metrics": {
+      "description": "Describes the configuration option for the metrics capability.",
+      "properties": {
+        "emit_id": {
+          "default": false,
+          "description": "Whether to emit the microVM instance id (the value passed to the jailer \"--id\") as a top-level \"id\" field on each metrics line.",
+          "type": "boolean"
+        },
+        "metrics_path": {
+          "description": "Path to the named pipe or file where the JSON-formatted metrics are flushed.",
+          "type": "string"
+        },
+        "properties": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Operator-defined key-value pairs emitted under a top-level \"properties\" field on each metrics line.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "metrics_path"
+      ],
+      "type": "object"
+    },
+    "MmdsConfig": {
+      "description": "Defines the MMDS configuration.",
+      "properties": {
+        "imds_compat": {
+          "default": false,
+          "description": "MMDS operates compatibly with EC2 IMDS (i.e. responds \"text/plain\" content regardless of Accept header in requests).",
+          "type": "boolean"
+        },
+        "ipv4_address": {
+          "default": "169.254.169.254",
+          "description": "A valid IPv4 link-local address.",
+          "format": "169.254.([1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4]).([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])",
+          "type": "string"
+        },
+        "network_interfaces": {
+          "description": "List of the network interface IDs capable of forwarding packets to the MMDS. Network interface IDs mentioned must be valid at the time of this request. The net device model will reply to HTTP GET requests sent to the MMDS address via the interfaces mentioned. In this case, both ARP requests and TCP segments heading to `ipv4_address` are intercepted by the device model, and do not reach the associated TAP device.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "default": "V1",
+          "description": "Enumeration indicating the MMDS version to be configured.",
+          "enum": [
+            "V1",
+            "V2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "network_interfaces"
+      ],
+      "type": "object"
+    },
+    "MmdsContentsObject": {
+      "additionalProperties": true,
+      "description": "Describes the contents of MMDS in JSON format.",
+      "type": "object"
+    },
+    "MsrModifier": {
+      "description": "Modifier for a model specific register (x86_64)",
+      "properties": {
+        "addr": {
+          "description": "32-bit MSR address as hex, binary, or decimal string (e.g., \"0x10a\", \"0b100001010\", \"266\")",
+          "type": "string"
+        },
+        "bitmap": {
+          "description": "64-bit bitmap string defining which bits to modify. Format is \"0b\" followed by 64 characters where '0' = clear bit, '1' = set bit, 'x' = don't modify. Underscores can be used for readability. Example \"0b0000000000000000000000000000000000000000000000000000000000000001\"",
+          "type": "string"
+        }
+      },
+      "required": [
+        "addr",
+        "bitmap"
+      ],
+      "type": "object"
+    },
+    "NetworkInterface": {
+      "description": "Defines a network interface.",
+      "properties": {
+        "guest_mac": {
+          "type": "string"
+        },
+        "host_dev_name": {
+          "description": "Host level path for the guest network interface",
+          "type": "string"
+        },
+        "iface_id": {
+          "type": "string"
+        },
+        "mtu": {
+          "description": "MTU to advertise to the guest via VIRTIO_NET_F_MTU. When set, a compatible guest driver will configure the interface with this MTU. When absent, VIRTIO_NET_F_MTU is not advertised and the guest uses its default MTU.",
+          "maximum": 65535,
+          "minimum": 68,
+          "type": "integer"
+        },
+        "rx_rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        },
+        "tx_rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        }
+      },
+      "required": [
+        "host_dev_name",
+        "iface_id"
+      ],
+      "type": "object"
+    },
+    "NetworkOverride": {
+      "description": "Allows for changing the backing TAP device of a network interface during snapshot restore.",
+      "properties": {
+        "host_dev_name": {
+          "description": "The new host device of the interface",
+          "type": "string"
+        },
+        "iface_id": {
+          "description": "The name of the interface to modify",
+          "type": "string"
+        }
+      },
+      "required": [
+        "iface_id",
+        "host_dev_name"
+      ],
+      "type": "object"
+    },
+    "PartialDrive": {
+      "properties": {
+        "drive_id": {
+          "type": "string"
+        },
+        "path_on_host": {
+          "description": "Host level path for the guest drive. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+          "type": "string"
+        },
+        "rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        }
+      },
+      "required": [
+        "drive_id"
+      ],
+      "type": "object"
+    },
+    "PartialNetworkInterface": {
+      "description": "Defines a partial network interface structure, used to update the rate limiters for that interface, after microvm start.",
+      "properties": {
+        "iface_id": {
+          "type": "string"
+        },
+        "rx_rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        },
+        "tx_rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        }
+      },
+      "required": [
+        "iface_id"
+      ],
+      "type": "object"
+    },
+    "PartialPmem": {
+      "description": "Defines a partial pmem device structure, used to update the rate limiter for that device, after microvm start.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Pmem": {
+      "properties": {
+        "id": {
+          "description": "Identificator for this device.",
+          "type": "string"
+        },
+        "path_on_host": {
+          "description": "Host level path for the virtio-pmem device to use as a backing file.",
+          "type": "string"
+        },
+        "rate_limiter": {
+          "$ref": "#/definitions/RateLimiter"
+        },
+        "read_only": {
+          "description": "Flag to map backing file in read-only mode.",
+          "type": "boolean"
+        },
+        "root_device": {
+          "description": "Flag to make this device be the root device for VM boot. Setting this flag will fail if there is another device configured to be a root device already.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "path_on_host"
+      ],
+      "type": "object"
+    },
+    "RateLimiter": {
+      "description": "Defines an IO rate limiter with independent bytes/s and ops/s limits. Limits are defined by configuring each of the _bandwidth_ and _ops_ token buckets. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.",
+      "properties": {
+        "bandwidth": {
+          "$ref": "#/definitions/TokenBucket",
+          "description": "Token bucket with bytes as tokens"
+        },
+        "ops": {
+          "$ref": "#/definitions/TokenBucket",
+          "description": "Token bucket with operations as tokens"
+        }
+      },
+      "type": "object"
+    },
+    "SerialDevice": {
+      "description": "The configuration of the serial device",
+      "properties": {
+        "rate_limiter": {
+          "$ref": "#/definitions/TokenBucket",
+          "description": "Optional token bucket for rate limiting serial console output bandwidth. When present, guest writes to the serial port that exceed the configured rate are silently dropped and counted in the `uart.rate_limiter_dropped_bytes` metric. When absent (the default), serial output is not rate-limited."
+        },
+        "serial_out_path": {
+          "description": "Path to a file or named pipe on the host to which serial output should be written.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SnapshotCreateParams": {
+      "properties": {
+        "mem_file_path": {
+          "description": "Path to the file that will contain the guest memory.",
+          "type": "string"
+        },
+        "snapshot_path": {
+          "description": "Path to the file that will contain the microVM state.",
+          "type": "string"
+        },
+        "snapshot_type": {
+          "description": "Type of snapshot to create. It is optional and by default, a full snapshot is created.",
+          "enum": [
+            "Full",
+            "Diff"
+          ],
+          "type": "string"
+        },
+        "sync_snapshot_files": {
+          "default": true,
+          "description": "Whether the snapshot state and guest memory files are synced to disk (fsync) before the request returns. Optional, defaults to true, guaranteeing durability across host crashes. Setting it to false returns without waiting for the writeback, making snapshot creation faster at the cost of durability across a host crash; the data stays in the host page cache, so same-host reads still see the full contents. Block device backing files are always fsync'd regardless of this setting.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mem_file_path",
+        "snapshot_path"
+      ],
+      "type": "object"
+    },
+    "SnapshotLoadParams": {
+      "description": "Defines the configuration used for handling snapshot resume. Exactly one of the two `mem_*` fields must be present in the body of the request.",
+      "properties": {
+        "clock_realtime": {
+          "description": "[x86_64 only] When set to true, passes KVM_CLOCK_REALTIME to KVM_SET_CLOCK on restore, advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false (default), kvmclock resumes from where it was at snapshot time. This option may be extended to other clock sources and CPU architectures in the future.",
+          "type": "boolean"
+        },
+        "enable_diff_snapshots": {
+          "description": "(Deprecated) Enable dirty page tracking to improve space efficiency of diff snapshots",
+          "type": "boolean"
+        },
+        "huge_pages": {
+          "description": "Selects the huge pages configuration for the restored microVM. Snapshot reuses the value serialized in the snapshot and is the default when this field is omitted; None uses the host's default memory-mapping behavior. Explicit hugetlbfs (`2M`) pages require a UFFD memory backend. With UFFD, the effectiveness of transparent huge pages may be limited.",
+          "enum": [
+            "Snapshot",
+            "None",
+            "Transparent",
+            "2M"
+          ],
+          "type": "string"
+        },
+        "mem_backend": {
+          "$ref": "#/definitions/MemoryBackend",
+          "description": "Configuration for the backend that handles memory load. If this field is specified, `mem_file_path` is forbidden. Either `mem_backend` or `mem_file_path` must be present at a time."
+        },
+        "mem_file_path": {
+          "description": "Path to the file that contains the guest memory to be loaded. It is only allowed if `mem_backend` is not present. This parameter has been deprecated and it will be removed in future Firecracker release.",
+          "type": "string"
+        },
+        "network_overrides": {
+          "description": "Network host device names to override",
+          "items": {
+            "$ref": "#/definitions/NetworkOverride"
+          },
+          "type": "array"
+        },
+        "resume_vm": {
+          "description": "When set to true, the vm is also resumed if the snapshot load is successful.",
+          "type": "boolean"
+        },
+        "snapshot_path": {
+          "description": "Path to the file that contains the microVM state to be loaded.",
+          "type": "string"
+        },
+        "track_dirty_pages": {
+          "description": "Enable dirty page tracking to improve space efficiency of diff snapshots",
+          "type": "boolean"
+        },
+        "vsock_override": {
+          "$ref": "#/definitions/VsockOverride",
+          "description": "Overrides the vsock device's UDS path on snapshot restore. This is useful for restoring a snapshot with a different socket path than the one used when the snapshot was created. For example, when the original socket path is no longer available or when deploying to a different environment."
+        }
+      },
+      "required": [
+        "snapshot_path"
+      ],
+      "type": "object"
+    },
+    "TokenBucket": {
+      "description": "Defines a token bucket with a maximum capacity (size), an initial burst size (one_time_burst) and an interval for refilling purposes (refill_time). The refill-rate is derived from size and refill_time, and it is the constant rate at which the tokens replenish. The refill process only starts happening after the initial burst budget is consumed. Consumption from the token bucket is unbounded in speed which allows for bursts bound in size by the amount of tokens available. Once the token bucket is empty, consumption speed is bound by the refill_rate.",
+      "properties": {
+        "one_time_burst": {
+          "description": "The initial size of a token bucket.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refill_time": {
+          "description": "The amount of milliseconds it takes for the bucket to refill.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "size": {
+          "description": "The total number of tokens this bucket can hold.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "refill_time",
+        "size"
+      ],
+      "type": "object"
+    },
+    "VcpuFeatures": {
+      "description": "vCPU feature modifier (aarch64)",
+      "properties": {
+        "bitmap": {
+          "description": "32-bit bitmap string defining which bits to modify. Format is \"0b\" followed by 32 characters where '0' = clear bit, '1' = set bit, 'x' = don't modify. Example \"0b00000000000000000000000001100000\"",
+          "type": "string"
+        },
+        "index": {
+          "description": "Index in the kvm_vcpu_init.features array",
+          "format": "int32",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "bitmap"
+      ],
+      "type": "object"
+    },
+    "Vm": {
+      "description": "Defines the microVM running state. It is especially useful in the snapshotting context.",
+      "properties": {
+        "state": {
+          "enum": [
+            "Paused",
+            "Resumed"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "Vsock": {
+      "description": "Defines a vsock device, backed by a set of Unix Domain Sockets, on the host side. For host-initiated connections, Firecracker will be listening on the Unix socket identified by the path `uds_path`. Firecracker will create this socket, bind and listen on it. Host-initiated connections will be performed by connection to this socket and issuing a connection forwarding request to the desired guest-side vsock port (i.e. `CONNECT 52\\n`, to connect to port 52). For guest-initiated connections, Firecracker will expect host software to be bound and listening on Unix sockets at `uds_path_<PORT>`. E.g. \"/path/to/host_vsock.sock_52\" for port number 52.",
+      "properties": {
+        "guest_cid": {
+          "description": "Guest Vsock CID",
+          "minimum": 3,
+          "type": "integer"
+        },
+        "uds_path": {
+          "description": "Path to UNIX domain socket, used to proxy vsock connections.",
+          "type": "string"
+        },
+        "vsock_id": {
+          "description": "This parameter has been deprecated and it will be removed in future Firecracker release.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "guest_cid",
+        "uds_path"
+      ],
+      "type": "object"
+    },
+    "VsockOverride": {
+      "description": "Allows for changing the backing Unix Domain Socket of a vsock device during snapshot restore.",
+      "properties": {
+        "uds_path": {
+          "description": "The new path for the backing Unix Domain Socket.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uds_path"
+      ],
+      "type": "object"
+    }
+  },
+  "host": "localhost",
+  "info": {
+    "contact": {
+      "email": "firecracker-maintainers@amazon.com"
+    },
+    "description": "RESTful public-facing API. The API is accessible through HTTP calls on specific URLs carrying JSON modeled data. The transport medium is a Unix Domain Socket.",
+    "license": {
+      "name": "Apache 2.0",
+      "url": "http://www.apache.org/licenses/LICENSE-2.0.html"
+    },
+    "termsOfService": "",
+    "title": "Firecracker API",
+    "version": "1.17.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "describeInstance",
+        "responses": {
+          "200": {
+            "description": "The instance information",
+            "schema": {
+              "$ref": "#/definitions/InstanceInfo"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Returns general information about an instance."
+      }
+    },
+    "/actions": {
+      "put": {
+        "operationId": "createSyncAction",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "info",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/InstanceActionInfo"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The update was successful"
+          },
+          "400": {
+            "description": "The action cannot be executed due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates a synchronous action."
+      }
+    },
+    "/balloon": {
+      "get": {
+        "operationId": "describeBalloonConfig",
+        "responses": {
+          "200": {
+            "description": "The balloon device configuration",
+            "schema": {
+              "$ref": "#/definitions/Balloon"
+            }
+          },
+          "400": {
+            "description": "Balloon device not configured.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Returns the current balloon device configuration."
+      },
+      "patch": {
+        "description": "Updates an existing balloon device, before or after machine startup. Will fail if update is not possible.",
+        "operationId": "patchBalloon",
+        "parameters": [
+          {
+            "description": "Balloon properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/BalloonUpdate"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Balloon device updated"
+          },
+          "400": {
+            "description": "Balloon device cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates a balloon device."
+      },
+      "put": {
+        "description": "Creates a new balloon device if one does not already exist, otherwise updates it, before machine startup. This will fail after machine startup. Will fail if update is not possible.",
+        "operationId": "putBalloon",
+        "parameters": [
+          {
+            "description": "Balloon properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Balloon"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Balloon device created/updated"
+          },
+          "400": {
+            "description": "Balloon device cannot be created/updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates or updates a balloon device."
+      }
+    },
+    "/balloon/hinting/start": {
+      "patch": {
+        "operationId": "startBalloonHinting",
+        "parameters": [
+          {
+            "description": "When the device completes the hinting whether we should automatically ack this.",
+            "in": "body",
+            "name": "body",
+            "required": false,
+            "schema": {
+              "$ref": "#/definitions/BalloonStartCmd"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Free page hinting run started."
+          },
+          "400": {
+            "description": "The balloon free hinting was not enabled when the device was configured.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Starts a free page hinting run only if enabled pre-boot."
+      }
+    },
+    "/balloon/hinting/status": {
+      "get": {
+        "operationId": "describeBalloonHinting",
+        "responses": {
+          "200": {
+            "description": "The balloon free page hinting statistics",
+            "schema": {
+              "$ref": "#/definitions/BalloonHintingStatus"
+            }
+          },
+          "400": {
+            "description": "The balloon free hinting was not enabled when the device was configured.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Returns the balloon hinting statistics, only if enabled pre-boot."
+      }
+    },
+    "/balloon/hinting/stop": {
+      "patch": {
+        "operationId": "stopBalloonHinting",
+        "responses": {
+          "204": {
+            "description": "Free page hinting run stopped."
+          },
+          "400": {
+            "description": "The balloon free hinting was not enabled when the device was configured.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Stops a free page hinting run only if enabled pre-boot."
+      }
+    },
+    "/balloon/statistics": {
+      "get": {
+        "operationId": "describeBalloonStats",
+        "responses": {
+          "200": {
+            "description": "The balloon device statistics",
+            "schema": {
+              "$ref": "#/definitions/BalloonStats"
+            }
+          },
+          "400": {
+            "description": "The balloon device statistics were not enabled when the device was configured.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Returns the latest balloon device statistics, only if enabled pre-boot."
+      },
+      "patch": {
+        "description": "Updates an existing balloon device statistics interval, before or after machine startup. Will fail if update is not possible.",
+        "operationId": "patchBalloonStatsInterval",
+        "parameters": [
+          {
+            "description": "Balloon properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/BalloonStatsUpdate"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Balloon statistics interval updated"
+          },
+          "400": {
+            "description": "Balloon statistics interval cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates a balloon device statistics polling interval."
+      }
+    },
+    "/boot-source": {
+      "put": {
+        "description": "Creates new boot source if one does not already exist, otherwise updates it. Will fail if update is not possible.",
+        "operationId": "putGuestBootSource",
+        "parameters": [
+          {
+            "description": "Guest boot source properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/BootSource"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Boot source created/updated"
+          },
+          "400": {
+            "description": "Boot source cannot be created due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates or updates the boot source. Pre-boot only."
+      }
+    },
+    "/cpu-config": {
+      "put": {
+        "description": "Provides configuration to the Firecracker process to specify vCPU resource configuration prior to launching the guest machine.",
+        "operationId": "putCpuConfiguration",
+        "parameters": [
+          {
+            "description": "CPU configuration request",
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "$ref": "#/definitions/CpuConfig"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "CPU configuration set successfully"
+          },
+          "400": {
+            "description": "CPU configuration cannot be updated due to invalid input format",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Configures CPU features flags for the vCPUs of the guest VM. Pre-boot only."
+      }
+    },
+    "/drives/{drive_id}": {
+      "patch": {
+        "description": "Updates the properties of the drive with the ID specified by drive_id path parameter. Will fail if update is not possible.",
+        "operationId": "patchGuestDriveByID",
+        "parameters": [
+          {
+            "description": "The id of the guest drive",
+            "in": "path",
+            "name": "drive_id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "Guest drive properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PartialDrive"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Drive updated"
+          },
+          "400": {
+            "description": "Drive cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the properties of a drive. Post-boot only."
+      },
+      "put": {
+        "description": "Creates new drive with ID specified by drive_id path parameter. If a drive with the specified ID already exists, updates its state based on new input. Will fail if update is not possible.",
+        "operationId": "putGuestDriveByID",
+        "parameters": [
+          {
+            "description": "The id of the guest drive",
+            "in": "path",
+            "name": "drive_id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "Guest drive properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Drive"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Drive created/updated"
+          },
+          "400": {
+            "description": "Drive cannot be created/updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates or updates a drive. Pre-boot only."
+      }
+    },
+    "/entropy": {
+      "put": {
+        "description": "Enables an entropy device that provides high-quality random data to the guest.",
+        "operationId": "putEntropyDevice",
+        "parameters": [
+          {
+            "description": "Guest entropy device properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/EntropyDevice"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Entropy device created"
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates an entropy device. Pre-boot only."
+      }
+    },
+    "/hotplug/memory": {
+      "get": {
+        "description": "Reuturn the status of the hotpluggable memory. This can be used to follow the progress of the guest after a PATCH API.",
+        "operationId": "getMemoryHotplug",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/MemoryHotplugStatus"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Retrieves the status of the hotpluggable memory"
+      },
+      "patch": {
+        "description": "Updates the size of the hotpluggable memory region. The guest will plug and unplug memory to hit the requested memory.",
+        "operationId": "patchMemoryHotplug",
+        "parameters": [
+          {
+            "description": "Hotpluggable memory size update",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/MemoryHotplugSizeUpdate"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Hotpluggable memory configured"
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the size of the hotpluggable memory region"
+      },
+      "put": {
+        "description": "Configure the hotpluggable memory, which is a virtio-mem device, with an associated memory area that can be hot(un)plugged in the guest on demand using the PATCH API.",
+        "operationId": "putMemoryHotplug",
+        "parameters": [
+          {
+            "description": "Hotpluggable memory configuration",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/MemoryHotplugConfig"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Hotpluggable memory configured"
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Configures the hotpluggable memory"
+      }
+    },
+    "/logger": {
+      "put": {
+        "operationId": "putLogger",
+        "parameters": [
+          {
+            "description": "Logging system description",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Logger"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Logger created."
+          },
+          "400": {
+            "description": "Logger cannot be initialized due to bad input.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Initializes the logger by specifying a named pipe or a file for the logs output."
+      }
+    },
+    "/machine-config": {
+      "get": {
+        "description": "Gets the machine configuration of the VM. When called before the PUT operation, it will return the default values for the vCPU count (=1), memory size (=128 MiB). By default SMT is disabled and there is no CPU Template.",
+        "operationId": "getMachineConfiguration",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/MachineConfiguration"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Gets the machine configuration of the VM."
+      },
+      "patch": {
+        "description": "Partially updates the Virtual Machine Configuration with the specified input. If any of the parameters has an incorrect value, the whole update fails.",
+        "operationId": "patchMachineConfiguration",
+        "parameters": [
+          {
+            "description": "A subset of Machine Configuration Parameters",
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "$ref": "#/definitions/MachineConfiguration"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Machine Configuration created/updated"
+          },
+          "400": {
+            "description": "Machine Configuration cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Partially updates the Machine Configuration of the VM. Pre-boot only."
+      },
+      "put": {
+        "description": "Updates the Virtual Machine Configuration with the specified input. Firecracker starts with default values for vCPU count (=1) and memory size (=128 MiB). The vCPU count is restricted to the [1, 32] range. With SMT enabled, the vCPU count is required to be either 1 or an even number in the range. otherwise there are no restrictions regarding the vCPU count. If 2M hugetlbfs pages are specified, then `mem_size_mib` must be a multiple of 2. If any of the parameters has an incorrect value, the whole update fails. All parameters that are optional and are not specified are set to their default values (smt = false, track_dirty_pages = false, cpu_template = None, huge_pages = None).",
+        "operationId": "putMachineConfiguration",
+        "parameters": [
+          {
+            "description": "Machine Configuration Parameters",
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "$ref": "#/definitions/MachineConfiguration"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Machine Configuration created/updated"
+          },
+          "400": {
+            "description": "Machine Configuration cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the Machine Configuration of the VM. Pre-boot only."
+      }
+    },
+    "/metrics": {
+      "put": {
+        "operationId": "putMetrics",
+        "parameters": [
+          {
+            "description": "Metrics system description",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Metrics"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Metrics system created."
+          },
+          "400": {
+            "description": "Metrics system cannot be initialized due to bad input request or metrics system already initialized.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Initializes the metrics system by specifying a named pipe or a file for the metrics output."
+      }
+    },
+    "/mmds": {
+      "get": {
+        "operationId": "getMmds",
+        "responses": {
+          "200": {
+            "description": "The MMDS data store JSON.",
+            "schema": {
+              "additionalProperties": true,
+              "type": "object"
+            }
+          },
+          "404": {
+            "description": "The MMDS data store content can not be found.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Get the MMDS data store."
+      },
+      "patch": {
+        "operationId": "patchMmds",
+        "parameters": [
+          {
+            "description": "The MMDS data store patch JSON.",
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "$ref": "#/definitions/MmdsContentsObject"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "MMDS data store updated."
+          },
+          "400": {
+            "description": "MMDS data store cannot be updated due to bad input.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the MMDS data store."
+      },
+      "put": {
+        "operationId": "putMmds",
+        "parameters": [
+          {
+            "description": "The MMDS data store as JSON.",
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "$ref": "#/definitions/MmdsContentsObject"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "MMDS data store created/updated."
+          },
+          "400": {
+            "description": "MMDS data store cannot be created due to bad input.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates a MMDS (Microvm Metadata Service) data store."
+      }
+    },
+    "/mmds/config": {
+      "put": {
+        "description": "Configures MMDS version, IPv4 address used by the MMDS network stack and interfaces that allow MMDS requests.",
+        "operationId": "putMmdsConfig",
+        "parameters": [
+          {
+            "description": "The MMDS configuration as JSON.",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/MmdsConfig"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "MMDS configuration was created/updated."
+          },
+          "400": {
+            "description": "MMDS configuration cannot be updated due to bad input.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Set MMDS configuration. Pre-boot only."
+      }
+    },
+    "/network-interfaces/{iface_id}": {
+      "patch": {
+        "description": "Updates the rate limiters applied to a network interface.",
+        "operationId": "patchGuestNetworkInterfaceByID",
+        "parameters": [
+          {
+            "description": "The id of the guest network interface",
+            "in": "path",
+            "name": "iface_id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "A subset of the guest network interface properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PartialNetworkInterface"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Network interface updated"
+          },
+          "400": {
+            "description": "Network interface cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the rate limiters applied to a network interface. Post-boot only."
+      },
+      "put": {
+        "description": "Creates new network interface with ID specified by iface_id path parameter.",
+        "operationId": "putGuestNetworkInterfaceByID",
+        "parameters": [
+          {
+            "description": "The id of the guest network interface",
+            "in": "path",
+            "name": "iface_id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "Guest network interface properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/NetworkInterface"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Network interface created/updated"
+          },
+          "400": {
+            "description": "Network interface cannot be created due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates a network interface. Pre-boot only."
+      }
+    },
+    "/pmem/{id}": {
+      "patch": {
+        "description": "Updates the rate limiter applied to the pmem device with the ID specified by the id path parameter.",
+        "operationId": "patchGuestPmemByID",
+        "parameters": [
+          {
+            "description": "The id of the guest pmem device",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "Pmem rate limiter properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PartialPmem"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pmem device updated"
+          },
+          "400": {
+            "description": "Pmem device cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the rate limiter of a pmem device. Post-boot only."
+      },
+      "put": {
+        "description": "Creates new pmem device with ID specified by id parameter. If a pmem device with the specified ID already exists, updates its state based on new input. Will fail if update is not possible.",
+        "operationId": "putGuestPmemByID",
+        "parameters": [
+          {
+            "description": "The id of the guest pmem device",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "description": "Guest pmem device properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Pmem"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pmem device is created/updated"
+          },
+          "400": {
+            "description": "Pmem device cannot be created/updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates or updates a pmem device. Pre-boot only."
+      }
+    },
+    "/serial": {
+      "put": {
+        "description": "Configure the serial console, which the guest can write its kernel logs to. Has no effect if the serial console is not also enabled on the guest kernel command line",
+        "operationId": "putSerialDevice",
+        "parameters": [
+          {
+            "description": "Serial console properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SerialDevice"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Serial device configured"
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Configures the serial console"
+      }
+    },
+    "/snapshot/create": {
+      "put": {
+        "description": "Creates a snapshot of the microVM state. The microVM should be in the `Paused` state.",
+        "operationId": "createSnapshot",
+        "parameters": [
+          {
+            "description": "The configuration used for creating a snapshot.",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SnapshotCreateParams"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Snapshot created"
+          },
+          "400": {
+            "description": "Snapshot cannot be created due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates a full or diff snapshot. Post-boot only."
+      }
+    },
+    "/snapshot/load": {
+      "put": {
+        "description": "Loads the microVM state from a snapshot. Only accepted on a fresh Firecracker process (before configuring any resource other than the Logger and Metrics).",
+        "operationId": "loadSnapshot",
+        "parameters": [
+          {
+            "description": "The configuration used for loading a snapshot.",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SnapshotLoadParams"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Snapshot loaded"
+          },
+          "400": {
+            "description": "Snapshot cannot be loaded due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Loads a snapshot. Pre-boot only."
+      }
+    },
+    "/version": {
+      "get": {
+        "operationId": "getFirecrackerVersion",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/FirecrackerVersion"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Gets the Firecracker version."
+      }
+    },
+    "/vm": {
+      "patch": {
+        "description": "Sets the desired state (Paused or Resumed) for the microVM.",
+        "operationId": "patchVm",
+        "parameters": [
+          {
+            "description": "The microVM state",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Vm"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Vm state updated"
+          },
+          "400": {
+            "description": "Vm state cannot be updated due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Updates the microVM state."
+      }
+    },
+    "/vm/config": {
+      "get": {
+        "description": "Gets configuration for all VM resources. If the VM is restored from a snapshot, the boot-source, machine-config.smt and machine-config.cpu_template will be empty.",
+        "operationId": "getExportVmConfig",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/FullVmConfiguration"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Gets the full VM configuration."
+      }
+    },
+    "/vsock": {
+      "put": {
+        "description": "The first call creates the device with the configuration specified in body. Subsequent calls will update the device configuration. May fail if update is not possible.",
+        "operationId": "putGuestVsock",
+        "parameters": [
+          {
+            "description": "Guest vsock properties",
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Vsock"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Vsock created/updated"
+          },
+          "400": {
+            "description": "Vsock cannot be created due to bad input",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "default": {
+            "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Creates/updates a vsock device. Pre-boot only."
+      }
+    }
+  },
+  "produces": [
+    "application/json"
+  ],
+  "schemes": [
+    "http"
+  ],
+  "swagger": "2.0"
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Host-only tenant control agent over vsock
+After=local-fs.target motor-net-rules.service
+Requires=motor-net-rules.service
+
+[Service]
+User=root
+Environment=HOME=/tenant
+Environment=CARGO_HOME=/usr/local/lib/motor/cargo
+Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup
+Environment=PATH=/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=/usr/local/bin/motor-runner tenant-agent
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
