@@ -1,0 +1,10 @@
+{
+  "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "pathname": "/v1/hosts/host-1/heartbeat",
+  "body": "{\"free_vcpus\":4,\"free_mem_mib\":8192,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true}",
+  "timestamp": "1800000000000",
+  "counter": "1800000000000001",
+  "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-1/heartbeat\n2ede0deac95ce71edec5e056465309b7257e1d2619d82fdf6567d56b33ee5375\n1800000000000\n1800000000000001",
+  "signature": "26d53e7617b1d0e0daeef882ff177ecbc0cff87100e031d50a83f5cf9ed36383c07b41815f22a910eb3542403da539109c32548db562b03792fd880be548650c"
+}

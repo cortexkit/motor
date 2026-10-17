@@ -55,3 +55,22 @@ fn digest_manifest_covers_every_mirrored_contract_and_vector_file() {
         "mirror files must not escape digest coverage"
     );
 }
+
+#[test]
+fn cloud_final_files_match_their_manifest_digests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts");
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
+    for path in ["cloud/job-tokens.json", "cloud/host-signature.json"] {
+        let entry = manifest
+            .files
+            .iter()
+            .find(|entry| entry.path == Path::new(path))
+            .unwrap_or_else(|| panic!("missing CLOUD file in manifest: {path}"));
+        assert_eq!(
+            sha256_hex(&std::fs::read(root.join(path)).unwrap()),
+            entry.sha256,
+            "digest mismatch: {path}"
+        );
+    }
+}
