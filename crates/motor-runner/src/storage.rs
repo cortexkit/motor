@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -67,6 +67,24 @@ pub(crate) fn empty_queue_entry() -> Arc<AtomicU64> {
 pub(crate) fn empty_queue_elapsed() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
+pub(crate) fn empty_queue_clock_initialized() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+pub(crate) fn queue_clock_at(entry: &AtomicU64, elapsed: &AtomicU64, now: u64) -> (u64, u64) {
+    loop {
+        let state = entry.load(Ordering::Acquire);
+        let accumulated = elapsed.load(Ordering::Acquire);
+        if state == entry.load(Ordering::Acquire) {
+            let live = if state == NO_QUEUE || state == PAUSED_QUEUE {
+                0
+            } else {
+                now.saturating_sub(state)
+            };
+            return (state, accumulated.saturating_add(live));
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Job {
@@ -76,24 +94,18 @@ pub(crate) struct Job {
     pub accepted_ms: u64,
     #[serde(default)]
     pub queued_ms: Option<u64>,
-    /// Runtime queue-clock start, or a marker that the queue clock is paused,
-    /// shared without the runner state lock so heartbeat writers can report
-    /// only active queue wait.
+    /// Runtime queue-clock start or paused marker, shared without the runner
+    /// state lock so heartbeat writers can report active queue wait. Because
+    /// startup refuses queued jobs before subscribers attach, it needs no
+    /// persisted queue clock to restore.
     #[serde(skip, default = "empty_queue_entry")]
     pub queue_entry: Arc<AtomicU64>,
-    /// Runtime copy of the durable queue-wait time already spent.
+    /// Runtime copy of the accumulated queue-wait time already spent.
     #[serde(skip, default = "empty_queue_elapsed")]
     pub queue_elapsed: Arc<AtomicU64>,
-    /// Queue-wait time accumulated while waiting for shared capacity or other
-    /// shared blockers. Workspace-owner waits do not add to this duration.
-    #[serde(default)]
-    pub queue_wait_elapsed_ms: u64,
-    #[serde(default)]
-    pub queue_wait_started_ms: Option<u64>,
-    /// Older records have only queued_ms, so they continue to use the duration
-    /// calculated from that field.
-    #[serde(default)]
-    pub queue_wait_clock_initialized: bool,
+    /// Runtime marker indicating whether this job has entered the live queue.
+    #[serde(skip, default = "empty_queue_clock_initialized")]
+    pub queue_wait_clock_initialized: Arc<AtomicBool>,
     #[serde(default)]
     pub setup_ms: Option<u64>,
     pub finished_ms: Option<u64>,
@@ -202,9 +214,7 @@ impl Job {
             queued_ms: None,
             queue_entry: empty_queue_entry(),
             queue_elapsed: empty_queue_elapsed(),
-            queue_wait_elapsed_ms: 0,
-            queue_wait_started_ms: None,
-            queue_wait_clock_initialized: false,
+            queue_wait_clock_initialized: empty_queue_clock_initialized(),
             setup_ms: None,
             finished_ms: None,
             started_ms: None,
@@ -246,6 +256,7 @@ impl Job {
             .unwrap_or("")
     }
     pub fn terminal(&mut self, outcome: Outcome, now: u64) {
+        let queue_wait_ms = self.queue_wait_ms(now);
         self.queue_entry.store(NO_QUEUE, Ordering::Release);
         let remote = self.started_ms.is_some();
         let bundle_bytes = self
@@ -263,7 +274,7 @@ impl Job {
             self.id,
             outcome,
             self.started_ms.map(|t| now.saturating_sub(t)).unwrap_or(0),
-            self.queue_wait_ms(now),
+            queue_wait_ms,
             bundle_bytes,
         )
         .with_ran(if remote { Ran::Remote } else { Ran::None });
@@ -282,12 +293,8 @@ impl Job {
     }
 
     pub fn queue_wait_ms(&self, now: u64) -> u64 {
-        if self.queue_wait_clock_initialized {
-            self.queue_wait_elapsed_ms.saturating_add(
-                self.queue_wait_started_ms
-                    .map(|started| now.saturating_sub(started))
-                    .unwrap_or(0),
-            )
+        if self.queue_wait_clock_initialized.load(Ordering::Acquire) {
+            queue_clock_at(&self.queue_entry, &self.queue_elapsed, now).1
         } else {
             self.setup_ms
                 .or(self.started_ms)
@@ -296,50 +303,32 @@ impl Job {
         }
     }
 
-    pub fn start_queue_wait(&mut self, now: u64) {
-        self.queue_wait_clock_initialized = true;
-        self.queue_wait_elapsed_ms = 0;
-        self.queue_wait_started_ms = Some(now);
-        self.publish_queue_wait();
+    pub fn start_queue_wait(&self, now: u64) {
+        self.queue_elapsed.store(0, Ordering::Release);
+        self.queue_wait_clock_initialized
+            .store(true, Ordering::Release);
+        self.queue_entry.store(now, Ordering::Release);
     }
 
-    pub fn pause_queue_wait(&mut self, now: u64) {
-        if let Some(started) = self.queue_wait_started_ms.take() {
-            self.queue_wait_elapsed_ms = self
-                .queue_wait_elapsed_ms
-                .saturating_add(now.saturating_sub(started));
+    pub fn pause_queue_wait(&self, now: u64) {
+        let (entry, elapsed) = queue_clock_at(&self.queue_entry, &self.queue_elapsed, now);
+        if entry != NO_QUEUE && entry != PAUSED_QUEUE {
+            self.queue_entry.store(PAUSED_QUEUE, Ordering::Release);
+            self.queue_elapsed.store(elapsed, Ordering::Release);
         }
-        self.publish_queue_wait();
     }
 
-    pub fn resume_queue_wait(&mut self, now: u64) {
+    pub fn resume_queue_wait(&self, now: u64) {
         if self.state == JobState::Queued && self.queued_ms.is_some() {
-            self.queue_wait_clock_initialized = true;
-            self.queue_wait_started_ms = Some(now);
-            self.publish_queue_wait();
+            self.queue_wait_clock_initialized
+                .store(true, Ordering::Release);
+            self.queue_entry.store(now, Ordering::Release);
         }
     }
 
-    pub fn stop_queue_wait(&mut self, now: u64) {
+    pub fn stop_queue_wait(&self, now: u64) {
         self.pause_queue_wait(now);
         self.queue_entry.store(NO_QUEUE, Ordering::Release);
-    }
-
-    fn publish_queue_wait(&self) {
-        let entry = match (self.state == JobState::Queued, self.queue_wait_started_ms) {
-            (true, Some(started)) => started,
-            (true, None) if self.queued_ms.is_some() => PAUSED_QUEUE,
-            _ => NO_QUEUE,
-        };
-        if entry == PAUSED_QUEUE {
-            self.queue_entry.store(entry, Ordering::Release);
-            self.queue_elapsed
-                .store(self.queue_wait_elapsed_ms, Ordering::Release);
-        } else {
-            self.queue_elapsed
-                .store(self.queue_wait_elapsed_ms, Ordering::Release);
-            self.queue_entry.store(entry, Ordering::Release);
-        }
     }
 
     pub fn record_reservation_use(&mut self, cpu_time_ns: u64, ended_ms: u64) {
