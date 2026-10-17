@@ -25,6 +25,7 @@ TEST_FILES = [
     "script/runner/test_deploy.py",
     "script/runner/test_review_reaper.py",
     "script/runner/test_sync_lock.py",
+    "script/tenant-vm-spike/test_hosted_spike.py",
     "script/windows-vm/test_control.py",
     "script/windows-vm/test_provisioning.py",
     "scripts/tests/test_safety_fences.py",
