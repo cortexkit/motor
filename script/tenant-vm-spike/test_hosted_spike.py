@@ -14,11 +14,20 @@ import time
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("hosted_spike", Path(__file__).with_name("hosted_spike.py"))
 assert spec is not None and spec.loader is not None
 spike = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(spike)
+config_spec = importlib.util.spec_from_file_location("kernel_config", Path(__file__).with_name("check-kernel-config.py"))
+assert config_spec is not None and config_spec.loader is not None
+kernel_config = importlib.util.module_from_spec(config_spec)
+config_spec.loader.exec_module(kernel_config)
+guest_spec = importlib.util.spec_from_file_location("guest", Path(__file__).with_name("guest.py"))
+assert guest_spec is not None and guest_spec.loader is not None
+guest = importlib.util.module_from_spec(guest_spec)
+guest_spec.loader.exec_module(guest)
 
 
 def complete_samples():
@@ -26,6 +35,41 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    def test_resolved_kernel_config_accepts_required_features_without_tunnels(self):
+        text = "\n".join(f"CONFIG_{name}=y" for name in kernel_config.REQUIRED)
+        self.assertEqual(kernel_config.check(text), [])
+
+    def test_resolved_kernel_config_rejects_fallback_tunnel(self):
+        text = "\n".join(f"CONFIG_{name}=y" for name in kernel_config.REQUIRED) + "\nCONFIG_IPV6_SIT=y"
+        self.assertEqual(kernel_config.check(text), [
+            "CONFIG_IPV6_SIT must be unset: namespace fallback interfaces are not allowed"])
+
+    def test_resolved_kernel_config_requires_cgroup_bpf(self):
+        text = "\n".join(f"CONFIG_{name}=y" for name in kernel_config.REQUIRED if name != "CGROUP_BPF")
+        self.assertEqual(kernel_config.check(text), ["CONFIG_CGROUP_BPF must be built in"])
+
+    def test_guest_diagnostics_finds_runtime_unit_by_job_sandbox_not_job_id(self):
+        job_id = "00000000-0000-4000-8000-000000000001"
+
+        def run(args, **_kwargs):
+            if "list-units" in args:
+                output = "motor-job-runtime.service loaded active running Job\n"
+            elif "--property=RootDirectory" in args:
+                output = f"/tenant/state/spike/sandboxes/{job_id}/root\n"
+            elif "--value" in args:
+                output = "123\n"
+            elif args[0] == "journalctl":
+                output = "systemd: BPF available\n"
+            else:
+                output = "PrivateNetwork=yes\nPrivateDevices=yes\nMainPID=123\n"
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+        with patch.object(guest.subprocess, "run", side_effect=run), patch.object(guest.os, "readlink", return_value="net:[123]"):
+            result = guest.diagnostics(job_id)
+        self.assertEqual(result["unit"], "motor-job-runtime.service")
+        self.assertIn("PrivateNetwork=yes", result["properties"]["stdout"])
+        self.assertEqual(result["network_namespaces"]["job_main"], "net:[123]")
+
     def test_isolated_probe_decodes_output_bytes_and_collects_unit_diagnostics(self):
         a, b = socket.socketpair()
         errors, requests = [], []

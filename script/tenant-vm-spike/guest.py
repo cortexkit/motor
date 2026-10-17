@@ -138,7 +138,7 @@ def cache_verify():
 
 def diagnostics(job_id):
     import uuid
-    unit = f"motor-job-{uuid.UUID(job_id)}.service"
+    job_id = str(uuid.UUID(job_id))
 
     def probe(*args):
         result = subprocess.run(args, capture_output=True, text=True, timeout=10)
@@ -148,8 +148,17 @@ def diagnostics(job_id):
                   "PrivateDevices", "DevicePolicy", "DeviceAllow", "RestrictNamespaces",
                   "RestrictAddressFamilies", "RestrictNetworkInterfaces", "IPAddressDeny",
                   "IPAddressAllow", "SocketBindAllow", "SocketBindDeny", "NoNewPrivileges"]
-    shown = probe("systemctl", "show", unit, *(f"--property={name}" for name in properties))
-    main_pid = probe("systemctl", "show", unit, "--property=MainPID", "--value")["stdout"].strip()
+    candidates = probe("systemctl", "list-units", "--all", "--plain", "--no-legend", "--type=service", "motor-job-*.service")
+    unit = None
+    for line in candidates["stdout"].splitlines():
+        candidate = line.split()[0]
+        root = probe("systemctl", "show", candidate, "--property=RootDirectory", "--value")["stdout"].strip()
+        if root.endswith(f"/sandboxes/{job_id}/root"):
+            unit = candidate
+            break
+    shown = probe("systemctl", "show", unit, *(f"--property={name}" for name in properties)) if unit else {
+        "status": None, "stdout": "", "stderr": "job unit no longer present; no effective-property claim"}
+    main_pid = probe("systemctl", "show", unit, "--property=MainPID", "--value")["stdout"].strip() if unit else "0"
     namespaces = {}
     for name, pid in [("guest_init", "1"), ("agent", str(os.getpid())), ("job_main", main_pid)]:
         try:
@@ -158,8 +167,8 @@ def diagnostics(job_id):
             namespaces[name] = str(error)
     journal = probe("journalctl", "-b", "--no-pager", "-n", "2000")["stdout"]
     related = [line for line in journal.splitlines()
-               if any(word in line.lower() for word in ["namespace", "bpf", "firewall", "device", unit.lower()])]
-    return {"unit": unit, "properties": shown, "network_namespaces": namespaces,
+               if any(word in line.lower() for word in ["namespace", "bpf", "firewall", "device", (unit or "motor-job-").lower()])]
+    return {"unit": unit, "unit_candidates": candidates, "properties": shown, "network_namespaces": namespaces,
             "guest_interfaces": socket.if_nameindex(), "namespace_journal": "\n".join(related)[-24000:]}
 
 

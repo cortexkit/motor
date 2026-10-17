@@ -25,7 +25,11 @@ absolute paths; the Firecracker executable must be named `firecracker`.
   isolation compiles native launchers even when the submitted job is a shell.
 - The kernel builder pins Linux 6.1.128 and its kernel.org SHA-256. It builds
   XFS, virtio-blk/net/vsock, namespaces, cgroups and nftables into the ELF kernel;
-  it uses ordinary pages, not hugepages. Inputs/config/digests are retained.
+  it uses ordinary pages, not hugepages. It enables cgroup BPF for systemd's
+  device/firewall policies and disables tunnel drivers that create fallback
+  interfaces inside otherwise private network namespaces. The resolved config
+  is checked before compilation and again when saved, not just requested via
+  `scripts/config`. Inputs/config/digests are retained.
 - Allow **128 GiB peak incremental disk** including Cargo/kernel build scratch,
   rootfs copies, fully allocated 1/20/24 GiB XFS disks and two 18 GiB memory
   snapshots. Allow 22 GiB available host RAM and four build CPUs. Once inputs
