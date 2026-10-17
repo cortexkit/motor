@@ -24,6 +24,8 @@ import uuid
 GIB = 1024**3
 RAM_MIB = 18432
 HEADROOM_MIB = 512
+# Live scratch: 45 GiB disks + 36 GiB memory snapshots + 8 GiB rootfs copies + 7 GiB margin.
+MEASUREMENT_BUDGET_GIB = 96
 REQUIRED_METRICS = (
     "cold_boot", "vsock", "base_snapshot_create", "base_restore_20g", "base_restore_24g",
     "network_override", "drive_substitute_20g", "drive_substitute_24g",
@@ -84,9 +86,14 @@ def wait_for(action, timeout=60):
             time.sleep(0.02)
 
 
-def recv_exact(sock, size):
+def recv_exact(sock, size, deadline=None):
     data = bytearray()
     while len(data) < size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("probe frame deadline exceeded")
+            sock.settimeout(remaining)
         chunk = sock.recv(size - len(data))
         if not chunk:
             raise RuntimeError("unexpected EOF")
@@ -99,16 +106,25 @@ def send_frame(sock, frame):
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def read_frame(sock):
-    size, = struct.unpack(">I", recv_exact(sock, 4))
-    if not 0 < size <= 1048576:
-        raise RuntimeError(f"invalid frame size {size}")
-    return json.loads(recv_exact(sock, size))
+def read_frame(sock, deadline=None):
+    deadline = time.monotonic() + 120 if deadline is None else deadline
+    timeout = sock.gettimeout()
+    try:
+        while True:
+            size, = struct.unpack(">I", recv_exact(sock, 4, deadline))
+            if not 0 < size <= 1048576:
+                raise RuntimeError(f"invalid frame size {size}")
+            frame = json.loads(recv_exact(sock, size, deadline))
+            # The runner writer can tick before any reply, including Hello and Accepted.
+            if frame.get("type") != "heartbeat":
+                return frame
+    finally:
+        sock.settimeout(timeout)
 
 
-def hello(sock):
+def hello(sock, deadline=None):
     send_frame(sock, {"type": "hello", "protocol_version": 1, "started": True})
-    frame = read_frame(sock)
+    frame = read_frame(sock, deadline)
     if frame.get("type") != "hello" or frame.get("protocol_version") != 1:
         raise RuntimeError(f"runner hello failed: {frame}")
     return frame
@@ -434,15 +450,16 @@ def isolated_job(harness, vm):
                "length": len(bundle), "sha256": hashlib.sha256(bundle).hexdigest()}]}
     output = bytearray()
     with vm.connect(52) as conn:
-        hello(conn)
+        deadline = time.monotonic() + 120
+        hello(conn, deadline)
         send_frame(conn, request)
-        frame = read_frame(conn)
+        frame = read_frame(conn, deadline)
         if frame.get("type") != "accepted":
             raise RuntimeError(f"isolated job not accepted: {frame}")
         send_frame(conn, {"type": "bundle_chunk", "index": 0, "offset": 0,
                           "data": base64.b64encode(bundle).decode()})
         while True:
-            frame = read_frame(conn)
+            frame = read_frame(conn, deadline)
             harness.e.record("job_frame", frame=frame)
             if frame["type"] == "output":
                 output.extend(base64.b64decode(frame["data"], validate=True))
@@ -576,11 +593,13 @@ def preflight(args):
     for path in [args.kernel, args.rootfs]:
         if not path.is_file():
             raise RuntimeError(f"missing image input: {path}")
+    if args.rootfs.stat().st_size > 4 * GIB:
+        raise RuntimeError("rootfs exceeds the 4 GiB input size used by the probe's disk budget")
     for path in [args.work, args.results]:
         if path.exists() or not path.parent.is_dir():
             raise RuntimeError(f"need a new directory with an existing parent: {path}")
-    if shutil.disk_usage(args.work.parent).free < (128 + 16 + 128) * GIB:
-        raise RuntimeError("need >=272 GiB free: 128 GiB fleet floor + 16 GiB reserve + 128 GiB peak budget")
+    if shutil.disk_usage(args.work.parent).free < (128 + 16 + MEASUREMENT_BUDGET_GIB) * GIB:
+        raise RuntimeError("need >=240 GiB free: 128 GiB fleet floor + 16 GiB reserve + 96 GiB probe budget")
     available = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
                      if line.startswith("MemAvailable:"))
     if available < 22 * GIB:

@@ -9,6 +9,7 @@ import struct
 import subprocess
 import platform
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -50,6 +51,23 @@ class HostedSpikeTests(unittest.TestCase):
             a.shutdown(socket.SHUT_WR)
             with self.assertRaisesRegex(RuntimeError, "unexpected EOF"):
                 spike.read_frame(b)
+
+    def test_frame_reads_skip_heartbeats_before_the_real_reply(self):
+        a, b = socket.socketpair()
+        with a, b:
+            spike.send_frame(a, {"type": "heartbeat"})
+            spike.send_frame(a, {"type": "heartbeat", "queue_wait_ms": 0})
+            spike.send_frame(a, {"type": "accepted", "job_id": "probe"})
+            self.assertEqual(spike.read_frame(b), {"type": "accepted", "job_id": "probe"})
+
+    def test_heartbeats_cannot_extend_the_absolute_frame_deadline(self):
+        a, b = socket.socketpair()
+        with a, b:
+            for _ in range(10):
+                spike.send_frame(a, {"type": "heartbeat"})
+            with self.assertRaises((TimeoutError, socket.timeout)):
+                spike.read_frame(b, deadline=time.monotonic() + 0.01)
+            self.assertIsNone(b.gettimeout())
 
     def test_frame_rejects_oversized_message(self):
         a, b = socket.socketpair()

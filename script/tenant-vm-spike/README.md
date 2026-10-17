@@ -28,9 +28,13 @@ absolute paths; the Firecracker executable must be named `firecracker`.
   it uses ordinary pages, not hugepages. Inputs/config/digests are retained.
 - Allow **128 GiB peak incremental disk** including Cargo/kernel build scratch,
   rootfs copies, fully allocated 1/20/24 GiB XFS disks and two 18 GiB memory
-  snapshots. Allow 22 GiB available host RAM and four build CPUs. The measurement
-  preflight requires 272 GiB free (128 GiB fleet refusal floor + 16 GiB reserve
-  + the entire 128 GiB budget); each snapshot checks the floor again. Do not
+  snapshots. Allow 22 GiB available host RAM and four build CPUs. Once inputs
+  are built, the probe allocates at most 89 GiB: 45 GiB of tenant/placeholder
+  disks, 36 GiB of snapshot memory, and two 4 GiB rootfs copies. Its **96 GiB**
+  measurement budget adds 7 GiB for state/logs, fixtures and margin; existing
+  build inputs already reduce the host's reported free space. The measurement
+  preflight requires **240 GiB free** (128 GiB fleet refusal floor + 16 GiB
+  reserve + 96 GiB probe budget); each snapshot checks the floor again. Do not
   run if concurrent work could consume that reserve. Typical wall time budget:
   **30–60 minutes including builds**, **5–15 minutes for measurements**; these
   are planning allowances, not measured results.
