@@ -319,3 +319,74 @@ async fn tls_listener_runs_the_pinned_requester_bound_prelude() {
     assert!(task.await.unwrap().is_err());
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn warm_admission_applies_share_before_relay_and_third_run_keeps_quota_unchanged() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let mut clients = Vec::new();
+    let mut tasks = Vec::new();
+    for job in [JOB, JOB2] {
+        let mut c = c.clone();
+        c.jti = job.into();
+        let (mut client, server) = tokio::io::duplex(8192);
+        tasks.push(tokio::spawn(serve(runtime.clone(), server)));
+        let challenge = hello(&mut client, &broker, &requester, &c).await;
+        assert_eq!(
+            respond(&mut client, &requester, &c, challenge).await["type"],
+            "lease_ok"
+        );
+        write_frame(&mut client, &json!({"type":"hello"}))
+            .await
+            .unwrap();
+        let guest = peer(&fake).await;
+        guest.set_nonblocking(true).unwrap();
+        let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+        assert_eq!(
+            read_frame(&mut guest).await.unwrap()["type"],
+            "verified_lease"
+        );
+        clients.push((client, guest));
+    }
+    let quotas = || {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("quota:"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(quotas(), ["quota:1", "quota:2"]);
+    let mut third = c.clone();
+    third.jti = JOB3.into();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &third).await;
+    assert_eq!(
+        respond(&mut client, &requester, &third, challenge).await,
+        json!({"type":"lease_refused","reason":"host_full"})
+    );
+    task.await.unwrap().unwrap();
+    assert_eq!(quotas(), ["quota:1", "quota:2"]);
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == "relay:52")
+            .count(),
+        2
+    );
+    let guests: Vec<_> = clients
+        .into_iter()
+        .map(|(client, guest)| {
+            drop(client);
+            guest
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    drop(guests);
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}

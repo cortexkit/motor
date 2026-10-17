@@ -127,6 +127,9 @@ impl Runtime {
             let generation = self.control.wake(tenant, generation)?;
             let mut host = self.host.lock().expect("host lock");
             host.guest_ready(tenant, generation)?;
+        }
+        {
+            let host = self.host.lock().expect("host lock");
             self.control.quota(tenant, host.quota(tenant, unix_ms()))?;
         }
         self.start_events(tenant.to_owned());
@@ -266,6 +269,7 @@ struct ConnectionGuard {
     runtime: Arc<Runtime>,
     id: u64,
     alive: Arc<AtomicBool>,
+    tenant: String,
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
@@ -273,6 +277,15 @@ impl Drop for ConnectionGuard {
         let mut host = self.runtime.host.lock().expect("host lock");
         if host.close(self.id).is_err() {
             eprintln!("journal_failed");
+        }
+        if host.is_ready(&self.tenant)
+            && self
+                .runtime
+                .control
+                .quota(&self.tenant, host.quota(&self.tenant, unix_ms()))
+                .is_err()
+        {
+            eprintln!("quota_update_failed");
         }
     }
 }
@@ -384,6 +397,7 @@ where
         runtime: runtime.clone(),
         id,
         alive: alive.clone(),
+        tenant: prelude_guard.tenant.clone(),
     };
     drop(prelude_guard);
     let connected = async {
