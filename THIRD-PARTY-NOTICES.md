@@ -34,6 +34,21 @@ with references to the upstream source but contains no upstream code.
 These files are install inputs for a network measurement, not source code.
 `script/runner/network-fixture/README.md` records their SHA-256 digests.
 
+## Firecracker API specification (tenant-VM spike fixture)
+
+- Source: Firecracker v1.17.0 release, `firecracker_spec-v1.17.0.yaml` from
+  `firecracker-v1.17.0-x86_64.tgz`,
+  <https://github.com/firecracker-microvm/firecracker/releases/tag/v1.17.0>
+- License: Apache License 2.0, Copyright Amazon.com, Inc. or its affiliates
+- Files:
+  - `script/tenant-vm-spike/fixtures/firecracker_spec-v1.17.0.yaml` (verbatim)
+  - `script/tenant-vm-spike/fixtures/firecracker_spec-v1.17.0.json` (a
+    generated JSON projection of the YAML)
+  - `script/tenant-vm-spike/fixtures/LICENSE-APACHE-2.0` (the license text)
+
+`script/tenant-vm-spike/fixtures/README.md` records the YAML's SHA-256 and how
+the projection is regenerated and checked.
+
 ## AFT Windows VM setup script
 
 - Source: AFT, <https://github.com/cortexkit/aft>, `scripts/windows-vm/setup-guest.ps1`
