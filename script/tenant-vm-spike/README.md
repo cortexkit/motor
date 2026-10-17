@@ -14,6 +14,9 @@ absolute paths; the Firecracker executable must be named `firecracker`.
 - Host tools: Python 3.10+, iproute2, util-linux (including `mount`, `nsenter`,
   `fallocate`), xfsprogs, e2fsprogs, Git, debootstrap, curl, GNU make, GCC,
   flex, bison, bc, OpenSSL development headers, and libelf development headers.
+  Kernel and host kernel-build tools use **GCC 13.4.0** (`gcc-13`, not the
+  default GCC 15). The builder logs its version and refuses any other version;
+  GCC 15's C23 default rejects this kernel's `bool`/`false` definitions.
 - The rootfs builder reads `/etc/os-release` for the operator host's **Ubuntu
   release**, recording its suite, packages/build log and runner SHA. This avoids pairing a host-built
   executable with an older glibc. It refuses systemd older than 257 and checks
@@ -43,7 +46,7 @@ export CARGO_TARGET_DIR="$PWD/script/tenant-vm-spike/.work/cargo-target"
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
   cargo build --release --locked -p motor-runner -j4
-JOBS=4 bash script/tenant-vm-spike/build-kernel.sh \
+CC=gcc-13 JOBS=4 bash script/tenant-vm-spike/build-kernel.sh \
   "$PWD/script/tenant-vm-spike/.work/kernel"
 sudo env MOTOR_RUNNER="$CARGO_TARGET_DIR/release/motor-runner" \
   bash script/tenant-vm-spike/build-rootfs.sh \

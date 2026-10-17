@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import socket
 import struct
+import subprocess
+import platform
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -21,6 +23,20 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64", "Linux kernel builder")
+    def test_kernel_builder_refuses_unpinned_compiler_before_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            compiler = Path(directory) / "gcc-unpinned"
+            compiler.write_text("#!/bin/sh\necho '15.2.0'\n")
+            compiler.chmod(0o755)
+            import os
+            result = subprocess.run(["bash", str(Path(__file__).with_name("build-kernel.sh")),
+                                     str(Path(directory) / "output")],
+                                    env={**os.environ, "CC": str(compiler)}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("kernel compiler must be pinned GCC 13.4.0", result.stdout)
+            self.assertFalse((Path(directory) / "output/linux-6.1.128.tar.xz").exists())
+
     def test_frame_roundtrip(self):
         a, b = socket.socketpair()
         with a, b:
