@@ -7,3 +7,43 @@ instance runs jobs.
 
 [docs/linux-microvm.md](../../docs/linux-microvm.md#motor-vm-helper) describes
 its host prerequisites, installation, protocol, restart behavior and tests.
+# Persistent tenant operations
+
+The existing connection-owned job slots are unchanged. Tenant operations are
+independent of job leases and survive client disconnects. Authorized peers can
+send `ensure`, `attach_disk`, `suspend`, `restore`, `stop_tenant`, `set_cpu_max`,
+`set_egress`, `open_relay` and `adopt`. Each takes only `tenant`; `set_cpu_max`
+also requires integer `vcpus` (1 through the registry ceiling), and `open_relay`
+requires `port` (52, 53 or 54). Hyphenated aliases are accepted for the multiword
+ops. Unknown fields are refused. `open_relay` returns one SCM_RIGHTS descriptor
+with `{"result":"relay","fd_count":1}`; other tenant operations return
+`{"result":"tenant","running":true,"restored":false,"generation":1}`.
+`adopt` only observes the current helper's VM, and never wakes a stopped VM.
+
+Only root provisioning writes `/etc/motor-vm-helper/tenants/<tenant>.json`.
+Tenant names are validated before opening any registry path, and registry
+symlinks/writable ancestors are refused. See `script/tenant-provision/README.md`
+for the registry, image, cgroup and disk prerequisites. Tenant VMMs specifically
+use `/usr/local/lib/firecracker/1.17.0/{jailer,firecracker}`; existing job binaries
+remain configured as before. They use ordinary file-backed RAM, no job UFFD
+loader, and never clone a tenant disk. A disk lock prevents duplicate attachment.
+
+Fresh starts load a paused base snapshot for the pinned image, vCPU ceiling and
+guest RAM size, update the drive and tap,
+and durably increment generation before resuming. Suspend requires a successful
+guest `prepare_snapshot` (bounded drain, sync and freeze), snapshots to a key
+containing image hashes and generation, then stops the VMM. Insufficient byte
+space returns `suspend_skipped_space`. Failed preparation or snapshot creation
+leaves the VM running and thaws the guest; `stop_tenant` also prepares the disk
+but never writes a snapshot. Restore consumes/fsyncs the snapshot and advances
+generation **before** resume; it then thaws. The host still calls `post_restore`
+on a restored VM and `attach_tenant` on a fresh one. Mismatched keys or failed
+snapshot loads fall back to the size base, preserving the disk. A helper restart
+kills old tenant VMMs, but never removes tenant disks or generation files.
+
+The host's `motor_tenant` nftables table is independent of the guest's per-job
+`motor_net` table. It drops tenant traffic to the host, other tenants' taps,
+private/reserved IPv4 destinations, all IPv6 and unsolicited inbound traffic.
+Each drop rule counts blocked packets and bytes. Public egress is masqueraded
+per tenant. `set_egress` installs this fixed policy; callers
+cannot pass firewall rules or paths. Per-job network policy stays in the guest.

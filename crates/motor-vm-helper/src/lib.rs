@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod tenant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -59,6 +60,40 @@ pub enum Request {
     },
     List {
         instance: String,
+    },
+    Ensure {
+        tenant: String,
+    },
+    #[serde(alias = "attach-disk")]
+    AttachDisk {
+        tenant: String,
+    },
+    Suspend {
+        tenant: String,
+    },
+    Restore {
+        tenant: String,
+    },
+    #[serde(alias = "stop-tenant")]
+    StopTenant {
+        tenant: String,
+    },
+    #[serde(alias = "set-cpu-max")]
+    SetCpuMax {
+        tenant: String,
+        vcpus: u32,
+    },
+    #[serde(alias = "set-egress")]
+    SetEgress {
+        tenant: String,
+    },
+    #[serde(alias = "open-relay")]
+    OpenRelay {
+        tenant: String,
+        port: u32,
+    },
+    Adopt {
+        tenant: String,
     },
 }
 
@@ -119,11 +154,27 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
-    Acquired { slot: Option<usize> },
-    Started { fd_count: usize },
+    Acquired {
+        slot: Option<usize>,
+    },
+    Started {
+        fd_count: usize,
+    },
     Ok,
-    List { slots: Vec<SlotView> },
-    Error { message: String },
+    List {
+        slots: Vec<SlotView>,
+    },
+    Error {
+        message: String,
+    },
+    Tenant {
+        running: bool,
+        restored: bool,
+        generation: u64,
+    },
+    Relay {
+        fd_count: usize,
+    },
 }
 pub struct Response {
     pub reply: Reply,
@@ -146,6 +197,9 @@ pub trait Machine {
     fn stop(&mut self, slot: usize, lease: &Lease, export: bool) -> Result<()>;
     fn cleanup(&mut self, slot: usize) -> Result<()>;
     fn alive(&mut self, slot: usize) -> bool;
+    fn tenant(&mut self, _tenant: &str, _op: tenant::Operation) -> Result<Response> {
+        Err(Error("tenant VMs are not configured".into()))
+    }
 }
 
 pub struct Helper<M: Machine> {
@@ -305,7 +359,27 @@ impl<M: Machine> Helper<M> {
                     .collect();
                 Ok(Response::new(Reply::List { slots }))
             }
+            Request::Ensure { tenant } => self.tenant(&tenant, tenant::Operation::Ensure),
+            Request::AttachDisk { tenant } => self.tenant(&tenant, tenant::Operation::AttachDisk),
+            Request::Suspend { tenant } => self.tenant(&tenant, tenant::Operation::Suspend),
+            Request::Restore { tenant } => self.tenant(&tenant, tenant::Operation::Restore),
+            Request::StopTenant { tenant } => self.tenant(&tenant, tenant::Operation::Stop),
+            Request::SetCpuMax { tenant, vcpus } => {
+                self.tenant(&tenant, tenant::Operation::Cpu(vcpus))
+            }
+            Request::SetEgress { tenant } => self.tenant(&tenant, tenant::Operation::Egress),
+            Request::OpenRelay { tenant, port } => {
+                self.tenant(&tenant, tenant::Operation::Relay(port))
+            }
+            Request::Adopt { tenant } => self.tenant(&tenant, tenant::Operation::Adopt),
         }
+    }
+    fn tenant(&mut self, name: &str, op: tenant::Operation) -> Result<Response> {
+        tenant::validate_name(name)?;
+        if let tenant::Operation::Relay(port) = op {
+            tenant::validate_port(port)?;
+        }
+        self.machine.tenant(name, op)
     }
     pub fn disconnect(&mut self, connection: u64) {
         self.connections.remove(&connection);

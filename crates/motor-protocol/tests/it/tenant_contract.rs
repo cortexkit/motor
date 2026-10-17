@@ -3,7 +3,7 @@ use serde_json::json;
 
 #[test]
 fn pinned_tenant_frames_are_inline_and_integer_only() {
-    let id = Uuid::now_v7();
+    let id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
     let value = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:test","vcpus":2,
         "mem_mib":16384,"platform":"linux","net":false,"max_s":30,"exp":1800000000});
     let frame: Frame = serde_json::from_value(value.clone()).unwrap();
@@ -40,7 +40,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
 
 #[test]
 fn pinned_agent_operations_roundtrip_and_preserve_exit_after() {
-    let id = Uuid::now_v7();
+    let id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
     for value in [
         json!({"op":"attach_tenant","generation":1,"unix_ms":1800000000000_u64,"seed":"seed","address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"tenant-a","machine_id":"0123456789abcdef0123456789abcdef"}),
         json!({"op":"post_restore","unix_ms":1800000000000_u64,"seed":"seed"}),
@@ -59,4 +59,36 @@ fn pinned_agent_operations_roundtrip_and_preserve_exit_after() {
             .is_err()
     );
     assert!(serde_json::from_value::<TenantAgentRequest>(json!({"op":"unknown"})).is_err());
+}
+
+#[test]
+fn tenant_snapshot_control_roundtrips_additively() {
+    for (wire, expected) in [
+        (
+            r#"{"op":"prepare_snapshot","kind":"base"}"#,
+            TenantAgentRequest::PrepareSnapshot {
+                kind: SnapshotKind::Base,
+            },
+        ),
+        (
+            r#"{"op":"prepare_snapshot","kind":"suspend"}"#,
+            TenantAgentRequest::PrepareSnapshot {
+                kind: SnapshotKind::Suspend,
+            },
+        ),
+        (r#"{"op":"thaw"}"#, TenantAgentRequest::Thaw),
+        (r#"{"op":"status"}"#, TenantAgentRequest::Status),
+    ] {
+        let decoded: TenantAgentRequest = serde_json::from_str(wire).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::from_str::<serde_json::Value>(wire).unwrap()
+        );
+    }
+    assert!(serde_json::from_str::<TenantAgentRequest>(
+        r#"{"op":"prepare_snapshot","kind":"unknown"}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<TenantAgentRequest>(r#"{"op":"prepare_snapshot"}"#).is_err());
 }

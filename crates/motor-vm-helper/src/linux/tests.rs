@@ -30,6 +30,8 @@ fn capacity_machine(base: &Path) -> LinuxMachine {
     let mut config: crate::config::Config =
         serde_json::from_str(include_str!("../../fixtures/helper.json")).unwrap();
     config.hugepages_per_slot = 4;
+    let tenants =
+        crate::tenant::Controller(tenant::LinuxTenants::new(&config, base.join("cgroups")));
     LinuxMachine {
         config,
         base: File::open(base).unwrap(),
@@ -38,6 +40,7 @@ fn capacity_machine(base: &Path) -> LinuxMachine {
             root: base.join("cgroups"),
         },
         running: BTreeMap::new(),
+        tenants,
     }
 }
 
