@@ -84,7 +84,7 @@ Group=motor-spike
 Environment=HOME=/tenant/home
 Environment=CARGO_HOME=/tenant/home/.cargo
 Environment=RUSTUP_HOME=/tenant/home/.rustup
-ExecStart=/usr/local/bin/motor-runner serve --backend host --instance spike --state-root /tenant/state --workspace-root /tenant/work --owned-workspace-root /workspace --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648
+ExecStart=/usr/local/bin/motor-runner serve --backend host --instance spike --state-root /tenant/state --workspace-root /tenant/work --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648
 EOF
 chroot "$root" systemctl enable spike-agent.service
 chroot "$root" systemctl mask systemd-networkd.service systemd-resolved.service apt-daily.timer apt-daily-upgrade.timer

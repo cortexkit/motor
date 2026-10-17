@@ -49,10 +49,12 @@ def attach(expected_bytes):
         raise RuntimeError("refusing to mount an already attached tenant")
     command("mount", "-t", "xfs", "/dev/vdb", "/tenant")
     for name in ["home", "home/.cargo", "home/.cargo/bin", "home/.cargo/registry",
-                 "home/.cargo/git", "home/.rustup", "state", "work", "probe-a", "probe-b"]:
+                 "home/.cargo/git", "home/.rustup", "state", "state/workspaces", "work", "probe-a", "probe-b"]:
         Path("/tenant", name).mkdir(parents=True, exist_ok=True)
     command("chown", "-R", "motor-spike:motor-spike", "/tenant")
-    Path("/workspace").mkdir(exist_ok=True)
+    Path("/Users").mkdir(exist_ok=True)
+    command("mount", "--bind", "/tenant/state/workspaces", "/Users")
+    command("runuser", "-u", "motor-spike", "--", "test", "-w", "/Users")
     Path("/var/lib/motor-spike/host-only").write_text("not visible to an isolated job\n")
     Path("/tenant/persistent-marker").write_text("tenant-vm-spike\n")
     os.sync()
@@ -64,6 +66,8 @@ def attach(expected_bytes):
         time.sleep(0.05)
     return {"device": "/dev/vdb", "bytes": size,
             "filesystem": command("findmnt", "-n", "-o", "FSTYPE", "/tenant"),
+            "owned_workspace_root": "/Users", "workspace_source": "/tenant/state/workspaces",
+            "workspace_owner_uid": Path("/Users").stat().st_uid,
             "runner": command("systemctl", "is-active", "spike-runner")}
 
 

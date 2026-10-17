@@ -26,6 +26,7 @@ RAM_MIB = 18432
 HEADROOM_MIB = 512
 # Live scratch: 45 GiB disks + 36 GiB memory snapshots + 8 GiB rootfs copies + 7 GiB margin.
 MEASUREMENT_BUDGET_GIB = 96
+PROBE_WORKSPACE = "/Users/spike/probe"
 REQUIRED_METRICS = (
     "cold_boot", "vsock", "base_snapshot_create", "base_restore_20g", "base_restore_24g",
     "network_override", "drive_substitute_20g", "drive_substitute_24g",
@@ -244,19 +245,34 @@ class VM:
         return result
 
     def snapshot(self, name):
+        before = self.io_counters()
         started = time.monotonic_ns()
         result = self.api("PUT", "/snapshot/create", {"snapshot_type": "Full",
                           "snapshot_path": f"/state/{name}.vmstate", "mem_file_path": f"/state/{name}.mem"})
         responded = time.monotonic_ns()
-        for path in [self.h.state / f"{name}.vmstate", self.h.state / f"{name}.mem", self.h.state]:
+        after = self.io_counters()
+        phases = {}
+        for label, path in [("vmstate_file", self.h.state / f"{name}.vmstate"),
+                            ("memory_file", self.h.state / f"{name}.mem"), ("directory", self.h.state)]:
+            sync_started = time.monotonic_ns()
             fd = os.open(path, os.O_RDONLY)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            phases[label + "_fsync_ms"] = (time.monotonic_ns() - sync_started) / 1e6
+        memory = (self.h.state / f"{name}.mem").stat()
         self.e.record("snapshot_timing", name=name, api_ms=(responded - started) / 1e6,
-                      fsync_ms=(time.monotonic_ns() - responded) / 1e6)
+                      fsync_ms=sum(phases.values()), **phases,
+                      memory_file_bytes=memory.st_size, memory_file_allocated_bytes=memory.st_blocks * 512,
+                      vmm_io_delta={key: after[key] - value for key, value in before.items()})
         return result
+
+    def io_counters(self):
+        if self.proc is None:
+            raise RuntimeError("VMM I/O counters require a running jailer process")
+        return {key.rstrip(":"): int(value) for key, value in
+                (line.split() for line in Path(f"/proc/{self.proc.pid}/io").read_text().splitlines())}
 
     def load(self, name, tap):
         return self.api("PUT", "/snapshot/load", {"snapshot_path": f"/state/{name}.vmstate",
@@ -453,8 +469,8 @@ def isolated_job(harness, vm):
         "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
     job_id = str(uuid.uuid4())
     commit, tree, bundle = fixture_bundle(harness.e, fixture, job_id)
-    request = {"type": "run", "job_id": job_id, "workspace_key": "/workspace/probe",
-               "repository_root": "/workspace/probe", "cwd": "/workspace/probe",
+    request = {"type": "run", "job_id": job_id, "workspace_key": PROBE_WORKSPACE,
+               "repository_root": PROBE_WORKSPACE, "cwd": PROBE_WORKSPACE,
                "command": "test \"$(id -un)\" = motor-job && "
                           "test ! -e /var/lib/motor-spike/host-only && "
                           "python3 -c 'import socket; assert socket.if_nameindex() == [(1, \"lo\")]' && "
@@ -462,7 +478,7 @@ def isolated_job(harness, vm):
                "env": {}, "weight_hint": 1, "timeout": 30, "queue_wait_limit_s": 30,
                # This temporary repository has no remote; an empty tip avoids background cache fills.
                "snapshot_commit": commit, "tree_hash": tree, "integration_tip": "",
-               "siblings": [], "bundles": [{"index": 0, "repository": "/workspace/probe",
+               "siblings": [], "bundles": [{"index": 0, "repository": PROBE_WORKSPACE,
                "length": len(bundle), "sha256": hashlib.sha256(bundle).hexdigest()}]}
     output = bytearray()
     with vm.connect(52) as conn:

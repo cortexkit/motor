@@ -92,6 +92,10 @@ the `motor-job` identity, hidden guest-root files, and loopback-only networking,
 and require an exit-0 terminal plus an output marker. No compiler/cache workload
 or outbound-job test is implied. The permissive daemon sudoers entry and the
 root vsock test agent are for this throwaway image only, not production policy.
+The daemon owns `/tenant/state/workspaces`, bind-mounted at `/Users` before
+runner startup. Jobs use `/Users/spike/probe` under the runner's default owned
+workspace root, matching the production same-filesystem layout. `/Users` is
+not an unrelated root-owned directory and the runner's checks are unchanged.
 
 - `cold_boot`: launch jailer through base-agent vsock readiness. The base has a
   1 GiB placeholder `/dev/vdb`, **not mounted**, and the runner is not started
@@ -102,7 +106,11 @@ root vsock test agent are for this throwaway image only, not production policy.
   with `snapshot_type:Full`, `snapshot_path`, `mem_file_path`; includes fsync of
   both files and their directory. The guest is synced before pause. Snapshot
   creation is timed separately from preparation/stop; `snapshot_timing` raw
-  events separate API request duration from the following fsync interval.
+  events separate the API phase (including memory-file writes) from **each**
+  subsequent memory-file, VM-state-file and directory fsync. VMM `/proc/PID/io`
+  deltas and memory-file length/allocated bytes are also recorded. API timing
+  includes Firecracker's internal serialization, not just pure write syscalls;
+  no tracing overhead is added to the five-run latency measurements.
 - `base_restore_{20,24}g`: new jailer/cgroup, `PUT /snapshot/load` using
   `mem_backend:{backend_type:File,backend_path}`, `resume_vm:false`,
   `enable_diff_snapshots:false` and
