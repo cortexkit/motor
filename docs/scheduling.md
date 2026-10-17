@@ -91,14 +91,25 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
 - A job's queue-wait clock starts when its bundles are verified and pinned, not
   at acceptance; upload, fetch and setup do not count. Test:
   `upload_fetch_and_setup_do_not_spend_queue_wait_budget`.
-- While the job waits for capacity, its heartbeats carry `queue_wait_ms`. The
-  client keeps a local deadline from it and, when the budget runs out, asks the
-  runner to withdraw the job. The runner answers `withdrawn` (the job ends as
-  `refused_before_start` / `queue_wait_exceeded`) or `started` (too late; the
-  job runs). Only that answer decides. Tests:
+- While the job is queued, its heartbeats carry `queue_wait_ms`. The clock
+  advances for capacity and other shared scheduler blockers, but pauses while
+  the only blocker is an earlier job that owns the same workspace. If another
+  blocker appears, queue time resumes from its accumulated value. Cancellation
+  still removes a queued job; the request's execution timeout still starts when
+  its command starts. Job status reports the current scheduler blocker in
+  `waiting_on`.
+  The client keeps a local deadline from `queue_wait_ms` and, when the budget
+  runs out, asks the runner to withdraw the job. The runner answers `withdrawn`
+  (the job ends as `refused_before_start` / `queue_wait_exceeded`) or `started`
+  (too late; the job runs). Only that answer decides. Tests:
   `zero_queue_wait_withdraws_and_cancel_is_idempotent`
   (`crates/motor-module/tests/it/recovery.rs`),
   `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`,
+  `workspace_owner_wait_does_not_spend_queue_wait_budget`,
+  `queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes`,
+  `cancelled_workspace_waiter_is_removed_from_the_queue`,
+  `jobs_waiting_on_a_workspace_keep_fifo_order`
+  (`crates/motor-runner/src/tests.rs`),
   `streamed_elapsed_queue_time_sets_a_local_deadline`
   (`crates/motor-module/src/queue_tests.rs`).
 - The budget is the request's `queue_wait_limit_s`, else `ck-motor`'s

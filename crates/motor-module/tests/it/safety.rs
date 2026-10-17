@@ -911,6 +911,7 @@ impl Connector for FutureRecords {
                         &Frame::JobStatusReply(JobStatusReply {
                             job_id,
                             state: "running".into(),
+                            waiting_on: None,
                             terminal: None,
                             unit: None,
                             unit_alive: None,
@@ -1021,6 +1022,7 @@ impl Connector for UnknownCursorRecovery {
                         &Frame::JobStatusReply(JobStatusReply {
                             job_id,
                             state: "running".into(),
+                            waiting_on: None,
                             terminal: None,
                             unit: None,
                             unit_alive: None,

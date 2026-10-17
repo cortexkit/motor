@@ -314,6 +314,48 @@ fn large_retained_table_and_blocked_heads_use_a_bounded_number_of_scheduler_scan
 }
 
 #[test]
+fn queue_wait_clock_updates_scan_a_large_retained_table_once() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 64;
+    config.disable_warm_builds = true;
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    for number in 1..=10_000u128 {
+        let mut retained = Job::new(Uuid::from_u128(number), None, now, 0, 0);
+        retained.terminal(Outcome::Exit { code: 0 }, now);
+        inner.jobs.insert(retained.id, retained);
+    }
+    let mut owner = job(&request, &f.key, 2, 0, false, now);
+    owner.request.as_mut().unwrap().siblings.clear();
+    owner.state = JobState::Running;
+    owner.started_ms = Some(now);
+    let owner_id = owner.id;
+    inner.jobs.insert(owner_id, owner);
+    let mut waiting = job(&request, &f.key, 2, 1, false, now);
+    waiting.request.as_mut().unwrap().siblings.clear();
+    waiting.start_queue_wait(now);
+    let waiting_id = waiting.id;
+    inner.jobs.insert(waiting_id, waiting);
+
+    inner.scheduler_visits.store(0, Ordering::SeqCst);
+    runner.dispatch(&mut inner, now).unwrap();
+    let visits = inner.scheduler_visits.load(Ordering::SeqCst);
+    assert_eq!(
+        inner.jobs[&waiting_id].queue_entry.load(Ordering::Acquire),
+        PAUSED_QUEUE
+    );
+    assert!(!inner.starting.contains(&waiting_id));
+    assert!(
+        visits <= 3 * 10_002,
+        "queue clock update multiplied retained-table scans: {visits}"
+    );
+}
+
+#[test]
 fn dispatch_indexes_preserve_running_and_reserved_sibling_conflicts() {
     let f = Fixture::new();
     let runner = runner(&f);

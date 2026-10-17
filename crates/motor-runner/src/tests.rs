@@ -4161,6 +4161,223 @@ async fn upload_fetch_and_setup_do_not_spend_queue_wait_budget() {
 }
 
 #[tokio::test]
+async fn workspace_owner_wait_does_not_spend_queue_wait_budget() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let release = f.scratch.join("release-workspace-owner");
+    struct FinishHolder(PathBuf);
+    impl Drop for FinishHolder {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+    let _finish = FinishHolder(release.clone());
+    let (holder, bytes) = f.run(&format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    ));
+    f.submit(&runner, &holder, &bytes);
+    until(|| runner.job_status(holder.job_id).unwrap().state == "running").await;
+
+    let (mut waiting, bytes) = f.run("true");
+    waiting.queue_wait_limit_s = 1;
+    f.submit(&runner, &waiting, &bytes);
+    let progress = runner.queue_progress(waiting.job_id);
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(status.state, "queued");
+    assert_eq!(status.waiting_on.as_deref(), Some("workspace owner"));
+    assert_eq!(status.queue_wait_ms, Some(0));
+
+    f.clock.fetch_add(10_000, Ordering::SeqCst);
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some("workspace owner"));
+    assert_eq!(status.queue_wait_ms, Some(0));
+    assert_eq!(progress.elapsed_ms(), Some(0));
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Started
+    );
+
+    fs::write(release, "").unwrap();
+    assert_eq!(
+        terminal(&runner, holder.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    assert_eq!(
+        terminal(&runner, waiting.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+}
+
+#[test]
+fn queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let now = runner.now();
+    let (mut owner, _) = f.run("true");
+    owner.siblings.clear();
+    let (mut capacity_owner, _) = job_at(&f, "capacity-owner", "true");
+    capacity_owner.siblings.clear();
+    let (mut waiting, _) = f.run("true");
+    waiting.siblings.clear();
+    waiting.queue_wait_limit_s = 1;
+
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let mut owner_job = Job::new(owner.job_id, Some(owner.clone()), now, 1, 2);
+        owner_job.state = JobState::Running;
+        inner.jobs.insert(owner.job_id, owner_job);
+        let mut capacity_job = Job::new(
+            capacity_owner.job_id,
+            Some(capacity_owner.clone()),
+            now,
+            2,
+            1,
+        );
+        capacity_job.state = JobState::Running;
+        inner.jobs.insert(capacity_job.id, capacity_job);
+        let mut waiting_job = Job::new(waiting.job_id, Some(waiting.clone()), now, 3, 2);
+        waiting_job.state = JobState::Queued;
+        waiting_job.queued_ms = Some(now);
+        waiting_job.start_queue_wait(now);
+        inner.jobs.insert(waiting.job_id, waiting_job);
+    }
+
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some("workspace owner"));
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.jobs.remove(&owner.job_id);
+        inner.jobs.get_mut(&capacity_owner.job_id).unwrap().weight = 3;
+    }
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some("permits"));
+    assert_eq!(status.queue_wait_ms, Some(0));
+    f.clock.fetch_add(400, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(400)
+    );
+    f.clock.fetch_add(600, Ordering::SeqCst);
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let terminal = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    assert_eq!(terminal.queue_wait_ms, 1_000);
+    assert!(terminal
+        .refusal_detail()
+        .unwrap()
+        .starts_with("waiting_on=permits"));
+}
+
+#[test]
+fn cancelled_workspace_waiter_is_removed_from_the_queue() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let now = runner.now();
+    let (mut owner, _) = f.run("true");
+    owner.siblings.clear();
+    let (mut waiting, _) = f.run("touch must-not-run");
+    waiting.siblings.clear();
+
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let mut owner_job = Job::new(owner.job_id, Some(owner), now, 1, 2);
+        owner_job.state = JobState::Running;
+        inner.jobs.insert(owner_job.id, owner_job);
+        let mut waiting_job = Job::new(waiting.job_id, Some(waiting.clone()), now, 2, 2);
+        waiting_job.state = JobState::Queued;
+        waiting_job.queued_ms = Some(now);
+        waiting_job.start_queue_wait(now);
+        inner.jobs.insert(waiting.job_id, waiting_job);
+    }
+    assert_eq!(
+        runner
+            .job_status(waiting.job_id)
+            .unwrap()
+            .waiting_on
+            .as_deref(),
+        Some("workspace owner")
+    );
+    assert_eq!(runner.queue_progress(waiting.job_id).elapsed_ms(), Some(0));
+
+    runner.cancel(waiting.job_id).unwrap();
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().state,
+        "tombstone"
+    );
+    assert_eq!(runner.queue_progress(waiting.job_id).elapsed_ms(), None);
+    assert!(!runner.core.inner.lock().unwrap().jobs[&waiting.job_id].pending());
+}
+
+#[tokio::test]
+async fn jobs_waiting_on_a_workspace_keep_fifo_order() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let release = f.scratch.join("release-workspace-fifo");
+    let log = f.scratch.join("workspace-fifo.log");
+    struct FinishHolder(PathBuf);
+    impl Drop for FinishHolder {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+    let _finish = FinishHolder(release.clone());
+    let (holder, bytes) = f.run(&format!(
+        "while test ! -e '{}'; do sleep .02; done; echo first >> '{}'",
+        release.display(),
+        log.display()
+    ));
+    f.submit(&runner, &holder, &bytes);
+    until(|| runner.job_status(holder.job_id).unwrap().state == "running").await;
+
+    let (first, bytes) = f.run(&format!("echo second >> '{}'", log.display()));
+    f.submit(&runner, &first, &bytes);
+    let (second, bytes) = f.run(&format!("echo third >> '{}'", log.display()));
+    f.submit(&runner, &second, &bytes);
+    assert_eq!(
+        runner
+            .job_status(first.job_id)
+            .unwrap()
+            .waiting_on
+            .as_deref(),
+        Some("workspace owner")
+    );
+    assert_eq!(
+        runner
+            .job_status(second.job_id)
+            .unwrap()
+            .waiting_on
+            .as_deref(),
+        Some("workspace owner")
+    );
+
+    fs::write(release, "").unwrap();
+    for id in [holder.job_id, first.job_id, second.job_id] {
+        assert_eq!(
+            terminal(&runner, id).await.outcome,
+            Outcome::Exit { code: 0 }
+        );
+    }
+    assert_eq!(fs::read_to_string(log).unwrap(), "first\nsecond\nthird\n");
+}
+
+#[tokio::test]
 async fn real_permit_wait_still_expires_and_names_the_other_holder() {
     let f = Fixture::new();
     let mut config = f.config();
