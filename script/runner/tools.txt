@@ -31,6 +31,8 @@
 #   /usr/local/lib/firecracker/1.17.0/ with links /usr/local/bin/firecracker-1.17.0
 #   and /usr/local/bin/jailer-1.17.0. Operator-only: the microVM and tenant-VM
 #   work runs them as root on the host; jobs never start VMs.
+# - flex, bison and libelf-dev: kernel build prerequisites for the operator's
+#   tenant-VM guest kernel (script/tenant-vm-spike/build-kernel.sh).
 # - Node, pnpm and Bun: preinstall the versions required by repository manifests.
 #   The runner also uses Bun for pre-job bun.lock installs. Verify official
 #   release archives against published SHA-256 sums. Install tools under /usr
