@@ -572,7 +572,9 @@ impl Backend for HostBackend {
                 .map(|sandbox| {
                     #[cfg(test)]
                     let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
-                    sandbox.retaining_failed_units()
+                    sandbox
+                        .retaining_failed_units()
+                        .in_tenant_vm(config.tenant_vm)
                 })
                 .and_then(|sandbox| {
                     #[cfg(test)]

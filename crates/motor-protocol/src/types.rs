@@ -274,6 +274,9 @@ macro_rules! define_frames {
 }
 
 define_frames! {
+    VerifiedLease(crate::VerifiedLease),
+    Event(crate::TenantEvent),
+    Ack { event_seq: u64 },
     Hello {
         protocol_version: u32,
         /// Opt in to sequenced Started records; absence preserves the legacy output cursor.

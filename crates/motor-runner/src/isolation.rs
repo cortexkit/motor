@@ -1520,6 +1520,15 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
     Ok(())
 }
 
+fn tenant_unit_properties() -> [&'static str; 3] {
+    [
+        "--property=TasksMax=4096",
+        "--property=RestrictAddressFamilies=~AF_VSOCK",
+        // Alternate syscall ABIs must not bypass the address-family filter.
+        "--property=SystemCallArchitectures=native",
+    ]
+}
+
 pub(crate) struct Sandbox {
     id: Uuid,
     root: PathBuf,
@@ -1544,6 +1553,7 @@ pub(crate) struct Sandbox {
     user: &'static str,
     writer: bool,
     network: bool,
+    tenant_vm: bool,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2109,12 +2119,17 @@ impl Sandbox {
             user: if writer { WRITER_USER } else { USER },
             writer,
             network: false,
+            tenant_vm: false,
         })
     }
 
     /// See [`Sandbox::retain_failed`].
     pub(crate) fn retaining_failed_units(mut self) -> Self {
         self.retain_failed = true;
+        self
+    }
+    pub(crate) fn in_tenant_vm(mut self, enabled: bool) -> Self {
+        self.tenant_vm = enabled;
         self
     }
 
@@ -2173,6 +2188,9 @@ impl Sandbox {
             "--expand-environment=no",
         ])
         .arg(format!("--unit={}", unit(self.id)));
+        if self.tenant_vm {
+            cmd.args(tenant_unit_properties());
+        }
         if durable {
             // Inheriting --pipe stderr would let a job forge launcher accounting
             // through its parent's descriptors. Only stdin crosses the boundary.
