@@ -87,7 +87,7 @@ impl Server {
             .unwrap();
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
             body.len()
         )
         .unwrap();
@@ -170,14 +170,14 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
         &lease.job_token,
         &keys,
         HOST,
-        Some("test-job"),
+        Some("019e4567-89ab-7cde-8012-3456789abcde"),
         Purpose::Run,
         now_ms() / 1000,
     )
     .unwrap();
     assert_eq!(token.purpose, Purpose::Run);
     let (status, body) = server.post(
-        "/v1/leases/test-job/reattach",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
         &ReattachRequest {
             requester_jwk: lease_request().requester_jwk,
         },
@@ -189,7 +189,7 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
             &attach.job_token,
             &keys,
             HOST,
-            Some("test-job"),
+            Some("019e4567-89ab-7cde-8012-3456789abcde"),
             Purpose::Attach,
             now_ms() / 1000
         )
@@ -213,18 +213,18 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
     let mut u = usage();
     u.started_at_ms = now_ms() - 3000;
     u.ended_at_ms = u.started_at_ms + 3000;
-    let first = server.host_post("usage", &u, 2, now_ms());
+    let first = server.host_post("usage", &u, 3, now_ms());
     assert_eq!(
         first,
         (
             200,
-            json!({"job_id":"test-job","settled_vcpu_ms":6000,"released_vcpu_ms":14000})
+            json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde","settled_vcpu_ms":6000,"released_vcpu_ms":14000})
         )
     );
-    assert_eq!(server.host_post("usage", &u, 3, now_ms()), first);
+    assert_eq!(server.host_post("usage", &u, 4, now_ms()), first);
     assert_eq!(
         server.post(
-            "/v1/leases/test-job/reattach",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
             &ReattachRequest {
                 requester_jwk: lease_request().requester_jwk
             }
@@ -233,11 +233,11 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
     );
     assert_eq!(
         server.request("POST", "/v1/leases", b"{}", false, None),
-        (401, json!({"error":"auth"}))
+        (401, json!({"error":"unauthorized"}))
     );
     assert_eq!(
         server.post("/v1/leases", &json!({})),
-        (400, json!({"error":"invalid_request"}))
+        (400, json!({"error":"bad_request"}))
     );
 }
 
@@ -263,7 +263,7 @@ fn fake_binary_refusal_and_shortening_flags_work_over_http() {
     let (status, body) = shortened.post("/v1/leases", &request);
     assert_eq!(status, 201);
     assert_eq!(body["max_s"], 5);
-    assert_eq!(body["reserved_vcpu_ms"], 200000);
+    assert_eq!(body["reserved_vcpu_ms"], 10000);
 }
 
 #[test]
@@ -272,16 +272,22 @@ fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
     let (status, body) = server.post("/v1/leases", &lease_request());
     assert_eq!(status, 201);
     let lease: LeaseResponse = serde_json::from_value(body).unwrap();
-    let first = server.post("/v1/leases/test-job/release", &ReleaseRequest {});
+    let first = server.post(
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+        &ReleaseRequest {},
+    );
     assert_eq!(
         first,
         (
             202,
-            json!({"job_id":"test-job", "release_at_ms":lease.token_expires_at_ms + 60000})
+            json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde", "release_at_ms":lease.token_expires_at_ms + 60000})
         )
     );
     assert_eq!(
-        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        server.post(
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+            &ReleaseRequest {}
+        ),
         first
     );
     assert_eq!(
@@ -290,7 +296,7 @@ fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
     );
     assert_eq!(
         server.post(
-            "/v1/leases/test-job/reattach",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
             &ReattachRequest {
                 requester_jwk: lease_request().requester_jwk
             }
@@ -305,7 +311,7 @@ fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
         &lease.job_token,
         &keys,
         HOST,
-        Some("test-job"),
+        Some("019e4567-89ab-7cde-8012-3456789abcde"),
         Purpose::Run,
         now_ms() / 1000,
     )
@@ -317,7 +323,10 @@ fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
         200
     );
     assert_eq!(
-        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        server.post(
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+            &ReleaseRequest {}
+        ),
         (409, json!({"error":"job_admitted"}))
     );
     let mut u = usage();
@@ -327,11 +336,14 @@ fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
         server.host_post("usage", &u, 2, now_ms()),
         (
             200,
-            json!({"job_id":"test-job", "settled_vcpu_ms":6000, "released_vcpu_ms":14000})
+            json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde", "settled_vcpu_ms":6000, "released_vcpu_ms":14000})
         )
     );
     assert_eq!(
-        server.post("/v1/leases/test-job/release", &ReleaseRequest {}),
+        server.post(
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+            &ReleaseRequest {}
+        ),
         (409, json!({"error":"job_finished"}))
     );
 }

@@ -102,6 +102,9 @@ pub(crate) enum Error {
     Admitted,
     Finished,
     Rejected,
+    Released,
+    Budget,
+    Platform,
 }
 impl Error {
     pub(crate) fn code(self) -> &'static str {
@@ -119,6 +122,9 @@ impl Error {
             Self::Admitted => "hosted_job_admitted",
             Self::Finished => "hosted_job_finished",
             Self::Rejected => "lease_mismatch",
+            Self::Released => "hosted_job_released",
+            Self::Budget => "hosted_budget_exhausted",
+            Self::Platform => "hosted_platform_unsupported",
         }
     }
     pub(crate) fn reason(self) -> RefusalReason {
@@ -148,6 +154,14 @@ pub(crate) fn now_s() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+/// Linux jobs use the x86-64 hosted toolchain independently of the caller's CPU.
+/// Windows and other wire platforms must not acquire a hosted lease.
+fn lease_platform(platform: Option<&motor_protocol::Platform>) -> Result<&'static str, Error> {
+    match platform {
+        None | Some(motor_protocol::Platform::Linux) => Ok("linux-x64"),
+        _ => Err(Error::Rejected),
+    }
+}
 pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
     if request.timeout.is_none_or(|s| s == 0) {
         return Err(Error::NoTimeout);
@@ -176,9 +190,37 @@ pub(crate) fn keyed_hash(salt: &[u8; 32], domain: &str, path: &str) -> io::Resul
     let canonical = canonical
         .to_str()
         .ok_or_else(|| io::Error::other("path is not UTF-8"))?;
+    Ok(keyed_hash_input(salt, &format!("{domain}\n{canonical}")))
+}
+fn keyed_hash_input(salt: &[u8; 32], input: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC accepts a 32-byte key");
-    mac.update(format!("{domain}\n{canonical}").as_bytes());
-    Ok(motor_lease::base64url(&mac.finalize().into_bytes()))
+    mac.update(input.as_bytes());
+    motor_lease::base64url(&mac.finalize().into_bytes())
+}
+
+fn lease_body(
+    id: Uuid,
+    request: &RunRequest,
+    hashes: (String, String),
+    hint: Option<Placement>,
+    requester_jwk: RequesterJwk,
+) -> Result<LeaseRequest, Error> {
+    Ok(LeaseRequest {
+        job_id: id.to_string(),
+        vcpus: request.weight_hint.unwrap_or(2),
+        platform: lease_platform(request.platform.as_ref())?.into(),
+        net: request.network.is_some(),
+        workspace_key_hash: hashes.0,
+        repo_hash: hashes.1,
+        placement_hint: hint.filter(|placement| placement.vm.is_some()),
+        timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
+        requester_jwk,
+    })
+}
+fn reattach_body(key: &SigningKey) -> ReattachRequest {
+    ReattachRequest {
+        requester_jwk: RequesterJwk::from_key(&key.verifying_key()),
+    }
 }
 
 pub(crate) struct Client {
@@ -233,9 +275,12 @@ impl Client {
                 {
                     Some("job_admitted") => Error::Admitted,
                     Some("job_finished") => Error::Finished,
-                    Some("capacity") => Error::Capacity,
+                    Some("capacity" | "no_capacity") => Error::Capacity,
                     Some("host_full") => Error::HostFull,
-                    Some("job_conflict" | "job_released" | "release_pending") => Error::Rejected,
+                    Some("job_released") => Error::Released,
+                    Some("budget_exhausted") => Error::Budget,
+                    Some("platform_unsupported") => Error::Platform,
+                    Some("job_conflict" | "bad_request") => Error::Rejected,
                     _ => Error::Broker,
                 },
             );
@@ -253,12 +298,7 @@ impl Client {
     pub(crate) async fn attach(&self, id: Uuid, storage: &Storage) -> Result<Channel, Error> {
         let key = requester()?;
         let lease: LeaseResponse = self
-            .post(
-                &format!("/v1/leases/{id}/reattach"),
-                &ReattachRequest {
-                    requester_jwk: RequesterJwk::from_key(&key.verifying_key()),
-                },
-            )
+            .post(&format!("/v1/leases/{id}/reattach"), &reattach_body(&key))
             .await?;
         if self
             .route
@@ -296,20 +336,18 @@ impl Client {
             .and_then(|s| s.lease_request)
         {
             Some(request) => request,
-            None => LeaseRequest {
-                job_id: id.to_string(),
-                vcpus: request.weight_hint.unwrap_or(2),
-                mem_mib: motor_lease::memory_max_mib(request.weight_hint.unwrap_or(2)),
-                platform: "linux".into(),
-                net: request.network.is_some(),
-                workspace_key_hash: keyed_hash(&salt, "ck-ws-v1", &request.workspace_key)
-                    .map_err(|_| Error::Path)?,
-                repo_hash: keyed_hash(&salt, "ck-repo-v1", &request.repository_root)
-                    .map_err(|_| Error::Path)?,
-                placement_hint: storage.hosted_placement(&request.workspace_key),
-                timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
-                requester_jwk: RequesterJwk::from_key(&requester()?.verifying_key()),
-            },
+            None => lease_body(
+                id,
+                request,
+                (
+                    keyed_hash(&salt, "ck-ws-v1", &request.workspace_key)
+                        .map_err(|_| Error::Path)?,
+                    keyed_hash(&salt, "ck-repo-v1", &request.repository_root)
+                        .map_err(|_| Error::Path)?,
+                ),
+                storage.hosted_placement(&request.workspace_key),
+                RequesterJwk::from_key(&requester()?.verifying_key()),
+            )?,
         };
         storage
             .hosted_update(id, |state| state.lease_request = Some(body.clone()))
@@ -346,7 +384,7 @@ impl Client {
             };
             let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
             if claims.vcpus != body.vcpus
-                || claims.mem_mib != body.mem_mib
+                || claims.mem_mib != motor_lease::memory_max_mib(body.vcpus)
                 || claims.platform != body.platform
                 || claims.net != body.net
                 || claims.max_s > body.timeout_s

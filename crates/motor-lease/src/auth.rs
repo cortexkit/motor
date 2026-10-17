@@ -6,7 +6,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Challenge, Claims, Purpose, RequesterJwk, CLOCK_SKEW_S, ISSUER, MAX_TOKEN_LIFETIME_S};
+use crate::{
+    valid_job_id, valid_name, Challenge, Claims, Purpose, RequesterJwk, CLOCK_SKEW_S, ISSUER,
+    MAX_SAFE_INTEGER, MAX_TOKEN_LIFETIME_S,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthError {
@@ -34,6 +37,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], AuthError> {
+    if text.len() != N * 2
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(AuthError::Auth);
+    }
+    let mut result = [0; N];
+    for (i, value) in result.iter_mut().enumerate() {
+        *value = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(|_| AuthError::Auth)?;
+    }
+    Ok(result)
 }
 
 fn decode<const N: usize>(text: &str) -> Result<[u8; N], AuthError> {
@@ -84,6 +105,10 @@ pub struct JwksKey {
     pub crv: String,
     #[serde(default)]
     pub x: String,
+    #[serde(default)]
+    pub alg: Option<String>,
+    #[serde(default, rename = "use")]
+    pub key_use: Option<String>,
 }
 impl JwksKey {
     pub fn from_key(kid: impl Into<String>, key: &VerifyingKey) -> Self {
@@ -93,6 +118,8 @@ impl JwksKey {
             kty: jwk.kty,
             crv: jwk.crv,
             x: jwk.x,
+            alg: Some("EdDSA".into()),
+            key_use: Some("sig".into()),
         }
     }
 }
@@ -107,14 +134,38 @@ pub struct Jwks {
 #[derive(Default)]
 pub struct KeySet {
     keys: BTreeMap<String, VerifyingKey>,
+    last_fetch_s: Option<u64>,
 }
 impl KeySet {
+    /// Call before fetching JWKS. Record attempts, including failed fetches, so an
+    /// unknown signing key cannot trigger more than one network request a minute.
+    pub fn should_refetch(&mut self, token: &str, now_s: u64) -> bool {
+        let kid = token
+            .split('.')
+            .next()
+            .and_then(|part| URL_SAFE_NO_PAD.decode(part).ok())
+            .and_then(|bytes| serde_json::from_slice::<Header>(&bytes).ok())
+            .map(|header| header.kid);
+        let elapsed = self.last_fetch_s.map(|last| now_s.saturating_sub(last));
+        let fetch = elapsed.is_none_or(|elapsed| elapsed >= 600)
+            || (elapsed.is_some_and(|elapsed| elapsed >= 60)
+                && kid.is_some_and(|kid| !self.keys.contains_key(&kid)));
+        if fetch {
+            self.last_fetch_s = Some(now_s);
+        }
+        fetch
+    }
     pub fn refresh(&mut self, fetched: Result<Jwks, AuthError>) -> Result<(), AuthError> {
         let jwks = fetched?;
         let mut keys = BTreeMap::new();
         let mut conflicts = BTreeSet::new();
         for key in jwks.keys {
-            if key.kty != "OKP" || key.crv != "Ed25519" || key.kid.is_empty() {
+            if key.kty != "OKP"
+                || key.crv != "Ed25519"
+                || key.kid.is_empty()
+                || key.alg.as_deref().is_some_and(|alg| alg != "EdDSA")
+                || key.key_use.as_deref().is_some_and(|usage| usage != "sig")
+            {
                 continue;
             }
             let Ok(public) = (RequesterJwk {
@@ -188,7 +239,7 @@ pub fn verify_token(
             .map_err(|_| AuthError::Auth)?,
     )
     .map_err(|_| AuthError::Auth)?;
-    if header.alg != "EdDSA" || header.typ != "ck-job+jwt" || header.extra.contains_key("crit") {
+    if header.alg != "EdDSA" || header.typ != "ck-job+jwt" || !header.extra.is_empty() {
         return Err(AuthError::Auth);
     }
     let key = keys.keys.get(&header.kid).ok_or(AuthError::Auth)?;
@@ -204,8 +255,13 @@ pub fn verify_token(
     if claims.iss != ISSUER
         || claims.aud != host_id
         || claims.placement.host != host_id
-        || claims.placement.vm.is_empty()
-        || claims.jti.is_empty()
+        || claims
+            .placement
+            .vm
+            .as_deref()
+            .is_some_and(|vm| !valid_name(vm))
+        || !valid_job_id(&claims.jti)
+        || !valid_name(&claims.aud)
         || expected_job.is_some_and(|job| job != claims.jti)
         || claims.purpose != required_purpose
         || !valid_subject(&claims.sub)
@@ -213,9 +269,13 @@ pub fn verify_token(
         || claims.exp <= claims.iat
         || claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_S
         || claims.vcpus == 0
+        || claims.vcpus > 64
+        || claims.iat > MAX_SAFE_INTEGER
+        || claims.exp > MAX_SAFE_INTEGER
         || claims.mem_mib != crate::memory_max_mib(claims.vcpus)
         || claims.max_s == 0
-        || claims.platform.is_empty()
+        || claims.max_s > 7200
+        || !valid_name(&claims.platform)
         || decode::<32>(&claims.cnf.jkt).is_err()
     {
         return Err(AuthError::Auth);
@@ -227,11 +287,8 @@ pub fn verify_token(
     Ok(claims)
 }
 
-fn valid_subject(subject: &str) -> bool {
-    let Some(id) = subject
-        .strip_prefix("acct:")
-        .or_else(|| subject.strip_prefix("org:"))
-    else {
+pub(crate) fn valid_subject(subject: &str) -> bool {
+    let Some(id) = subject.strip_prefix("acct:") else {
         return false;
     };
     id.len() == 26
@@ -360,14 +417,18 @@ impl HostHeaders {
         counter: u64,
         key: &SigningKey,
     ) -> Result<Self, AuthError> {
-        if counter == 0 {
+        if counter == 0
+            || counter > MAX_SAFE_INTEGER
+            || timestamp == 0
+            || timestamp > MAX_SAFE_INTEGER
+        {
             return Err(AuthError::Auth);
         }
         Ok(Self {
             host: host.into(),
             timestamp,
             counter,
-            signature: base64url(
+            signature: lowercase_hex(
                 &key.sign(&host_message_bytes(method, path, body, timestamp, counter))
                     .to_bytes(),
             ),
@@ -394,17 +455,23 @@ impl HostAuthenticator {
     ) -> Result<(), AuthError> {
         let (key, counter) = self.hosts.get_mut(&headers.host).ok_or(AuthError::Auth)?;
         if headers.counter == 0
+            || headers.counter > MAX_SAFE_INTEGER
+            || headers.timestamp == 0
+            || headers.timestamp > MAX_SAFE_INTEGER
             || headers.counter <= *counter
-            || headers.timestamp.abs_diff(now_ms) > CLOCK_SKEW_S * 1000
         {
             return Err(AuthError::Auth);
         }
         key.verify_strict(
             &host_message_bytes(method, path, body, headers.timestamp, headers.counter),
-            &Signature::from_bytes(&decode(&headers.signature)?),
+            &Signature::from_bytes(&decode_hex(&headers.signature)?),
         )
         .map_err(|_| AuthError::Auth)?;
         *counter = headers.counter;
+        // A valid signature consumes its counter even if the timestamp is stale.
+        if headers.timestamp.abs_diff(now_ms) > CLOCK_SKEW_S * 1000 {
+            return Err(AuthError::Auth);
+        }
         Ok(())
     }
 }

@@ -124,7 +124,7 @@ impl Harness {
                     subject: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                     placement: Placement {
                         host: "test-host".into(),
-                        vm: "test-vm".into(),
+                        vm: Some("test-vm".into()),
                     },
                     endpoint,
                     endpoint_spki_sha256: pin,
@@ -375,6 +375,7 @@ impl Harness {
                         } else {
                             broker.lock().unwrap().handle(
                                 BrokerRequest {
+                                    content_type: Some("application/json"),
                                     method: "POST",
                                     path: &path,
                                     bearer: bearer.as_deref(),

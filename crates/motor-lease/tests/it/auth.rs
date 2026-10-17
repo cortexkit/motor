@@ -2,8 +2,90 @@ use ed25519_dalek::SigningKey;
 use motor_lease::*;
 use serde_json::{json, Value};
 
+// These adversarial credentials are created only for tests. The separate cloud.rs
+// tests compare production code with the broker's fixed inputs in contracts/cloud/.
 fn vectors() -> Value {
-    serde_json::from_str(include_str!("../../contracts/vectors/interim.json")).unwrap()
+    use ed25519_dalek::Signer;
+    let current = SigningKey::from_bytes(&[1; 32]);
+    let next = SigningKey::from_bytes(&[2; 32]);
+    let requester = RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key());
+    let header = json!({"alg":"EdDSA","typ":"ck-job+jwt","kid":"current"});
+    let c = json!({"iss":ISSUER,"aud":"test-host","jti":"019e4567-89ab-7cde-8012-3456789abcde","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","purpose":"run","iat":1700000000u64,"exp":1700000300u64,"vcpus":2,"mem_mib":16384,"platform":"linux-x64","net":false,"placement":{"host":"test-host","vm":"test-vm"},"max_s":30,"cnf":{"jkt":requester.thumbprint().unwrap()}});
+    let token = |h: &Value, c: &Value, key: &SigningKey| {
+        let input = format!(
+            "{}.{}",
+            base64url(&serde_json::to_vec(h).unwrap()),
+            base64url(&serde_json::to_vec(c).unwrap())
+        );
+        format!(
+            "{input}.{}",
+            base64url(&key.sign(input.as_bytes()).to_bytes())
+        )
+    };
+    let mut cases = vec![
+        json!({"name":"valid_run","token":token(&header,&c,&current),"now_s":1700000000u64,"result":"ok"}),
+    ];
+    for (name, field, value) in [
+        ("wrong_alg", "alg", json!("HS256")),
+        ("wrong_typ", "typ", json!("JWT")),
+        ("unknown_kid", "kid", json!("unknown")),
+        ("crit_empty", "crit", json!([])),
+        ("crit_null", "crit", Value::Null),
+    ] {
+        let mut h = header.clone();
+        h[field] = value;
+        cases.push(json!({"name":name,"token":token(&h,&c,&current),"now_s":1700000000u64,"result":"auth"}));
+    }
+    for (name, pointer, value) in [
+        ("wrong_issuer", "/iss", json!("https://invalid.example")),
+        ("wrong_audience", "/aud", json!("other-host")),
+        (
+            "wrong_job",
+            "/jti",
+            json!("019e4567-89ab-7cde-8012-3456789abcdf"),
+        ),
+        (
+            "wrong_placement_host",
+            "/placement/host",
+            json!("other-host"),
+        ),
+        ("mem_mismatch", "/mem_mib", json!(16383)),
+        ("future_iat", "/iat", json!(1700000061u64)),
+        ("invalid_purpose", "/purpose", json!("admin")),
+        ("zero_vcpus", "/vcpus", json!(0)),
+    ] {
+        let mut changed = c.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        cases.push(json!({"name":name,"token":token(&header,&changed,&current),"now_s":1700000000u64,"result":"auth"}));
+    }
+    cases.push(json!({"name":"expired_at_connect","token":token(&header,&c,&current),"now_s":1700000300u64,"result":"expired"}));
+    let mut boundary = c.clone();
+    boundary["iat"] = json!(1700000060u64);
+    cases.push(json!({"name":"iat_skew_boundary","token":token(&header,&boundary,&current),"now_s":1700000000u64,"result":"ok"}));
+    let mut h = header.clone();
+    h["kid"] = json!("next");
+    cases.push(json!({"name":"announced_next","token":token(&h,&c,&next),"now_s":1700000000u64,"result":"ok"}));
+    let mut attach = c.clone();
+    attach["purpose"] = json!("attach");
+    cases.push(json!({"name":"valid_attach","token":token(&header,&attach,&current),"now_s":1700000000u64,"result":"ok"}));
+    let mut tampered: Vec<String> = token(&header, &c, &current)
+        .split('.')
+        .map(str::to_owned)
+        .collect();
+    let mut changed = c.clone();
+    changed["max_s"] = json!(31);
+    tampered[1] = base64url(&serde_json::to_vec(&changed).unwrap());
+    cases.push(json!({"name":"tampered_claims","token":tampered.join("."),"now_s":1700000000u64,"result":"auth"}));
+    let challenge = json!({"nonce":"ab".repeat(32),"host_id":"test-host","ts":1700000000u64});
+    let challenge_input=format!("motor-host-challenge-v1\n{}\ntest-host\n019e4567-89ab-7cde-8012-3456789abcde\n1700000000\n","ab".repeat(32));
+    let body =
+        r#"{"free_vcpus":2,"free_mem_mib":18432,"queued":0,"warm":[],"running":[],"healthy":true}"#;
+    let host_input = format!(
+        "ck-host-v1\nPOST\n/v1/hosts/test-host/heartbeat\n{}\n1700000000000\n1700000000000000",
+        sha256_hex(body.as_bytes())
+    );
+    let host_key = SigningKey::from_bytes(&[4; 32]);
+    json!({"claims":c,"jwks":{"keys":[JwksKey::from_key("current",&current.verifying_key()),JwksKey::from_key("next",&next.verifying_key())]},"token_cases":cases,"requester_jwk":requester,"thumbprint":requester.thumbprint().unwrap(),"challenge":challenge,"challenge_input":challenge_input,"challenge_signature":base64url(&SigningKey::from_bytes(&[3;32]).sign(challenge_input.as_bytes()).to_bytes()),"host_body":body,"host_input":host_input,"host_jwk":RequesterJwk::from_key(&host_key.verifying_key()),"host_headers":HostHeaders::sign("test-host","POST","/v1/hosts/test-host/heartbeat",body.as_bytes(),1700000000000,1700000000000000,&host_key).unwrap()})
 }
 fn claims() -> Claims {
     serde_json::from_value(vectors()["claims"].clone()).unwrap()
@@ -27,7 +109,7 @@ fn every_mirrored_token_vector() {
             case["token"].as_str().unwrap(),
             &keys(),
             "test-host",
-            Some("test-job"),
+            Some("019e4567-89ab-7cde-8012-3456789abcde"),
             if case["name"] == "valid_attach" {
                 Purpose::Attach
             } else {
@@ -435,7 +517,7 @@ fn host_message_signing_vector_and_counter_seed() {
 }
 
 #[test]
-fn host_auth_rejects_replay_skew_unknown_host_and_tampering_without_consuming_counter() {
+fn host_auth_bad_signatures_preserve_counter_but_signed_skew_consumes_it() {
     let v = vectors();
     let host: RequesterJwk = serde_json::from_value(v["host_jwk"].clone()).unwrap();
     let mut auth = HostAuthenticator::default();
@@ -455,17 +537,83 @@ fn host_auth_rejects_replay_skew_unknown_host_and_tampering_without_consuming_co
     assert!(auth
         .verify("POST", path, body, &headers, headers.timestamp + 60001)
         .is_err());
-    assert!(auth
-        .verify("POST", path, body, &headers, headers.timestamp - 60001)
-        .is_err());
     let mut unknown = headers.clone();
     unknown.host = "unknown-host".into();
     assert!(auth
         .verify("POST", path, body, &unknown, headers.timestamp)
         .is_err());
-    auth.verify("POST", path, body, &headers, headers.timestamp + 60000)
+    assert!(auth
+        .verify("POST", path, body, &headers, headers.timestamp + 60000)
+        .is_err());
+    let fresh = HostHeaders::sign(
+        "test-host",
+        "POST",
+        path,
+        body,
+        headers.timestamp,
+        headers.counter + 1,
+        &SigningKey::from_bytes(&[4; 32]),
+    )
+    .unwrap();
+    auth.verify("POST", path, body, &fresh, headers.timestamp + 60000)
         .unwrap();
     assert!(auth
         .verify("POST", path, body, &headers, headers.timestamp)
         .is_err());
+}
+
+#[test]
+fn jwks_refetch_schedule_limits_unknown_keys_and_retains_last_good_set() {
+    let token = sign_token(&claims(), "current", &SigningKey::from_bytes(&[1; 32])).unwrap();
+    let unknown = sign_token(&claims(), "unknown", &SigningKey::from_bytes(&[9; 32])).unwrap();
+    let mut cache = KeySet::default();
+    assert!(cache.should_refetch(&token, 1000));
+    cache
+        .refresh(Ok(
+            serde_json::from_value(vectors()["jwks"].clone()).unwrap()
+        ))
+        .unwrap();
+    assert!(!cache.should_refetch(&unknown, 1059));
+    assert!(cache.should_refetch(&unknown, 1060));
+    assert!(cache.refresh(Err(AuthError::Auth)).is_err());
+    assert!(!cache.should_refetch(&unknown, 1119));
+    assert!(cache.should_refetch(&unknown, 1120));
+    assert!(cache.refresh(Ok(Jwks { keys: vec![] })).is_err());
+    assert!(!cache.should_refetch(&token, 1719));
+    assert!(cache.should_refetch(&token, 1720));
+    assert!(verify_token(&token, &cache, "test-host", None, Purpose::Run, 1700000000).is_ok());
+}
+
+#[test]
+fn exact_claims_and_nullable_cold_placement_are_enforced() {
+    use ed25519_dalek::Signer;
+    let mut c = claims();
+    c.placement.vm = None;
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let token = sign_token(&c, "current", &key).unwrap();
+    assert_eq!(
+        verify_token(&token, &keys(), "test-host", None, Purpose::Run, c.iat)
+            .unwrap()
+            .placement
+            .vm,
+        None
+    );
+    let mut value = serde_json::to_value(&c).unwrap();
+    value["extra"] = json!(true);
+    let header = base64url(br#"{"alg":"EdDSA","kid":"current","typ":"ck-job+jwt"}"#);
+    let input = format!(
+        "{header}.{}",
+        base64url(&serde_json::to_vec(&value).unwrap())
+    );
+    let token = format!(
+        "{input}.{}",
+        base64url(&key.sign(input.as_bytes()).to_bytes())
+    );
+    assert_eq!(
+        verify_token(&token, &keys(), "test-host", None, Purpose::Run, c.iat),
+        Err(AuthError::Auth)
+    );
+    value.as_object_mut().unwrap().remove("extra");
+    value["placement"].as_object_mut().unwrap().remove("vm");
+    assert!(serde_json::from_value::<Claims>(value).is_err());
 }

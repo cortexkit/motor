@@ -810,7 +810,12 @@ impl Motor {
                     result = self.open_job_channel(id) => result,
                     _ = tx.closed() => return Err(io::Error::other("caller detached")),
                 };
-                if hosted && matches!(opened, Err(crate::hosted::Error::Finished)) {
+                if hosted
+                    && matches!(
+                        opened,
+                        Err(crate::hosted::Error::Finished | crate::hosted::Error::Released)
+                    )
+                {
                     return self.finish_hosted(id, true, tx).await;
                 }
                 if let Ok(c) = opened {
@@ -1087,7 +1092,9 @@ impl Motor {
         }
         let mut channel = match self.open_job_channel(id).await {
             Ok(channel) => channel,
-            Err(crate::hosted::Error::Finished) if self.hosted_state(id).is_some() => {
+            Err(crate::hosted::Error::Finished | crate::hosted::Error::Released)
+                if self.hosted_state(id).is_some() =>
+            {
                 let (tx, _rx) = mpsc::channel(1);
                 self.finish_hosted(id, true, &tx).await?;
                 return Ok(JobStatusReply {

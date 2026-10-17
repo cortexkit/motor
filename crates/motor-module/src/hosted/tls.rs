@@ -83,6 +83,8 @@ pub(super) fn claims(
         || claims.aud != lease.placement.host
         || claims.iat > now_s().saturating_add(60)
         || claims.exp <= now_s()
+        || lease.token_expires_at_ms != claims.exp.saturating_mul(1000)
+        || lease.token_expires_at_ms <= now_s().saturating_mul(1000)
         || motor_lease::bind_requester(&claims, &jwk).is_err()
     {
         return Err(Error::Auth);

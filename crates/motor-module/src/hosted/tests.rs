@@ -146,8 +146,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
             &motor_lease::LeaseRequest {
                 job_id: id.to_string(),
                 vcpus: 2,
-                mem_mib: motor_lease::memory_max_mib(2),
-                platform: "linux".into(),
+                platform: "linux-x64".into(),
                 net: false,
                 workspace_key_hash: keyed_hash(&salt, "ck-ws-v1", scratch.0.to_str().unwrap())
                     .unwrap(),
@@ -590,4 +589,104 @@ async fn hosted_real_snapshot_lost_run_ack_never_resubmits_and_refusals_release(
         }
         assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+fn hosted_linux_platform_is_architecture_qualified_and_windows_is_not_hosted() {
+    assert_eq!(lease_platform(None), Ok("linux-x64"));
+    assert_eq!(lease_platform(Some(&Platform::Linux)), Ok("linux-x64"));
+    assert_eq!(
+        lease_platform(Some(&Platform::Windows)),
+        Err(Error::Rejected)
+    );
+}
+
+#[test]
+fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/lease.json"
+    ))
+    .unwrap();
+    let tokens: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/job-tokens.json"
+    ))
+    .unwrap();
+    let decode_hex = |text: &str| -> [u8; 32] {
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    };
+    let salt = decode_hex(v["hash_derivation"]["test_only_salt_hex"].as_str().unwrap());
+    let workspace = keyed_hash_input(
+        &salt,
+        v["hash_derivation"]["workspace_input"].as_str().unwrap(),
+    );
+    let repo = keyed_hash_input(&salt, v["hash_derivation"]["repo_input"].as_str().unwrap());
+    assert_eq!(workspace, v["request"]["body"]["workspace_key_hash"]);
+    assert_eq!(repo, v["request"]["body"]["repo_hash"]);
+    let key = SigningKey::from_bytes(&decode_hex(
+        tokens["test_only_requester_seed_hex"].as_str().unwrap(),
+    ));
+    let request = RunRequest::new(
+        "/home/test/workspace",
+        "/home/test/workspace/repo",
+        "/home/test/workspace",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_weight_hint(v["request"]["body"]["vcpus"].as_u64().unwrap() as u32)
+    .with_timeout(v["request"]["body"]["timeout_s"].as_u64().unwrap())
+    .with_network(Network::Outbound);
+    let id = Uuid::parse_str(v["request"]["body"]["job_id"].as_str().unwrap()).unwrap();
+    let body = lease_body(
+        id,
+        &request,
+        (workspace, repo),
+        Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
+        RequesterJwk::from_key(&key.verifying_key()),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
+    assert_eq!(
+        serde_json::to_value(reattach_body(&key)).unwrap(),
+        v["reattach"]["request"]["body"]
+    );
+    assert_eq!(
+        serde_json::to_value(ReleaseRequest::default()).unwrap(),
+        v["release"]["request"]["body"]
+    );
+}
+
+#[tokio::test]
+async fn hosted_job_released_stops_reattaching_without_resubmitting() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    Client::new(h.route.clone()).release(id).await.unwrap();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Unavailable
+    );
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("/reattach"))
+            .count(),
+        1
+    );
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }

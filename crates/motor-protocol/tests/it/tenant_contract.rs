@@ -5,7 +5,7 @@ use serde_json::json;
 fn pinned_tenant_frames_are_inline_and_integer_only() {
     let id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
     let value = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:test","vcpus":2,
-        "mem_mib":16384,"platform":"linux","net":false,"max_s":30,"exp":1800000000});
+        "mem_mib":16384,"platform":"linux-x64","net":false,"max_s":30,"exp":1800000000});
     let frame: Frame = serde_json::from_value(value.clone()).unwrap();
     assert!(matches!(frame, Frame::VerifiedLease(_)));
     assert_eq!(serde_json::to_value(&frame).unwrap(), value);

@@ -132,6 +132,14 @@ impl EventLog {
     }
 }
 
+pub(crate) fn host_platform() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        _ => None,
+    }
+}
+
 pub(crate) fn matches(lease: &VerifiedLease, run: &Run) -> bool {
     run.weight_hint == Some(lease.vcpus)
         && run
@@ -145,7 +153,7 @@ pub(crate) fn matches(lease: &VerifiedLease, run: &Run) -> bool {
             .as_ref()
             .map(|p| p == &Platform::Linux)
             .unwrap_or(true)
-        && lease.platform == "linux"
+        && host_platform().is_some_and(|platform| lease.platform == platform)
         && run.timeout.is_some_and(|s| s <= lease.max_s)
 }
 

@@ -1,0 +1,34 @@
+{
+  "clock_ms": 1792195209000,
+  "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "request": {
+    "method": "POST",
+    "pathname": "/v1/hosts/host-a/usage",
+    "headers": {
+      "Content-Type": "application/json",
+      "CK-Host": "host-a",
+      "CK-Timestamp": "1792195209000",
+      "CK-Counter": "1792195209000001",
+      "CK-Signature": "c2a27bd1e3271dcfa625e88e6d813c763ae61a45e97bb6f716e7dd29232057797cf3b76c828eeac3c0e7d69c209b3618bae88e7c740921db02deda9499398902"
+    },
+    "body": {
+      "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+      "vcpus": 2,
+      "started_at_ms": 1792195200123,
+      "ended_at_ms": 1792195207623,
+      "mem_peak_mib": null,
+      "egress_bytes": null,
+      "outcome": "exit"
+    }
+  },
+  "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\na9ca655915d5988a86e7b236cceedc0de98bc2fc1f2f8a672d414896483db859\n1792195209000\n1792195209000001",
+  "reply": {
+    "status": 200,
+    "body": {
+      "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+      "settled_vcpu_ms": 15000,
+      "released_vcpu_ms": 9000
+    }
+  }
+}
