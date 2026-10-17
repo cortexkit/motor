@@ -99,6 +99,10 @@ The initial native `PATH` puts Rust's `cargo\bin`, Git's `cmd`, the installed
 Git `ucrt64\bin` (or `mingw64\bin`), Git's `usr\bin`, and PowerShell 7 before
 Windows' machine-then-user `PATH`. Equivalent case-insensitive path entries are
 deduplicated, keeping the first; managed tools win executable-name conflicts.
+So a bare name that both Git and Windows provide resolves to Git's GNU tool,
+even from `cmd /c`: `timeout`, `find`, `sort` and similar take GNU arguments.
+Call the Windows tool by its full path when that is what you need, for example
+`%SystemRoot%\System32\timeout.exe`.
 Git Bash may prepend its own normal shell directories. A caller cannot replace
 `PATH` through the request allowlist. Test:
 `managed_paths_win_and_windows_machine_then_user_paths_survive`.
