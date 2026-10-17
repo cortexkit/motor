@@ -62,6 +62,7 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | `/motor-home` (`HOME`), with a private `CARGO_HOME` at `/motor-home/cargo` | Read-write | Per-job directory |
 | `/motor-home/cargo/registry`, `/motor-home/cargo/git` | Read-only | The shared Cargo registry and Git sources |
 | `/tmp` (`TMPDIR`, `TMP`, `TEMP` point at `/motor-home/tmp`) | Read-write | Per-job directory |
+| `/dev/shm` | Read-write, private tmpfs with mode `1777`, `nosuid,nodev`, and a size cap equal to `MemoryMax` (executable, matching the host mount) | Per-job `TemporaryFileSystem=` mount |
 | `/usr`, `/bin`, `/lib`, `/lib64`, the shared Cargo `bin`, the rustup home, Bun's `bin` if present | Read-only | Host toolchains |
 | `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, `/etc/ssl/openssl.cnf` | Read-only | Host files |
 | `/etc/hosts` | Read-only | Generated; see 3.5 |
@@ -73,12 +74,15 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 
 Source: `Sandbox` construction in `crates/motor-runner/src/isolation.rs`.
 Test for the command shape: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`.
-The complete mount list is not covered by one test; the rules below name the
-tests for each property. A Rust job also gets `CARGO_TARGET_DIR=/run/motor/target`
-and `SCCACHE_DIR=/motor-cache`.
+The complete mount list is not covered by one test; the
+`systemd_job_command_enforces_recorded_cpu_set_and_memory` test asserts that
+`/dev/shm` is sized to `MemoryMax`, and the rules below name tests for other
+properties. A Rust job also gets `CARGO_TARGET_DIR=/run/motor/target` and
+`SCCACHE_DIR=/motor-cache`.
 
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
-jobs' sandboxes. Test: `isolated_job_cannot_access_runner_or_other_jobs`.
+jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
+`isolated_jobs_receive_private_shm_that_disappears_after_they_end` (operator-only).
 
 3.2. A job can read shared registry sources but cannot write them, and it
 cannot write the shared compile cache. Tests:
@@ -212,7 +216,10 @@ run on more CPUs than it reserved. See [scheduling.md](scheduling.md) for how
 CPUs are chosen. Test: `systemd_job_command_enforces_recorded_cpu_set_and_memory`.
 
 7.2. Memory is capped with `MemoryMax=`: 3.5 GiB per vCPU, with a 16 GiB floor.
-Tests: `memory_max_scales_per_vcpu_with_a_sixteen_gib_floor`,
+The per-job `/dev/shm` tmpfs has an explicit size cap equal to `MemoryMax`;
+tmpfs pages are charged to that job's memory cgroup. Tests:
+`systemd_job_command_enforces_recorded_cpu_set_and_memory`,
+`memory_max_scales_per_vcpu_with_a_sixteen_gib_floor`,
 `memory_limit_gib_formats_floor_and_scaled_limits`.
 
 7.3. The request's `timeout`, in seconds, runs from the moment the job starts,
