@@ -668,6 +668,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "motor-lease"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cortexkit-test-support",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "motor-module"
 version = "0.1.0"
 dependencies = [

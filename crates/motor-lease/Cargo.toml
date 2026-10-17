@@ -1,0 +1,25 @@
+[package]
+name = "motor-lease"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Pure hosted lease authentication and broker contract test control"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+cortexkit-test-support = "=0.1.7"
+
+[[bin]]
+name = "motor-fake-broker"
+path = "src/bin/fake-broker.rs"
+
+[[example]]
+name = "generate-interim-vectors"
+path = "examples/generate-interim-vectors.rs"
