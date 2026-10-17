@@ -96,6 +96,12 @@ The daemon owns `/tenant/state/workspaces`, bind-mounted at `/Users` before
 runner startup. Jobs use `/Users/spike/probe` under the runner's default owned
 workspace root, matching the production same-filesystem layout. `/Users` is
 not an unrelated root-owned directory and the runner's checks are unchanged.
+Before asserting the interface list is exactly `[(1, "lo")]`, each job prints
+its interfaces, network namespace identity and `ip -br link`. A short diagnostic
+pause lets the root agent capture the job unit's effective namespace/device/BPF
+properties, guest/job network namespace IDs and relevant systemd journal lines.
+The host records the saved post-`olddefconfig` feature flags and config digest;
+extra interfaces remain a failure, not an exception added to the probe.
 
 - `cold_boot`: launch jailer through base-agent vsock readiness. The base has a
   1 GiB placeholder `/dev/vdb`, **not mounted**, and the runner is not started

@@ -136,6 +136,33 @@ def cache_verify():
     return {"verified_bytes": path.stat().st_size, "cached_bytes": meminfo()["Cached"]}
 
 
+def diagnostics(job_id):
+    import uuid
+    unit = f"motor-job-{uuid.UUID(job_id)}.service"
+
+    def probe(*args):
+        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        return {"status": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+    properties = ["LoadState", "ActiveState", "MainPID", "PrivateNetwork", "NetworkNamespacePath",
+                  "PrivateDevices", "DevicePolicy", "DeviceAllow", "RestrictNamespaces",
+                  "RestrictAddressFamilies", "RestrictNetworkInterfaces", "IPAddressDeny",
+                  "IPAddressAllow", "SocketBindAllow", "SocketBindDeny", "NoNewPrivileges"]
+    shown = probe("systemctl", "show", unit, *(f"--property={name}" for name in properties))
+    main_pid = probe("systemctl", "show", unit, "--property=MainPID", "--value")["stdout"].strip()
+    namespaces = {}
+    for name, pid in [("guest_init", "1"), ("agent", str(os.getpid())), ("job_main", main_pid)]:
+        try:
+            namespaces[name] = os.readlink(f"/proc/{pid}/ns/net")
+        except OSError as error:
+            namespaces[name] = str(error)
+    journal = probe("journalctl", "-b", "--no-pager", "-n", "2000")["stdout"]
+    related = [line for line in journal.splitlines()
+               if any(word in line.lower() for word in ["namespace", "bpf", "firewall", "device", unit.lower()])]
+    return {"unit": unit, "properties": shown, "network_namespaces": namespaces,
+            "guest_interfaces": socket.if_nameindex(), "namespace_journal": "\n".join(related)[-24000:]}
+
+
 def control(conn):
     with conn:
         conn.settimeout(120)
@@ -154,6 +181,8 @@ def control(conn):
                 result = cache_fill()
             elif op == "cache_verify":
                 result = cache_verify()
+            elif op == "diagnostics":
+                result = diagnostics(request["job_id"])
             elif op == "sync":
                 os.sync()
                 result = ready()

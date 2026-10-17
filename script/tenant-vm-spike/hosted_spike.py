@@ -471,7 +471,10 @@ def isolated_job(harness, vm):
     commit, tree, bundle = fixture_bundle(harness.e, fixture, job_id)
     request = {"type": "run", "job_id": job_id, "workspace_key": PROBE_WORKSPACE,
                "repository_root": PROBE_WORKSPACE, "cwd": PROBE_WORKSPACE,
-               "command": "test \"$(id -un)\" = motor-job && "
+               "command": "python3 -c 'import os,socket; print(\"SPIKE_INTERFACES\", socket.if_nameindex(), "
+                          "\"NETNS\", os.readlink(\"/proc/self/ns/net\"), flush=True)' && "
+                          "(ip -br link || true) && sleep 5 && "
+                          "test \"$(id -un)\" = motor-job && "
                           "test ! -e /var/lib/motor-spike/host-only && "
                           "python3 -c 'import socket; assert socket.if_nameindex() == [(1, \"lo\")]' && "
                           "echo SPIKE_ISOLATED_JOB_PASS",
@@ -493,10 +496,13 @@ def isolated_job(harness, vm):
         while True:
             frame = read_frame(conn, deadline)
             harness.e.record("job_frame", frame=frame)
+            if frame["type"] == "started":
+                harness.e.record("job_diagnostics", result=vm.control("diagnostics", job_id=job_id))
             if frame["type"] == "output":
-                output.extend(base64.b64decode(frame["data"], validate=True))
+                output.extend(base64.b64decode(frame["bytes"], validate=True))
             if frame["type"] == "terminal":
                 if frame["outcome"] != {"type": "exit", "code": 0} or b"SPIKE_ISOLATED_JOB_PASS" not in output:
+                    harness.e.record("failed_job_diagnostics", result=vm.control("diagnostics", job_id=job_id))
                     raise RuntimeError(f"isolated job failed: {frame}; {output!r}")
                 return {"terminal": frame, "output": output.decode()}
 
@@ -673,8 +679,16 @@ def main():
     try:
         evidence.record("invocation", argv=sys.argv, kernel=platform.release(), python=platform.python_version(),
                         guest_ram_mib=RAM_MIB, memory_headroom_mib=HEADROOM_MIB)
+        config = args.kernel.with_name("kernel.config")
+        if not config.is_file():
+            raise RuntimeError(f"missing retained post-olddefconfig kernel config: {config}")
+        names = ["NAMESPACES", "UTS_NS", "IPC_NS", "USER_NS", "PID_NS", "NET_NS", "CGROUPS",
+                 "CGROUP_DEVICE", "CGROUP_BPF", "BPF_SYSCALL", "SECCOMP", "SECCOMP_FILTER", "IPV6_SIT"]
+        lines = set(config.read_text().splitlines())
+        evidence.record("kernel_features", enabled={name: f"CONFIG_{name}=y" in lines for name in names})
         for path in [args.kernel, args.rootfs, Path(harness.firecracker), Path(harness.jailer)]:
             evidence.record("input", path=str(path), sha256=evidence.run("sha256sum", path))
+        evidence.record("input", path=str(config), sha256=evidence.run("sha256sum", config))
         evidence.run(harness.firecracker, "--version")
         evidence.run(harness.jailer, "--version")
         harness.prepare()

@@ -2,6 +2,7 @@
 """Portable tests for the measurement plumbing, not evidence of VM behavior."""
 
 import importlib.util
+import base64
 import json
 from pathlib import Path
 import socket
@@ -10,6 +11,7 @@ import subprocess
 import platform
 import tempfile
 import time
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -24,6 +26,44 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    def test_isolated_probe_decodes_output_bytes_and_collects_unit_diagnostics(self):
+        a, b = socket.socketpair()
+        errors, requests = [], []
+
+        def server():
+            try:
+                with b:
+                    b.settimeout(5)
+                    spike.read_frame(b)
+                    spike.send_frame(b, {"type": "hello", "protocol_version": 1})
+                    requests.append(spike.read_frame(b))
+                    spike.send_frame(b, {"type": "heartbeat"})
+                    spike.send_frame(b, {"type": "accepted"})
+                    spike.read_frame(b)
+                    spike.send_frame(b, {"type": "started", "seq": 0})
+                    spike.send_frame(b, {"type": "output", "seq": 1, "stream": "stdout",
+                        "bytes": base64.b64encode(b"SPIKE_ISOLATED_JOB_PASS\n").decode()})
+                    spike.send_frame(b, {"type": "terminal", "outcome": {"type": "exit", "code": 0}})
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=server, daemon=True)
+        worker.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                harness = Mock(work=Path(directory))
+                vm = Mock()
+                vm.connect.return_value = a
+                with patch.object(spike, "fixture_bundle", return_value=("0" * 40, "1" * 40, b"bundle")):
+                    result = spike.isolated_job(harness, vm)
+                self.assertEqual(result["output"], "SPIKE_ISOLATED_JOB_PASS\n")
+                vm.control.assert_called_once_with("diagnostics", job_id=requests[0]["job_id"])
+        finally:
+            a.close()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
     def test_fixture_bundle_contains_only_the_requested_snapshot_ref(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
