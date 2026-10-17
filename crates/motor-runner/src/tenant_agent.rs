@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod paths;
 mod runner_socket;
+mod snapshot;
 
 const ARGS: &str = "/tenant/runner-args";
 const ROOTS: [&str; 2] = ["/Users", "/home"];
@@ -121,6 +122,15 @@ async fn dispatch(
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
         TenantAgentRequest::Status => forward(Frame::Status).await,
+        TenantAgentRequest::PrepareSnapshot { kind } => {
+            let _guard = attach.lock().await;
+            snapshot::prepare(kind).await
+        }
+        TenantAgentRequest::Thaw => {
+            let _guard = attach.lock().await;
+            snapshot::thaw().await?;
+            Ok(json!({"ok":true}))
+        }
     }
 }
 

@@ -112,7 +112,7 @@ impl Config {
         Ok(())
     }
 }
-fn cpu_list(s: &str) -> bool {
+pub(crate) fn cpu_list(s: &str) -> bool {
     !s.is_empty()
         && s.split(',').all(|range| {
             let parts: Vec<_> = range.split('-').collect();
