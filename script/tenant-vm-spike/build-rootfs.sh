@@ -45,6 +45,7 @@ chroot "$root" /usr/local/bin/motor-runner --version
 chroot "$root" /usr/bin/rustc --version
 chroot "$root" /usr/bin/cargo --version
 chroot "$root" /usr/bin/cc --version
+chroot "$root" /usr/sbin/fsfreeze --version
 chroot "$root" /usr/lib/systemd/systemd --version
 sysver=$(chroot "$root" /usr/lib/systemd/systemd --version | head -n 1)
 [[ ${sysver#systemd } =~ ^(25[7-9]|2[6-9][0-9]|[3-9][0-9][0-9]) ]] || { echo 'need systemd >=257 for runner PrivatePIDs'; exit 1; }

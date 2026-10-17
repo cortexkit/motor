@@ -35,6 +35,58 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    def test_mirror_integrity_check_detects_a_real_missing_git_object(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            mirror = state / "mirrors" / hashlib.sha256(guest.PROBE_REPOSITORY.encode()).hexdigest()
+            subprocess.run(["git", "init", "--bare", "--quiet", str(mirror)], check=True)
+            digest = subprocess.run(["git", "-C", str(mirror), "hash-object", "-w", "--stdin"],
+                                    input="mirror integrity probe\n", text=True, capture_output=True, check=True).stdout.strip()
+            subprocess.run(["git", "-C", str(mirror), "update-ref", f"refs/snapshots/{digest}", digest], check=True)
+            result = guest.verify_state(state_dir=state, command_prefix=())
+            self.assertTrue(result["present"])
+            self.assertEqual(result["refs"], [f"refs/snapshots/{digest} {digest}"])
+            (mirror / "objects" / digest[:2] / digest[2:]).unlink()
+            with self.assertRaisesRegex(RuntimeError, "mirror fsck failed"):
+                guest.verify_state(state_dir=state, command_prefix=())
+
+    def test_base_snapshot_refuses_a_mounted_tenant(self):
+        with patch.object(guest.os.path, "ismount", return_value=True), patch.object(guest.os, "sync"):
+            with self.assertRaisesRegex(RuntimeError, "base snapshot must not contain a mounted tenant"):
+                guest.prepare_snapshot("base")
+
+    def test_suspend_freezes_and_restore_thaws_the_same_mounted_filesystem(self):
+        calls = []
+        setattr(guest, "_tenant_frozen", False)
+        try:
+            with patch.object(guest.os.path, "ismount", return_value=True), \
+                    patch.object(guest, "verify_state", return_value={"present": True}), \
+                    patch.object(guest, "command", side_effect=lambda *args: calls.append(args) or "ok"), \
+                    patch.object(guest.os, "sync", side_effect=lambda: calls.append(("sync",))):
+                self.assertTrue(guest.prepare_snapshot("suspend")["frozen"])
+                self.assertTrue(guest._tenant_frozen)
+                self.assertTrue(guest.post_restore()["thawed"])
+                self.assertFalse(guest._tenant_frozen)
+            self.assertEqual(calls, [("sync",), ("fsfreeze", "--freeze", "/tenant"),
+                                     ("fsfreeze", "--unfreeze", "/tenant")])
+        finally:
+            setattr(guest, "_tenant_frozen", False)
+
+    def test_cold_detach_drains_syncs_and_unmounts_before_host_stop(self):
+        calls = []
+        setattr(guest, "_tenant_frozen", False)
+        with patch.object(guest.os.path, "ismount", side_effect=[True, False, False]), \
+                patch.object(guest, "verify_state", return_value={"present": True}), \
+                patch.object(guest, "command", side_effect=lambda *args: calls.append(args) or "ok"), \
+                patch.object(guest.os, "sync", side_effect=lambda: calls.append(("sync",))):
+            result = guest.detach()
+        self.assertIn("drain", calls[0])
+        self.assertEqual(calls[1:], [("systemctl", "stop", "spike-runner"), ("sync",),
+                                   ("umount", "/Users"), ("umount", "/tenant"), ("sync",)])
+        self.assertFalse(result["tenant_mounted"])
+        self.assertFalse(result["users_mounted"])
+
     @unittest.skipUnless(platform.system() == "Linux", "requires real Linux /proc socket ownership")
     def test_runner_readiness_requires_current_pid_to_own_a_listening_socket(self):
         import os
@@ -170,7 +222,9 @@ class HostedSpikeTests(unittest.TestCase):
                 with patch.object(spike, "fixture_bundle", return_value=("0" * 40, "1" * 40, b"bundle")):
                     result = spike.isolated_job(harness, vm)
                 self.assertEqual(result["output"], "SPIKE_ISOLATED_JOB_PASS\n")
-                vm.control.assert_called_once_with("diagnostics", job_id=requests[0]["job_id"])
+                vm.control.assert_any_call("diagnostics", job_id=requests[0]["job_id"])
+                vm.control.assert_any_call("verify_state")
+                self.assertEqual(vm.control.call_count, 2)
         finally:
             a.close()
             worker.join(timeout=5)

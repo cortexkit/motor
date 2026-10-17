@@ -182,6 +182,11 @@ class VM:
             raise
 
     def bind(self, source, name, readonly=False, directory=False):
+        source = Path(source)
+        if source.name.startswith("tenant-") and source.suffix == ".xfs":
+            info = source.stat()
+            self.e.record("tenant_disk_identity", path=str(source), device=info.st_dev, inode=info.st_ino,
+                          bytes=info.st_size, jail=self.identifier, bind_name=name)
         target = self.root / name
         if directory:
             target.mkdir()
@@ -328,8 +333,14 @@ class VM:
 
     def peak(self):
         value = int((self.cgroup / "memory.peak").read_text())
+        if self.proc is None:
+            raise RuntimeError("restore memory evidence requires a live VMM")
+        status = Path(f"/proc/{self.proc.pid}/status").read_text().splitlines()
+        rss = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in status
+               if line.split(":", 1)[0] in ("VmRSS", "RssAnon", "RssFile", "RssShmem")}
         self.e.record("memory", memory_peak=value,
-                      memory_events=(self.cgroup / "memory.events").read_text())
+                      memory_events=(self.cgroup / "memory.events").read_text(),
+                      memory_stat=(self.cgroup / "memory.stat").read_text(), vmm_rss=rss)
         return value
 
     def close(self):
@@ -545,6 +556,7 @@ def isolated_job(harness, vm):
                 if frame["outcome"] != {"type": "exit", "code": 0} or b"SPIKE_ISOLATED_JOB_PASS" not in output:
                     harness.e.record("failed_job_diagnostics", result=vm.control("diagnostics", job_id=job_id))
                     raise RuntimeError(f"isolated job failed: {frame}; {output!r}")
+                harness.e.record("tenant_state_check", result=vm.control("verify_state"))
                 return {"terminal": frame, "output": output.decode()}
 
 
@@ -570,7 +582,7 @@ def experiment(harness):
         vm = harness.active
         e.measure("vsock", lambda: vm.control("ready"))
         vm.control("network", profile="a")
-        vm.control("sync")
+        vm.control("prepare_snapshot", kind="base")
         vm.pause()
         snapshot_space(harness)
         e.measure("base_snapshot_create", lambda: vm.snapshot("base"))
@@ -599,6 +611,7 @@ def experiment(harness):
             vm.ready(runner=True)
             e.sample(f"base_restore_{gib}g", (time.monotonic_ns() - started) / 1e6)
             e.measure(f"ficlone_{gib}g", lambda: vm.control("ficlone"))
+            e.record("tenant_state_check", result=vm.control("verify_state", require_existing=iteration > 1))
             isolated_job(harness, vm)
             if gib == 20:
                 cache = vm.control("cache_fill")
@@ -606,7 +619,7 @@ def experiment(harness):
                 snapshot_space(harness)
 
                 def suspend():
-                    vm.control("sync")
+                    vm.control("prepare_snapshot", kind="suspend")
                     vm.pause()
                     e.measure("suspend_snapshot_create", lambda: vm.snapshot("suspend"))
                     harness.stop()
@@ -619,6 +632,8 @@ def experiment(harness):
                 vm.bind(harness.disk(20), "replacement.img")
                 vm.load("suspend", "tap-b")
                 vm.resume()
+                vm.ready()
+                e.record("post_restore", result=vm.control("post_restore"))
                 result = vm.ready(runner=True)
                 e.sample("suspend_restore", (time.monotonic_ns() - started) / 1e6, result=result)
                 e.sample("restore_memory_peak_bytes", vm.peak(), unit="bytes")
@@ -627,11 +642,13 @@ def experiment(harness):
                 isolated_job(harness, vm)
 
                 def detach():
+                    vm.control("detach")
                     harness.stop()
                     return harness.assert_detached(harness.disk(20))
 
                 e.measure("disk_detach", detach)
             else:
+                vm.control("detach")
                 harness.stop()
                 harness.assert_detached(harness.disk(24))
 

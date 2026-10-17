@@ -157,21 +157,38 @@ and agent journal captured, rather than hiding a real daemon failure.
   `FICLONE` directly between two separate bind mounts of that filesystem and
   verifies nonempty random content and distinct inodes, with no copy fallback.
 - `suspend`: a 20 GiB disk, an actual **10 GiB resident file page cache** verified
-  by `mincore`, guest sync, pause, full snapshot + fsync, VMM stop, bind unmount
+  by `mincore`, mirror integrity check, guest sync and XFS freeze, pause,
+  full snapshot + fsync, VMM stop, host bind unmount
   and a `/proc/*/fd` inode scan proving no process holds the disk. The rootfs
   image is kept consistent with the VM state; this is not yet the read-only
   overlay-root implementation. `suspend_snapshot_create` isolates the API/fsync
   portion. The 10 GiB allocation is not used as a proxy for page residency.
 - `suspend_restore`: new jailer/cgroup, ordinary-file snapshot load with the
-  network override, resume, agent readiness and runner hello. The cgroup uses
+  network override, resume, thaw of the **same** tenant filesystem, mirror fsck,
+  agent readiness and runner hello. The cgroup uses
   `(18432 + 512) MiB memory.max`, `cpu.max=100000 100000`, `pids.max=66`.
   `restore_memory_peak_bytes` is the fresh restore cgroup's peak through runner
   readiness. A **separate**, untimed full cache-file read checks persistence
-  and records peak after touching all cached pages; it is not hidden in the
+  and records peak after touching all cached pages; both points also retain
+  cgroup `memory.stat` and VMM RSS/anonymous/file-backed RSS so a small cgroup
+  peak is not mistaken for total guest residency. The full read is not hidden in the
   resume-to-ready threshold. Another real isolated job must succeed.
-- `disk_detach`: stop VMM, wait, unmount binds, scan open fds; the file remains.
+- `disk_detach`: drain/stop the idle guest runner, mirror fsck, guest sync,
+  unmount `/Users` and `/tenant`, then stop VMM, wait, unmount host binds and
+  scan open fds; the file remains. This is a clean detach, not a power cut.
   Firecracker has no runtime block hot-unplug operation here. Neither guest
   virtio device deletion nor a nonexistent `DELETE /drives` is claimed.
+
+Base snapshots explicitly require `/tenant` **unmounted** before drive
+substitution. Suspend snapshots instead retain the mounted, frozen filesystem
+and its page cache, and restore only with the same unchanged disk; `post_restore`
+thaws it before use. The post-restore test job writes new Git objects, so its
+final stop must use the clean detach path rather than killing the VMM with
+dirty guest page cache. The 20/24 GiB disk files are reused across all iterations,
+never cloned or reset, and each bind records device/inode identity. Real
+`git fsck --full --no-dangling` checks the persistent mirror before reuse, after
+every job, before suspend, after restore and before detach; corrupt state is
+reported, never repaired or discarded to make the experiment pass.
 
 The last line is **go** only if every required metric has five samples, all
 functional probes succeeded, and suspend restore p50 is **<=5 s**. Any transport,

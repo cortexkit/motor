@@ -2,6 +2,7 @@
 """Throwaway root-only vsock probe; never install this agent in a tenant image."""
 
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,8 @@ import time
 
 GIB = 1024**3
 RUNNER = "/tenant/state/spike/runner.sock"
+PROBE_REPOSITORY = "/Users/spike/probe"
+_tenant_frozen = False
 
 
 def command(*args):
@@ -74,6 +77,70 @@ def runner_diagnostics():
                             "--property=ActiveState", "--property=SubState", "--property=ExecMainStatus")}
 
 
+def verify_state(require_existing=True, state_dir=Path("/tenant/state/spike"),
+                 command_prefix=("runuser", "-u", "motor-spike", "--")):
+    mirror = state_dir / "mirrors" / hashlib.sha256(PROBE_REPOSITORY.encode()).hexdigest()
+    if not mirror.exists():
+        if require_existing:
+            raise RuntimeError(f"persisted probe mirror is missing: {mirror}")
+        return {"mirror": str(mirror), "present": False}
+    try:
+        fsck = command(*command_prefix, "git", "--no-optional-locks", "-C", str(mirror),
+                       "fsck", "--full", "--no-dangling")
+        refs = command(*command_prefix, "git", "--no-optional-locks", "-C", str(mirror),
+                       "for-each-ref", "--format=%(refname) %(objectname)", "refs/snapshots/", "refs/tips/")
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"persisted mirror fsck failed: {mirror}: {error.output}") from error
+    if require_existing and not refs:
+        raise RuntimeError(f"persisted probe mirror has no pinned snapshot refs: {mirror}")
+    return {"mirror": str(mirror), "present": True, "fsck": fsck, "refs": refs.splitlines()}
+
+
+def prepare_snapshot(kind):
+    global _tenant_frozen
+    mounted = os.path.ismount("/tenant")
+    if kind == "base":
+        if mounted or os.path.ismount("/Users"):
+            raise RuntimeError("base snapshot must not contain a mounted tenant filesystem")
+        os.sync()
+        return {"tenant_mounted": False, "synced": True, "frozen": False}
+    if kind != "suspend" or not mounted or _tenant_frozen:
+        raise RuntimeError("suspend requires a mounted, not-yet-frozen tenant filesystem")
+    state = verify_state()
+    os.sync()
+    command("fsfreeze", "--freeze", "/tenant")
+    _tenant_frozen = True
+    return {"tenant_mounted": True, "synced": True, "frozen": True, "state_check": state}
+
+
+def post_restore():
+    global _tenant_frozen
+    if not _tenant_frozen or not os.path.ismount("/tenant"):
+        raise RuntimeError("suspend restore must contain the frozen original tenant filesystem")
+    command("fsfreeze", "--unfreeze", "/tenant")
+    _tenant_frozen = False
+    return {"thawed": True, "state_check": verify_state()}
+
+
+def detach():
+    if _tenant_frozen or not os.path.ismount("/tenant"):
+        raise RuntimeError("cold detach requires a mounted, thawed tenant filesystem")
+    drained = command("runuser", "-u", "motor-spike", "--", "/usr/local/bin/motor-runner", "drain",
+                      "--instance", "spike", "--state-root", "/tenant/state", "--drain-timeout-s", "30",
+                      "--exit-after-drain", "true")
+    command("systemctl", "stop", "spike-runner")
+    state = verify_state()
+    os.sync()
+    command("umount", "/Users")
+    command("umount", "/tenant")
+    os.sync()
+    tenant_mounted, users_mounted = os.path.ismount("/tenant"), os.path.ismount("/Users")
+    if tenant_mounted or users_mounted:
+        raise RuntimeError("tenant filesystem is still mounted after cold detach")
+    return {"drain": drained, "synced": True, "tenant_mounted": tenant_mounted,
+            "users_mounted": users_mounted, "state_check": state}
+
+
 def attach(expected_bytes):
     size = int(command("blockdev", "--getsize64", "/dev/vdb"))
     if size != expected_bytes:
@@ -88,7 +155,11 @@ def attach(expected_bytes):
     Path("/Users").mkdir(exist_ok=True)
     command("mount", "--bind", "/tenant/state/workspaces", "/Users")
     command("runuser", "-u", "motor-spike", "--", "test", "-w", "/Users")
-    Path("/var/lib/motor-spike/host-only").write_text("not visible to an isolated job\n")
+    marker = Path("/var/lib/motor-spike/host-only")
+    marker.parent.chmod(0o755)
+    marker.write_text("not visible to an isolated job\n")
+    marker.chmod(0o644)
+    command("runuser", "-u", "motor-job", "--", "test", "-r", str(marker))
     Path("/tenant/persistent-marker").write_text("tenant-vm-spike\n")
     os.sync()
     active = subprocess.run(["systemctl", "is-active", "--quiet", "spike-runner"]).returncode == 0
@@ -245,6 +316,14 @@ def control(conn):
                 result = diagnostics(request["job_id"])
             elif op == "runner_diagnostics":
                 result = runner_diagnostics()
+            elif op == "verify_state":
+                result = verify_state(request.get("require_existing", True))
+            elif op == "prepare_snapshot":
+                result = prepare_snapshot(request["kind"])
+            elif op == "post_restore":
+                result = post_restore()
+            elif op == "detach":
+                result = detach()
             elif op == "sync":
                 os.sync()
                 result = ready()
@@ -252,7 +331,8 @@ def control(conn):
                 raise ValueError(f"unknown spike operation: {op}")
             reply = {"ok": True, "result": result}
         except Exception as error:
-            reply = {"ok": False, "error": str(error)}
+            detail = f"{error}: {error.output}" if isinstance(error, subprocess.CalledProcessError) else str(error)
+            reply = {"ok": False, "error": detail}
         conn.sendall(json.dumps(reply).encode() + b"\n")
 
 
