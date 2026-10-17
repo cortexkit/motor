@@ -2207,19 +2207,18 @@ impl Sandbox {
                 "--property=AllowedCPUs={}",
                 crate::cpu::format_list(cpus)
             ));
-            // Placement can shrink to avoid Windows cores without reducing the
-            // memory budget associated with the job's requested vCPU count.
-            #[cfg(test)]
-            let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
-            #[cfg(not(test))]
-            let memory_max = crate::backend::memory_max(requested_vcpus);
-            cmd.arg(format!("--property=MemoryMax={memory_max}"));
-            // Match the host's executable /dev/shm policy while bounding this
-            // job's private tmpfs to the same memory limit as the service.
-            cmd.arg(format!(
-                "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
-            ));
         }
+        // The memory limit follows requested_vcpus, even when placement is empty or smaller.
+        #[cfg(test)]
+        let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
+        #[cfg(not(test))]
+        let memory_max = crate::backend::memory_max(requested_vcpus);
+        cmd.arg(format!("--property=MemoryMax={memory_max}"));
+        // Match the host's executable /dev/shm policy while bounding this
+        // job's private tmpfs to the same memory limit as the service.
+        cmd.arg(format!(
+            "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+        ));
         cmd.arg(format!("--property=User={user}"))
             .arg(format!("--property=Group={user}"));
         for property in [

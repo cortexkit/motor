@@ -97,6 +97,30 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
 }
 
 #[test]
+fn systemd_job_command_bounds_shm_without_cpu_placement() {
+    let f = Fixture::new();
+    let sandbox = f.command_sandbox();
+    let command = sandbox
+        .command("nproc", &f.workspace, &[], true, &[], 1)
+        .unwrap();
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    let memory_max = 17_179_869_184_u64;
+    assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+    assert!(args.contains(
+        &format!(
+            "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+        )
+        .as_str()
+    ));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("--property=AllowedCPUs=")));
+}
+
+#[test]
 fn capped_cpu_placement_keeps_requested_memory_limit() {
     let f = Fixture::new();
     let sandbox = f.command_sandbox();
