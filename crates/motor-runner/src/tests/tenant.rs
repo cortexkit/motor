@@ -29,6 +29,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
 }
 fn hello() -> Frame {
     Frame::Hello {
+        return_paths: false,
         protocol_version: motor_protocol::PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -694,4 +695,70 @@ fn tenant_compile_target_determines_lease_platform() {
     assert_eq!(crate::tenant::matches(&token, &run), expected.is_some());
     token.platform = "linux".into();
     assert!(!crate::tenant::matches(&token, &run));
+}
+
+#[tokio::test]
+async fn return_paths_tenant_cap_one_returns_failure_before_real_terminal_and_replays() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut request, bytes) = f.run("printf xy > returned; exit 17");
+    request.return_paths = vec![format!("{}/returned", f.key)];
+    request.return_max_bytes = 1;
+    request.timeout = Some(30);
+    request.weight_hint = Some(2);
+    let id = request.job_id;
+    let (mut socket, task) = connect(&runner, lease(id, LeasePurpose::Run)).await;
+    write_frame_async(&mut socket, &Frame::Run(request.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut socket).await, Some(Frame::Accepted(_))));
+    for (index, data) in bytes.iter().enumerate() {
+        write_frame_async(
+            &mut socket,
+            &Frame::BundleChunk {
+                index: index as u32,
+                offset: 0,
+                data: BytePayload(data.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    until(|| runner.job_status(id).unwrap().state == "queued").await;
+    runner.tick().unwrap();
+    let mut returned = None;
+    loop {
+        match frame(&mut socket).await.unwrap() {
+            Frame::ReturnResult(result) => returned = Some(result),
+            Frame::Terminal(t) => {
+                assert_eq!(t.outcome, Outcome::Exit { code: 17 });
+                assert_eq!(t.ran, Some(Ran::Remote));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let result = returned.unwrap();
+    assert_eq!(result.returned_files, None);
+    assert_eq!(
+        result.return_paths_failed,
+        Some(ReturnPathsFailed {
+            measured_bytes: 2,
+            cap_bytes: 1,
+            cause: ReturnFailureCause::OverCap
+        })
+    );
+    drop(socket);
+    task.await.unwrap().unwrap();
+    let (mut socket, task) = connect(&runner, lease(id, LeasePurpose::Attach)).await;
+    write_frame_async(
+        &mut socket,
+        &Frame::Attach(AttachRequest::new(id, result.seq)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame(&mut socket).await, Some(Frame::ReturnResult(result)));
+    assert!(matches!(frame(&mut socket).await, Some(Frame::Terminal(_))));
+    drop(socket);
+    task.await.unwrap().unwrap();
 }

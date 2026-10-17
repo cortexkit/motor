@@ -35,6 +35,8 @@ mod nested_workspaces;
 mod platform_refusal;
 #[path = "tests/refusals.rs"]
 mod refusals;
+#[path = "tests/return_paths.rs"]
+mod return_paths;
 #[path = "tests/started.rs"]
 mod started;
 #[path = "tests/status_transitions.rs"]
@@ -265,6 +267,8 @@ impl Fixture {
         let (b, second) = self.bundle(&self.sibling, &self.canonical, 1);
         (
             Run {
+                return_paths: Vec::new(),
+                return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -383,6 +387,8 @@ impl Fixture {
         let (b, second) = self.bundle(&self.sibling, &self.canonical, 1);
         (
             Run {
+                return_paths: Vec::new(),
+                return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -1656,6 +1662,7 @@ async fn connect(socket: &Path) -> UnixStream {
     write_frame_async(
         &mut stream,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1668,6 +1675,7 @@ async fn connect(socket: &Path) -> UnixStream {
     assert_eq!(
         read_next(&mut stream).await,
         Frame::Hello {
+            return_paths: true,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1854,6 +1862,7 @@ fn blocking_hello(socket: &Path) -> io::Result<std::os::unix::net::UnixStream> {
     write_frame(
         &mut stream,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,

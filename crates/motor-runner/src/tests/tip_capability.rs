@@ -4,6 +4,7 @@ async fn connect_tip(socket: &Path, capable: bool) -> UnixStream {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     let hello = if capable {
         Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: true,
@@ -14,7 +15,11 @@ async fn connect_tip(socket: &Path, capable: bool) -> UnixStream {
         serde_json::from_str(r#"{"type":"hello","protocol_version":1,"started":true}"#).unwrap()
     };
     write_frame_async(&mut stream, &hello).await.unwrap();
-    assert_eq!(read_next(&mut stream).await, hello);
+    let mut expected = hello;
+    if let Frame::Hello { return_paths, .. } = &mut expected {
+        *return_paths = true;
+    }
+    assert_eq!(read_next(&mut stream).await, expected);
     stream
 }
 

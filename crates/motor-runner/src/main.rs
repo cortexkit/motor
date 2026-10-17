@@ -51,7 +51,7 @@ async fn main() -> io::Result<()> {
                     let mut socket = tokio::net::UnixStream::connect(config.socket_path()).await?;
                     write_frame_async(
                         &mut socket,
-                        &Frame::Hello { protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
+                        &Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
                     )
                     .await?;
                     loop {

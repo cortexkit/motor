@@ -74,6 +74,8 @@ and stderr here as they arrive.
   --timeout SECONDS   stop the command after this long (default 3600, at most
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
+  --return-path PATH  return this absolute workspace file (repeatable, at most 64)
+  --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
   --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
 
 The words after -- are joined with single spaces into one command line, which
@@ -108,6 +110,8 @@ pub struct RunArgs {
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
     pub secret_file: Option<PathBuf>,
+    pub return_paths: Vec<String>,
+    pub return_max_bytes: Option<u64>,
 }
 
 /// Parse the words after `ck motor run`. An option takes its value as the
@@ -135,7 +139,14 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         };
         if !matches!(
             name,
-            "--vcpus" | "--sibling" | "--env" | "--timeout" | "--cwd" | "--secret-file"
+            "--vcpus"
+                | "--sibling"
+                | "--env"
+                | "--timeout"
+                | "--cwd"
+                | "--secret-file"
+                | "--return-path"
+                | "--return-max-bytes"
         ) {
             return Err(if word.starts_with('-') {
                 format!("unknown option {word}")
@@ -174,6 +185,12 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "--sibling" => parsed.siblings.push(PathBuf::from(value)),
             "--cwd" => parsed.cwd = Some(PathBuf::from(value)),
             "--secret-file" => parsed.secret_file = Some(PathBuf::from(value)),
+            "--return-path" => parsed.return_paths.push(value),
+            "--return-max-bytes" => {
+                parsed.return_max_bytes = Some(value.parse().map_err(|_| {
+                    format!("--return-max-bytes needs a nonnegative integer, got {value:?}")
+                })?)
+            }
             _ => {
                 let (key, val) = value
                     .split_once('=')
@@ -762,6 +779,7 @@ pub fn exit_code(terminal: &TerminalRecord) -> u8 {
 pub struct SubcClient {
     consumer: SubcConsumer,
     route: RouteHandle,
+    returns: crate::ReturnOptions,
 }
 
 impl SubcClient {
@@ -794,7 +812,11 @@ impl SubcClient {
             )
             .await
             .map_err(connection_error)?;
-        Ok(Self { consumer, route })
+        Ok(Self {
+            consumer,
+            route,
+            returns: crate::ReturnOptions::default(),
+        })
     }
 
     async fn subscribe(
@@ -862,7 +884,8 @@ fn connection_error(error: CallError) -> SubmitError {
 #[async_trait]
 impl ExecClient for SubcClient {
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
-        self.subscribe("exec.run", request, None).await
+        self.subscribe("exec.run", self.returns.params(request), None)
+            .await
     }
 
     async fn attach(
@@ -964,12 +987,18 @@ pub async fn main(args: &[String]) -> u8 {
             return EXIT_CANCELLED;
         }
     };
-    let client = match client {
+    let mut client = match client {
         Ok(client) => client,
         Err(message) => {
             eprintln!("ck motor run: refused before start: {message}");
             return EXIT_REFUSED;
         }
+    };
+    client.returns = crate::ReturnOptions {
+        return_paths: args.return_paths.clone(),
+        return_max_bytes: args
+            .return_max_bytes
+            .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
     };
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
@@ -1131,6 +1160,8 @@ mod tests {
                 cwd: Some("/w".into()),
                 command: words("cargo test -p x"),
                 secret_file: None,
+                return_paths: Vec::new(),
+                return_max_bytes: None,
             }
         );
         assert_eq!(command_line(&args.command), "cargo test -p x");
@@ -1149,6 +1180,30 @@ mod tests {
             panic!("expected a run")
         };
         assert_eq!(command_line(&args.command), "ls --help");
+    }
+
+    #[test]
+    fn return_paths_cli_options_are_repeatable_and_merge_into_direct_request() {
+        let Ok(Invocation::Run(args)) = parse_args(&words(
+            "--return-path /w/one --return-path=/w/two --return-max-bytes 1 -- true",
+        )) else {
+            panic!("expected run")
+        };
+        assert_eq!(args.return_paths, vec!["/w/one", "/w/two"]);
+        assert_eq!(args.return_max_bytes, Some(1));
+        let request = RunRequest::new("/w", "/w", "/w", "true");
+        let params = crate::ReturnOptions {
+            return_paths: args.return_paths,
+            return_max_bytes: args.return_max_bytes.unwrap(),
+        }
+        .params(&request);
+        assert_eq!(params["return_paths"], json!(["/w/one", "/w/two"]));
+        assert_eq!(params["return_max_bytes"], 1);
+        assert_eq!(params["command"], "true");
+        let empty = crate::ReturnOptions::default().params(&request);
+        assert!(empty.get("return_paths").is_none());
+        assert!(empty.get("return_max_bytes").is_none());
+        assert!(parse_args(&words("--return-max-bytes -1 -- true")).is_err());
     }
 
     #[test]

@@ -1057,6 +1057,7 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
         frame,
         Frame::Hello {
             protocol_version: 1,
+            return_paths: false,
             started: false,
             default_branch_tip: false,
             gate_jobs: false,
@@ -1069,6 +1070,7 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
         capable,
         Frame::Hello {
             protocol_version: 1,
+            return_paths: false,
             started: true,
             default_branch_tip: false,
             gate_jobs: false,
@@ -1085,6 +1087,7 @@ fn hello_default_branch_tip_capability_is_additive() {
         capable,
         Frame::Hello {
             protocol_version: 1,
+            return_paths: false,
             started: true,
             default_branch_tip: true,
             gate_jobs: false,

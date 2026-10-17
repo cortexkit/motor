@@ -22,6 +22,7 @@ impl Connector for ReplayPeer {
                 write_frame_async(
                     &mut peer,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

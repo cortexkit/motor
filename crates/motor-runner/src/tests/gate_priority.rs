@@ -156,6 +156,7 @@ async fn gate_mark_is_honored_only_after_capability_negotiation() {
         write_frame_async(
             &mut stream,
             &Frame::Hello {
+                return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,

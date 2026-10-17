@@ -56,6 +56,7 @@ pub enum Behavior {
     DropTerminal,
     WrongHost,
     DropRunAck,
+    ReturnCapFailure,
 }
 
 pub struct Harness {
@@ -230,6 +231,7 @@ impl Harness {
                         motor_protocol::write_frame_async(
                             &mut tls,
                             &Frame::Hello {
+                                return_paths: false,
                                 protocol_version: PROTOCOL_VERSION,
                                 started: true,
                                 default_branch_tip: true,
@@ -281,13 +283,33 @@ impl Harness {
                                     return;
                                 }
                                 Frame::Attach(_) => {
-                                    let terminal = TerminalRecord::new(
+                                    if matches!(behavior, Behavior::ReturnCapFailure) {
+                                        motor_protocol::write_frame_async(
+                                            &mut tls,
+                                            &Frame::ReturnResult(ReturnResult {
+                                                job_id: id,
+                                                seq: 0,
+                                                returned_files: None,
+                                                return_paths_failed: Some(ReturnPathsFailed {
+                                                    measured_bytes: 2,
+                                                    cap_bytes: 1,
+                                                    cause: ReturnFailureCause::OverCap,
+                                                }),
+                                            }),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    }
+                                    let mut terminal = TerminalRecord::new(
                                         id,
                                         Outcome::Exit { code: 23 },
                                         0,
                                         0,
                                         0,
                                     );
+                                    if matches!(behavior, Behavior::ReturnCapFailure) {
+                                        terminal.ran = Some(Ran::Remote);
+                                    }
                                     motor_protocol::write_frame_async(
                                         &mut tls,
                                         &Frame::Terminal(terminal),

@@ -1734,6 +1734,19 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+        if let Err(code) = validate_return_paths(
+            &request.workspace_key,
+            &request.return_paths,
+            request.return_max_bytes,
+        ) {
+            return Some((RefusalReason::RequestRejected, code.into()));
+        }
+        if self.core.config.windows_instance() && !request.return_paths.is_empty() {
+            return Some((
+                RefusalReason::RequestRejected,
+                "return_paths_unsupported".into(),
+            ));
+        }
         if let Err(error) = self.ensure_admission_ownership() {
             return Some((RefusalReason::WorkspaceSetupFailed, error.to_string()));
         }
@@ -2388,6 +2401,8 @@ impl Runner {
         )?;
         inner.order += 1;
         let request = Run {
+            return_paths: Vec::new(),
+            return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
             gate_job: false,
             network: None,
             platform: None,
@@ -2438,7 +2453,7 @@ impl Runner {
     ) -> io::Result<Vec<Frame>> {
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
-        let (started, terminal, chunks, earliest, output_from, shift, _lease) = loop {
+        let (started, terminal, return_result, chunks, earliest, output_from, shift, _lease) = loop {
             let mut inner = self.core.inner.lock().unwrap();
             if let Some(job) = inner.jobs.get(&id) {
                 let shift = if let (false, Some(started)) = (supports_started, &job.started) {
@@ -2458,7 +2473,10 @@ impl Runner {
                     .filter(|started| supports_started && started.seq >= from)
                     .cloned();
                 let output_from = started.as_ref().map_or(from, |started| started.seq + 1);
-                let earliest = job.chunks.front().map_or(job.next_seq, |chunk| chunk.seq);
+                let earliest = job.chunks.front().map_or_else(
+                    || job.return_result.as_ref().map_or(job.next_seq, |r| r.seq),
+                    |chunk| chunk.seq,
+                );
                 let mut chunks = Vec::new();
                 let mut bytes = 0u64;
                 let mut more = false;
@@ -2477,6 +2495,11 @@ impl Runner {
                     chunks.push(chunk.clone());
                 }
                 let terminal = if more { None } else { job.terminal.clone() };
+                let return_result = job
+                    .return_result
+                    .as_ref()
+                    .filter(|r| !more && r.seq >= from)
+                    .cloned();
                 // Take the lease under the index lock: neither retention nor
                 // expiry may unlink this snapshot's files before the read ends.
                 let lease = log.lease(
@@ -2493,6 +2516,7 @@ impl Runner {
                 break (
                     started,
                     terminal,
+                    return_result,
                     chunks,
                     earliest,
                     output_from,
@@ -2570,6 +2594,10 @@ impl Runner {
                 output
             };
             frames.push(Frame::Output(output));
+        }
+        if let Some(mut result) = return_result {
+            result.seq -= shift;
+            frames.push(Frame::ReturnResult(result));
         }
         if let Some(terminal) = terminal {
             frames.push(Frame::Terminal(terminal));
@@ -4529,6 +4557,14 @@ impl Runner {
                 tracing::warn!(%id, %write_error, "monitoring error retained in job record; replay diagnostic unavailable");
             }
         }
+        let return_result = job
+            .request
+            .as_ref()
+            .filter(|r| !r.return_paths.is_empty())
+            .map(|request| {
+                let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
+                crate::return_paths::collect(request, seq)
+            });
         let log = self.job_log(id);
         let (mut inner, success) = loop {
             let write = log.write.lock().unwrap();
@@ -4551,6 +4587,17 @@ impl Runner {
                 Err(_) => Outcome::OutcomeUnknown,
             };
             let mut finished = inner.jobs[&id].clone();
+            if let Some(mut result) = return_result.clone() {
+                // Save the bounded collection result with the command's finished
+                // state so replay cannot expose one without the other after restart.
+                crate::return_paths::set_seq(
+                    &mut result,
+                    finished.next_seq,
+                    job.request.as_ref().unwrap().return_max_bytes,
+                );
+                finished.next_seq += 1;
+                finished.return_result = Some(result);
+            }
             finished.execution_ended_ms = Some(ended_ms);
             if let Some(cpu_time_ns) = inner.cpu_times.get(&id) {
                 finished.record_reservation_use(*cpu_time_ns, ended_ms);

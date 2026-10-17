@@ -115,6 +115,8 @@ pub(crate) struct Job {
     pub started: Option<Started>,
     pub process: Option<crate::platform::ProcessIdentity>,
     pub terminal: Option<TerminalRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_result: Option<ReturnResult>,
     pub chunks: Chunks,
     pub next_seq: u64,
     pub output_bytes: u64,
@@ -221,6 +223,7 @@ impl Job {
             started: None,
             process: None,
             terminal: None,
+            return_result: None,
             chunks: Chunks::default(),
             next_seq: 0,
             output_bytes: 0,

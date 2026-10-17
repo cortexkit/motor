@@ -54,6 +54,8 @@ pub(super) fn snapshot_run(
     bundle: &[u8],
 ) -> Run {
     Run {
+        return_paths: Vec::new(),
+        return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
         gate_job: false,
         network: None,
         platform: None,
@@ -97,6 +99,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
     let (mut writer, mut reader) = UnixStream::pair().unwrap();
     let frames = [
         Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -162,6 +165,7 @@ pub(super) async fn submit_with_capability(
     write_frame_async(
         &mut stream,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip,
