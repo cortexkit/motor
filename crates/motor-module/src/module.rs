@@ -168,12 +168,14 @@ fn build_provenance_from_build_facts(
         (None, _) => BuildGitShaSource::NoGitDir,
     };
 
-    build_provenance_from_source(
-        source,
-        lock_digest.filter(|digest| !digest.is_empty()),
-        None,
-    )
-    .expect("build script emits canonical provenance facts")
+    let lock_digest = lock_digest.filter(|digest| !digest.is_empty());
+    // The module builds this manifest when it registers, so a fact in an
+    // unexpected form (a SHA-256 object format repository, say) must not stop
+    // ck-motor from starting: declare the revision as never derived instead.
+    build_provenance_from_source(source, lock_digest, None).unwrap_or_else(|_| {
+        build_provenance_from_source(BuildGitShaSource::NeverDerived, None, None)
+            .expect("provenance without facts is always well formed")
+    })
 }
 
 #[cfg(test)]
@@ -205,6 +207,20 @@ mod provenance_tests {
         assert_eq!(
             no_git.build_git_sha_absence_reason,
             Some(BuildGitShaAbsenceReason::NoGitDir)
+        );
+
+        // A 64-character revision (SHA-256 object format) is not a valid
+        // build_git_sha; it must degrade to never-derived, not panic.
+        let sha256_revision = "0".repeat(64);
+        let odd = build_provenance_from_build_facts(
+            Some(&sha256_revision),
+            Some("clean"),
+            Some(LOCK_DIGEST),
+        );
+        assert!(odd.build_git_sha.is_none());
+        assert_eq!(
+            odd.build_git_sha_absence_reason,
+            Some(BuildGitShaAbsenceReason::NeverDerived)
         );
     }
 }
