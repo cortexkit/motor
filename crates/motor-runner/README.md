@@ -49,9 +49,24 @@ cross-bind-mount reflinks before starting the transient
 `/tenant/runner-args`; its state root is `/tenant/state` and Cargo home is
 `/tenant/cargo-home`. Restore only refreshes the clock and entropy; it does
 not remount the disk or restart the runner.
+Attachment refuses symlinks, non-root-owned directories and writable-by-others
+directories in persisted mount paths, and pins bind sources with open directory
+descriptors. It removes only a stale socket node and waits until the runner
+socket's peer PID matches the unit's current `MainPID`. Administrative forwarding
+checks the same PID binding before sending any frames.
 
 Portable `tenant_*` tests cover the operation fence, lease matching,
 admission and lifecycle replay. The ignored operator-only test
 `hosted_job_cannot_open_vsock` checks that a job cannot create a vsock socket
 even when the runner can. It requires a trusted tenant VM with real isolation and
 AF_VSOCK support, and must not run on a shared development host.
+Run it inside the provisioned tenant image as part of image qualification,
+where AF_VSOCK support and the image's job-isolation setup are available.
+The ordinary host isolation suite selects names containing `::isolated_`;
+this guest-only qualification is deliberately separate. Its exact command is:
+
+```sh
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  cargo test -p motor-runner --lib \
+  isolation::tests::hosted_job_cannot_open_vsock -- --ignored --exact
+```

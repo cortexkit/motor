@@ -369,7 +369,7 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             ctx.runner
                 .tenant_events()
-                .unwrap()
+                .ok_or_else(|| io::Error::other("tenant event log is not configured"))?
                 .refused(ctx.lease.jti, state.cause)?;
         }
     }

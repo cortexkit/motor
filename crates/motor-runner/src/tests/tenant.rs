@@ -116,6 +116,23 @@ async fn tenant_first_frame_is_strict_and_local_ssh_still_uses_hello() {
 }
 
 #[tokio::test]
+async fn tenant_connection_without_event_log_returns_error_instead_of_panicking() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (client, task) = connect(&runner, lease(Uuid::now_v7(), LeasePurpose::Run)).await;
+    drop(client);
+    let error = task
+        .await
+        .expect("connection task must not panic")
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("tenant event log is not configured"));
+}
+
+#[tokio::test]
 async fn tenant_mismatch_refuses_without_admission() {
     let f = Fixture::new();
     let runner = open(&f);

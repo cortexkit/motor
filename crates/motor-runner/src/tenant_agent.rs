@@ -12,6 +12,9 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod paths;
+mod runner_socket;
+
 const ARGS: &str = "/tenant/runner-args";
 const ROOTS: [&str; 2] = ["/Users", "/home"];
 
@@ -129,14 +132,29 @@ async fn forward(frame: Frame) -> io::Result<Value> {
     };
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
-        forward_socket(&config.socket_path(), frame),
+        forward_socket(&config.socket_path(), frame, runner_socket::main_pid),
     )
     .await
     .map_err(io::Error::other)?
 }
 
-async fn forward_socket(path: &Path, frame: Frame) -> io::Result<Value> {
+async fn forward_socket(
+    path: &Path,
+    frame: Frame,
+    mut current_pid: impl FnMut() -> io::Result<Option<u32>>,
+) -> io::Result<Value> {
+    let expected =
+        current_pid()?.ok_or_else(|| io::Error::other("tenant runner has no current MainPID"))?;
     let mut socket = tokio::net::UnixStream::connect(path).await?;
+    if !runner_socket::peer_is_current(&socket, expected, &mut current_pid)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runner socket {} does not belong to the current runner MainPID",
+                path.display()
+            ),
+        ));
+    }
     write_frame_async(
         &mut socket,
         &Frame::Hello {
@@ -157,6 +175,15 @@ async fn forward_socket(path: &Path, frame: Frame) -> io::Result<Value> {
             Some(Frame::Heartbeat { .. }) => {}
             _ => return Err(io::Error::other("runner did not negotiate agent protocol")),
         }
+    }
+    if !runner_socket::peer_is_current(&socket, expected, &mut current_pid)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runner socket {} changed MainPID before the administrative request",
+                path.display()
+            ),
+        ));
     }
     write_frame_async(&mut socket, &frame).await?;
     loop {
@@ -401,9 +428,15 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     command("hostname", &[&hostname])?;
     fs::write("/etc/hostname", format!("{hostname}\n"))?;
     fs::write("/etc/machine-id", format!("{machine_id}\n"))?;
-    fs::create_dir_all("/tenant")?;
+    match fs::create_dir("/tenant") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let _mountpoint = paths::Directory::absolute(Path::new("/tenant"), 0)?;
     command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
-    fs::create_dir_all("/tenant/state")?;
+    let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
+    layout.runner.remove_stale_socket("runner.sock")?;
     let args = RunnerArgs::read(Path::new(ARGS))?;
     let image_cargo = PathBuf::from(
         std::env::var_os("CARGO_HOME")
@@ -414,30 +447,26 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
             "image tool directory must be outside /tenant",
         ));
     }
-    fs::create_dir_all("/tenant/cargo-home/bin")?;
     let tool_bin = image_cargo.join("bin");
-    let tool_bin = tool_bin
-        .to_str()
-        .ok_or_else(|| io::Error::other("image tool path is not UTF-8"))?;
-    command("mount", &["--bind", tool_bin, "/tenant/cargo-home/bin"])?;
-    command(
-        "mount",
-        &["-o", "remount,bind,ro", "/tenant/cargo-home/bin"],
-    )?;
-    for root in ROOTS {
-        let source = format!("/tenant/roots{root}");
-        fs::create_dir_all(&source)?;
-        fs::create_dir_all(root)?;
-        command("mount", &["--bind", &source, root])?;
+    paths::Directory::absolute(&tool_bin, 0)?.bind(&layout.cargo_bin, true)?;
+    let mut bound_roots = Vec::new();
+    for (source, root) in layout.roots.iter().zip(ROOTS) {
+        match fs::create_dir(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let target = paths::Directory::absolute(Path::new(root), 0)?;
+        bound_roots.push(source.bind(&target, false)?);
     }
     start_after_probes(
         || {
-            for root in ROOTS {
-                reflink_probe(Path::new("/tenant/state"), Path::new(root))?;
+            for root in &bound_roots {
+                reflink_probe(&layout.state.fd_path(), &root.fd_path())?;
             }
             Ok(())
         },
-        || start_runner(&args),
+        || start_runner(&args, &layout.runner.fd_path().join("runner.sock")),
     )?;
     fs::write("/run/motor-tenant-generation", generation.to_string())?;
     Ok(())
@@ -487,7 +516,7 @@ fn reflink_probe(source: &Path, destination: &Path) -> io::Result<()> {
     result
 }
 
-fn start_runner(args: &RunnerArgs) -> io::Result<()> {
+fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
     let mut cmd = Command::new("systemd-run");
     cmd.args([
         "--unit=motor-tenant-runner",
@@ -510,7 +539,11 @@ fn start_runner(args: &RunnerArgs) -> io::Result<()> {
             String::from_utf8_lossy(&status.stderr).trim()
         )));
     }
-    Ok(())
+    runner_socket::wait(
+        socket,
+        std::time::Duration::from_secs(30),
+        runner_socket::main_pid,
+    )
 }
 
 #[cfg(test)]
@@ -661,8 +694,58 @@ mod tests {
                 assert_eq!(read_frame_async(&mut socket).await.unwrap(), Some(expected));
                 write_frame_async(&mut socket, &reply).await.unwrap();
             };
-            let (result, ()) = tokio::join!(forward_socket(&path, request), task);
+            let (result, ()) = tokio::join!(
+                forward_socket(&path, request, || Ok(Some(std::process::id()))),
+                task
+            );
             assert_eq!(result.unwrap()["ok"], true);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_refuses_a_socket_not_owned_by_current_main_pid() {
+        use cortexkit_test_support::ScratchDir;
+        let root = ScratchDir::new("motor-tenant-wrong-peer");
+        let path = root.join("runner.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let task = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(
+                read_frame_async(&mut socket).await.unwrap().is_none(),
+                "no administrative frame may reach the wrong peer"
+            );
+        };
+        let (result, ()) = tokio::join!(
+            forward_socket(&path, Frame::Status, || Ok(Some(std::process::id() + 1))),
+            task
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn agent_rechecks_main_pid_after_hello_before_forwarding() {
+        use cortexkit_test_support::ScratchDir;
+        let root = ScratchDir::new("motor-tenant-peer-restart");
+        let path = root.join("runner.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let task = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let hello = read_frame_async(&mut socket).await.unwrap().unwrap();
+            assert!(matches!(hello, Frame::Hello { .. }));
+            write_frame_async(&mut socket, &hello).await.unwrap();
+            assert!(
+                read_frame_async(&mut socket).await.unwrap().is_none(),
+                "the previous runner must not receive the administrative request"
+            );
+        };
+        let mut lookups = 0;
+        let (result, ()) = tokio::join!(
+            forward_socket(&path, Frame::Status, || {
+                lookups += 1;
+                Ok(Some(std::process::id() + u32::from(lookups > 2)))
+            }),
+            task
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 }
