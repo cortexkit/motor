@@ -197,6 +197,33 @@ mod tests {
         unsafe { libc::geteuid() }
     }
 
+    /// A tenant root shaped like a fresh tenant disk: mode 0755 and no default
+    /// ACL. Scratch space can carry a group-writable default ACL (the build
+    /// server's /srv/build/tmp does), which new directories would inherit and
+    /// which the ownership checks rightly refuse.
+    fn tenant_root(name: &str) -> (ScratchDir, PathBuf) {
+        let scratch = ScratchDir::new(name);
+        let root = scratch.join("tenant");
+        fs::create_dir(&root).unwrap();
+        #[cfg(target_os = "linux")]
+        match std::process::Command::new("setfacl")
+            .args(["-b", "-k"])
+            .arg(&root)
+            .status()
+        {
+            Ok(status) => assert!(
+                status.success(),
+                "setfacl -b -k failed on {}",
+                root.display()
+            ),
+            // Without setfacl the filesystem carries no ACL for us to clear.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("setfacl: {error}"),
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        (scratch, root)
+    }
+
     #[test]
     fn attach_refuses_persisted_symlink_sources_with_the_path() {
         for source in [
@@ -207,10 +234,14 @@ mod tests {
             "cargo-home/bin",
             "cargo-home",
         ] {
-            let root = ScratchDir::new("motor-tenant-symlink");
+            let (scratch, root) = tenant_root("motor-tenant-symlink");
             let path = root.join(source);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let outside = root.join("outside");
+            // Explicit 0755: the default 0777 would leave parents group-writable
+            // under a 002 umask, and attach would refuse them before the symlink.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o755)
+                .create(path.parent().unwrap())
+                .unwrap();
+            let outside = scratch.join("outside");
             fs::create_dir(&outside).unwrap();
             symlink(&outside, &path).unwrap();
             let error = prepare_disk_layout(&root, uid())
@@ -226,7 +257,7 @@ mod tests {
 
     #[test]
     fn source_fds_stay_pinned_and_check_ownership_and_permissions() {
-        let root = ScratchDir::new("motor-tenant-source-fd");
+        let (_scratch, root) = tenant_root("motor-tenant-source-fd");
         let layout = prepare_disk_layout(&root, uid()).unwrap();
         let source = &layout.roots[0];
         fs::write(source.path().join("original"), b"pinned").unwrap();
@@ -243,7 +274,7 @@ mod tests {
 
     #[test]
     fn attach_removes_only_a_leftover_socket_node() {
-        let root = ScratchDir::new("motor-tenant-stale-socket");
+        let (_scratch, root) = tenant_root("motor-tenant-stale-socket");
         let layout = prepare_disk_layout(&root, uid()).unwrap();
         let path = layout.runner.fd_path().join("runner.sock");
         let listener = UnixListener::bind(&path).unwrap();
