@@ -280,6 +280,10 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         assert!(layout.runner.remove_stale_socket("runner.sock").is_err());
         drop(listener);
+        // Recreate the node so nothing can be listening on it; see
+        // `leftover_socket_node` for why the dropped listener isn't enough.
+        fs::remove_file(&path).unwrap();
+        super::super::runner_socket::tests::leftover_socket_node(&path);
         layout.runner.remove_stale_socket("runner.sock").unwrap();
         assert!(!path.exists());
         fs::write(&path, b"not a socket").unwrap();
