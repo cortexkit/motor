@@ -122,7 +122,7 @@ extra interfaces remain a failure, not an exception added to the probe.
   length-prefixed JSON job frames to `/tenant/state/spike/runner.sock`.
 - `base_snapshot_create`: `PATCH /vm {state:Paused}`, then `PUT /snapshot/create`
   with `snapshot_type:Full`, `snapshot_path`, `mem_file_path` and
-  `snapshot_files_sync:false`; includes host-side fsync of
+  `sync_snapshot_files:false`; includes host-side fsync of
   both files and their directory. The guest is synced before pause. Snapshot
   creation is timed separately from preparation/stop; `snapshot_timing` raw
   events separate the API dump phase (including memory-file writes) from **each**
@@ -177,7 +177,7 @@ real data and exact command in hosted-runners design section 6 before advancing.
 Firecracker 1.17.0 writes the memory file itself using buffered file I/O. Its
 API has no direct-I/O or external-writer/FD setting. By default it also syncs
 the files inside the API call. The spike now disables that internal sync using
-the supported `snapshot_files_sync` flag and explicitly fsyncs both files and
+the supported `sync_snapshot_files` flag and explicitly fsyncs both files and
 their directory from the operator process **while the VM remains paused**.
 This preserves the durable suspend boundary and makes the write/durability
 phases separately measurable; earlier default-sync API samples are not pure
@@ -194,6 +194,18 @@ default high threshold. Snapshot HTTP timeout is 300 s so throttling time is
 measured rather than mistaken for a transport error. A result with this option
 must name the option and its workload; it does not qualify arbitrary full-RAM
 guests or prove a general production throttle policy.
+
+### Release-schema request guard
+
+Every outgoing API request is validated before transport against the pinned
+published `firecracker_spec-v1.17.0.yaml`, through its complete generated JSON
+projection. The portable test calls the real probe methods to check all current
+request bodies, including snapshot creation/load and drive patch. A negative
+test rejects the wrong `snapshot_files_sync` spelling; the actual API field is
+`sync_snapshot_files`. Fixture digests, release-tarball provenance, regeneration
+instructions and Apache-2.0 license are under `fixtures/`. The probe/tests need
+only the Python standard library; regenerating/checking the JSON projection
+against YAML additionally uses PyYAML.
 
 Portable plumbing tests (not VM qualification):
 

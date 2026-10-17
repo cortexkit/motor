@@ -35,6 +35,59 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    def test_every_probe_api_body_matches_the_published_release_schema(self):
+        vm = spike.VM.__new__(spike.VM)
+        vm.e = Mock()
+        vm.ready = Mock(return_value={"ready": True})
+        vm.io_counters = Mock(return_value={"wchar": 0})
+        calls = []
+
+        def request(method, path, body=None, **_kwargs):
+            spike.SCHEMA.validate(method, path, body)
+            calls.append((method, path))
+            return {"status": 204}
+
+        vm.api = request
+        with tempfile.TemporaryDirectory() as directory:
+            vm.h = Mock(state=Path(directory), snapshot_memory_high_mib=0)
+            for name in ["base.mem", "base.vmstate"]:
+                (Path(directory) / name).touch()
+            vm.api("GET", "/version")
+            vm.boot()
+            vm.pause()
+            vm.snapshot("base")
+            vm.load("base", "tap-b")
+            vm.update_drive("/replacement.img")
+            vm.resume()
+        self.assertEqual(set(calls), {("GET", "/version"), ("PUT", "/machine-config"),
+            ("PUT", "/boot-source"), ("PUT", "/drives/rootfs"), ("PUT", "/drives/tenant"),
+            ("PUT", "/network-interfaces/eth0"), ("PUT", "/vsock"), ("PUT", "/actions"),
+            ("PATCH", "/vm"), ("PUT", "/snapshot/create"), ("PUT", "/snapshot/load"),
+            ("PATCH", "/drives/tenant")})
+        self.assertEqual(len(calls), 13)
+
+    def test_release_schema_rejects_the_misspelled_snapshot_sync_field(self):
+        with self.assertRaisesRegex(ValueError, "undeclared request field: snapshot_files_sync"):
+            spike.SCHEMA.validate("PUT", "/snapshot/create", {
+                "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem",
+                "snapshot_files_sync": False})
+
+    def test_release_schema_enforces_required_scalar_enum_and_range_constraints(self):
+        cases = [("/actions", {}), ("/machine-config", {"mem_size_mib": 1, "vcpu_count": True}),
+                 ("/machine-config", {"mem_size_mib": 1, "vcpu_count": 0}),
+                 ("/actions", {"action_type": "NotAnAction"})]
+        for path, body in cases:
+            with self.subTest(path=path, body=body), self.assertRaises(ValueError):
+                spike.SCHEMA.validate("PUT", path, body)
+
+    def test_release_schema_checks_nested_overrides_and_memory_source_exclusivity(self):
+        for body in [{"snapshot_path": "/base", "mem_backend": {"backend_type": "File", "backend_path": "/mem"},
+                      "network_overrides": [{"iface_id": "eth0"}]},
+                     {"snapshot_path": "/base", "mem_file_path": "/mem",
+                      "mem_backend": {"backend_type": "File", "backend_path": "/mem"}}]:
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                spike.SCHEMA.validate("PUT", "/snapshot/load", body)
+
     def test_resolved_kernel_config_accepts_required_features_without_tunnels(self):
         text = "\n".join(f"CONFIG_{name}=y" for name in kernel_config.REQUIRED)
         self.assertEqual(kernel_config.check(text), [])
@@ -221,7 +274,7 @@ class HostedSpikeTests(unittest.TestCase):
                 self.assertEqual(sync.call_count, 3)
         vm.api.assert_called_once_with("PUT", "/snapshot/create", {"snapshot_type": "Full",
             "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem",
-            "snapshot_files_sync": False}, timeout=300)
+            "sync_snapshot_files": False}, timeout=300)
         self.assertEqual(vm.e.record.call_args.args[0], "snapshot_timing")
         self.assertGreaterEqual(vm.e.record.call_args.kwargs["api_ms"], 0)
         self.assertGreaterEqual(vm.e.record.call_args.kwargs["fsync_ms"], 0)

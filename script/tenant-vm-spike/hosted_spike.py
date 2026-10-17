@@ -6,6 +6,7 @@ import base64
 from contextlib import closing
 import hashlib
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,12 @@ import subprocess
 import sys
 import time
 import uuid
+
+_schema_spec = importlib.util.spec_from_file_location("spike_api_schema", Path(__file__).with_name("api_schema.py"))
+assert _schema_spec is not None and _schema_spec.loader is not None
+_schema_module = importlib.util.module_from_spec(_schema_spec)
+_schema_spec.loader.exec_module(_schema_module)
+SCHEMA = _schema_module.SCHEMA
 
 GIB = 1024**3
 RAM_MIB = 18432
@@ -186,6 +193,7 @@ class VM:
             self.e.run("mount", "-o", "remount,bind,ro", target)
 
     def api(self, method, path, body=None, timeout=120):
+        SCHEMA.validate(method, path, body)
         self.e.record("api_request", method=method, path=path, body=body)
         with closing(UnixHTTP(self.socket_root / "api.sock", timeout)) as client:
             client.request(method, path, None if body is None else json.dumps(body),
@@ -269,7 +277,7 @@ class VM:
         started = time.monotonic_ns()
         result = self.api("PUT", "/snapshot/create", {"snapshot_type": "Full",
                           "snapshot_path": f"/state/{name}.vmstate", "mem_file_path": f"/state/{name}.mem",
-                          "snapshot_files_sync": False}, timeout=300)
+                          "sync_snapshot_files": False}, timeout=300)
         responded = time.monotonic_ns()
         after = self.io_counters()
         phases = {}
@@ -306,6 +314,9 @@ class VM:
 
     def resume(self):
         self.api("PATCH", "/vm", {"state": "Resumed"})
+
+    def update_drive(self, path):
+        return self.api("PATCH", "/drives/tenant", {"drive_id": "tenant", "path_on_host": path})
 
     def peak(self):
         value = int((self.cgroup / "memory.peak").read_text())
@@ -567,8 +578,7 @@ def experiment(harness):
             # cannot notify virtio-blk of a different-sized tenant disk.
             def substitute():
                 vm.bind(harness.disk(gib), "replacement.img")
-                return vm.api("PATCH", "/drives/tenant",
-                              {"drive_id": "tenant", "path_on_host": "/replacement.img"})
+                return vm.update_drive("/replacement.img")
 
             e.measure(f"drive_substitute_{gib}g", substitute)
             vm.resume()
