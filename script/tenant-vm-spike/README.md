@@ -76,6 +76,7 @@ sudo env FIRECRACKER="$FIRECRACKER" JAILER="$JAILER" \
   python3 script/tenant-vm-spike/hosted_spike.py \
   --kernel "$PWD/script/tenant-vm-spike/.work/kernel/vmlinux" \
   --rootfs "$PWD/script/tenant-vm-spike/.work/image/rootfs.ext4" \
+  --snapshot-memory-high-mib 16384 \
   --work "$PWD/script/tenant-vm-spike/.work/vm-01" \
   --results "$PWD/script/tenant-vm-spike/.results/run-01"
 ```
@@ -194,7 +195,7 @@ The last line is **go** only if every required metric has five samples, all
 functional probes succeeded, and suspend restore p50 is **<=5 s**. Any transport,
 drive, network or FICLONE failure, missing run or >5 s p50 is **replan**. Extra
 memory headroom is also a replan, not a silent cap change. Record the operator's
-real data and exact command in hosted-runners design section 6 before advancing.
+real data, exact command, workload and limits with the deployment decision.
 
 ### Snapshot writeback-pressure experiment
 
@@ -207,8 +208,8 @@ This preserves the durable suspend boundary and makes the write/durability
 phases separately measurable; earlier default-sync API samples are not pure
 write-time samples. File ownership does not transfer page-cache charges.
 
-Run 09 OOM-killed the VMM during a cache-heavy snapshot at the unchanged
-18.5 GiB hard cap. An optional `--snapshot-memory-high-mib 16384` experiment
+An unthrottled cache-heavy snapshot OOM-killed the VMM at the 18.5 GiB hard
+cap. An optional `--snapshot-memory-high-mib 16384` experiment
 sets a **16 GiB `memory.high` only while taking a paused snapshot**, with the
 same 18.5 GiB `memory.max`. It restores the previous high threshold even on
 failure and records memory current/peak/stat/events before and after. The
