@@ -2214,6 +2214,11 @@ impl Sandbox {
             #[cfg(not(test))]
             let memory_max = crate::backend::memory_max(requested_vcpus);
             cmd.arg(format!("--property=MemoryMax={memory_max}"));
+            // Match the host's executable /dev/shm policy while bounding this
+            // job's private tmpfs to the same memory limit as the service.
+            cmd.arg(format!(
+                "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+            ));
         }
         cmd.arg(format!("--property=User={user}"))
             .arg(format!("--property=Group={user}"));

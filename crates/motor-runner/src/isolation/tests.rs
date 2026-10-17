@@ -68,12 +68,18 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
                 .unwrap(),
             cpus
         );
-        let expected = if cpus.len() == 5 {
-            "--property=MemoryMax=18790481920"
+        let memory_max = if cpus.len() == 5 {
+            18_790_481_920_u64
         } else {
-            "--property=MemoryMax=17179869184"
+            17_179_869_184_u64
         };
-        assert!(args.contains(&expected));
+        assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+        assert!(args.contains(
+            &format!(
+                "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
+            )
+            .as_str()
+        ));
         assert!(!args.iter().any(|arg| arg.contains("CPUAccounting=")));
         assert!(!args.contains(&"--pipe"));
         assert!(!args.contains(&"--quiet"));
