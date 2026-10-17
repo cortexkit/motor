@@ -11,6 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", binary_version());
         return Ok(());
     }
+    if print_manifest(&args, &mut io::stdout().lock())? {
+        return Ok(());
+    }
     // `ck motor ...` runs this binary as a command-line tool. The daemon
     // starts the module with `--subc FILE`, never with these first words, so
     // the module start below is unchanged.
@@ -105,9 +108,23 @@ fn binary_version() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
 }
 
+fn print_manifest(
+    args: &[String],
+    output: &mut impl io::Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if args != ["--manifest"] {
+        return Ok(false);
+    }
+    let module_id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| "ck-motor".into());
+    let manifest = motor_module::module::manifest(&module_id);
+    serde_json::to_writer(&mut *output, &manifest)?;
+    writeln!(output)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{binary_version, version_requested};
+    use super::{binary_version, print_manifest, version_requested};
 
     #[test]
     fn version_argument_is_recognized_without_daemon_arguments() {
@@ -116,5 +133,19 @@ mod tests {
         assert!(!version_requested(&["--version".into(), "extra".into()]));
         assert!(binary_version().starts_with(concat!(env!("CARGO_PKG_VERSION"), " (")));
         assert!(binary_version().ends_with(')'));
+    }
+
+    #[test]
+    fn manifest_option_prints_valid_json_with_provenance() {
+        let mut output = Vec::new();
+        assert!(print_manifest(&["--manifest".into()], &mut output).unwrap());
+
+        let manifest: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let provenance = manifest["provenance"].as_object().unwrap();
+        assert!(
+            provenance.contains_key("build_git_sha")
+                || provenance.contains_key("build_git_sha_absence_reason")
+        );
+        assert!(!print_manifest(&[], &mut Vec::new()).unwrap());
     }
 }

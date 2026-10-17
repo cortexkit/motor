@@ -139,8 +139,76 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
             observability: Vec::new(),
             identity_scope: Vec::new(),
         }])
+        .provenance(Some(build_provenance_from_build_facts(
+            option_env!("CK_BUILD_GIT_SHA"),
+            option_env!("CK_BUILD_GIT_STATUS"),
+            option_env!("CK_BUILD_LOCK_DIGEST"),
+        )))
         .build()
 }
+
+fn build_provenance_from_build_facts(
+    revision: Option<&str>,
+    git_status: Option<&str>,
+    lock_digest: Option<&str>,
+) -> subc_protocol::manifest::ManifestProvenance {
+    use subc_protocol::manifest::{build_provenance_from_source, BuildGitShaSource, GitTreeState};
+
+    let revision = revision.filter(|revision| !revision.is_empty());
+    let source = match (revision, git_status) {
+        (Some(revision), Some("clean")) => BuildGitShaSource::Git {
+            revision,
+            tree_state: GitTreeState::Clean,
+        },
+        (Some(revision), Some("dirty")) => BuildGitShaSource::Git {
+            revision,
+            tree_state: GitTreeState::Dirty,
+        },
+        (Some(_), _) => BuildGitShaSource::NeverDerived,
+        (None, _) => BuildGitShaSource::NoGitDir,
+    };
+
+    build_provenance_from_source(
+        source,
+        lock_digest.filter(|digest| !digest.is_empty()),
+        None,
+    )
+    .expect("build script emits canonical provenance facts")
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::build_provenance_from_build_facts;
+    use subc_protocol::manifest::BuildGitShaAbsenceReason;
+
+    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    const LOCK_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn build_facts_map_clean_dirty_and_missing_git_to_provenance() {
+        let clean =
+            build_provenance_from_build_facts(Some(REVISION), Some("clean"), Some(LOCK_DIGEST));
+        assert_eq!(clean.build_git_sha.as_deref(), Some(REVISION));
+        assert!(clean.build_git_sha_absence_reason.is_none());
+        assert_eq!(clean.build_lock_digest.as_deref(), Some(LOCK_DIGEST));
+
+        let dirty =
+            build_provenance_from_build_facts(Some(REVISION), Some("dirty"), Some(LOCK_DIGEST));
+        assert!(dirty.build_git_sha.is_none());
+        assert_eq!(
+            dirty.build_git_sha_absence_reason,
+            Some(BuildGitShaAbsenceReason::DeclinedDirty)
+        );
+
+        let no_git = build_provenance_from_build_facts(None, None, Some(LOCK_DIGEST));
+        assert!(no_git.build_git_sha.is_none());
+        assert_eq!(
+            no_git.build_git_sha_absence_reason,
+            Some(BuildGitShaAbsenceReason::NoGitDir)
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct Handler {
     config: Config,

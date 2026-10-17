@@ -18,6 +18,9 @@ name = "motor-bench-client-dev"
 path = "../../scripts/bench-client.rs"
 required-features = ["bench-client"]
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dependencies]
 motor-protocol = { path = "../motor-protocol" }
 cortexkit-claustrum-client = "=0.1.0"
