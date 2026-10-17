@@ -114,6 +114,13 @@ pause lets the root agent capture the job unit's effective namespace/device/BPF
 properties, guest/job network namespace IDs and relevant systemd journal lines.
 The host records the saved post-`olddefconfig` feature flags and config digest;
 extra interfaces remain a failure, not an exception added to the probe.
+Fresh tenant attach refuses an already active daemon, removes only a stale
+Unix socket node, and waits for a **listening** socket owned by the new systemd
+`MainPID` (verified through `/proc/net/unix` and `/proc/PID/fd`). A persisted
+pathname or systemd's exec-level `active` status alone is not readiness. Attach
+records the listener and whether a stale node was removed. The first real
+port-52 hello is never retried: any EOF aborts with bridge errors and the runner
+and agent journal captured, rather than hiding a real daemon failure.
 
 - `cold_boot`: launch jailer through base-agent vsock readiness. The base has a
   1 GiB placeholder `/dev/vdb`, **not mounted**, and the runner is not started

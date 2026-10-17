@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import select
 import socket
+import stat
 import subprocess
+import sys
 import threading
 import time
 
@@ -42,6 +44,36 @@ def network(profile):
     return {"address": address, "ping": command("ping", "-n", "-c", "1", "-W", "2", gateway)}
 
 
+def listening_runner_socket(pid, path=RUNNER):
+    sockets = set()
+    for line in Path("/proc/net/unix").read_text().splitlines()[1:]:
+        fields = line.split(maxsplit=7)
+        if len(fields) == 8 and fields[7] == path and fields[4] == "0001" and int(fields[3], 16) & 0x10000:
+            sockets.add(f"socket:[{fields[6]}]")
+    if not sockets:
+        return None
+    try:
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                target = os.readlink(fd)
+                if target in sockets:
+                    return {"pid": pid, "socket_inode": target, "path": path}
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def runner_diagnostics():
+    result = subprocess.run(["journalctl", "-b", "--no-pager", "-n", "160",
+                             "-u", "spike-runner", "-u", "spike-agent"],
+                            capture_output=True, text=True, timeout=10)
+    return {"journal": result.stdout[-32000:], "stderr": result.stderr,
+            "unit": command("systemctl", "show", "spike-runner", "--property=MainPID",
+                            "--property=ActiveState", "--property=SubState", "--property=ExecMainStatus")}
+
+
 def attach(expected_bytes):
     size = int(command("blockdev", "--getsize64", "/dev/vdb"))
     if size != expected_bytes:
@@ -59,16 +91,34 @@ def attach(expected_bytes):
     Path("/var/lib/motor-spike/host-only").write_text("not visible to an isolated job\n")
     Path("/tenant/persistent-marker").write_text("tenant-vm-spike\n")
     os.sync()
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "spike-runner"]).returncode == 0
+    if active:
+        raise RuntimeError("refusing to replace a socket while the runner is active")
+    try:
+        old = Path(RUNNER).lstat()
+    except FileNotFoundError:
+        old = None
+    if old is not None:
+        if not stat.S_ISSOCK(old.st_mode):
+            raise RuntimeError("refusing non-socket runner.sock in the tenant state")
+        Path(RUNNER).unlink()
     command("systemctl", "start", "spike-runner")
+    pid = int(command("systemctl", "show", "spike-runner", "--property=MainPID", "--value"))
     deadline = time.monotonic() + 30
-    while not Path(RUNNER).exists():
-        if time.monotonic() > deadline:
-            raise RuntimeError(command("journalctl", "-u", "spike-runner", "--no-pager", "-n", "60"))
+    listener = None
+    while listener is None:
+        listener = listening_runner_socket(pid)
+        if not Path(f"/proc/{pid}").exists() or time.monotonic() > deadline:
+            raise RuntimeError(json.dumps(runner_diagnostics()))
+        if listener is not None:
+            break
         time.sleep(0.05)
     return {"device": "/dev/vdb", "bytes": size,
             "filesystem": command("findmnt", "-n", "-o", "FSTYPE", "/tenant"),
             "owned_workspace_root": "/Users", "workspace_source": "/tenant/state/workspaces",
             "workspace_owner_uid": Path("/Users").stat().st_uid,
+            "runner_listener": listener,
+            "stale_runner_socket_removed": old is not None,
             "runner": command("systemctl", "is-active", "spike-runner")}
 
 
@@ -193,6 +243,8 @@ def control(conn):
                 result = cache_verify()
             elif op == "diagnostics":
                 result = diagnostics(request["job_id"])
+            elif op == "runner_diagnostics":
+                result = runner_diagnostics()
             elif op == "sync":
                 os.sync()
                 result = ready()
@@ -208,6 +260,7 @@ def bridge(conn):
     with conn, socket.socket(socket.AF_UNIX) as runner:
         try:
             runner.connect(RUNNER)
+            runner_bytes = 0
             while True:
                 readers, _, _ = select.select([conn, runner], [], [], 120)
                 if not readers:
@@ -215,9 +268,14 @@ def bridge(conn):
                 for source in readers:
                     data = source.recv(65536)
                     if not data:
+                        if source is runner and runner_bytes == 0:
+                            print(json.dumps({"runner_bridge_eof_before_reply": RUNNER}), file=sys.stderr, flush=True)
                         return
+                    if source is runner:
+                        runner_bytes += len(data)
                     (runner if source is conn else conn).sendall(data)
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError) as error:
+            print(json.dumps({"runner_bridge_error": str(error), "path": RUNNER}), file=sys.stderr, flush=True)
             return
 
 

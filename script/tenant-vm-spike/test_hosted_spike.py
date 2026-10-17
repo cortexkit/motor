@@ -35,6 +35,22 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    @unittest.skipUnless(platform.system() == "Linux", "requires real Linux /proc socket ownership")
+    def test_runner_readiness_requires_current_pid_to_own_a_listening_socket(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "runner.sock")
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(path)
+                self.assertIsNone(guest.listening_runner_socket(os.getpid(), path))
+                server.listen(1)
+                result = guest.listening_runner_socket(os.getpid(), path)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["pid"], os.getpid())
+                self.assertIsNone(guest.listening_runner_socket(0, path))
+            self.assertTrue(Path(path).exists())
+            self.assertIsNone(guest.listening_runner_socket(os.getpid(), path))
+
     def test_every_probe_api_body_matches_the_published_release_schema(self):
         vm = spike.VM.__new__(spike.VM)
         vm.e = Mock()

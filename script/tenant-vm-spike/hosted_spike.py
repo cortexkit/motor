@@ -248,8 +248,16 @@ class VM:
     def ready(self, runner=False):
         result = wait_for(lambda: self.control("ready"))
         if runner:
-            with self.connect(52) as conn:
-                result["runner_hello"] = hello(conn)
+            try:
+                with self.connect(52) as conn:
+                    result["runner_hello"] = hello(conn)
+            except Exception as error:
+                try:
+                    diagnostics = self.control("runner_diagnostics")
+                except Exception as diagnostic_error:
+                    diagnostics = {"error": str(diagnostic_error)}
+                self.e.record("runner_hello_failure", error=str(error), diagnostics=diagnostics)
+                raise RuntimeError(f"port-52 runner hello failed (not retried): {error}") from error
         return result
 
     def snapshot(self, name):
