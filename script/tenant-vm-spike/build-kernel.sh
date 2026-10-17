@@ -3,6 +3,8 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd -P)
 out=${1:?usage: build-kernel.sh OUTPUT_DIRECTORY}
+mode=${2:-build}
+[[ $mode == build || $mode == --config-only ]] || { echo 'expected --config-only or no second argument'; exit 1; }
 mkdir -p "$out"
 out=$(cd "$out" && pwd -P)
 exec > >(tee "$out/kernel-build.log") 2>&1
@@ -24,7 +26,7 @@ test ! -e "$out/linux-$version" || { echo 'refusing existing kernel source direc
 tar -xJf "$archive" -C "$out"
 cd "$out/linux-$version"
 make CC="$compiler" HOSTCC="$compiler" x86_64_defconfig
-scripts/config --disable MODULES --disable DEBUG_INFO --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+scripts/config --enable MODULES --disable DEBUG_INFO --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
     --disable TRANSPARENT_HUGEPAGE --disable HUGETLBFS --disable HUGETLB_PAGE \
     --enable VIRTIO --enable VIRTIO_MMIO --enable VIRTIO_MMIO_CMDLINE_DEVICES \
     --enable VIRTIO_BLK --enable VIRTIO_NET --enable VIRTIO_CONSOLE \
@@ -43,6 +45,12 @@ scripts/config --disable MODULES --disable DEBUG_INFO --disable DEBUG_INFO_DWARF
     --enable SERIAL_8250 --enable SERIAL_8250_CONSOLE --enable RANDOM_TRUST_CPU
 make CC="$compiler" HOSTCC="$compiler" olddefconfig
 python3 "$here/check-kernel-config.py" .config
+if [[ $mode == --config-only ]]; then
+    cp .config "$out/kernel.config"
+    sha256sum "$out/kernel.config"
+    echo 'kernel config-only verification: passed (no kernel compile)'
+    exit 0
+fi
 make CC="$compiler" HOSTCC="$compiler" -j"${JOBS:-4}" vmlinux
 cp vmlinux "$out/vmlinux"
 cp .config "$out/kernel.config"

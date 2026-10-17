@@ -29,7 +29,12 @@ absolute paths; the Firecracker executable must be named `firecracker`.
   device/firewall policies and disables tunnel drivers that create fallback
   interfaces inside otherwise private network namespaces. The resolved config
   is checked before compilation and again when saved, not just requested via
-  `scripts/config`. Inputs/config/digests are retained.
+  `scripts/config`. Linux 6.1's BPF JIT depends on `MODULES`; both are enabled to
+  match systemd 259's documented BPF network-policy prerequisites. Required
+  guest drivers remain built in and no loadable module files are installed in
+  the rootfs. Inputs/config/digests are retained. To verify the complete config
+  recipe without a kernel compile, pass `--config-only` as the builder's second
+  argument, using a new output directory.
 - Allow **128 GiB peak incremental disk** including Cargo/kernel build scratch,
   rootfs copies, fully allocated 1/20/24 GiB XFS disks and two 18 GiB memory
   snapshots. Allow 22 GiB available host RAM and four build CPUs. Once inputs
