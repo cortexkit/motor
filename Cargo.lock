@@ -884,6 +884,7 @@ name = "motor-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cortexkit-test-support",
  "ed25519-dalek",
  "libc",
  "motor-lease",

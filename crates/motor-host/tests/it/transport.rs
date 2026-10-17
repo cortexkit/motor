@@ -182,7 +182,7 @@ async fn close_after_lease_ok_before_delivery_releases_without_refused_event() {
 #[tokio::test]
 async fn verified_lease_is_first_and_watermark_is_durable_before_output_is_visible() {
     let (runtime, fake, broker, requester, c) = fixture();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = scratch();
     *runtime.host.lock().unwrap() = disk_host(directory.path());
     let (mut client, server) = tokio::io::duplex(8192);
     let task = tokio::spawn(serve(runtime.clone(), server));

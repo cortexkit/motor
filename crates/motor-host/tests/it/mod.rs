@@ -82,3 +82,9 @@ fn disk_host(path: &std::path::Path) -> Host {
     let (journal, snapshot) = FileJournal::open(path).unwrap();
     Host::new(tenants(), snapshot, Box::new(journal))
 }
+
+fn scratch() -> tempfile::TempDir {
+    let root = cortexkit_test_support::scratch_root();
+    std::fs::create_dir_all(&root).unwrap();
+    tempfile::tempdir_in(root).unwrap()
+}

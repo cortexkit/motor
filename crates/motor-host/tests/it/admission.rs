@@ -204,7 +204,7 @@ fn delivered_expiry_needs_continuous_event_stream_and_all_refusal_causes_are_ord
 }
 #[test]
 fn quota_stays_one_until_guest_ready_and_deadline_exclusion_survives_restart() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = scratch();
     let mut h = disk_host(directory.path());
     let mut c = claims(JOB);
     c.vcpus = 2;
@@ -255,7 +255,7 @@ fn idle_requires_runner_idle_no_relay_reserved_or_prelude_and_exact_byte_floor()
 }
 #[test]
 fn fsync_snapshot_retains_nonce_binding_state_and_highest_sequence() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = scratch();
     let mut h = disk_host(directory.path());
     h.consume_nonce("nonce".into(), NOW, NOW).unwrap();
     let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
@@ -291,7 +291,7 @@ fn failed_journal_never_publishes_reservation_or_watermark() {
 
 #[test]
 fn admitted_unstarted_deadline_persists_zero_and_cancel_until_acknowledged() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = scratch();
     let mut h = disk_host(directory.path());
     let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
     h.delivered(id).unwrap();

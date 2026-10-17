@@ -1,3 +1,4 @@
+use super::scratch;
 use motor_host::helper::{read_json, write_json, Control, Helper};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -37,7 +38,7 @@ fn descriptor_reply(stream: &UnixStream, fd: &UnixStream) {
 #[test]
 fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
     for restored in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = scratch();
         let path = directory.path().join("helper.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let worker = std::thread::spawn(move || {
