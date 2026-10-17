@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Portable tests for the measurement plumbing, not evidence of VM behavior."""
+
+import importlib.util
+import json
+from pathlib import Path
+import socket
+import struct
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+spec = importlib.util.spec_from_file_location("hosted_spike", Path(__file__).with_name("hosted_spike.py"))
+assert spec is not None and spec.loader is not None
+spike = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(spike)
+
+
+def complete_samples():
+    return {name: [100, 102, 101, 99, 103] for name in spike.REQUIRED_METRICS}
+
+
+class HostedSpikeTests(unittest.TestCase):
+    def test_frame_roundtrip(self):
+        a, b = socket.socketpair()
+        with a, b:
+            spike.send_frame(a, {"type": "hello", "protocol_version": 1})
+            self.assertEqual(spike.read_frame(b), {"type": "hello", "protocol_version": 1})
+
+    def test_frame_short_read_and_eof(self):
+        a, b = socket.socketpair()
+        with a, b:
+            a.sendall(struct.pack(">I", 4) + b"{")
+            a.shutdown(socket.SHUT_WR)
+            with self.assertRaisesRegex(RuntimeError, "unexpected EOF"):
+                spike.read_frame(b)
+
+    def test_frame_rejects_oversized_message(self):
+        a, b = socket.socketpair()
+        with a, b:
+            a.sendall(struct.pack(">I", 1048577))
+            with self.assertRaisesRegex(RuntimeError, "invalid frame size"):
+                spike.read_frame(b)
+
+    def test_snapshot_load_has_network_override_and_ordinary_file_memory(self):
+        vm = spike.VM.__new__(spike.VM)
+        vm.api = Mock(return_value={"status": 204})
+        vm.load("base", "tap-b")
+        vm.api.assert_called_once_with("PUT", "/snapshot/load", {
+            "snapshot_path": "/state/base.vmstate",
+            "mem_backend": {"backend_type": "File", "backend_path": "/state/base.mem"},
+            "enable_diff_snapshots": False, "resume_vm": False,
+            "network_overrides": [{"iface_id": "eth0", "host_dev_name": "tap-b"}],
+        })
+
+    def test_api_sends_http_json_and_closes_connection(self):
+        vm = spike.VM.__new__(spike.VM)
+        vm.e = Mock()
+        vm.socket_root = Path("/unused")
+        a, b = socket.socketpair()
+        with a, b:
+            b.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            with patch.object(spike.UnixHTTP, "connect", lambda client: setattr(client, "sock", a)):
+                self.assertEqual(vm.api("PATCH", "/vm", {"state": "Paused"}), {"status": 204, "body": ""})
+            self.assertEqual(a.fileno(), -1)
+            request = b.recv(4096)
+            self.assertIn(b"PATCH /vm HTTP/1.1", request)
+            self.assertIn(b'{"state": "Paused"}', request)
+
+    def test_snapshot_create_is_full_and_fsyncs_both_files_and_directory(self):
+        vm = spike.VM.__new__(spike.VM)
+        vm.api = Mock(return_value={"status": 204})
+        with tempfile.TemporaryDirectory() as directory:
+            vm.h = Mock(state=Path(directory))
+            for name in ["base.mem", "base.vmstate"]:
+                (Path(directory) / name).touch()
+            with patch.object(spike.os, "fsync") as sync:
+                self.assertEqual(vm.snapshot("base"), {"status": 204})
+                self.assertEqual(sync.call_count, 3)
+        vm.api.assert_called_once_with("PUT", "/snapshot/create", {"snapshot_type": "Full",
+            "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.mem"})
+
+    def test_network_override_requires_packets_on_replacement_tap(self):
+        harness = spike.Harness.__new__(spike.Harness)
+        harness.tap_rx = Mock(side_effect=[10, 10])
+        vm = Mock()
+        vm.control.return_value = {"ping": "1 received"}
+        with self.assertRaisesRegex(RuntimeError, "did not send packets through tap-b"):
+            harness.check_network_override(vm)
+        vm.control.assert_called_once_with("network", profile="b")
+
+    def test_network_override_accepts_observed_replacement_tap_packets(self):
+        harness = spike.Harness.__new__(spike.Harness)
+        harness.tap_rx = Mock(side_effect=[10, 12])
+        vm = Mock()
+        vm.control.return_value = {"ping": "1 received"}
+        result = harness.check_network_override(vm)
+        self.assertEqual(result["tap_b_rx_after"], 12)
+
+    def test_complete_five_run_report_uses_median(self):
+        result = spike.summarize(complete_samples())
+        self.assertEqual(result["verdict"], "go")
+        self.assertEqual(result["metrics"]["cold_boot"]["p50"], 101)
+        self.assertEqual(result["metrics"]["cold_boot"]["n"], 5)
+
+    def test_missing_measurement_replans(self):
+        samples = complete_samples()
+        del samples["ficlone_24g"]
+        result = spike.summarize(samples)
+        self.assertEqual(result["verdict"], "replan")
+        self.assertIn("ficlone_24g", " ".join(result["reasons"]))
+
+    def test_four_runs_cannot_pass_as_five(self):
+        samples = complete_samples()
+        samples["cold_boot"].pop()
+        self.assertEqual(spike.summarize(samples)["verdict"], "replan")
+
+    def test_suspend_restore_over_budget_replans(self):
+        samples = complete_samples()
+        samples["suspend_restore"] = [4999, 5001, 5002, 5003, 5004]
+        self.assertEqual(spike.summarize(samples)["verdict"], "replan")
+
+    def test_suspend_restore_at_budget_is_allowed(self):
+        samples = complete_samples()
+        samples["suspend_restore"] = [5000] * 5
+        self.assertEqual(spike.summarize(samples)["verdict"], "go")
+
+    def test_restore_headroom_breach_replans(self):
+        samples = complete_samples()
+        samples["restore_memory_peak_bytes"][-1] = 19 * spike.GIB
+        self.assertEqual(spike.summarize(samples)["verdict"], "replan")
+
+    def test_an_error_cannot_produce_go(self):
+        self.assertEqual(spike.summarize(complete_samples(), "drive substitution failed")["verdict"], "replan")
+
+    def test_raw_samples_preserve_command_and_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = spike.Evidence(Path(directory))
+            evidence.record("invocation", argv=["hosted_spike.py", "--work", "work"])
+            evidence.sample("restore_memory_peak_bytes", 123456, unit="bytes")
+            evidence.raw.close()
+            rows = [json.loads(line) for line in (Path(directory) / "raw.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["argv"][0], "hosted_spike.py")
+            self.assertEqual(rows[1]["unit"], "bytes")
+            self.assertEqual(rows[1]["value"], 123456)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
