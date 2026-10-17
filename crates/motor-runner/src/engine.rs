@@ -371,12 +371,26 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
 #[derive(Clone)]
 pub(crate) struct QueueProgress {
     entry: Arc<std::sync::atomic::AtomicU64>,
+    elapsed: Arc<std::sync::atomic::AtomicU64>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 impl QueueProgress {
     pub(crate) fn elapsed_ms(&self) -> Option<u64> {
-        let entry = self.entry.load(std::sync::atomic::Ordering::Acquire);
-        (entry != NO_QUEUE).then(|| (self.clock)().saturating_sub(entry))
+        loop {
+            let entry = self.entry.load(std::sync::atomic::Ordering::Acquire);
+            if entry == NO_QUEUE {
+                return None;
+            }
+            let elapsed = self.elapsed.load(std::sync::atomic::Ordering::Acquire);
+            if entry != self.entry.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            return Some(elapsed.saturating_add(if entry == PAUSED_QUEUE {
+                0
+            } else {
+                (self.clock)().saturating_sub(entry)
+            }));
+        }
     }
 }
 
@@ -1978,10 +1992,11 @@ impl Runner {
             return self.save(job);
         }
         job.state = JobState::Queued;
-        job.queued_ms = Some(self.now());
+        let queued_ms = self.now();
+        job.queued_ms = Some(queued_ms);
+        job.start_queue_wait(queued_ms);
         self.save(job)?;
-        job.queue_entry
-            .store(job.queued_ms.unwrap(), std::sync::atomic::Ordering::Release);
+        self.update_queue_wait_clocks(&mut inner, queued_ms)?;
         tracing::info!(job_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "bundles fetched; job queued");
         // Legacy clients may name an unmerged job branch; only opted-in tips may queue cache fills.
         if !default_branch_tip {
@@ -2552,7 +2567,7 @@ impl Runner {
             .jobs
             .get(&id)
             .filter(|j| j.state == JobState::Queued && !inner.starting.contains(&id))
-            .and_then(|j| j.queued_ms.map(|t| now.saturating_sub(t)))
+            .and_then(|j| j.queued_ms.map(|_| j.queue_wait_ms(now)))
     }
     pub(crate) fn queue_progress(&self, id: Uuid) -> QueueProgress {
         let inner = self.core.inner.lock().unwrap();
@@ -2562,11 +2577,17 @@ impl Runner {
                 .get(&id)
                 .map(|j| j.queue_entry.clone())
                 .unwrap_or_else(empty_queue_entry),
+            elapsed: inner
+                .jobs
+                .get(&id)
+                .map(|j| j.queue_elapsed.clone())
+                .unwrap_or_else(empty_queue_elapsed),
             clock: self.core.config.clock.clone(),
         }
     }
     pub fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
-        let inner = self.core.inner.lock().unwrap();
+        let mut inner = self.core.inner.lock().unwrap();
+        self.update_queue_wait_clocks(&mut inner, self.now())?;
         let job = inner.jobs.get(&id);
         let quarantine = self.core.quarantined.get(&id);
         let process = job
@@ -2585,6 +2606,7 @@ impl Runner {
                     }
                     .into()
                 }),
+            waiting_on: self.queue_wait_phase(&inner, id).map(str::to_owned),
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
                 .and_then(|p| p.unit)
@@ -2655,6 +2677,8 @@ impl Runner {
         let log = self.job_log(id);
         let _write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
+        let now = self.now();
+        self.update_queue_wait_clocks(&mut inner, now)?;
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
             (!inner.starting.contains(&id) || self.core.config.windows_instance())
@@ -2662,16 +2686,24 @@ impl Runner {
                 && if stalled {
                     job.state == JobState::AwaitingBundles
                 } else {
+                    // Windows VM boot stays withdrawable after setup reserves the job.
+                    // Keep that setup interval separate from paused workspace-owner time.
+                    let setup_wait = if self.core.config.windows_instance()
+                        && inner.starting.contains(&job.id)
+                    {
+                        now.saturating_sub(job.setup_ms.unwrap_or(now))
+                    } else {
+                        0
+                    };
                     job.state == JobState::Queued
-                        && job.queued_ms.is_some_and(|t| {
-                            self.now().saturating_sub(t)
-                                >= job
-                                    .request
-                                    .as_ref()
-                                    .unwrap()
-                                    .queue_wait_limit_s
-                                    .saturating_mul(1000)
-                        })
+                        && job.queued_ms.is_some()
+                        && job.queue_wait_ms(now).saturating_add(setup_wait)
+                            >= job
+                                .request
+                                .as_ref()
+                                .unwrap()
+                                .queue_wait_limit_s
+                                .saturating_mul(1000)
                 }
         });
         let detail = if stalled {
@@ -2778,6 +2810,99 @@ impl Runner {
         heads.into_iter().map(|(_, _, _, id)| id).collect()
     }
 
+    fn queue_wait_phase(&self, inner: &Inner, id: Uuid) -> Option<&'static str> {
+        let job = inner.jobs.get(&id)?;
+        if job.state == JobState::AwaitingBundles {
+            return Some("bundle upload/fetch");
+        }
+        if job.state != JobState::Queued {
+            return None;
+        }
+        if inner.starting.contains(&id) {
+            return Some("workspace setup");
+        }
+        Some(if inner.dropping.contains(job.key()) {
+            "workspace drop"
+        } else if Self::occupied(inner, job.key()) {
+            "workspace owner"
+        } else if job
+            .request
+            .as_ref()
+            .is_some_and(|r| Self::siblings_blocked(inner, &r.siblings))
+        {
+            "sibling checkout owner"
+        } else if job.weight > self.core.config.max_weight {
+            "demand exceeds capacity"
+        } else if Self::held_weight(inner).saturating_add(job.weight) > self.core.config.max_weight
+        {
+            "permits"
+        } else {
+            "queue order"
+        })
+    }
+
+    fn queue_wait_paused_by_workspace(&self, inner: &Inner, id: Uuid) -> bool {
+        let Some(job) = inner.jobs.get(&id) else {
+            return false;
+        };
+        if job.state != JobState::Queued || job.queued_ms.is_none() || inner.starting.contains(&id)
+        {
+            return false;
+        }
+        let Some(request) = job.request.as_ref() else {
+            return false;
+        };
+        let Some(owner) = inner.jobs.values().find(|owner| {
+            owner.id != id
+                && owner.key() == job.key()
+                && (owner.state == JobState::Running || inner.starting.contains(&owner.id))
+        }) else {
+            return false;
+        };
+        if Self::deleting(inner, job.key(), &request.siblings)
+            || Self::siblings_blocked(inner, &request.siblings)
+        {
+            return false;
+        }
+        let heads = self.queue_heads(inner);
+        if !heads.contains(&id) || self.blocking_head(inner, &heads, id).is_some() {
+            return false;
+        }
+        let held_without_workspace_owner = Self::held_weight(inner).saturating_sub(owner.weight);
+        job.weight <= self.core.config.max_weight
+            && held_without_workspace_owner.saturating_add(job.weight)
+                <= self.core.config.max_weight
+    }
+
+    fn update_queue_wait_clocks(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+        let queued: Vec<_> = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state == JobState::Queued
+                    && job.queued_ms.is_some()
+                    && !inner.starting.contains(&job.id)
+            })
+            .map(|job| job.id)
+            .collect();
+        for id in queued {
+            let pause = self.queue_wait_paused_by_workspace(inner, id);
+            let job = &inner.jobs[&id];
+            let active = job.queue_wait_started_ms.is_some();
+            if (pause && active) || (!pause && !active) {
+                let mut updated = job.clone();
+                if pause {
+                    updated.pause_queue_wait(now);
+                } else {
+                    updated.resume_queue_wait(now);
+                }
+                self.save(&updated)?;
+                inner.jobs.insert(id, updated);
+            }
+        }
+        Ok(())
+    }
+
     /// Include both resource owners and scheduler fences in the refusal itself;
     /// the client need not have journal access to explain a local fallback.
     fn queue_wait_detail(&self, inner: &Inner, id: Uuid) -> String {
@@ -2822,26 +2947,8 @@ impl Runner {
             })
             .collect();
         let mut blocking_head = None;
-        let phase = if job.state == JobState::AwaitingBundles {
-            "bundle upload/fetch"
-        } else if inner.starting.contains(&id) {
-            "workspace setup"
-        } else if inner.dropping.contains(job.key()) {
-            "workspace drop"
-        } else if Self::occupied(inner, job.key()) {
-            "workspace owner"
-        } else if job
-            .request
-            .as_ref()
-            .is_some_and(|r| Self::siblings_blocked(inner, &r.siblings))
-        {
-            "sibling checkout owner"
-        } else if job.weight > self.core.config.max_weight {
-            "demand exceeds capacity"
-        } else if Self::held_weight(inner).saturating_add(job.weight) > self.core.config.max_weight
-        {
-            "permits"
-        } else {
+        let phase = self.queue_wait_phase(inner, id).unwrap_or("queue order");
+        let phase = if phase == "queue order" {
             // This job would fit, so a job ahead of it holds the queue: a gate
             // job, or an older job past its backfill grace that is waiting for
             // enough free permits (the scheduler stops smaller jobs overtaking
@@ -2852,6 +2959,8 @@ impl Runner {
                 Some((_, false)) => "older job ahead needs more free permits",
                 None => "queue order",
             }
+        } else {
+            phase
         };
         let blocking = blocking_head
             .map(|(head, _)| {
@@ -3422,6 +3531,7 @@ impl Runner {
         if self.ensure_admission_ownership().is_err() {
             return Ok(());
         }
+        self.update_queue_wait_clocks(inner, now)?;
         let mut index = DispatchIndex::build(inner);
         loop {
             let mut next = None;
@@ -3466,6 +3576,7 @@ impl Runner {
             let Some(id) = next else { break };
             self.start(inner, id, &index.claims)?;
             index.started(inner, id);
+            self.update_queue_wait_clocks(inner, now)?;
         }
         Ok(())
     }
@@ -3528,7 +3639,9 @@ impl Runner {
             cpus = ?placement.cpus, windows_active = ?placement.windows_active,
             avoided_cpus = ?placement.avoided_cpus, "placed job CPUs");
         queued_job.cpus = placement.cpus;
-        queued_job.setup_ms = Some(self.now());
+        let setup_ms = self.now();
+        queued_job.setup_ms = Some(setup_ms);
+        queued_job.stop_queue_wait(setup_ms);
         queued_job
             .queue_entry
             .store(NO_QUEUE, std::sync::atomic::Ordering::Release);

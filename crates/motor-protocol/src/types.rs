@@ -373,11 +373,14 @@ define_frames! {
 pub struct JobStatusReply {
     pub job_id: Uuid,
     pub state: String,
+    /// Current scheduler phase or blocker while the job has not started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
     pub terminal: Option<TerminalRecord>,
     pub unit: Option<String>,
     pub unit_alive: Option<bool>,
-    /// Present while waiting for scheduler capacity, absent once the job owns
-    /// capacity for workspace creation or command execution.
+    /// Present while the job remains queued; it counts time spent waiting for
+    /// shared scheduler capacity, excluding time paused behind a workspace owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_ms: Option<u64>,
 }

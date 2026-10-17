@@ -228,6 +228,7 @@ impl Connector for RoutingPeer {
                                 &Frame::JobStatusReply(JobStatusReply {
                                     job_id: id,
                                     state: instance.clone(),
+                                    waiting_on: None,
                                     terminal: None,
                                     unit: None,
                                     unit_alive: None,

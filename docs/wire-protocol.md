@@ -312,10 +312,15 @@ stays retrievable for 24 hours. Test: `cancelled_request_detaches_and_the_job_ke
 
 ## 8. Queue wait and withdrawal
 
-8.1. `heartbeat.queue_wait_ms` is present only while the job waits for
-capacity, measured from when its bundles were verified and pinned. It is absent
-during upload, fetch, setup and execution. A plain heartbeat never authorizes
-withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
+8.1. `heartbeat.queue_wait_ms` is present only while the job is queued,
+measured from when its bundles were verified and pinned. It counts time waiting
+for capacity or another shared scheduler blocker, but excludes time when an
+earlier job owning the same workspace is the only blocker. The runner resumes
+the clock if another blocker appears. Upload, fetch, setup and execution are
+excluded. Cancellation still removes a queued job, and the request's execution
+timeout starts when its command starts. `job_status_reply.waiting_on` reports the
+current blocker, such as `workspace owner` or `permits`. A plain heartbeat never
+authorizes withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
 `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`
 (`crates/motor-module/src/queue_tests.rs`).
 

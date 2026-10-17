@@ -73,6 +73,7 @@ impl Connector for ClockPeer {
                                 &Frame::JobStatusReply(JobStatusReply {
                                     job_id,
                                     state: "queued".into(),
+                                    waiting_on: None,
                                     terminal: None,
                                     unit: None,
                                     unit_alive: None,
