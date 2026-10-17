@@ -425,6 +425,23 @@ class Harness:
             raise RuntimeError("; ".join(failures))
 
 
+def fixture_bundle(evidence, fixture, job_id):
+    run = evidence.run
+    commit = run("git", "-C", fixture, "rev-parse", "HEAD")
+    tree = run("git", "-C", fixture, "rev-parse", "HEAD^{tree}")
+    reference = f"refs/ck-motor/{job_id}/snapshot"
+    path = fixture / "input.bundle"
+    run("git", "-C", fixture, "update-ref", reference, commit)
+    try:
+        run("git", "-C", fixture, "bundle", "create", path, reference)
+    finally:
+        run("git", "-C", fixture, "update-ref", "-d", reference)
+    heads = run("git", "-C", fixture, "bundle", "list-heads", path)
+    if heads != f"{commit} {reference}":
+        raise RuntimeError(f"fixture bundle does not name its snapshot commit: {heads}")
+    return commit, tree, path.read_bytes()
+
+
 def isolated_job(harness, vm):
     fixture = harness.work / ("fixture-" + uuid.uuid4().hex[:8])
     fixture.mkdir()
@@ -434,18 +451,17 @@ def isolated_job(harness, vm):
     run("git", "-C", fixture, "add", "input")
     run("git", "-C", fixture, "-c", "user.name=Spike", "-c", "user.email=spike@example.invalid",
         "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
-    commit = run("git", "-C", fixture, "rev-parse", "HEAD")
-    tree = run("git", "-C", fixture, "rev-parse", "HEAD^{tree}")
-    run("git", "-C", fixture, "bundle", "create", fixture / "input.bundle", "HEAD")
-    bundle = (fixture / "input.bundle").read_bytes()
-    request = {"type": "run", "job_id": str(uuid.uuid4()), "workspace_key": "/workspace/probe",
+    job_id = str(uuid.uuid4())
+    commit, tree, bundle = fixture_bundle(harness.e, fixture, job_id)
+    request = {"type": "run", "job_id": job_id, "workspace_key": "/workspace/probe",
                "repository_root": "/workspace/probe", "cwd": "/workspace/probe",
                "command": "test \"$(id -un)\" = motor-job && "
                           "test ! -e /var/lib/motor-spike/host-only && "
                           "python3 -c 'import socket; assert socket.if_nameindex() == [(1, \"lo\")]' && "
                           "echo SPIKE_ISOLATED_JOB_PASS",
                "env": {}, "weight_hint": 1, "timeout": 30, "queue_wait_limit_s": 30,
-               "snapshot_commit": commit, "tree_hash": tree, "integration_tip": commit,
+               # This temporary repository has no remote; an empty tip avoids background cache fills.
+               "snapshot_commit": commit, "tree_hash": tree, "integration_tip": "",
                "siblings": [], "bundles": [{"index": 0, "repository": "/workspace/probe",
                "length": len(bundle), "sha256": hashlib.sha256(bundle).hexdigest()}]}
     output = bytearray()

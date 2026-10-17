@@ -24,6 +24,28 @@ def complete_samples():
 
 
 class HostedSpikeTests(unittest.TestCase):
+    def test_fixture_bundle_contains_only_the_requested_snapshot_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            evidence = spike.Evidence(root)
+            try:
+                evidence.run("git", "init", "--quiet", repository)
+                (repository / "input").write_text("probe\n")
+                evidence.run("git", "-C", repository, "add", "input")
+                evidence.run("git", "-C", repository, "-c", "user.name=Probe",
+                             "-c", "user.email=probe@example.invalid", "-c", "commit.gpgsign=false",
+                             "commit", "--quiet", "-m", "probe")
+                job_id = "00000000-0000-4000-8000-000000000001"
+                commit, tree, bundle = spike.fixture_bundle(evidence, repository, job_id)
+                heads = evidence.run("git", "bundle", "list-heads", repository / "input.bundle")
+                self.assertEqual(heads, f"{commit} refs/ck-motor/{job_id}/snapshot")
+                self.assertEqual(tree, evidence.run("git", "-C", repository, "rev-parse", "HEAD^{tree}"))
+                self.assertTrue(bundle.startswith((b"# v2 git bundle\n", b"# v3 git bundle\n")))
+                self.assertEqual(evidence.run("git", "-C", repository, "for-each-ref", "refs/ck-motor/"), "")
+            finally:
+                evidence.raw.close()
+
     @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64", "Linux kernel builder")
     def test_kernel_builder_refuses_unpinned_compiler_before_download(self):
         with tempfile.TemporaryDirectory() as directory:
