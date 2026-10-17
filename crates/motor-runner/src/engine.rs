@@ -41,6 +41,9 @@ pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 /// Paths are instance-specific except build_slot_root, which is machine-wide.
 #[derive(Clone)]
 pub struct Config {
+    /// Accept host-authenticated tenant connections over vsock and limit each
+    /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
+    pub tenant_vm: bool,
     pub instance: String,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
@@ -199,6 +202,7 @@ impl Config {
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
         Self {
+            tenant_vm: false,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,
@@ -459,6 +463,7 @@ struct Reservation {
 }
 
 struct Core {
+    tenant_events: Option<crate::tenant::EventLog>,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
@@ -1021,8 +1026,18 @@ impl Runner {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?
         };
         let repository_usage = health::RepositoryUsage::from_jobs(jobs.values(), now);
+        let tenant_events = if config.tenant_vm {
+            let log = crate::tenant::EventLog::open(&state)?;
+            for job in jobs.values() {
+                log.observe(job)?;
+            }
+            Some(log)
+        } else {
+            None
+        };
         let runner = Self {
             core: Arc::new(Core {
+                tenant_events,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
@@ -1387,11 +1402,55 @@ impl Runner {
             write(&self.record_path(job.id))?;
         }
         atomic_json(&self.record_path(job.id), job)?;
+        if let Some(log) = &self.core.tenant_events {
+            log.observe(job)?;
+        }
         self.core
             .repository_usage
             .lock()
             .unwrap()
             .record_job(job, self.now());
+        Ok(())
+    }
+    pub(crate) fn tenant_events(&self) -> Option<&crate::tenant::EventLog> {
+        self.core.tenant_events.as_ref()
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn tenant_idle(&self) -> bool {
+        let inner = self.core.inner.lock().unwrap();
+        let idle = inner.jobs.values().all(|job| job.terminal.is_some()) && inner.writer.is_none();
+        #[cfg(target_os = "linux")]
+        let idle = idle && inner.cache_fills.is_empty();
+        idle
+    }
+    pub(crate) fn has_job_record(&self, id: Uuid) -> bool {
+        self.core.quarantined.contains_key(&id)
+            || self.core.inner.lock().unwrap().jobs.contains_key(&id)
+    }
+    pub(crate) fn forget_unadmitted(&self, id: Uuid) -> io::Result<()> {
+        let mut inner = self.core.inner.lock().unwrap();
+        if inner
+            .jobs
+            .get(&id)
+            .is_some_and(|job| job.state == JobState::AwaitingBundles && job.started_ms.is_none())
+        {
+            let path = self.record_path(id);
+            let directory = path.parent().unwrap();
+            std::fs::remove_dir_all(directory)?;
+            File::open(directory.parent().unwrap())?.sync_all()?;
+            inner.jobs.remove(&id);
+        }
+        Ok(())
+    }
+    pub(crate) fn tenant_admitted(&self, id: Uuid) -> io::Result<()> {
+        let inner = self.core.inner.lock().unwrap();
+        let log = self
+            .tenant_events()
+            .ok_or_else(|| io::Error::other("not a tenant runner"))?;
+        log.admit(id)?;
+        if let Some(job) = inner.jobs.get(&id) {
+            log.observe(job)?;
+        }
         Ok(())
     }
     fn catalog(&self, inner: &Inner) -> io::Result<()> {

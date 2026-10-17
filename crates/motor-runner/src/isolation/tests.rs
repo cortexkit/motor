@@ -91,6 +91,50 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
 }
 
 #[test]
+fn tenant_job_units_limit_tasks_and_deny_vsock_only_in_tenant_mode() {
+    let f = Fixture::new();
+    for enabled in [false, true] {
+        let sandbox = f.command_sandbox().in_tenant_vm(enabled);
+        let command = sandbox
+            .command("true", &f.workspace, &[], true, &[0], 1)
+            .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(args.contains(&"--property=TasksMax=4096"), enabled);
+        assert_eq!(
+            args.contains(&"--property=RestrictAddressFamilies=~AF_VSOCK"),
+            enabled
+        );
+        assert_eq!(
+            args.contains(&"--property=SystemCallArchitectures=native"),
+            enabled
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a trusted tenant VM with AF_VSOCK and job isolation"]
+fn hosted_job_cannot_open_vsock() {
+    let host_socket =
+        unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(
+        host_socket >= 0,
+        "operator fixture must support AF_VSOCK outside the job"
+    );
+    unsafe {
+        libc::close(host_socket);
+    }
+    let f = Fixture::new();
+    let sandbox = f.sandbox().in_tenant_vm(true);
+    let (status, stdout, stderr) = output(&sandbox,
+        "python3 -c 'import socket,errno;\ntry: socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM)\nexcept OSError as e: assert e.errno in (errno.EPERM,errno.EAFNOSUPPORT); print(\"blocked\")\nelse: raise AssertionError(\"AF_VSOCK admitted\")'", &f.workspace);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "blocked");
+}
+
+#[test]
 fn capped_cpu_placement_keeps_requested_memory_limit() {
     let f = Fixture::new();
     let sandbox = f.command_sandbox();
@@ -169,6 +213,7 @@ impl Fixture {
             )),
             retain_failed: false,
             network: false,
+            tenant_vm: false,
             parent_umask: 0o022,
             memory_floor_gib: None,
             user: USER,
@@ -291,6 +336,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         )),
         retain_failed: false,
         network: false,
+        tenant_vm: false,
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -775,6 +821,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 runtime: sandbox.runtime.clone(),
                 retain_failed: false,
                 network: false,
+                tenant_vm: false,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -822,6 +869,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 runtime: sandbox.runtime.clone(),
                 retain_failed: false,
                 network: false,
+                tenant_vm: false,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1200,6 +1248,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         )),
         retain_failed: false,
         network: false,
+        tenant_vm: false,
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,

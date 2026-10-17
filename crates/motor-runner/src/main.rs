@@ -11,6 +11,14 @@ async fn main() -> io::Result<()> {
         println!("{}", binary_version());
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|arg| arg == "tenant-agent") {
+        if args.len() != 1 {
+            return Err(io::Error::other("tenant-agent takes no arguments"));
+        }
+        let _ = motor_protocol::logging::init(LOG_PREFIX);
+        return motor_runner::serve_agent().await;
+    }
     if args.first().is_some_and(|arg| arg == "windows-prepare") {
         if args.len() != 2 {
             return Err(io::Error::other("windows-prepare requires a plan file"));
@@ -166,13 +174,21 @@ async fn main() -> io::Result<()> {
                 version = binary_version(),
                 "motor-runner serving"
             );
+            #[cfg(target_os = "linux")]
+            if runner.config().tenant_vm {
+                let tenant = motor_runner::serve_tenant(runner.clone());
+                tokio::select! { result = serve(runner, listener) => result?, result = tenant => result? }
+            } else {
+                serve(runner, listener).await?;
+            }
+            #[cfg(not(target_os = "linux"))]
             serve(runner, listener).await?;
             // A bounded drain must not wait indefinitely for a filesystem task
             // on Tokio's blocking pool while the runtime is being destroyed.
             std::process::exit(0)
         }
         _ => Err(io::Error::other(
-             "usage: motor-runner serve|connect|drain|resume [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm] [--vm-config FILE]",
+              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm] [--tenant-vm] [--vm-config FILE]",
         )),
     }
 }
@@ -185,6 +201,10 @@ fn configure_options(
     let mut drain_timeout_s = 1800;
     let mut exit_after = true;
     while let Some(arg) = args.next() {
+        if arg == "--tenant-vm" {
+            config.tenant_vm = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| io::Error::other("missing option value"))?;
@@ -218,7 +238,41 @@ fn configure_options(
             _ => return Err(io::Error::other(format!("unknown option {arg}"))),
         }
     }
+    if config.tenant_vm
+        && (!cfg!(target_os = "linux") || config.backend != motor_runner::BackendKind::Host)
+    {
+        return Err(io::Error::other(
+            "--tenant-vm requires the Linux host backend",
+        ));
+    }
     Ok((job, drain_timeout_s, exit_after))
+}
+
+#[cfg(test)]
+mod tenant_options {
+    use super::*;
+
+    #[test]
+    fn tenant_flag_takes_no_value_and_requires_linux_host_backend() {
+        let mut config = Config::new("unused", "test");
+        let result = configure_options(
+            &mut config,
+            ["--tenant-vm", "--max-weight", "2"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(result.is_ok(), cfg!(target_os = "linux"));
+        assert!(config.tenant_vm);
+        assert_eq!(config.max_weight, 2);
+        let mut config = Config::new("unused", "test");
+        assert!(configure_options(
+            &mut config,
+            ["--tenant-vm", "--backend", "vm"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .is_err());
+    }
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

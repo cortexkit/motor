@@ -406,6 +406,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         )),
         retain_failed: false,
         network: false,
+        tenant_vm: false,
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: WRITER_USER,

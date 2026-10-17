@@ -9,13 +9,108 @@ use crate::{
 };
 use activity::{Activity, ActivityRead};
 use motor_protocol::*;
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{UnixListener, UnixStream},
     sync::{mpsc, watch},
 };
 use tracing::Instrument;
+
+fn unix_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+struct TenantState {
+    admitted: bool,
+    closed: bool,
+    created_record: bool,
+    cause: RefusedCause,
+}
+
+struct TenantConnection {
+    runner: Runner,
+    lease: VerifiedLease,
+    state: tokio::sync::Mutex<TenantState>,
+    changed: tokio::sync::Notify,
+    stop_write: tokio::sync::Notify,
+}
+
+impl TenantConnection {
+    async fn admitted(&self) -> bool {
+        self.state.lock().await.admitted
+    }
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(self.lease.exp.saturating_sub(unix_s()))
+    }
+    async fn expire(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.admitted {
+            return false;
+        }
+        state.closed = true;
+        state.cause = RefusedCause::Expired;
+        self.changed.notify_one();
+        true
+    }
+    fn operation_refused(&self) {
+        tracing::warn!(jti = %self.lease.jti, "operation_refused");
+    }
+    fn allowed(&self, frame: &Frame, hello: &mut bool, ran: &mut bool) -> bool {
+        if !*hello {
+            *hello = matches!(frame, Frame::Hello { .. });
+            return *hello;
+        }
+        let run = self.lease.purpose == LeasePurpose::Run;
+        match frame {
+            Frame::Have { .. } | Frame::BundleChunk { .. } => run,
+            Frame::Run(request) if run && !*ran && request.job_id == self.lease.jti => {
+                if self.runner.has_job_record(self.lease.jti) {
+                    return false;
+                }
+                *ran = true;
+                true
+            }
+            Frame::Attach(request) => request.job_id == self.lease.jti,
+            Frame::Cancel(request) => request.job_id == self.lease.jti,
+            Frame::Withdraw { job_id, .. } | Frame::JobStatus { job_id } => {
+                *job_id == self.lease.jti
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn tenant_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    runner: Runner,
+    mut socket: S,
+) -> io::Result<()> {
+    let accepted = std::time::Instant::now();
+    // Do not use read_frame_async here: it skips unknown records for SSH's
+    // additive compatibility, whereas this boundary must fail closed.
+    let lease =
+        match tokio::time::timeout(Duration::from_secs(60), read_record_async(&mut socket)).await {
+            Ok(Ok(Some(DecodedFrame::Frame(Frame::VerifiedLease(lease))))) => lease,
+            _ => return Ok(()),
+        };
+    let ctx = Arc::new(TenantConnection {
+        runner: runner.clone(),
+        lease,
+        state: tokio::sync::Mutex::new(TenantState {
+            admitted: false,
+            closed: false,
+            created_record: false,
+            cause: RefusedCause::Disconnect,
+        }),
+        changed: tokio::sync::Notify::new(),
+        stop_write: tokio::sync::Notify::new(),
+    });
+    channel_stream(runner, socket, accepted, Some(ctx)).await
+}
 
 /// The daemon owns no TCP listener. Connections use the pinned framed protocol;
 /// heartbeats are transport-only and never enter retained job history.
@@ -57,14 +152,32 @@ async fn reader<R: AsyncRead + Unpin>(
     read: R,
     tx: mpsc::Sender<Frame>,
     activity: watch::Sender<Activity>,
+    tenant: Option<Arc<TenantConnection>>,
 ) {
     let mut read = ActivityRead {
         read,
         activity,
         idle: Box::pin(tokio::time::sleep(Duration::from_secs(60))),
     };
+    let mut hello = false;
+    let mut ran = false;
     loop {
-        let frame = match read_frame_async(&mut read).await {
+        let result = if let Some(ctx) = &tenant {
+            tokio::select! {
+                result = read_record_async(&mut read) => match result {
+                    Ok(Some(DecodedFrame::Frame(frame))) => Ok(Some(frame)),
+                    Ok(None) => Ok(None),
+                    _ => { ctx.operation_refused(); break; }
+                },
+                _ = tokio::time::sleep_until(ctx.deadline()), if ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
+                    if ctx.expire().await { break; }
+                    continue;
+                }
+            }
+        } else {
+            read_frame_async(&mut read).await
+        };
+        let frame = match result {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
@@ -72,6 +185,12 @@ async fn reader<R: AsyncRead + Unpin>(
                 break;
             }
         };
+        if let Some(ctx) = &tenant {
+            if !ctx.allowed(&frame, &mut hello, &mut ran) {
+                ctx.operation_refused();
+                break;
+            }
+        }
         read.activity.send_modify(|p| {
             p.partial_at = None;
             if matches!(&frame, Frame::BundleChunk { data, .. } if !data.0.is_empty()) {
@@ -82,6 +201,11 @@ async fn reader<R: AsyncRead + Unpin>(
             break;
         }
     }
+    if let Some(ctx) = tenant {
+        ctx.state.lock().await.closed = true;
+        ctx.changed.notify_one();
+        ctx.stop_write.notify_one();
+    }
 }
 
 async fn writer<W: AsyncWrite + Unpin>(
@@ -89,6 +213,7 @@ async fn writer<W: AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<Frame>,
     accepted: std::time::Instant,
     job: watch::Receiver<Option<QueueProgress>>,
+    tenant: Option<Arc<TenantConnection>>,
 ) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -98,7 +223,58 @@ async fn writer<W: AsyncWrite + Unpin>(
                 queue_wait_ms: job.borrow().as_ref().and_then(QueueProgress::elapsed_ms),
             },
         };
-        if let Err(error) = write_frame_async(&mut write, &frame).await {
+        if let Some(ctx) = &tenant {
+            if ctx.state.lock().await.closed {
+                break;
+            }
+        }
+        let result = if let (Some(ctx), Frame::Accepted(_)) = (&tenant, &frame) {
+            let mut state = ctx.state.lock().await;
+            if state.closed || unix_s() >= ctx.lease.exp {
+                state.cause = RefusedCause::Expired;
+                state.closed = true;
+                ctx.changed.notify_one();
+                break;
+            }
+            let result = match tokio::time::timeout_at(
+                ctx.deadline(),
+                write_frame_async(&mut write, &frame),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    state.cause = RefusedCause::Expired;
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tenant admission expired during accepted write",
+                    ))
+                }
+            };
+            if result.is_ok() {
+                // Upload and execution wait for this write and the durable event,
+                // so detached work cannot outrun its admission record.
+                state.admitted = true;
+                if let Err(error) = ctx.runner.tenant_admitted(ctx.lease.jti) {
+                    tracing::error!(%error, "cannot persist tenant admission");
+                    state.closed = true;
+                    ctx.changed.notify_one();
+                    break;
+                }
+            } else {
+                state.closed = true;
+            }
+            ctx.changed.notify_one();
+            result
+        } else if let Some(ctx) = &tenant {
+            tokio::select! {
+                result = write_frame_async(&mut write, &frame) => result,
+                _ = ctx.stop_write.notified() => break,
+            }
+        } else {
+            write_frame_async(&mut write, &frame).await
+        };
+        if let Err(error) = result {
             let frame_type = match &frame {
                 Frame::Hello { .. } => "hello",
                 Frame::Started { .. } => "started",
@@ -155,18 +331,48 @@ async fn channel(
     socket: UnixStream,
     accepted: std::time::Instant,
 ) -> io::Result<()> {
-    let (read, write) = socket.into_split();
+    channel_stream(runner, socket, accepted, None).await
+}
+
+async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    runner: Runner,
+    socket: S,
+    accepted: std::time::Instant,
+    tenant: Option<Arc<TenantConnection>>,
+) -> io::Result<()> {
+    let (read, write) = tokio::io::split(socket);
     let (in_tx, mut rx) = mpsc::channel(8);
     let (tx, out_rx) = mpsc::channel(16);
     let mut tasks = tokio::task::JoinSet::new();
     let (activity, mut progress) = watch::channel(Activity::default());
-    let reading = tasks.spawn(reader(read, in_tx, activity));
+    let reading = tasks.spawn(reader(read, in_tx, activity, tenant.clone()));
     let (live_job, job) = watch::channel(None);
-    tasks.spawn(writer(write, out_rx, accepted, job).in_current_span());
-    let result = session(runner, &mut rx, &tx, accepted, &mut progress, &live_job).await;
+    tasks.spawn(writer(write, out_rx, accepted, job, tenant.clone()).in_current_span());
+    let result = session(
+        runner,
+        &mut rx,
+        &tx,
+        accepted,
+        &mut progress,
+        &live_job,
+        tenant.as_ref(),
+    )
+    .await;
     reading.abort();
     drop(tx);
     while tasks.join_next().await.is_some() {}
+    if let Some(ctx) = tenant {
+        let state = ctx.state.lock().await;
+        if !state.admitted && ctx.lease.purpose == LeasePurpose::Run {
+            if state.created_record {
+                ctx.runner.forget_unadmitted(ctx.lease.jti)?;
+            }
+            ctx.runner
+                .tenant_events()
+                .unwrap()
+                .refused(ctx.lease.jti, state.cause)?;
+        }
+    }
     result
 }
 
@@ -177,6 +383,7 @@ async fn session(
     accepted: std::time::Instant,
     progress: &mut watch::Receiver<Activity>,
     live_job: &watch::Sender<Option<QueueProgress>>,
+    tenant: Option<&Arc<TenantConnection>>,
 ) -> io::Result<()> {
     let Some(Frame::Hello {
         protocol_version,
@@ -213,6 +420,11 @@ async fn session(
         return Ok(());
     }
     while let Some(frame) = next(rx).await {
+        if let Some(ctx) = tenant {
+            if ctx.state.lock().await.closed {
+                return Ok(());
+            }
+        }
         match frame {
             Frame::Have {
                 repositories,
@@ -237,11 +449,37 @@ async fn session(
                 .await?;
             }
             Frame::Run(mut request) => {
+                if let Some(ctx) = tenant {
+                    if !crate::tenant::matches(&ctx.lease, &request) {
+                        ctx.state.lock().await.cause = RefusedCause::Mismatch;
+                        send(
+                            tx,
+                            Frame::Refusal(Refusal {
+                                job_id: Some(request.job_id),
+                                transfer_id: None,
+                                reason: RefusalReason::RequestRejected,
+                                disk_full: None,
+                                retry_after_ms: None,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
                 request.gate_job &= supports_gate_jobs;
                 let admitted = request.clone();
                 match locked(&runner, move |r| r.accept(admitted)).await? {
-                    Admission::Duplicate => return Ok(()),
+                    Admission::Duplicate => {
+                        if let Some(ctx) = tenant {
+                            ctx.operation_refused();
+                        }
+                        return Ok(());
+                    }
                     Admission::Refused(reason) => {
+                        if let Some(ctx) = tenant {
+                            ctx.state.lock().await.cause = RefusedCause::Rejected;
+                        }
                         let id = request.job_id;
                         // The detail only helps the caller: if the record can't
                         // be read, the refusal still goes out without it.
@@ -268,6 +506,9 @@ async fn session(
                         return Ok(());
                     }
                     Admission::Accepted(queue_position) => {
+                        if let Some(ctx) = tenant {
+                            ctx.state.lock().await.created_record = true;
+                        }
                         let id = request.job_id;
                         let progress = locked(&runner, move |r| Ok(r.queue_progress(id))).await?;
                         live_job.send_replace(Some(progress));
@@ -287,8 +528,25 @@ async fn session(
                             .await?;
                             return Err(e);
                         }
+                        if let Some(ctx) = tenant {
+                            loop {
+                                let notified = ctx.changed.notified();
+                                let state = ctx.state.lock().await;
+                                if state.closed {
+                                    return Ok(());
+                                }
+                                if state.admitted {
+                                    break;
+                                }
+                                drop(state);
+                                notified.await;
+                            }
+                        }
                     }
                     Admission::DiskFull(full) => {
+                        if let Some(ctx) = tenant {
+                            ctx.state.lock().await.cause = RefusedCause::Rejected;
+                        }
                         send(
                             tx,
                             Frame::Refusal(Refusal {
@@ -333,7 +591,16 @@ async fn session(
                         locked(&runner, move |r| r.refuse(id, reason, error)).await?;
                     }
                 }
-                return attach(&runner, request.job_id, 0, supports_started, rx, tx).await;
+                return attach(
+                    &runner,
+                    request.job_id,
+                    0,
+                    supports_started,
+                    rx,
+                    tx,
+                    tenant.is_some(),
+                )
+                .await;
             }
             Frame::Prepare(request) => {
                 let req = request.clone();
@@ -455,6 +722,7 @@ async fn session(
                     supports_started,
                     rx,
                     tx,
+                    tenant.is_some(),
                 )
                 .await;
             }
@@ -462,11 +730,17 @@ async fn session(
                 let id = request.job_id;
                 locked(&runner, move |r| r.cancel(id)).await?;
                 send(tx, Frame::CancelReply(CancelReply::new(request.job_id))).await?;
+                if tenant.is_some() {
+                    continue;
+                }
                 return Ok(());
             }
             Frame::Withdraw { job_id, reason } => {
                 let outcome = locked(&runner, move |r| r.withdraw_for(job_id, reason)).await?;
                 send(tx, Frame::WithdrawReply { outcome }).await?;
+                if tenant.is_some() {
+                    continue;
+                }
                 return Ok(());
             }
             Frame::Status => {
@@ -477,6 +751,9 @@ async fn session(
             Frame::JobStatus { job_id } => {
                 let status = locked(&runner, move |r| r.job_status(job_id)).await?;
                 send(tx, Frame::JobStatusReply(status)).await?;
+                if tenant.is_some() {
+                    continue;
+                }
                 return Ok(());
             }
             Frame::Resume => {
@@ -595,6 +872,7 @@ async fn attach(
     started: bool,
     rx: &mut mpsc::Receiver<Frame>,
     tx: &mpsc::Sender<Frame>,
+    tenant: bool,
 ) -> io::Result<()> {
     tracing::info!(job_id = %id, from_seq = from, supports_started = started, "runner job stream attached");
     loop {
@@ -624,7 +902,15 @@ async fn attach(
             _ = tokio::time::sleep(Duration::from_millis(25)) => {},
             frame = next(rx) => match frame {
                 None => return Ok(()),
-                Some(Frame::Cancel(_)) => locked(runner, move |r| r.cancel(id)).await?,
+                Some(Frame::Cancel(_)) => {
+                    locked(runner, move |r| r.cancel(id)).await?;
+                    if tenant { send(tx, Frame::CancelReply(CancelReply::new(id))).await?; }
+                },
+                Some(Frame::Attach(request)) if tenant => from = request.from_seq,
+                Some(Frame::JobStatus { .. }) if tenant => {
+                    let status = locked(runner, move |r| r.job_status(id)).await?;
+                    send(tx, Frame::JobStatusReply(status)).await?;
+                },
                 Some(Frame::Withdraw { reason, .. }) => {
                     let outcome = locked(runner, move |r| r.withdraw_for(id, reason)).await?;
                     send(tx, Frame::WithdrawReply { outcome }).await?;

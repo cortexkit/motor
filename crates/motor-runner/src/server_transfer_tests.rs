@@ -176,7 +176,7 @@ async fn a_single_slow_fragmented_chunk_keeps_moving_beyond_300_seconds() {
     let (read, mut write) = tokio::io::duplex(64);
     let (tx, mut rx) = mpsc::channel(8);
     let (activity, mut progress) = watch::channel(Activity::default());
-    let reader = tokio::spawn(reader(read, tx, activity));
+    let reader = tokio::spawn(reader(read, tx, activity, None));
     let sender = tokio::spawn(async move {
         for byte in encoded {
             tokio::time::sleep(Duration::from_secs(30)).await;

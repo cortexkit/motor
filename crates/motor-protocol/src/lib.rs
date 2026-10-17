@@ -6,6 +6,7 @@
 mod codec;
 mod environment;
 pub mod logging;
+mod tenant;
 mod types;
 
 pub use codec::{
@@ -13,6 +14,7 @@ pub use codec::{
     write_frame_async, DecodedFrame, MAX_FRAME_BYTES,
 };
 pub use environment::allowed_env;
+pub use tenant::*;
 pub use types::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;

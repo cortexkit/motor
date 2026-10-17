@@ -1,0 +1,62 @@
+use motor_protocol::*;
+use serde_json::json;
+
+#[test]
+fn pinned_tenant_frames_are_inline_and_integer_only() {
+    let id = Uuid::now_v7();
+    let value = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:test","vcpus":2,
+        "mem_mib":16384,"platform":"linux","net":false,"max_s":30,"exp":1800000000});
+    let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(frame, Frame::VerifiedLease(_)));
+    assert_eq!(serde_json::to_value(&frame).unwrap(), value);
+    let mut invalid = value;
+    invalid["vcpus"] = json!(2.5);
+    assert!(serde_json::from_value::<Frame>(invalid).is_err());
+    let event = Frame::Event(TenantEvent {
+        event_seq: 1,
+        event: TenantEventKind::Refused,
+        jti: Some(id),
+        cause: Some(RefusedCause::Mismatch),
+    });
+    assert_eq!(
+        serde_json::to_value(event).unwrap(),
+        json!({"type":"event","event_seq":1,"event":"refused","jti":id,"cause":"mismatch"})
+    );
+    let idle = Frame::Event(TenantEvent {
+        event_seq: 2,
+        event: TenantEventKind::Idle,
+        jti: None,
+        cause: None,
+    });
+    assert_eq!(
+        serde_json::to_value(idle).unwrap(),
+        json!({"type":"event","event_seq":2,"event":"idle"})
+    );
+    assert_eq!(
+        serde_json::to_value(Frame::Ack { event_seq: 2 }).unwrap(),
+        json!({"type":"ack","event_seq":2})
+    );
+}
+
+#[test]
+fn pinned_agent_operations_roundtrip_and_preserve_exit_after() {
+    let id = Uuid::now_v7();
+    for value in [
+        json!({"op":"attach_tenant","generation":1,"unix_ms":1800000000000_u64,"seed":"seed","address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"tenant-a","machine_id":"0123456789abcdef0123456789abcdef"}),
+        json!({"op":"post_restore","unix_ms":1800000000000_u64,"seed":"seed"}),
+        json!({"op":"cancel","job_id":id}),
+        json!({"op":"drain","deadline_s":10,"exit_after":false}),
+        json!({"op":"drain","deadline_s":10,"exit_after":true}),
+        json!({"op":"resume"}),
+        json!({"op":"status"}),
+        json!({"op":"args_status"}),
+    ] {
+        let request: TenantAgentRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+    assert!(
+        serde_json::from_value::<TenantAgentRequest>(json!({"op":"drain","deadline_s":10}))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<TenantAgentRequest>(json!({"op":"unknown"})).is_err());
+}
