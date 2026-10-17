@@ -324,6 +324,7 @@ fn transport_spy_bundle_base64_name_collision_is_not_environment_metadata() {
     assert!(metadata.contains(r#""index":1"#));
     assert!(metadata.contains(r#""offset":42"#));
     let structured = [Frame::Hello {
+        return_paths: false,
         protocol_version: PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -564,6 +565,7 @@ impl Connector for DisconnectDuringHave {
                 write_frame_async(
                     &mut runner,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -895,6 +897,7 @@ impl Connector for FutureRecords {
                 write_frame_async(
                     &mut b,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1006,6 +1009,7 @@ impl Connector for UnknownCursorRecovery {
                 write_frame_async(
                     &mut b,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1163,6 +1167,7 @@ impl Connector for WireRecords {
                 write_frame_async(
                     &mut b,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

@@ -11,8 +11,10 @@ mod hosted;
 pub mod logging;
 pub mod module;
 mod motor;
+mod return_paths;
 mod snapshot;
 mod storage;
+pub use return_paths::ReturnOptions;
 mod transport;
 
 pub use config::{BrokerTokenSource, Config};

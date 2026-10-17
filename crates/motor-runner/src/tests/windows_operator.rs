@@ -872,6 +872,7 @@ fn peer(config: &Config, child: &mut Daemon) -> std::os::unix::net::UnixStream {
             motor_protocol::write_frame(
                 &mut peer,
                 &Frame::Hello {
+                    return_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
                     default_branch_tip: false,

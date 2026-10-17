@@ -11,6 +11,8 @@ fn recorded_job(
 ) -> Job {
     let id = Uuid::now_v7();
     let request = Run {
+        return_paths: Vec::new(),
+        return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
         job_id: id,
         gate_job: false,
         network: None,

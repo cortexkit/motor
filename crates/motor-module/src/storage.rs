@@ -31,6 +31,8 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted: Option<crate::hosted::HostedJobState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_result: Option<ReturnResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_job: bool,
@@ -167,6 +169,12 @@ impl Drop for JobLease {
 }
 
 impl Storage {
+    pub fn return_result(&self, result: ReturnResult) -> io::Result<()> {
+        let id = result.job_id;
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_result = Some(result);
+        })
+    }
     pub(crate) fn hosted_update(
         &self,
         id: Uuid,

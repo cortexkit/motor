@@ -168,6 +168,7 @@ async fn forward_socket(
     write_frame_async(
         &mut socket,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -692,6 +693,7 @@ mod tests {
                 write_frame_async(
                     &mut socket,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

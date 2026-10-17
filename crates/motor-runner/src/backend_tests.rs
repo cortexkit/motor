@@ -21,6 +21,8 @@ fn setup(cwd: &Path) -> Setup {
         id,
         cpus: vec![1, 17],
         request: Run {
+            return_paths: Vec::new(),
+            return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
             gate_job: false,
             network: None,
             platform: None,

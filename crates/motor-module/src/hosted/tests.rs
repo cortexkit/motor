@@ -456,6 +456,83 @@ async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn return_paths_hosted_limits_refuse_before_lease_and_keep_no_fallback() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    for returns in [
+        crate::ReturnOptions {
+            return_paths: vec!["/home/missing/out".into()],
+            return_max_bytes: RETURN_MAX_BYTES + 1,
+        },
+        crate::ReturnOptions {
+            return_paths: vec!["/home/missing/out".into(); 65],
+            return_max_bytes: 1,
+        },
+        crate::ReturnOptions {
+            return_paths: vec![format!("/home/missing/{}", "x".repeat(4096))],
+            return_max_bytes: 1,
+        },
+        crate::ReturnOptions {
+            return_paths: vec!["/home/elsewhere/out".into()],
+            return_max_bytes: 1,
+        },
+    ] {
+        let stream = motor
+            .run_with_returns(
+                RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
+                    .with_timeout(30),
+                returns,
+            )
+            .unwrap();
+        let id = stream.job_id;
+        let t = terminal(stream).await;
+        assert_eq!(
+            t.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        );
+        let state = motor.hosted_state(id).unwrap();
+        assert!(state.hosted_no_fallback);
+        assert_eq!(state.hosted_code.as_deref(), Some("return_paths_exceeded"));
+    }
+    assert_eq!(h.requests.lock().unwrap().len(), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn return_paths_hosted_failure_is_stored_without_changing_remote_terminal() {
+    let h = Harness::new(Behavior::ReturnCapFailure).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(t.ran, Some(Ran::Remote));
+    let result = motor.return_result(id).unwrap();
+    assert_eq!(result.returned_files, None);
+    assert_eq!(
+        result.return_paths_failed,
+        Some(ReturnPathsFailed {
+            measured_bytes: 2,
+            cap_bytes: 1,
+            cause: ReturnFailureCause::OverCap
+        })
+    );
+    let replayed = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(replayed, t);
+    assert_eq!(motor.return_result(id), Some(result));
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
 // This ignored test snapshots a real repository below the current checkout.
 // Hosted workspace paths must be under /Users or /home, so it requires a checkout
 // in one of those roots; the ordinary tests work from any checkout location.

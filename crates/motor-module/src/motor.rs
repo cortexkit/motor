@@ -32,6 +32,9 @@ impl JobStream {
     pub fn hosted_state(&self) -> Option<crate::HostedJobState> {
         self.storage.job(self.job_id).and_then(|j| j.hosted)
     }
+    pub fn return_result(&self) -> Option<ReturnResult> {
+        self.storage.job(self.job_id).and_then(|j| j.return_result)
+    }
     /// Record terminal delivery only after the consumer has successfully handled
     /// the terminal record. Merely queueing a record does not count as delivery.
     pub fn acknowledge_terminal(&self) -> io::Result<()> {
@@ -82,14 +85,30 @@ impl Motor {
         request: RunRequest,
         attribution: Option<JobAttribution>,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, attribution, false)
+        self.run_classified(request, attribution, false, crate::ReturnOptions::default())
     }
+    #[cfg(test)]
     pub(crate) fn run_direct(
         &self,
         request: RunRequest,
         attribution: Option<JobAttribution>,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, attribution, true)
+        self.run_classified(request, attribution, true, crate::ReturnOptions::default())
+    }
+    pub fn run_with_returns(
+        &self,
+        request: RunRequest,
+        returns: crate::ReturnOptions,
+    ) -> io::Result<JobStream> {
+        self.run_classified(request, None, false, returns)
+    }
+    pub(crate) fn run_direct_with_returns(
+        &self,
+        request: RunRequest,
+        attribution: Option<JobAttribution>,
+        returns: crate::ReturnOptions,
+    ) -> io::Result<JobStream> {
+        self.run_classified(request, attribution, true, returns)
     }
     pub(crate) fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
         self.storage.set_direct_secret_hash(id, hash)
@@ -102,6 +121,7 @@ impl Motor {
         mut request: RunRequest,
         attribution: Option<JobAttribution>,
         gate_job: bool,
+        returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
         let mut env_not_forwarded: Vec<_> = request
             .env
@@ -138,7 +158,7 @@ impl Motor {
         let motor = self.clone();
         tokio::spawn(async move {
             if let Err(e) = motor
-                .run_job(id, request, env_not_forwarded, wait, &tx, rx)
+                .run_job(id, (request, returns), env_not_forwarded, wait, &tx, rx)
                 .await
             {
                 let _ = tx
@@ -272,13 +292,29 @@ impl Motor {
     async fn run_job(
         &self,
         id: Uuid,
-        mut request: RunRequest,
+        submission: (RunRequest, crate::ReturnOptions),
         env_not_forwarded: Vec<String>,
         wait: u64,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
     ) -> io::Result<()> {
+        let (mut request, returns) = submission;
         let hosted = self.hosted_state(id).is_some();
+        if let Err(code) = validate_return_paths(
+            &request.workspace_key,
+            &returns.return_paths,
+            returns.return_max_bytes,
+        ) {
+            return self
+                .refused(
+                    id,
+                    RefusalReason::RequestRejected,
+                    None,
+                    Some(code.into()),
+                    tx,
+                )
+                .await;
+        }
         if hosted {
             if let Err(error) = crate::hosted::validate(&request) {
                 return self
@@ -409,6 +445,17 @@ impl Motor {
                         .await
                 }
             };
+            if !returns.return_paths.is_empty() && !channel.return_paths {
+                return self
+                    .refused(
+                        id,
+                        RefusalReason::RequestRejected,
+                        Some(snapshots.main.tree_hash.clone()),
+                        Some("return_paths_unsupported".into()),
+                        tx,
+                    )
+                    .await;
+            }
             if windows
                 && !channel
                     .platforms
@@ -475,6 +522,8 @@ impl Motor {
             }
         };
         let run = Run {
+            return_paths: returns.return_paths,
+            return_max_bytes: returns.return_max_bytes,
             gate_job: self.storage.job(id).is_some_and(|job| job.gate_job) && channel.gate_jobs,
             network: request.network.clone(),
             platform: if windows {
@@ -685,6 +734,9 @@ impl Motor {
     }
     pub fn hosted_state(&self, id: Uuid) -> Option<crate::HostedJobState> {
         self.storage.job(id).and_then(|j| j.hosted)
+    }
+    pub fn return_result(&self, id: Uuid) -> Option<ReturnResult> {
+        self.storage.job(id).and_then(|j| j.return_result)
     }
     pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
         if !self.config.hosted_runners {
@@ -900,6 +952,14 @@ impl Motor {
                     if matches!(output.stream, OutputStream::Stdout | OutputStream::Stderr) {
                         emit(tx, StreamRecord::Output(output)).await?;
                     }
+                    backoff = 1;
+                }
+                Ok(Incoming::Frame(Frame::ReturnResult(result))) if result.job_id == id => {
+                    if result.seq < cursor {
+                        continue;
+                    }
+                    cursor = result.seq.saturating_add(1);
+                    self.storage.return_result(result)?;
                     backoff = 1;
                 }
                 Ok(Incoming::Unknown(seq)) => {
@@ -1468,6 +1528,7 @@ mod delivery_tests {
                     write_frame_async(
                         &mut peer,
                         &Frame::Hello {
+                            return_paths: false,
                             protocol_version: PROTOCOL_VERSION,
                             started: false,
                             default_branch_tip: false,

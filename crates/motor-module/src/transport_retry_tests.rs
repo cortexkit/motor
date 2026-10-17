@@ -57,6 +57,7 @@ impl Connector for HelloConnector {
                     write_active(
                         &mut runner,
                         &Frame::Hello {
+                            return_paths: false,
                             protocol_version,
                             started: true,
                             default_branch_tip: false,

@@ -427,6 +427,7 @@ impl Handler {
         }
         match op {
             "exec.run" => {
+                let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
                 let request: RunRequest = parse(envelope.params)?;
                 let motor = self.initialized()?;
                 let secret = crate::direct_secret::DirectSecret::mint()?;
@@ -451,7 +452,11 @@ impl Handler {
                         return Ok(HandlerOutcome::Streamed);
                     }
                 };
-                let stream = motor.run_direct(request, self.attribution(route, envelope.preset))?;
+                let stream = motor.run_direct_with_returns(
+                    request,
+                    self.attribution(route, envelope.preset),
+                    returns,
+                )?;
                 motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
                 self.direct_jobs
                     .lock()
@@ -869,6 +874,7 @@ async fn pump_direct_secret(
             .take()
             .map(|secret| serde_json::json!({"job_id": id, "secret": secret.expose()}));
         let hosted = storage.job(id).and_then(|j| j.hosted);
+        let return_result = storage.job(id).and_then(|j| j.return_result);
         async move {
             let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
             if let Some(direct_job) = direct_job {
@@ -876,6 +882,9 @@ async fn pump_direct_secret(
             }
             if let Some(hosted) = hosted {
                 value["hosted"] = serde_json::to_value(hosted).map_err(io::Error::other)?;
+            }
+            if let Some(result) = return_result {
+                value["return_result"] = serde_json::to_value(result).map_err(io::Error::other)?;
             }
             reply(ctx, value).await
         }
