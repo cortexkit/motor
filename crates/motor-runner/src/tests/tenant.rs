@@ -15,7 +15,9 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         sub: "acct:test".into(),
         vcpus: 2,
         mem_mib: 16384,
-        platform: "linux".into(),
+        platform: crate::tenant::host_platform()
+            .unwrap_or("unsupported")
+            .into(),
         net: false,
         max_s: 30,
         exp: std::time::SystemTime::now()
@@ -641,4 +643,55 @@ async fn tenant_failed_accepted_write_is_not_admitted_and_can_reconnect() {
     drop(client);
     task.await.unwrap().unwrap();
     assert_eq!(pending(&runner)[0].cause, Some(RefusedCause::Disconnect));
+}
+
+#[tokio::test]
+async fn tenant_wrong_architecture_refuses_before_admission() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut run, _) = f.run("true");
+    run.weight_hint = Some(2);
+    run.timeout = Some(30);
+    run.platform = Some(Platform::Linux);
+    let mut token = lease(run.job_id, LeasePurpose::Run);
+    token.platform = if cfg!(target_arch = "aarch64") {
+        "linux-x64"
+    } else {
+        "linux-arm64"
+    }
+    .into();
+    assert!(!crate::tenant::matches(&token, &run));
+    let (mut client, task) = connect(&runner, token).await;
+    motor_protocol::write_frame_async(&mut client, &Frame::Run(run.clone()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(frame(&mut client).await, Some(Frame::Refusal(refusal)) if refusal.reason == RefusalReason::RequestRejected)
+    );
+    task.await.unwrap().unwrap();
+    assert!(!runner.has_job_record(run.job_id));
+    let events = pending(&runner);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cause, Some(RefusedCause::Mismatch));
+}
+
+#[test]
+fn tenant_compile_target_determines_lease_platform() {
+    let expected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("linux-x64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("linux-arm64")
+    } else {
+        None
+    };
+    assert_eq!(crate::tenant::host_platform(), expected);
+    let f = Fixture::new();
+    let (mut run, _) = f.run("true");
+    run.weight_hint = Some(2);
+    run.timeout = Some(30);
+    run.platform = None;
+    let mut token = lease(run.job_id, LeasePurpose::Run);
+    assert_eq!(crate::tenant::matches(&token, &run), expected.is_some());
+    token.platform = "linux".into();
+    assert!(!crate::tenant::matches(&token, &run));
 }

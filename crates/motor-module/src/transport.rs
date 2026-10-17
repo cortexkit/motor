@@ -497,6 +497,35 @@ impl Drop for Channel {
 }
 
 impl Channel {
+    /// Exchange hello once on a TLS connection already authenticated by its lease.
+    /// On failure the hosted client requests a fresh lease before reconnecting;
+    /// SSH's independent connection retry loop must not reuse the old token.
+    pub(crate) async fn from_hosted(pipe: Box<dyn Duplex>) -> io::Result<Self> {
+        let mut channel = Self::new(pipe);
+        channel
+            .send(Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                started: true,
+                default_branch_tip: true,
+                gate_jobs: true,
+                platforms: Vec::new(),
+            })
+            .await?;
+        match channel.next().await? {
+            Incoming::Frame(Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                platforms,
+                gate_jobs,
+                ..
+            }) => {
+                channel.platforms = platforms;
+                channel.gate_jobs = gate_jobs;
+                channel.enable_heartbeats();
+                Ok(channel)
+            }
+            _ => Err(io::Error::other("invalid hosted runner hello")),
+        }
+    }
     pub async fn open(connector: &dyn Connector, id: Uuid) -> Result<Self, RefusalReason> {
         Self::open_with_cause(connector, id)
             .await

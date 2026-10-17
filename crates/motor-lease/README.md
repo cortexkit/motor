@@ -9,31 +9,22 @@ signature. `KeySet::refresh` filters unsupported, malformed and conflicting keys
 retaining usable Ed25519 keys; an error or empty usable result keeps the last good
 set. This lets future key types coexist without blocking Ed25519 rotation.
 `verify_token` requires the expected purpose and refuses lifetimes over 300 s.
+`KeySet::should_refetch` records fetch attempts and requests a refresh every ten
+minutes or for an unknown signing key at most once a minute. Call it before each
+fetch attempt, then pass the fetched result to `refresh`.
+
 `Nonces::verify` prunes timestamps older than twice the clock-skew window; an idle
 host can also call `Nonces::prune` explicitly.
 
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. Its pinned revision has not yet been supplied. For now,
-`contracts/interim-pins.txt` is a verbatim excerpt of the reviewed interim Pins,
-**not a new canonical contract**. `contracts/vectors/interim.json` is generated
-from those formats with public, deterministic test seeds. The generator spells
-out signing inputs independently of the library authentication functions.
-`contracts/digest-manifest.json` records provenance and hashes. The digest test
-also checks inventory completeness, so an omitted mirror file is an error.
-`contracts/lease-details.txt` mirrors the subsequently supplied design excerpt and
-confirmed contract clarifications. It supersedes the original excerpt's unkeyed
-hashes and no-release wording. Those updates are confirmed contract rules, not
-interim behavior; the canonical repository revision is still pending.
-Replace the interim material with CLOUD's pinned contract/vectors before hosted
-client integration merges; do not treat these fixtures as CLOUD approval.
-
-Regenerate `contracts/vectors/interim.json` and the manifest hashes with:
-
-```sh
-cargo run -p motor-lease --example generate-interim-vectors -- --write
-```
+`test-vectors/runners/`. `contracts/cloud/` mirrors all five canonical files at
+commit `00e688e` verbatim. `contracts/digest-manifest.json` records source paths,
+revision and SHA-256 values. The digest test checks every file and inventory
+completeness. The conformance tests compare tokens, signing bytes, request bodies
+and settlement replies directly to these external vectors; they never regenerate
+or rewrite the canonical bytes.
 
 ## Fake broker test executable
 
@@ -50,7 +41,7 @@ cargo run -p motor-lease --bin motor-fake-broker -- \
   --listen 127.0.0.1:0 --max-s 30
 ```
 
-The config JSON contains `worker_bearer`, `subject` (`acct:<ULID>` or `org:<ULID>`),
+The config JSON contains `worker_bearer`, `subject` (`acct:<ULID>`),
 `placement` (`host`, `vm`), `endpoint`, `endpoint_spki_sha256`, `kid`, a base64url
 32-byte broker-only `signing_seed`, optional `announced_keys` (public JWKS keys),
 and `registered_hosts` (`host`, `public_key` as a public requester-shaped JWK).
@@ -61,15 +52,15 @@ The first stdout line gives its bound address; credentials are never printed.
 
 `--refuse CODE` refuses leases with HTTP 403 before creating a reservation.
 `--max-s SECONDS` simulates a budget-shortened runtime (including below 10 s).
-The reservation remains `vcpus * max(requested timeout_s, 10) * 1000`, the formula
-in `contracts/interim-pins.txt`, rather than shrinking with the runtime cap.
-Model tests can set both knobs directly without a server or clock delays.
+The reservation is `vcpus * granted max_s * 1000`. Model tests can set a finite
+allowance to exercise budget shortening and the below-10 refusal; `--max-s` can
+also deliberately issue a below-10 cap as a hostile-client test control.
 
 Workspace and repository hashes are opaque caller-supplied values. The broker
 checks exactly 43 base64url characters and compares equality; it cannot check the
 HMAC without the caller's private per-machine salt. No path-hashing helper is
 provided here. ck-motor owns HMAC-SHA256 derivation using the `ck-ws-v1\n` and
-`ck-repo-v1\n` prefixes described in `contracts/lease-details.txt`.
+`ck-repo-v1\n` prefixes described in `contracts/cloud/runners-contract.md`.
 
 ## Delayed release
 
@@ -86,11 +77,13 @@ Releasing an admitted job gets 409 `job_admitted`.
 
 At the deadline, an unadmitted job settles at 0 with reason `released`. That job id
 is permanently closed to lease requests (409 `job_released`); a new run needs a new
-job id. Repeat release returns the original 202 reply unchanged, including after
-release settlement. Other settled jobs get 409 `job_finished` on release, and
-reattach after any settlement gets 409 `job_finished`. The in-memory model's
-`FakeBroker::settle_due` and the executable's timer process release and lost-host
-deadlines.
+job id. Repeat release returns the original 202 reply only before settlement.
+After release settlement, release returns `job_finished` and reattach still
+returns `job_released`; that marker takes precedence over other settled status.
+A host admitting a released job must report an admitted/started heartbeat before
+`release_at_ms`, or the broker settles zero and rejects later usage as `job_settled`.
+The in-memory model's `FakeBroker::settle_due` and executable timer process release
+and lost-host deadlines.
 
-Run `cargo test -p motor-lease` for the digest, generated vector, authentication,
+Run `cargo test -p motor-lease` for the digest, canonical conformance, authentication,
 broker state-machine and real-loopback route tests.

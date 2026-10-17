@@ -337,6 +337,7 @@ define_frames! {
     },
     Attach(AttachRequest),
     Terminal(TerminalRecord),
+    HostedTerminal(HostedTerminal),
     Prepare(Prepare),
     PrepareAccepted {
         transfer_id: Uuid,
@@ -369,6 +370,16 @@ define_frames! {
     },
     Cancel(CancelRequest),
     CancelReply(CancelReply),
+}
+
+/// Host-observed usage. A host sends this after the runner's terminal result and
+/// replays the same billing figure whenever a client reattaches to the job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostedTerminal {
+    pub job_id: Uuid,
+    pub placement: String,
+    pub billed_vcpu_ms: u64,
+    pub max_runtime_s: u64,
 }
 
 /// Per-job lifecycle inspection. Aggregate status retains its v1 shape.

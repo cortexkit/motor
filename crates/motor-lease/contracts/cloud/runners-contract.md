@@ -1,0 +1,403 @@
+# Runners wire contract
+
+The broker is `https://runners.cortexkit.io` (`workers/runners`). It is a control plane only:
+ck-motor receives a lease and connects directly to the placed host. Job bytes never pass through
+the broker. [runners.md](runners.md) covers architecture, operator commands, deployment and key
+rotation. The pinned bytes under `test-vectors/runners/` are part of this contract.
+
+## Credentials and job tokens
+
+Client endpoints require `Authorization: Bearer <token>`, with that exact scheme and one space.
+The account service issues this machine worker token with protected header `typ: ck-worker+jwt`,
+audience `cortexkit-runners` and exactly the claims `account`, `device`, `iat`, `exp`, `aud`, `jti`.
+The broker uses `WorkerJwksVerifier` from `packages/account-auth` and the account JWKS at
+`https://account.cortexkit.io/.well-known/jwks.json`. The tenant is `acct:` plus the verified
+account byte for byte. Any verified account can call the client routes; device is not an
+authorization boundary. A runners token is not an account machine principal.
+
+The **job token** is a different credential, signed by the broker for the placed host. It is a
+compact JWS with unpadded base64url segments. The header JSON bytes are exactly:
+
+```json
+{"alg":"EdDSA","kid":"<signing key id>","typ":"ck-job+jwt"}
+```
+
+Payload keys occur in this order, without whitespace:
+
+| Claim | Value |
+| --- | --- |
+| `iss` | `https://runners.cortexkit.io` |
+| `aud` | Placed host id, equal to `placement.host` |
+| `sub` | Tenant `acct:<ULID>` |
+| `jti` | `job_id` |
+| `iat` | `floor(broker_clock_ms / 1000)` at issue |
+| `exp` | `iat + 300` |
+| `vcpus`, `mem_mib`, `platform`, `net` | Leased resources and options |
+| `placement` | `{"host":"<host id>","vm":"<warm VM id>"}` in that key order, or `vm: null` for cold placement |
+| `max_s` | Run limit enforced by the host from job start, not token issue |
+| `cnf` | `{"jkt":"<thumbprint>"}` |
+| `purpose` | `"run"` from lease; `"attach"` from reattach |
+
+`cnf.jkt` is the unpadded base64url SHA-256 RFC 7638 thumbprint of the UTF-8 JSON
+`{"crv":"Ed25519","kty":"OKP","x":"<requester x>"}`. The token is bound to the requester key.
+
+Hosts check expiration at connect only. They reject any other `alg` or `typ`, unknown `kid`, any
+`crit` header, wrong `iss` or `aud`, any purpose other than `run` or `attach`, and extra or missing
+claims. Host executions are keyed by `jti`: a `run` token starts an execution only if none exists
+for that job; later tokens reconnect without starting another execution or restarting `max_s`.
+An `attach` token never starts an execution. An ended execution refuses connection. These are
+host obligations, not execution logic implemented in the broker.
+
+`GET /.well-known/jwks.json` is unauthenticated and returns 200 `{"keys":[…]}` with
+`Cache-Control: public, max-age=300`. Each key is
+`{kty:"OKP",crv:"Ed25519",x,kid,alg:"EdDSA",use:"sig"}`. The current key is first, followed by next
+and previous when configured. Each `x` is the unpadded base64url 32-byte public key derived from
+the corresponding Ed25519 seed. There is never a `d` member. Only current signs; previous remains
+usable for verification while configured. Machine worker tokens use the account JWKS, never
+this endpoint.
+
+Hosts refetch this set every 10 minutes, and immediately when a job token names a `kid` they don't
+hold, at most once a minute. A failed fetch keeps the last good set. Rotation publishes the next
+key at least 7 days before it starts signing, so a host that refetches on schedule never sees an
+unknown `kid` in normal operation.
+
+## Common wire rules
+
+Routing comes first. A wrong method or unknown path is 404 `{"error":"not_found"}` before any
+authentication or body check, with no writes. Unexpected failures return 500
+`{"error":"internal"}`, never backend text or a stack.
+
+Bodies are UTF-8 JSON. A POST requires media type `application/json`; parameters such as
+`charset=utf-8` are accepted. Missing or different Content-Type, or more than 65536 raw body
+bytes, is 400 `bad_request` at the route's specified check position. GET routes have no body and
+no Content-Type check. Objects at every nesting level have exactly the documented keys: unknown,
+missing or duplicate keys are invalid. Integers are safe JSON numbers without fraction or
+exponent. Body field order need not match the canonical order.
+
+| Field | Grammar |
+| --- | --- |
+| `job_id` | Lowercase UUIDv7: `^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$` |
+| `workspace_key_hash`, `repo_hash` | `^[A-Za-z0-9_-]{43}$`: opaque to the broker, which checks only this shape and compares values for equality (see below) |
+| `platform`, `host_id`, warm `vm` | `^[A-Za-z0-9._-]{1,64}$` |
+| Account ULID | `^[0-7][0-9A-HJKMNP-TV-Z]{25}$` |
+| Warm `tenant` | `acct:` followed by an account ULID |
+| `requester_jwk` | Exactly `{kty:"OKP",crv:"Ed25519",x}`, where `x` is unpadded base64url encoding 32 bytes |
+| `endpoint_spki_sha256` | `^[A-Za-z0-9_-]{43}$`: unpadded base64url SHA-256 of the host certificate's DER SubjectPublicKeyInfo (32 bytes) |
+
+The endpoint is `host:port` (bracketed for IPv6), not a URL with a scheme or path. The endpoint
+and its SPKI hash come byte-exact from the host registry. Clients use
+`endpoint_spki_sha256` to pin the host certificate's public key on the direct TLS connection; it
+is not a certificate fingerprint or the host's report-signing Ed25519 key.
+
+`platform` names the operating system and CPU architecture together, for example `linux-x64` or
+`linux-arm64`. The broker gives it no other meaning: a lease is placed only on a host whose
+registered platform is byte-for-byte the same string. Clients send the platform of the job's
+toolchain, and hosts register their own, so hosts of a new architecture just add a new string.
+
+Clients derive `workspace_key_hash` and `repo_hash` as unpadded base64url HMAC-SHA256 under a
+per-machine secret salt, over `ck-ws-v1\n<workspace path>` and `ck-repo-v1\n<repository path>`
+respectively. Because the salt never leaves the machine, the broker and hosts can match the same
+workspace across leases for warm placement without learning or guessing its path.
+`test-vectors/runners/lease.json` records a TEST-ONLY salt and inputs that reproduce its values.
+
+Canonical JSON for hashing uses the body keys in each endpoint's listed order and no whitespace;
+`requester_jwk`, where present, uses `kty`, `crv`, `x`. The lease hash omits `requester_jwk`.
+The usage hash covers the full canonical usage body. A host signature instead hashes the raw
+request bytes, not canonical JSON.
+
+### Error catalog
+
+Every error body is exactly `{"error":"<code>"}`, with no other member.
+
+| Status | Code |
+| --- | --- |
+| 400 | `bad_request`, `platform_unsupported` |
+| 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
+| 402 | `budget_exhausted` |
+| 404 | `not_found`, `job_unknown` |
+| 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict` |
+| 500 | `internal` |
+| 503 | `no_capacity`, `unavailable`; both include `Retry-After: 5` |
+
+Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
+retryable transport failures. Host retries after a consumed counter must use a new counter.
+
+## Client endpoints
+
+After routing, client authentication precedes Content-Type, size, JSON parsing and all state
+access. A missing or invalid token returns 401 `unauthorized` even with no Content-Type, an empty
+body or an oversized body; no totals or rows change. Once authenticated, grammar or bound
+failures, including a path `job_id`, are 400 `bad_request` without writes.
+
+### POST /v1/leases
+
+The exact body fields, in canonical order, are:
+
+```text
+{job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
+ placement_hint, timeout_s, requester_jwk}
+```
+
+`vcpus` is 1–64 and `timeout_s` 10–7200. `net` is boolean. There is no client `mem_mib` field:
+the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
+`placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
+grammar. A matching selectable warm placement is preferred; an unusable hint falls back to
+normal placement. Other strings and the requester key follow the common grammars.
+
+After authentication and schema validation, checks proceed in this order:
+
+1. Read the account's allowance, then claim `job_id` in D1. A claim belonging to another tenant is
+   404 `job_unknown` and reveals none of that job's data.
+2. Check for an existing `TenantDO` row. A release marker takes precedence and gives 409
+   `job_released`, even after settlement. Otherwise a settled job is 409 `job_finished`; a reserved
+   job ever reported `admitted` or `started` is 409 `job_admitted`. Otherwise an identical lease hash
+   returns 201 on the same reservation, with a fresh `run` token for this requester's key. A
+   different hash is 409 `job_conflict`. These replies do not reserve again.
+3. Ask for placement. If no active host has the requested platform, return 400
+   `platform_unsupported`. If active hosts have it but none is selectable, return 503
+   `no_capacity`. Before returning a refusal, repeat the existing-job check so a concurrent
+   successful lease wins over that refusal.
+4. Compute the budget candidate from current totals. For finite allowances,
+   `remaining = max(0, allowance − settled_total − reserved_total)` and
+   `max_s = min(timeout_s, floor(remaining / (vcpus × 1000)))`; unlimited uses `timeout_s`.
+   If below 10, repeat the existing-job check before returning 402 `budget_exhausted`.
+5. Sign outside the transaction, then in one synchronous transaction repeat the existing-job
+   check and recompute the limit. Commit only if it still matches the signed candidate, inserting
+   the unique job row and reserving `vcpus × max_s × 1000`. A changed limit below 10 is 402;
+   otherwise retry signing. Three mismatches return 503 `unavailable` without a reservation.
+   A concurrent existing-row hit is not a mismatch attempt and reserves nothing.
+
+Thus reservations cannot exceed remaining budget. Each stored `max_s` equals its token's limit;
+separately, each stored reservation equals `vcpus × max_s × 1000`. For example, allowance 25000
+with no totals, 2 vCPUs and timeout 100 gives `max_s: 12`, reservation 24000; 20000 gives 10;
+19999 refuses. Unlimited, 64 vCPUs and 7200 seconds reserves 460800000.
+
+Placement and budget refusals leave no `TenantDO` job row and unchanged totals, but retain the D1
+claim. The same tenant can retry after capacity returns or allowance increases; another tenant
+still gets 404. Existing-job refusals never mutate its row or totals.
+
+Success is **201** with exactly these fields (the same shape is used by reattach):
+
+```text
+{lease_id, job_id, placement:{host,vm}, endpoint, endpoint_spki_sha256,
+ job_token, token_expires_at_ms, max_s, reserved_vcpu_ms}
+```
+
+`lease_id` is a lowercase UUID. `vm` is a warm VM string or `null` for cold placement. `endpoint`
+and `endpoint_spki_sha256` are the placed host's registry values. `job_token` has purpose `run`;
+`token_expires_at_ms` is its `exp × 1000`.
+
+A re-request may change only `requester_jwk`, retaining the same lease id, placement, endpoint,
+SPKI hash, run limit and reservation. The new token has a fresh issue time and 300-second life.
+If a token is expired before connecting, re-request before admission or use reattach; never
+connect with a token whose `token_expires_at_ms` is not after the client's current time. Neither
+refresh path extends the original host-lost deadline or starts another execution.
+
+Placement is not a capacity lock. On a full host, a new placement needs a new `job_id`; retrying
+the same lease keeps the same placement. The host releases the unused first reservation with a
+zero-duration usage report, or it remains until the host-lost alarm settles proved elapsed time.
+
+### POST /v1/leases/{job_id}/reattach
+
+The body is exactly `{requester_jwk}`. Success is **200** with exactly the lease reply fields:
+
+```text
+{lease_id, job_id, placement:{host,vm}, endpoint, endpoint_spki_sha256,
+ job_token, token_expires_at_ms, max_s, reserved_vcpu_ms}
+```
+
+Lease id, placement, endpoint, SPKI hash, run limit and reservation remain unchanged. The new
+`attach` token is bound to the supplied key and has its own `iat` and `exp = iat + 300`. It reserves
+and settles nothing and does not move the original deadline. Earlier tokens are not revoked;
+they expire at their own `exp`. Unknown, claim-only or another tenant's jobs return 404
+`job_unknown`. A release marker is 409 `job_released`, taking precedence over a settled job's
+409 `job_finished`.
+
+### POST /v1/leases/{job_id}/release
+
+The body is exactly `{}` with JSON Content-Type. Authentication still precedes path and body
+validation. Unknown, claim-only or another tenant's jobs return 404 `job_unknown`; a settled job
+returns 409 `job_finished`; an admitted job returns 409 `job_admitted`, in that order.
+
+Otherwise success is **202** with exactly `{job_id, release_at_ms}`. The first release records
+`release_at_ms = latest_run_token_expires_at_ms + 60000`. Repeated releases before settlement
+return the same time and change no totals. Release is delayed cancellation, not immediate
+settlement: outstanding run tokens must expire first. A release marker blocks lease re-request
+and reattach with 409 `job_released`.
+
+An `admitted` or `started` heartbeat that wins before settlement clears the marker and keeps
+the reservation; a `reserved` heartbeat preserves it. The alarm settles an unadmitted job for
+zero charge once release is due, releasing its entire reservation. The marker remains, so
+lease re-request and reattach continue returning `job_released`; another release returns
+`job_finished`. Usage after release settlement returns `job_settled`.
+
+**Known gap: a released job can run unbilled.** Every executed job should be billed, but this
+contract doesn't guarantee it for a released job that a host admits anyway. Billing depends on
+that host reporting `admitted` or `started` before `release_at_ms`. If those heartbeats don't
+arrive in time, for example because the host can't reach the broker, the alarm settles the job at
+zero and its later usage report gets `job_settled`. Hosts narrow the window by refusing to admit a
+job whose run token has expired, which leaves at least 60 seconds for the heartbeat.
+
+### GET /v1/tenant
+
+Success is **200** with exactly:
+
+```text
+{tenant_id, allowance, reserved_vcpu_ms, settled_vcpu_ms,
+ running_jobs:[{job_id, host, vm, vcpus, max_s, reserved_vcpu_ms, last_elapsed_ms}]}
+```
+
+`allowance` is the JSON string `"unlimited"` or a JSON number, never a numeric string. A missing
+allowance row means 0. `running_jobs` contains only reserved jobs, ordered by `job_id`. An account
+with no state reads totals 0 and `running_jobs: []`. The route writes no D1 row or Durable Object
+storage.
+
+## Host authentication
+
+Hosts are operator-enrolled with a raw 32-byte Ed25519 public key encoded as 64 lowercase hex
+characters. Retired hosts still authenticate and settle existing jobs; they are excluded only
+from new placement.
+
+HTTP header names are case-insensitive. Values are exact:
+
+| Header | Value |
+| --- | --- |
+| `CK-Host` | Must equal path `host_id` |
+| `CK-Timestamp` | Unix milliseconds, `^[1-9][0-9]*$`, safe integer |
+| `CK-Counter` | Positive safe integer, `^[1-9][0-9]*$`, strictly above the last accepted value |
+| `CK-Signature` | 64-byte Ed25519 signature as 128 lowercase hex characters |
+
+**Host startup rule:** seed the counter on start as `max(persisted + 1, unix_ms × 1000)`.
+Counters may have gaps. Persist and advance them across requests; a retry after counter acceptance
+must use a new value, even when the original request failed later checks.
+
+Sign exactly the UTF-8 string below, with literal newlines and **no trailing newline**:
+
+```text
+ck-host-v1
+POST
+<pathname>
+<lowercase hex sha256 of raw body bytes>
+<CK-Timestamp>
+<CK-Counter>
+```
+
+The pathname is as received, not percent-decoded. Timestamp and counter are the raw header
+values. Signature verification precedes JSON parsing.
+
+After routing, checks run in this order:
+
+1. Invalid path-host grammar, any query string, missing/wrong Content-Type or an oversized body:
+   400 `bad_request`, with no `HostDO` storage or counter write.
+2. Malformed headers, a `CK-Host` mismatch, an unregistered host or a bad signature against its
+   registered key: 401 `host_auth_failed`, with no counter write. Signing a request for host B
+   with host A's key changes nothing on B. Retirement is not an authentication failure.
+3. `HostDO` accepts only a counter strictly above its last accepted counter. Replay or a
+   non-increasing value is 401 `host_auth_failed` without change. The initial counter is 0;
+   stored counters belong to the registry generation. Retirement followed by re-registration
+   increments generation, so the new generation starts from 0 and can accept counter 1.
+   A passing counter is persisted before all remaining checks.
+4. Timestamp skew greater than 60000 ms from the broker is 401 `host_auth_failed`; exactly
+   60000 ms is accepted. A skew refusal consumes the counter but applies no body effects.
+5. Schema and bounds are checked: invalid JSON or fields are 400 `bad_request`, with the
+   counter consumed.
+6. A failed downstream `TenantDO` write is 503 `unavailable`; retry with a new counter.
+
+All authentication failures are exactly `{"error":"host_auth_failed"}`. Post-counter 4xx
+outcomes never roll the counter back.
+
+### POST /v1/hosts/{host_id}/heartbeat
+
+The exact body is:
+
+```text
+{free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm}],
+ running:[{job_id, state, elapsed_ms}], healthy}
+```
+
+Integers are non-negative safe integers. `healthy` is boolean. `warm` and `running` each have at
+most 64 entries. `state` is exactly `reserved`, `admitted` or `started`. The heartbeat replaces
+the host capacity snapshot, timestamped at broker receive time. `queued` is stored but does not
+affect placement.
+
+Running entries are processed in order. An unknown, claim-only or other-host job is listed in
+`ignored` without failing siblings or writing `TenantDO` storage. A settled job placed on this
+host has no effect. A reserved job on this host updates
+`last_elapsed_ms = max(last_elapsed_ms, min(elapsed_ms, max_s × 1000))`. States `admitted` and
+`started` permanently mark it admitted; later `reserved` does not clear that flag. This prevents
+lease re-request, but not reattach.
+
+Success is **200** with exactly `{"ignored":[<job_id>…]}`, strings in entry order and no other
+member. A valid heartbeat from a retired host still updates elapsed time and snapshots.
+
+### POST /v1/hosts/{host_id}/usage
+
+The exact body, also its canonical hash order, is:
+
+```text
+{job_id, vcpus, started_at_ms, ended_at_ms, mem_peak_mib, egress_bytes, outcome}
+```
+
+`vcpus` is 1–64. Times, `mem_peak_mib` and `egress_bytes` are non-negative safe integers;
+`ended_at_ms ≥ started_at_ms`. `outcome` is exactly `exit`, `signal`, `timeout`, `cancelled` or
+`lost`. Outcome and memory/egress measurements are audit-only. The host must cap its own report
+at `max_s` (`ended_at_ms − started_at_ms ≤ max_s × 1000`); independently the broker caps
+settlement at the reservation even if the host over-reports.
+
+After authentication and schema checks, precedence is:
+
+1. Unknown, claim-only or other-host job: 404 `job_unknown`. The signing host's counter is
+   consumed; the job's host and totals are unchanged.
+2. Settled job: after a host-lost or release settlement, 409 `job_settled`. After a reported
+   settlement, an identical canonical usage hash returns the original 200 reply; any other body gives 409
+   `usage_conflict`. These replies do not settle again.
+3. Reserved job whose `vcpus` differs from the lease: 400 `bad_request`; it stays reserved.
+4. Settle `S = min(leased_vcpus × (ended_at_ms − started_at_ms), reserved_vcpu_ms)` and release
+   `reserved_vcpu_ms − S`. Zero duration settles 0 and releases the full reservation.
+
+Success is **200** with exactly:
+
+```text
+{job_id, settled_vcpu_ms, released_vcpu_ms}
+```
+
+A repeated authenticated report needs a new `CK-Counter` even when its canonical body is
+identical: authentication consumes the counter before settlement idempotency is checked.
+
+## Placement, deadlines and metering
+
+Selectable hosts are active, platform-matching, healthy, no more than 60000 ms since heartbeat,
+have a snapshot for their current registry generation, and have sufficient free vCPUs and memory.
+Prefer the placement hint if it names a selectable warm entry matching tenant and
+`workspace_key_hash`. Otherwise prefer any matching warm entry, then bytewise host id and VM id.
+Without a warm match, choose the lowest selectable host id with `vm: null`.
+`repo_hash`, `net` and `queued` do not affect placement.
+Capacity snapshots do not lock hosts or VMs.
+
+The original lease fixes the host-lost deadline at
+`original_lease_iat × 1000 + max_s × 1000 + 600000`. Neither reattach nor lease re-request moves
+it. When due, the alarm settles `min(vcpus × last_elapsed_ms, reserved_vcpu_ms)`, zero without
+proved elapsed time, and releases the rest. Usage and alarm settlement serialize; the first
+transition wins. Usage after host-lost settlement is 409 `job_settled` and changes no totals.
+An unadmitted release can instead settle for zero at its release deadline, as described above.
+
+Each nonzero settlement adds its settled vCPU-ms exactly once to the UTC-hour `runners` /
+`vcpu_ms` aggregate. Zero settlements add nothing. Audit retries and repeated reports do not
+count again. These hourly facts go to account's `RunnersUsageIngest`; the account ledger is not
+the broker's reservation authority. Allowances are lifetime vCPU-ms; a missing row means 0, and
+`unlimited` removes the budget gate. Prices and invoices are outside this contract.
+
+## Pinned conformance evidence
+
+`test-vectors/runners/job-tokens.json` pins both token purposes and their header/claim bytes,
+the fixed signing seed and its derived public key. `test-vectors/runners/lease.json` pins the
+lease request and exact reply, including the lease id and SPKI hash.
+`test-vectors/runners/host-signature.json` pins the exact host signature input and signature.
+`test-vectors/runners/usage-settlement.json` pins the report and settlement reply.
+
+`workers/runners/test/vectors.test.ts` compares real implementation output to those committed
+bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,
+`workers/runners/test/host-auth.test.ts`, `workers/runners/test/usage.test.ts`,
+`workers/runners/test/rerequest.test.ts` and `workers/runners/test/lease-concurrency.test.ts`
+exercise the corresponding credentials, state transitions and accounting invariants. See
+[runners.md](runners.md#tests-and-wire-vectors) for the full explicit test file list.

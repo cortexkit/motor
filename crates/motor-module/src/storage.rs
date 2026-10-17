@@ -29,6 +29,8 @@ fn now_ms() -> u64 {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<crate::hosted::HostedJobState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_job: bool,
@@ -165,6 +167,83 @@ impl Drop for JobLease {
 }
 
 impl Storage {
+    pub(crate) fn hosted_update(
+        &self,
+        id: Uuid,
+        f: impl FnOnce(&mut crate::hosted::HostedJobState),
+    ) -> io::Result<()> {
+        self.update(|s| {
+            if let Some(state) = s.jobs.get_mut(&id).and_then(|j| j.hosted.as_mut()) {
+                f(state);
+            }
+        })
+    }
+    pub(crate) fn has_live_stream(&self, id: Uuid) -> bool {
+        self.state.lock().unwrap().active_jobs.contains_key(&id)
+    }
+    pub(crate) fn last_hosted(&self) -> Option<crate::HostedJobState> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .rev()
+            .filter_map(|j| j.hosted.clone())
+            .find(|h| h.lease_attempted)
+    }
+    pub(crate) fn hosted_route(
+        &self,
+        id: Uuid,
+        route: crate::hosted::HostedJobState,
+    ) -> io::Result<()> {
+        self.update(|s| {
+            s.jobs.entry(id).or_default().hosted = Some(route);
+        })
+    }
+    pub(crate) fn hosted_placement(&self, key: &str) -> Option<motor_lease::Placement> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .rev()
+            .find(|j| {
+                j.workspace_key.as_deref() == Some(key)
+                    && j.hosted.as_ref().is_some_and(|h| h.placement.is_some())
+            })
+            .and_then(|j| j.hosted.as_ref()?.placement.clone())
+    }
+    pub(crate) fn hosted_salt(&self) -> io::Result<[u8; 32]> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _guard = self.state.lock().unwrap();
+        let path = self.root.join("hosted-salt");
+        match fs::read(&path) {
+            Ok(bytes) => {
+                if fs::symlink_metadata(&path)?.file_type().is_symlink()
+                    || fs::metadata(&path)?.permissions().mode() & 0o777 != 0o600
+                {
+                    return Err(io::Error::other("unsafe hosted salt permissions"));
+                }
+                bytes
+                    .try_into()
+                    .map_err(|_| io::Error::other("invalid hosted salt"))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut salt = [0; 32];
+                getrandom::fill(&mut salt).map_err(io::Error::other)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                file.write_all(&salt)?;
+                file.sync_all()?;
+                File::open(&self.root)?.sync_all()?;
+                Ok(salt)
+            }
+            Err(e) => Err(e),
+        }
+    }
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let lease = OpenOptions::new()

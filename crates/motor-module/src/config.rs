@@ -7,6 +7,12 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip_serializing_if = "is_false")]
+    pub hosted_runners: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_url: Option<String>,
+    #[serde(skip_serializing_if = "BrokerTokenSource::is_default")]
+    pub broker_token_source: BrokerTokenSource,
     pub runner_instance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_runner_instance: Option<String>,
@@ -40,6 +46,19 @@ pub struct Config {
     pub direct_exec_max_timeout_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerTokenSource {
+    #[default]
+    CkAccount,
+    Fake,
+}
+impl BrokerTokenSource {
+    fn is_default(&self) -> bool {
+        *self == Self::CkAccount
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -60,6 +79,9 @@ impl Default for Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
+            hosted_runners: false,
+            broker_url: None,
+            broker_token_source: BrokerTokenSource::CkAccount,
             runner_instance: "main".into(),
             windows_runner_instance: None,
             windows_runner_state_root: None,
@@ -98,6 +120,31 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> io::Result<()> {
+        if self.runner_instance == "main" && self.broker_token_source == BrokerTokenSource::Fake {
+            return Err(io::Error::other(
+                "fake broker is forbidden for runner_instance main",
+            ));
+        }
+        if let Some(url) = &self.broker_url {
+            let url = reqwest::Url::parse(url).map_err(io::Error::other)?;
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || (url.scheme() != "https"
+                    && !(self.broker_token_source == BrokerTokenSource::Fake
+                        && url.scheme() == "http"
+                        && url.host_str().is_some_and(|h| {
+                            h == "localhost"
+                                || h.parse::<std::net::IpAddr>()
+                                    .is_ok_and(|ip| ip.is_loopback())
+                        })))
+            {
+                return Err(io::Error::other(
+                    "broker_url requires HTTPS (loopback HTTP is allowed only for fake)",
+                ));
+            }
+        }
         if self.runner_instance.is_empty()
             || !self
                 .runner_instance

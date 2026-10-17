@@ -19,7 +19,3 @@ cortexkit-test-support = "=0.1.7"
 [[bin]]
 name = "motor-fake-broker"
 path = "src/bin/fake-broker.rs"
-
-[[example]]
-name = "generate-interim-vectors"
-path = "examples/generate-interim-vectors.rs"

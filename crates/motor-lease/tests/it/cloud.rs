@@ -1,0 +1,263 @@
+//! These comparisons execute Motor against immutable, externally supplied bytes.
+use super::common::*;
+use ed25519_dalek::SigningKey;
+use motor_lease::{
+    fake::{BrokerRequest, FakeBroker, FakeConfig},
+    *,
+};
+use serde_json::{json, Value};
+
+fn vector(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("contracts/cloud")
+        .join(name);
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+fn seed(text: &str) -> SigningKey {
+    let bytes: Vec<_> = text
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    SigningKey::from_bytes(&bytes.try_into().unwrap())
+}
+
+#[test]
+fn cloud_job_tokens_and_requester_thumbprint_match_code_for_both_purposes() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let v = vector("job-tokens.json");
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(serde_json::from_value(v["jwks"].clone()).unwrap()))
+        .unwrap();
+    let requester = RequesterJwk::from_key(
+        &seed(v["test_only_requester_seed_hex"].as_str().unwrap()).verifying_key(),
+    );
+    assert_eq!(requester.thumbprint().unwrap(), v["requester_jkt"]);
+    for (name, purpose, other) in [
+        ("run", Purpose::Run, Purpose::Attach),
+        ("attach", Purpose::Attach, Purpose::Run),
+    ] {
+        let entry = &v["tokens"][name];
+        let token = entry["job_token"].as_str().unwrap();
+        let claims: Claims = serde_json::from_str(entry["claims"].as_str().unwrap()).unwrap();
+        let clock = v["clock_ms"].as_u64().unwrap() / 1000;
+        assert_eq!(
+            verify_token(
+                token,
+                &keys,
+                &claims.placement.host,
+                Some(&claims.jti),
+                purpose,
+                clock
+            )
+            .unwrap(),
+            claims
+        );
+        assert_eq!(
+            verify_token(
+                token,
+                &keys,
+                &claims.placement.host,
+                Some(&claims.jti),
+                other,
+                clock
+            ),
+            Err(AuthError::Auth)
+        );
+        assert_eq!(
+            bind_requester(&claims, &requester).unwrap(),
+            requester.verifying_key().unwrap()
+        );
+        let minted = sign_token(
+            &claims,
+            v["key_id"].as_str().unwrap(),
+            &seed(v["seed_hex"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(minted, token, "{name} JWS differs from CLOUD");
+        let parts: Vec<_> = minted.split('.').collect();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(parts[0]).unwrap(),
+            entry["header"].as_str().unwrap().as_bytes()
+        );
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(parts[1]).unwrap(),
+            entry["claims"].as_str().unwrap().as_bytes()
+        );
+    }
+}
+
+#[test]
+fn cloud_host_signature_bytes_header_and_verification_match() {
+    let v = vector("host-signature.json");
+    let key = seed(v["seed_hex"].as_str().unwrap());
+    let path = v["pathname"].as_str().unwrap();
+    let body = v["body"].as_str().unwrap().as_bytes();
+    let timestamp = v["timestamp"].as_str().unwrap().parse().unwrap();
+    let counter = v["counter"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        host_message_bytes("POST", path, body, timestamp, counter),
+        v["signed_string"].as_str().unwrap().as_bytes()
+    );
+    let headers =
+        HostHeaders::sign("host-1", "POST", path, body, timestamp, counter, &key).unwrap();
+    assert_eq!(headers.signature, v["ck_signature_header"]);
+    let mut auth = HostAuthenticator::default();
+    auth.register("host-1".into(), key.verifying_key());
+    let mut changed = body.to_vec();
+    changed[0] ^= 1;
+    assert_eq!(
+        auth.verify("POST", path, &changed, &headers, timestamp),
+        Err(AuthError::Auth)
+    );
+    auth.verify("POST", path, body, &headers, timestamp)
+        .unwrap();
+    let mut bad = headers.clone();
+    bad.signature.replace_range(
+        ..2,
+        if headers.signature.starts_with("00") {
+            "01"
+        } else {
+            "00"
+        },
+    );
+    let mut fresh = HostAuthenticator::default();
+    fresh.register("host-1".into(), key.verifying_key());
+    assert_eq!(
+        fresh.verify("POST", path, body, &bad, timestamp),
+        Err(AuthError::Auth)
+    );
+}
+
+#[test]
+fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
+    let v = vector("lease.json");
+    let tokens = vector("job-tokens.json");
+    let mut broker = FakeBroker::new(
+        "cloud-vector",
+        FakeConfig {
+            worker_bearer: BEARER.into(),
+            subject: format!("acct:{}", v["account"].as_str().unwrap()),
+            placement: serde_json::from_value(v["reply"]["body"]["placement"].clone()).unwrap(),
+            endpoint: v["host"]["endpoint"].as_str().unwrap().into(),
+            endpoint_spki_sha256: v["host"]["endpoint_spki_sha256"].as_str().unwrap().into(),
+            kid: v["key_id"].as_str().unwrap().into(),
+            signing_key: seed(v["seed_hex"].as_str().unwrap()),
+            announced_keys: vec![],
+        },
+    )
+    .unwrap();
+    broker.knobs.allowance_vcpu_ms = v["allowance_vcpu_ms"].as_u64();
+    broker.knobs.lease_id = Some(v["lease_id"].as_str().unwrap().into());
+    let clock = v["clock_ms"].as_u64().unwrap();
+    let request: LeaseRequest = serde_json::from_value(v["request"]["body"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        v["request"]["body"]
+    );
+    let issued = post(
+        &mut broker,
+        v["request"]["pathname"].as_str().unwrap(),
+        &request,
+        clock,
+    );
+    assert_eq!(issued.status, v["reply"]["status"].as_u64().unwrap() as u16);
+    assert_eq!(issued.body, v["reply"]["body"]);
+    let attach: ReattachRequest =
+        serde_json::from_value(v["reattach"]["request"]["body"].clone()).unwrap();
+    let attached = post(
+        &mut broker,
+        v["reattach"]["request"]["pathname"].as_str().unwrap(),
+        &attach,
+        clock,
+    );
+    assert_eq!(
+        attached.status,
+        v["reattach"]["reply"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(attached.body, v["reattach"]["reply"]["body"]);
+    assert_eq!(
+        attached.body["job_token"],
+        tokens["tokens"]["attach"]["job_token"]
+    );
+    let release = post(
+        &mut broker,
+        v["release"]["request"]["pathname"].as_str().unwrap(),
+        &ReleaseRequest::default(),
+        clock,
+    );
+    assert_eq!(
+        release.status,
+        v["release"]["reply"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(release.body, v["release"]["reply"]["body"]);
+    let u = vector("usage-settlement.json");
+    let key = seed(u["seed_hex"].as_str().unwrap());
+    broker.register_host("host-a".into(), key.verifying_key());
+    let usage: Usage = serde_json::from_value(u["request"]["body"].clone()).unwrap();
+    assert_eq!(usage.mem_peak_mib, None);
+    assert_eq!(usage.egress_bytes, None);
+    let body = serde_json::to_vec(&usage).unwrap();
+    let headers = &u["request"]["headers"];
+    let timestamp = headers["CK-Timestamp"].as_str().unwrap().parse().unwrap();
+    let counter = headers["CK-Counter"].as_str().unwrap().parse().unwrap();
+    let path = u["request"]["pathname"].as_str().unwrap();
+    assert_eq!(
+        host_message_bytes("POST", path, &body, timestamp, counter),
+        u["signed_string"].as_str().unwrap().as_bytes()
+    );
+    let signed =
+        HostHeaders::sign("host-a", "POST", path, &body, timestamp, counter, &key).unwrap();
+    assert_eq!(signed.signature, headers["CK-Signature"]);
+    let settled = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&signed),
+            body: &body,
+        },
+        u["clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        settled.status,
+        u["reply"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(settled.body, u["reply"]["body"]);
+    assert_eq!(serde_json::to_value(&usage).unwrap(), u["request"]["body"]);
+    let mut reordered = serde_json::to_vec(&u["request"]["body"]).unwrap();
+    reordered.push(b' ');
+    let signed = HostHeaders::sign(
+        "host-a",
+        "POST",
+        path,
+        &reordered,
+        timestamp,
+        counter + 1,
+        &key,
+    )
+    .unwrap();
+    assert_eq!(
+        broker.handle(
+            BrokerRequest {
+                content_type: Some("application/json"),
+                method: "POST",
+                path,
+                bearer: None,
+                host_headers: Some(&signed),
+                body: &reordered
+            },
+            timestamp
+        ),
+        settled
+    );
+    let mut missing = u["request"]["body"].clone();
+    missing.as_object_mut().unwrap().remove("mem_peak_mib");
+    assert!(serde_json::from_value::<Usage>(missing).is_err());
+    let mut unexpected = v["request"]["body"].clone();
+    unexpected["mem_mib"] = json!(16384);
+    assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
+}

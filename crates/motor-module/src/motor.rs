@@ -26,6 +26,12 @@ pub struct JobStream {
     _lease: JobLease,
 }
 impl JobStream {
+    pub(crate) fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+    pub fn hosted_state(&self) -> Option<crate::HostedJobState> {
+        self.storage.job(self.job_id).and_then(|j| j.hosted)
+    }
     /// Record terminal delivery only after the consumer has successfully handled
     /// the terminal record. Merely queueing a record does not count as delivery.
     pub fn acknowledge_terminal(&self) -> io::Result<()> {
@@ -122,6 +128,10 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create(id, wait, attribution, instance, gate_job)?;
+        if self.config.hosted_runners && request.platform != Some(Platform::Windows) {
+            self.storage
+                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+        }
         self.storage
             .retain_job(id, Some(request.workspace_key.clone()))?;
         let (stream, tx, rx) = self.stream(id);
@@ -143,7 +153,9 @@ impl Motor {
     pub fn attach(&self, request: AttachRequest) -> io::Result<JobStream> {
         let id = request.job_id;
         self.storage.retain_job(id, None)?;
-        self.connector_for_job(id)?;
+        if self.hosted_state(id).is_none() {
+            self.connector_for_job(id)?;
+        }
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
@@ -174,6 +186,10 @@ impl Motor {
     ) -> io::Result<JobStream> {
         let id = Uuid::now_v7();
         let (stream, tx, _) = self.stream(id);
+        if self.config.hosted_runners {
+            self.storage
+                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+        }
         let motor = self.clone();
         tokio::spawn(async move {
             if let Err(error) = motor.refused(id, reason, None, detail, &tx).await {
@@ -217,6 +233,36 @@ impl Motor {
         if let Some(hash) = hash {
             terminal = terminal.with_tree_hash(hash);
         }
+        let detail = if self.hosted_state(id).is_some() {
+            if let Some(state) = self.hosted_state(id).filter(|s| s.lease_attempted) {
+                if crate::hosted::Client::new(state).release(id).await
+                    == Err(crate::hosted::Error::Admitted)
+                {
+                    let (_, wake) = watch::channel(false);
+                    return self.follow(id, 0, None, tx, wake).await;
+                }
+            }
+            let code = detail
+                .as_deref()
+                .filter(|d| {
+                    d.starts_with("hosted_")
+                        || d.starts_with("return_paths_")
+                        || d.starts_with("lease_mismatch")
+                })
+                .and_then(|d| d.split(':').next())
+                .unwrap_or("hosted_request_rejected")
+                .to_string();
+            self.storage.hosted_update(id, |state| {
+                state.hosted_no_fallback = true;
+                state.hosted_code = Some(code.clone());
+            })?;
+            Some(match detail {
+                Some(d) if d.starts_with(&code) => d,
+                other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
+            })
+        } else {
+            detail
+        };
         if let Some(detail) = detail {
             terminal = terminal.with_refusal_detail(bounded_detail(detail));
         }
@@ -226,12 +272,20 @@ impl Motor {
     async fn run_job(
         &self,
         id: Uuid,
-        request: RunRequest,
+        mut request: RunRequest,
         env_not_forwarded: Vec<String>,
         wait: u64,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
     ) -> io::Result<()> {
+        let hosted = self.hosted_state(id).is_some();
+        if hosted {
+            if let Err(error) = crate::hosted::validate(&request) {
+                return self
+                    .refused(id, error.reason(), None, Some(error.code().into()), tx)
+                    .await;
+            }
+        }
         if let Err(error) = self.config.target(request.platform.as_ref()) {
             return self
                 .refused(
@@ -244,7 +298,11 @@ impl Motor {
                 .await;
         }
         let windows = request.platform == Some(Platform::Windows);
-        let connector = self.connector_for_job(id)?;
+        let connector = if hosted {
+            None
+        } else {
+            Some(self.connector_for_job(id)?)
+        };
         if request.network.is_some() && !self.config.network_routing {
             return self
                 .refused(
@@ -259,7 +317,7 @@ impl Motor {
                 )
                 .await;
         }
-        if let Some(code) = connector.refusal() {
+        if let Some(code) = connector.as_ref().and_then(|c| c.refusal()) {
             let (reason, detail) = request_refusal_fields(RefusalReason::Unknown(code.into()));
             return self.refused(id, reason, None, detail, tx).await;
         }
@@ -320,58 +378,86 @@ impl Motor {
                     .await;
             }
         };
-        let mut channel = match open_for_request(connector.as_ref(), id).await {
-            Ok(c) => c,
-            Err((reason, detail)) => {
+        let (mut channel, held) = loop {
+            let opened = if let Some(state) = self.hosted_state(id) {
+                let client = crate::hosted::Client::new(state);
+                match client.run(id, &request, &self.storage).await {
+                    Ok((channel, lease)) => {
+                        request.timeout = Some(lease.max_s);
+                        request.weight_hint = Some(request.weight_hint.unwrap_or(2));
+                        Ok(channel)
+                    }
+                    Err(crate::hosted::Error::Admitted) => {
+                        return self.follow(id, 0, None, tx, wake).await
+                    }
+                    Err(error) => Err((error.reason(), Some(error.code().into()))),
+                }
+            } else {
+                open_for_request(connector.as_ref().unwrap().as_ref(), id).await
+            };
+            let mut channel = match opened {
+                Ok(c) => c,
+                Err((reason, detail)) => {
+                    return self
+                        .refused(
+                            id,
+                            reason,
+                            Some(snapshots.main.tree_hash.clone()),
+                            detail,
+                            tx,
+                        )
+                        .await
+                }
+            };
+            if windows
+                && !channel
+                    .platforms
+                    .iter()
+                    .any(|platform| platform == "windows")
+            {
                 return self
                     .refused(
                         id,
-                        reason,
+                        RefusalReason::PlatformUnsupported,
                         Some(snapshots.main.tree_hash.clone()),
-                        detail,
+                        Some("requested platform windows is not listed in the runner hello".into()),
                         tx,
                     )
-                    .await
+                    .await;
             }
-        };
-        if windows
-            && !channel
-                .platforms
-                .iter()
-                .any(|platform| platform == "windows")
-        {
-            return self
-                .refused(
+            let held = match self
+                .have(
+                    &mut channel,
+                    snapshots.candidates(&self.storage.previous(&request.workspace_key)),
+                    snapshots.git_dependencies.keys().cloned().collect(),
                     id,
-                    RefusalReason::PlatformUnsupported,
-                    Some(snapshots.main.tree_hash.clone()),
-                    Some("requested platform windows is not listed in the runner hello".into()),
-                    tx,
+                    UnreachableStep::HaveExchange,
                 )
-                .await;
-        }
-        let held = match self
-            .have(
-                &mut channel,
-                snapshots.candidates(&self.storage.previous(&request.workspace_key)),
-                snapshots.git_dependencies.keys().cloned().collect(),
-                id,
-                UnreachableStep::HaveExchange,
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(_) => {
-                return self
-                    .refused(
-                        id,
-                        RefusalReason::Unreachable,
-                        Some(snapshots.main.tree_hash.clone()),
-                        None,
-                        tx,
-                    )
-                    .await
-            }
+                .await
+            {
+                Ok(h) => h,
+                Err(_)
+                    if hosted
+                        && self
+                            .hosted_state(id)
+                            .is_some_and(|s| s.placement_attempts < 3) =>
+                {
+                    drop(channel);
+                    continue;
+                }
+                Err(_) => {
+                    return self
+                        .refused(
+                            id,
+                            RefusalReason::Unreachable,
+                            Some(snapshots.main.tree_hash.clone()),
+                            hosted.then(|| "hosted_connect_failed".into()),
+                            tx,
+                        )
+                        .await
+                }
+            };
+            break (channel, held);
         };
         let hash = snapshots.main.tree_hash.clone();
         let (snapshots, bundles) = tokio::task::spawn_blocking(move || {
@@ -468,6 +554,17 @@ impl Motor {
             Ok(Incoming::Frame(Frame::Refusal(refusal))) => {
                 log_refusal(id, &refusal);
                 let (reason, detail) = runner_refusal_fields(&refusal);
+                if hosted {
+                    return self
+                        .refused(
+                            id,
+                            reason,
+                            Some(snapshots.main.tree_hash.clone()),
+                            Some(format!("lease_mismatch: {}", detail.unwrap_or_default())),
+                            tx,
+                        )
+                        .await;
+                }
                 let mut terminal =
                     TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
                         .with_ran(Ran::None)
@@ -574,10 +671,10 @@ impl Motor {
         self.storage.job(id).is_some_and(|j| j.pending_cancel)
     }
     async fn send_cancel(&self, id: Uuid) -> io::Result<()> {
-        let connector = self.connector_for_job(id)?;
-        let mut channel = Channel::open(connector.as_ref(), id)
+        let mut channel = self
+            .open_job_channel(id)
             .await
-            .map_err(|r| io::Error::other(format!("{r:?}")))?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         channel.send(Frame::Cancel(CancelRequest::new(id))).await?;
         match channel.next().await? {
             Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == id => {
@@ -585,6 +682,60 @@ impl Motor {
             }
             _ => Err(io::Error::other("expected cancel_reply")),
         }
+    }
+    pub fn hosted_state(&self, id: Uuid) -> Option<crate::HostedJobState> {
+        self.storage.job(id).and_then(|j| j.hosted)
+    }
+    pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
+        if !self.config.hosted_runners {
+            return None;
+        }
+        let last = self.storage.last_hosted();
+        let error = last.as_ref().and_then(|s| s.hosted_code.as_deref());
+        Some(serde_json::json!({
+            "hosted": true,
+            "token_source": self.config.broker_token_source,
+            "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
+            "last_lease_error": error,
+        }))
+    }
+    async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
+        if let Some(state) = self.hosted_state(id) {
+            crate::hosted::Client::new(state)
+                .attach(id, &self.storage)
+                .await
+        } else {
+            let connector = self
+                .connector_for_job(id)
+                .map_err(|_| crate::hosted::Error::Connect)?;
+            Channel::open(connector.as_ref(), id)
+                .await
+                .map_err(|_| crate::hosted::Error::Connect)
+        }
+    }
+    async fn finish_hosted(
+        &self,
+        id: Uuid,
+        unavailable: bool,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
+        if unavailable {
+            self.storage.hosted_update(id, |s| {
+                if s.billing != crate::BillingStatus::Available {
+                    s.billing = crate::BillingStatus::Unavailable;
+                }
+            })?;
+        }
+        let state = self
+            .hosted_state(id)
+            .ok_or_else(|| io::Error::other("missing hosted route"))?;
+        let terminal = state
+            .terminal
+            .unwrap_or_else(|| TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0));
+        self.storage
+            .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+        self.storage.terminal_observed(id)?;
+        emit(tx, StreamRecord::Terminal(terminal)).await
     }
     async fn follow(
         &self,
@@ -594,7 +745,13 @@ impl Motor {
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         mut wake: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        let connector = self.connector_for_job(id)?;
+        let hosted = self.hosted_state(id).is_some();
+        if self
+            .hosted_state(id)
+            .is_some_and(|s| s.billing != crate::BillingStatus::Pending && s.terminal.is_some())
+        {
+            return self.finish_hosted(id, false, tx).await;
+        }
         let wait = self
             .storage
             .job(id)
@@ -604,28 +761,63 @@ impl Motor {
         let mut withdraw_sent = false;
         let mut queue_deadline = None;
         let mut wake_open = true;
+        let mut reattaches = 0;
+        let mut hosted_terminal_deadline = None;
         loop {
             if tx.is_closed() {
                 return Err(io::Error::other("caller detached"));
             }
             if self.pending(id) {
-                let cancel = tokio::select! {
-                    result = self.send_cancel(id) => result,
-                    _ = tx.closed() => return Err(io::Error::other("caller detached")),
-                };
-                if cancel.is_err() {
-                    self.pause(backoff, &mut wake, &mut wake_open).await;
-                    backoff = (backoff * 2).min(30);
-                    continue;
+                if hosted && channel.is_some() {
+                    if channel
+                        .as_ref()
+                        .unwrap()
+                        .send(Frame::Cancel(CancelRequest::new(id)))
+                        .await
+                        .is_err()
+                    {
+                        channel = None;
+                    }
+                } else {
+                    let cancel = tokio::select! {
+                        result = self.send_cancel(id) => result,
+                        _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                    };
+                    if cancel.is_err() {
+                        if hosted {
+                            channel = None;
+                        } else {
+                            self.pause(backoff, &mut wake, &mut wake_open).await;
+                            backoff = (backoff * 2).min(30);
+                            continue;
+                        }
+                    }
+                    drop(channel.take());
                 }
-                drop(channel.take());
             }
             if channel.is_none() {
                 queue_deadline = None;
+                if hosted && reattaches == 3 {
+                    return self.finish_hosted(id, false, tx).await;
+                }
+                if hosted {
+                    if reattaches > 0 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    reattaches += 1;
+                }
                 let opened = tokio::select! {
-                    result = Channel::open(connector.as_ref(), id) => result,
+                    result = self.open_job_channel(id) => result,
                     _ = tx.closed() => return Err(io::Error::other("caller detached")),
                 };
+                if hosted
+                    && matches!(
+                        opened,
+                        Err(crate::hosted::Error::Finished | crate::hosted::Error::Released)
+                    )
+                {
+                    return self.finish_hosted(id, true, tx).await;
+                }
                 if let Ok(c) = opened {
                     // A persisted cancellation may arrive while the connection opens.
                     if self.pending(id) {
@@ -640,9 +832,16 @@ impl Motor {
                         .is_ok()
                     {
                         channel = Some(c);
+                        if hosted && self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
+                            hosted_terminal_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        }
                     }
                 }
                 if channel.is_none() {
+                    if hosted {
+                        continue;
+                    }
                     self.pause(backoff, &mut wake, &mut wake_open).await;
                     backoff = (backoff * 2).min(30);
                     continue;
@@ -652,6 +851,9 @@ impl Motor {
             let incoming = tokio::select! {
                 biased;
                 frame = c.next_job() => Some(frame),
+                _ = async { if let Some(deadline) = hosted_terminal_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                    channel = None; hosted_terminal_deadline = None; None
+                },
                 changed = wake.changed(), if wake_open => { if changed.is_err() { wake_open = false; } None },
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
                     withdraw_sent = true;
@@ -718,11 +920,59 @@ impl Motor {
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     self.storage.terminal_observed(id)?;
+                    if hosted {
+                        self.storage.cancel(id, false)?;
+                        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+                            terminal.refusal_detail = Some(format!(
+                                "lease_mismatch: {}",
+                                terminal.refusal_detail.take().unwrap_or_default()
+                            ));
+                            self.storage.hosted_update(id, |state| {
+                                state.hosted_no_fallback = true;
+                                state.hosted_code = Some("lease_mismatch".into());
+                            })?;
+                        }
+                        self.storage.hosted_update(id, |state| {
+                            if state
+                                .terminal
+                                .as_ref()
+                                .is_none_or(|t| matches!(t.outcome, Outcome::OutcomeUnknown))
+                            {
+                                state.terminal = Some(terminal.clone());
+                            }
+                        })?;
+                        hosted_terminal_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        continue;
+                    }
                     return emit(tx, StreamRecord::Terminal(terminal)).await;
                 }
+                Ok(Incoming::Frame(Frame::HostedTerminal(terminal)))
+                    if hosted && terminal.job_id == id =>
+                {
+                    let state = self.hosted_state(id).unwrap();
+                    if state.terminal.is_none()
+                        || state
+                            .placement
+                            .as_ref()
+                            .is_none_or(|p| terminal.placement != format!("first_party/{}", p.host))
+                        || state.max_runtime_s != Some(terminal.max_runtime_s)
+                    {
+                        return Err(io::Error::other(
+                            "hosted terminal does not match stored route",
+                        ));
+                    }
+                    self.storage
+                        .hosted_update(id, |state| state.settled(terminal))?;
+                    return self.finish_hosted(id, false, tx).await;
+                }
                 Ok(Incoming::Frame(Frame::WithdrawReply { .. })) => {}
+                Ok(Incoming::Frame(Frame::CancelReply(reply))) if hosted && reply.job_id == id => {
+                    self.storage.cancel(id, false)?;
+                }
                 _ => {
                     channel = None;
+                    hosted_terminal_deadline = None;
                     // EOF and write failure wake immediately; only failed
                     // reconnects back off, not the first status query.
                 }
@@ -736,8 +986,19 @@ impl Motor {
     /// a retry task sends it without depending on an attach caller staying alive.
     pub async fn cancel(&self, request: CancelRequest) -> io::Result<CancelReply> {
         let id = request.job_id;
-        self.connector_for_job(id)?;
+        if self.hosted_state(id).is_none() {
+            self.connector_for_job(id)?;
+        }
+        if self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
+            return Ok(CancelReply::new(id));
+        }
         self.storage.cancel(id, true)?;
+        // The task streaming a hosted job already owns its only allowed attach
+        // connection. It checks pending cancellation on each heartbeat and sends
+        // it there, rather than opening a conflicting second connection.
+        if self.hosted_state(id).is_some() && self.storage.has_live_stream(id) {
+            return Ok(CancelReply::new(id));
+        }
         if self.send_cancel(id).await.is_err() {
             let motor = self.clone();
             tokio::spawn(async move {
@@ -772,6 +1033,13 @@ impl Motor {
         &self,
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
+        if self.config.hosted_runners && platform != Some(&Platform::Windows) {
+            return Ok(RunnerStatusReply {
+                status: StatusReply::new(0, Vec::new(), false, Vec::new(), "hosted"),
+                disk: None,
+                health: None,
+            });
+        }
         let connector = self.connector_for_target(self.config.target(platform)?);
         let mut channel = Channel::open_with_cause(connector.as_ref(), Uuid::now_v7())
             .await
@@ -805,19 +1073,78 @@ impl Motor {
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
-        let connector = self.connector_for_job(id)?;
-        let mut channel = Channel::open(connector.as_ref(), id)
-            .await
-            .map_err(|reason| io::Error::other(format!("job_id={id}: {reason:?}")))?;
+        if let Some(state) = self.hosted_state(id).filter(|s| s.terminal.is_some()) {
+            if state.billing == crate::BillingStatus::Pending {
+                let (tx, mut rx) = mpsc::channel(32);
+                let (_, wake) = watch::channel(false);
+                self.follow(id, u64::MAX, None, &tx, wake).await?;
+                let _ = rx.try_recv();
+            }
+            return Ok(JobStatusReply {
+                job_id: id,
+                state: "terminal".into(),
+                waiting_on: None,
+                terminal: self.hosted_state(id).and_then(|s| s.terminal),
+                unit: None,
+                unit_alive: None,
+                queue_wait_ms: None,
+            });
+        }
+        let mut channel = match self.open_job_channel(id).await {
+            Ok(channel) => channel,
+            Err(crate::hosted::Error::Finished | crate::hosted::Error::Released)
+                if self.hosted_state(id).is_some() =>
+            {
+                let (tx, _rx) = mpsc::channel(1);
+                self.finish_hosted(id, true, &tx).await?;
+                return Ok(JobStatusReply {
+                    job_id: id,
+                    state: "terminal".into(),
+                    waiting_on: None,
+                    terminal: self.hosted_state(id).and_then(|s| s.terminal),
+                    unit: None,
+                    unit_alive: None,
+                    queue_wait_ms: None,
+                });
+            }
+            Err(error) => return Err(io::Error::other(format!("job_id={id}: {error:?}"))),
+        };
         channel.send(Frame::JobStatus { job_id: id }).await?;
         match channel.next().await? {
-            Incoming::Frame(Frame::JobStatusReply(reply)) if reply.job_id == id => Ok(reply),
+            Incoming::Frame(Frame::JobStatusReply(mut reply)) if reply.job_id == id => {
+                if let Some(terminal) = reply
+                    .terminal
+                    .as_ref()
+                    .filter(|_| self.hosted_state(id).is_some())
+                {
+                    self.storage
+                        .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+                    drop(channel);
+                    let (tx, _rx) = mpsc::channel(1);
+                    let (_, wake) = watch::channel(false);
+                    self.follow(id, u64::MAX, None, &tx, wake).await?;
+                    reply.terminal = self.hosted_state(id).and_then(|s| s.terminal);
+                }
+                Ok(reply)
+            }
             _ => Err(io::Error::other(format!(
                 "job_id={id}: expected job_status_reply"
             ))),
         }
     }
     pub async fn drop_workspace(&self, request: DropRequest) -> io::Result<DropReply> {
+        if self.config.hosted_runners {
+            let id = Uuid::now_v7();
+            self.storage
+                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+            self.storage.hosted_update(id, |s| {
+                s.hosted_no_fallback = true;
+                s.hosted_code = Some("hosted_prepare_unsupported".into());
+            })?;
+            return Err(io::Error::other(
+                "hosted_prepare_unsupported: hosted_no_fallback",
+            ));
+        }
         let mut channel = Channel::open(self.connector.as_ref(), Uuid::now_v7())
             .await
             .map_err(|r| io::Error::other(format!("{r:?}")))?;
@@ -829,6 +1156,16 @@ impl Motor {
     }
     pub async fn prepare(&self, request: PrepareRequest) -> io::Result<PrepareReply> {
         let id = Uuid::now_v7();
+        if self.config.hosted_runners {
+            self.storage
+                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+            self.storage.hosted_update(id, |s| {
+                s.hosted_no_fallback = true;
+                s.hosted_code = Some("hosted_prepare_unsupported".into());
+            })?;
+            return Ok(prepare_refused(id, RefusalReason::RequestRejected)
+                .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"));
+        }
         let config = self.config.clone();
         let r = request.clone();
         if let Err(error) = tokio::task::spawn_blocking(move || {

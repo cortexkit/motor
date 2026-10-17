@@ -19,9 +19,11 @@ pub struct FakeConfig {
 
 #[derive(Clone, Default)]
 pub struct Knobs {
+    pub allowance_vcpu_ms: Option<u64>,
+    pub lease_id: Option<String>,
     /// Refuse lease requests before creating or changing a reservation.
     pub refusal: Option<(u16, String)>,
-    /// Shorten the granted runtime without changing the requested reservation.
+    /// Shorten the granted runtime; the reservation follows the granted cap.
     pub max_s: Option<u64>,
 }
 
@@ -43,6 +45,7 @@ impl BrokerReply {
 }
 
 pub struct BrokerRequest<'a> {
+    pub content_type: Option<&'a str>,
     pub method: &'a str,
     pub path: &'a str,
     pub bearer: Option<&'a str>,
@@ -55,8 +58,8 @@ struct Reservation {
     lease_id: String,
     max_s: u64,
     reserved: u64,
-    last_token_iat: u64,
     run_iat: u64,
+    original_iat: u64,
     state: JobState,
     elapsed_ms: u64,
     release: Option<ReleaseReply>,
@@ -105,21 +108,35 @@ impl FakeBroker {
 
     /// `now_ms` is supplied by the transport or a deterministic test clock.
     pub fn handle(&mut self, request: BrokerRequest<'_>, now_ms: u64) -> BrokerReply {
-        self.settle_due(now_ms);
+        if request.path.split_once('?').is_some_and(|(path, _)| {
+            path.strip_prefix("/v1/hosts/")
+                .and_then(|p| p.split_once('/'))
+                .is_some_and(|(_, route)| matches!(route, "heartbeat" | "usage"))
+        }) {
+            return BrokerReply::error(400, "bad_request");
+        }
         if request.method == "GET" && request.path == "/.well-known/jwks.json" {
             return BrokerReply::json(200, self.jwks());
         }
         if request.method != "POST" {
             return BrokerReply::error(404, "not_found");
         }
-        if request.path == "/v1/leases" || request.path.starts_with("/v1/leases/") {
+        let client_job = request.path.strip_prefix("/v1/leases/").and_then(|path| {
+            path.strip_suffix("/release")
+                .or_else(|| path.strip_suffix("/reattach"))
+        });
+        if request.path == "/v1/leases" || client_job.is_some() {
             if request.bearer != Some(self.config.worker_bearer.as_str()) {
-                return BrokerReply::error(401, "auth");
+                return BrokerReply::error(401, "unauthorized");
             }
+            if !json_request(&request) || client_job.is_some_and(|id| !valid_job_id(id)) {
+                return BrokerReply::error(400, "bad_request");
+            }
+            self.settle_due(now_ms);
             if request.path == "/v1/leases" {
                 return match serde_json::from_slice(request.body) {
                     Ok(body) => self.lease(body, now_ms / 1000),
-                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                    Err(_) => BrokerReply::error(400, "bad_request"),
                 };
             }
             if let Some(job_id) = request
@@ -129,7 +146,7 @@ impl FakeBroker {
             {
                 return match serde_json::from_slice::<ReleaseRequest>(request.body) {
                     Ok(_) => self.release(job_id),
-                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                    Err(_) => BrokerReply::error(400, "bad_request"),
                 };
             }
             if let Some(job_id) = request
@@ -139,7 +156,7 @@ impl FakeBroker {
             {
                 return match serde_json::from_slice::<ReattachRequest>(request.body) {
                     Ok(body) => self.reattach(job_id, body, now_ms / 1000),
-                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                    Err(_) => BrokerReply::error(400, "bad_request"),
                 };
             }
             return BrokerReply::error(404, "not_found");
@@ -149,6 +166,12 @@ impl FakeBroker {
             .strip_prefix("/v1/hosts/")
             .and_then(|p| p.split_once('/'))
         {
+            if !matches!(route, "heartbeat" | "usage") {
+                return BrokerReply::error(404, "not_found");
+            }
+            if !valid_name(host_id) || !json_request(&request) {
+                return BrokerReply::error(400, "bad_request");
+            }
             let Some(headers) = request.host_headers else {
                 return BrokerReply::error(401, "host_auth_failed");
             };
@@ -160,14 +183,15 @@ impl FakeBroker {
             {
                 return BrokerReply::error(401, "host_auth_failed");
             }
+            self.settle_due(now_ms);
             return match route {
                 "heartbeat" => match serde_json::from_slice(request.body) {
                     Ok(body) => self.heartbeat(host_id, body),
-                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                    Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 "usage" => match serde_json::from_slice(request.body) {
                     Ok(body) => self.usage(host_id, body, request.body),
-                    Err(_) => BrokerReply::error(400, "invalid_request"),
+                    Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 _ => BrokerReply::error(404, "not_found"),
             };
@@ -176,19 +200,21 @@ impl FakeBroker {
     }
 
     fn lease(&mut self, request: LeaseRequest, now_s: u64) -> BrokerReply {
-        if let Some((status, code)) = &self.knobs.refusal {
-            return BrokerReply::error(*status, code);
-        }
         if request.requester_jwk.verifying_key().is_err()
-            || request.job_id.is_empty()
-            || request.job_id.contains('/')
+            || !valid_job_id(&request.job_id)
+            || !(1..=64).contains(&request.vcpus)
+            || !(10..=7200).contains(&request.timeout_s)
+            || !valid_name(&request.platform)
+            || request.placement_hint.as_ref().is_some_and(|p| {
+                !valid_name(&p.host) || p.vm.as_deref().is_none_or(|vm| !valid_name(vm))
+            })
             || !valid_keyed_hash(&request.workspace_key_hash)
             || !valid_keyed_hash(&request.repo_hash)
         {
-            return BrokerReply::error(400, "invalid_request");
+            return BrokerReply::error(400, "bad_request");
         }
         if let Some(job) = self.jobs.get(&request.job_id) {
-            if matches!(job.settlement, Some(Settlement::Released(_))) {
+            if job.release.is_some() {
                 return BrokerReply::error(409, "job_released");
             }
             if job.settlement.is_some() {
@@ -206,32 +232,52 @@ impl FakeBroker {
                 return BrokerReply::error(409, "job_conflict");
             }
         } else {
-            if request.vcpus == 0
-                || request.mem_mib != memory_max_mib(request.vcpus)
-                || request.timeout_s == 0
-                || request.platform.is_empty()
-            {
-                return BrokerReply::error(400, "invalid_request");
+            if let Some((status, code)) = &self.knobs.refusal {
+                return BrokerReply::error(*status, code);
+            }
+            let used: u64 = self
+                .jobs
+                .values()
+                .map(|job| match &job.settlement {
+                    None => job.reserved,
+                    Some(
+                        Settlement::Usage { reply, .. }
+                        | Settlement::HostLost(reply)
+                        | Settlement::Released(reply),
+                    ) => reply.settled_vcpu_ms,
+                })
+                .sum();
+            let mut max_s = self
+                .knobs
+                .max_s
+                .unwrap_or(request.timeout_s)
+                .min(request.timeout_s);
+            if let Some(allowance) = self.knobs.allowance_vcpu_ms {
+                max_s =
+                    max_s.min(allowance.saturating_sub(used) / (u64::from(request.vcpus) * 1000));
+                if max_s < 10 {
+                    return BrokerReply::error(402, "budget_exhausted");
+                }
             }
             let Some(reserved) = u64::from(request.vcpus)
-                .checked_mul(request.timeout_s.max(10))
+                .checked_mul(max_s)
                 .and_then(|n| n.checked_mul(1000))
             else {
-                return BrokerReply::error(400, "invalid_request");
+                return BrokerReply::error(400, "bad_request");
             };
             self.jobs.insert(
                 request.job_id.clone(),
                 Reservation {
                     request: request.clone(),
-                    lease_id: format!("fake-{}", request.job_id),
-                    max_s: self
+                    lease_id: self
                         .knobs
-                        .max_s
-                        .unwrap_or(request.timeout_s)
-                        .min(request.timeout_s),
+                        .lease_id
+                        .clone()
+                        .unwrap_or_else(|| request.job_id.clone()),
+                    max_s,
                     reserved,
-                    last_token_iat: now_s.saturating_sub(1),
                     run_iat: now_s,
+                    original_iat: now_s,
                     state: JobState::Reserved,
                     elapsed_ms: 0,
                     release: None,
@@ -249,17 +295,17 @@ impl FakeBroker {
     }
 
     fn reattach(&mut self, job_id: &str, request: ReattachRequest, now_s: u64) -> BrokerReply {
+        if request.requester_jwk.verifying_key().is_err() {
+            return BrokerReply::error(400, "bad_request");
+        }
         let Some(job) = self.jobs.get(job_id) else {
             return BrokerReply::error(404, "job_unknown");
         };
-        if job.settlement.is_some() {
-            return BrokerReply::error(409, "job_finished");
-        }
         if job.release.is_some() {
             return BrokerReply::error(409, "job_released");
         }
-        if request.requester_jwk.verifying_key().is_err() {
-            return BrokerReply::error(400, "invalid_request");
+        if job.settlement.is_some() {
+            return BrokerReply::error(409, "job_finished");
         }
         self.issue(job_id, &request.requester_jwk, Purpose::Attach, now_s, 200)
     }
@@ -268,14 +314,6 @@ impl FakeBroker {
         let Some(job) = self.jobs.get_mut(job_id) else {
             return BrokerReply::error(404, "job_unknown");
         };
-        if matches!(job.settlement, Some(Settlement::Released(_))) {
-            return BrokerReply::json(
-                202,
-                job.release
-                    .as_ref()
-                    .expect("released job retains release reply"),
-            );
-        }
         if job.settlement.is_some() {
             return BrokerReply::error(409, "job_finished");
         }
@@ -303,12 +341,12 @@ impl FakeBroker {
         status: u16,
     ) -> BrokerReply {
         let job = self.jobs.get_mut(job_id).expect("reservation exists");
-        let iat = now_s.max(job.last_token_iat.saturating_add(1));
+        let iat = now_s;
         let Some(exp) = iat
             .checked_add(MAX_TOKEN_LIFETIME_S)
             .filter(|exp| exp.checked_mul(1000).is_some())
         else {
-            return BrokerReply::error(400, "invalid_request");
+            return BrokerReply::error(400, "bad_request");
         };
         let claims = Claims {
             iss: ISSUER.into(),
@@ -319,7 +357,7 @@ impl FakeBroker {
             iat,
             exp,
             vcpus: job.request.vcpus,
-            mem_mib: job.request.mem_mib,
+            mem_mib: memory_max_mib(job.request.vcpus),
             platform: job.request.platform.clone(),
             net: job.request.net,
             placement: self.config.placement.clone(),
@@ -329,9 +367,8 @@ impl FakeBroker {
             },
         };
         let Ok(job_token) = sign_token(&claims, &self.config.kid, &self.config.signing_key) else {
-            return BrokerReply::error(500, "signing_failed");
+            return BrokerReply::error(500, "internal");
         };
-        job.last_token_iat = iat;
         if purpose == Purpose::Run {
             job.run_iat = iat;
         }
@@ -352,6 +389,23 @@ impl FakeBroker {
     }
 
     fn heartbeat(&mut self, host: &str, heartbeat: Heartbeat) -> BrokerReply {
+        if heartbeat.free_vcpus > MAX_SAFE_INTEGER
+            || heartbeat.free_mem_mib > MAX_SAFE_INTEGER
+            || heartbeat.queued > MAX_SAFE_INTEGER
+            || heartbeat.warm.len() > 64
+            || heartbeat.running.len() > 64
+            || heartbeat
+                .running
+                .iter()
+                .any(|job| !valid_job_id(&job.job_id) || job.elapsed_ms > MAX_SAFE_INTEGER)
+            || heartbeat.warm.iter().any(|vm| {
+                !valid_name(&vm.vm)
+                    || !valid_keyed_hash(&vm.workspace_key_hash)
+                    || !crate::auth::valid_subject(&vm.tenant)
+            })
+        {
+            return BrokerReply::error(400, "bad_request");
+        }
         let mut ignored = Vec::new();
         for running in heartbeat.running {
             if host != self.config.placement.host {
@@ -368,15 +422,27 @@ impl FakeBroker {
                     if running.state != JobState::Reserved {
                         job.release = None;
                     }
-                    job.elapsed_ms = running.elapsed_ms;
+                    job.elapsed_ms = job.elapsed_ms.max(running.elapsed_ms.min(job.max_s * 1000));
                 }
-                _ => ignored.push(running.job_id),
+                Some(_) => {}
+                None => ignored.push(running.job_id),
             }
         }
         BrokerReply::json(200, json!({"ignored": ignored}))
     }
 
-    fn usage(&mut self, host: &str, usage: Usage, body: &[u8]) -> BrokerReply {
+    fn usage(&mut self, host: &str, usage: Usage, _body: &[u8]) -> BrokerReply {
+        if !valid_job_id(&usage.job_id)
+            || !(1..=64).contains(&usage.vcpus)
+            || usage.started_at_ms > MAX_SAFE_INTEGER
+            || usage.ended_at_ms > MAX_SAFE_INTEGER
+            || usage.ended_at_ms < usage.started_at_ms
+            || usage.mem_peak_mib.is_some_and(|v| v > MAX_SAFE_INTEGER)
+            || usage.egress_bytes.is_some_and(|v| v > MAX_SAFE_INTEGER)
+        {
+            return BrokerReply::error(400, "bad_request");
+        }
+        let body = serde_json::to_vec(&usage).expect("usage is serializable");
         let Some(job) = self
             .jobs
             .get_mut(&usage.job_id)
@@ -392,7 +458,7 @@ impl FakeBroker {
                 body: original,
                 reply,
             }) => {
-                return if original == body {
+                return if original == &body {
                     BrokerReply::json(200, reply)
                 } else {
                     BrokerReply::error(409, "usage_conflict")
@@ -401,7 +467,7 @@ impl FakeBroker {
             None => {}
         }
         if usage.vcpus != job.request.vcpus || usage.ended_at_ms < usage.started_at_ms {
-            return BrokerReply::error(400, "invalid_request");
+            return BrokerReply::error(400, "bad_request");
         }
         let settled = u64::from(usage.vcpus)
             .saturating_mul(usage.ended_at_ms - usage.started_at_ms)
@@ -412,7 +478,7 @@ impl FakeBroker {
             released_vcpu_ms: job.reserved - settled,
         };
         job.settlement = Some(Settlement::Usage {
-            body: body.to_vec(),
+            body,
             reply: reply.clone(),
         });
         BrokerReply::json(200, reply)
@@ -436,7 +502,7 @@ impl FakeBroker {
                 continue;
             }
             let deadline_ms = job
-                .run_iat
+                .original_iat
                 .saturating_add(job.max_s)
                 .saturating_add(600)
                 .saturating_mul(1000);
@@ -461,6 +527,16 @@ impl FakeBroker {
             Settlement::Released(reply) => Some((reply, "released")),
         }
     }
+}
+
+fn json_request(request: &BrokerRequest<'_>) -> bool {
+    request.body.len() <= 65536
+        && request.content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+        })
 }
 
 fn valid_keyed_hash(value: &str) -> bool {

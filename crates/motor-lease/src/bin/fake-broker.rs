@@ -133,7 +133,7 @@ fn serve_connection(mut stream: TcpStream, broker: &mut FakeBroker) -> io::Resul
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let reply = read_request(&mut stream, broker)
-        .unwrap_or_else(|_| BrokerReply::error(400, "invalid_request"));
+        .unwrap_or_else(|_| BrokerReply::error(400, "bad_request"));
     send_reply(&mut stream, reply)
 }
 
@@ -185,21 +185,19 @@ fn read_request(stream: &mut TcpStream, broker: &mut FakeBroker) -> io::Result<B
         .transpose()
         .map_err(|_| invalid_request())?
         .unwrap_or(0);
-    if len > 1_048_576 {
-        return Err(invalid_request());
-    }
-    let mut body = vec![0; len];
+    let mut body = vec![0; len.min(65537)];
     reader.read_exact(&mut body)?;
     let host_headers = (|| {
         Some(HostHeaders {
             host: headers.get("ck-host")?.clone(),
-            timestamp: headers.get("ck-timestamp")?.parse().ok()?,
-            counter: headers.get("ck-counter")?.parse().ok()?,
+            timestamp: positive_header(headers.get("ck-timestamp")?)?,
+            counter: positive_header(headers.get("ck-counter")?)?,
             signature: headers.get("ck-signature")?.clone(),
         })
     })();
     Ok(broker.handle(
         BrokerRequest {
+            content_type: headers.get("content-type").map(String::as_str),
             method: &method,
             path: &path,
             bearer: headers
@@ -212,9 +210,25 @@ fn read_request(stream: &mut TcpStream, broker: &mut FakeBroker) -> io::Result<B
     ))
 }
 
+fn positive_header(text: &str) -> Option<u64> {
+    if text.starts_with('0') || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u64>()
+        .ok()
+        .filter(|n| *n <= motor_lease::MAX_SAFE_INTEGER)
+}
+
 fn send_reply(stream: &mut TcpStream, reply: BrokerReply) -> io::Result<()> {
     let body = serde_json::to_vec(&reply.body)?;
-    write!(stream, "HTTP/1.1 {} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.status, body.len())?;
+    let extra = if reply.status == 503 {
+        "Retry-After: 5\r\n"
+    } else if reply.body.get("keys").is_some() {
+        "Cache-Control: public, max-age=300\r\n"
+    } else {
+        ""
+    };
+    write!(stream, "HTTP/1.1 {} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n", reply.status, body.len())?;
     stream.write_all(&body)
 }
 

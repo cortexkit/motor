@@ -23,6 +23,13 @@ sha2 = "0.10"
 
 [dependencies]
 motor-protocol = { path = "../motor-protocol" }
+motor-lease = { path = "../motor-lease" }
+ed25519-dalek = { workspace = true }
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+x509-cert = "0.2"
 cortexkit-claustrum-client = "=0.1.0"
 cortexkit-store-types = { workspace = true }
 subc-protocol = { workspace = true }
@@ -43,10 +50,10 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 subc-transport = { workspace = true }
 motor-runner = { path = "../motor-runner" }
 cortexkit-test-support = "=0.1.7"
 rand = "0.8"
-ed25519-dalek = { workspace = true }
 ssh-key = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

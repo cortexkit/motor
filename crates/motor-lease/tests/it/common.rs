@@ -14,7 +14,7 @@ pub fn config() -> FakeConfig {
         subject: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
         placement: Placement {
             host: HOST.into(),
-            vm: "test-vm".into(),
+            vm: Some("test-vm".into()),
         },
         endpoint: "127.0.0.1:4443".into(),
         endpoint_spki_sha256: base64url(&[8; 32]),
@@ -36,15 +36,14 @@ pub fn broker() -> FakeBroker {
 }
 pub fn lease_request() -> LeaseRequest {
     LeaseRequest {
-        job_id: "test-job".into(),
+        job_id: "019e4567-89ab-7cde-8012-3456789abcde".into(),
         vcpus: 2,
-        mem_mib: 16384,
-        platform: "linux".into(),
+        platform: "linux-x64".into(),
         net: false,
         workspace_key_hash: base64url(&[5; 32]),
         repo_hash: base64url(&[6; 32]),
         placement_hint: None,
-        timeout_s: 3,
+        timeout_s: 10,
         requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
     }
 }
@@ -52,6 +51,7 @@ pub fn post(b: &mut FakeBroker, path: &str, body: &impl Serialize, now: u64) -> 
     let body = serde_json::to_vec(body).unwrap();
     b.handle(
         BrokerRequest {
+            content_type: Some("application/json"),
             method: "POST",
             path,
             bearer: Some(BEARER),
@@ -82,6 +82,7 @@ pub fn host_post(
     .unwrap();
     b.handle(
         BrokerRequest {
+            content_type: Some("application/json"),
             method: "POST",
             path: &path,
             bearer: None,
@@ -99,7 +100,7 @@ pub fn heartbeat(state: JobState, elapsed_ms: u64) -> Heartbeat {
         warm: vec![],
         healthy: true,
         running: vec![RunningJob {
-            job_id: "test-job".into(),
+            job_id: "019e4567-89ab-7cde-8012-3456789abcde".into(),
             state,
             elapsed_ms,
         }],
@@ -107,7 +108,7 @@ pub fn heartbeat(state: JobState, elapsed_ms: u64) -> Heartbeat {
 }
 pub fn usage() -> Usage {
     Usage {
-        job_id: "test-job".into(),
+        job_id: "019e4567-89ab-7cde-8012-3456789abcde".into(),
         vcpus: 2,
         started_at_ms: NOW,
         ended_at_ms: NOW + 3000,
