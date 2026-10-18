@@ -321,6 +321,148 @@ exit 0
 "#.into()
 }
 
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_symlinks_do_not_escape_collection_or_cache() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    fs::write(
+        f.main.join("symlink-fixture.ps1"),
+        symlink_qualification_script(),
+    )
+    .unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "symlink qualification fixture"]);
+    let command = "powershell.exe -NoProfile -NonInteractive -File ./symlink-fixture.ps1";
+    let (setup, job) = launch(&runner, &f, command);
+    assert!(finish(job).contains("symlink creation passed"));
+    let job_dir = runner
+        .config()
+        .state_dir()
+        .join("jobs")
+        .join(setup.id.to_string());
+    let bytes = fs::read(job_dir.join("windows-changes.tar")).unwrap();
+    let prefix = format!("m{}/", setup.request.workspace_key);
+    let targets = [
+        ("link-file-system", r"C:\Windows\System32\kernel32.dll"),
+        ("link-dir-system", r"C:\Windows\System32"),
+        ("link-file-agent", r"C:\ProgramData\Motor\job-password.txt"),
+        ("link-dir-agent", r"C:\ProgramData\Motor"),
+        ("link-unc", r"\\motor-symlink.invalid\share\absent"),
+    ];
+    let mut found = BTreeMap::new();
+    let mut canary_collected = false;
+    for entry in tar::Archive::new(&bytes[..]).entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_str().unwrap().to_owned();
+        assert!(
+            name.starts_with(&prefix),
+            "outside workspace member: {name}"
+        );
+        let name = name.strip_prefix(&prefix).unwrap().to_owned();
+        let mut payload = Vec::new();
+        entry.read_to_end(&mut payload).unwrap();
+        if name == "symlink-collected.txt" {
+            canary_collected = true;
+            assert!(entry.header().entry_type().is_file());
+            assert_eq!(payload, b"ordinary collection canary");
+        } else {
+            assert!(entry.header().entry_type().is_symlink(), "followed {name}");
+            assert!(payload.is_empty(), "target contents returned for {name}");
+            let target = String::from_utf8(entry.link_name_bytes().unwrap().into_owned()).unwrap();
+            found.insert(name, target);
+        }
+    }
+    assert!(
+        canary_collected,
+        "ordinary collection canary was not returned"
+    );
+    assert_eq!(
+        found,
+        targets
+            .into_iter()
+            .map(|(name, target)| (name.to_owned(), target.to_owned()))
+            .collect()
+    );
+    assert!(
+        !job_dir.join("m").exists(),
+        "collection created a Linux source tree"
+    );
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&setup.request.workspace_key);
+    assert!(disk.is_file(), "first job did not retain its clean cache");
+    let output = run(&runner, &f, &format!("{command} -Check"));
+    assert!(
+        output.contains("only explained cache links persisted"),
+        "{output}"
+    );
+    assert!(disk.is_file());
+    no_units(&runner);
+}
+
+fn symlink_qualification_script() -> String {
+    r#"
+param([switch]$Check)
+$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw 'unexpected job account'}
+if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job is an administrator'}
+$mode=Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue
+if($mode -eq 1){throw 'Developer Mode is enabled'}
+$links=@(
+ @('link-file-system','C:\Windows\System32\kernel32.dll',0),
+ @('link-dir-system','C:\Windows\System32',1),
+ @('link-file-agent','C:\ProgramData\Motor\job-password.txt',0),
+ @('link-dir-agent','C:\ProgramData\Motor',1),
+ @('link-unc','\\motor-symlink.invalid\share\absent',0)
+)
+$cache='C:\t\motor-symlink-cache'
+$outside=Join-Path $env:TEMP 'motor-symlink-outside'
+if($Check) {
+ if(Test-Path -LiteralPath $outside){throw 'outside overlay state survived'}
+ $workspaceNames=@(Get-ChildItem -LiteralPath (Get-Location) -Force | ForEach-Object {$_.Name})
+ foreach($link in $links){if($workspaceNames -contains $link[0]){throw 'workspace link survived'}}
+ if([IO.File]::ReadAllText((Join-Path $cache 'marker')) -cne 'expected cache contents'){throw 'cache was not reused'}
+ $expected=@('marker') + @($links | ForEach-Object {$_[0]})
+ $actual=@(Get-ChildItem -LiteralPath $cache -Force | ForEach-Object {$_.Name})
+ if(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)){throw 'unexplained cache contents'}
+ foreach($link in $links) {
+  $item=Get-Item -LiteralPath (Join-Path $cache $link[0]) -Force
+  if(-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'cache link became a file'}
+  if(@($item.Target)[0] -cne $link[1]){throw 'cache link target changed'}
+ }
+ $rootNames=@(Get-ChildItem -LiteralPath 'C:\t' -Force | ForEach-Object {$_.Name})
+ foreach($name in $rootNames){if($name -notin @('motor-symlink-cache','System Volume Information','$RECYCLE.BIN')){throw "unexplained cache root entry: $name"}}
+ Write-Output 'only explained cache links persisted'
+ exit 0
+}
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class MotorSymlink {
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+ [return: MarshalAs(UnmanagedType.U1)]
+ public static extern bool CreateSymbolicLink(string link, string target, uint flags);
+}
+'@
+New-Item -ItemType Directory -Path $cache,$outside | Out-Null
+foreach($root in @((Get-Location).Path,$outside,$cache)) {
+ foreach($link in $links) {
+  if(-not [MotorSymlink]::CreateSymbolicLink((Join-Path $root $link[0]),$link[1],[uint32]$link[2])){throw "CreateSymbolicLink failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"}
+ }
+}
+[IO.File]::WriteAllText((Join-Path $cache 'marker'),'expected cache contents')
+[IO.File]::WriteAllText((Join-Path (Get-Location) 'symlink-collected.txt'),'ordinary collection canary')
+Write-Output 'symlink creation passed'
+"#.into()
+}
+
 /// Break check: add a NIC to the job VM. Successful external DNS, TCP, UDP or
 /// IPv6 routing makes this check fail; guest loopback must remain usable.
 #[test]
@@ -1642,6 +1784,14 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
     let script = baseline_environment_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
     assert!(powershell(&script).len() < 8000);
+}
+
+#[test]
+fn symlink_qualification_generated_powershell_has_balanced_braces() {
+    let script = symlink_qualification_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
+    assert!(script.contains("[switch]$Check"));
+    assert!(script.contains("CreateSymbolicLink"));
 }
 
 #[test]

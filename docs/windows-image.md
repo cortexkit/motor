@@ -102,13 +102,28 @@ administrator, randomizes local passwords and runs, in order:
    SYSTEM/Administrators full control and Users read/execute and added to machine
    `PATH` so native tools rebuilding their environment also find it; the standard
    `motor-job` user and its batch-logon
-   right, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
+   right and `SeCreateSymbolicLinkPrivilege`, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
    `C:\rust` (read-only to the job user), the virtio-serial driver, and the
    guest agent built from the seed's source with
    `cargo build --release --locked --target x86_64-pc-windows-msvc` and
    installed as an automatic LocalSystem service at
    `C:\ProgramData\Motor\motor-winagent.exe`. The agent's SHA-256 is written to
    `C:\build\provision\winagent.sha256`.
+
+The local security policy is exported and configured with `secedit`. Only the
+`motor-job` SID is added to the existing account-right assignments; no Users or
+Authenticated Users grant is added, and the account stays non-administrative.
+Developer Mode is neither needed nor enabled. This change requires a full image
+rebuild, not an agent-only swap.
+
+The image's setup checklist re-exports effective policy after applying it and
+requires the job SID in both `SeBatchLogonRight` and
+`SeCreateSymbolicLinkPrivilege`. The transcript must contain `Verified` lines
+for both rights. Setup also refuses `AllowDevelopmentWithoutDevLicense=1` under
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock`.
+The real-image symlink qualification below verifies that the standard job token
+can create both file and directory links without Developer Mode; portable
+provisioning-input tests alone do not prove the effective Windows policy.
 
 Success writes `C:\build\provision\provisioned`; failure writes
 `C:\build\provision\FAILED.txt`. With no SSH, follow progress with
@@ -198,6 +213,7 @@ binary must come from the same commit. The lane runs, from
 | --- | --- |
 | `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | Standard-user PowerShell 7.6.7 execution and recursive write denial; a long-checkout MSVC build uses `C:\t` and is readable through checkout `target/`. |
 | `windows_qualification_standard_user_environment` | Windows' full machine `PATHEXT`, PowerShell on machine `PATH`, native command lookup from Git Bash and PowerShell, writable user application-data folders, and accepted request overrides. |
+| `windows_qualification_symlinks_do_not_escape_collection_or_cache` | Standard-user file/directory symlinks to absolute system/agent and UNC targets, inside and outside the workspace; link-only collection, no Linux link creation, and an explained cache inventory on the next job. |
 | `windows_qualification_no_network_but_loopback_works` | No network beyond loopback. |
 | `windows_qualification_qemu_and_preparation_accounts_are_confined` | `motor-qemu` and `motor-prep` confinement. |
 | `windows_qualification_one_vm_slot_lock_refuses_without_boot` | A held slot refuses without booting. |
