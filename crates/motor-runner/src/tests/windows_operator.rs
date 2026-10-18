@@ -470,11 +470,16 @@ if($Check) {
  $expected=@('marker') + @($links | ForEach-Object {$_[0]})
  $actual=@(Get-ChildItem -LiteralPath $cache -Force | ForEach-Object {$_.Name})
  if(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)){throw 'unexplained cache contents'}
+ $mismatches=@()
  foreach($link in $links) {
   $item=Get-Item -LiteralPath (Join-Path $cache $link[0]) -Force
-  if(-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'cache link became a file'}
-  if(@($item.Target)[0] -cne $link[1]){throw 'cache link target changed'}
+  $actual=@($item.Target)
+  if(-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $actual.Count -ne 1 -or -not (Test-MotorLinkTarget $actual[0] $link[1])) {
+   $mismatches += "cache link mismatch: name=<$($link[0])> expected=<$($link[1])> actual=<$($actual -join '|')> attributes=<$($item.Attributes)>"
+  }
  }
+ foreach($message in $mismatches){Write-Output $message}
+ if($mismatches.Count -ne 0){throw "cache link targets changed: $($mismatches.Count) mismatches"}
  $rootNames=@(Get-ChildItem -LiteralPath 'C:\t' -Force | ForEach-Object {$_.Name})
  foreach($name in $rootNames){if($name -notin @('motor-symlink-cache','System Volume Information','$RECYCLE.BIN')){throw "unexplained cache root entry: $name"}}
  Write-Output 'only explained cache links persisted'
@@ -498,7 +503,7 @@ foreach($root in @((Get-Location).Path,$outside,$cache)) {
 [IO.File]::WriteAllText((Join-Path $cache 'marker'),'expected cache contents')
 [IO.File]::WriteAllText((Join-Path (Get-Location) 'symlink-collected.txt'),'ordinary collection canary')
 Write-Output 'symlink creation passed'
-"#.into()
+"#.replacen("param([switch]$Check)", &format!("param([switch]$Check)\n{}", include_str!("windows_link_target.ps1")), 1)
 }
 
 /// Break check: add a NIC to the job VM. Successful external DNS, TCP, UDP or
