@@ -107,6 +107,9 @@ impl Runtime {
                 })
             })?;
         uuid::Uuid::parse_str(&claims.jti).map_err(|_| Error::Refused(Refusal::Auth))?;
+        if claims.platform != "linux-x64" {
+            return Err(Error::Refused(Refusal::Auth));
+        }
         bind_requester(&claims, jwk).map_err(|_| Error::Refused(Refusal::Auth))?;
         self.host.lock().expect("host lock").binding(&claims)?;
         Ok(claims)

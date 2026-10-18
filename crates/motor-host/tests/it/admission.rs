@@ -11,7 +11,7 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, reason: Refusal) {
 fn binding_refuses_unknown_vm_cross_tenant_and_changed_job_binding_without_mutation() {
     let mut h = host();
     let mut bad = claims(JOB);
-    bad.placement.vm = "unknown".into();
+    bad.placement.vm = Some("unknown".into());
     refused(h.claim(bad, NOW * 1000), Refusal::Auth);
     let mut bad = claims(JOB);
     bad.sub = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
@@ -19,7 +19,7 @@ fn binding_refuses_unknown_vm_cross_tenant_and_changed_job_binding_without_mutat
     assert!(h.snapshot.leases.is_empty());
     h.claim(claims(JOB), NOW * 1000).unwrap();
     let mut changed = claims(JOB);
-    changed.placement.vm = "other".into();
+    changed.placement.vm = Some("other".into());
     h.tenants.insert(
         "other".into(),
         Tenant {

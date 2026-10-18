@@ -206,10 +206,12 @@ impl Host {
         self.save(next)
     }
     pub fn binding(&self, claims: &Claims) -> Result<&Tenant, Error> {
-        let entry = self
-            .tenants
-            .get(&claims.placement.vm)
+        let vm = claims
+            .placement
+            .vm
+            .as_deref()
             .ok_or(Error::Refused(Refusal::Auth))?;
+        let entry = self.tenants.get(vm).ok_or(Error::Refused(Refusal::Auth))?;
         if entry.sub != claims.sub {
             return refuse(Refusal::Auth);
         }
@@ -708,6 +710,8 @@ fn end_zero(
 }
 
 fn finish_connection(connection: &Connection, next: ConnectionState) {
+    // Cleanup can close the sender before its receiver reads a refusal. Keep
+    // the terminal cause available even after the connection record is removed.
     connection.updates.send_if_modified(|state| {
         if matches!(
             *state,

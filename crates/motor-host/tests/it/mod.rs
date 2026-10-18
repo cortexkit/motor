@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 const NOW: u64 = 1_800_000_000;
-const JOB: &str = "00000000-0000-4000-8000-000000000001";
-const JOB2: &str = "00000000-0000-4000-8000-000000000002";
-const JOB3: &str = "00000000-0000-4000-8000-000000000003";
+const JOB: &str = "00000000-0000-7000-8000-000000000001";
+const JOB2: &str = "00000000-0000-7000-8000-000000000002";
+const JOB3: &str = "00000000-0000-7000-8000-000000000003";
 
 fn claims(job: &str) -> Claims {
     Claims {
@@ -25,11 +25,11 @@ fn claims(job: &str) -> Claims {
         exp: NOW + 300,
         vcpus: 1,
         mem_mib: 16_384,
-        platform: "linux".into(),
+        platform: "linux-x64".into(),
         net: false,
         placement: Placement {
             host: "host".into(),
-            vm: "vm".into(),
+            vm: Some("vm".into()),
         },
         max_s: 30,
         cnf: Confirmation {

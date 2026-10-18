@@ -124,16 +124,22 @@ async fn invalid_signature_never_wakes_or_attaches_and_refuses_before_lease_ok()
 }
 #[tokio::test]
 async fn unknown_vm_wrong_sub_and_wrong_requester_are_auth_before_challenge_with_no_usage() {
-    for case in 0..3 {
+    for case in 0..5 {
         let (runtime, fake, broker, requester, mut c) = fixture();
         if case == 0 {
-            c.placement.vm = "unknown".into();
+            c.placement.vm = Some("unknown".into());
         }
         if case == 1 {
             c.sub = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
         }
         if case == 2 {
             c.cnf.jkt = motor_lease::base64url(&[4; 32]);
+        }
+        if case == 3 {
+            c.placement.vm = None;
+        }
+        if case == 4 {
+            c.platform = "linux".into();
         }
         let (mut client, server) = tokio::io::duplex(8192);
         let task = tokio::spawn(serve(runtime.clone(), server));
@@ -200,6 +206,11 @@ async fn verified_lease_is_first_and_watermark_is_durable_before_output_is_visib
     let verified = read_frame(&mut guest).await.unwrap();
     assert_eq!(verified["type"], "verified_lease");
     assert_eq!(verified["jti"], JOB);
+    assert_eq!(verified["platform"], "linux-x64");
+    assert!(matches!(
+        serde_json::from_value::<motor_protocol::Frame>(verified).unwrap(),
+        motor_protocol::Frame::VerifiedLease(_)
+    ));
     assert_eq!(
         read_frame(&mut guest).await.unwrap(),
         json!({"type":"hello"})
@@ -417,7 +428,7 @@ async fn waiting_session(
     let task = tokio::spawn(serve(runtime.clone(), server));
     let challenge: Challenge =
         serde_json::from_value(hello(&mut client, &broker, &requester, &c).await).unwrap();
-    let sig = motor_lease::sign_challenge(&challenge, &c, &requester).unwrap();
+    let sig = motor_lease::sign_challenge(&challenge, &c, &requester, unix_ms() / 1000).unwrap();
     write_frame(
         &mut client,
         &json!({"type":"challenge_response", "sig":sig}),
@@ -565,4 +576,37 @@ async fn waiting_lease_uses_expiry_timer_without_host_tick() {
         json!({"type":"lease_refused", "reason":"expired"})
     );
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn live_relay_replacement_closes_without_advancing_clock() {
+    let (runtime, fake, broker, requester, mut c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "verified_lease"
+    );
+    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    c.iat += 1;
+    c.exp += 1;
+    let (replacement, _) = runtime.host.lock().unwrap().claim(c, unix_ms()).unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(tokio::time::Instant::now(), before);
+    assert!(read_frame(&mut client).await.is_err());
+    runtime.host.lock().unwrap().close(replacement).unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
 }

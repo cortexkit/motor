@@ -37,6 +37,11 @@ fetch preserves the last successfully fetched broker public-key set. No public
 keys means no admission. Tenant binding and requester-key binding precede
 the challenge; signature verification precedes every wake and disk operation.
 
+Job tokens follow the mirrored CLOUD contract and use the full `linux-x64`
+platform name, lowercase UUIDv7 job IDs and nullable placement VM field. A null
+or unknown VM has no provisioned tenant binding and is refused with `auth`;
+the host does not invent a placement for it.
+
 The journal is an atomically replaced, file-and-directory-fsynced snapshot. Its
 lease states, current token issue time, delivered flag, nonce replay set,
 acknowledged lifecycle event numbers and highest client-output sequence numbers
@@ -51,6 +56,13 @@ single share. An admission event received while replacement or expiry is pending
 keeps the original job admitted: the replacement is refused and no zero-expiry
 settlement is created.
 Disconnection alone never proves that a delivered lease did not start.
+
+Connections wait on retained watch notifications for admission, refusal,
+replacement and closure, not a periodic mutex poll. A separate expiry timer
+bounds pre-admission waiting and is disarmed after admission. Capacity, host-full
+and expiry refusals keep their actual wire reasons; a replacement whose original
+job was admitted gets `auth`. Missing lease records are checked without panicking
+under the shared host lock.
 
 No-start endings create idempotent `zero_usage` journal entries for the signed
 usage/outbox consumer. Admitted/started end timestamps and `stop_pending` are
