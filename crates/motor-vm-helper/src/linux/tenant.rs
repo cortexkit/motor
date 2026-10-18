@@ -86,7 +86,9 @@ impl LinuxTenants {
         }
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
-        for r in self.registries()? {
+        let registries = self.registries()?;
+        tenant_network::install(&registries)?;
+        for r in registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(&std::fs::symlink_metadata(ancestor)?)?;
             }

@@ -110,6 +110,9 @@ without resetting shared state, so memory is a sampled peak: spikes between the
 another Reserved, Admitted or Started lease; otherwise they are integer values.
 Missing initial samples are not fabricated as zero. All helper and broker I/O
 runs outside the host-state mutex.
+The helper preserves each registered tenant's named egress counter across other
+tenants' enable/disable transactions and across helper reconciliation, so a solo
+job's byte delta does not reset when another tenant starts.
 
 CPU quota remains one vCPU until guest initialization replies, then uses the
 current share (at least one). Started leases past their runtime cap leave the

@@ -60,3 +60,11 @@ private/reserved IPv4 destinations, all IPv6 and unsolicited inbound traffic.
 Each drop rule counts blocked packets and bytes. Public egress is masqueraded
 per tenant. `set_egress` installs this fixed policy; callers
 cannot pass firewall rules or paths. Per-job network policy stays in the guest.
+Each tenant has its own input, forward and NAT chains and a named
+`tenant_mtap<N>_egress` counter referenced only by its public forward rule.
+Reconciliation compares the registry with existing nftables objects, including
+at helper startup. One atomic transaction adds new tenant objects or removes
+only objects for tenants whose registries were removed. Existing live counters
+and other tenants' chains are never flushed or recreated. Incomplete live object
+sets are refused rather than reset; stopping or suspending a VM does not disable
+its registered tenant or delete its cumulative counter.
