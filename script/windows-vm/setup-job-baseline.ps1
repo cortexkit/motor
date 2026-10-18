@@ -52,29 +52,76 @@ if (Get-LocalGroupMember $admins | Where-Object { $_.SID.Value -eq $jobSid }) {
 if ($LASTEXITCODE -ne 0) { throw 'Job credential ACL setup failed' }
 $password = $null
 
-# Preserve existing batch-logon grants while adding the standard job account.
-$policy = Join-Path $env:TEMP 'motor-batch-right.inf'
-$policyDb = Join-Path $env:TEMP 'motor-batch-right.sdb'
+# Export all USER_RIGHTS and rewrite only the two job assignments, preserving
+# existing trustees. Add only the job SID, never a broad user group.
+# SeCreateSymbolicLinkPrivilege replaces the need for machine-wide Developer Mode.
+function Resolve-MotorTrusteeSid {
+    param([string]$Trustee, [scriptblock]$ResolveName = {
+        param($name)
+        ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
+    })
+    $Trustee = $Trustee.Trim()
+    if ($Trustee -match '^\*?(S-\d+(?:-\d+)+)$') { return $Matches[1] }
+    try {
+        $sid = & $ResolveName $Trustee
+        if ($sid -notmatch '^S-\d+(?:-\d+)+$') { throw 'Invalid resolved SID' }
+        return $sid
+    } catch {
+        throw "Cannot resolve policy trustee '$Trustee': $_"
+    }
+}
+
+function Assert-MotorDeveloperModeDisabled {
+    param([scriptblock]$ReadKey = {
+        Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue
+    })
+    # Fresh Server images may have neither the key nor the value. Only an
+    # explicitly enabled value is Developer Mode, not an absent setting.
+    $developerMode = (& $ReadKey).AllowDevelopmentWithoutDevLicense
+    if ($developerMode -eq 1) { throw 'Job baseline must not enable Developer Mode' }
+}
+
+$policy = Join-Path $env:TEMP 'motor-job-rights.inf'
+$policyDb = Join-Path $env:TEMP 'motor-job-rights.sdb'
 try {
     & secedit /export /cfg $policy /areas USER_RIGHTS /quiet
     if ($LASTEXITCODE -ne 0) { throw 'Exporting local logon rights failed' }
     $lines = @(Get-Content $policy)
-    $entry = $lines | Where-Object { $_ -match '^SeBatchLogonRight\s*=' }
-    if ($entry) {
-        $grants = @((($entry -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($grants -notcontains "*$jobSid") { $grants += "*$jobSid" }
-        $lines = $lines | ForEach-Object {
-            if ($_ -match '^SeBatchLogonRight\s*=') { 'SeBatchLogonRight = ' + ($grants -join ',') } else { $_ }
-        }
-    } else {
-        $lines = $lines | ForEach-Object {
-            $_
-            if ($_ -eq '[Privilege Rights]') { "SeBatchLogonRight = *$jobSid" }
+    foreach ($right in @('SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege')) {
+        $pattern = '^' + $right + '\s*='
+        $entry = @($lines | Where-Object { $_ -match $pattern })
+        if ($entry.Count -gt 1) { throw "Duplicate policy entries for $right" }
+        if ($entry) {
+            $grants = @((($entry[0] -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $grantSids = @($grants | ForEach-Object { Resolve-MotorTrusteeSid $_ })
+            if ($grantSids -notcontains $jobSid) { $grants += "*$jobSid" }
+            $lines = $lines | ForEach-Object {
+                if ($_ -match $pattern) { "$right = " + ($grants -join ',') } else { $_ }
+            }
+        } else {
+            $lines = $lines | ForEach-Object {
+                $_
+                if ($_ -eq '[Privilege Rights]') { "$right = *$jobSid" }
+            }
         }
     }
     $lines | Set-Content $policy -Encoding Unicode
     & secedit /configure /db $policyDb /cfg $policy /areas USER_RIGHTS /quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Granting batch logon failed' }
+    if ($LASTEXITCODE -ne 0) { throw 'Granting job account rights failed' }
+    # Re-export the configured assignments, not the template just written.
+    # Qualification after reboot separately checks the job token's privileges.
+    Remove-Item $policy -Force
+    & secedit /export /cfg $policy /areas USER_RIGHTS /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Verifying job account rights failed' }
+    foreach ($right in @('SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege')) {
+        $entry = @(Get-Content $policy | Where-Object { $_ -match ('^' + $right + '\s*=') })
+        if ($entry.Count -ne 1) { throw "Expected one policy entry for $right" }
+        $grants = @((($entry[0] -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $grantSids = @($grants | ForEach-Object { Resolve-MotorTrusteeSid $_ })
+        if ($grantSids -notcontains $jobSid) { throw "Job SID missing from $right" }
+        Write-Host "Verified $right for motor-job SID $jobSid"
+    }
+    Assert-MotorDeveloperModeDisabled
 } finally {
     Remove-Item $policy,$policyDb -Force -ErrorAction SilentlyContinue
 }

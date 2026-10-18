@@ -105,7 +105,10 @@ fn finish(launch: backend::Launch) -> String {
     finish_with_context(launch, "")
 }
 fn finish_with_context(mut launch: backend::Launch, context: &str) -> String {
-    let output = launch.execution.output().unwrap();
+    finish_execution(launch.execution.as_mut(), context)
+}
+fn finish_execution(execution: &mut dyn backend::Execution, context: &str) -> String {
+    let output = execution.output().unwrap();
     let read = |mut reader: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut text = String::new();
@@ -115,8 +118,8 @@ fn finish_with_context(mut launch: backend::Launch, context: &str) -> String {
     };
     let stdout = read(output.stdout);
     let stderr = read(output.stderr);
-    let status = launch.execution.wait();
-    launch.execution.reap();
+    let status = execution.wait();
+    execution.reap();
     let stdout = stdout.join().unwrap();
     let stderr = stderr.join().unwrap();
     assert!(
@@ -138,6 +141,38 @@ fn powershell(script: &str) -> String {
         "powershell.exe -NoProfile -EncodedCommand {}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     )
+}
+
+#[test]
+fn direct_collection_can_be_read_after_finish_before_owner_cleanup() {
+    struct Completed;
+    impl backend::Execution for Completed {
+        fn release(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn output(&self) -> io::Result<backend::Output> {
+            Ok(backend::Output {
+                stdout: Box::new(io::empty()),
+                stderr: Box::new(io::empty()),
+            })
+        }
+        fn wait(&mut self) -> io::Result<backend::ExecutionOutcome> {
+            Ok(backend::ExecutionOutcome::WindowsExit { code: 0 })
+        }
+        fn reap(&self) {}
+    }
+    let f = Fixture::new();
+    let config = super::windows_instance::config(&f);
+    let id = Uuid::now_v7();
+    let directory = config.state_dir().join("jobs").join(id.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    let archive = directory.join("windows-changes.tar");
+    fs::write(&archive, b"collected link records").unwrap();
+    let mut execution = super::windows_instance::direct_execution(&config, id, Box::new(Completed));
+    finish_execution(execution.as_mut(), "");
+    assert_eq!(fs::read(&archive).unwrap(), b"collected link records");
+    drop(execution);
+    assert!(!directory.exists());
 }
 fn cancel(runner: &Runner, setup: &Setup, hard: bool) {
     let mut job = Job::new(setup.id, Some(setup.request.clone()), 0, 0, 4);
@@ -319,6 +354,156 @@ if($LASTEXITCODE -ne 7){throw "pwsh could not resolve cmd or preserve exit 7: $L
 Write-Output 'normal Windows user environment passed'
 exit 0
 "#.into()
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_symlinks_do_not_escape_collection_or_cache() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    fs::write(
+        f.main.join("symlink-fixture.ps1"),
+        symlink_qualification_script(),
+    )
+    .unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "symlink qualification fixture"]);
+    let command = "powershell.exe -NoProfile -NonInteractive -File ./symlink-fixture.ps1";
+    let (setup, mut job) = launch(&runner, &f, command);
+    // DirectExecution removes collection-only job directories on drop. Retain
+    // its owner until the archive assertions have consumed the result.
+    assert!(finish_execution(job.execution.as_mut(), "").contains("symlink creation passed"));
+    let job_dir = runner
+        .config()
+        .state_dir()
+        .join("jobs")
+        .join(setup.id.to_string());
+    let bytes = fs::read(job_dir.join("windows-changes.tar")).unwrap();
+    let prefix = format!("m{}/", setup.request.workspace_key);
+    let targets = [
+        ("link-file-system", r"C:\Windows\System32\kernel32.dll"),
+        ("link-dir-system", r"C:\Windows\System32"),
+        ("link-file-agent", r"C:\ProgramData\Motor\job-password.txt"),
+        ("link-dir-agent", r"C:\ProgramData\Motor"),
+        ("link-unc", r"\\motor-symlink.invalid\share\absent"),
+    ];
+    let mut found = BTreeMap::new();
+    let mut canary_collected = false;
+    for entry in tar::Archive::new(&bytes[..]).entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_str().unwrap().to_owned();
+        assert!(
+            name.starts_with(&prefix),
+            "outside workspace member: {name}"
+        );
+        let name = name.strip_prefix(&prefix).unwrap().to_owned();
+        let mut payload = Vec::new();
+        entry.read_to_end(&mut payload).unwrap();
+        if name == "symlink-collected.txt" {
+            canary_collected = true;
+            assert!(entry.header().entry_type().is_file());
+            assert_eq!(payload, b"ordinary collection canary");
+        } else {
+            assert!(entry.header().entry_type().is_symlink(), "followed {name}");
+            assert!(payload.is_empty(), "target contents returned for {name}");
+            let target = String::from_utf8(entry.link_name_bytes().unwrap().into_owned()).unwrap();
+            found.insert(name, target);
+        }
+    }
+    assert!(
+        canary_collected,
+        "ordinary collection canary was not returned"
+    );
+    assert_eq!(
+        found,
+        targets
+            .into_iter()
+            .map(|(name, target)| (name.to_owned(), target.to_owned()))
+            .collect()
+    );
+    assert!(
+        !job_dir.join("m").exists(),
+        "collection created a Linux source tree"
+    );
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&setup.request.workspace_key);
+    assert!(disk.is_file(), "first job did not retain its clean cache");
+    drop(job);
+    let output = run(&runner, &f, &format!("{command} -Check"));
+    assert!(
+        output.contains("only explained cache links persisted"),
+        "{output}"
+    );
+    assert!(disk.is_file());
+    no_units(&runner);
+}
+
+fn symlink_qualification_script() -> String {
+    r#"
+param([switch]$Check)
+$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw 'unexpected job account'}
+if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job is an administrator'}
+$mode=(Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
+if($mode -eq 1){throw 'Developer Mode is enabled'}
+$links=@(
+ @('link-file-system','C:\Windows\System32\kernel32.dll',0),
+ @('link-dir-system','C:\Windows\System32',1),
+ @('link-file-agent','C:\ProgramData\Motor\job-password.txt',0),
+ @('link-dir-agent','C:\ProgramData\Motor',1),
+ @('link-unc','\\motor-symlink.invalid\share\absent',0)
+)
+$cache='C:\t\motor-symlink-cache'
+$outside=Join-Path $env:TEMP 'motor-symlink-outside'
+if($Check) {
+ if(Test-Path -LiteralPath $outside){throw 'outside overlay state survived'}
+ $workspaceNames=@(Get-ChildItem -LiteralPath (Get-Location) -Force | ForEach-Object {$_.Name})
+ foreach($link in $links){if($workspaceNames -contains $link[0]){throw 'workspace link survived'}}
+ if([IO.File]::ReadAllText((Join-Path $cache 'marker')) -cne 'expected cache contents'){throw 'cache was not reused'}
+ $expected=@('marker') + @($links | ForEach-Object {$_[0]})
+ $actual=@(Get-ChildItem -LiteralPath $cache -Force | ForEach-Object {$_.Name})
+ if(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)){throw 'unexplained cache contents'}
+ $mismatches=@()
+ foreach($link in $links) {
+  $item=Get-Item -LiteralPath (Join-Path $cache $link[0]) -Force
+  $actual=@($item.Target)
+  if(-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $actual.Count -ne 1 -or -not (Test-MotorLinkTarget $actual[0] $link[1])) {
+   $mismatches += "cache link mismatch: name=<$($link[0])> expected=<$($link[1])> actual=<$($actual -join '|')> attributes=<$($item.Attributes)>"
+  }
+ }
+ foreach($message in $mismatches){Write-Output $message}
+ if($mismatches.Count -ne 0){throw "cache link targets changed: $($mismatches.Count) mismatches"}
+ $rootNames=@(Get-ChildItem -LiteralPath 'C:\t' -Force | ForEach-Object {$_.Name})
+ foreach($name in $rootNames){if($name -notin @('motor-symlink-cache','System Volume Information','$RECYCLE.BIN')){throw "unexplained cache root entry: $name"}}
+ Write-Output 'only explained cache links persisted'
+ exit 0
+}
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class MotorSymlink {
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+ [return: MarshalAs(UnmanagedType.U1)]
+ public static extern bool CreateSymbolicLink(string link, string target, uint flags);
+}
+'@
+New-Item -ItemType Directory -Path $cache,$outside | Out-Null
+foreach($root in @((Get-Location).Path,$outside,$cache)) {
+ foreach($link in $links) {
+  if(-not [MotorSymlink]::CreateSymbolicLink((Join-Path $root $link[0]),$link[1],[uint32]$link[2])){throw "CreateSymbolicLink failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"}
+ }
+}
+[IO.File]::WriteAllText((Join-Path $cache 'marker'),'expected cache contents')
+[IO.File]::WriteAllText((Join-Path (Get-Location) 'symlink-collected.txt'),'ordinary collection canary')
+Write-Output 'symlink creation passed'
+"#.replacen("param([switch]$Check)", &format!("param([switch]$Check)\n{}", include_str!("windows_link_target.ps1")), 1)
 }
 
 /// Break check: add a NIC to the job VM. Successful external DNS, TCP, UDP or
@@ -1642,6 +1827,14 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
     let script = baseline_environment_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
     assert!(powershell(&script).len() < 8000);
+}
+
+#[test]
+fn symlink_qualification_generated_powershell_has_balanced_braces() {
+    let script = symlink_qualification_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
+    assert!(script.contains("[switch]$Check"));
+    assert!(script.contains("CreateSymbolicLink"));
 }
 
 #[test]

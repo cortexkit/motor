@@ -115,13 +115,13 @@ struct Control {
     cancel: AtomicU8,
     abandoned: AtomicBool,
     done: AtomicBool,
-    worker: std::sync::OnceLock<std::thread::Thread>,
+    worker: Mutex<Option<std::thread::Thread>>,
     #[cfg(test)]
     output_blocked: AtomicBool,
 }
 impl Control {
     fn wake(&self) {
-        if let Some(worker) = self.worker.get() {
+        if let Some(worker) = self.worker.lock().unwrap().as_ref() {
             worker.unpark();
         }
     }
@@ -154,7 +154,7 @@ impl Read for ChannelReader {
 }
 
 pub(crate) struct PreparedVm {
-    _registration: Registration,
+    _registration: Option<Registration>,
     control: Arc<Control>,
     output: Mutex<Option<backend::Output>>,
     completion: mpsc::Receiver<io::Result<ExecutionOutcome>>,
@@ -368,6 +368,12 @@ impl Transport {
                 self.pending_cache = Some(timings);
                 Ok(())
             }
+            Frame::CacheFailed { failure }
+                if failure.step == motor_winagent::cache_steps::CacheStep::VolumeAcl
+                    && failure.message == "VolumeAcl: cache_grant_missing" =>
+            {
+                Err(io::Error::other(CacheGrantMissing))
+            }
             Frame::CacheFailed { failure } => Err(invalid(failure.to_string())),
             _ => Err(invalid("unexpected agent frame during tree upload")),
         }
@@ -465,6 +471,15 @@ fn unit_exit(status: std::process::ExitStatus) -> io::Error {
     }
 }
 
+#[derive(Debug)]
+struct CacheGrantMissing;
+impl std::fmt::Display for CacheGrantMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cache_grant_missing")
+    }
+}
+impl std::error::Error for CacheGrantMissing {}
+
 pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::Result<Prepared> {
     let control = config
         .windows_runtime
@@ -478,6 +493,43 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
         runtime: config.windows_runtime.clone(),
         id: setup.id,
     };
+    let mut retried = false;
+    let mut handle = loop {
+        match materialize_attempt(config, trees, setup, control.clone()) {
+            Ok(handle) => break handle,
+            Err(error)
+                if !retried
+                    && error.get_ref().is_some_and(|e| e.is::<CacheGrantMissing>())
+                    && control.cancel.load(Ordering::Acquire) == 0 =>
+            {
+                // The failed attempt has joined and discarded its cache before
+                // returning this error. No execution gate has been opened.
+                let cache = config.windows.as_ref().unwrap().caches();
+                tracing::warn!(job_id = %setup.id, workspace_hash = %cache.key(&setup.request.workspace_key),
+                    "cache_grant_missing: discarded Windows cache; retrying once with a fresh disk");
+                control.abandoned.store(false, Ordering::Release);
+                control.done.store(false, Ordering::Release);
+                retried = true;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    handle._registration = Some(registration);
+    Ok(Prepared {
+        cwd: PathBuf::from(&setup.request.cwd),
+        target: PathBuf::from(&setup.request.workspace_key).join("target"),
+        wrapper: None,
+        sandbox: None,
+        windows: Some(Mutex::new(Some(handle))),
+    })
+}
+
+fn materialize_attempt(
+    config: &Config,
+    trees: &Trees,
+    setup: &Setup,
+    control: Arc<Control>,
+) -> io::Result<PreparedVm> {
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
     }
@@ -526,7 +578,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
     };
     let thread_control = control.clone();
     let thread = std::thread::spawn(move || {
-        let _ = thread_control.worker.set(std::thread::current());
+        *thread_control.worker.lock().unwrap() = Some(std::thread::current());
         let mut exit_code = None;
         let result = (|| {
             let bounds = Bounds::new(unit_started_ms);
@@ -688,7 +740,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
         let _ = result_tx.send(result);
     });
     let handle = PreparedVm {
-        _registration: registration,
+        _registration: None,
         control,
         output: Mutex::new(Some(backend::Output {
             stdout: Box::new(ChannelReader {
@@ -708,15 +760,14 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
         .unwrap_or_else(|_| Err(invalid("Windows setup I/O thread stopped")));
     if let Err(error) = ready {
         handle.reap();
-        return Err(error);
+        return Err(handle
+            .completion
+            .try_recv()
+            .ok()
+            .and_then(Result::err)
+            .unwrap_or(error));
     }
-    Ok(Prepared {
-        cwd: PathBuf::from(&setup.request.cwd),
-        target: PathBuf::from(&setup.request.workspace_key).join("target"),
-        wrapper: None,
-        sandbox: None,
-        windows: Some(Mutex::new(Some(handle))),
-    })
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -784,7 +835,7 @@ mod tests {
             tx.send(vec![1]).unwrap();
             let (done, result) = mpsc::channel();
             let worker = std::thread::spawn(move || {
-                let _ = transport.control.worker.set(std::thread::current());
+                *transport.control.worker.lock().unwrap() = Some(std::thread::current());
                 done.send(transport.forward_output(&tx, vec![2])).unwrap();
             });
             let began = Instant::now();

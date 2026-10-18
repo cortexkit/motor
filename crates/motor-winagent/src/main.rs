@@ -569,8 +569,20 @@ mod guest {
             }
             let mountpoint_started = Instant::now();
             reporter.step(CacheStep::MountDirectory, || {
-                std::fs::create_dir_all(CACHE_MOUNT)
+                motor_winagent::cache::empty_mount_directory(Path::new(CACHE_MOUNT))
             })?;
+            let folder_acl_started = Instant::now();
+            // The empty OS folder is trusted only before the cache is mounted.
+            // Never propagate this grant into a reused volume's children.
+            let mountpoint_acl_updated = reporter.step(CacheStep::FolderAcl, || {
+                Self::grant_access(
+                    CACHE_MOUNT.trim_end_matches('\\'),
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    user,
+                    true,
+                )
+            })?;
+            let folder_acl_ms = folder_acl_started.elapsed().as_millis();
             reporter.step(CacheStep::MountPoint, || unsafe {
                 win32(SetVolumeMountPointW(
                     wide(CACHE_MOUNT).as_ptr(),
@@ -582,7 +594,7 @@ mod guest {
                 volume,
                 clean: false,
                 acl_updated: false,
-                mountpoint_acl_updated: false,
+                mountpoint_acl_updated,
                 timings: CacheTimings::default(),
             };
             let dirty_started = Instant::now();
@@ -605,21 +617,14 @@ mod guest {
                 return Err(invalid("cache volume has a dirty NTFS bit"));
             }
             let dirty_ms = dirty_started.elapsed().as_millis();
-            let acl_started = Instant::now();
-            // The mounted folder on C: and the target volume root are separate
-            // security objects. Grant access to both; OPEN_REPARSE_POINT keeps
-            // the first update on the OS folder rather than following its mount.
-            cache.mountpoint_acl_updated = reporter.step(CacheStep::FolderAcl, || {
-                Self::grant_access(
-                    CACHE_MOUNT.trim_end_matches('\\'),
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                    user,
-                )
-            })?;
-            let folder_acl_ms = acl_started.elapsed().as_millis();
             let volume_acl_started = Instant::now();
             cache.acl_updated = reporter.step(CacheStep::VolumeAcl, || {
-                Self::grant_access(&cache.volume, FILE_FLAG_BACKUP_SEMANTICS, user)
+                Self::grant_access(
+                    &cache.volume,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    user,
+                    disk.freshly_formatted,
+                )
             })?;
             let volume_acl_ms = volume_acl_started.elapsed().as_millis();
             cache.timings = CacheTimings {
@@ -638,7 +643,12 @@ mod guest {
             };
             Ok(cache)
         }
-        fn grant_access(path: &str, flags: u32, user: &User) -> io::Result<bool> {
+        fn grant_access(
+            path: &str,
+            flags: u32,
+            user: &User,
+            freshly_formatted: bool,
+        ) -> io::Result<bool> {
             // Apply the same exact-SID Modify policy to each security object.
             // Preserve other trustees and skip Windows' inheritance propagation
             // entirely when this object's explicit grant is already present.
@@ -686,10 +696,10 @@ mod guest {
                 ))?;
                 let _descriptor = LocalSecurityBuffer(descriptor);
                 let sid_bytes = std::slice::from_raw_parts(sid.cast(), GetLengthSid(sid) as usize);
-                if cache_has_modify_grant(&parse_cache_aces(old_acl)?, sid_bytes) {
-                    // SetSecurityInfo propagates inheritable ACEs through the
-                    // existing tree even for an unchanged DACL. Reused caches
-                    // need no such walk once the exact root grant is present.
+                if !motor_winagent::cache::cache_acl_update(
+                    cache_has_modify_grant(&parse_cache_aces(old_acl)?, sid_bytes),
+                    freshly_formatted,
+                )? {
                     return Ok(false);
                 }
                 let access = EXPLICIT_ACCESS_W {
@@ -756,8 +766,9 @@ mod guest {
                     &mut returned,
                     null_mut(),
                 ))?;
-                win32(DeleteVolumeMountPointW(wide(CACHE_MOUNT).as_ptr()))?;
             }
+            // C:\t can be replaced by the job. Leave its mount point in the
+            // disposable OS overlay rather than resolving a job-controlled path.
             self.clean = true;
             Ok(())
         }

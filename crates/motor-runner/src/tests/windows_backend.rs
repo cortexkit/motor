@@ -54,6 +54,8 @@ enum Fault {
     Collect,
     Dismount,
     DismountOnce,
+    CacheGrantMissingOnce,
+    CacheGrantMissingAlways,
     UnitExit,
     Silent,
     FloodOutput,
@@ -230,9 +232,13 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
     let captured = agent.clone();
     c.windows_vm = Some(Arc::new(move |args, nonce, path| {
         captured.units.lock().unwrap().push(args.to_vec());
-        let fault = if fault == Fault::DismountOnce {
+        let fault = if matches!(fault, Fault::DismountOnce | Fault::CacheGrantMissingOnce) {
             if captured.units.lock().unwrap().len() == 1 {
-                Fault::Dismount
+                if fault == Fault::DismountOnce {
+                    Fault::Dismount
+                } else {
+                    Fault::CacheGrantMissingAlways
+                }
             } else {
                 Fault::None
             }
@@ -301,6 +307,21 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                         nonce,
                     },
                 )?;
+                if fault == Fault::CacheGrantMissingAlways {
+                    session.send(
+                        &mut port,
+                        &AgentFrame::CacheFailed {
+                            failure: motor_winagent::cache_steps::CacheFailure {
+                                step: motor_winagent::cache_steps::CacheStep::VolumeAcl,
+                                elapsed_ms: 1,
+                                message: "VolumeAcl: cache_grant_missing".into(),
+                                completed: Vec::new(),
+                            },
+                        },
+                    )?;
+                    stall(&a, &s, 2);
+                    return Ok(());
+                }
                 session.send(
                     &mut port,
                     &AgentFrame::CacheMounted {
@@ -1025,6 +1046,60 @@ async fn windows_backend_failed_dismount_then_immediate_same_workspace_job() {
         assert!(!path.exists(), "{} remains", path.display());
     }
     assert_eq!(a.stops.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn windows_backend_missing_cache_grant_discards_and_retries_once_before_start() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::CacheGrantMissingOnce, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (request, bytes) = request(&f);
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&request.workspace_key);
+    fs::write(&disk, b"untrusted reused cache").unwrap();
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    assert_eq!(fs::read(&disk).unwrap(), b"fake qcow2");
+    assert_eq!(a.units.lock().unwrap().len(), 2);
+    assert_eq!(a.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(a.stops.load(Ordering::SeqCst), 2);
+    for path in job_artifacts(runner.config(), request.job_id) {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+}
+
+#[tokio::test]
+async fn windows_backend_missing_cache_grant_on_retry_refuses_without_third_boot() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::CacheGrantMissingAlways, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (request, bytes) = request(&f);
+    f.submit(&runner, &request, &bytes);
+    assert!(matches!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::RefusedBeforeStart { .. }
+    ));
+    assert_eq!(a.units.lock().unwrap().len(), 2);
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(a.stops.load(Ordering::SeqCst), 2);
+    assert!(!runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&request.workspace_key)
+        .exists());
 }
 
 #[tokio::test]

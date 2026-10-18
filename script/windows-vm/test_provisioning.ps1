@@ -18,10 +18,44 @@ foreach ($name in @('bootstrap.ps1', 'setup-guest.ps1', 'setup-job-baseline.ps1'
 
 # These assertions defend the provisioning inputs, not Windows installer behavior.
 $baseline = Get-Content (Join-Path $Scripts 'setup-job-baseline.ps1') -Raw
+$ast = [Management.Automation.Language.Parser]::ParseInput($baseline, [ref]$null, [ref]$null)
+$definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-MotorTrusteeSid'}, $true)
+Invoke-Expression $definition.Extent.Text
+$resolver = {param($name) if ($name -in @('motor-job','HOST\motor-job')) { 'S-1-5-21-123-1001' } else { throw 'unknown account' }}
+foreach ($export in @('SeBatchLogonRight = motor-job,*S-1-5-32-544', 'SeBatchLogonRight = *S-1-5-21-123-1001,*S-1-5-32-544')) {
+    $sids = @((($export -split '=',2)[1] -split ',') | ForEach-Object { Resolve-MotorTrusteeSid $_ $resolver })
+    Assert ($sids -contains 'S-1-5-21-123-1001') 'exported job trustee did not resolve'
+    Assert ($sids.Count -eq 2) 'trustee normalization duplicated a grant'
+}
+$rejected = $false
+try { Resolve-MotorTrusteeSid 'missing-user' $resolver } catch { $rejected = $_.ToString().Contains('missing-user') }
+Assert $rejected 'unresolvable trustee did not fail closed with its name'
+$checks++
+Write-Host 'PASS policy_named_and_sid_trustees'
+$definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-MotorDeveloperModeDisabled'}, $true)
+Invoke-Expression $definition.Extent.Text
+foreach ($state in @('key-absent','value-absent','zero','one')) {
+    $readKey = {
+        switch ($state) {
+            'key-absent' { return $null }
+            'value-absent' { return [pscustomobject]@{} }
+            'zero' { return [pscustomobject]@{AllowDevelopmentWithoutDevLicense=0} }
+            'one' { return [pscustomobject]@{AllowDevelopmentWithoutDevLicense=1} }
+        }
+    }
+    $threw = $false
+    try { Assert-MotorDeveloperModeDisabled $readKey } catch {
+        Assert ($_.ToString().Contains('must not enable Developer Mode')) "unexpected registry-check error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq ($state -eq 'one')) "wrong Developer Mode result for $state"
+}
+$checks++
+Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
 $items = [ordered]@{
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')
     virtio_serial = @('vioserial\2k22\amd64\vioser.inf', '& pnputil /add-driver', '/install')
-    standard_job_user = @("`$jobUser = 'motor-job'", 'New-LocalUser $jobUser', 'Remove-LocalGroupMember $admins', 'SeBatchLogonRight', 'CreateProfile($jobSid', 'job-password.txt', '$credential /inheritance:r')
+    standard_job_user = @("`$jobUser = 'motor-job'", 'New-LocalUser $jobUser', 'Remove-LocalGroupMember $admins', 'SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege', 'Job SID missing from $right', 'Job baseline must not enable Developer Mode', 'CreateProfile($jobSid', 'job-password.txt', '$credential /inheritance:r')
     service = @('build --release --locked', 'New-Service -Name motor-winagent', '-StartupType Automatic', "StartName -ne 'LocalSystem'", 'Get-FileHash', 'SHA256')
     long_paths = @('config --system core.longpaths true', 'LongPathsEnabled -PropertyType DWord -Value 1')
     defender = @("@('C:\m', 'C:\rust', `$jobCargo)", 'Add-MpPreference -ExclusionPath $path')
@@ -86,6 +120,15 @@ if ($env:OS -ne 'Windows_NT') {
                 throw "FAIL bootstrap_job_baseline_${mode}: $_"
             }
         }
+        Set-Content S:\setup-job-baseline.ps1 'throw "baseline failure fixture"'
+        function Stop-Computer { Set-Content C:\build\provision\shutdown-requested yes; throw 'shutdown observed' }
+        $shutdown = $false
+        try { & S:\bootstrap.ps1 -JobBaseline } catch { $shutdown = $_.ToString().Contains('shutdown observed') }
+        Assert $shutdown 'failed job bootstrap did not request shutdown'
+        Assert (Test-Path C:\build\provision\shutdown-requested) 'shutdown was not dispatched'
+        Assert ((Get-Content C:\build\provision\FAILED.txt -Raw).Contains('baseline failure fixture')) 'bootstrap lost original failure'
+        $checks++
+        Write-Host 'PASS bootstrap_failure_records_error_and_shuts_down'
         # Substitute only the Windows elevation query so the real setup flow can run portably.
         $guest = Get-Content (Join-Path $Scripts 'setup-guest.ps1') -Raw
         $adminQuery = '$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")'

@@ -549,6 +549,16 @@ impl Command {
 /// Preflight the complete archive before writing any files. Directory prefixes
 /// participate in collision detection, so `a/x` and `A/y` cannot merge silently.
 pub fn validate_tree(reader: &mut (impl Read + io::Seek)) -> io::Result<()> {
+    validate_archive(reader, false)
+}
+
+/// Collected links are inert archive records, never extraction instructions.
+/// Keep this separate from the stricter host-to-guest staging format.
+pub fn validate_collection(reader: &mut (impl Read + io::Seek)) -> io::Result<()> {
+    validate_archive(reader, true)
+}
+
+fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io::Result<()> {
     reader.rewind()?;
     let mut archive = tar::Archive::new(&mut *reader);
     let mut names = BTreeMap::<String, String>::new();
@@ -557,12 +567,28 @@ pub fn validate_tree(reader: &mut (impl Read + io::Seek)) -> io::Result<()> {
         let entry = entry?;
         let bytes = entry.path_bytes();
         let path = std::str::from_utf8(&bytes).map_err(|_| invalid("tar path is not UTF-8"))?;
-        if !entry.header().entry_type().is_file() && !entry.header().entry_type().is_dir() {
+        let kind = entry.header().entry_type();
+        let link = collection && kind.is_symlink();
+        if !kind.is_file() && !kind.is_dir() && !link {
             return Err(invalid(format!(
                 "tar links and non-file members are forbidden: {path}"
             )));
         }
         validate_archive_path(path)?;
+        if collection && !path.starts_with("m/") {
+            return Err(invalid(format!(
+                "collect member is not a source path: {path}"
+            )));
+        }
+        if link {
+            let target = entry
+                .link_name_bytes()
+                .ok_or_else(|| invalid("link has no target"))?;
+            std::str::from_utf8(&target).map_err(|_| invalid("link target is not UTF-8"))?;
+            if target.is_empty() || entry.size() != 0 {
+                return Err(invalid("collected link must have a target and no payload"));
+            }
+        }
         let path = path.trim_end_matches('/');
         if !entry.header().entry_type().is_dir() && matches!(path, "m" | "cargo-home") {
             return Err(invalid(format!(
@@ -592,7 +618,7 @@ pub fn validate_tree(reader: &mut (impl Read + io::Seek)) -> io::Result<()> {
 
 fn safe_directory(path: &std::path::Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.is_dir() && !is_reparse(&metadata) => Ok(()),
         Ok(_) => Err(invalid(format!(
             "extraction directory is not a real directory: {}",
             path.display()
@@ -600,6 +626,61 @@ fn safe_directory(path: &std::path::Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir(path),
         Err(error) => Err(error),
     }
+}
+
+fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn open_source_file(path: &std::path::Path) -> io::Result<std::fs::File> {
+    if is_reparse(&std::fs::symlink_metadata(path)?) {
+        return Err(invalid("source file is a reparse point"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000).share_mode(1); // OPEN_REPARSE_POINT, FILE_SHARE_READ
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err(invalid(
+            "source file changed into a reparse point or non-file",
+        ));
+    }
+    Ok(file)
+}
+
+fn source_directory(path: &std::path::Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || is_reparse(&metadata) {
+        return Err(invalid("source directory is not a physical directory"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny write/delete sharing while resolving children, so an ancestor
+        // cannot be renamed or turned into a reparse point during the walk.
+        options.custom_flags(0x02200000).share_mode(1); // OPEN_REPARSE_POINT | BACKUP_SEMANTICS
+    }
+    let directory = options.open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || is_reparse(&metadata) {
+        return Err(invalid("source directory changed into a reparse point"));
+    }
+    Ok(directory)
 }
 
 /// Roots must already exist and be owned by the job user. Extraction never uses
@@ -643,7 +724,7 @@ pub fn unpack_tree(
 pub type Inventory = BTreeMap<String, [u8; 32]>;
 
 /// Target directories live on the cache disk and must never enter collected
-/// source changes. Reject generated links instead of following them out of m/.
+/// source changes. Hash link text, never the contents of a link's target.
 pub fn inventory(root: &std::path::Path) -> io::Result<Inventory> {
     use sha2::{Digest, Sha256};
     fn walk(
@@ -651,6 +732,7 @@ pub fn inventory(root: &std::path::Path) -> io::Result<Inventory> {
         dir: &std::path::Path,
         files: &mut Inventory,
     ) -> io::Result<()> {
+        let _directory = source_directory(dir)?;
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry
@@ -662,19 +744,26 @@ pub fn inventory(root: &std::path::Path) -> io::Result<Inventory> {
                 continue;
             }
             let path = entry.path();
-            let kind = entry.file_type()?;
-            if kind.is_symlink() {
-                return Err(invalid(format!(
-                    "source symlink is forbidden: {}",
-                    path.display()
-                )));
-            }
-            if kind.is_dir() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !is_reparse(&metadata) && metadata.is_dir() {
                 walk(root, &path, files)?;
-            } else if kind.is_file() {
-                let mut file = std::fs::File::open(&path)?;
+            } else {
                 let mut digest = Sha256::new();
-                io::copy(&mut file, &mut digest)?;
+                if is_reparse(&metadata) {
+                    // read_link understands symbolic links and directory junctions;
+                    // unsupported reparse tags fail rather than becoming traversal.
+                    let target = std::fs::read_link(&path)?;
+                    let target = target
+                        .to_str()
+                        .ok_or_else(|| invalid("link target is not UTF-8"))?;
+                    digest.update(b"link\0");
+                    digest.update(target.as_bytes());
+                } else if metadata.is_file() {
+                    digest.update(b"file\0");
+                    io::copy(&mut open_source_file(&path)?, &mut digest)?;
+                } else {
+                    return Err(invalid(format!("non-file source path: {}", path.display())));
+                }
                 let relative = path
                     .strip_prefix(root)
                     .unwrap()
@@ -683,8 +772,6 @@ pub fn inventory(root: &std::path::Path) -> io::Result<Inventory> {
                     .collect::<Vec<_>>()
                     .join("/");
                 files.insert(format!("m/{relative}"), digest.finalize().into());
-            } else {
-                return Err(invalid(format!("non-file source path: {}", path.display())));
             }
         }
         Ok(())
@@ -715,9 +802,26 @@ pub fn collect_changes(
     }
     let after = inventory(root)?;
     let mut builder = tar::Builder::new(CollectBuffer(Vec::new()));
+    builder.follow_symlinks(false);
     for (path, hash) in &after {
         if before.get(path) != Some(hash) {
-            builder.append_path_with_name(root.join(path.strip_prefix("m/").unwrap()), path)?;
+            let relative = std::path::Path::new(path.strip_prefix("m/").unwrap());
+            let mut parents = vec![source_directory(root)?];
+            let mut parent = root.to_path_buf();
+            for component in relative.parent().unwrap().components() {
+                parent.push(component);
+                parents.push(source_directory(&parent)?);
+            }
+            let source = root.join(relative);
+            if is_reparse(&std::fs::symlink_metadata(&source)?) {
+                let target = std::fs::read_link(&source)?;
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| invalid("link target is not UTF-8"))?;
+                append_source_link(&mut builder, path, target)?;
+            } else {
+                builder.append_file(path, &mut open_source_file(&source)?)?;
+            }
         }
     }
     let deleted = before
@@ -726,6 +830,25 @@ pub fn collect_changes(
         .cloned()
         .collect();
     Ok((builder.into_inner()?.0, deleted))
+}
+
+fn append_source_link(
+    builder: &mut tar::Builder<impl Write>,
+    path: &str,
+    target: &str,
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_mode(0o777);
+    header.set_size(0);
+    // Path-based tar helpers normalize Windows separators. Preserve literal
+    // link text, including absolute and UNC targets, without resolving it.
+    if target.len() <= 100 {
+        header.set_link_name_literal(target.as_bytes())?;
+    } else {
+        builder.append_pax_extensions([("linkpath", target.as_bytes())])?;
+    }
+    builder.append_data(&mut header, path, io::empty())
 }
 
 #[cfg(test)]
@@ -1559,12 +1682,98 @@ mod tests {
             .is_err()
         );
         assert!(!outside.join("touched").exists());
-        assert!(inventory(&source).is_err());
+        assert_eq!(inventory(&source).unwrap().len(), 1);
+        assert!(inventory(&source.join("escape")).is_err());
     }
 
-    struct Scratch(std::path::PathBuf);
+    #[cfg(unix)]
+    #[test]
+    fn collection_returns_file_directory_and_dangling_links_without_target_bytes() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new();
+        let source = scratch.0.join("m");
+        let outside = scratch.0.join("outside");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "outside target bytes").unwrap();
+        let links = [
+            ("file", outside.join("secret")),
+            ("directory", outside.clone()),
+            ("dangling", outside.join("absent")),
+            ("unc", std::path::PathBuf::from(r"\\server\share\absent")),
+        ];
+        for (name, target) in &links {
+            symlink(target, source.join(name)).unwrap();
+        }
+        assert!(open_source_file(&source.join("file")).is_err());
+        assert!(source_directory(&source.join("directory")).is_err());
+        let (bytes, deleted) = collect_changes(&source, &Inventory::new()).unwrap();
+        assert!(deleted.is_empty());
+        validate_collection(&mut Cursor::new(&bytes)).unwrap();
+        assert!(validate_tree(&mut Cursor::new(&bytes)).is_err());
+        let mut found = BTreeMap::new();
+        for entry in tar::Archive::new(&bytes[..]).entries().unwrap() {
+            let mut entry = entry.unwrap();
+            assert!(entry.header().entry_type().is_symlink());
+            let mut payload = Vec::new();
+            entry.read_to_end(&mut payload).unwrap();
+            assert!(payload.is_empty());
+            found.insert(
+                entry.path().unwrap().into_owned(),
+                entry.link_name().unwrap().unwrap().into_owned(),
+            );
+        }
+        assert_eq!(found.len(), links.len());
+        for (name, target) in links {
+            assert_eq!(
+                found[&std::path::PathBuf::from(format!("m/{name}"))],
+                target
+            );
+        }
+        let before = inventory(&source).unwrap();
+        std::fs::write(outside.join("secret"), "changed target bytes").unwrap();
+        assert_eq!(inventory(&source).unwrap(), before);
+        std::fs::remove_file(source.join("file")).unwrap();
+        std::fs::write(
+            source.join("file"),
+            outside.join("secret").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(inventory(&source).unwrap()["m/file"], before["m/file"]);
+    }
+
+    #[test]
+    fn collection_validation_does_not_admit_hardlinks_or_non_source_paths() {
+        for members in [
+            vec![("m/a", tar::EntryType::Link)],
+            vec![("cargo-home/a", tar::EntryType::Regular)],
+            vec![("m/../outside", tar::EntryType::Regular)],
+        ] {
+            assert!(validate_collection(&mut archive(&members)).is_err());
+        }
+    }
+
+    #[test]
+    fn collected_link_text_preserves_windows_absolute_unc_and_long_targets() {
+        for target in [
+            r"C:\Windows\System32".to_owned(),
+            r"\\server\share\file".to_owned(),
+            format!(r"C:\{}\file", "long".repeat(80)),
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            append_source_link(&mut builder, "m/link", &target).unwrap();
+            let bytes = builder.into_inner().unwrap();
+            validate_collection(&mut Cursor::new(&bytes)).unwrap();
+            let mut archive = tar::Archive::new(&bytes[..]);
+            let entry = archive.entries().unwrap().next().unwrap().unwrap();
+            assert_eq!(entry.link_name_bytes().unwrap().as_ref(), target.as_bytes());
+            assert!(entry.header().entry_type().is_symlink());
+        }
+    }
+
+    pub(super) struct Scratch(pub(super) std::path::PathBuf);
     impl Scratch {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("target/test-scratch")

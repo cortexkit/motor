@@ -82,6 +82,7 @@ pub trait CacheStorage {
 
 pub struct PreparedCache {
     pub volume: String,
+    pub freshly_formatted: bool,
     pub native_attributes_ms: u64,
     pub powershell_ms: u64,
     pub volume_ms: u64,
@@ -163,10 +164,40 @@ pub fn prepare_cache(storage: &mut impl CacheStorage, number: u32) -> io::Result
     }
     Ok(PreparedCache {
         volume: volume.path,
+        freshly_formatted: raw,
         native_attributes_ms,
         powershell_ms,
         volume_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// Updating an inheritable DACL can walk existing children as SYSTEM. A reused
+/// disk is untrusted, so a missing grant requires discarding it, not repairing it.
+pub fn cache_acl_update(has_grant: bool, freshly_formatted: bool) -> io::Result<bool> {
+    match (has_grant, freshly_formatted) {
+        (true, _) => Ok(false),
+        (false, true) => Ok(true),
+        (false, false) => Err(io::Error::other("cache_grant_missing")),
+    }
+}
+
+/// Grant the OS mount folder before attaching any job-populated volume to it.
+pub fn empty_mount_directory(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || crate::is_reparse(&metadata)
+        || std::fs::read_dir(path)?.next().is_some()
+    {
+        return Err(io::Error::other(
+            "cache mount folder must be an empty physical directory",
+        ));
+    }
+    Ok(())
 }
 
 pub fn mount_script(number: u32) -> String {
@@ -184,6 +215,55 @@ $d | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privileged_dismount_never_resolves_the_job_mount_folder() {
+        // Dismount runs after the job can replace C:\t. Fence the actual
+        // Windows implementation against reintroducing pathname-based cleanup.
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("fn open_volume(&self)")
+            .unwrap()
+            .1
+            .split_once("enum Event")
+            .unwrap()
+            .0;
+        assert!(body.contains("self.open_volume()?"));
+        assert!(body.contains("FSCTL_LOCK_VOLUME"));
+        assert!(body.contains("FSCTL_DISMOUNT_VOLUME"));
+        for forbidden in ["DeleteVolumeMountPoint", "wide(CACHE_MOUNT)", "std::fs::"] {
+            assert!(
+                !body.contains(forbidden),
+                "dismount resolved a job path: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_cache_missing_grant_never_updates_acl() {
+        assert!(!super::cache_acl_update(true, false).unwrap());
+        assert!(!super::cache_acl_update(true, true).unwrap());
+        assert!(super::cache_acl_update(false, true).unwrap());
+        assert_eq!(
+            super::cache_acl_update(false, false)
+                .unwrap_err()
+                .to_string(),
+            "cache_grant_missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_folder_refuses_links_and_nonempty_directories() {
+        let root = crate::tests::Scratch::new();
+        let target = root.0.join("target");
+        let mount = root.0.join("mount");
+        super::empty_mount_directory(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &mount).unwrap();
+        assert!(super::empty_mount_directory(&mount).is_err());
+        std::fs::write(target.join("child"), "unchanged").unwrap();
+        assert!(super::empty_mount_directory(&target).is_err());
+        assert_eq!(std::fs::read(target.join("child")).unwrap(), b"unchanged");
+    }
     use super::*;
 
     struct FakeStorage {
@@ -364,6 +444,7 @@ mod tests {
             }
             let prepared = prepare_cache(&mut fake, 7).unwrap();
             assert_eq!(prepared.volume, fake.volumes[0].path);
+            assert_eq!(prepared.freshly_formatted, raw);
             assert_eq!(fake.mutations, 1);
             assert_eq!(fake.formats, usize::from(raw));
             if !raw {

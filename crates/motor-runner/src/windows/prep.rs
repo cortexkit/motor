@@ -585,7 +585,15 @@ pub(super) fn store_collection(
     bytes: &[u8],
     deleted: &[String],
 ) -> io::Result<()> {
-    motor_winagent::validate_tree(&mut io::Cursor::new(bytes))?;
+    motor_winagent::validate_collection(&mut io::Cursor::new(bytes))?;
+    for path in deleted {
+        motor_winagent::validate_archive_path(path)?;
+        if !path.starts_with("m/") {
+            return Err(invalid(format!(
+                "deleted member is not a source path: {path}"
+            )));
+        }
+    }
     let mut paths = deleted.to_vec();
     for entry in tar::Archive::new(io::Cursor::new(bytes)).entries()? {
         let entry = entry?;
@@ -599,7 +607,7 @@ pub(super) fn store_collection(
                 "collect member is not a source path: {path}"
             )));
         }
-        if entry.header().entry_type().is_file() {
+        if entry.header().entry_type().is_file() || entry.header().entry_type().is_symlink() {
             paths.push(path);
         }
     }
@@ -618,6 +626,36 @@ pub(super) fn store_collection(
 
 #[cfg(test)]
 mod trusted_cargo_config_tests {
+    #[test]
+    fn collected_links_are_only_inert_tar_bytes_on_the_host() {
+        let root = ScratchDir::new("windows-collected-links");
+        let config = Config::new(root.path().join("state"), "links");
+        let id = Uuid::now_v7();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "m/escape", "/etc/shadow")
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        super::store_collection(&config, id, &bytes, &["m/deleted".into()]).unwrap();
+        let job = config.state_dir().join("jobs").join(id.to_string());
+        assert_eq!(
+            std::fs::read(job.join("windows-changes.tar")).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read_dir(&job).unwrap().count(), 2);
+        assert!(!job.join("m").exists());
+        let manifest: Vec<String> = read_json(&job.join("windows-changes.json")).unwrap();
+        assert_eq!(manifest, ["m/deleted", "m/escape"]);
+        for path in ["../outside", "cargo-home/escape", "m/../escape", "m/a\\b"] {
+            assert!(
+                super::store_collection(&config, Uuid::now_v7(), &bytes, &[path.into()]).is_err()
+            );
+        }
+    }
     use super::*;
     use cortexkit_test_support::ScratchDir;
 

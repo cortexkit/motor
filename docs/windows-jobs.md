@@ -162,6 +162,22 @@ Test: `windows_backend_case_collisions_are_detected_before_case_insensitive_extr
 4.5. A tracked symlink is staged as a regular file whose content is the link's
 target. Test: `windows_backend_stages_a_tracked_symlink_as_a_file_holding_its_target`.
 
+4.6. The standard `motor-job` account holds `SeCreateSymbolicLinkPrivilege`
+through a SID-specific local-security-policy assignment, not Developer Mode or
+administrator membership. Jobs can create file and directory symlinks, including
+absolute and UNC targets. Junctions and directory mount points already required
+no such privilege. After the Job Object empties, collection runs impersonated as
+the job user: it hashes link text and emits zero-payload symlink tar records,
+never target bytes. Reparse directories are not traversed, a reparse source root
+is refused, and unsupported reparse types fail rather than being followed.
+Case-insensitive `target` subtrees remain excluded. The Linux runner saves this
+archive as inert bytes plus a validated source-path manifest; it never unpacks
+returned links onto the host. Staging still forbids link archive entries. Tests:
+`collection_returns_file_directory_and_dangling_links_without_target_bytes`,
+`collected_link_text_preserves_windows_absolute_unc_and_long_targets`,
+`collected_links_are_only_inert_tar_bytes_on_the_host`, and
+`windows_qualification_symlinks_do_not_escape_collection_or_cache` (operator-only).
+
 ## 5. What a Windows job may build
 
 5.1. A trusted preparation step, run on the host as the `motor-prep` account,
@@ -266,3 +282,18 @@ Tests: `windows_cache_key_includes_baseline_name_and_toolchain`,
 
 Two workspaces never share a disk, but jobs in the same workspace do: a job can
 leave files in the cache that the next job in that workspace reads.
+
+The agent grants the empty physical `C:\t` folder before mounting the cache.
+Only a newly formatted volume may receive the inheritable job-SID Modify ACL;
+SYSTEM never repairs ACLs recursively on a reused, job-populated tree. If its
+exact grant is missing, the agent reports `cache_grant_missing` without changing
+the tree. The host stops the failed VM, discards the cache, logs the workspace's
+cache-key hash, and retries preparation once on a fresh disk before opening the
+execution gate. A second failure refuses the job, not a third boot. Dismount uses
+the volume GUID, never the mutable workspace junction or `C:\t` pathname; the
+mount folder is left in the disposable OS overlay. Tests:
+`reused_cache_missing_grant_never_updates_acl`,
+`mount_folder_refuses_links_and_nonempty_directories`,
+`privileged_dismount_never_resolves_the_job_mount_folder`,
+`windows_backend_missing_cache_grant_discards_and_retries_once_before_start`, and
+`windows_backend_missing_cache_grant_on_retry_refuses_without_third_boot`.
