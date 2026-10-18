@@ -99,9 +99,8 @@ async fn tenant_first_frame_is_strict_and_local_ssh_still_uses_hello() {
         task.await.unwrap().unwrap();
     }
     assert!(pending(&runner).is_empty());
-    let listener = tokio::net::UnixListener::bind(runner.config().socket_path()).unwrap();
-    let task = tokio::spawn(crate::serve(runner.clone(), listener));
-    let mut socket = tokio::net::UnixStream::connect(runner.config().socket_path())
+    let (socket_path, task) = super::listener(&f, &runner);
+    let mut socket = tokio::net::UnixStream::connect(&*socket_path)
         .await
         .unwrap();
     motor_protocol::write_frame_async(&mut socket, &hello())
@@ -290,6 +289,20 @@ async fn tenant_rejection_disconnect_and_expiry_are_distinct() {
     task.await.unwrap().unwrap();
     assert_eq!(pending(&runner)[0].cause, Some(RefusedCause::Expired));
     assert!(!runner.has_job_record(run.job_id));
+}
+
+// Only Linux hosts provide a tenant VM platform, so only they can reach the
+// valid-run lease path whose drain refusal this test exercises.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tenant_drain_refuses_a_supported_run_lease() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut run, _) = f.run("true");
+    run.weight_hint = Some(2);
+    run.timeout = Some(30);
+    run.platform = None;
+    run.network = None;
     runner.begin_drain(Duration::from_secs(30), false);
     let (mut client, task) = connect(&runner, lease(run.job_id, LeasePurpose::Run)).await;
     motor_protocol::write_frame_async(&mut client, &Frame::Run(run))
@@ -303,6 +316,9 @@ async fn tenant_rejection_disconnect_and_expiry_are_distinct() {
     assert_eq!(pending(&runner)[0].cause, Some(RefusedCause::Rejected));
 }
 
+// Tenant Run admission is Linux-only because host_platform() deliberately
+// returns None on hosts that cannot run the tenant VM.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tenant_accepted_is_admitted_and_withdraw_is_terminal() {
     let f = Fixture::new();
@@ -474,6 +490,9 @@ async fn tenant_retained_records_cannot_be_run_again_in_any_state() {
     }
 }
 
+// This requires the runner to accept a valid tenant Run lease, which is only
+// supported on Linux hosts.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tenant_second_run_after_started_detaches_but_original_finishes() {
     let f = Fixture::new();
@@ -532,6 +551,9 @@ async fn tenant_second_run_after_started_detaches_but_original_finishes() {
     );
 }
 
+// This requires the runner to accept a valid tenant Run lease, which is only
+// supported on Linux hosts.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tenant_failed_accepted_write_is_not_admitted_and_can_reconnect() {
     use std::{
@@ -697,6 +719,9 @@ fn tenant_compile_target_determines_lease_platform() {
     assert!(!crate::tenant::matches(&token, &run));
 }
 
+// This requires the runner to accept a valid tenant Run lease, which is only
+// supported on Linux hosts.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn return_paths_tenant_cap_one_returns_failure_before_real_terminal_and_replays() {
     let f = Fixture::new();
