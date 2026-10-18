@@ -12,7 +12,7 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
-    path::{Component, Path},
+    path::{Path, PathBuf},
 };
 
 // Resolve symlinks first for an explicit escape result, then walk the resolved
@@ -98,26 +98,29 @@ fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cau
     Err(Cause::NotRegular)
 }
 
-fn open_directory(path: &Path) -> Result<File, Cause> {
-    let mut directory = File::open("/").map_err(|_| Cause::Missing)?;
-    for component in path.components() {
-        let Component::Normal(name) = component else {
-            continue;
-        };
-        let name = CString::new(name.as_bytes()).map_err(|_| Cause::Missing)?;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-            )
-        };
-        if fd < 0 {
-            return Err(Cause::Escape);
-        }
-        directory = unsafe { File::from_raw_fd(fd) };
+fn open_directory(path: &Path) -> Result<(File, PathBuf), Cause> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or(Cause::Escape)?;
+    let root_name = name.to_owned();
+    let parent = fs::canonicalize(parent).map_err(|_| Cause::Escape)?;
+    let directory = File::open(&parent).map_err(|_| Cause::Escape)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| Cause::Escape)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(Cause::Escape);
     }
-    Ok(directory)
+    let directory = unsafe { File::from_raw_fd(fd) };
+    let root = parent.join(root_name);
+    Ok((directory, root))
 }
 
 pub(crate) fn collect(request: &Run, seq: u64) -> ReturnResult {
@@ -157,8 +160,7 @@ fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) ->
     };
     let mut measured = 0u64;
     let collected = (|| -> Result<Vec<ReturnedFile>, Cause> {
-        let directory = open_directory(Path::new(&request.workspace_key))?;
-        let root = fs::canonicalize(&request.workspace_key).map_err(|_| Cause::Missing)?;
+        let (directory, root) = open_directory(Path::new(&request.workspace_key))?;
         let mut files = Vec::new();
         for path in &request.return_paths {
             let relative = Path::new(path)
@@ -427,5 +429,24 @@ mod tests {
         fs::rename(&root, canonical.join("old-workspace")).unwrap();
         symlink(canonical.join("old-workspace"), &root).unwrap();
         failed(collect(&run), Cause::Escape, 0, 2);
+    }
+
+    #[test]
+    fn return_paths_allow_a_symlinked_workspace_ancestor() {
+        use std::os::unix::fs::symlink;
+        let dir = ScratchDir::new("return-paths");
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let actual_parent = base.join("actual-parent");
+        let linked_parent = base.join("linked-parent");
+        fs::create_dir_all(actual_parent.join("workspace")).unwrap();
+        symlink(&actual_parent, &linked_parent).unwrap();
+        let root = linked_parent.join("workspace");
+        let file = root.join("returned");
+        fs::write(&file, b"x").unwrap();
+
+        let result = collect(&request(&root, &[&file], 1));
+
+        assert_eq!(result.return_paths_failed, None);
+        assert_eq!(result.returned_files.unwrap()[0].data, "eA==");
     }
 }
