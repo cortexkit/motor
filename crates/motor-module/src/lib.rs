@@ -7,6 +7,7 @@ pub mod cli;
 mod config;
 mod default_tip;
 mod diagnostics;
+mod engram_catalog;
 mod hosted;
 pub mod logging;
 pub mod module;

@@ -240,7 +240,20 @@ pub struct Handler {
     run_count: Arc<std::sync::atomic::AtomicUsize>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
+    write_engram_catalog: bool,
 }
+fn module_data_dir() -> io::Result<PathBuf> {
+    let data = match std::env::var_os("XDG_DATA_HOME") {
+        Some(data) => PathBuf::from(data),
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| io::Error::other("neither XDG_DATA_HOME nor HOME is set"))?,
+        )
+        .join(".local/share"),
+    };
+    Ok(data.join("cortexkit/ck-motor"))
+}
+
 impl Handler {
     pub fn new(config: Config) -> Self {
         Self {
@@ -253,7 +266,12 @@ impl Handler {
             run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
+            write_engram_catalog: false,
         }
+    }
+    pub fn with_engram_catalog(mut self) -> Self {
+        self.write_engram_catalog = true;
+        self
     }
     /// Serve with an already open `Motor` instead of opening one from the
     /// daemon's storage descriptor, so tests can drive this handler against an
@@ -289,18 +307,7 @@ impl Handler {
                     _ => Err(io::Error::other("ck-motor requires SQLite module storage")),
                 }
             }
-            None => {
-                let data = match std::env::var_os("XDG_DATA_HOME") {
-                    Some(data) => PathBuf::from(data),
-                    None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
-                        io::Error::other("neither XDG_DATA_HOME nor HOME is set")
-                    })?)
-                    .join(".local/share"),
-                };
-                Ok(data
-                    .join("cortexkit/ck-motor")
-                    .join(&self.config.runner_instance))
-            }
+            None => Ok(module_data_dir()?.join(&self.config.runner_instance)),
         }
     }
     fn startup_failed(&self, detail: String) {
@@ -310,6 +317,7 @@ impl Handler {
     async fn initialize_storage(
         &self,
         root: PathBuf,
+        catalog_data_dir: io::Result<PathBuf>,
         first_attempt: tokio::sync::oneshot::Sender<()>,
     ) {
         let mut first_attempt = Some(first_attempt);
@@ -331,6 +339,14 @@ impl Handler {
                         .await,
                     );
                     motor.set_connector(ssh.clone());
+                    if self.write_engram_catalog {
+                        // Catalog I/O must not delay readiness on a slow data volume.
+                        let data_dir = catalog_data_dir;
+                        let catalog_root = root.clone();
+                        drop(tokio::task::spawn_blocking(move || {
+                            crate::engram_catalog::write_best_effort(data_dir, &catalog_root)
+                        }));
+                    }
                     self.ssh.set(ssh).ok();
                     self.motor.set(motor).ok();
                     *self.startup_error.lock().unwrap() = None;
@@ -577,7 +593,9 @@ impl ModuleHandler for Handler {
             }
             let handler = self.clone();
             *task = Some(tokio::spawn(async move {
-                handler.initialize_storage(root, ready).await
+                handler
+                    .initialize_storage(root, module_data_dir(), ready)
+                    .await
             }));
         }
         // Keep the ordinary startup ready before serving requests. Contention

@@ -83,7 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             id.clone(),
         ),
     );
-    let handler = Handler::new(config).with_credentials(resolver);
+    let handler = Handler::new(config)
+        .with_credentials(resolver)
+        .with_engram_catalog();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let result = tokio::select! {
