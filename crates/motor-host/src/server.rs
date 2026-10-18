@@ -11,6 +11,25 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[derive(Default)]
+pub struct LifecycleStream {
+    boundary: Option<u64>,
+}
+impl LifecycleStream {
+    pub fn boundary(&mut self, frame: &Value) -> Result<bool> {
+        if frame["type"] != "event_replay" {
+            return Ok(false);
+        }
+        ensure!(self.boundary.is_none(), "duplicate replay boundary");
+        let boundary: motor_protocol::TenantReplayBoundary = serde_json::from_value(frame.clone())?;
+        self.boundary = Some(boundary.through_seq);
+        Ok(true)
+    }
+    pub fn is_live(&self, seq: u64) -> bool {
+        self.boundary.is_some_and(|through| seq > through)
+    }
+}
+
 pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -28,6 +47,7 @@ pub struct Runtime {
     pub fetch_keys: AtomicBool,
     last_key_refresh: Mutex<u64>,
     event_workers: Mutex<BTreeSet<String>>,
+    terminal_workers: Mutex<BTreeSet<String>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
 }
 impl Runtime {
@@ -43,6 +63,7 @@ impl Runtime {
             keys: RwLock::new(KeySet::default()),
             control,
             event_workers: Mutex::new(BTreeSet::new()),
+            terminal_workers: Mutex::new(BTreeSet::new()),
             tenant_operations,
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
@@ -58,6 +79,10 @@ impl Runtime {
             return;
         }
         *last = now;
+        self.keys
+            .write()
+            .expect("keys lock")
+            .should_refetch("", now);
         let fetched = (|| -> Result<motor_lease::Jwks> {
             Ok(reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -74,6 +99,10 @@ impl Runtime {
             .refresh(fetched.map_err(|_| AuthError::Auth));
     }
     pub fn recover(self: &Arc<Self>) -> Result<()> {
+        self.host
+            .lock()
+            .expect("host lock")
+            .start_billing(unix_ms())?;
         let tenants: Vec<_> = self
             .host
             .lock()
@@ -84,7 +113,14 @@ impl Runtime {
             .collect();
         for tenant in tenants {
             if self.control.adopt(&tenant)? {
-                self.ensure(&tenant)?;
+                if self.ensure(&tenant).is_err() {
+                    tracing::error!(tenant, "tenant_recovery_pending");
+                }
+            } else {
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .lose_tenant(&tenant, unix_ms())?;
             }
         }
         Ok(())
@@ -148,7 +184,10 @@ impl Runtime {
             )
         };
         if !ready {
-            let generation = self.control.wake(tenant, generation)?;
+            let generation = self.control.wake(tenant, generation).map_err(|error| {
+                tracing::error!(tenant, detail=%error, "tenant_recovery_or_initialization_failed");
+                Error::Refused(Refusal::Capacity)
+            })?;
             let mut host = self.host.lock().expect("host lock");
             host.guest_ready(tenant, generation)?;
         }
@@ -231,13 +270,27 @@ impl Runtime {
                         .lock()
                         .expect("host lock")
                         .events_connected(&tenant, Some(unix_ms()));
+                    let mut observation = LifecycleStream::default();
                     loop {
                         let frame = read_json(&mut stream)?;
+                        if observation.boundary(&frame)? {
+                            continue;
+                        }
                         ensure!(frame["type"] == "event", "invalid lifecycle frame");
-                        let event = serde_json::from_value(frame)?;
+                        let event: motor_protocol::TenantEvent = serde_json::from_value(frame)?;
+                        let metrics = runtime.control.metrics(&tenant).ok();
                         let update = {
                             let mut host = runtime.host.lock().expect("host lock");
-                            host.event(&tenant, &event, unix_ms())?;
+                            host.event_observed(
+                                &tenant,
+                                &event,
+                                unix_ms(),
+                                observation.is_live(event.event_seq),
+                            )?;
+                            if let Some(metrics) = metrics {
+                                host.sample(&tenant, metrics)?;
+                            }
+                            host.billing_tick(unix_ms())?;
                             host.quota_update(&tenant, unix_ms())?
                         };
                         if let Some(update) = update {
@@ -260,9 +313,11 @@ impl Runtime {
             }
         });
     }
-    pub fn tick(&self, now_ms: u64) -> Result<()> {
+    pub fn tick(self: &Arc<Self>, now_ms: u64) -> Result<()> {
+        self.fetch_detached_terminals();
         let (cancels, quotas, candidates) = {
             let mut host = self.host.lock().expect("host lock");
+            host.billing_tick(now_ms)?;
             let cancels = host.expire(now_ms)?;
             let mut quotas = Vec::new();
             let mut candidates = Vec::new();
@@ -296,6 +351,21 @@ impl Runtime {
                 failure.get_or_insert(error);
             }
         }
+        let stops = self.host.lock().expect("host lock").stops_due();
+        for tenant in stops {
+            let operations = self.tenant_operations(&tenant)?;
+            let _operation = operations.lock().expect("tenant operations lock");
+            if self
+                .host
+                .lock()
+                .expect("host lock")
+                .stops_due()
+                .contains(&tenant)
+            {
+                self.control.stop(&tenant)?;
+                self.host.lock().expect("host lock").stopped(&tenant)?;
+            }
+        }
         if !candidates.is_empty() {
             match self.control.available_bytes() {
                 Ok(available) => {
@@ -313,6 +383,78 @@ impl Runtime {
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+    fn fetch_detached_terminals(self: &Arc<Self>) {
+        let jobs: Vec<_> = {
+            let host = self.host.lock().expect("host lock");
+            host.snapshot
+                .leases
+                .iter()
+                .filter(|(job, l)| {
+                    l.state == LeaseState::Ended
+                        && !host.snapshot.zero_usage.contains_key(*job)
+                        && host
+                            .snapshot
+                            .billing
+                            .get(*job)
+                            .is_none_or(|b| b.terminal.is_none())
+                })
+                .map(|(job, l)| (job.clone(), l.clone()))
+                .collect()
+        };
+        for (job, lease) in jobs {
+            if !self
+                .terminal_workers
+                .lock()
+                .expect("terminal workers")
+                .insert(job.clone())
+            {
+                continue;
+            }
+            let runtime = self.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> Result<()> {
+                    // This host-CID-only attach reads the runner's real result;
+                    // it neither admits a run nor reserves another CPU share.
+                    let mut stream = runtime.control.relay(&lease.tenant, 52)?;
+                    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                    let c = &lease.claims;
+                    write_json(
+                        &mut stream,
+                        &json!({"type":"verified_lease","jti":job,"purpose":"attach","sub":c.sub,"vcpus":c.vcpus,"mem_mib":c.mem_mib,"platform":c.platform,"net":c.net,"max_s":c.max_s,"exp":c.exp}),
+                    )?;
+                    write_json(
+                        &mut stream,
+                        &json!({"type":"hello", "protocol_version":1, "started":true}),
+                    )?;
+                    write_json(
+                        &mut stream,
+                        &json!({"type":"attach", "job_id":job, "from_seq":lease.highest_seq.saturating_add(1)}),
+                    )?;
+                    loop {
+                        let frame = read_json(&mut stream)?;
+                        if frame["type"] == "terminal" {
+                            let metrics = runtime.control.metrics(&lease.tenant).ok();
+                            let mut host = runtime.host.lock().expect("host lock");
+                            if let Some(metrics) = metrics {
+                                host.sample(&lease.tenant, metrics)?;
+                            }
+                            host.receive_terminal_observed(&job, frame, unix_ms(), false)?;
+                            return Ok(());
+                        }
+                    }
+                })();
+                if result.is_err() {
+                    tracing::warn!(jti = job, "terminal_fetch_retry");
+                }
+                runtime
+                    .terminal_workers
+                    .lock()
+                    .expect("terminal workers")
+                    .remove(&job);
+            });
         }
     }
     fn suspend_tenant(&self, tenant: &str, now_ms: u64, available_bytes: u64) -> Result<()> {
@@ -488,7 +630,14 @@ where
     let authentication = tokio::task::spawn_blocking(move || {
         let result = auth_runtime.authenticate(&token, &auth_requester, unix_ms() / 1000);
         if matches!(result, Err(Error::Refused(Refusal::Auth))) {
-            auth_runtime.refresh_keys(60);
+            let refetch = auth_runtime
+                .keys
+                .write()
+                .expect("keys lock")
+                .should_refetch(&token, unix_ms() / 1000);
+            if refetch {
+                auth_runtime.refresh_keys(60);
+            }
             auth_runtime.authenticate(&token, &auth_requester, unix_ms() / 1000)
         } else {
             result
@@ -592,6 +741,10 @@ where
         let remaining = claims.exp.saturating_mul(1000).saturating_sub(unix_ms());
         let first = tokio::time::timeout(Duration::from_millis(remaining), read_frame(&mut client))
             .await??;
+        let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
+        if stored {
+            return serve_stored(&runtime, &claims.jti, &first, &mut client).await;
+        }
         let delivery_runtime = runtime.clone();
         let delivery_claims = claims.clone();
         let mut delivery = tokio::task::spawn_blocking(move || {
@@ -607,7 +760,17 @@ where
                     ensure!(n > 0, "client closed before delivery");
                     buffered.extend_from_slice(&buffer[..n]);
                 }
-                stream = &mut delivery => { break stream??; }
+                stream = &mut delivery => {
+                    match stream? {
+                        Ok(stream) => break stream,
+                        Err(error) => {
+                            if error.downcast_ref::<Error>().is_some_and(|e| matches!(e, Error::Refused(Refusal::Capacity))) {
+                                write_frame(&mut client,&json!({"type":"lease_refused","reason":"capacity"})).await?;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
             }
         };
         stream.set_nonblocking(true)?;
@@ -618,14 +781,58 @@ where
         let (mut gr, mut gw) = guest.split();
         let to_guest = tokio::io::copy(&mut cr, &mut gw);
         let to_client = async {
+            let mut cursor: u64 = 0;
             loop {
-                let frame = read_frame(&mut gr).await?;
+                let read = read_frame(&mut gr);
+                tokio::pin!(read);
+                let frame = loop {
+                    tokio::select! {
+                        result = &mut read => { break Some(result); },
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
+                            if let Some(frames) = frames {
+                                for frame in frames { write_frame(&mut cw, &frame).await?; }
+                                runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                                break None;
+                            }
+                        }
+                    }
+                };
+                let Some(frame) = frame else { return Ok::<(),anyhow::Error>(()); };
+                let settled = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
+                if let Some(frames) = settled {
+                    tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
+                    for frame in frames { write_frame(&mut cw,&frame).await?; }
+                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                    return Ok::<(),anyhow::Error>(());
+                }
+                let frame = frame?;
                 if let Some(seq) = frame["seq"].as_u64() {
                     runtime
                         .host
                         .lock()
                         .expect("host lock")
                         .watermark(&claims.jti, seq)?;
+                    cursor = cursor.max(seq);
+                }
+                if frame["type"] == "terminal" {
+                    let control = runtime.control.clone();
+                    let tenant = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].tenant.clone();
+                    let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await?;
+                    {
+                        let mut host = runtime.host.lock().expect("host lock");
+                        if let Ok((tenant,sample)) = sample { host.sample(&tenant,sample)?; }
+                        host.receive_terminal(&claims.jti, frame.clone(), unix_ms())?;
+                    }
+                    let hosted = loop {
+                        let value = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.hosted_terminal.clone());
+                        if let Some(value) = value { break value; }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    };
+                    write_frame(&mut cw, &frame).await?;
+                    write_frame(&mut cw, &hosted).await?;
+                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                    return Ok::<(),anyhow::Error>(());
                 }
                 write_frame(&mut cw, &frame).await?;
             }
@@ -639,6 +846,56 @@ where
     }.await;
     connection.finish().await;
     outcome
+}
+
+async fn serve_stored(
+    runtime: &Runtime,
+    job: &str,
+    first: &Value,
+    client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+) -> Result<()> {
+    ensure!(first["type"] == "hello", "expected hello");
+    write_frame(
+        client,
+        &json!({"type":"hello", "protocol_version":1,"started":true}),
+    )
+    .await?;
+    loop {
+        let request = read_frame(client).await?;
+        ensure!(request["job_id"] == job, "operation_refused");
+        match request["type"].as_str() {
+            Some("attach") => {
+                let from = request["from_seq"].as_u64().context("attach cursor")?;
+                let frames = runtime
+                    .host
+                    .lock()
+                    .expect("host lock")
+                    .host_settled_frames(job, from)
+                    .context("stored terminal")?;
+                for frame in frames {
+                    write_frame(client, &frame).await?;
+                }
+                runtime
+                    .host
+                    .lock()
+                    .expect("host lock")
+                    .terminal_delivered(job, unix_ms())?;
+                return Ok(());
+            }
+            Some("job_status") => {
+                let mut terminal = runtime.host.lock().expect("host lock").snapshot.billing[job]
+                    .terminal
+                    .clone()
+                    .context("stored terminal")?;
+                terminal.as_object_mut().context("terminal")?.remove("type");
+                write_frame(client, &json!({"type":"job_status_reply","job_id":job,"state":"ended","terminal":terminal,"unit":null,"unit_alive":false})).await?;
+            }
+            Some("cancel") => {
+                write_frame(client, &json!({"type":"cancel_reply","job_id":job})).await?
+            }
+            _ => bail!("operation_refused"),
+        }
+    }
 }
 
 async fn await_admission(

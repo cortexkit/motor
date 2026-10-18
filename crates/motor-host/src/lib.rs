@@ -1,5 +1,7 @@
 //! Unprivileged tenant admission and durable relay ownership.
 
+pub mod billing;
+pub mod broker;
 pub mod helper;
 pub mod journal;
 pub mod server;

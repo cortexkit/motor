@@ -52,11 +52,20 @@ pub struct TenantEvent {
     pub cause: Option<RefusedCause>,
 }
 
+/// The event sequence allocated before a lifecycle connection began. Events at
+/// or below this watermark are replay, even if they arrive much later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantReplayBoundary {
+    pub through_seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TenantAgentRequest {
     AttachTenant {
         generation: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        recovery_required: bool,
         unix_ms: u64,
         seed: String,
         address: String,
@@ -83,6 +92,9 @@ pub enum TenantAgentRequest {
         kind: SnapshotKind,
     },
     Thaw,
+    RecoveryStatus {
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

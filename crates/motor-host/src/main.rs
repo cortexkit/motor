@@ -20,6 +20,7 @@ struct Config {
     listen: String,
     certificate: PathBuf,
     private_key: PathBuf,
+    host_signing_key: PathBuf,
     journal_dir: PathBuf,
     helper_socket: PathBuf,
     registry_dir: PathBuf,
@@ -104,6 +105,33 @@ async fn main() -> Result<()> {
         startup.recover()
     })
     .await??;
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    let mut signing_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&config.host_signing_key)?;
+    let metadata = signing_file.metadata()?;
+    // SAFETY: geteuid has no arguments or preconditions.
+    ensure!(
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "host signing key must be a private, owned regular file"
+    );
+    let mut bytes = Vec::new();
+    signing_file.by_ref().take(33).read_to_end(&mut bytes)?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("host_signing_key must contain a 32-byte Ed25519 seed"))?;
+    let sender = runtime.clone();
+    std::thread::spawn(move || {
+        if motor_host::broker::run(sender, ed25519_dalek::SigningKey::from_bytes(&seed)).is_err() {
+            tracing::error!("host_sender_failed");
+        }
+    });
     let refresher = runtime.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(600));

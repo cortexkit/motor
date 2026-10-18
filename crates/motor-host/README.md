@@ -11,6 +11,8 @@ lease response.
 Configuration is a closed JSON object with these required fields:
 
 - `host_id`, `listen` (a socket address), `certificate`, `private_key`;
+- `host_signing_key`, a host-private file containing a raw 32-byte Ed25519 seed
+  registered with the broker (separate from the TLS key);
 - `journal_dir` (normally `/var/lib/motor-host`);
 - `helper_socket` (normally `/run/motor-vm-helper.sock`);
 - `bindings` (normally `/etc/motor-host/tenants.json`), the provisioner's VM to
@@ -64,12 +66,53 @@ and expiry refusals keep their actual wire reasons; a replacement whose original
 job was admitted gets `auth`. Missing lease records are checked without panicking
 under the shared host lock.
 
-No-start endings create idempotent `zero_usage` journal entries for the signed
-usage/outbox consumer. Admitted/started end timestamps and `stop_pending` are
-retained for the usage/watchdog layer; this admission package does not send
-broker usage requests or implement terminal billing/delivery grace. Lifecycle
-and relay handling expose that durable state for that layer rather than treating
-a network disconnect as a settlement.
+No-start endings create idempotent `zero_usage` journal entries. The billing
+owner consumes them alongside real terminal frames, using host observations only.
+A lifecycle connection starts with an additive `event_replay {through_seq}`
+watermark; existing event and acknowledgement frames are unchanged. Events at or
+below the watermark are replay: started is stamped at host restart and terminal
+at the previous `last_alive`. Without a watermark, all events are conservatively
+replay. A wholly unobserved run settles zero, never guest-reported elapsed time.
+
+At the runtime cap the watchdog journals a cancel and removes the CPU share.
+After another 60 seconds without a runner result on the job relay (port 52) or
+a terminal lifecycle event on the event stream (port 53), the watchdog records
+the job as lost. Receiving the job-relay result prevents that lost outcome. If
+its lifecycle event is missing for 30 seconds, the host instead uses the receipt
+time of the job-relay result as the end. An unstarted lease is cancelled at token
+issue time plus six minutes.
+Lost jobs have a stored empty output truncation marker and unsequenced
+`outcome_unknown` terminal, followed by the immutable `hosted_terminal` billing
+record. The synthesized empty output uses exec-remote/v1's `bytes` field. Reattaches replay
+these records without waking a guest. A pending VM stop rejects new runs with
+`capacity`, lets other jobs finish, then stops the VM without a snapshot.
+
+Real terminals are held until their integer billing record is durable, then
+written before `hosted_terminal`. Usage is enqueued after that write or after a
+60-second delivery grace. Detached results are retrieved through a host-only
+attach, never by resubmitting Run. Different broker settlement figures and final
+409 replies log `usage_billing_diverged` without changing the caller's figure.
+
+One broker sender signs heartbeats every 15 seconds and on lifecycle change, and
+drains the durable usage outbox. Its counter is fsynced before signing, seeded at
+`max(persisted + 1, unix_ms * 1000)` on restart. Retries preserve body bytes and
+use fresh timestamps, counters and lowercase-hex signatures from `motor-lease`.
+Only one signed request is in flight. `usage_conflict`, `job_settled` and
+`job_unknown` are final reconciliation errors; other failures retry. After 30
+days an entry is archived under `journal_dir/outbox-expired` and the queue moves
+on. A 401 emits a key-retirement alert for an operator to check clock reversal.
+
+The read-only `tenant_metrics` helper operation samples the VM's
+`memory.current` and its own nftables forward-rule byte counter at start, end and
+periodic heartbeats. VM-lifetime `memory.peak` cannot be scoped to one lease
+without resetting shared state, so memory is a sampled peak: spikes between the
+15-second samples can be missed. Both measurements are null after overlap with
+another Reserved, Admitted or Started lease; otherwise they are integer values.
+Missing initial samples are not fabricated as zero. All helper and broker I/O
+runs outside the host-state mutex.
+The helper preserves each registered tenant's named egress counter across other
+tenants' enable/disable transactions and across helper reconciliation, so a solo
+job's byte delta does not reset when another tenant starts.
 
 CPU quota remains one vCPU until guest initialization replies, then uses the
 current share (at least one). Started leases past their runtime cap leave the
@@ -106,3 +149,13 @@ framed relay and helper descriptor tests. `tests/it/` is folded into library tes
 Actual Firecracker restore, cgroup enforcement, root-owned registry permissions
 and free-space accounting on the operator filesystem require the dedicated
 hosted VM qualification lane; portable tests are not that qualification.
+
+The image qualification must also exercise an unclean stop during a Git write:
+verify that the durable host `unclean-stop.json` survives agent/helper restart;
+that new work is refused until the guest mounts XFS to replay its log, unmounts,
+runs `xfs_repair -n`, remounts and runs `git fsck --full --no-dangling` on retained
+bare stores; and that only a successful initialized guest clears the flag.
+Inject an XFS-check failure and an unreachable guest and verify the flag stays
+set and no Run reaches the runner. A clean start must run none of these checks.
+The image needs `xfs_repair` and Git. No tenant filesystem is ever mounted by the
+host kernel, and recovery never uses `xfs_repair -L` or deletes disk data.

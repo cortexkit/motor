@@ -104,3 +104,74 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
         worker.join().unwrap();
     }
 }
+
+#[test]
+fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant_fenced() {
+    for result in ["pass", "fail", "unreachable"] {
+        let directory = scratch();
+        let socket = directory.path().join("helper.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            for op in ["adopt", "ensure", "set_cpu_max", "open_relay"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["op"], op);
+                assert_eq!(request["tenant"], "tenant");
+                if op == "open_relay" {
+                    let (fd, mut guest) = UnixStream::pair().unwrap();
+                    descriptor_reply(&stream, &fd);
+                    let init = read_json(&mut guest).unwrap();
+                    assert_eq!(init["recovery_required"], true);
+                    assert_eq!(init["op"], "attach_tenant");
+                    if result == "pass" {
+                        write_json(&mut guest, &json!({"ok":true})).unwrap();
+                    }
+                    if result == "fail" {
+                        write_json(&mut guest,&json!({"ok":false,"error":"tenant_recovery_failed","detail":"xfs_check failed"})).unwrap();
+                    }
+                } else {
+                    writeln!(stream,"{}",json!({"result":"tenant","running":op!="adopt","generation":2,"recovery_required":true})).unwrap();
+                }
+            }
+            if result == "pass" {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["op"],
+                    "recovery_complete"
+                );
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"result":"tenant","running":true,"generation":2})
+                )
+                .unwrap();
+            }
+        });
+        let helper = Helper {
+            socket,
+            storage: directory.path().into(),
+            guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
+        };
+        let response = helper.wake("tenant", None);
+        assert_eq!(response.is_ok(), result == "pass");
+        if result != "pass" {
+            assert!(matches!(
+                response
+                    .unwrap_err()
+                    .downcast_ref::<motor_host::state::Error>(),
+                Some(motor_host::state::Error::Refused(
+                    motor_host::state::Refusal::Capacity
+                ))
+            ));
+        }
+        worker.join().unwrap();
+    }
+}

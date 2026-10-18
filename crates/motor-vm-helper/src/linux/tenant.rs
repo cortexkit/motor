@@ -66,6 +66,12 @@ impl LinuxTenants {
             for entry in std::fs::read_dir(&self.groups)? {
                 let path = entry?.path();
                 if path.is_dir() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| Error("invalid tenant cgroup name".into()))?;
+                    let registry = self.registry(name)?;
+                    self.mark_unclean(&registry, "helper_restart")?;
                     std::fs::write(path.join("cgroup.kill"), "1")?;
                     wait_empty(&path)?;
                     std::fs::remove_dir(path)?;
@@ -80,7 +86,9 @@ impl LinuxTenants {
         }
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
-        for r in self.registries()? {
+        let registries = self.registries()?;
+        tenant_network::install(&registries)?;
+        for r in registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(&std::fs::symlink_metadata(ancestor)?)?;
             }
@@ -175,6 +183,60 @@ fn read_deadline(
     Ok(())
 }
 impl Backend for LinuxTenants {
+    fn unclean(&mut self, registry: &Registry) -> Result<bool> {
+        let path = registry.generation.with_file_name("unclean-stop.json");
+        match fs::trusted_file(&path) {
+            Ok(file) => {
+                let _: Value = serde_json::from_reader(file)
+                    .map_err(|e| Error(format!("invalid unclean-stop record: {e}")))?;
+                Ok(true)
+            }
+            Err(_) if !path.exists() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    fn mark_unclean(&mut self, registry: &Registry, reason: &str) -> Result<()> {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        durable_write(
+            &registry.generation.with_file_name("unclean-stop.json"),
+            &serde_json::to_vec(
+                &json!({"at_ms":at_ms,"reason":reason.chars().take(1024).collect::<String>()}),
+            )
+            .map_err(|e| Error(e.to_string()))?,
+        )
+    }
+    fn prepare_stop(&mut self, tenant: &str) -> Result<()> {
+        let fd = self.relay(tenant, 54)?;
+        exchange_agent(
+            UnixStream::from(fd),
+            &json!({"op":"prepare_snapshot","kind":"suspend"}),
+            Duration::from_secs(15),
+        )
+    }
+    fn recovery_complete(&mut self, tenant: &str, registry: &Registry) -> Result<()> {
+        if !self.unclean(registry)? {
+            return Ok(());
+        }
+        let generation = self.key(registry)?.generation;
+        self.agent(
+            tenant,
+            json!({"op":"recovery_status","generation":generation}),
+        )?;
+        let path = registry.generation.with_file_name("unclean-stop.json");
+        std::fs::remove_file(&path)?;
+        File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(())
+    }
+    fn metrics(&mut self, tenant: &str, registry: &Registry) -> Result<(u64, u64)> {
+        let memory = std::fs::read_to_string(self.vm(tenant)?.group.join("memory.current"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| Error("invalid tenant memory sample".into()))?;
+        Ok((memory, tenant_network::egress_bytes(registry)?))
+    }
     fn registry(&mut self, tenant: &str) -> Result<Registry> {
         crate::tenant::validate_name(tenant)?;
         // Validate before even opening the registry directory. trusted_file
@@ -226,6 +288,9 @@ impl Backend for LinuxTenants {
     fn load(&mut self, tenant: &str, r: &Registry, saved: bool) -> Result<()> {
         if self.running(tenant) {
             return Err(Error("tenant already running".into()));
+        }
+        if self.running.contains_key(tenant) {
+            self.mark_unclean(r, "vm_process_lost")?;
         }
         self.stop(tenant)?;
         let uid = self.uid(r)?;

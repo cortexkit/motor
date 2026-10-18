@@ -119,6 +119,12 @@ impl EventLog {
         self.state.lock().unwrap().pending.front().cloned()
     }
     #[cfg(any(target_os = "linux", test))]
+    fn replay_boundary(&self) -> TenantReplayBoundary {
+        TenantReplayBoundary {
+            through_seq: self.state.lock().unwrap().next_seq,
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn ack(&self, seq: u64) -> io::Result<()> {
         let mut guard = self.state.lock().unwrap();
         if guard.pending.front().map(|e| e.event_seq) != Some(seq) {
@@ -207,6 +213,15 @@ pub(crate) async fn event_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
     let log = runner
         .tenant_events()
         .ok_or_else(|| io::Error::other("not a tenant runner"))?;
+    // Capture the watermark before any await; newly allocated events are live.
+    // This additive control frame leaves the retained event and ack bytes alone.
+    let mut boundary = serde_json::to_value(log.replay_boundary()).map_err(io::Error::other)?;
+    boundary["type"] = serde_json::json!("event_replay");
+    let bytes = serde_json::to_vec(&boundary).map_err(io::Error::other)?;
+    use tokio::io::AsyncWriteExt;
+    socket.write_u32(bytes.len() as u32).await?;
+    socket.write_all(&bytes).await?;
+    socket.flush().await?;
     loop {
         log.idle(runner.tenant_idle())?;
         if let Some(event) = log.first() {

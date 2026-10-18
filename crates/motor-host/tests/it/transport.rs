@@ -1,7 +1,7 @@
 use super::*;
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signer, SigningKey};
-use motor_host::helper::{write_json, Control};
+use motor_host::helper::{read_json, write_json, Control};
 use motor_host::server::{read_frame, serve, unix_ms, write_frame, Runtime};
 use motor_lease::{Challenge, Jwks, JwksKey, RequesterJwk};
 use serde_json::{json, Value};
@@ -834,4 +834,216 @@ fn superseded_quota_generation_cannot_override_a_newer_write() {
         .cloned()
         .collect();
     assert_eq!(writes, ["quota:2", "quota:1"]);
+}
+
+#[tokio::test]
+async fn host_settled_attach_replays_identically_without_waking_or_relaying_vm() {
+    let (runtime, fake, broker, requester, mut c) = fixture();
+    {
+        let mut h = runtime.host.lock().unwrap();
+        let now = unix_ms();
+        let (id, _) = h.claim(c.clone(), now).unwrap();
+        h.delivered(id).unwrap();
+        h.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.sample(
+            "tenant",
+            motor_host::billing::Metrics {
+                memory_bytes: 1048576,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+        h.watermark(JOB, 7).unwrap();
+        h.lose_tenant("tenant", now + 3000).unwrap();
+        h.close(id).unwrap();
+    }
+    c.purpose = motor_lease::Purpose::Attach;
+    let mut previous = None;
+    for from in [0, 0, 8, 8] {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(runtime.clone(), server));
+        let challenge = hello(&mut client, &broker, &requester, &c).await;
+        assert_eq!(
+            respond(&mut client, &requester, &c, challenge).await["type"],
+            "lease_ok"
+        );
+        write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+        write_frame(
+            &mut client,
+            &json!({"type":"attach","job_id":JOB,"from_seq":from}),
+        )
+        .await
+        .unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.push(read_frame(&mut client).await.unwrap());
+        }
+        assert_eq!(frames[0]["seq"], 8);
+        assert_eq!(frames[1]["outcome"]["type"], "outcome_unknown");
+        assert_eq!(frames[2]["type"], "hosted_terminal");
+        if let Some(previous) = &previous {
+            assert_eq!(&frames, previous);
+        }
+        previous = Some(frames);
+        task.await.unwrap().unwrap();
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_terminal_and_usage()
+{
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let mut guest = peer(&fake).await;
+    guest
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    // Read in a blocking worker: UnixStream is a synchronous test endpoint.
+    guest = tokio::task::spawn_blocking(move || {
+        assert_eq!(read_json(&mut guest).unwrap()["type"], "verified_lease");
+        assert_eq!(read_json(&mut guest).unwrap()["type"], "hello");
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+    let now = unix_ms();
+    {
+        let mut h = runtime.host.lock().unwrap();
+        h.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.sample(
+            "tenant",
+            motor_host::billing::Metrics {
+                memory_bytes: 1048576,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+    }
+    let terminal = json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":7},"wall_ms":3000,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null});
+    write_json(&mut guest, &terminal).unwrap();
+    // Hold the job-relay result until its lifecycle terminal event arrives,
+    // or until the 30-second wait for that event expires.
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        read_frame(&mut client)
+    )
+    .await
+    .is_err());
+    assert!(runtime.host.lock().unwrap().snapshot.outbox.is_empty());
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            now + 3000,
+        )
+        .unwrap();
+    runtime.tick(now + 3000).unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap(), terminal);
+    let hosted = read_frame(&mut client).await.unwrap();
+    assert_eq!(hosted["billed_vcpu_ms"], 3000);
+    task.await.unwrap().unwrap();
+    assert_eq!(runtime.host.lock().unwrap().snapshot.outbox.len(), 1);
+}
+
+#[tokio::test]
+async fn host_loss_sends_stored_frames_even_when_guest_eof_wins_the_relay_race() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let mut guest = peer(&fake).await;
+    guest = tokio::task::spawn_blocking(move || {
+        read_json(&mut guest).unwrap();
+        read_json(&mut guest).unwrap();
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+    let now = unix_ms();
+    {
+        let mut h = runtime.host.lock().unwrap();
+        h.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        h.sample(
+            "tenant",
+            motor_host::billing::Metrics {
+                memory_bytes: 1048576,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+        h.watermark(JOB, 7).unwrap();
+        h.lose_tenant("tenant", now + 1000).unwrap();
+    }
+    drop(guest);
+    let output = read_frame(&mut client).await.unwrap();
+    assert_eq!(output["seq"], 8);
+    assert_eq!(
+        read_frame(&mut client).await.unwrap()["outcome"]["type"],
+        "outcome_unknown"
+    );
+    assert_eq!(
+        read_frame(&mut client).await.unwrap()["type"],
+        "hosted_terminal"
+    );
+    task.await.unwrap().unwrap();
 }
