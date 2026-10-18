@@ -610,3 +610,228 @@ async fn live_relay_replacement_closes_without_advancing_clock() {
     runtime.host.lock().unwrap().close(replacement).unwrap();
     runtime.host.lock().unwrap().guest_unready("tenant");
 }
+
+#[derive(Default)]
+struct SlowSuspend {
+    inner: Fake,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<bool>,
+    released: std::sync::Condvar,
+    suspended: std::sync::atomic::AtomicBool,
+    quota_writes: Mutex<Vec<(String, u32)>>,
+}
+impl SlowSuspend {
+    fn release(&self) {
+        *self.release.lock().unwrap() = true;
+        self.released.notify_all();
+    }
+}
+impl Control for SlowSuspend {
+    fn adopt(&self, tenant: &str) -> Result<bool> {
+        self.inner.adopt(tenant)
+    }
+    fn wake(&self, tenant: &str, generation: Option<u64>) -> Result<u64> {
+        self.inner.wake(tenant, generation)
+    }
+    fn quota(&self, tenant: &str, vcpus: u32) -> Result<()> {
+        self.quota_writes
+            .lock()
+            .unwrap()
+            .push((tenant.into(), vcpus));
+        self.inner.quota(tenant, vcpus)
+    }
+    fn relay(&self, tenant: &str, port: u32) -> Result<UnixStream> {
+        self.inner.relay(tenant, port)
+    }
+    fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
+        self.inner.admin(tenant, request)
+    }
+    fn available_bytes(&self) -> Result<u64> {
+        self.inner.available_bytes()
+    }
+    fn suspend(&self, _: &str) -> Result<()> {
+        self.suspended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let release = self.release.lock().unwrap();
+        let _ = self
+            .released
+            .wait_timeout_while(release, std::time::Duration::from_secs(4), |release| {
+                !*release
+            })
+            .unwrap();
+        self.suspended
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+// Unblock a failed test before Tokio waits for its blocking tasks at shutdown.
+struct ReleaseSuspend(Arc<SlowSuspend>);
+impl Drop for ReleaseSuspend {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_suspend_does_not_block_other_tenant_admission_or_connection_close() {
+    let (_, _, broker, requester, c) = fixture();
+    let mut host = host();
+    let mut other = tenants()["vm"].clone();
+    other.tenant = "tenant-b".into();
+    other.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+    host.tenants.insert("vm-b".into(), other.clone());
+    host.guest_ready("tenant", 1).unwrap();
+    host.guest_ready("tenant-b", 1).unwrap();
+    let now = unix_ms();
+    host.event("tenant", &event(1, TenantEventKind::Idle, None, None), now)
+        .unwrap();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let control = Arc::new(SlowSuspend {
+        entered: Mutex::new(Some(entered)),
+        ..Default::default()
+    });
+    let _release_on_failure = ReleaseSuspend(control.clone());
+    let runtime = Runtime::new("host".into(), host, control.clone());
+    runtime
+        .keys
+        .write()
+        .unwrap()
+        .refresh(Ok(Jwks {
+            keys: vec![JwksKey::from_key("key", &broker.verifying_key())],
+        }))
+        .unwrap();
+    let mut old = c.clone();
+    old.sub = other.sub.clone();
+    old.placement.vm = Some("vm-b".into());
+    old.vcpus = 2;
+    let (mut old_client, server) = tokio::io::duplex(8192);
+    let old_task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut old_client, &broker, &requester, &old).await;
+    assert_eq!(
+        respond(&mut old_client, &requester, &old, challenge).await["type"],
+        "lease_ok"
+    );
+    let ticker = runtime.clone();
+    tokio::task::spawn_blocking(move || ticker.tick(now))
+        .await
+        .unwrap()
+        .unwrap();
+    let ticker = runtime.clone();
+    let tick = tokio::task::spawn_blocking(move || ticker.tick(now + 60_001));
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = std::time::Instant::now();
+    drop(old_client);
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(1), old_task).await;
+    assert!(
+        closed.is_ok(),
+        "connection cleanup blocked behind another tenant's suspend"
+    );
+    assert!(closed.unwrap().unwrap().is_err());
+    assert!(control
+        .quota_writes
+        .lock()
+        .unwrap()
+        .contains(&("tenant-b".into(), 1)));
+    let mut fresh = old.clone();
+    fresh.jti = JOB3.into();
+    fresh.vcpus = 1;
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        hello(&mut client, &broker, &requester, &fresh),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        respond(&mut client, &requester, &fresh, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&control.inner).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(read_frame(&mut guest).await.unwrap()["jti"], JOB3);
+    assert!(
+        before.elapsed() < std::time::Duration::from_secs(2),
+        "other tenant's admission or close waited for suspend"
+    );
+    assert!(control.suspended.load(std::sync::atomic::Ordering::SeqCst));
+    let mut retry = c;
+    retry.jti = JOB2.into();
+    let (mut retry_client, retry_server) = tokio::io::duplex(8192);
+    let retry_task = tokio::spawn(serve(runtime.clone(), retry_server));
+    let challenge = hello(&mut retry_client, &broker, &requester, &retry).await;
+    assert_eq!(
+        respond(&mut retry_client, &requester, &retry, challenge).await,
+        json!({"type":"lease_refused","reason":"capacity"})
+    );
+    retry_task.await.unwrap().unwrap();
+    assert!(!runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .leases
+        .contains_key(JOB2));
+    tokio::time::timeout(std::time::Duration::from_secs(6), tick)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!runtime.host.lock().unwrap().is_ready("tenant"));
+    let (mut retry_client, retry_server) = tokio::io::duplex(8192);
+    let retry_task = tokio::spawn(serve(runtime.clone(), retry_server));
+    let challenge = hello(&mut retry_client, &broker, &requester, &retry).await;
+    assert_eq!(
+        respond(&mut retry_client, &requester, &retry, challenge).await["type"],
+        "lease_ok"
+    );
+    drop(retry_client);
+    assert!(retry_task.await.unwrap().is_err());
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant-b");
+}
+
+#[test]
+fn superseded_quota_generation_cannot_override_a_newer_write() {
+    let (runtime, fake, _, _, mut c) = fixture();
+    let (older, newer, id) = {
+        let mut host = runtime.host.lock().unwrap();
+        host.guest_ready("tenant", 1).unwrap();
+        let older = host.quota_update("tenant", unix_ms()).unwrap().unwrap();
+        c.vcpus = 2;
+        let (id, _) = host.claim(c, unix_ms()).unwrap();
+        let newer = host.quota_update("tenant", unix_ms()).unwrap().unwrap();
+        assert!(newer.generation > older.generation);
+        (older, newer, id)
+    };
+    runtime.apply_quota(newer.clone()).unwrap();
+    runtime.apply_quota(older).unwrap();
+    let released = {
+        let mut host = runtime.host.lock().unwrap();
+        host.close(id).unwrap();
+        host.quota_update("tenant", unix_ms()).unwrap().unwrap()
+    };
+    assert!(released.generation > newer.generation);
+    runtime.apply_quota(released).unwrap();
+    runtime.apply_quota(newer).unwrap();
+    let writes: Vec<_> = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.starts_with("quota:"))
+        .cloned()
+        .collect();
+    assert_eq!(writes, ["quota:2", "quota:1"]);
+}

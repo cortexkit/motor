@@ -122,10 +122,21 @@ struct Connection {
 struct LiveVm {
     preludes: u32,
     ready: bool,
+    suspending: bool,
+    quota_generation: u64,
+    quota_target: Option<u32>,
+    applied_quota_generation: u64,
     runner_idle: bool,
     space_logged: bool,
     idle_since_ms: Option<u64>,
     events_since_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaUpdate {
+    pub tenant: String,
+    pub generation: u64,
+    pub vcpus: u32,
 }
 
 /// All callers serialize this owner. Persisting a candidate before publishing it
@@ -252,6 +263,38 @@ impl Host {
     pub fn is_ready(&self, tenant: &str) -> bool {
         self.live.get(tenant).is_some_and(|v| v.ready)
     }
+    pub(crate) fn is_suspending(&self, tenant: &str) -> bool {
+        self.live.get(tenant).is_some_and(|v| v.suspending)
+    }
+    pub(crate) fn quota_update(
+        &mut self,
+        tenant: &str,
+        now_ms: u64,
+    ) -> Result<Option<QuotaUpdate>, Error> {
+        if !self.is_ready(tenant) || self.is_suspending(tenant) {
+            return Ok(None);
+        }
+        let vcpus = self.quota(tenant, now_ms);
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        if live.quota_target != Some(vcpus) {
+            live.quota_generation = live
+                .quota_generation
+                .checked_add(1)
+                .ok_or(Error::Refused(Refusal::Capacity))?;
+            live.quota_target = Some(vcpus);
+        }
+        Ok(
+            (live.applied_quota_generation < live.quota_generation).then(|| QuotaUpdate {
+                tenant: tenant.to_owned(),
+                generation: live.quota_generation,
+                vcpus,
+            }),
+        )
+    }
+    pub(crate) fn quota_applied(&mut self, update: &QuotaUpdate) {
+        let live = self.live.entry(update.tenant.clone()).or_default();
+        live.applied_quota_generation = live.applied_quota_generation.max(update.generation);
+    }
     pub fn guest_ready(&mut self, tenant: &str, generation: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         next.vms
@@ -259,11 +302,15 @@ impl Host {
             .or_default()
             .initialized_generation = Some(generation);
         self.save(next)?;
-        self.live.entry(tenant.to_owned()).or_default().ready = true;
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        live.ready = true;
+        live.quota_target = None;
         Ok(())
     }
     pub fn guest_unready(&mut self, tenant: &str) {
-        self.live.entry(tenant.to_owned()).or_default().ready = false;
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        live.ready = false;
+        live.quota_target = None;
     }
     pub fn events_connected(&mut self, tenant: &str, now_ms: Option<u64>) {
         self.live
@@ -279,6 +326,9 @@ impl Host {
         let tenant = self.binding(&claims)?.clone();
         if now_ms / 1000 >= claims.exp {
             return refuse(Refusal::Expired);
+        }
+        if self.is_suspending(&tenant.tenant) {
+            return refuse(Refusal::Capacity);
         }
         let old = self.snapshot.leases.get(&claims.jti).cloned();
         let live = self
@@ -386,6 +436,9 @@ impl Host {
             LeaseState::Reserved => {}
         }
         let tenant = self.binding(&lease.claims)?;
+        if self.is_suspending(&tenant.tenant) {
+            return refuse(Refusal::Capacity);
+        }
         if self
             .snapshot
             .vms
@@ -623,44 +676,94 @@ impl Host {
             live.preludes = live.preludes.saturating_sub(1);
         }
     }
-    pub fn suspend_due(&mut self, tenant: &str, now_ms: u64, available_bytes: u64) -> bool {
-        let Some(config) = self.tenants.values().find(|t| t.tenant == tenant) else {
+    fn tenant_idle(&self, tenant: &str) -> bool {
+        let Some(live) = self.live.get(tenant) else {
             return false;
         };
-        let busy = self.snapshot.leases.values().any(|l| {
-            l.tenant == tenant
+        let busy = self.snapshot.leases.values().any(|lease| {
+            lease.tenant == tenant
                 && matches!(
-                    l.state,
+                    lease.state,
                     LeaseState::Reserved | LeaseState::Admitted | LeaseState::Started
                 )
         });
-        let relay = self.connections.iter().any(|c| {
+        let relay = self.connections.iter().any(|connection| {
             self.snapshot
                 .leases
-                .get(&c.job)
-                .is_some_and(|l| l.tenant == tenant)
+                .get(&connection.job)
+                .is_some_and(|lease| lease.tenant == tenant)
         });
+        live.runner_idle && live.preludes == 0 && !busy && !relay
+    }
+    pub(crate) fn suspend_candidate(&mut self, tenant: &str, now_ms: u64) -> bool {
+        let Some(idle_suspend_s) = self
+            .tenants
+            .values()
+            .find(|t| t.tenant == tenant)
+            .map(|t| t.idle_suspend_s)
+        else {
+            return false;
+        };
+        let idle = self.is_ready(tenant) && !self.is_suspending(tenant) && self.tenant_idle(tenant);
         let live = self.live.entry(tenant.to_owned()).or_default();
-        if !live.ready || !live.runner_idle || live.preludes > 0 || busy || relay {
+        if !idle {
             live.idle_since_ms = None;
             live.space_logged = false;
             return false;
         }
         let since = *live.idle_since_ms.get_or_insert(now_ms);
+        now_ms.saturating_sub(since) >= idle_suspend_s.saturating_mul(1000)
+    }
+    pub fn suspend_due(&mut self, tenant: &str, now_ms: u64, available_bytes: u64) -> bool {
+        if !self.suspend_candidate(tenant, now_ms) {
+            return false;
+        }
+        let Some(config) = self.tenants.values().find(|t| t.tenant == tenant) else {
+            return false;
+        };
         let required = config
             .guest_ram_mib
             .checked_mul(1_048_576)
             .and_then(|ram| ram.checked_add(config.host_floor_bytes));
-        let due = now_ms.saturating_sub(since) >= config.idle_suspend_s.saturating_mul(1000);
         let space = required.is_some_and(|bytes| available_bytes >= bytes);
-        if due && !space && !live.space_logged {
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        if !space && !live.space_logged {
             tracing::warn!(tenant, "suspend_skipped_space");
             live.space_logged = true;
         }
         if space {
             live.space_logged = false;
         }
-        due && space
+        space
+    }
+    pub(crate) fn begin_suspend(
+        &mut self,
+        tenant: &str,
+        now_ms: u64,
+        available_bytes: u64,
+    ) -> bool {
+        if !self.suspend_due(tenant, now_ms, available_bytes) {
+            return false;
+        }
+        self.live.entry(tenant.to_owned()).or_default().suspending = true;
+        self.publish_connections();
+        true
+    }
+    pub(crate) fn suspend_still_idle(&self, tenant: &str) -> bool {
+        self.is_suspending(tenant) && self.is_ready(tenant) && self.tenant_idle(tenant)
+    }
+    pub(crate) fn finish_suspend(&mut self, tenant: &str, succeeded: bool) -> bool {
+        let still_idle = self.tenant_idle(tenant);
+        // A successful snapshot stopped the VM even if a new prelude arrived.
+        // Preserve that activity; the next admitted connection must restore it.
+        if succeeded {
+            self.guest_unready(tenant);
+        }
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        live.suspending = false;
+        live.idle_since_ms = None;
+        self.publish_connections();
+        still_idle
     }
 }
 fn counted(l: &Lease, now_ms: u64) -> bool {

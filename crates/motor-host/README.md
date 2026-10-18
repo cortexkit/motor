@@ -78,6 +78,21 @@ Reserved/admitted/started lease, no relay or prelude, continuous idle time and
 available bytes at least `guest_ram_mib * 1048576 + host_floor_bytes`. The helper
 rechecks space and quiesces the guest before snapshotting.
 
+Helper work is serialized per tenant, never while holding the shared host-state
+mutex. Tick, lifecycle and connection-cleanup paths plan quota updates under that
+mutex, then apply them outside it. Each quota plan carries a host-side generation;
+the per-tenant worker coalesces old plans to the latest desired value and records
+the applied generation. These counters are independent of disk generations and
+do not add arguments to the privileged `set_cpu_max` RPC.
+
+Suspend candidates are rechecked after the free-space read and after obtaining
+the tenant's operation lock. A `suspending` marker makes new admissions for that
+tenant return retryable `capacity` without creating a lease. Other tenants can
+still admit and close connections during the snapshot. Completion rechecks
+idleness and preserves new activity; a successful snapshot clears VM readiness,
+so a later connection restores it. Async connection cleanup runs in the blocking
+pool rather than issuing helper calls from a destructor on a runtime thread.
+
 The mode-0600 admin socket uses four-byte big-endian length-prefixed JSON. A
 request combines `tenant` with one guest control operation: `drain` with
 `deadline_s` and `exit_after`, `resume`, `cancel` with `job_id`, or `status`. Only

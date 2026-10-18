@@ -431,3 +431,33 @@ fn connection_watch_tracks_lifecycle_but_not_unchanged_watermark_writes() {
     h.close(id).unwrap();
     assert_eq!(*updates.borrow(), ConnectionState::Closed);
 }
+
+#[test]
+fn suspend_reservation_rechecks_idle_and_preserves_new_activity() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Idle, None, None),
+        NOW * 1000,
+    )
+    .unwrap();
+    assert!(!h.suspend_candidate("tenant", NOW * 1000));
+    assert!(h.suspend_candidate("tenant", (NOW + 60) * 1000));
+    let (id, _) = h.claim(claims(JOB), (NOW + 60) * 1000).unwrap();
+    assert!(!h.begin_suspend("tenant", (NOW + 60) * 1000, u64::MAX));
+    assert!(h.connection_live(id));
+    h.close(id).unwrap();
+    assert!(!h.suspend_candidate("tenant", (NOW + 60) * 1000));
+    assert!(h.begin_suspend("tenant", (NOW + 120) * 1000, u64::MAX));
+    refused(h.claim(claims(JOB2), (NOW + 120) * 1000), Refusal::Capacity);
+    assert!(!h.snapshot.leases.contains_key(JOB2));
+    h.prelude("tenant", true);
+    assert!(!h.suspend_still_idle("tenant"));
+    assert!(!h.finish_suspend("tenant", true));
+    assert!(!h.is_ready("tenant"));
+    assert!(!h.is_suspending("tenant"));
+    h.claim(claims(JOB2), (NOW + 120) * 1000).unwrap();
+    assert_eq!(h.snapshot.leases[JOB2].state, LeaseState::Reserved);
+    assert_eq!(h.quota("tenant", (NOW + 120) * 1000), 1);
+}

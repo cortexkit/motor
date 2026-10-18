@@ -1,11 +1,11 @@
 use crate::helper::{read_json, write_json, Control, FRAME_LIMIT};
-use crate::state::{ConnectionState, Error, Host, LeaseState, Refusal};
+use crate::state::{ConnectionState, Error, Host, LeaseState, QuotaUpdate, Refusal};
 use anyhow::{bail, ensure, Context, Result};
 use motor_lease::{
     bind_requester, verify_token, AuthError, Challenge, Claims, KeySet, Nonces, Prelude, Purpose,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,17 +28,22 @@ pub struct Runtime {
     pub fetch_keys: AtomicBool,
     last_key_refresh: Mutex<u64>,
     event_workers: Mutex<BTreeSet<String>>,
-    wake_lock: Mutex<()>,
+    tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
 }
 impl Runtime {
     pub fn new(host_id: String, host: Host, control: Arc<dyn Control>) -> Arc<Self> {
+        let tenant_operations = host
+            .tenants
+            .values()
+            .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
+            .collect();
         Arc::new(Self {
             host_id,
             host: Mutex::new(host),
             keys: RwLock::new(KeySet::default()),
             control,
             event_workers: Mutex::new(BTreeSet::new()),
-            wake_lock: Mutex::new(()),
+            tenant_operations,
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
         })
@@ -115,9 +120,25 @@ impl Runtime {
         Ok(claims)
     }
     fn ensure(self: &Arc<Self>, tenant: &str) -> Result<()> {
-        let _wake = self.wake_lock.lock().expect("wake lock");
+        let operations = self.tenant_operations(tenant)?;
+        let _operation = operations.lock().expect("tenant operations lock");
+        self.ensure_locked(tenant)?;
+        self.start_events(tenant.to_owned());
+        Ok(())
+    }
+    fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
+        self.tenant_operations
+            .get(tenant)
+            .cloned()
+            .context("unknown tenant operations")
+    }
+    fn ensure_locked(&self, tenant: &str) -> Result<()> {
         let (ready, generation) = {
             let host = self.host.lock().expect("host lock");
+            ensure!(
+                !host.is_suspending(tenant),
+                Error::Refused(Refusal::Capacity)
+            );
             (
                 host.is_ready(tenant),
                 host.snapshot
@@ -131,12 +152,40 @@ impl Runtime {
             let mut host = self.host.lock().expect("host lock");
             host.guest_ready(tenant, generation)?;
         }
-        {
-            let host = self.host.lock().expect("host lock");
-            self.control.quota(tenant, host.quota(tenant, unix_ms()))?;
+        let update = self
+            .host
+            .lock()
+            .expect("host lock")
+            .quota_update(tenant, unix_ms())?;
+        if let Some(update) = update {
+            self.apply_quota_locked(&update)?;
         }
-        self.start_events(tenant.to_owned());
         Ok(())
+    }
+    pub(crate) fn apply_quota(&self, requested: QuotaUpdate) -> Result<()> {
+        let operations = self.tenant_operations(&requested.tenant)?;
+        let _operation = operations.lock().expect("tenant operations lock");
+        self.apply_quota_locked(&requested)
+    }
+    // The caller owns this tenant's operation lock. Generation numbers order
+    // host-side work, not disk generations or extra privileged RPC arguments.
+    fn apply_quota_locked(&self, requested: &QuotaUpdate) -> Result<()> {
+        loop {
+            let update = self
+                .host
+                .lock()
+                .expect("host lock")
+                .quota_update(&requested.tenant, unix_ms())?;
+            let Some(update) = update else {
+                return Ok(());
+            };
+            ensure!(
+                update.generation >= requested.generation,
+                "quota generation regressed"
+            );
+            self.control.quota(&update.tenant, update.vcpus)?;
+            self.host.lock().expect("host lock").quota_applied(&update);
+        }
     }
     fn start_events(self: &Arc<Self>, tenant: String) {
         if !self
@@ -151,10 +200,32 @@ impl Runtime {
         std::thread::spawn(move || {
             loop {
                 if !runtime.host.lock().expect("host lock").is_ready(&tenant) {
-                    break;
+                    let operations = runtime
+                        .tenant_operations(&tenant)
+                        .expect("registered tenant");
+                    let _operation = operations.lock().expect("tenant operations lock");
+                    // Retire under the wake operation's lock so a concurrent
+                    // wake cannot miss starting its lifecycle reader.
+                    if !runtime.host.lock().expect("host lock").is_ready(&tenant) {
+                        runtime
+                            .event_workers
+                            .lock()
+                            .expect("workers lock")
+                            .remove(&tenant);
+                        return;
+                    }
                 }
                 let result = (|| -> Result<()> {
-                    let mut stream = runtime.control.relay(&tenant, 53)?;
+                    let mut stream = {
+                        let operations = runtime.tenant_operations(&tenant)?;
+                        let _operation = operations.lock().expect("tenant operations lock");
+                        let available = {
+                            let host = runtime.host.lock().expect("host lock");
+                            host.is_ready(&tenant) && !host.is_suspending(&tenant)
+                        };
+                        ensure!(available, "tenant stopped or suspending");
+                        runtime.control.relay(&tenant, 53)?
+                    };
                     runtime
                         .host
                         .lock()
@@ -164,12 +235,13 @@ impl Runtime {
                         let frame = read_json(&mut stream)?;
                         ensure!(frame["type"] == "event", "invalid lifecycle frame");
                         let event = serde_json::from_value(frame)?;
-                        {
+                        let update = {
                             let mut host = runtime.host.lock().expect("host lock");
                             host.event(&tenant, &event, unix_ms())?;
-                            runtime
-                                .control
-                                .quota(&tenant, host.quota(&tenant, unix_ms()))?;
+                            host.quota_update(&tenant, unix_ms())?
+                        };
+                        if let Some(update) = update {
+                            runtime.apply_quota(update)?;
                         }
                         write_json(
                             &mut stream,
@@ -186,32 +258,100 @@ impl Runtime {
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
-            runtime
-                .event_workers
-                .lock()
-                .expect("workers lock")
-                .remove(&tenant);
         });
     }
     pub fn tick(&self, now_ms: u64) -> Result<()> {
-        let mut host = self.host.lock().expect("host lock");
-        for (tenant, job) in host.expire(now_ms)? {
-            let reply = self
-                .control
-                .admin(&tenant, &json!({"op":"cancel", "job_id":job}))?;
-            ensure!(reply["ok"] == true, "guest cancel refused");
-            host.cancel_delivered(&job)?;
+        let (cancels, quotas, candidates) = {
+            let mut host = self.host.lock().expect("host lock");
+            let cancels = host.expire(now_ms)?;
+            let mut quotas = Vec::new();
+            let mut candidates = Vec::new();
+            for tenant in self.tenant_operations.keys() {
+                if let Some(update) = host.quota_update(tenant, now_ms)? {
+                    quotas.push(update);
+                }
+                if host.suspend_candidate(tenant, now_ms) {
+                    candidates.push(tenant.clone());
+                }
+            }
+            (cancels, quotas, candidates)
+        };
+        let mut failure = None;
+        for (tenant, job) in cancels {
+            let result = (|| -> Result<()> {
+                let reply = self.admin(&tenant, &json!({"op":"cancel", "job_id":job}))?;
+                ensure!(reply["ok"] == true, "guest cancel refused");
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .cancel_delivered(&job)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
         }
-        let tenants: Vec<_> = host.tenants.values().map(|t| t.tenant.clone()).collect();
-        for tenant in tenants {
-            if !host.is_ready(&tenant) {
-                continue;
+        for update in quotas {
+            if let Err(error) = self.apply_quota(update) {
+                failure.get_or_insert(error);
             }
-            self.control.quota(&tenant, host.quota(&tenant, now_ms))?;
-            if host.suspend_due(&tenant, now_ms, self.control.available_bytes()?) {
-                self.control.suspend(&tenant)?;
-                host.guest_unready(&tenant);
+        }
+        if !candidates.is_empty() {
+            match self.control.available_bytes() {
+                Ok(available) => {
+                    for tenant in candidates {
+                        if let Err(error) = self.suspend_tenant(&tenant, now_ms, available) {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    fn suspend_tenant(&self, tenant: &str, now_ms: u64, available_bytes: u64) -> Result<()> {
+        let operations = self.tenant_operations(tenant)?;
+        if !self
+            .host
+            .lock()
+            .expect("host lock")
+            .begin_suspend(tenant, now_ms, available_bytes)
+        {
+            return Ok(());
+        }
+        let _operation = operations.lock().expect("tenant operations lock");
+        {
+            let mut host = self.host.lock().expect("host lock");
+            if !host.suspend_still_idle(tenant) {
+                host.finish_suspend(tenant, false);
+                return Ok(());
+            }
+        }
+        let result = self.control.suspend(tenant);
+        let still_idle = self
+            .host
+            .lock()
+            .expect("host lock")
+            .finish_suspend(tenant, result.is_ok());
+        if result.is_ok() && !still_idle {
+            tracing::info!(tenant, "suspended_with_new_activity");
+        }
+        result
+    }
+    fn close_connection(&self, id: u64, tenant: &str) -> Result<()> {
+        let update = {
+            let mut host = self.host.lock().expect("host lock");
+            host.close(id)?;
+            host.quota_update(tenant, unix_ms())?
+        };
+        if let Some(update) = update {
+            self.apply_quota(update)?;
         }
         Ok(())
     }
@@ -235,6 +375,8 @@ impl Runtime {
         // Decode the closed guest schema so the local socket cannot become an
         // alternate route to disk attachment or clock/identity mutation.
         let request: motor_protocol::TenantAgentRequest = serde_json::from_value(request.clone())?;
+        let operations = self.tenant_operations(tenant)?;
+        let _operation = operations.lock().expect("tenant operations lock");
         self.control.admin(tenant, &serde_json::to_value(request)?)
     }
     fn deliver(
@@ -250,16 +392,21 @@ impl Runtime {
             .binding(claims)?
             .tenant
             .clone();
-        self.ensure(&tenant)?;
+        let operations = self.tenant_operations(&tenant)?;
+        let _operation = operations.lock().expect("tenant operations lock");
+        self.ensure_locked(&tenant)?;
+        self.start_events(tenant.clone());
         let mut stream = self.control.relay(&tenant, 52)?;
-        let mut host = self.host.lock().expect("host lock");
-        ensure!(host.connection_live(id), "connection superseded");
-        ensure!(
-            alive.load(Ordering::Acquire),
-            "client closed before delivery"
-        );
+        {
+            let mut host = self.host.lock().expect("host lock");
+            ensure!(host.connection_live(id), "connection superseded");
+            ensure!(
+                alive.load(Ordering::Acquire),
+                "client closed before delivery"
+            );
+            host.delivered(id)?;
+        }
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        host.delivered(id)?;
         write_json(
             &mut stream,
             &json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp}),
@@ -274,22 +421,38 @@ struct ConnectionGuard {
     alive: Arc<AtomicBool>,
     tenant: String,
     jti: String,
+    armed: bool,
+}
+impl ConnectionGuard {
+    fn cleanup(&self) -> impl FnOnce() + Send + 'static {
+        let runtime = self.runtime.clone();
+        let id = self.id;
+        let tenant = self.tenant.clone();
+        let jti = self.jti.clone();
+        move || {
+            if let Err(error) = runtime.close_connection(id, &tenant) {
+                tracing::error!(%jti, %tenant, %error, "connection_cleanup_failed");
+            }
+        }
+    }
+    async fn finish(mut self) {
+        self.alive.store(false, Ordering::Release);
+        self.armed = false;
+        if tokio::task::spawn_blocking(self.cleanup()).await.is_err() {
+            tracing::error!(jti = %self.jti, "connection_cleanup_failed");
+        }
+    }
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        let mut host = self.runtime.host.lock().expect("host lock");
-        if host.close(self.id).is_err() {
-            tracing::error!(jti = %self.jti, "journal_failed");
-        }
-        if host.is_ready(&self.tenant)
-            && self
-                .runtime
-                .control
-                .quota(&self.tenant, host.quota(&self.tenant, unix_ms()))
-                .is_err()
-        {
-            tracing::error!(jti = %self.jti, tenant = %self.tenant, "quota_update_failed");
+        if self.armed {
+            let cleanup = self.cleanup();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(cleanup);
+            } else {
+                std::thread::spawn(cleanup);
+            }
         }
     }
 }
@@ -398,14 +561,16 @@ where
     };
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
-    let _connection = ConnectionGuard {
+    let connection = ConnectionGuard {
         runtime: runtime.clone(),
         id,
         alive: alive.clone(),
         tenant: prelude_guard.tenant.clone(),
         jti: claims.jti.clone(),
+        armed: true,
     };
     drop(prelude_guard);
+    let outcome = async {
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(claims.exp.saturating_mul(1000).saturating_sub(unix_ms()));
     match await_admission(&mut updates, deadline).await {
@@ -471,6 +636,9 @@ where
         Ok(())
     };
     tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) }
+    }.await;
+    connection.finish().await;
+    outcome
 }
 
 async fn await_admission(
