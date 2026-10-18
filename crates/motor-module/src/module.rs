@@ -231,6 +231,7 @@ pub struct Handler {
     motor: Arc<OnceLock<Motor>>,
     ssh: Arc<OnceLock<Arc<SshConnector>>>,
     resolver: Arc<dyn CredentialResolver>,
+    account_tokens: Option<Arc<crate::AccountTokens>>,
     routes: Arc<Mutex<HashMap<RouteHandle, RouteBindRequest>>>,
     /// Jobs started by direct routes, keyed to the route that started them. The
     /// route handle is the daemon's own stamp for a bound route on this
@@ -261,6 +262,7 @@ impl Handler {
             motor: Arc::new(OnceLock::new()),
             ssh: Arc::new(OnceLock::new()),
             resolver: Arc::new(UnavailableCredentialResolver),
+            account_tokens: None,
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
             run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -283,6 +285,10 @@ impl Handler {
     }
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
         self.resolver = resolver;
+        self
+    }
+    pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
+        self.account_tokens = Some(tokens);
         self
     }
     pub async fn shutdown(&self) {
@@ -328,6 +334,9 @@ impl Handler {
             let opened = tokio::task::spawn_blocking(move || Motor::open(config, &path)).await;
             match opened.unwrap_or_else(|error| Err(io::Error::other(error))) {
                 Ok(mut motor) => {
+                    if let Some(tokens) = &self.account_tokens {
+                        motor = motor.with_account_tokens(tokens.clone());
+                    }
                     // The lease must be held before initialization can replace an
                     // earlier process's private SSH agent directory.
                     let ssh = Arc::new(
