@@ -35,6 +35,8 @@ pub struct Lease {
     pub started_at_ms: Option<u64>,
     pub ended_at_ms: Option<u64>,
     pub highest_seq: u64,
+    #[serde(default)]
+    pub refusal: Option<Refusal>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -54,7 +56,8 @@ pub struct Snapshot {
     pub pending_cancels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Refusal {
     Auth,
     Expired,
@@ -100,11 +103,20 @@ pub enum Admission {
     Ready,
     Waiting,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Waiting,
+    Ready,
+    Live(LeaseState),
+    Refused(Refusal),
+    Closed,
+}
 #[derive(Clone, Debug)]
 struct Connection {
     id: u64,
     job: String,
     purpose: Purpose,
+    updates: tokio::sync::watch::Sender<ConnectionState>,
 }
 #[derive(Default)]
 struct LiveVm {
@@ -125,6 +137,7 @@ pub struct Host {
     connections: Vec<Connection>,
     live: BTreeMap<String, LiveVm>,
     next_connection: u64,
+    observed_at_ms: u64,
 }
 impl Host {
     pub fn new(
@@ -139,12 +152,58 @@ impl Host {
             connections: Vec::new(),
             live: BTreeMap::new(),
             next_connection: 0,
+            observed_at_ms: 0,
         }
     }
     fn save(&mut self, next: Snapshot) -> Result<(), Error> {
         self.journal.store(&next)?;
         self.snapshot = next;
+        self.publish_connections();
         Ok(())
+    }
+    fn publish_connections(&self) {
+        for connection in &self.connections {
+            let current = *connection.updates.borrow();
+            let next = match current {
+                ConnectionState::Closed | ConnectionState::Refused(_) => continue,
+                ConnectionState::Waiting | ConnectionState::Ready
+                    if connection.purpose == Purpose::Run =>
+                {
+                    match self.pending(&connection.job) {
+                        Ok(Admission::Waiting) => ConnectionState::Waiting,
+                        Ok(Admission::Ready) => ConnectionState::Ready,
+                        Err(Error::Refused(reason)) => ConnectionState::Refused(reason),
+                        Err(Error::Journal(_)) => continue,
+                    }
+                }
+                _ => match self.snapshot.leases.get(&connection.job) {
+                    Some(lease) => ConnectionState::Live(lease.state),
+                    None => ConnectionState::Refused(Refusal::Auth),
+                },
+            };
+            connection.updates.send_if_modified(|state| {
+                if *state == next {
+                    return false;
+                }
+                *state = next;
+                true
+            });
+        }
+    }
+    pub fn watch_connection(
+        &self,
+        id: u64,
+    ) -> Result<tokio::sync::watch::Receiver<ConnectionState>, Error> {
+        self.connections
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.updates.subscribe())
+            .ok_or(Error::Refused(Refusal::Auth))
+    }
+    pub fn set_stop_pending(&mut self, tenant: &str, pending: bool) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.vms.entry(tenant.to_owned()).or_default().stop_pending = pending;
+        self.save(next)
     }
     pub fn binding(&self, claims: &Claims) -> Result<&Tenant, Error> {
         let entry = self
@@ -214,6 +273,7 @@ impl Host {
         self.connections.iter().any(|c| c.id == id)
     }
     pub fn claim(&mut self, claims: Claims, now_ms: u64) -> Result<(u64, Admission), Error> {
+        self.observed_at_ms = now_ms;
         let tenant = self.binding(&claims)?.clone();
         if now_ms / 1000 >= claims.exp {
             return refuse(Refusal::Expired);
@@ -277,9 +337,17 @@ impl Host {
                     started_at_ms: None,
                     ended_at_ms: None,
                     highest_seq: old.as_ref().map_or(0, |l| l.highest_seq),
+                    refusal: None,
                 },
             );
             self.save(next)?;
+            for connection in self
+                .connections
+                .iter()
+                .filter(|c| c.job == claims.jti && c.purpose == Purpose::Run)
+            {
+                finish_connection(connection, ConnectionState::Closed);
+            }
             self.connections
                 .retain(|c| c.job != claims.jti || c.purpose != Purpose::Run);
         }
@@ -289,14 +357,43 @@ impl Host {
             id,
             job: claims.jti,
             purpose: claims.purpose,
+            updates: tokio::sync::watch::channel(if admission == Admission::Waiting {
+                ConnectionState::Waiting
+            } else {
+                ConnectionState::Ready
+            })
+            .0,
         });
         self.live.entry(tenant.tenant).or_default().idle_since_ms = None;
         Ok((id, admission))
     }
     pub fn pending(&self, job: &str) -> Result<Admission, Error> {
-        let lease = &self.snapshot.leases[job];
-        if lease.state != LeaseState::Reserved {
-            return refuse(Refusal::Auth);
+        let lease = self
+            .snapshot
+            .leases
+            .get(job)
+            .ok_or(Error::Refused(Refusal::Auth))?;
+        if let Some(reason) = lease.refusal {
+            return refuse(reason);
+        }
+        match lease.state {
+            LeaseState::Released => return refuse(Refusal::Capacity),
+            LeaseState::Admitted | LeaseState::Started | LeaseState::Ended => {
+                return refuse(Refusal::Auth)
+            }
+            LeaseState::Reserved => {}
+        }
+        let tenant = self.binding(&lease.claims)?;
+        if self
+            .snapshot
+            .vms
+            .get(&lease.tenant)
+            .is_some_and(|v| v.stop_pending)
+        {
+            return refuse(Refusal::Capacity);
+        }
+        if self.share(&lease.tenant, self.observed_at_ms) > tenant.vcpu_ceiling {
+            return refuse(Refusal::HostFull);
         }
         Ok(if lease.replacing {
             Admission::Waiting
@@ -309,38 +406,46 @@ impl Host {
             .connections
             .iter()
             .find(|c| c.id == id)
+            .cloned()
             .ok_or(Error::Refused(Refusal::Auth))?;
-        if connection.purpose == Purpose::Attach {
-            return Ok(());
-        }
         let mut next = self.snapshot.clone();
         let lease = next
             .leases
             .get_mut(&connection.job)
-            .expect("reserved lease");
+            .ok_or(Error::Refused(Refusal::Auth))?;
+        if connection.purpose == Purpose::Attach {
+            connection
+                .updates
+                .send_replace(ConnectionState::Live(lease.state));
+            return Ok(());
+        }
         if lease.replacing || lease.state != LeaseState::Reserved {
             return refuse(Refusal::Auth);
         }
         lease.delivered = true;
-        self.save(next)
+        self.save(next)?;
+        connection
+            .updates
+            .send_replace(ConnectionState::Live(LeaseState::Reserved));
+        Ok(())
     }
     pub fn close(&mut self, id: u64) -> Result<(), Error> {
-        let Some(index) = self.connections.iter().position(|c| c.id == id) else {
+        let Some(connection) = self.connections.iter().find(|c| c.id == id).cloned() else {
             return Ok(());
         };
-        let connection = self.connections[index].clone();
         if connection.purpose == Purpose::Run {
             let mut next = self.snapshot.clone();
-            let lease = next
+            if let Some(lease) = next
                 .leases
                 .get_mut(&connection.job)
-                .expect("reserved lease");
-            if lease.state == LeaseState::Reserved && !lease.delivered {
+                .filter(|l| l.state == LeaseState::Reserved && !l.delivered)
+            {
                 lease.state = LeaseState::Released;
                 self.save(next)?;
             }
         }
-        self.connections.remove(index);
+        finish_connection(&connection, ConnectionState::Closed);
+        self.connections.retain(|c| c.id != id);
         Ok(())
     }
     pub fn watermark(&mut self, job: &str, seq: u64) -> Result<(), Error> {
@@ -349,12 +454,16 @@ impl Host {
         };
         if seq > lease.highest_seq {
             let mut next = self.snapshot.clone();
-            next.leases.get_mut(job).expect("lease").highest_seq = seq;
+            next.leases
+                .get_mut(job)
+                .ok_or(Error::Refused(Refusal::Auth))?
+                .highest_seq = seq;
             self.save(next)?;
         }
         Ok(())
     }
     pub fn event(&mut self, tenant: &str, event: &TenantEvent, now_ms: u64) -> Result<(), Error> {
+        self.observed_at_ms = now_ms;
         let mut next = self.snapshot.clone();
         let vm = next.vms.entry(tenant.to_owned()).or_default();
         if event.event_seq <= vm.event_seq {
@@ -382,9 +491,12 @@ impl Host {
                         if matches!(lease.state, LeaseState::Admitted | LeaseState::Started) =>
                     {
                         if lease.started_at_ms.is_none() {
-                            end_zero(&mut next, &job, now_ms);
+                            end_zero(&mut next, &job, now_ms, None)?;
                         } else {
-                            let lease = next.leases.get_mut(&job).expect("lease");
+                            let lease = next
+                                .leases
+                                .get_mut(&job)
+                                .ok_or(Error::Refused(Refusal::Auth))?;
                             lease.state = LeaseState::Ended;
                             lease.ended_at_ms = Some(now_ms);
                         }
@@ -412,7 +524,13 @@ impl Host {
                                     RefusedCause::Mismatch
                                     | RefusedCause::Rejected
                                     | RefusedCause::Expired,
-                                ) => end_zero(&mut next, &job, now_ms),
+                                ) => end_zero(
+                                    &mut next,
+                                    &job,
+                                    now_ms,
+                                    (event.cause == Some(RefusedCause::Expired))
+                                        .then_some(Refusal::Expired),
+                                )?,
                                 None => return refuse(Refusal::Auth),
                             }
                         }
@@ -435,6 +553,7 @@ impl Host {
     /// 60 seconds with port 53 continuously connected before settling zero, so
     /// an admission queued before expiry can retain the reservation.
     pub fn expire(&mut self, now_ms: u64) -> Result<Vec<(String, String)>, Error> {
+        self.observed_at_ms = now_ms;
         let mut next = self.snapshot.clone();
         let mut cancel = Vec::new();
         let mut close_jobs = std::collections::BTreeSet::new();
@@ -458,22 +577,28 @@ impl Host {
                 cancel.push((lease.tenant.clone(), job.clone()));
                 next.pending_cancels
                     .insert(job.clone(), lease.tenant.clone());
-                end_zero(&mut next, job, now_ms);
+                end_zero(&mut next, job, now_ms, expired.then_some(Refusal::Expired))?;
             } else if expired
                 && ((!lease.delivered && !lease.replacing)
                     || (continuous && now_ms >= exp_ms.saturating_add(60_000)))
             {
-                end_zero(&mut next, job, now_ms);
+                end_zero(&mut next, job, now_ms, Some(Refusal::Expired))?;
             }
         }
         if !cancel.is_empty() || next.zero_usage.len() != self.snapshot.zero_usage.len() {
             self.save(next)?;
         }
+        self.publish_connections();
         self.connections.retain(|c| {
             if c.purpose == Purpose::Attach {
                 return true;
             }
-            !close_jobs.contains(&c.job)
+            if close_jobs.contains(&c.job) {
+                finish_connection(c, ConnectionState::Refused(Refusal::Expired));
+                false
+            } else {
+                true
+            }
         });
         Ok(self
             .snapshot
@@ -527,7 +652,7 @@ impl Host {
         let due = now_ms.saturating_sub(since) >= config.idle_suspend_s.saturating_mul(1000);
         let space = required.is_some_and(|bytes| available_bytes >= bytes);
         if due && !space && !live.space_logged {
-            eprintln!("suspend_skipped_space");
+            tracing::warn!(tenant, "suspend_skipped_space");
             live.space_logged = true;
         }
         if space {
@@ -555,10 +680,19 @@ fn same_reservation(a: &Claims, b: &Claims) -> bool {
         && a.net == b.net
         && a.platform == b.platform
 }
-fn end_zero(next: &mut Snapshot, job: &str, now_ms: u64) {
-    let lease = next.leases.get_mut(job).expect("lease");
+fn end_zero(
+    next: &mut Snapshot,
+    job: &str,
+    now_ms: u64,
+    refusal: Option<Refusal>,
+) -> Result<(), Error> {
+    let lease = next
+        .leases
+        .get_mut(job)
+        .ok_or(Error::Refused(Refusal::Auth))?;
     lease.state = LeaseState::Ended;
     lease.ended_at_ms = Some(now_ms);
+    lease.refusal = refusal;
     next.zero_usage
         .entry(job.to_owned())
         .or_insert_with(|| Usage {
@@ -570,4 +704,18 @@ fn end_zero(next: &mut Snapshot, job: &str, now_ms: u64) {
             egress_bytes: None,
             outcome: UsageOutcome::Cancelled,
         });
+    Ok(())
+}
+
+fn finish_connection(connection: &Connection, next: ConnectionState) {
+    connection.updates.send_if_modified(|state| {
+        if matches!(
+            *state,
+            ConnectionState::Closed | ConnectionState::Refused(_)
+        ) {
+            return false;
+        }
+        *state = next;
+        true
+    });
 }

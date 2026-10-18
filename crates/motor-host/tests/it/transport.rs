@@ -390,3 +390,179 @@ async fn warm_admission_applies_share_before_relay_and_third_run_keeps_quota_unc
     drop(guests);
     runtime.host.lock().unwrap().guest_unready("tenant");
 }
+
+async fn waiting_session(
+    vcpus: u32,
+) -> (
+    Arc<Runtime>,
+    SigningKey,
+    SigningKey,
+    Claims,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    use motor_host::state::ConnectionState;
+    let (runtime, _, broker, requester, mut c) = fixture();
+    c.vcpus = vcpus;
+    c.mem_mib = motor_lease::memory_max_mib(vcpus);
+    let mut old_updates = {
+        let mut host = runtime.host.lock().unwrap();
+        let (old, _) = host.claim(c.clone(), unix_ms()).unwrap();
+        host.delivered(old).unwrap();
+        host.watch_connection(old).unwrap()
+    };
+    c.iat += 1;
+    c.exp += 1;
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge: Challenge =
+        serde_json::from_value(hello(&mut client, &broker, &requester, &c).await).unwrap();
+    let sig = motor_lease::sign_challenge(&challenge, &c, &requester).unwrap();
+    write_frame(
+        &mut client,
+        &json!({"type":"challenge_response", "sig":sig}),
+    )
+    .await
+    .unwrap();
+    while *old_updates.borrow_and_update() != ConnectionState::Closed {
+        old_updates.changed().await.unwrap();
+    }
+    (runtime, broker, requester, c, client, task)
+}
+
+#[tokio::test]
+async fn waiting_refusal_transition_wakes_admission_without_advancing_clock() {
+    let (runtime, _, _, c, mut client, task) = waiting_session(1).await;
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(
+                1,
+                TenantEventKind::Refused,
+                Some(JOB),
+                Some(RefusedCause::Disconnect),
+            ),
+            unix_ms(),
+        )
+        .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "lease_ok");
+    assert_eq!(tokio::time::Instant::now(), before);
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.leases[JOB].claims.iat,
+        c.iat
+    );
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+}
+
+async fn waiting_refusal(reason: motor_host::state::Refusal) {
+    use motor_host::state::Refusal;
+    let (runtime, _, _, c, mut client, task) = waiting_session(2).await;
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        match reason {
+            Refusal::Capacity => host.set_stop_pending("tenant", true).unwrap(),
+            Refusal::HostFull => {
+                host.tenants.get_mut("vm").unwrap().vcpu_ceiling = 1;
+                host.event(
+                    "tenant",
+                    &event(
+                        1,
+                        TenantEventKind::Refused,
+                        Some(JOB),
+                        Some(RefusedCause::Disconnect),
+                    ),
+                    unix_ms(),
+                )
+                .unwrap();
+            }
+            Refusal::Expired => {
+                host.expire(c.exp * 1000).unwrap();
+            }
+            Refusal::Auth => {
+                host.event(
+                    "tenant",
+                    &event(1, TenantEventKind::Admitted, Some(JOB), None),
+                    unix_ms(),
+                )
+                .unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        read_frame(&mut client).await.unwrap(),
+        json!({"type":"lease_refused", "reason":reason.wire()})
+    );
+    assert_eq!(tokio::time::Instant::now(), before);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn waiting_capacity_refusal_preserves_retryable_reason_without_polling() {
+    waiting_refusal(motor_host::state::Refusal::Capacity).await;
+}
+#[tokio::test]
+async fn waiting_host_full_refusal_preserves_retryable_reason_without_polling() {
+    waiting_refusal(motor_host::state::Refusal::HostFull).await;
+}
+#[tokio::test]
+async fn waiting_expiry_refusal_preserves_expired_reason_without_polling() {
+    waiting_refusal(motor_host::state::Refusal::Expired).await;
+}
+#[tokio::test]
+async fn waiting_admitted_original_refuses_replacement_as_auth_without_polling() {
+    waiting_refusal(motor_host::state::Refusal::Auth).await;
+}
+
+#[tokio::test]
+async fn expired_removed_waiting_lease_does_not_poison_host_or_block_second_connection() {
+    use motor_host::state::{Error, Refusal};
+    let (runtime, broker, requester, c, mut client, task) = waiting_session(1).await;
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.expire((c.exp + 60) * 1000).unwrap();
+        host.snapshot.leases.remove(JOB);
+        assert!(matches!(
+            host.pending(JOB),
+            Err(Error::Refused(Refusal::Auth))
+        ));
+    }
+    assert_eq!(
+        read_frame(&mut client).await.unwrap(),
+        json!({"type":"lease_refused", "reason":"expired"})
+    );
+    task.await.unwrap().unwrap();
+    assert!(!runtime.host.is_poisoned());
+    let mut fresh = c;
+    fresh.jti = JOB2.into();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &fresh).await;
+    assert_eq!(
+        respond(&mut client, &requester, &fresh, challenge).await["type"],
+        "lease_ok"
+    );
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+    assert!(!runtime.host.is_poisoned());
+}
+
+#[tokio::test]
+async fn waiting_lease_uses_expiry_timer_without_host_tick() {
+    let (_, _, _, c, mut client, task) = waiting_session(1).await;
+    tokio::time::pause();
+    let until_expiry = std::time::Duration::from_millis(c.exp * 1000 - unix_ms());
+    tokio::time::advance(until_expiry + std::time::Duration::from_millis(1)).await;
+    assert_eq!(
+        read_frame(&mut client).await.unwrap(),
+        json!({"type":"lease_refused", "reason":"expired"})
+    );
+    task.await.unwrap().unwrap();
+}

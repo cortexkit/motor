@@ -1,5 +1,5 @@
 use crate::helper::{read_json, write_json, Control, FRAME_LIMIT};
-use crate::state::{Admission, Error, Host, Refusal};
+use crate::state::{ConnectionState, Error, Host, LeaseState, Refusal};
 use anyhow::{bail, ensure, Context, Result};
 use motor_lease::{
     bind_requester, verify_token, AuthError, Challenge, Claims, KeySet, Nonces, Prelude, Purpose,
@@ -270,13 +270,14 @@ struct ConnectionGuard {
     id: u64,
     alive: Arc<AtomicBool>,
     tenant: String,
+    jti: String,
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         let mut host = self.runtime.host.lock().expect("host lock");
         if host.close(self.id).is_err() {
-            eprintln!("journal_failed");
+            tracing::error!(jti = %self.jti, "journal_failed");
         }
         if host.is_ready(&self.tenant)
             && self
@@ -285,7 +286,7 @@ impl Drop for ConnectionGuard {
                 .quota(&self.tenant, host.quota(&self.tenant, unix_ms()))
                 .is_err()
         {
-            eprintln!("quota_update_failed");
+            tracing::error!(jti = %self.jti, tenant = %self.tenant, "quota_update_failed");
         }
     }
 }
@@ -370,16 +371,17 @@ where
     let Prelude::ChallengeResponse { sig } = serde_json::from_value(response)? else {
         bail!("expected challenge response");
     };
-    let verified = (|| -> Result<(u64, Admission), Error> {
+    let verified = (|| -> Result<_, Error> {
         let mut nonces = Nonces::default();
         nonces
             .verify(&challenge, &claims, &requester_jwk, &sig, unix_ms() / 1000)
             .map_err(|_| Error::Refused(Refusal::Auth))?;
         let mut host = runtime.host.lock().expect("host lock");
         host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)?;
-        host.claim(claims.clone(), unix_ms())
+        let (id, _) = host.claim(claims.clone(), unix_ms())?;
+        Ok((id, host.watch_connection(id)?))
     })();
-    let (id, mut admission) = match verified {
+    let (id, mut updates) = match verified {
         Ok(value) => value,
         Err(Error::Refused(r)) => {
             write_frame(
@@ -391,34 +393,31 @@ where
         }
         Err(e) => return Err(e.into()),
     };
-    eprintln!("lease_connected jti={}", claims.jti);
+    tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
     let _connection = ConnectionGuard {
         runtime: runtime.clone(),
         id,
         alive: alive.clone(),
         tenant: prelude_guard.tenant.clone(),
+        jti: claims.jti.clone(),
     };
     drop(prelude_guard);
-    let connected = async {
-        while admission == Admission::Waiting {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            let refused = {
-                let host = runtime.host.lock().expect("host lock");
-                admission = host.pending(&claims.jti).unwrap_or(Admission::Waiting);
-                !host.connection_live(id)
-                    || unix_ms() / 1000 >= claims.exp
-                    || host.pending(&claims.jti).is_err()
-            };
-            if refused {
-                write_frame(
-                    &mut client,
-                    &json!({"type":"lease_refused", "reason":"auth"}),
-                )
-                .await?;
-                return Ok(());
-            }
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(claims.exp.saturating_mul(1000).saturating_sub(unix_ms()));
+    match await_admission(&mut updates, deadline).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(reason) => {
+            write_frame(
+                &mut client,
+                &json!({"type":"lease_refused", "reason":reason.wire()}),
+            )
+            .await?;
+            return Ok(());
         }
+    }
+    let connected = async {
         write_frame(&mut client, &json!({"type":"lease_ok"})).await?;
         // Wait for a client frame before waking the guest. A client that disappears
         // immediately after lease_ok has never delivered a lease to the runner.
@@ -468,14 +467,47 @@ where
         tokio::select! { result = to_guest => { result?; }, result = to_client => { result?; } }
         Ok(())
     };
-    tokio::select! { result = connected => result, _ = connection_gone(&runtime, id) => Ok(()) }
+    tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) }
 }
 
-async fn connection_gone(runtime: &Runtime, id: u64) {
+async fn await_admission(
+    updates: &mut tokio::sync::watch::Receiver<ConnectionState>,
+    deadline: tokio::time::Instant,
+) -> Result<bool, Refusal> {
     loop {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if !runtime.host.lock().expect("host lock").connection_live(id) {
-            break;
+        let state = *updates.borrow_and_update();
+        match state {
+            ConnectionState::Refused(reason) => return Err(reason),
+            ConnectionState::Closed => return Ok(false),
+            _ if tokio::time::Instant::now() >= deadline => return Err(Refusal::Expired),
+            ConnectionState::Ready | ConnectionState::Live(_) => return Ok(true),
+            ConnectionState::Waiting => {}
+        }
+        tokio::select! {
+            biased;
+            changed = updates.changed() => { if changed.is_err() { return Ok(false); } },
+            _ = tokio::time::sleep_until(deadline) => return Err(Refusal::Expired),
+        }
+    }
+}
+
+async fn connection_ended(
+    updates: &mut tokio::sync::watch::Receiver<ConnectionState>,
+    deadline: Option<tokio::time::Instant>,
+) {
+    loop {
+        let state = *updates.borrow_and_update();
+        if matches!(state, ConnectionState::Closed | ConnectionState::Refused(_)) {
+            return;
+        }
+        let before_admission = !matches!(
+            state,
+            ConnectionState::Live(LeaseState::Admitted | LeaseState::Started | LeaseState::Ended)
+        );
+        tokio::select! {
+            biased;
+            changed = updates.changed() => { if changed.is_err() { return; } },
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if before_admission && deadline.is_some() => return,
         }
     }
 }

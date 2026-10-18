@@ -37,6 +37,7 @@ struct Binding {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    motor_protocol::logging::init("[motor-host]")?;
     let path = std::env::args_os()
         .nth(1)
         .context("usage: motor-host <config.json>")?;
@@ -111,14 +112,14 @@ async fn main() -> Result<()> {
     let ticker = runtime.clone();
     std::thread::spawn(move || loop {
         if ticker.tick(unix_ms()).is_err() {
-            eprintln!("host_tick_failed");
+            tracing::error!("host_tick_failed");
         }
         std::thread::sleep(Duration::from_millis(100));
     });
     let admin = runtime.clone();
     tokio::spawn(async move {
         if admin_socket(admin, &config.admin_socket).await.is_err() {
-            eprintln!("admin_socket_failed");
+            tracing::error!("admin_socket_failed");
         }
     });
     let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(config.certificate)?))
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
             if let Ok(Ok(stream)) = accepted {
                 // Errors deliberately omit peer-controlled data and credentials.
                 if serve(runtime, stream).await.is_err() {
-                    eprintln!("connection_closed");
+                    tracing::warn!("connection_closed");
                 }
             }
         });

@@ -362,3 +362,72 @@ fn abandoned_replacement_releases_on_old_refusal_and_terminal_does_not_cut_off_r
     h.expire((NOW + 700) * 1000).unwrap();
     assert!(h.connection_live(new));
 }
+
+#[test]
+fn absent_lease_access_is_typed_and_connection_cleanup_is_idempotent() {
+    let mut h = host();
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.snapshot.leases.remove(JOB);
+    refused(h.pending(JOB), Refusal::Auth);
+    refused(h.delivered(id), Refusal::Auth);
+    refused(h.watermark(JOB, 1), Refusal::Auth);
+    h.close(id).unwrap();
+    h.close(id).unwrap();
+    assert!(!h.connection_live(id));
+    h.claim(claims(JOB2), NOW * 1000).unwrap();
+}
+
+#[test]
+fn connection_watch_preserves_close_and_durable_refusal_causes() {
+    use motor_host::state::ConnectionState;
+    let mut h = host();
+    let (old, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.delivered(old).unwrap();
+    let old_updates = h.watch_connection(old).unwrap();
+    let mut c = claims(JOB);
+    c.iat += 1;
+    c.exp += 1;
+    let (new, _) = h.claim(c, NOW * 1000).unwrap();
+    assert_eq!(*old_updates.borrow(), ConnectionState::Closed);
+    let updates = h.watch_connection(new).unwrap();
+    assert_eq!(*updates.borrow(), ConnectionState::Waiting);
+    h.expire((NOW + 362) * 1000).unwrap();
+    assert_eq!(
+        *updates.borrow(),
+        ConnectionState::Refused(Refusal::Expired)
+    );
+    refused(h.pending(JOB), Refusal::Expired);
+    h.close(new).unwrap();
+    assert_eq!(
+        *updates.borrow(),
+        ConnectionState::Refused(Refusal::Expired)
+    );
+}
+
+#[test]
+fn connection_watch_tracks_lifecycle_but_not_unchanged_watermark_writes() {
+    use motor_host::state::ConnectionState;
+    let mut h = host();
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    let mut updates = h.watch_connection(id).unwrap();
+    updates.borrow_and_update();
+    h.delivered(id).unwrap();
+    assert_eq!(
+        *updates.borrow_and_update(),
+        ConnectionState::Live(LeaseState::Reserved)
+    );
+    h.watermark(JOB, 17).unwrap();
+    assert!(!updates.has_changed().unwrap());
+    for (seq, kind, state) in [
+        (1, TenantEventKind::Admitted, LeaseState::Admitted),
+        (2, TenantEventKind::Started, LeaseState::Started),
+        (3, TenantEventKind::Terminal, LeaseState::Ended),
+    ] {
+        h.event("tenant", &event(seq, kind, Some(JOB), None), NOW * 1000)
+            .unwrap();
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(*updates.borrow_and_update(), ConnectionState::Live(state));
+    }
+    h.close(id).unwrap();
+    assert_eq!(*updates.borrow(), ConnectionState::Closed);
+}
