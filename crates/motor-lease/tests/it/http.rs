@@ -53,6 +53,8 @@ impl Server {
                 broker.settle_due(now_ms());
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // Model Darwin's inherited nonblocking mode on every test platform.
+                        stream.set_nonblocking(true).unwrap();
                         let _ = super::serve_connection(stream, &mut broker);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -152,6 +154,47 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[test]
+fn http_nonblocking_connection_waits_for_headers_and_body() {
+    let server = Server::start(&[]);
+    let mut stream = TcpStream::connect(&server.address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let body = serde_json::to_vec(&lease_request()).unwrap();
+    stream.write_all(b"POST /v1/leases HTTP/1.1\r\n").unwrap();
+    let assert_pending = |stream: &mut TcpStream| {
+        let error = stream.read(&mut [0; 1]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    };
+    assert_pending(&mut stream);
+    write!(
+        stream,
+        "Host: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {BEARER}\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    let (first, last) = body.split_at(body.len() / 2);
+    stream.write_all(first).unwrap();
+    assert_pending(&mut stream);
+    stream.write_all(last).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(headers.split_whitespace().nth(1), Some("201"));
+    let lease: LeaseResponse = serde_json::from_str(body).unwrap();
+    assert_eq!(lease.reserved_vcpu_ms, 20000);
 }
 
 #[test]

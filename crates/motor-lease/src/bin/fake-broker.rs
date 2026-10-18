@@ -130,10 +130,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn serve_connection(mut stream: TcpStream, broker: &mut FakeBroker) -> io::Result<()> {
+    // Darwin inherits the listener's nonblocking mode, but this parser waits for a full request.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let reply = read_request(&mut stream, broker)
-        .unwrap_or_else(|_| BrokerReply::error(400, "bad_request"));
+    let reply = read_request(&mut stream, broker).unwrap_or_else(|error| {
+        eprintln!("fake broker request parsing failed: {error}");
+        BrokerReply::error(400, "bad_request")
+    });
     send_reply(&mut stream, reply)
 }
 
