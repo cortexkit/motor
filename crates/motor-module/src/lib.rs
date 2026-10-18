@@ -19,6 +19,7 @@ pub use return_paths::ReturnOptions;
 mod transport;
 
 pub use config::{BrokerTokenSource, Config};
+pub use hosted::account::AccountTokens;
 pub use hosted::{BillingStatus, HostedJobState};
 pub use motor::{JobStream, Motor};
 pub use transport::{Connector, Duplex, SshConnector};

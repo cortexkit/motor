@@ -1,6 +1,7 @@
 //! Broker credentials and saved job routes are separate from SSH. Jobs already
 //! placed on a hosted runner keep that route even if `hosted_runners` is disabled;
 //! reconnecting those jobs must never open an SSH connection.
+pub(crate) mod account;
 mod tls;
 
 use crate::{config::BrokerTokenSource, storage::Storage, transport::Channel, Config};
@@ -105,6 +106,11 @@ pub(crate) enum Error {
     Released,
     Budget,
     Platform,
+    AccountNotFound,
+    AccountAuthRequired,
+    AccountTransient(Option<u64>),
+    AccountPermanent,
+    AccountInvalid,
 }
 impl Error {
     pub(crate) fn code(self) -> &'static str {
@@ -125,14 +131,39 @@ impl Error {
             Self::Released => "hosted_job_released",
             Self::Budget => "hosted_budget_exhausted",
             Self::Platform => "hosted_platform_unsupported",
+            Self::AccountNotFound => "hosted_account_not_found",
+            Self::AccountAuthRequired => "hosted_account_auth_required",
+            Self::AccountTransient(_) => "hosted_account_transient",
+            Self::AccountPermanent => "hosted_account_permanent",
+            Self::AccountInvalid => "hosted_account_invalid",
         }
     }
     pub(crate) fn reason(self) -> RefusalReason {
         match self {
-            Self::Auth | Self::Expired | Self::Spki => RefusalReason::RunnerAuthenticationFailed,
+            Self::Auth
+            | Self::Expired
+            | Self::Spki
+            | Self::AccountNotFound
+            | Self::AccountAuthRequired
+            | Self::AccountPermanent
+            | Self::AccountInvalid => RefusalReason::RunnerAuthenticationFailed,
             Self::HostFull | Self::Capacity => RefusalReason::RunnerFull,
-            Self::Connect | Self::Broker => RefusalReason::Unreachable,
+            Self::Connect | Self::Broker | Self::AccountTransient(_) => RefusalReason::Unreachable,
+            Self::Platform => RefusalReason::PlatformUnsupported,
             _ => RefusalReason::RequestRejected,
+        }
+    }
+    pub(crate) fn detail(self) -> String {
+        if self == Self::AccountAuthRequired {
+            format!("{}: a person must run `ck account login`", self.code())
+        } else {
+            self.code().into()
+        }
+    }
+    pub(crate) fn retry_after_ms(self) -> Option<u64> {
+        match self {
+            Self::AccountTransient(delay) => delay,
+            _ => None,
         }
     }
     fn replaceable(self) -> bool {
@@ -226,31 +257,55 @@ fn reattach_body(key: &SigningKey) -> ReattachRequest {
 pub(crate) struct Client {
     http: reqwest::Client,
     route: HostedJobState,
+    account_tokens: Option<Arc<account::AccountTokens>>,
 }
 impl Client {
     pub(crate) fn new(route: HostedJobState) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(15))
+                .timeout(account::BROKER_TIMEOUT)
                 .build()
                 .expect("HTTP client configuration"),
             route,
+            account_tokens: None,
         }
+    }
+    pub(crate) fn with_account_tokens(
+        mut self,
+        tokens: Option<Arc<account::AccountTokens>>,
+    ) -> Self {
+        self.account_tokens = tokens;
+        self
     }
     async fn post<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &T,
     ) -> Result<R, Error> {
-        // Acquiring a machine bearer from `ck account` is not implemented here.
-        // Refuse authentication rather than send a hosted job through SSH.
-        let bearer = match self.route.token_source {
+        let bearer = self.bearer().await?;
+        self.post_authorized(path, body, bearer).await
+    }
+    async fn bearer(&self) -> Result<String, Error> {
+        match self.route.token_source {
             BrokerTokenSource::Fake => {
-                std::env::var("MOTOR_FAKE_BROKER_TOKEN").map_err(|_| Error::Auth)?
+                std::env::var("MOTOR_FAKE_BROKER_TOKEN").map_err(|_| Error::Auth)
             }
-            BrokerTokenSource::CkAccount => return Err(Error::Auth),
-        };
+            BrokerTokenSource::CkAccount => {
+                self.account_tokens
+                    .as_ref()
+                    .ok_or(Error::AccountNotFound)?
+                    .bearer()
+                    .await
+            }
+        }
+    }
+    async fn post_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+        bearer: String,
+    ) -> Result<R, Error> {
         let reply = self
             .http
             .post(format!(
@@ -366,6 +421,9 @@ impl Client {
             let attempt = state.placement_attempts;
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
+            // Acquire credentials before recording this attempt: a vault refusal
+            // means no HTTP request was sent to create a reservation for it.
+            let bearer = self.bearer().await?;
             // Even if the lease response is lost, the broker may have issued a
             // token. Wait past its possible issue second before requesting another:
             // the host accepts a replacement run token only with a greater iat.
@@ -376,7 +434,8 @@ impl Client {
                     state.retry_iat = Some(now_s());
                 })
                 .map_err(|_| Error::Broker)?;
-            let lease: LeaseResponse = match self.post("/v1/leases", &body).await {
+            let lease: LeaseResponse = match self.post_authorized("/v1/leases", &body, bearer).await
+            {
                 Ok(l) => l,
                 Err(Error::Broker) if attempt < 2 => continue,
                 Err(error) if error.replaceable() && attempt < 2 => continue,

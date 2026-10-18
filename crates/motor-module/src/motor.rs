@@ -55,7 +55,11 @@ pub struct Motor {
     storage: Arc<Storage>,
     connector: Arc<dyn Connector>,
     spool_root: PathBuf,
+    account_tokens: Option<Arc<crate::AccountTokens>>,
 }
+#[cfg(test)]
+#[path = "hosted/account/boundary_tests.rs"]
+mod hosted_account_tests;
 impl Motor {
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
         self.connector = connector;
@@ -75,7 +79,15 @@ impl Motor {
             storage: Arc::new(Storage::open(storage_root)?),
             connector,
             spool_root: storage_root.join("spools"),
+            account_tokens: None,
         })
+    }
+    pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
+        self.account_tokens = Some(tokens);
+        self
+    }
+    fn hosted_client(&self, state: crate::HostedJobState) -> crate::hosted::Client {
+        crate::hosted::Client::new(state).with_account_tokens(self.account_tokens.clone())
     }
     pub fn run(&self, request: RunRequest) -> io::Result<JobStream> {
         self.run_attributed(request, None)
@@ -248,14 +260,27 @@ impl Motor {
         detail: Option<String>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
     ) -> io::Result<()> {
+        self.refused_with_retry(id, reason, hash, detail, None, tx)
+            .await
+    }
+    async fn refused_with_retry(
+        &self,
+        id: Uuid,
+        reason: RefusalReason,
+        hash: Option<String>,
+        detail: Option<String>,
+        retry_after_ms: Option<u64>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
         let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
             .with_ran(Ran::None);
+        terminal.retry_after_ms = retry_after_ms;
         if let Some(hash) = hash {
             terminal = terminal.with_tree_hash(hash);
         }
         let detail = if self.hosted_state(id).is_some() {
             if let Some(state) = self.hosted_state(id).filter(|s| s.lease_attempted) {
-                if crate::hosted::Client::new(state).release(id).await
+                if self.hosted_client(state).release(id).await
                     == Err(crate::hosted::Error::Admitted)
                 {
                     let (_, wake) = watch::channel(false);
@@ -416,7 +441,7 @@ impl Motor {
         };
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
-                let client = crate::hosted::Client::new(state);
+                let client = self.hosted_client(state);
                 match client.run(id, &request, &self.storage).await {
                     Ok((channel, lease)) => {
                         request.timeout = Some(lease.max_s);
@@ -426,20 +451,25 @@ impl Motor {
                     Err(crate::hosted::Error::Admitted) => {
                         return self.follow(id, 0, None, tx, wake).await
                     }
-                    Err(error) => Err((error.reason(), Some(error.code().into()))),
+                    Err(error) => {
+                        Err((error.reason(), Some(error.detail()), error.retry_after_ms()))
+                    }
                 }
             } else {
-                open_for_request(connector.as_ref().unwrap().as_ref(), id).await
+                open_for_request(connector.as_ref().unwrap().as_ref(), id)
+                    .await
+                    .map_err(|(reason, detail)| (reason, detail, None))
             };
             let mut channel = match opened {
                 Ok(c) => c,
-                Err((reason, detail)) => {
+                Err((reason, detail, retry_after_ms)) => {
                     return self
-                        .refused(
+                        .refused_with_retry(
                             id,
                             reason,
                             Some(snapshots.main.tree_hash.clone()),
                             detail,
+                            retry_after_ms,
                             tx,
                         )
                         .await
@@ -753,9 +783,7 @@ impl Motor {
     }
     async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
         if let Some(state) = self.hosted_state(id) {
-            crate::hosted::Client::new(state)
-                .attach(id, &self.storage)
-                .await
+            self.hosted_client(state).attach(id, &self.storage).await
         } else {
             let connector = self
                 .connector_for_job(id)

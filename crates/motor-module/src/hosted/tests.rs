@@ -83,12 +83,45 @@ fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
             RefusalReason::RequestRejected,
             "hosted_path_outside_roots",
         ),
+        (
+            Error::Budget,
+            RefusalReason::RequestRejected,
+            "hosted_budget_exhausted",
+        ),
+        (
+            Error::Platform,
+            RefusalReason::PlatformUnsupported,
+            "hosted_platform_unsupported",
+        ),
     ] {
         assert_eq!(error.reason(), reason);
         assert_eq!(error.code(), code);
     }
     assert!(!Error::Auth.replaceable());
     assert!(!Error::Expired.replaceable());
+}
+
+#[test]
+fn hosted_cutover_config_is_opt_in_and_roundtrips_without_changing_ssh_defaults() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "hosted_runners": true, "broker_url": "https://runners.cortexkit.io"
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    assert!(config.hosted_runners);
+    assert_eq!(config.broker_token_source, BrokerTokenSource::CkAccount);
+    let mut off = config.clone();
+    off.hosted_runners = false;
+    off.broker_url = None;
+    assert_eq!(
+        serde_json::to_value(&off).unwrap(),
+        serde_json::to_value(Config::default()).unwrap()
+    );
+    assert_eq!(config.runner_instance, Config::default().runner_instance);
+    assert_eq!(
+        config.ssh_config_override,
+        Config::default().ssh_config_override
+    );
 }
 
 #[test]
@@ -101,6 +134,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
     assert_eq!(state.billed_line(), "billed: 6.001 vCPU-s");
 }
 
+mod account;
 mod harness;
 use harness::*;
 use motor_protocol::*;
