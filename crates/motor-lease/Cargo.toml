@@ -14,7 +14,7 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 
 [dev-dependencies]
-cortexkit-test-support = "=0.1.7"
+cortexkit-test-support = "=0.1.10"
 
 [[bin]]
 name = "motor-fake-broker"

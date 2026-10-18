@@ -28,6 +28,6 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-cortexkit-test-support = "=0.1.7"
+cortexkit-test-support = "=0.1.10"
 rand = "0.8"
 tokio = { workspace = true, features = ["test-util"] }
