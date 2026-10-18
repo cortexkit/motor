@@ -47,7 +47,10 @@ async fn queued_caller_receives_accepted_started_output_terminal_and_replays_sta
         panic!("Started before Output")
     };
     assert_eq!(started.seq, 0);
-    assert_eq!(started.queue_wait_ms, 125);
+    // The 125 ms the queued job spent behind the holder doesn't count: the only
+    // blocker was an earlier job owning the same workspace, and Started carries
+    // the same counted queue wait as the queue-wait budget and heartbeats.
+    assert_eq!(started.queue_wait_ms, 0);
     assert_eq!(started.started_at_ms, f.clock.load(Ordering::SeqCst));
     assert!(
         matches!(&remaining[1], StreamRecord::Output(o) if o.seq == 1 && o.bytes.0 == b"queued-output")

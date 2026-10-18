@@ -30,6 +30,7 @@ mod health;
 mod operator_cli;
 pub(crate) mod placement;
 mod recovery;
+mod return_paths;
 mod routing;
 mod safety;
 mod started;

@@ -481,6 +481,7 @@ impl Connector for SshConnector {
 pub(crate) use motor_protocol::DecodedFrame as Incoming;
 type WriteRequest = (Frame, oneshot::Sender<io::Result<()>>);
 pub(crate) struct Channel {
+    pub return_paths: bool,
     pub gate_jobs: bool,
     pub platforms: Vec<String>,
     tx: mpsc::Sender<WriteRequest>,
@@ -497,6 +498,38 @@ impl Drop for Channel {
 }
 
 impl Channel {
+    /// Exchange hello once on a TLS connection already authenticated by its lease.
+    /// On failure the hosted client requests a fresh lease before reconnecting;
+    /// SSH's independent connection retry loop must not reuse the old token.
+    pub(crate) async fn from_hosted(pipe: Box<dyn Duplex>) -> io::Result<Self> {
+        let mut channel = Self::new(pipe);
+        channel
+            .send(Frame::Hello {
+                return_paths: false,
+                protocol_version: PROTOCOL_VERSION,
+                started: true,
+                default_branch_tip: true,
+                gate_jobs: true,
+                platforms: Vec::new(),
+            })
+            .await?;
+        match channel.next().await? {
+            Incoming::Frame(Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                platforms,
+                gate_jobs,
+                return_paths,
+                ..
+            }) => {
+                channel.platforms = platforms;
+                channel.gate_jobs = gate_jobs;
+                channel.return_paths = return_paths;
+                channel.enable_heartbeats();
+                Ok(channel)
+            }
+            _ => Err(io::Error::other("invalid hosted runner hello")),
+        }
+    }
     pub async fn open(connector: &dyn Connector, id: Uuid) -> Result<Self, RefusalReason> {
         Self::open_with_cause(connector, id)
             .await
@@ -552,13 +585,11 @@ impl Channel {
                     advance(UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello {
-                            protocol_version: PROTOCOL_VERSION,
-                            started: true,
-                            default_branch_tip: true,
-                            gate_jobs: true,
-                            platforms: Vec::new(),
-                        })
+                        .send(Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION,
+                        started: true,
+                        default_branch_tip: true,
+                        gate_jobs: true,
+                        platforms: Vec::new(), })
                         .await
                         .map_err(|error| {
                             AttemptFailure::Step(UnreachableStep::HelloSend, error.to_string())
@@ -567,11 +598,12 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
+                            channel.return_paths = return_paths;
                             channel.enable_heartbeats();
                             tracing::info!(job_or_workspace_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake complete");
                             Ok(channel)
@@ -716,6 +748,7 @@ impl Channel {
         });
         Self {
             gate_jobs: false,
+            return_paths: false,
             platforms: Vec::new(),
             tx,
             rx,
@@ -795,6 +828,7 @@ mod hello_tests {
             write_active(
                 &mut peer,
                 &Frame::Hello {
+                    return_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
                     default_branch_tip: false,
@@ -825,6 +859,7 @@ mod hello_tests {
                 write_frame_async(
                     &mut peer,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

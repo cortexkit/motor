@@ -57,7 +57,7 @@ it.
 | `run` | client → runner | Submit a job: workspace, command, filtered environment, snapshot commit, tree hash, siblings, bundle manifest, optional `weight_hint`, `timeout`, `queue_wait_limit_s`, `platform`, `network`, `workspace_kind`, `gate_job`. |
 | `accepted` | runner → client | The job is durably accepted; carries queue position, granted network and platform echo. |
 | `bundle_chunk` | client → runner | Bundle bytes by bundle index and offset. |
-| `started` | runner → client | The job took capacity and began; carries `seq`, queue wait, start time, optional `path_mapping`. |
+| `started` | runner → client | The job took capacity and began; carries `seq`, counted queue wait (8.1), start time, optional `path_mapping`. |
 | `output` | runner → client | Sequenced stdout or stderr bytes. |
 | `heartbeat` | runner → client | Keeps the stream alive; optional `queue_wait_ms` while waiting for capacity. |
 | `terminal` | runner → client | The job's final record. Ends the job's stream. |
@@ -318,7 +318,9 @@ for capacity or another shared scheduler blocker, but excludes time when an
 earlier job owning the same workspace is the only blocker. The runner resumes
 the clock if another blocker appears. Upload, fetch, setup and execution are
 excluded. Cancellation still removes a queued job, and the request's execution
-timeout starts when its command starts. `job_status_reply.waiting_on` reports the
+timeout starts when its command starts. The `queue_wait_ms` in `started` and in
+the terminal record is this same counted wait, so a job that waited only behind
+its own workspace reports 0. `job_status_reply.waiting_on` reports the
 current blocker, such as `workspace owner` or `permits`. A plain heartbeat never
 authorizes withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
 `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`

@@ -61,7 +61,13 @@ fn cloud_final_files_match_their_manifest_digests() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts");
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
-    for path in ["cloud/job-tokens.json", "cloud/host-signature.json"] {
+    for path in [
+        "cloud/runners-contract.md",
+        "cloud/job-tokens.json",
+        "cloud/host-signature.json",
+        "cloud/lease.json",
+        "cloud/usage-settlement.json",
+    ] {
         let entry = manifest
             .files
             .iter()

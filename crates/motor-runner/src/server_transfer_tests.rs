@@ -18,6 +18,8 @@ fn fixture() -> (ScratchDir, Runner, Run, Vec<u8>) {
         .to_string_lossy()
         .into_owned();
     let request = Run {
+        return_paths: Vec::new(),
+        return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
         gate_job: false,
         network: None,
         platform: None,

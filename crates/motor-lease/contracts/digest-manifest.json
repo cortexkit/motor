@@ -1,56 +1,51 @@
 {
+  "source": {
+    "canonical_repository": "cortexkit-cloud",
+    "canonical_contract": "docs/runners-contract.md",
+    "canonical_vectors": "test-vectors/runners/",
+    "revision": "00e688e",
+    "kind": "canonical"
+  },
   "files": [
     {
-      "path": "interim-pins.txt",
-      "sha256": "192e0cd05f204f7041e938f861ee71115f0e367c19678803822fba3963d99a7a"
-    },
-    {
-      "path": "lease-details.txt",
-      "sha256": "919e5b75785dfe9610908c801e319a0ad5754186f247e9bf1486de625e1e423b"
-    },
-    {
-      "path": "vectors/interim.json",
-      "sha256": "3865ea73160cc1f253e23c5f2d260e49cf9bcb271c10deb5ced3fd4a1b8785ae"
-    },
-    {
-      "path": "cloud/job-tokens.json",
-      "sha256": "47ef19ef6c1da27fe2dc191415883723f6526651acd341e76e5cb9d727b15445"
+      "path": "cloud/runners-contract.md",
+      "sha256": "9e98c7df9bed62dd5674fbff4b0f7b4fb30486a72a2dc7d44b409e55be39976b",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "00e688e",
+      "source_path": "docs/runners-contract.md",
+      "canonical": true
     },
     {
       "path": "cloud/host-signature.json",
-      "sha256": "08a19498873c3bb9c059aaf67af5910ba967fe753fb44c58aa92bf4d3936dae1"
+      "sha256": "9c8876854bb955aa4468ffe9cf61f68d31327bc4e13367813f8c2e89c5e1b398",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "00e688e",
+      "source_path": "test-vectors/runners/host-signature.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/job-tokens.json",
+      "sha256": "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "00e688e",
+      "source_path": "test-vectors/runners/job-tokens.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/lease.json",
+      "sha256": "078eb7992b1fd47ae3ce7346ce73ee8cf4d2b088accf990a5676d501746f08d3",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "00e688e",
+      "source_path": "test-vectors/runners/lease.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/usage-settlement.json",
+      "sha256": "4f53e2eb16dd586308f31f9a9ffe986c1f214a65aa45dd973f2a3de1f63084b7",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "00e688e",
+      "source_path": "test-vectors/runners/usage-settlement.json",
+      "canonical": true
     }
-  ],
-  "source": {
-    "canonical_contract": "docs/runners-contract.md",
-    "canonical_repository": "cortexkit-cloud",
-    "canonical_vectors": "test-vectors/runners/",
-    "canonical_parts": [
-      {
-        "mirror_path": "cloud/job-tokens.json",
-        "source_path": "test-vectors/runners/job-tokens.json",
-        "source_repository": "cortexkit-cloud",
-        "source_commit": "9a62f15",
-        "note": "Final per CLOUD; this vector is canonical."
-      },
-      {
-        "mirror_path": "cloud/host-signature.json",
-        "source_path": "test-vectors/runners/host-signature.json",
-        "source_repository": "cortexkit-cloud",
-        "source_commit": "9a62f15",
-        "note": "Final per CLOUD; this vector is canonical."
-      }
-    ],
-    "interim_parts": [
-      "interim-pins.txt",
-      "lease-details.txt",
-      "vectors/interim.json"
-    ],
-    "confirmed_details": "lease-details.txt",
-    "date": "2026-10-17",
-    "kind": "partial-final-pins",
-    "note": "Only the two cloud vectors in canonical_parts are canonical. The lease, reattach, release, usage settlement, and contract document remain interim.",
-    "replacement_required_before": "hosted client integration",
-    "revision": null
-  }
+  ]
 }

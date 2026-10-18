@@ -175,6 +175,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
     write_frame_async(
         &mut stream,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started,
             default_branch_tip: false,
@@ -185,9 +186,12 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
     .await
     .unwrap();
     let expected = match (kind, started) {
-        (BackendKind::Host, false) => br#"{"type":"hello","protocol_version":1}"#.as_slice(),
+        (BackendKind::Host, false) => {
+            br#"{"type":"hello","protocol_version":1,"return_paths":true}"#.as_slice()
+        }
         (BackendKind::Host, true) => {
-            br#"{"type":"hello","protocol_version":1,"started":true}"#.as_slice()
+            br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true}"#
+                .as_slice()
         }
         (BackendKind::WindowsVm, true) => {
             br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["windows"]}"#

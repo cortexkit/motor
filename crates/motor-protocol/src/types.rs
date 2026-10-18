@@ -62,6 +62,13 @@ pub struct Run {
     pub weight_hint: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_paths: Vec<String>,
+    #[serde(
+        default = "default_return_max_bytes",
+        skip_serializing_if = "is_default_return_max_bytes"
+    )]
+    pub return_max_bytes: u64,
     pub queue_wait_limit_s: u64,
     pub snapshot_commit: String,
     pub tree_hash: String,
@@ -289,6 +296,8 @@ define_frames! {
         /// without stopping or changing the CPU reservation of any running job.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         gate_jobs: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        return_paths: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         platforms: Vec<String>,
     },
@@ -320,6 +329,7 @@ define_frames! {
         data: BytePayload,
     },
     Output(Output),
+    ReturnResult(ReturnResult),
     Heartbeat {
         /// Elapsed time waiting for scheduler capacity on a job stream. When
         /// absent, the client clears its local queue deadline rather than
@@ -337,6 +347,7 @@ define_frames! {
     },
     Attach(AttachRequest),
     Terminal(TerminalRecord),
+    HostedTerminal(HostedTerminal),
     Prepare(Prepare),
     PrepareAccepted {
         transfer_id: Uuid,
@@ -369,6 +380,91 @@ define_frames! {
     },
     Cancel(CancelRequest),
     CancelReply(CancelReply),
+}
+
+pub const RETURN_MAX_BYTES: u64 = 262144;
+
+pub fn default_return_max_bytes() -> u64 {
+    RETURN_MAX_BYTES
+}
+
+fn is_default_return_max_bytes(value: &u64) -> bool {
+    *value == RETURN_MAX_BYTES
+}
+
+/// Validate lexical bounds before acquiring a lease or admitting a job. Files
+/// may not exist until the command runs; symlinks are checked when collecting.
+pub fn validate_return_paths(
+    workspace: &str,
+    paths: &[String],
+    cap: u64,
+) -> Result<(), &'static str> {
+    use std::path::{Component, Path};
+    let root = Path::new(workspace);
+    if cap > RETURN_MAX_BYTES || paths.len() > 64 {
+        return Err("return_paths_exceeded");
+    }
+    for path in paths {
+        let path_ref = Path::new(path);
+        if path.len() > 4096
+            || !path_ref.is_absolute()
+            || !root.is_absolute()
+            || !path_ref.starts_with(root)
+            || path_ref
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err("return_paths_exceeded");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReturnedFile {
+    pub path: String,
+    pub sha256: String,
+    /// Standard padded base64 of the file's raw bytes.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReturnFailureCause {
+    OverCap,
+    Missing,
+    Escape,
+    NotRegular,
+    FrameLimit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReturnPathsFailed {
+    pub measured_bytes: u64,
+    pub cap_bytes: u64,
+    pub cause: ReturnFailureCause,
+}
+
+/// File collection result ordered by seq among the job's events, immediately
+/// before its terminal record. Collection failure does not change the exit outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReturnResult {
+    pub job_id: Uuid,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_files: Option<Vec<ReturnedFile>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_paths_failed: Option<ReturnPathsFailed>,
+}
+
+/// Host-observed usage. A host sends this after the runner's terminal result and
+/// replays the same billing figure whenever a client reattaches to the job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostedTerminal {
+    pub job_id: Uuid,
+    pub placement: String,
+    pub billed_vcpu_ms: u64,
+    pub max_runtime_s: u64,
 }
 
 /// Per-job lifecycle inspection. Aggregate status retains its v1 shape.

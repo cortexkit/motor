@@ -87,6 +87,7 @@ fn connect_forwards_short_frames_before_socket_eof() {
     let scratch = SocketScratch::new();
     let listener = listener(scratch.path());
     let hello = Frame::Hello {
+        return_paths: false,
         protocol_version: PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -219,6 +220,7 @@ fn drain_executable_sends_bounded_hold_request_and_reports_deadline() {
         assert_eq!(
             read_frame(&mut socket).unwrap(),
             Some(Frame::Hello {
+                return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -229,6 +231,7 @@ fn drain_executable_sends_bounded_hold_request_and_reports_deadline() {
         write_frame(
             &mut socket,
             &Frame::Hello {
+                return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -310,6 +313,7 @@ fn resume_executable_negotiates_admin_frame_and_rejects_legacy_eof() {
         write_frame(
             &mut socket,
             &Frame::Hello {
+                return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,

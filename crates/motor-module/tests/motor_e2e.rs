@@ -2104,6 +2104,7 @@ async fn runner_rpc(frame: Frame) -> Frame {
     motor_protocol::write_frame_async(
         &mut stdin,
         &Frame::Hello {
+            return_paths: false,
             protocol_version: motor_protocol::PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -2126,16 +2127,17 @@ async fn runner_rpc(frame: Frame) -> Frame {
     })
     .await
     .unwrap();
-    assert_eq!(
-        hello,
+    assert!(matches!(
+        &hello,
         Frame::Hello {
             protocol_version: motor_protocol::PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
             gate_jobs: false,
-            platforms: Vec::new(),
-        }
-    );
+            platforms,
+            ..
+        } if platforms.is_empty()
+    ));
     motor_protocol::write_frame_async(&mut stdin, &frame)
         .await
         .unwrap();

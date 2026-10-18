@@ -12,11 +12,12 @@ fn fake_is_forbidden_for_main_and_requires_worker_bearer() {
     let body = serde_json::to_vec(&lease_request()).unwrap();
     for path in [
         "/v1/leases",
-        "/v1/leases/test-job/reattach",
-        "/v1/leases/test-job/release",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
     ] {
         let reply = b.handle(
             BrokerRequest {
+                content_type: Some("application/json"),
                 method: "POST",
                 path,
                 bearer: Some("wrong"),
@@ -29,6 +30,7 @@ fn fake_is_forbidden_for_main_and_requires_worker_bearer() {
     }
     let jwks = b.handle(
         BrokerRequest {
+            content_type: Some("application/json"),
             method: "GET",
             path: "/.well-known/jwks.json",
             bearer: None,
@@ -89,32 +91,41 @@ fn release_requires_a_same_tenant_bearer_an_empty_object_and_a_known_job() {
     for bearer in [None, Some("another-tenant-token")] {
         let reply = b.handle(
             BrokerRequest {
+                content_type: Some("application/json"),
                 method: "POST",
-                path: "/v1/leases/test-job/release",
+                path: "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
                 bearer,
                 host_headers: None,
                 body: b"{}",
             },
             NOW,
         );
-        assert_eq!((reply.status, reply.body), (401, json!({"error":"auth"})));
+        assert_eq!(
+            (reply.status, reply.body),
+            (401, json!({"error":"unauthorized"}))
+        );
     }
     for body in [
         json!(null),
         json!([]),
         json!(""),
-        json!({"job_id":"test-job"}),
+        json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde"}),
         json!({"extra":true}),
     ] {
-        let reply = post(&mut b, "/v1/leases/test-job/release", &body, NOW);
+        let reply = post(
+            &mut b,
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+            &body,
+            NOW,
+        );
         assert_eq!(
             (reply.status, reply.body),
-            (400, json!({"error":"invalid_request"}))
+            (400, json!({"error":"bad_request"}))
         );
     }
     let unknown = post(
         &mut b,
-        "/v1/leases/unknown/release",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcd1/release",
         &ReleaseRequest {},
         NOW,
     );
@@ -122,7 +133,9 @@ fn release_requires_a_same_tenant_bearer_an_empty_object_and_a_known_job() {
         (unknown.status, unknown.body),
         (404, json!({"error":"job_unknown"}))
     );
-    assert!(b.settlement("test-job").is_none());
+    assert!(b
+        .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+        .is_none());
 }
 
 #[test]
@@ -132,17 +145,16 @@ fn release_is_idempotent_blocks_new_tokens_and_settles_unadmitted_jobs_at_zero()
         let lease = issued(&mut b, &lease_request(), NOW);
         let pending = post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW,
         );
-        let expected =
-            json!({"job_id":"test-job", "release_at_ms":lease.token_expires_at_ms + 60000});
+        let expected = json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde", "release_at_ms":lease.token_expires_at_ms + 60000});
         assert_eq!((pending.status, pending.body.clone()), (202, expected));
         assert_eq!(
             post(
                 &mut b,
-                "/v1/leases/test-job/release",
+                "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
                 &ReleaseRequest {},
                 NOW + 1000
             ),
@@ -157,7 +169,7 @@ fn release_is_idempotent_blocks_new_tokens_and_settles_unadmitted_jobs_at_zero()
         };
         let denied = post(
             &mut b,
-            "/v1/leases/test-job/reattach",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
             &reattach,
             NOW + 1000,
         );
@@ -180,14 +192,18 @@ fn release_is_idempotent_blocks_new_tokens_and_settles_unadmitted_jobs_at_zero()
         }
         let at = lease.token_expires_at_ms + 60000;
         b.settle_due(at - 1);
-        assert!(b.settlement("test-job").is_none());
+        assert!(b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .is_none());
         b.settle_due(at);
-        let (settled, reason) = b.settlement("test-job").unwrap();
+        let (settled, reason) = b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap();
         assert_eq!(reason, "released");
         assert_eq!(
             settled,
             &UsageReply {
-                job_id: "test-job".into(),
+                job_id: "019e4567-89ab-7cde-8012-3456789abcde".into(),
                 settled_vcpu_ms: 0,
                 released_vcpu_ms: 20000
             }
@@ -195,11 +211,12 @@ fn release_is_idempotent_blocks_new_tokens_and_settles_unadmitted_jobs_at_zero()
         assert_eq!(
             post(
                 &mut b,
-                "/v1/leases/test-job/release",
+                "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
                 &ReleaseRequest {},
                 at + 1
-            ),
-            pending
+            )
+            .body,
+            json!({"error":"job_finished"})
         );
         let mut retry = lease_request();
         retry.platform = "other-platform".into();
@@ -217,16 +234,21 @@ fn release_is_idempotent_blocks_new_tokens_and_settles_unadmitted_jobs_at_zero()
         );
         let ended_attach = post(
             &mut b,
-            "/v1/leases/test-job/reattach",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
             &reattach,
             at + 1_000_001,
         );
         assert_eq!(
             (ended_attach.status, ended_attach.body),
-            (409, json!({"error":"job_finished"}))
+            (409, json!({"error":"job_released"}))
         );
-        assert_eq!(b.settlement("test-job").unwrap().1, "released");
-        retry.job_id = "new-job".into();
+        assert_eq!(
+            b.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+                .unwrap()
+                .1,
+            "released"
+        );
+        retry.job_id = "019e4567-89ab-7cde-8012-3456789abcdf".into();
         issued(&mut b, &retry, at + 1_000_001);
     }
 }
@@ -239,7 +261,7 @@ fn release_deadline_uses_latest_run_expiry_and_ignores_attach_expiry() {
     assert!(latest.token_expires_at_ms > first.token_expires_at_ms);
     let attach = post(
         &mut b,
-        "/v1/leases/test-job/reattach",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
         &ReattachRequest {
             requester_jwk: lease_request().requester_jwk,
         },
@@ -248,7 +270,7 @@ fn release_deadline_uses_latest_run_expiry_and_ignores_attach_expiry() {
     assert!(attach.body["token_expires_at_ms"].as_u64().unwrap() > latest.token_expires_at_ms);
     let release = post(
         &mut b,
-        "/v1/leases/test-job/release",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
         &ReleaseRequest {},
         NOW + 4000,
     );
@@ -259,7 +281,7 @@ fn release_deadline_uses_latest_run_expiry_and_ignores_attach_expiry() {
     assert_eq!(
         post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW + 10000
         ),
@@ -274,7 +296,7 @@ fn release_then_connect_with_still_valid_run_token_cancels_release_and_bills_nor
         let lease = issued(&mut b, &lease_request(), NOW);
         let pending = post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW,
         );
@@ -291,7 +313,7 @@ fn release_then_connect_with_still_valid_run_token_cancels_release_and_bills_nor
         );
         let admitted = post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW + 2000,
         );
@@ -301,10 +323,12 @@ fn release_then_connect_with_still_valid_run_token_cancels_release_and_bills_nor
         );
         let at = pending.body["release_at_ms"].as_u64().unwrap();
         b.settle_due(at);
-        assert!(b.settlement("test-job").is_none());
+        assert!(b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .is_none());
         let attach = post(
             &mut b,
-            "/v1/leases/test-job/reattach",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
             &ReattachRequest {
                 requester_jwk: lease_request().requester_jwk,
             },
@@ -316,10 +340,15 @@ fn release_then_connect_with_still_valid_run_token_cancels_release_and_bills_nor
             (reply.status, reply.body),
             (
                 200,
-                json!({"job_id":"test-job", "settled_vcpu_ms":6000, "released_vcpu_ms":14000})
+                json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde", "settled_vcpu_ms":6000, "released_vcpu_ms":14000})
             )
         );
-        assert_eq!(b.settlement("test-job").unwrap().1, "usage");
+        assert_eq!(
+            b.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+                .unwrap()
+                .1,
+            "usage"
+        );
     }
 }
 
@@ -331,7 +360,7 @@ fn release_refuses_previously_admitted_or_otherwise_finished_jobs() {
         host_post(&mut b, "heartbeat", &heartbeat(state, 0), 1, NOW);
         let admitted = post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW,
         );
@@ -342,7 +371,7 @@ fn release_refuses_previously_admitted_or_otherwise_finished_jobs() {
         host_post(&mut b, "usage", &usage(), 2, NOW + 3000);
         let finished = post(
             &mut b,
-            "/v1/leases/test-job/release",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
             &ReleaseRequest {},
             NOW + 3000,
         );
@@ -355,9 +384,9 @@ fn release_refuses_previously_admitted_or_otherwise_finished_jobs() {
     issued(&mut b, &lease_request(), NOW);
     let finished = post(
         &mut b,
-        "/v1/leases/test-job/release",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
         &ReleaseRequest {},
-        NOW + 604000,
+        NOW + 611000,
     );
     assert_eq!(
         (finished.status, finished.body),
@@ -371,15 +400,15 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     let lease = issued(&mut b, &lease_request(), NOW);
     post(
         &mut b,
-        "/v1/leases/test-job/release",
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
         &ReleaseRequest {},
         NOW,
     );
     let mut other_job = heartbeat(JobState::Started, 1000);
-    other_job.running[0].job_id = "other-job".into();
+    other_job.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcdf".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &other_job, 1, NOW).body,
-        json!({"ignored":["other-job"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcdf"]})
     );
     let key = SigningKey::from_bytes(&[9; 32]);
     b.register_host("other-host".into(), key.verifying_key());
@@ -388,6 +417,7 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     let headers = HostHeaders::sign("other-host", "POST", path, &body, NOW, 1, &key).unwrap();
     let reply = b.handle(
         BrokerRequest {
+            content_type: Some("application/json"),
             method: "POST",
             path,
             bearer: None,
@@ -396,10 +426,24 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
         },
         NOW,
     );
-    assert_eq!(reply.body, json!({"ignored":["test-job"]}));
+    assert_eq!(
+        reply.body,
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]})
+    );
     b.settle_due(lease.token_expires_at_ms + 60000);
-    assert_eq!(b.settlement("test-job").unwrap().1, "released");
-    assert_eq!(b.settlement("test-job").unwrap().0.settled_vcpu_ms, 0);
+    assert_eq!(
+        b.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap()
+            .1,
+        "released"
+    );
+    assert_eq!(
+        b.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap()
+            .0
+            .settled_vcpu_ms,
+        0
+    );
 }
 
 #[test]
@@ -411,7 +455,7 @@ fn reservation_floor_fresh_tokens_before_heartbeat_and_while_reserved() {
     let first_claims = verified(&b, &first, Purpose::Run, NOW);
     assert_eq!(first_claims.purpose, Purpose::Run);
     req.requester_jwk = RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key());
-    let second = issued(&mut b, &req, NOW);
+    let second = issued(&mut b, &req, NOW + 1000);
     assert_eq!(second.lease_id, first.lease_id);
     assert_eq!(second.placement, first.placement);
     assert_eq!(second.reserved_vcpu_ms, first.reserved_vcpu_ms);
@@ -433,7 +477,7 @@ fn reservation_floor_fresh_tokens_before_heartbeat_and_while_reserved() {
         .status,
         200
     );
-    let third = issued(&mut b, &req, NOW);
+    let third = issued(&mut b, &req, NOW + 2000);
     assert_eq!(third.lease_id, first.lease_id);
     assert!(verified(&b, &third, Purpose::Run, NOW).iat > second_claims.iat);
 }
@@ -444,16 +488,15 @@ fn rerequest_rejects_every_non_requester_field_change() {
     issued(&mut b, &lease_request(), NOW);
     for mutate in [
         |r: &mut LeaseRequest| r.vcpus = 3,
-        |r: &mut LeaseRequest| r.mem_mib = 1,
         |r: &mut LeaseRequest| r.platform = "windows".into(),
         |r: &mut LeaseRequest| r.net = true,
         |r: &mut LeaseRequest| r.workspace_key_hash = base64url(&[7; 32]),
         |r: &mut LeaseRequest| r.repo_hash = base64url(&[7; 32]),
-        |r: &mut LeaseRequest| r.timeout_s = 4,
+        |r: &mut LeaseRequest| r.timeout_s = 11,
         |r: &mut LeaseRequest| {
             r.placement_hint = Some(Placement {
                 host: HOST.into(),
-                vm: "test-vm".into(),
+                vm: Some("test-vm".into()),
             })
         },
     ] {
@@ -483,7 +526,12 @@ fn admitted_and_started_require_reattach_and_settled_jobs_are_finished() {
                 &SigningKey::from_bytes(&[9; 32]).verifying_key(),
             ),
         };
-        let reply = post(&mut b, "/v1/leases/test-job/reattach", &reattach, NOW);
+        let reply = post(
+            &mut b,
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+            &reattach,
+            NOW,
+        );
         assert_eq!(reply.status, 200);
         let attach: LeaseResponse = serde_json::from_value(reply.body).unwrap();
         assert_eq!(attach.placement, lease.placement);
@@ -491,7 +539,10 @@ fn admitted_and_started_require_reattach_and_settled_jobs_are_finished() {
         assert_eq!(c.purpose, Purpose::Attach);
         assert_eq!(c.cnf.jkt, reattach.requester_jwk.thumbprint().unwrap());
         host_post(&mut b, "usage", &usage(), 2, NOW + 3000);
-        for path in ["/v1/leases", "/v1/leases/test-job/reattach"] {
+        for path in [
+            "/v1/leases",
+            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        ] {
             let reply = if path == "/v1/leases" {
                 post(&mut b, path, &lease_request(), NOW + 3000)
             } else {
@@ -531,15 +582,24 @@ fn delayed_reserved_heartbeat_cannot_reopen_admission() {
 
 #[test]
 fn host_message_vectors_get_exact_401_errors_for_replay_skew_and_unregistered_host() {
-    let v: serde_json::Value =
-        serde_json::from_str(include_str!("../../contracts/vectors/interim.json")).unwrap();
-    let headers: HostHeaders = serde_json::from_value(v["host_headers"].clone()).unwrap();
-    let body = v["host_body"].as_str().unwrap().as_bytes();
+    let body = serde_json::to_vec(&heartbeat(JobState::Reserved, 0)).unwrap();
+    let body = body.as_slice();
     let path = "/v1/hosts/test-host/heartbeat";
+    let headers = HostHeaders::sign(
+        HOST,
+        "POST",
+        path,
+        body,
+        NOW,
+        NOW * 1000,
+        &SigningKey::from_bytes(&[4; 32]),
+    )
+    .unwrap();
     let mut b = broker();
     let handle = |b: &mut FakeBroker, h: &HostHeaders, now| {
         b.handle(
             BrokerRequest {
+                content_type: Some("application/json"),
                 method: "POST",
                 path,
                 bearer: None,
@@ -596,7 +656,7 @@ fn usage_resend_conflict_unknown_and_reservation_cap() {
         (first.status, first.body.clone()),
         (
             200,
-            json!({"job_id":"test-job","settled_vcpu_ms":6000,"released_vcpu_ms":14000})
+            json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde","settled_vcpu_ms":6000,"released_vcpu_ms":14000})
         )
     );
     assert_eq!(host_post(&mut b, "usage", &usage(), 2, NOW + 3000), first);
@@ -607,7 +667,7 @@ fn usage_resend_conflict_unknown_and_reservation_cap() {
         (conflict.status, conflict.body),
         (409, json!({"error":"usage_conflict"}))
     );
-    changed.job_id = "unknown".into();
+    changed.job_id = "019e4567-89ab-7cde-8012-3456789abcd1".into();
     let unknown = host_post(&mut b, "usage", &changed, 4, NOW + 3000);
     assert_eq!(
         (unknown.status, unknown.body),
@@ -620,7 +680,7 @@ fn usage_resend_conflict_unknown_and_reservation_cap() {
     let capped = host_post(&mut b, "usage", &changed, 1, NOW + 100000);
     assert_eq!(
         capped.body,
-        json!({"job_id":"test-job","settled_vcpu_ms":20000,"released_vcpu_ms":0})
+        json!({"job_id":"019e4567-89ab-7cde-8012-3456789abcde","settled_vcpu_ms":20000,"released_vcpu_ms":0})
     );
 }
 
@@ -641,7 +701,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
         (
             "heartbeat",
             serde_json::to_vec(&heartbeat(JobState::Started, 999)).unwrap(),
-            json!({"ignored":["test-job"]}),
+            json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]}),
         ),
     ] {
         let path = format!("/v1/hosts/other-host/{route}");
@@ -657,6 +717,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
         .unwrap();
         let reply = b.handle(
             BrokerRequest {
+                content_type: Some("application/json"),
                 method: "POST",
                 path: &path,
                 bearer: None,
@@ -668,10 +729,10 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
         assert_eq!(reply.body, expected);
     }
     let mut hb = heartbeat(JobState::Started, 10);
-    hb.running[0].job_id = "not-placed".into();
+    hb.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcd0".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &hb, 1, NOW).body,
-        json!({"ignored":["not-placed"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcd0"]})
     );
 }
 
@@ -691,9 +752,13 @@ fn lost_host_settlement_uses_last_elapsed_or_zero_and_blocks_late_usage() {
         }
         let deadline = NOW + (lease.max_s + 600) * 1000;
         b.settle_due(deadline - 1);
-        assert!(b.settlement("test-job").is_none());
+        assert!(b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .is_none());
         b.settle_due(deadline);
-        let (settled, reason) = b.settlement("test-job").unwrap();
+        let (settled, reason) = b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap();
         assert_eq!(reason, "host_lost");
         assert_eq!(settled.settled_vcpu_ms, 2 * elapsed.unwrap_or(0));
         let reply = host_post(&mut b, "usage", &usage(), 2, deadline);
@@ -703,7 +768,10 @@ fn lost_host_settlement_uses_last_elapsed_or_zero_and_blocks_late_usage() {
         );
         b.settle_due(deadline + 1000);
         assert_eq!(
-            b.settlement("test-job").unwrap().0.settled_vcpu_ms,
+            b.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+                .unwrap()
+                .0
+                .settled_vcpu_ms,
             2 * elapsed.unwrap_or(0)
         );
     }
@@ -721,13 +789,13 @@ fn refusal_and_budget_shortening_knobs_leave_reservations_correct() {
     b.knobs.refusal = None;
     for (max_s, timeout_s) in [(30, 100), (5, 100)] {
         let mut req = lease_request();
-        req.job_id = format!("budget-{max_s}");
+        req.job_id = format!("019e4567-89ab-7cde-8012-{max_s:012x}");
         req.timeout_s = timeout_s;
         b.knobs.max_s = Some(max_s);
         let lease = issued(&mut b, &req, NOW);
         assert_eq!(lease.max_s, max_s);
         assert_eq!(verified(&b, &lease, Purpose::Run, NOW).max_s, max_s);
-        assert_eq!(lease.reserved_vcpu_ms, 200000);
+        assert_eq!(lease.reserved_vcpu_ms, 2 * max_s * 1000);
         b.settle_due(NOW + (max_s + 600) * 1000);
         assert_eq!(b.settlement(&req.job_id).unwrap().0.settled_vcpu_ms, 0);
     }
@@ -750,6 +818,168 @@ fn invalid_usage_and_resource_overflow_do_not_settle_or_panic() {
             host_post(&mut b, "usage", &u, if u.vcpus == 1 { 1 } else { 2 }, NOW).status,
             400
         );
-        assert!(b.settlement("test-job").is_none());
+        assert!(b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .is_none());
     }
+}
+
+#[test]
+fn heartbeat_elapsed_is_monotonic_capped_and_refreshes_do_not_move_loss_deadline() {
+    let mut b = broker();
+    let request = lease_request();
+    let lease = issued(&mut b, &request, NOW);
+    assert_eq!(
+        host_post(
+            &mut b,
+            "heartbeat",
+            &heartbeat(JobState::Started, 5000),
+            1,
+            NOW
+        )
+        .status,
+        200
+    );
+    host_post(
+        &mut b,
+        "heartbeat",
+        &heartbeat(JobState::Reserved, 0),
+        2,
+        NOW + 1000,
+    );
+    assert_eq!(
+        post(&mut b, "/v1/leases", &request, NOW + 1000).body,
+        json!({"error":"job_admitted"})
+    );
+    host_post(
+        &mut b,
+        "heartbeat",
+        &heartbeat(JobState::Started, 999999),
+        3,
+        NOW + 2000,
+    );
+    let deadline = NOW + (lease.max_s + 600) * 1000;
+    b.settle_due(deadline);
+    assert_eq!(
+        b.settlement(&request.job_id).unwrap().0.settled_vcpu_ms,
+        20000
+    );
+    assert_eq!(
+        host_post(
+            &mut b,
+            "heartbeat",
+            &heartbeat(JobState::Started, 1),
+            4,
+            deadline
+        )
+        .body,
+        json!({"ignored":[]})
+    );
+    let mut b = broker();
+    issued(&mut b, &request, NOW);
+    issued(&mut b, &request, NOW + 20000);
+    let attach = ReattachRequest {
+        requester_jwk: request.requester_jwk.clone(),
+    };
+    post(
+        &mut b,
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        &attach,
+        NOW + 40000,
+    );
+    b.settle_due(deadline);
+    assert_eq!(b.settlement(&request.job_id).unwrap().1, "host_lost");
+}
+
+#[test]
+fn unusable_placement_hint_is_a_hint_and_finite_budget_uses_granted_runtime() {
+    let mut b = broker();
+    let mut request = lease_request();
+    request.placement_hint = Some(Placement {
+        host: "unavailable-host".into(),
+        vm: Some("unavailable-vm".into()),
+    });
+    let lease = issued(&mut b, &request, NOW);
+    assert_eq!(lease.placement, config().placement);
+    let mut b = broker();
+    b.knobs.allowance_vcpu_ms = Some(25000);
+    request.timeout_s = 100;
+    let lease = issued(&mut b, &request, NOW);
+    assert_eq!((lease.max_s, lease.reserved_vcpu_ms), (12, 24000));
+    let mut b = broker();
+    b.knobs.allowance_vcpu_ms = Some(19999);
+    assert_eq!(
+        post(&mut b, "/v1/leases", &request, NOW).body,
+        json!({"error":"budget_exhausted"})
+    );
+    assert!(b.settlement(&request.job_id).is_none());
+}
+
+#[test]
+fn released_admission_report_must_win_before_zero_settlement() {
+    let mut b = broker();
+    let request = lease_request();
+    let lease = issued(&mut b, &request, NOW);
+    post(
+        &mut b,
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+        &ReleaseRequest::default(),
+        NOW,
+    );
+    let at = lease.token_expires_at_ms + 60000;
+    host_post(
+        &mut b,
+        "heartbeat",
+        &heartbeat(JobState::Admitted, 0),
+        1,
+        at,
+    );
+    assert_eq!(b.settlement(&request.job_id).unwrap().1, "released");
+    assert_eq!(
+        host_post(&mut b, "usage", &usage(), 2, at).body,
+        json!({"error":"job_settled"})
+    );
+}
+
+#[test]
+fn routing_authentication_and_media_type_checks_have_contract_precedence() {
+    let mut b = broker();
+    let request = |path, bearer, content_type| BrokerRequest {
+        method: "POST",
+        path,
+        bearer,
+        content_type,
+        host_headers: None,
+        body: b"not-json",
+    };
+    assert_eq!(
+        b.handle(request("/v1/unknown", None, None), NOW).body,
+        json!({"error":"not_found"})
+    );
+    assert_eq!(
+        b.handle(request("/v1/leases", None, None), NOW).body,
+        json!({"error":"unauthorized"})
+    );
+    assert_eq!(
+        b.handle(request("/v1/leases", Some(BEARER), None), NOW)
+            .body,
+        json!({"error":"bad_request"})
+    );
+    assert_eq!(
+        b.handle(request("/v1/hosts/test-host/unknown", None, None), NOW)
+            .body,
+        json!({"error":"not_found"})
+    );
+    assert_eq!(
+        b.handle(
+            request(
+                "/v1/hosts/test-host/heartbeat?extra=1",
+                None,
+                Some("application/json")
+            ),
+            NOW
+        )
+        .body,
+        json!({"error":"bad_request"})
+    );
 }

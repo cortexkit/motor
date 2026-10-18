@@ -49,6 +49,7 @@ pub(super) struct Proxy {
     pub unavailable: AtomicBool,
     pub pause_on_cut: AtomicBool,
     pub legacy_have: AtomicBool,
+    pub strip_return_paths: AtomicBool,
     pub strip_run_network: AtomicBool,
     // None leaves the runner's grant unchanged; Some sets or removes it.
     pub accepted_network: Mutex<Option<Option<Network>>>,
@@ -216,6 +217,11 @@ impl Connector for Arc<Proxy> {
                                 && is_run.load(Ordering::SeqCst)
                                 && matches!(&frame, Frame::Output(o) if o.seq == 7));
                         let mut value = serde_json::to_value(frame).unwrap();
+                        if proxy.strip_return_paths.load(Ordering::SeqCst)
+                            && value["type"] == "hello"
+                        {
+                            value.as_object_mut().unwrap().remove("return_paths");
+                        }
                         if proxy.legacy_have.load(Ordering::SeqCst) && value["type"] == "have_reply"
                         {
                             value.as_object_mut().unwrap().remove("git_dependencies");
@@ -379,6 +385,7 @@ impl Fixture {
             unavailable: AtomicBool::new(false),
             pause_on_cut: AtomicBool::new(false),
             legacy_have: AtomicBool::new(false),
+            strip_return_paths: AtomicBool::new(false),
             strip_run_network: AtomicBool::new(false),
             accepted_network: Mutex::new(None),
             frames: Arc::new(Mutex::new(Vec::new())),

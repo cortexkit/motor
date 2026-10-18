@@ -145,6 +145,7 @@ impl Connector for RoutingPeer {
                 write_frame_async(
                     &mut peer,
                     &Frame::Hello {
+                        return_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -775,4 +776,33 @@ fn network_routing_defaults_off_and_omits_the_legacy_config_key() {
             enabled.then_some(&json!(true))
         );
     }
+}
+
+#[tokio::test]
+async fn hosted_switch_keeps_windows_on_its_direct_stored_route() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let mut config = configured(f.config.clone());
+    config.hosted_runners = true;
+    config.broker_url = Some("https://unused.invalid".into());
+    let motor = peer.motor(config.clone());
+    let stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    let id = stream.job_id;
+    let records = collect(stream).await;
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, StreamRecord::Accepted(_))));
+    assert!(motor.hosted_state(id).is_none());
+    drop(motor);
+    config.hosted_runners = false;
+    let restarted = super::reopen_motor(|| {
+        Motor::with_connector(config.clone(), &peer.module_state, peer.clone())
+    })
+    .await;
+    collect(restarted.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    restarted.cancel(CancelRequest::new(id)).await.unwrap();
+    assert_eq!(restarted.job_status(id).await.unwrap().state, "windows");
+    peer.assert_windows_only();
 }

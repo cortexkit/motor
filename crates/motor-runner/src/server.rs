@@ -405,6 +405,7 @@ async fn session(
     send(
         tx,
         Frame::Hello {
+            return_paths: !runner.config().windows_instance(),
             protocol_version: PROTOCOL_VERSION,
             started: supports_started,
             default_branch_tip: supports_default_branch_tip,
@@ -890,6 +891,7 @@ async fn attach(
             match &frame {
                 Frame::Output(output) => from = output.seq + 1,
                 Frame::Started { seq, .. } => from = seq + 1,
+                Frame::ReturnResult(result) => from = result.seq + 1,
                 _ => {}
             }
             let terminal = matches!(frame, Frame::Terminal(_));
