@@ -4,4 +4,5 @@ crates/motor-runner/tests/it/main.rs	Consolidated integration harness.
 crates/prefrontal-build-slot/tests/it/main.rs	Consolidated integration harness.
 crates/motor-module/tests/it/main.rs	Consolidated integration harness.
 # Real-server daemon, exclusive run lock and process-wide scratch environment require a separate ignored binary.
+crates/motor-module/tests/engram_catalog_cli.rs	Runs the built ck-motor binary through CARGO_BIN_EXE, which only integration test targets receive; motor-module's tests/it modules are compiled in-process into the library.
 crates/motor-module/tests/motor_e2e.rs	Fenced real-server daemon, exclusive run lock and process-wide scratch environment cannot share a process with other tests.
