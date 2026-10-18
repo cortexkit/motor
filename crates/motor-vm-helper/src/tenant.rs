@@ -36,6 +36,8 @@ pub enum Operation {
     Egress,
     Relay(u32),
     Adopt,
+    Metrics,
+    RecoveryComplete,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -135,6 +137,18 @@ pub struct SnapshotKey {
 /// Platform methods keep the destructive boundary small. In particular, load
 /// leaves the guest paused; consume must durably unlink before resume is called.
 pub trait Backend {
+    fn unclean(&mut self, _registry: &Registry) -> Result<bool> {
+        Ok(false)
+    }
+    fn mark_unclean(&mut self, _registry: &Registry, _reason: &str) -> Result<()> {
+        Err(Error("unclean record unavailable".into()))
+    }
+    fn prepare_stop(&mut self, tenant: &str) -> Result<()> {
+        self.prepare(tenant)
+    }
+    fn recovery_complete(&mut self, _tenant: &str, _registry: &Registry) -> Result<()> {
+        Err(Error("recovery unavailable".into()))
+    }
     fn registry(&mut self, tenant: &str) -> Result<Registry>;
     fn key(&mut self, registry: &Registry) -> Result<SnapshotKey>;
     fn saved_key(&mut self, registry: &Registry) -> Result<Option<SnapshotKey>>;
@@ -155,6 +169,9 @@ pub trait Backend {
     fn cpu(&mut self, tenant: &str, value: &str) -> Result<()>;
     fn egress(&mut self, tenant: &str, r: &Registry) -> Result<()>;
     fn relay(&mut self, tenant: &str, port: u32) -> Result<OwnedFd>;
+    fn metrics(&mut self, _tenant: &str, _registry: &Registry) -> Result<(u64, u64)> {
+        Err(Error("tenant metrics unavailable".into()))
+    }
 }
 
 pub struct Controller<B: Backend>(pub B);
@@ -169,6 +186,9 @@ impl<B: Backend> Controller<B> {
         let mut restored = self.0.was_restored(tenant);
         match op {
             Operation::Ensure | Operation::Restore => {
+                if self.0.unclean(&r)? && self.0.running(tenant) {
+                    self.0.stop(tenant)?;
+                }
                 if !self.0.running(tenant) {
                     restored = self.wake(tenant, &r)?;
                 }
@@ -177,6 +197,14 @@ impl<B: Backend> Controller<B> {
             Operation::Cpu(vcpus) => self.0.cpu(tenant, &r.cpu_max(vcpus)?)?,
             Operation::Egress => self.0.egress(tenant, &r)?,
             Operation::Adopt => {}
+            Operation::RecoveryComplete => self.0.recovery_complete(tenant, &r)?,
+            Operation::Metrics => {
+                let (memory_bytes, egress_bytes) = self.0.metrics(tenant, &r)?;
+                return Ok(Response::new(Reply::TenantMetrics {
+                    memory_bytes,
+                    egress_bytes,
+                }));
+            }
             Operation::Relay(port) => {
                 return Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
@@ -185,14 +213,15 @@ impl<B: Backend> Controller<B> {
             }
             Operation::Stop => {
                 if self.0.running(tenant) {
-                    if let Err(error) = self.0.prepare(tenant) {
-                        let _ = self.0.thaw(tenant);
-                        return Err(error);
-                    }
+                    let record = match self.0.prepare_stop(tenant) {
+                        Ok(()) => Ok(()),
+                        Err(error) => self.0.mark_unclean(&r, &error.to_string()),
+                    };
                     if let Err(error) = self.0.stop(tenant) {
                         let _ = self.0.thaw(tenant);
                         return Err(error);
                     }
+                    record?;
                 }
             }
             Operation::Suspend => {
@@ -227,6 +256,7 @@ impl<B: Backend> Controller<B> {
             running: self.0.running(tenant),
             restored,
             generation,
+            recovery_required: self.0.unclean(&r)?,
         }))
     }
     fn wake(&mut self, tenant: &str, r: &Registry) -> Result<bool> {
@@ -236,7 +266,8 @@ impl<B: Backend> Controller<B> {
             .saved_key(r)
             .ok()
             .flatten()
-            .is_some_and(|saved| saved == key);
+            .is_some_and(|saved| saved == key)
+            && !self.0.unclean(r)?;
         self.0.egress(tenant, r)?;
         if saved {
             let result = self

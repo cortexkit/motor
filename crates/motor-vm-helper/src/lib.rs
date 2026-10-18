@@ -95,6 +95,12 @@ pub enum Request {
     Adopt {
         tenant: String,
     },
+    TenantMetrics {
+        tenant: String,
+    },
+    RecoveryComplete {
+        tenant: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -171,9 +177,15 @@ pub enum Reply {
         running: bool,
         restored: bool,
         generation: u64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        recovery_required: bool,
     },
     Relay {
         fd_count: usize,
+    },
+    TenantMetrics {
+        memory_bytes: u64,
+        egress_bytes: u64,
     },
 }
 pub struct Response {
@@ -372,6 +384,10 @@ impl<M: Machine> Helper<M> {
                 self.tenant(&tenant, tenant::Operation::Relay(port))
             }
             Request::Adopt { tenant } => self.tenant(&tenant, tenant::Operation::Adopt),
+            Request::TenantMetrics { tenant } => self.tenant(&tenant, tenant::Operation::Metrics),
+            Request::RecoveryComplete { tenant } => {
+                self.tenant(&tenant, tenant::Operation::RecoveryComplete)
+            }
         }
     }
     fn tenant(&mut self, name: &str, op: tenant::Operation) -> Result<Response> {

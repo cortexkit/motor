@@ -1,0 +1,500 @@
+use super::*;
+use motor_host::billing::{sign_request, Metrics, OUTBOX_MAX_AGE_MS};
+use motor_host::server::LifecycleStream;
+use motor_lease::{JobState, UsageOutcome};
+use serde_json::{json, Value};
+
+const MS: u64 = NOW * 1000;
+fn admitted(h: &mut Host, job: &str, seq: u64) {
+    let (id, _) = h.claim(claims(job), MS).unwrap();
+    h.delivered(id).unwrap();
+    h.event(
+        "tenant",
+        &event(seq, TenantEventKind::Admitted, Some(job), None),
+        MS,
+    )
+    .unwrap();
+}
+pub(super) fn started(h: &mut Host, job: &str, seq: u64) {
+    admitted(h, job, seq);
+    h.event(
+        "tenant",
+        &event(seq + 1, TenantEventKind::Started, Some(job), None),
+        MS,
+    )
+    .unwrap();
+    h.sample(
+        "tenant",
+        Metrics {
+            memory_bytes: 10 * 1_048_576,
+            egress_bytes: 100,
+        },
+    )
+    .unwrap();
+}
+pub(super) fn terminal(job: &str, outcome: &str) -> Value {
+    json!({"type":"terminal","job_id":job,"outcome":{"type":outcome,"code":7,"signal":9},
+        "wall_ms":999999999,"started_at_ms":1,"ended_at_ms":999999999,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null})
+}
+pub(super) fn end(h: &mut Host, job: &str, seq: u64, at: u64, frame: Value) {
+    h.event(
+        "tenant",
+        &event(seq, TenantEventKind::Terminal, Some(job), None),
+        at,
+    )
+    .unwrap();
+    h.sample(
+        "tenant",
+        Metrics {
+            memory_bytes: 13 * 1_048_576,
+            egress_bytes: 145,
+        },
+    )
+    .unwrap();
+    h.receive_terminal(job, frame, at).unwrap();
+}
+
+#[test]
+fn observed_usage_ignores_guest_clocks_caps_and_maps_all_outcomes() {
+    for (outcome, killed, expected) in [
+        ("exit", None, UsageOutcome::Exit),
+        ("signal", None, UsageOutcome::Signal),
+        ("signal", Some("deadline"), UsageOutcome::Timeout),
+        ("signal", Some("cancel"), UsageOutcome::Cancelled),
+        ("cancelled", None, UsageOutcome::Cancelled),
+    ] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        let mut frame = terminal(JOB, outcome);
+        if let Some(killed) = killed {
+            frame["killed"] = json!(killed);
+        }
+        end(&mut h, JOB, 3, MS + 3000, frame);
+        let b = &h.snapshot.billing[JOB];
+        let usage = b.usage.as_ref().unwrap();
+        assert_eq!((usage.started_at_ms, usage.ended_at_ms), (MS, MS + 3000));
+        assert_eq!(usage.outcome, expected);
+        assert_eq!(
+            (usage.mem_peak_mib, usage.egress_bytes),
+            (Some(13), Some(45))
+        );
+        assert_eq!(b.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"], 3000);
+    }
+    let mut h = host();
+    admitted(&mut h, JOB, 1);
+    end(
+        &mut h,
+        JOB,
+        2,
+        MS + 3000,
+        terminal(JOB, "refused_before_start"),
+    );
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(
+        (usage.started_at_ms, usage.ended_at_ms, usage.outcome),
+        (MS + 3000, MS + 3000, UsageOutcome::Cancelled)
+    );
+}
+
+#[test]
+fn replay_boundary_distinguishes_outage_events_from_new_live_observations_and_old_runners_bill_zero(
+) {
+    for boundary in [true, false] {
+        let mut h = host();
+        admitted(&mut h, JOB, 1);
+        admitted(&mut h, JOB2, 2);
+        h.snapshot.last_alive = MS + 1000;
+        h.start_billing(MS + 5000).unwrap();
+        let mut stream = LifecycleStream::default();
+        if boundary {
+            stream
+                .boundary(&json!({"type":"event_replay","through_seq":4}))
+                .unwrap();
+        }
+        for (seq, job, kind, now) in [
+            (3, JOB, TenantEventKind::Started, MS + 5100),
+            (4, JOB, TenantEventKind::Terminal, MS + 5200),
+            (5, JOB2, TenantEventKind::Started, MS + 6000),
+            (6, JOB2, TenantEventKind::Terminal, MS + 9000),
+        ] {
+            h.event_observed(
+                "tenant",
+                &event(seq, kind, Some(job), None),
+                now,
+                stream.is_live(seq),
+            )
+            .unwrap();
+        }
+        h.sample(
+            "tenant",
+            Metrics {
+                memory_bytes: 1_048_576,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+        h.receive_terminal_observed(JOB, terminal(JOB, "exit"), MS + 10000, false)
+            .unwrap();
+        h.receive_terminal_observed(JOB2, terminal(JOB2, "exit"), MS + 10000, false)
+            .unwrap();
+        let replay = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+        assert_eq!(
+            (replay.started_at_ms, replay.ended_at_ms),
+            (MS + 5000, MS + 5000)
+        );
+        let live = h.snapshot.billing[JOB2].usage.as_ref().unwrap();
+        assert_eq!(
+            live.ended_at_ms - live.started_at_ms,
+            if boundary { 3000 } else { 0 }
+        );
+        if boundary {
+            assert_eq!(live.started_at_ms, MS + 6000);
+        }
+    }
+}
+
+#[test]
+fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_healthy_job() {
+    let dir = scratch();
+    let mut h = disk_host(dir.path());
+    started(&mut h, JOB, 1);
+    started(&mut h, JOB2, 3);
+    // The second command starts later and remains inside its own runtime cap.
+    h.snapshot.leases.get_mut(JOB2).unwrap().started_at_ms = Some(MS + 20_000);
+    h.snapshot.leases.get_mut(JOB2).unwrap().claims.max_s = 120;
+    h.billing_tick(MS + 30_000).unwrap();
+    assert_eq!(h.share("tenant", MS + 30_000), 1);
+    assert!(h.snapshot.pending_cancels.contains_key(JOB));
+    h.cancel_delivered(JOB).unwrap();
+    drop(h);
+    let mut h = disk_host(dir.path());
+    assert_eq!(h.share("tenant", MS + 31_000), 1);
+    h.billing_tick(MS + 89_999).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    h.billing_tick(MS + 90_000).unwrap();
+    assert!(h.snapshot.billing[JOB].host_settled);
+    assert!(h.snapshot.vms["tenant"].stop_pending);
+    assert!(h.stops_due().is_empty());
+    assert!(matches!(
+        h.claim(claims(JOB3), MS + 90_000),
+        Err(motor_host::state::Error::Refused(
+            motor_host::state::Refusal::Capacity
+        ))
+    ));
+    end(&mut h, JOB2, 5, MS + 91_000, terminal(JOB2, "exit"));
+    assert_eq!(
+        h.snapshot.billing[JOB2].usage.as_ref().unwrap().outcome,
+        UsageOutcome::Exit
+    );
+    assert_eq!(h.stops_due(), vec!["tenant"]);
+    h.stopped("tenant").unwrap();
+    assert!(h.stops_due().is_empty());
+    h.billing_tick(MS + 150_000).unwrap();
+    let original = serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap();
+    h.event(
+        "tenant",
+        &event(6, TenantEventKind::Terminal, Some(JOB), None),
+        MS + 160_000,
+    )
+    .unwrap();
+    h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 160_000)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap(),
+        original
+    );
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(
+        (usage.outcome, usage.ended_at_ms - usage.started_at_ms),
+        (UsageOutcome::Lost, 30_000)
+    );
+    assert_eq!(
+        h.snapshot
+            .outbox
+            .iter()
+            .filter(|r| r.job.as_deref() == Some(JOB))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn port52_terminal_disarms_watchdog_and_preserves_real_result_with_port53_down() {
+    for receipt in [59_000, 89_000] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        h.billing_tick(MS + 30_000).unwrap();
+        h.receive_terminal(JOB, terminal(JOB, "exit"), MS + receipt)
+            .unwrap();
+        h.billing_tick(MS + 90_000).unwrap();
+        h.billing_tick(MS + receipt + 30_000).unwrap();
+        let b = &h.snapshot.billing[JOB];
+        assert!(!b.host_settled);
+        assert_eq!(b.terminal.as_ref().unwrap()["outcome"]["type"], "exit");
+        let usage = b.usage.as_ref().unwrap();
+        assert_eq!(
+            (usage.outcome, usage.ended_at_ms - usage.started_at_ms),
+            (UsageOutcome::Timeout, 30_000)
+        );
+    }
+}
+
+#[test]
+fn synthesized_frames_are_durable_identical_unsequenced_and_cursor_filtered() {
+    let dir = scratch();
+    let mut h = disk_host(dir.path());
+    started(&mut h, JOB, 1);
+    h.watermark(JOB, 7).unwrap();
+    h.lose_tenant("tenant", MS + 3000).unwrap();
+    let expected = h.host_settled_frames(JOB, 0).unwrap();
+    h.watermark(JOB, 100).unwrap();
+    assert_eq!(h.host_settled_frames(JOB, 0).unwrap(), expected);
+    assert_eq!(expected[0]["seq"], 8);
+    assert_eq!(expected[0]["truncated_before_seq"], 8);
+    assert!(expected[1].get("seq").is_none());
+    assert!(expected[2].get("seq").is_none());
+    // Use the actual protocol decoder, not just a JSON proxy for a terminal.
+    for frame in &expected {
+        motor_protocol::decode_frame(&serde_json::to_vec(frame).unwrap()).unwrap();
+    }
+    drop(h);
+    let h = disk_host(dir.path());
+    for _ in 0..2 {
+        assert_eq!(h.host_settled_frames(JOB, 0).unwrap(), expected);
+        assert_eq!(h.host_settled_frames(JOB, 8).unwrap(), expected);
+        assert_eq!(h.host_settled_frames(JOB, 9).unwrap(), expected[1..]);
+    }
+}
+
+#[test]
+fn hosted_terminal_delivery_or_sixty_second_grace_enqueues_usage_once() {
+    for delivered in [true, false] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+        h.billing_tick(MS + 62_999).unwrap();
+        assert!(h.snapshot.outbox.is_empty());
+        if delivered {
+            h.terminal_delivered(JOB, MS + 62_999).unwrap();
+        } else {
+            h.billing_tick(MS + 63_000).unwrap();
+        }
+        assert_eq!(h.snapshot.outbox.len(), 1);
+        h.terminal_delivered(JOB, MS + 70_000).unwrap();
+        assert_eq!(h.snapshot.outbox.len(), 1);
+        let figure = h.snapshot.billing[JOB].hosted_terminal.clone();
+        let request = h.snapshot.outbox[0].clone();
+        assert!(h
+            .finish_request(
+                &request,
+                200,
+                &json!({"job_id":JOB,"settled_vcpu_ms":2000,"released_vcpu_ms":0})
+            )
+            .unwrap());
+        assert!(h.snapshot.outbox.is_empty());
+        assert_eq!(h.snapshot.billing[JOB].hosted_terminal, figure);
+    }
+}
+
+#[test]
+fn overlap_makes_both_metrics_null_and_missing_metrics_are_not_fabricated_zero() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    admitted(&mut h, JOB2, 3);
+    end(&mut h, JOB, 4, MS + 3000, terminal(JOB, "exit"));
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!((usage.mem_peak_mib, usage.egress_bytes), (None, None));
+    let mut h = host();
+    admitted(&mut h, JOB, 1);
+    h.event(
+        "tenant",
+        &event(2, TenantEventKind::Started, Some(JOB), None),
+        MS,
+    )
+    .unwrap();
+    h.event(
+        "tenant",
+        &event(3, TenantEventKind::Terminal, Some(JOB), None),
+        MS + 3000,
+    )
+    .unwrap();
+    h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 3000)
+        .unwrap();
+    assert!(h.snapshot.billing[JOB].usage.is_none());
+}
+
+#[test]
+fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
+    let mut h = host();
+    let (id, _) = h.claim(claims(JOB), MS).unwrap();
+    h.guest_ready("tenant", 1).unwrap();
+    let hb = h.heartbeat(MS, 123, true);
+    assert_eq!((hb.free_vcpus, hb.free_mem_mib, hb.queued), (1, 123, 1));
+    assert_eq!(hb.warm[0].vm, "vm");
+    h.close(id).unwrap();
+    let hb = h.heartbeat(MS, 123, true);
+    assert_eq!(
+        (hb.running[0].state, hb.free_vcpus),
+        (JobState::Reserved, 2)
+    );
+}
+
+#[test]
+fn usage_outbox_finals_advance_retry_bodies_are_unchanged_and_counter_is_durable() {
+    let dir = scratch();
+    let mut h = disk_host(dir.path());
+    h.start_billing(MS).unwrap();
+    started(&mut h, JOB, 1);
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    h.terminal_delivered(JOB, MS + 3000).unwrap();
+    let r = h.snapshot.outbox[0].clone();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+    let first = sign_request(&mut h, "host", &r, MS + 3000, &key).unwrap();
+    let bytes = r.body.clone();
+    assert!(!h.finish_request(&r, 503, &json!({})).unwrap());
+    drop(h);
+    let mut h = disk_host(dir.path());
+    h.start_billing(MS + 90_000).unwrap();
+    let retry = h.snapshot.outbox[0].clone();
+    let second = sign_request(&mut h, "host", &retry, MS + 90_000, &key).unwrap();
+    assert!(second.counter > first.counter);
+    assert!(second.timestamp > first.timestamp);
+    assert_ne!(first.signature, second.signature);
+    assert_eq!(h.snapshot.outbox[0].body, bytes);
+    for (status, error) in [
+        (409, "usage_conflict"),
+        (409, "job_settled"),
+        (404, "job_unknown"),
+    ] {
+        let mut next = h.snapshot.clone();
+        next.outbox = vec![r.clone()];
+        let mut h = Host::new(tenants(), next, Box::<MemoryJournal>::default());
+        assert!(h
+            .finish_request(&r, status, &json!({"error":error}))
+            .unwrap());
+        assert!(h.snapshot.outbox.is_empty());
+    }
+    h.expire_outbox(MS + 3000 + OUTBOX_MAX_AGE_MS).unwrap();
+    assert!(h.snapshot.outbox.is_empty());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("outbox-expired"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<String>>>);
+impl tracing::Subscriber for Logs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn differing_settlement_and_final_409_log_divergence_but_never_change_caller_figure() {
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        for (status, reply) in [
+            (
+                200,
+                json!({"job_id":JOB,"settled_vcpu_ms":1,"released_vcpu_ms":29999}),
+            ),
+            (409, json!({"error":"job_settled"})),
+        ] {
+            let mut h = host();
+            started(&mut h, JOB, 1);
+            end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+            h.terminal_delivered(JOB, MS + 3000).unwrap();
+            let figure = h.snapshot.billing[JOB].hosted_terminal.clone();
+            let request = h.snapshot.outbox[0].clone();
+            h.finish_request(&request, status, &reply).unwrap();
+            assert_eq!(h.snapshot.billing[JOB].hosted_terminal, figure);
+        }
+    });
+    assert_eq!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.contains("usage_billing_diverged"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.contains("usage_reconciliation_required"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn watchdog_runtime_stops_the_only_lease_once_and_clears_durable_stop_pending() {
+    use anyhow::{bail, Result};
+    use motor_host::{helper::Control, server::Runtime};
+    struct Stop(std::sync::atomic::AtomicUsize);
+    impl Control for Stop {
+        fn adopt(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
+            bail!("unexpected wake")
+        }
+        fn quota(&self, _: &str, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn relay(&self, _: &str, _: u32) -> Result<std::os::unix::net::UnixStream> {
+            bail!("unexpected relay")
+        }
+        fn admin(&self, _: &str, _: &Value) -> Result<Value> {
+            Ok(json!({"ok":true}))
+        }
+        fn suspend(&self, _: &str) -> Result<()> {
+            bail!("unexpected suspend")
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+        fn stop(&self, _: &str) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.guest_ready("tenant", 1).unwrap();
+    let control = Arc::new(Stop(std::sync::atomic::AtomicUsize::new(0)));
+    let runtime = Runtime::new("host".into(), h, control.clone());
+    runtime.tick(MS + 30_000).unwrap();
+    assert_eq!(runtime.host.lock().unwrap().share("tenant", MS + 30_000), 0);
+    runtime.tick(MS + 90_000).unwrap();
+    runtime.tick(MS + 91_000).unwrap();
+    assert_eq!(control.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let h = runtime.host.lock().unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    assert!(h.snapshot.vms["tenant"].initialized_generation.is_none());
+}

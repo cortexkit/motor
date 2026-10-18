@@ -27,6 +27,7 @@ struct Fake {
     saved: Option<SnapshotKey>,
     fail: &'static str,
     space: u64,
+    unclean: bool,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -37,6 +38,7 @@ impl Default for Fake {
             saved: None,
             fail: "",
             space: u64::MAX,
+            unclean: false,
         }
     }
 }
@@ -59,6 +61,23 @@ fn key(generation: u64) -> SnapshotKey {
     }
 }
 impl Backend for Fake {
+    fn unclean(&mut self, _: &Registry) -> Result<bool> {
+        Ok(self.unclean)
+    }
+    fn mark_unclean(&mut self, _: &Registry, _: &str) -> Result<()> {
+        self.call("unclean-fsync")?;
+        self.unclean = true;
+        Ok(())
+    }
+    fn recovery_complete(&mut self, _: &str, _: &Registry) -> Result<()> {
+        self.call("guest-recovery-status")?;
+        self.unclean = false;
+        Ok(())
+    }
+    fn metrics(&mut self, _: &str, _: &Registry) -> Result<(u64, u64)> {
+        self.call("metrics")?;
+        Ok((1048576, 123))
+    }
     fn registry(&mut self, _: &str) -> Result<Registry> {
         self.call("registry")?;
         Ok(registry("a"))
@@ -167,6 +186,33 @@ impl Backend for Fake {
     fn relay(&mut self, _: &str, port: u32) -> Result<OwnedFd> {
         self.call(&format!("relay-{port}"))?;
         Ok(std::os::unix::net::UnixStream::pair()?.0.into())
+    }
+}
+
+#[test]
+fn tenant_metrics_are_read_only_bound_to_registry_and_reject_paths() {
+    let mut c = Controller(Fake::default());
+    assert!(matches!(
+        c.handle("a", Operation::Metrics).unwrap().reply,
+        Reply::TenantMetrics {
+            memory_bytes: 1048576,
+            egress_bytes: 123
+        }
+    ));
+    assert_eq!(c.0.calls, ["registry", "metrics"]);
+    c.0.calls.clear();
+    assert!(c.handle("b", Operation::Metrics).is_err());
+    assert_eq!(c.0.calls, ["registry"]);
+    c.0.calls.clear();
+    for name in ["", ".", "..", "../a", "a/b"] {
+        assert!(c.handle(name, Operation::Metrics).is_err());
+    }
+    assert!(c.0.calls.is_empty());
+    for body in [
+        json!({"op":"tenant_metrics","tenant":"a","path":"/etc/passwd"}),
+        json!({"op":"tenant_metrics","tenant":"a","handle":1}),
+    ] {
+        assert!(serde_json::from_value::<crate::Request>(body).is_err());
     }
 }
 #[test]
@@ -431,4 +477,48 @@ fn hosted_reconnect_adopts_without_waking_or_stopping_the_tenant() {
         }
     ));
     assert_eq!(helper.machine.0 .0.calls, ["registry"]);
+}
+
+#[test]
+fn hosted_stop_bounds_quiesce_records_unclean_before_hard_stop_and_never_snapshots() {
+    for fail in ["", "prepare", "agent-refused", "agent-timeout"] {
+        let mut c = Controller(Fake {
+            running: true,
+            fail,
+            ..Fake::default()
+        });
+        c.handle("a", Operation::Stop).unwrap();
+        assert!(!c.0.running);
+        assert_eq!(c.0.unclean, !fail.is_empty());
+        assert!(!c.0.calls.iter().any(|c| c == "snapshot-create"));
+        if !fail.is_empty() {
+            let flag = c.0.calls.iter().position(|c| c == "unclean-fsync").unwrap();
+            let stop = c.0.calls.iter().position(|c| c == "stop").unwrap();
+            assert!(flag < stop);
+        }
+    }
+}
+
+#[test]
+fn hosted_unclean_disk_never_restores_snapshot_and_flag_waits_for_guest_recovery_success() {
+    let mut c = Controller(Fake {
+        unclean: true,
+        saved: Some(key(4)),
+        ..Fake::default()
+    });
+    assert!(matches!(
+        c.handle("a", Operation::Ensure).unwrap().reply,
+        Reply::Tenant {
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.calls.iter().any(|c| c == "load-base-size-tap"));
+    assert!(!c.0.calls.iter().any(|c| c == "load-saved-tap"));
+    c.0.fail = "guest-recovery-status";
+    assert!(c.handle("a", Operation::RecoveryComplete).is_err());
+    assert!(c.0.unclean);
+    c.0.fail = "";
+    c.handle("a", Operation::RecoveryComplete).unwrap();
+    assert!(!c.0.unclean);
 }

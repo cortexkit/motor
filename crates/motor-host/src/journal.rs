@@ -28,6 +28,30 @@ impl FileJournal {
 
 impl Journal for FileJournal {
     fn store(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        if !snapshot.expired_outbox.is_empty() {
+            let directory = self
+                .path
+                .parent()
+                .expect("journal parent")
+                .join("outbox-expired");
+            fs::create_dir_all(&directory)?;
+            for (index, request) in snapshot.expired_outbox.iter().enumerate() {
+                let path = directory.join(format!("{}-{index}.json", request.created_ms));
+                if !path.exists() {
+                    let mut options = OpenOptions::new();
+                    options.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                    }
+                    let mut file = options.open(path)?;
+                    serde_json::to_writer(&mut file, request).map_err(io::Error::other)?;
+                    file.sync_all()?;
+                }
+            }
+            File::open(directory)?.sync_all()?;
+        }
         let temporary = self.path.with_extension("new");
         let mut options = OpenOptions::new();
         options.create(true).truncate(true).write(true);

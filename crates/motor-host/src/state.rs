@@ -54,6 +54,16 @@ pub struct Snapshot {
     /// No-start reports are durable inputs to the signed usage outbox.
     pub zero_usage: BTreeMap<String, Usage>,
     pub pending_cancels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub billing: BTreeMap<String, crate::billing::JobBilling>,
+    #[serde(default)]
+    pub outbox: Vec<crate::billing::Request>,
+    #[serde(default)]
+    pub expired_outbox: Vec<crate::billing::Request>,
+    #[serde(default)]
+    pub counter: u64,
+    #[serde(default)]
+    pub last_alive: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -149,6 +159,8 @@ pub struct Host {
     live: BTreeMap<String, LiveVm>,
     next_connection: u64,
     observed_at_ms: u64,
+    pub(crate) restart_ms: u64,
+    pub(crate) prior_alive_ms: u64,
 }
 impl Host {
     pub fn new(
@@ -164,9 +176,12 @@ impl Host {
             live: BTreeMap::new(),
             next_connection: 0,
             observed_at_ms: 0,
+            restart_ms: 0,
+            prior_alive_ms: 0,
         }
     }
-    fn save(&mut self, next: Snapshot) -> Result<(), Error> {
+    pub(crate) fn save(&mut self, mut next: Snapshot) -> Result<(), Error> {
+        crate::billing::mark_overlap(&mut next);
         self.journal.store(&next)?;
         self.snapshot = next;
         self.publish_connections();
@@ -504,6 +519,14 @@ impl Host {
         Ok(())
     }
     pub fn watermark(&mut self, job: &str, seq: u64) -> Result<(), Error> {
+        if self
+            .snapshot
+            .billing
+            .get(job)
+            .is_some_and(|b| b.host_settled)
+        {
+            return Ok(());
+        }
         let Some(lease) = self.snapshot.leases.get(job) else {
             return refuse(Refusal::Auth);
         };
@@ -518,6 +541,15 @@ impl Host {
         Ok(())
     }
     pub fn event(&mut self, tenant: &str, event: &TenantEvent, now_ms: u64) -> Result<(), Error> {
+        self.event_observed(tenant, event, now_ms, true)
+    }
+    pub fn event_observed(
+        &mut self,
+        tenant: &str,
+        event: &TenantEvent,
+        now_ms: u64,
+        live_event: bool,
+    ) -> Result<(), Error> {
         self.observed_at_ms = now_ms;
         let mut next = self.snapshot.clone();
         let vm = next.vms.entry(tenant.to_owned()).or_default();
@@ -531,6 +563,9 @@ impl Host {
             }
         } else if let Some(job) = event.jti.map(|j| j.to_string()) {
             if let Some(lease) = next.leases.get_mut(&job).filter(|l| l.tenant == tenant) {
+                if next.billing.get(&job).is_some_and(|b| b.host_settled) {
+                    tracing::warn!(jti = job, "host_settled_runner_event_ignored");
+                }
                 match event.event {
                     TenantEventKind::Admitted
                         if lease.state == LeaseState::Reserved && lease.delivered =>
@@ -540,7 +575,9 @@ impl Host {
                     }
                     TenantEventKind::Started if lease.state == LeaseState::Admitted => {
                         lease.state = LeaseState::Started;
-                        lease.started_at_ms = Some(now_ms);
+                        lease.started_at_ms =
+                            Some(if live_event { now_ms } else { self.restart_ms });
+                        next.billing.entry(job.clone()).or_default().started_live = live_event;
                     }
                     TenantEventKind::Terminal
                         if matches!(lease.state, LeaseState::Admitted | LeaseState::Started) =>
@@ -553,8 +590,15 @@ impl Host {
                                 .get_mut(&job)
                                 .ok_or(Error::Refused(Refusal::Auth))?;
                             lease.state = LeaseState::Ended;
-                            lease.ended_at_ms = Some(now_ms);
+                            lease.ended_at_ms = Some(if live_event {
+                                now_ms
+                            } else {
+                                self.prior_alive_ms
+                            });
                         }
+                        let billing = next.billing.entry(job.clone()).or_default();
+                        billing.terminal_live = live_event;
+                        billing.ended_observed_ms = Some(now_ms);
                     }
                     TenantEventKind::Refused
                         if lease.state == LeaseState::Reserved && lease.delivered =>

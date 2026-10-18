@@ -10,6 +10,12 @@ use std::time::Duration;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
+        anyhow::bail!("tenant metrics unavailable")
+    }
+    fn stop(&self, _tenant: &str) -> Result<()> {
+        anyhow::bail!("tenant stop unavailable")
+    }
     fn adopt(&self, tenant: &str) -> Result<bool>;
     fn wake(&self, tenant: &str, initialized_generation: Option<u64>) -> Result<u64>;
     fn quota(&self, tenant: &str, vcpus: u32) -> Result<()>;
@@ -47,19 +53,43 @@ impl Helper {
     }
 }
 impl Control for Helper {
+    fn metrics(&self, tenant: &str) -> Result<crate::billing::Metrics> {
+        let (reply, _) = self.request(json!({"op":"tenant_metrics", "tenant":tenant}))?;
+        Ok(crate::billing::Metrics {
+            memory_bytes: reply["memory_bytes"]
+                .as_u64()
+                .context("tenant memory sample")?,
+            egress_bytes: reply["egress_bytes"]
+                .as_u64()
+                .context("tenant egress sample")?,
+        })
+    }
+    fn stop(&self, tenant: &str) -> Result<()> {
+        self.request(json!({"op":"stop_tenant", "tenant":tenant}))?;
+        Ok(())
+    }
     fn adopt(&self, tenant: &str) -> Result<bool> {
         Ok(self.request(json!({"op":"adopt", "tenant":tenant}))?.0["running"] == true)
     }
     fn wake(&self, tenant: &str, initialized_generation: Option<u64>) -> Result<u64> {
         let (adopted, _) = self.request(json!({"op":"adopt", "tenant":tenant}))?;
         let running = adopted["running"] == true;
-        let (reply, _) = if running {
+        if running
+            && adopted["recovery_required"] == true
+            && self
+                .request(json!({"op":"recovery_complete","tenant":tenant}))
+                .is_ok()
+        {
+            return adopted["generation"].as_u64().context("helper generation");
+        }
+        let (reply, _) = if running && adopted["recovery_required"] != true {
             (adopted, vec![])
         } else {
             self.request(json!({"op":"ensure", "tenant":tenant}))?
         };
         let generation = reply["generation"].as_u64().context("helper generation")?;
-        if !running || initialized_generation != Some(generation) {
+        let recovery = reply["recovery_required"] == true;
+        if recovery || !running || initialized_generation != Some(generation) {
             self.quota(tenant, 1)?;
             let mut request = if reply["restored"] == true {
                 json!({"op":"post_restore"})
@@ -71,14 +101,27 @@ impl Control for Helper {
                     .clone();
                 request["op"] = json!("attach_tenant");
                 request["generation"] = json!(generation);
+                if recovery {
+                    request["recovery_required"] = json!(true);
+                }
                 request
             };
             request["unix_ms"] = json!(crate::server::unix_ms());
             request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
-            ensure!(
-                self.admin(tenant, &request)?["ok"] == true,
-                "guest initialization refused"
-            );
+            let initialized = self.admin(tenant, &request);
+            match initialized {
+                Ok(reply) if reply["ok"] == true => {}
+                result => {
+                    let detail: String = format!("{result:?}").chars().take(4096).collect();
+                    tracing::error!(tenant, detail, "tenant_recovery_or_initialization_failed");
+                    return Err(
+                        crate::state::Error::Refused(crate::state::Refusal::Capacity).into(),
+                    );
+                }
+            }
+            if recovery {
+                self.request(json!({"op":"recovery_complete", "tenant":tenant}))?;
+            }
         }
         Ok(generation)
     }
@@ -98,7 +141,13 @@ impl Control for Helper {
     }
     fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         let mut stream = self.relay(tenant, 54)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(
+            if request["recovery_required"] == true {
+                600
+            } else {
+                30
+            },
+        )))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         write_json(&mut stream, request)?;
         read_json(&mut stream)

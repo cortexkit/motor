@@ -75,6 +75,9 @@ async fn agent_session<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let reply = match result {
             Ok(value) => value,
+            Err(error) if error.to_string().starts_with("tenant_recovery_failed") => {
+                json!({"ok":false,"error":"tenant_recovery_failed","detail":error.to_string()})
+            }
             Err(error) => json!({"ok":false,"error":error.to_string()}),
         };
         write_json(&mut socket, &reply).await?;
@@ -129,6 +132,16 @@ async fn dispatch(
         TenantAgentRequest::Thaw => {
             let _guard = attach.lock().await;
             snapshot::thaw().await?;
+            Ok(json!({"ok":true}))
+        }
+        TenantAgentRequest::RecoveryStatus { generation } => {
+            let recovered = fs::read_to_string("/run/motor-tenant-recovered")?
+                .trim()
+                .parse::<u64>()
+                .map_err(io::Error::other)?;
+            if recovered != generation {
+                return Err(io::Error::other("tenant recovery generation mismatch"));
+            }
             Ok(json!({"ok":true}))
         }
     }
@@ -404,6 +417,7 @@ fn validate_identity(
 fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     let TenantAgentRequest::AttachTenant {
         generation,
+        recovery_required,
         unix_ms,
         seed,
         address,
@@ -445,7 +459,11 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let _mountpoint = paths::Directory::absolute(Path::new("/tenant"), 0)?;
-    command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+    if recovery_required {
+        recover_tenant_disk()?;
+    } else {
+        command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+    }
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
     layout.runner.remove_stale_socket("runner.sock")?;
     let args = RunnerArgs::read(Path::new(ARGS))?;
@@ -480,6 +498,122 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
         || start_runner(&args, &layout.runner.fd_path().join("runner.sock")),
     )?;
     fs::write("/run/motor-tenant-generation", generation.to_string())?;
+    if recovery_required {
+        fs::write("/run/motor-tenant-recovered", generation.to_string())?;
+    }
+    Ok(())
+}
+
+fn recover_tenant_disk() -> io::Result<()> {
+    recovery_steps(|step| match step {
+        "replay" | "remount" => {
+            recovery_command(step, "mount", &["-t", "xfs", "/dev/vdb", "/tenant"])
+        }
+        "unmount" => recovery_command(step, "umount", &["/tenant"]),
+        "xfs_check" => recovery_command(step, "xfs_repair", &["-n", "/dev/vdb"]),
+        "stores" => {
+            let mirrors = Path::new("/tenant/state/main/mirrors");
+            let entries = match fs::read_dir(mirrors) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    return Err(io::Error::other("bare store is not a directory"));
+                }
+                let path = entry.path();
+                recovery_command(
+                    "git_fsck",
+                    "git",
+                    &[
+                        "--no-optional-locks",
+                        "-c",
+                        "safe.directory=*",
+                        "-C",
+                        path.to_str()
+                            .ok_or_else(|| io::Error::other("non-UTF8 bare store"))?,
+                        "fsck",
+                        "--full",
+                        "--no-dangling",
+                    ],
+                )?;
+            }
+            Ok(())
+        }
+        _ => unreachable!(),
+    })
+}
+
+fn recovery_steps(mut run: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+    // Only the guest kernel mounts tenant-controlled XFS. Check without repairs,
+    // then verify retained Git objects before any runner can accept work.
+    for step in ["replay", "unmount", "xfs_check", "remount", "stores"] {
+        run(step).map_err(|error| {
+            io::Error::other(format!("tenant_recovery_failed step={step}: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn recovery_command(step: &str, program: &str, args: &[&str]) -> io::Result<()> {
+    use std::{
+        io::Read,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn bounded(
+        mut reader: impl Read + Send + 'static,
+    ) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+        std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut bytes = [0; 1024];
+            loop {
+                let n = reader.read(&mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                let keep = n.min(2048usize.saturating_sub(captured.len()));
+                captured.extend_from_slice(&bytes[..keep]);
+            }
+            Ok(captured)
+        })
+    }
+    let stdout = bounded(child.stdout.take().unwrap());
+    let stderr = bounded(child.stderr.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = stdout
+        .join()
+        .map_err(|_| io::Error::other("recovery output reader"))??;
+    let err = stderr
+        .join()
+        .map_err(|_| io::Error::other("recovery error reader"))??;
+    if !status.is_some_and(|s| s.success()) {
+        return Err(io::Error::other(format!(
+            "{step}: status={status:?} stdout={} stderr={}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        )));
+    }
     Ok(())
 }
 
@@ -560,6 +694,35 @@ fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_replays_checks_read_only_then_remounts_and_verifies_stores_before_start() {
+        let mut steps = Vec::new();
+        recovery_steps(|step| {
+            steps.push(step.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            steps,
+            ["replay", "unmount", "xfs_check", "remount", "stores"]
+        );
+        for failed in ["replay", "unmount", "xfs_check", "remount", "stores"] {
+            let mut seen = Vec::new();
+            let error = recovery_steps(|step| {
+                seen.push(step.to_owned());
+                if step == failed {
+                    Err(io::Error::other("probe refused"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(seen.last().unwrap(), failed);
+            assert!(error.to_string().contains("tenant_recovery_failed"));
+            assert!(error.to_string().contains(failed));
+        }
+    }
 
     const TEST_ARGS: &str = "--backend host --tenant-vm --job-network veth --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
 

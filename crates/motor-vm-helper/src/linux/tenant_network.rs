@@ -77,6 +77,13 @@ pub fn rules(registries: &[Registry], exists: bool) -> String {
             r.tap_index
         ));
     }
+    for r in registries {
+        text.push_str(&format!(
+            " iifname \"{}\" counter comment \"tenant_egress_{}\"\n",
+            r.tap(),
+            r.tap()
+        ));
+    }
     text.push_str(" oifname @taps ct state established,related counter accept\n oifname @taps counter drop comment \"tenant_inbound\"\n }\n chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n");
     for r in registries {
         text.push_str(&format!(
@@ -114,9 +121,56 @@ pub fn install(registries: &[Registry]) -> Result<()> {
     Ok(())
 }
 
+pub fn egress_bytes(registry: &Registry) -> Result<u64> {
+    let output = Command::new("/usr/sbin/nft")
+        .args(["-j", "list", "chain", "inet", "motor_tenant", "forward"])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error("tenant forward counter unavailable".into()));
+    }
+    let value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error(format!("invalid nft JSON: {e}")))?;
+    forward_bytes(&value, &registry.tap())
+}
+
+fn forward_bytes(value: &serde_json::Value, tap: &str) -> Result<u64> {
+    let comment = format!("tenant_egress_{tap}");
+    let rules = value["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft rules".into()))?;
+    let mut found = None;
+    for item in rules {
+        let rule = &item["rule"];
+        if rule["family"] == "inet"
+            && rule["table"] == "motor_tenant"
+            && rule["chain"] == "forward"
+            && rule["comment"] == comment
+        {
+            let bytes = rule["expr"]
+                .as_array()
+                .and_then(|expr| expr.iter().find_map(|e| e["counter"]["bytes"].as_u64()))
+                .ok_or_else(|| Error("missing tenant byte counter".into()))?;
+            if found.replace(bytes).is_some() {
+                return Err(Error("duplicate tenant byte counter".into()));
+            }
+        }
+    }
+    found.ok_or_else(|| Error("tenant forward counter unavailable".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tenant_forward_bytes_select_only_own_forward_rule_not_host_or_nat() {
+        let value = serde_json::json!({"nftables":[
+            {"rule":{"family":"inet","table":"motor_tenant","chain":"input","comment":"tenant_egress_mtap1","expr":[{"counter":{"bytes":999}}]}},
+            {"rule":{"family":"inet","table":"motor_tenant","chain":"forward","comment":"tenant_egress_mtap2","expr":[{"counter":{"bytes":888}}]}},
+            {"rule":{"family":"inet","table":"motor_tenant","chain":"forward","comment":"tenant_egress_mtap1","expr":[{"counter":{"bytes":123}}]}}
+        ]});
+        assert_eq!(forward_bytes(&value, "mtap1").unwrap(), 123);
+        assert!(forward_bytes(&value, "mtap3").is_err());
+    }
     #[test]
     fn hosted_firewall_drops_before_return_traffic_and_snats_each_subnet() {
         let r = crate::tenant::tests::registry("a");

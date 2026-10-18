@@ -429,6 +429,41 @@ async fn tenant_event_channel_replays_unacked_frames_in_order() {
 }
 
 #[tokio::test]
+async fn tenant_event_replay_boundary_precedes_backlog_and_excludes_later_events() {
+    use tokio::io::AsyncReadExt;
+    let f = Fixture::new();
+    let runner = open(&f);
+    let log = runner.tenant_events().unwrap();
+    let id = Uuid::now_v7();
+    log.admit(id).unwrap();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let r = runner.clone();
+    let task = tokio::spawn(async move { crate::tenant::event_session(&r, server).await });
+    let len = client.read_u32().await.unwrap();
+    let mut bytes = vec![0; len as usize];
+    client.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({"type":"event_replay","through_seq":1})
+    );
+    log.refused(Uuid::now_v7(), RefusedCause::Disconnect)
+        .unwrap();
+    assert!(matches!(
+        frame(&mut client).await,
+        Some(Frame::Event(TenantEvent { event_seq: 1, .. }))
+    ));
+    motor_protocol::write_frame_async(&mut client, &Frame::Ack { event_seq: 1 })
+        .await
+        .unwrap();
+    assert!(matches!(
+        frame(&mut client).await,
+        Some(Frame::Event(TenantEvent { event_seq: 2, .. }))
+    ));
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn tenant_retained_records_cannot_be_run_again_in_any_state() {
     let f = Fixture::new();
     let runner = open(&f);
