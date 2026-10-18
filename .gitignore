@@ -23,3 +23,6 @@
 # The guest agent is a standalone crate with its own lockfile, so building it
 # in place writes a second target folder.
 crates/motor-winagent/target/
+
+# Python bytecode caches from running the repository scripts.
+__pycache__/
