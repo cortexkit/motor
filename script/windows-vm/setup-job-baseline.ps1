@@ -55,6 +55,22 @@ $password = $null
 # Export all USER_RIGHTS and rewrite only the two job assignments, preserving
 # existing trustees. Add only the job SID, never a broad user group.
 # SeCreateSymbolicLinkPrivilege replaces the need for machine-wide Developer Mode.
+function Resolve-MotorTrusteeSid {
+    param([string]$Trustee, [scriptblock]$ResolveName = {
+        param($name)
+        ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
+    })
+    $Trustee = $Trustee.Trim()
+    if ($Trustee -match '^\*?(S-\d+(?:-\d+)+)$') { return $Matches[1] }
+    try {
+        $sid = & $ResolveName $Trustee
+        if ($sid -notmatch '^S-\d+(?:-\d+)+$') { throw 'Invalid resolved SID' }
+        return $sid
+    } catch {
+        throw "Cannot resolve policy trustee '$Trustee': $_"
+    }
+}
+
 $policy = Join-Path $env:TEMP 'motor-job-rights.inf'
 $policyDb = Join-Path $env:TEMP 'motor-job-rights.sdb'
 try {
@@ -67,7 +83,8 @@ try {
         if ($entry.Count -gt 1) { throw "Duplicate policy entries for $right" }
         if ($entry) {
             $grants = @((($entry[0] -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($grants -notcontains "*$jobSid") { $grants += "*$jobSid" }
+            $grantSids = @($grants | ForEach-Object { Resolve-MotorTrusteeSid $_ })
+            if ($grantSids -notcontains $jobSid) { $grants += "*$jobSid" }
             $lines = $lines | ForEach-Object {
                 if ($_ -match $pattern) { "$right = " + ($grants -join ',') } else { $_ }
             }
@@ -90,7 +107,8 @@ try {
         $entry = @(Get-Content $policy | Where-Object { $_ -match ('^' + $right + '\s*=') })
         if ($entry.Count -ne 1) { throw "Expected one policy entry for $right" }
         $grants = @((($entry[0] -split '=', 2)[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($grants -notcontains "*$jobSid") { throw "Job SID missing from $right" }
+        $grantSids = @($grants | ForEach-Object { Resolve-MotorTrusteeSid $_ })
+        if ($grantSids -notcontains $jobSid) { throw "Job SID missing from $right" }
         Write-Host "Verified $right for motor-job SID $jobSid"
     }
     $developerMode = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue

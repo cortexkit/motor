@@ -112,9 +112,16 @@ Match Group administrators
     Set-Content C:\build\provision\provisioned (Get-Date -Format o)
 } catch {
     $_ | Out-String | Set-Content C:\build\provision\FAILED.txt
+    if ($JobBaseline) {
+        # Setup can fail before the finalizer exists. Close the transcript and
+        # power off the failed image rather than leaving the VM slot occupied.
+        Stop-Transcript
+        Stop-Computer -Force
+        exit 1
+    }
     throw
 } finally {
-    Stop-Transcript
+    if (-not $JobBaseline -or -not (Test-Path C:\build\provision\FAILED.txt)) { Stop-Transcript }
 }
 # Start only after successful setup and a closed transcript; later passes run at startup.
 if ($JobBaseline) { Start-ScheduledTask -TaskName MotorFinalize }

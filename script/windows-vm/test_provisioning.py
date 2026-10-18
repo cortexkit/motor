@@ -179,8 +179,8 @@ class BaselineInputsTests(unittest.TestCase):
     def test_job_symlink_right_is_sid_scoped_and_verified_without_developer_mode(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
         self.assertIn("@('SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege')", source)
-        self.assertIn('if ($grants -notcontains "*$jobSid") { $grants += "*$jobSid" }', source)
-        self.assertIn('if ($grants -notcontains "*$jobSid") { throw "Job SID missing from $right" }', source)
+        self.assertIn('if ($grantSids -notcontains $jobSid) { $grants += "*$jobSid" }', source)
+        self.assertIn('if ($grantSids -notcontains $jobSid) { throw "Job SID missing from $right" }', source)
         self.assertIn("if ($developerMode -eq 1) { throw 'Job baseline must not enable Developer Mode' }", source)
         self.assertEqual(source.count('& secedit /export /cfg $policy /areas USER_RIGHTS /quiet'), 2)
 
