@@ -413,7 +413,7 @@ $ErrorActionPreference='Stop'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw 'unexpected job account'}
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job is an administrator'}
-$mode=Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue
+$mode=(Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
 if($mode -eq 1){throw 'Developer Mode is enabled'}
 $links=@(
  @('link-file-system','C:\Windows\System32\kernel32.dll',0),

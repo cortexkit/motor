@@ -32,6 +32,26 @@ try { Resolve-MotorTrusteeSid 'missing-user' $resolver } catch { $rejected = $_.
 Assert $rejected 'unresolvable trustee did not fail closed with its name'
 $checks++
 Write-Host 'PASS policy_named_and_sid_trustees'
+$definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-MotorDeveloperModeDisabled'}, $true)
+Invoke-Expression $definition.Extent.Text
+foreach ($state in @('key-absent','value-absent','zero','one')) {
+    $readKey = {
+        switch ($state) {
+            'key-absent' { return $null }
+            'value-absent' { return [pscustomobject]@{} }
+            'zero' { return [pscustomobject]@{AllowDevelopmentWithoutDevLicense=0} }
+            'one' { return [pscustomobject]@{AllowDevelopmentWithoutDevLicense=1} }
+        }
+    }
+    $threw = $false
+    try { Assert-MotorDeveloperModeDisabled $readKey } catch {
+        Assert ($_.ToString().Contains('must not enable Developer Mode')) "unexpected registry-check error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq ($state -eq 'one')) "wrong Developer Mode result for $state"
+}
+$checks++
+Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
 $items = [ordered]@{
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')
     virtio_serial = @('vioserial\2k22\amd64\vioser.inf', '& pnputil /add-driver', '/install')

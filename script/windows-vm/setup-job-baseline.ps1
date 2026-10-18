@@ -71,6 +71,16 @@ function Resolve-MotorTrusteeSid {
     }
 }
 
+function Assert-MotorDeveloperModeDisabled {
+    param([scriptblock]$ReadKey = {
+        Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue
+    })
+    # Fresh Server images may have neither the key nor the value. Only an
+    # explicitly enabled value is Developer Mode, not an absent setting.
+    $developerMode = (& $ReadKey).AllowDevelopmentWithoutDevLicense
+    if ($developerMode -eq 1) { throw 'Job baseline must not enable Developer Mode' }
+}
+
 $policy = Join-Path $env:TEMP 'motor-job-rights.inf'
 $policyDb = Join-Path $env:TEMP 'motor-job-rights.sdb'
 try {
@@ -111,8 +121,7 @@ try {
         if ($grantSids -notcontains $jobSid) { throw "Job SID missing from $right" }
         Write-Host "Verified $right for motor-job SID $jobSid"
     }
-    $developerMode = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue
-    if ($developerMode -eq 1) { throw 'Job baseline must not enable Developer Mode' }
+    Assert-MotorDeveloperModeDisabled
 } finally {
     Remove-Item $policy,$policyDb -Force -ErrorAction SilentlyContinue
 }
