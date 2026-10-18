@@ -105,7 +105,10 @@ fn finish(launch: backend::Launch) -> String {
     finish_with_context(launch, "")
 }
 fn finish_with_context(mut launch: backend::Launch, context: &str) -> String {
-    let output = launch.execution.output().unwrap();
+    finish_execution(launch.execution.as_mut(), context)
+}
+fn finish_execution(execution: &mut dyn backend::Execution, context: &str) -> String {
+    let output = execution.output().unwrap();
     let read = |mut reader: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut text = String::new();
@@ -115,8 +118,8 @@ fn finish_with_context(mut launch: backend::Launch, context: &str) -> String {
     };
     let stdout = read(output.stdout);
     let stderr = read(output.stderr);
-    let status = launch.execution.wait();
-    launch.execution.reap();
+    let status = execution.wait();
+    execution.reap();
     let stdout = stdout.join().unwrap();
     let stderr = stderr.join().unwrap();
     assert!(
@@ -138,6 +141,38 @@ fn powershell(script: &str) -> String {
         "powershell.exe -NoProfile -EncodedCommand {}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     )
+}
+
+#[test]
+fn direct_collection_can_be_read_after_finish_before_owner_cleanup() {
+    struct Completed;
+    impl backend::Execution for Completed {
+        fn release(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn output(&self) -> io::Result<backend::Output> {
+            Ok(backend::Output {
+                stdout: Box::new(io::empty()),
+                stderr: Box::new(io::empty()),
+            })
+        }
+        fn wait(&mut self) -> io::Result<backend::ExecutionOutcome> {
+            Ok(backend::ExecutionOutcome::WindowsExit { code: 0 })
+        }
+        fn reap(&self) {}
+    }
+    let f = Fixture::new();
+    let config = super::windows_instance::config(&f);
+    let id = Uuid::now_v7();
+    let directory = config.state_dir().join("jobs").join(id.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    let archive = directory.join("windows-changes.tar");
+    fs::write(&archive, b"collected link records").unwrap();
+    let mut execution = super::windows_instance::direct_execution(&config, id, Box::new(Completed));
+    finish_execution(execution.as_mut(), "");
+    assert_eq!(fs::read(&archive).unwrap(), b"collected link records");
+    drop(execution);
+    assert!(!directory.exists());
 }
 fn cancel(runner: &Runner, setup: &Setup, hard: bool) {
     let mut job = Job::new(setup.id, Some(setup.request.clone()), 0, 0, 4);
@@ -335,8 +370,10 @@ fn windows_qualification_symlinks_do_not_escape_collection_or_cache() {
     git(&f.main, &["add", "."]);
     git(&f.main, &["commit", "-m", "symlink qualification fixture"]);
     let command = "powershell.exe -NoProfile -NonInteractive -File ./symlink-fixture.ps1";
-    let (setup, job) = launch(&runner, &f, command);
-    assert!(finish(job).contains("symlink creation passed"));
+    let (setup, mut job) = launch(&runner, &f, command);
+    // DirectExecution removes collection-only job directories on drop. Retain
+    // its owner until the archive assertions have consumed the result.
+    assert!(finish_execution(job.execution.as_mut(), "").contains("symlink creation passed"));
     let job_dir = runner
         .config()
         .state_dir()
@@ -397,6 +434,7 @@ fn windows_qualification_symlinks_do_not_escape_collection_or_cache() {
         .caches()
         .disk(&setup.request.workspace_key);
     assert!(disk.is_file(), "first job did not retain its clean cache");
+    drop(job);
     let output = run(&runner, &f, &format!("{command} -Check"));
     assert!(
         output.contains("only explained cache links persisted"),
