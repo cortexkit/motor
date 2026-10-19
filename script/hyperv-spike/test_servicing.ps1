@@ -1,15 +1,40 @@
 # Portable mocked control-flow tests; no Windows Update or registry calls.
-# Each isolated runspace maps C: to a private temporary fixture directory.
+# Private fixture drives leave native C: intact, including SYSTEM's temp paths.
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
 $bootstrapText = Get-Content (Join-Path $repo 'script/windows-vm/bootstrap.ps1') -Raw
 $finalizerText = Get-Content (Join-Path $repo 'script/windows-vm/finalize-job-baseline.ps1') -Raw
 $passed = 0
 $failed = 0
+Write-Host "EVIDENCE servicing test temp=$([IO.Path]::GetTempPath()); native C: is not rebound"
 function Assert-Service($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Test-Service([string]$Name, [scriptblock]$Check) {
     try { & $Check; Write-Host "PASS $Name"; $script:passed++ }
     catch { Write-Host "FAIL $Name $_"; $script:failed++ }
+}
+
+function Convert-ServiceFixturePath([string]$Path, [string]$PhysicalRoot) {
+    $comparison = [StringComparison]::OrdinalIgnoreCase
+    if (-not $Path.StartsWith('C:\', $comparison)) { return $Path }
+    if ($Path.Equals($PhysicalRoot.TrimEnd('\'), $comparison) -or $Path.StartsWith($PhysicalRoot.TrimEnd('\') + '\', $comparison)) { return $Path }
+    return 'MotorGuest:\' + $Path.Substring(3)
+}
+
+function Convert-ServiceFixtureSource([string]$Source, [string]$PhysicalRoot) {
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+    $paths = $ast.FindAll({ param($node)
+        ($node -is [Management.Automation.Language.StringConstantExpressionAst] -or $node -is [Management.Automation.Language.ExpandableStringExpressionAst]) -and $node.Value.StartsWith('C:\', [StringComparison]::OrdinalIgnoreCase)
+    }, $true)
+    # Rewrite logical guest path literals once. Physical paths returned by file
+    # APIs and $PSScriptRoot still use the real C: drive, never a rebound C: root.
+    foreach ($node in @($paths | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        if ((Convert-ServiceFixturePath $node.Value $PhysicalRoot) -eq $node.Value) { continue }
+        $offset = $node.Extent.StartOffset + $node.Extent.Text.IndexOf('C:\', [StringComparison]::OrdinalIgnoreCase)
+        $Source = $Source.Remove($offset, 3).Insert($offset, 'MotorGuest:\')
+    }
+    return $Source
 }
 
 function New-ServiceFixture {
@@ -19,13 +44,13 @@ function New-ServiceFixture {
     $shell = [PowerShell]::Create()
     $setup = {
         param($Root, $Bootstrap, $Finalizer)
-        # Rebind drives only inside this isolated runspace, before any script I/O.
+        # Use private names so native absolute paths are never resolved twice.
         Set-Location Function:\
-        Remove-PSDrive C,S -Force -ErrorAction SilentlyContinue
-        New-PSDrive C FileSystem (Join-Path $Root 'c') -Scope Global | Out-Null
+        Remove-PSDrive MotorGuest,S -Force -ErrorAction SilentlyContinue
+        New-PSDrive MotorGuest FileSystem (Join-Path $Root 'c') -Scope Global | Out-Null
         New-PSDrive S FileSystem (Join-Path $Root 's') -Scope Global | Out-Null
-        if ((Get-PSDrive C).Root -ne (Join-Path $Root 'c')) { throw 'Fixture drive isolation failed' }
-        Set-Location C:\
+        if ((Get-PSDrive MotorGuest).Root -ne (Join-Path $Root 'c')) { throw 'Fixture drive isolation failed' }
+        Set-Location MotorGuest:\
         $global:f = @{ rotations=0; reboots=0; stops=0; tasks=@{}; started=@(); seed=$true; searchCode=2; downloadCode=2; installCode=2; itemCode=2; pending=$false; offered=$true; calls=@() }
         Set-Content S:\bootstrap.ps1 $Bootstrap
         Set-Content S:\finalize-job-baseline.ps1 $Finalizer
@@ -77,8 +102,8 @@ function New-ServiceFixture {
         $global:session | Add-Member ScriptMethod CreateUpdateSearcher { $global:searcher }
         $global:session | Add-Member ScriptMethod CreateUpdateDownloader { $global:downloader }
         $global:session | Add-Member ScriptMethod CreateUpdateInstaller { $global:installer }
-        $global:collection = [pscustomobject]@{}
-        $global:collection | Add-Member ScriptMethod Add { param($Update) 1 }
+        $global:collection = [pscustomobject]@{Count=0}
+        $global:collection | Add-Member ScriptMethod Add { param($Update) $this.Count++; return ($this.Count - 1) }
         function global:New-Object {
             param($ComObject)
             switch ($ComObject) {
@@ -91,10 +116,11 @@ function New-ServiceFixture {
         & S:\bootstrap.ps1 -JobBaseline
     }
     try {
-        [void]$shell.AddScript($setup.ToString()).AddArgument($root).AddArgument($bootstrapText).AddArgument($finalizerText)
+        $physicalRoot = Join-Path $root 'c'
+        [void]$shell.AddScript($setup.ToString()).AddArgument($root).AddArgument((Convert-ServiceFixtureSource $bootstrapText $physicalRoot)).AddArgument((Convert-ServiceFixtureSource $finalizerText $physicalRoot))
         $null = $shell.Invoke()
         $shell.Commands.Clear()
-        [void]$shell.AddScript('Check (-not (Test-Path C:\build\provision\FAILED.txt)) "Initial bootstrap failed"; Check ($global:f.tasks.ContainsKey("MotorUpdateFirst")) "Initial bootstrap did not schedule OS servicing"')
+        [void]$shell.AddScript('Check (-not (Test-Path MotorGuest:\build\provision\FAILED.txt)) "Initial bootstrap failed"; Check ($global:f.tasks.ContainsKey("MotorUpdateFirst")) "Initial bootstrap did not schedule OS servicing"')
         $null = $shell.Invoke()
         if ($shell.InvocationStateInfo.State -ne 'Completed') { throw ($shell.Streams.Error | Out-String) }
         return @{root=$root; shell=$shell}
@@ -105,13 +131,29 @@ function Invoke-ServiceFixture($Fixture, [string]$Code) {
     $shell = $Fixture.shell
     $shell.Commands.Clear()
     $shell.Streams.Error.Clear()
-    [void]$shell.AddScript($Code)
+    [void]$shell.AddScript((Convert-ServiceFixtureSource $Code (Join-Path $Fixture.root 'c')))
     $result = @($shell.Invoke())
     if ($shell.InvocationStateInfo.State -ne 'Completed') { throw ($shell.Streams.Error | Out-String) }
     return $result
 }
 function Close-ServiceFixture($Fixture) { $Fixture.shell.Dispose(); Remove-Item $Fixture.root -Recurse -Force }
 
+Test-Service 'servicing-fixture-redirection-is-idempotent-with-native-c-temp-root' {
+    $root = 'C:\WINDOWS\SystemTemp\motor-servicing-fixture\c'
+    $native = "$root\build\provision\FAILED.txt"
+    $source = @"
+Get-Content C:\build\provision\FAILED.txt
+Get-Content '$native'
+`$log = "C:\build\provision\`$phase.log"
+"@
+    $once = Convert-ServiceFixtureSource $source $root
+    $twice = Convert-ServiceFixtureSource $once $root
+    Assert-Service ($once -ceq $twice) 'Fixture source was redirected twice'
+    Assert-Service ($once.Contains('Get-Content MotorGuest:\build\provision\FAILED.txt')) 'Logical guest path was not redirected'
+    Assert-Service ($once.Contains("Get-Content '$native'")) 'Already physical C: fixture path was redirected'
+    Assert-Service ($once.Contains('"MotorGuest:\build\provision\$phase.log"')) 'Interpolated guest path was not redirected'
+    Assert-Service ((Convert-ServiceFixturePath $native $root) -ceq $native) 'Physical C: path is not idempotent'
+}
 Test-Service 'servicing-is-scheduled-before-any-toolchain-and-uses-system-resume' {
     $f = New-ServiceFixture
     try {
@@ -134,6 +176,7 @@ Test-Service 'servicing-reboot-resumes-without-seed-password-rerun-or-early-shut
         $null = Invoke-ServiceFixture $f '& C:\build\provision\finalize-job-baseline.ps1 -BeforeToolchain'
         $null = Invoke-ServiceFixture $f @'
 Check ($global:f.reboots -eq 1 -and $global:f.stops -eq 0) 'Update pass must reboot, not power off'
+Check ($global:collection.Count -eq 1) 'COM collection count must not depend on implicit scalar Count'
 Check ($global:f.calls.Count -eq 0) 'Installer ran before reboot settled'
 Check (-not (Test-Path C:\build\provision\os-updated)) 'Early servicing marker'
 $inventory = Get-Content C:\build\provision\os-update-first-updates-1.json -Raw | ConvertFrom-Json
