@@ -553,10 +553,7 @@ async fn consume<C: ExecClient + ?Sized>(
             }
             Err(failure) => {
                 if !received && failure.code.as_deref() == Some("motor_job_not_found") {
-                    return attach_failure(
-                        SubmitError::NotSent("ck-motor has no such job for this caller".into()),
-                        err,
-                    );
+                    return attach_failure(SubmitError::NotSent(failure.message), err);
                 }
                 if !received
                     && failure
@@ -779,6 +776,7 @@ pub fn exit_code(terminal: &TerminalRecord) -> u8 {
 pub struct SubcClient {
     consumer: SubcConsumer,
     route: RouteHandle,
+    module_id: String,
     returns: crate::ReturnOptions,
 }
 
@@ -806,7 +804,9 @@ impl SubcClient {
         );
         let route = consumer
             .open_route(
-                RouteTarget::ManagementSurface { module_id },
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.clone(),
+                },
                 identity,
                 CallOptions::default(),
             )
@@ -815,6 +815,7 @@ impl SubcClient {
         Ok(Self {
             consumer,
             route,
+            module_id,
             returns: crate::ReturnOptions::default(),
         })
     }
@@ -833,7 +834,7 @@ impl SubcClient {
                 SubscribeOptions::default(),
             )
             .await
-            .map_err(submit_error)?;
+            .map_err(|error| submit_error(error, &self.module_id))?;
         // Drain the SDK's bounded channel even when the terminal's stdout is slow.
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -861,13 +862,13 @@ fn direct_envelope(op: &str, params: impl serde::Serialize, secret: Option<&str>
     serde_json::to_vec(&value).expect("serializable request")
 }
 
-fn submit_error(error: CallError) -> SubmitError {
+fn submit_error(error: CallError, module_id: &str) -> SubmitError {
     match error {
         CallError::NotSent(_) | CallError::StaleRouteHandle(_) => {
             SubmitError::NotSent(error.to_string())
         }
         _ if error.code() == Some("motor_job_not_found") => {
-            SubmitError::NotSent("ck-motor has no such job for this caller".into())
+            SubmitError::NotSent(format!("{module_id} has no such job for this caller"))
         }
         _ => SubmitError::Unknown(error.to_string()),
     }
@@ -906,7 +907,7 @@ impl ExecClient for SubcClient {
                 CallOptions::default(),
             )
             .await
-            .map_err(submit_error)?;
+            .map_err(|error| submit_error(error, &self.module_id))?;
         serde_json::from_slice(&bytes)
             .map_err(|_| SubmitError::Unknown("unreadable job status".into()))
     }

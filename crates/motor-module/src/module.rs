@@ -25,6 +25,7 @@ use subc_protocol::{
 };
 
 pub const CAPABILITY: &str = "exec-remote/v1";
+pub const DEFAULT_MODULE_ID: &str = "ck-motor";
 // subc-client-rs 0.26.1 lib.rs:86 fixes provider handler capacity at 64.
 pub const SDK_HANDLER_CAPACITY: usize = 64;
 // Reserve slots for status, cancel and attach when long-lived run streams fill
@@ -228,6 +229,7 @@ mod provenance_tests {
 #[derive(Clone)]
 pub struct Handler {
     config: Config,
+    module_id: String,
     motor: Arc<OnceLock<Motor>>,
     ssh: Arc<OnceLock<Arc<SshConnector>>>,
     resolver: Arc<dyn CredentialResolver>,
@@ -245,22 +247,33 @@ pub struct Handler {
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
 }
-fn module_data_dir() -> io::Result<PathBuf> {
-    let data = match std::env::var_os("XDG_DATA_HOME") {
-        Some(data) => PathBuf::from(data),
-        None => PathBuf::from(
-            std::env::var_os("HOME")
-                .ok_or_else(|| io::Error::other("neither XDG_DATA_HOME nor HOME is set"))?,
-        )
-        .join(".local/share"),
+fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
+    module_data_dir_for(
+        module_id,
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn module_data_dir_for(
+    module_id: &str,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> io::Result<PathBuf> {
+    let data = match xdg_data_home {
+        Some(data) => data,
+        None => home
+            .ok_or_else(|| io::Error::other("neither XDG_DATA_HOME nor HOME is set"))?
+            .join(".local/share"),
     };
-    Ok(data.join("cortexkit/ck-motor"))
+    Ok(data.join("cortexkit").join(module_id))
 }
 
 impl Handler {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            module_id: DEFAULT_MODULE_ID.into(),
             motor: Arc::new(OnceLock::new()),
             ssh: Arc::new(OnceLock::new()),
             resolver: Arc::new(UnavailableCredentialResolver),
@@ -277,6 +290,10 @@ impl Handler {
     }
     pub fn with_engram_catalog(mut self) -> Self {
         self.write_engram_catalog = true;
+        self
+    }
+    pub fn with_module_id(mut self, module_id: impl Into<String>) -> Self {
+        self.module_id = module_id.into();
         self
     }
     /// Serve with an already open `Motor` instead of opening one from the
@@ -311,18 +328,30 @@ impl Handler {
         }
     }
     fn storage_root(&self, ack: &ModuleHelloAckBody) -> io::Result<PathBuf> {
+        self.storage_root_with_data_dir(ack, module_data_dir)
+    }
+    fn storage_root_with_data_dir(
+        &self,
+        ack: &ModuleHelloAckBody,
+        data_dir_for_module: impl FnOnce(&str) -> io::Result<PathBuf>,
+    ) -> io::Result<PathBuf> {
         match &ack.storage {
             Some(value) => {
                 let descriptor: StorageDescriptor =
                     serde_json::from_value(value.clone()).map_err(io::Error::other)?;
                 match descriptor.backend {
                     StorageBackend::Sqlite { path } => {
+                        // This suffix identifies ck-motor's store format, not its module ID;
+                        // SUBC can move the data folder while the SQLite file name stays stable.
                         Ok(PathBuf::from(format!("{path}.ck-motor")))
                     }
-                    _ => Err(io::Error::other("ck-motor requires SQLite module storage")),
+                    _ => Err(io::Error::other(format!(
+                        "{} requires SQLite module storage",
+                        self.module_id
+                    ))),
                 }
             }
-            None => Ok(module_data_dir()?.join(&self.config.runner_instance)),
+            None => Ok(data_dir_for_module(&self.module_id)?.join(&self.config.runner_instance)),
         }
     }
     fn startup_failed(&self, detail: String) {
@@ -359,10 +388,15 @@ impl Handler {
                     motor.set_connector(ssh.clone());
                     if self.write_engram_catalog {
                         // Catalog I/O must not delay readiness on a slow data volume.
+                        let module_id = self.module_id.clone();
                         let data_dir = catalog_data_dir;
                         let catalog_root = root.clone();
                         drop(tokio::task::spawn_blocking(move || {
-                            crate::engram_catalog::write_best_effort(data_dir, &catalog_root)
+                            crate::engram_catalog::write_best_effort(
+                                &module_id,
+                                data_dir,
+                                &catalog_root,
+                            )
                         }));
                     }
                     self.ssh.set(ssh).ok();
@@ -454,10 +488,10 @@ pub fn direct_timeout_refusal(timeout: Option<u64>, cap: u64) -> Option<String> 
 /// What a direct caller gets for a job its route did not start. The bytes are
 /// the same whether the job belongs to another caller or does not exist, so a
 /// direct caller can't learn which job IDs are live.
-fn direct_job_not_found() -> HandlerOutcome {
+fn direct_job_not_found(module_id: &str) -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "motor_job_not_found".into(),
-        message: "ck-motor has no such job for this caller".into(),
+        message: format!("{module_id} has no such job for this caller"),
     }
 }
 
@@ -479,7 +513,7 @@ impl Handler {
         ) {
             return Ok(HandlerOutcome::Error {
                 code: "motor_op_not_permitted_for_principal".into(),
-                message: format!("ck-motor refuses {op} for direct"),
+                message: format!("{} refuses {op} for direct", self.module_id),
             });
         }
         let owned = |id: Uuid| self.direct_jobs.lock().unwrap().get(&id) == Some(&route);
@@ -536,10 +570,10 @@ impl Handler {
                     .and_then(Value::as_str)
                     .and_then(|id| id.parse().ok());
                 let Some(id) = id else {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 };
                 if !owned(id) && !motor.direct_authorized(id, envelope.direct_secret.as_str()) {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 }
                 let request: AttachRequest = parse(envelope.params)?;
                 pump_direct(&ctx, self.initialized()?.attach(request)?)
@@ -554,10 +588,10 @@ impl Handler {
                     .and_then(Value::as_str)
                     .and_then(|id| id.parse().ok());
                 let Some(id) = id else {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 };
                 if !owned(id) && !motor.direct_authorized(id, envelope.direct_secret.as_str()) {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 }
                 let request: CancelRequest = parse(envelope.params)?;
                 tracing::info!(caller = "direct", job_id = %request.job_id, "direct job cancel requested");
@@ -569,18 +603,18 @@ impl Handler {
                 let Some(id) = envelope.params.get("job_id") else {
                     return Ok(HandlerOutcome::Error {
                         code: "motor_op_not_permitted_for_principal".into(),
-                        message: "ck-motor refuses exec.status without a job_id for direct; a direct caller may check only its own jobs".into(),
+                        message: format!("{} refuses exec.status without a job_id for direct; a direct caller may check only its own jobs", self.module_id),
                     });
                 };
                 let Some(id) = id.as_str().and_then(|id| id.parse().ok()) else {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 };
                 if !owned(id)
                     && !self
                         .initialized()?
                         .direct_authorized(id, envelope.direct_secret.as_str())
                 {
-                    return Ok(direct_job_not_found());
+                    return Ok(direct_job_not_found(&self.module_id));
                 }
                 response(self.initialized()?.job_status(id).await?)
             }
@@ -591,7 +625,8 @@ impl Handler {
             io::Error::new(
                 io::ErrorKind::NotConnected,
                 format!(
-                    "ck-motor unavailable: {}",
+                    "{} unavailable: {}",
+                    self.module_id,
                     self.startup_error
                         .lock()
                         .unwrap()
@@ -639,7 +674,7 @@ impl ModuleHandler for Handler {
             let handler = self.clone();
             *task = Some(tokio::spawn(async move {
                 handler
-                    .initialize_storage(root, module_data_dir(), ready)
+                    .initialize_storage(root, module_data_dir(&handler.module_id), ready)
                     .await
             }));
         }
@@ -663,19 +698,19 @@ impl ModuleHandler for Handler {
             Some(Principal::Direct) => {
                 return BindDecision::reject(
                     "motor_direct_refused",
-                    "ck-motor refuses direct binds",
+                    format!("{} refuses direct binds", self.module_id),
                 )
             }
             Some(Principal::Unverified) | None => {
                 return BindDecision::reject(
                     "motor_unverified_refused",
-                    "ck-motor refuses unverified binds",
+                    format!("{} refuses unverified binds", self.module_id),
                 )
             }
             Some(Principal::Reserved { module_id }) => {
                 return BindDecision::reject(
                     "motor_principal_refused",
-                    format!("ck-motor refuses reserved:{module_id}; only reserved:aft, reserved:prefrontal-core and the {HEALTH_FLOW_ID} flow may bind"),
+                    format!("{} refuses reserved:{module_id}; only reserved:aft, reserved:prefrontal-core and the {HEALTH_FLOW_ID} flow may bind", self.module_id),
                 )
             }
         }
@@ -756,7 +791,7 @@ impl ModuleHandler for Handler {
                 _ => {
                     return Ok(HandlerOutcome::Error {
                         code: "motor_route_not_admitted".into(),
-                        message: "ck-motor requires an admitted reserved:aft, reserved:prefrontal-core or reserved:basal route".into(),
+                        message: format!("{} requires an admitted reserved:aft, reserved:prefrontal-core or reserved:basal route", self.module_id),
                     })
                 }
             };
@@ -773,7 +808,7 @@ impl ModuleHandler for Handler {
             if !permitted {
                 return Ok(HandlerOutcome::Error {
                     code: "motor_op_not_permitted_for_principal".into(),
-                    message: format!("ck-motor refuses {} for reserved:{module_id}", envelope.op),
+                    message: format!("{} refuses {} for reserved:{module_id}", self.module_id, envelope.op),
                 });
             }
             let motor = self.initialized()?;
@@ -1100,6 +1135,49 @@ mod startup_tests {
         process::{Command, Stdio},
         time::Duration,
     };
+
+    #[test]
+    fn module_data_directory_uses_the_runtime_module_id() {
+        let data_home = PathBuf::from("/test/data");
+        assert_eq!(
+            module_data_dir_for("ck-motor", Some(data_home.clone()), None).unwrap(),
+            data_home.join("cortexkit/ck-motor")
+        );
+        assert_eq!(
+            module_data_dir_for("motor", Some(data_home.clone()), None).unwrap(),
+            data_home.join("cortexkit/motor")
+        );
+    }
+
+    #[test]
+    fn storage_fallback_uses_the_runtime_module_data_directory() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-storage-fallback");
+        let data_home = scratch.join("xdg-data");
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: subc_protocol::PROTOCOL_VERSION,
+            subc_ops: Vec::new(),
+            subc_capabilities: Vec::new(),
+            storage: None,
+            machine_id: None,
+        };
+
+        for module_id in ["ck-motor", "motor"] {
+            let handler = Handler::new(Config::default()).with_module_id(module_id);
+            let storage_root = handler
+                .storage_root_with_data_dir(&ack, |id| {
+                    module_data_dir_for(id, Some(data_home.clone()), None)
+                })
+                .unwrap();
+            assert_eq!(
+                storage_root,
+                data_home
+                    .join("cortexkit")
+                    .join(module_id)
+                    .join(&handler.config.runner_instance),
+                "module id: {module_id}"
+            );
+        }
+    }
 
     #[test]
     fn lease_holder_process() {
