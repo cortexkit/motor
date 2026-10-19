@@ -719,18 +719,20 @@ impl ModuleHandler for Handler {
             .lock()
             .unwrap()
             .report(std::time::Instant::now());
-        let diagnostics = crate::diagnostics::health_detail();
+        // The detail line stays one sentence; the refusal counters are
+        // diagnostics, shown with `ck health ck-motor --verbose`.
+        if let Some(serde_json::Value::Object(metrics)) = report.metrics.as_mut() {
+            metrics.insert(
+                "unreachable_refusals_since_boot".into(),
+                crate::diagnostics::health_metrics(),
+            );
+        }
         if let Some(reason) = reason {
             report.status = HealthStatus::Failing;
-            report.detail = Some(format!(
-                "{reason}; {diagnostics}; {}",
-                report.detail.unwrap_or_default()
-            ));
-        } else {
-            report.detail = Some(format!(
-                "{}; {diagnostics}",
-                report.detail.unwrap_or_default()
-            ));
+            report.detail = Some(match report.detail.take() {
+                Some(detail) => format!("{reason}; {detail}"),
+                None => reason,
+            });
         }
         report
     }

@@ -91,11 +91,12 @@ pub(crate) fn record_unreachable(id: Uuid, step: UnreachableStep, cause: impl st
     );
 }
 
-pub(crate) fn health_detail() -> String {
-    let counts = UnreachableStep::ALL
+/// Per-step unreachable refusal counts since ck-motor started, for the health
+/// report's metrics: diagnostic detail for `--verbose`, never the summary line.
+pub(crate) fn health_metrics() -> serde_json::Value {
+    UnreachableStep::ALL
         .into_iter()
-        .map(|step| format!("{}={}", step.label(), process_count(step)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("unreachable_refusals_since_boot: {counts}")
+        .map(|step| (step.label().to_owned(), process_count(step).into()))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }

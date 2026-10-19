@@ -19,7 +19,7 @@ use std::{
     },
     time::Duration,
 };
-use subc_client_rs::{HealthStatus, ModuleHandler};
+use subc_client_rs::{HealthReport, HealthStatus, ModuleHandler};
 use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::{
@@ -663,14 +663,28 @@ async fn auth_required_recovers_health_without_restart() {
     )
     .await;
 }
+/// A failing report leads with its reason, keeps the detail to one line, and
+/// carries the unreachable-refusal counters in metrics rather than the detail.
+fn assert_failing_detail_and_counters(health: &HealthReport, reason: &str) {
+    let detail = health.detail.as_deref().unwrap_or_default();
+    assert!(detail.starts_with(&format!("{reason}; ")), "{detail}");
+    assert!(
+        !detail.contains("unreachable_refusals_since_boot"),
+        "{detail}"
+    );
+    let counters = &health.metrics.as_ref().unwrap()["unreachable_refusals_since_boot"];
+    assert!(
+        counters.is_object() && !counters.as_object().unwrap().is_empty(),
+        "{counters}"
+    );
+}
+
 async fn assert_health_recovers(class: CredentialErrorClass, reason: &str) {
     let resolver = RecoveringResolver::new(2, class);
     let rig = Rig::with_resolver(resolver.clone()).await;
     let health = rig.handler.health().await;
     assert_eq!(health.status, HealthStatus::Failing);
-    assert!(health.detail.as_deref().is_some_and(|detail| {
-        detail.starts_with(&format!("{reason}; unreachable_refusals_since_boot: "))
-    }));
+    assert_failing_detail_and_counters(&health, reason);
     assert_eq!(resolver.attempts.load(Ordering::SeqCst), 1);
     tokio::time::timeout(Duration::from_secs(6), async {
         while rig.handler.health().await.status != HealthStatus::Ok {
@@ -763,9 +777,7 @@ async fn assert_credential_refusal(class: CredentialErrorClass, reason: &str) {
     );
     let health = rig.handler.health().await;
     assert_eq!(health.status, HealthStatus::Failing);
-    assert!(health.detail.as_deref().is_some_and(|detail| {
-        detail.starts_with(&format!("{reason}; unreachable_refusals_since_boot: "))
-    }));
+    assert_failing_detail_and_counters(&health, reason);
     let terminal: StreamRecord = serde_json::from_value(rig.run("any-preset").await).unwrap();
     let StreamRecord::Terminal(terminal) = terminal else {
         panic!("expected terminal refusal")
@@ -1071,9 +1083,7 @@ async fn refused_sign_returns_agent_failure_typed_run_refusal_and_failing_health
     );
     let health = rig.handler.health().await;
     assert_eq!(health.status, HealthStatus::Failing);
-    assert!(health.detail.as_deref().is_some_and(|detail| {
-        detail.starts_with("runner_sign_grant_refused; unreachable_refusals_since_boot: ")
-    }));
+    assert_failing_detail_and_counters(&health, "runner_sign_grant_refused");
     let terminal: StreamRecord = serde_json::from_value(rig.run("any").await).unwrap();
     let StreamRecord::Terminal(terminal) = terminal else {
         panic!("expected refusal")
