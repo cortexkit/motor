@@ -40,6 +40,8 @@ pub fn unix_ms() -> u64 {
 }
 
 pub struct Runtime {
+    pub broker_endpoint: String,
+    pub jwks_url: String,
     pub host_id: String,
     pub host: Mutex<Host>,
     pub keys: RwLock<KeySet>,
@@ -52,12 +54,29 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn new(host_id: String, host: Host, control: Arc<dyn Control>) -> Arc<Self> {
+        Self::with_broker(
+            host_id,
+            host,
+            control,
+            motor_lease::ISSUER.into(),
+            motor_lease::JWKS_URL.into(),
+        )
+    }
+    pub fn with_broker(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        broker_endpoint: String,
+        jwks_url: String,
+    ) -> Arc<Self> {
         let tenant_operations = host
             .tenants
             .values()
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
         Arc::new(Self {
+            broker_endpoint,
+            jwks_url,
             host_id,
             host: Mutex::new(host),
             keys: RwLock::new(KeySet::default()),
@@ -86,8 +105,9 @@ impl Runtime {
         let fetched = (|| -> Result<motor_lease::Jwks> {
             Ok(reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?
-                .get("https://runners.cortexkit.io/.well-known/jwks.json")
+                .get(&self.jwks_url)
                 .send()?
                 .error_for_status()?
                 .json()?)

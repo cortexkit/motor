@@ -60,6 +60,8 @@ pub struct Registry {
     pub snapshot_memory_high_mib: u64,
     #[serde(default = "default_io_weight")]
     pub io_weight: u32,
+    #[serde(default)]
+    pub capture_console: bool,
 }
 fn default_headroom() -> u64 {
     512

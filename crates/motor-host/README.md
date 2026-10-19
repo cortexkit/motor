@@ -159,3 +159,16 @@ Inject an XFS-check failure and an unreachable guest and verify the flag stays
 set and no Run reaches the runner. A clean start must run none of these checks.
 The image needs `xfs_repair` and Git. No tenant filesystem is ever mounted by the
 host kernel, and recovery never uses `xfs_repair -L` or deletes disk data.
+
+## Qualification-only broker transport
+
+An optional `fake_broker_url` in the host JSON config redirects broker HTTP and
+JWKS fetching to one loopback HTTP origin (`http://127.0.0.1:PORT` or
+`http://[::1]:PORT`). It is not read from the environment. The config path and
+its ancestors must be root-owned, non-symlink and not writable by group/other;
+`listen` must also be loopback. Startup emits a warning naming the override.
+Redirects are refused, and token `iss` verification remains pinned to the normal
+broker identity used by the fake broker's fixtures. Without this field the
+production broker/JWKS URLs are unchanged. Never enable this field for a
+customer-serving host. `script/tenant-image/qualify.py` uses it only with an
+isolated journal and disposable tenant for operator qualification.

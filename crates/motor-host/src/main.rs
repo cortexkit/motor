@@ -28,6 +28,8 @@ struct Config {
     resolvers: Vec<std::net::Ipv4Addr>,
     admin_socket: PathBuf,
     storage: PathBuf,
+    #[serde(default)]
+    fake_broker_url: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +44,21 @@ async fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
         .context("usage: motor-host <config.json>")?;
-    let config: Config = serde_json::from_reader(File::open(path)?)?;
+    let config: Config = serde_json::from_reader(File::open(&path)?)?;
+    let (broker_endpoint, jwks_url) = if let Some(url) = &config.fake_broker_url {
+        motor_host::broker::trusted_override_config(std::path::Path::new(&path))?;
+        let endpoint = motor_host::broker::fake_broker_endpoint(url, &config.listen)?;
+        tracing::warn!(
+            endpoint,
+            "QUALIFICATION ONLY: fake broker override enabled; not production admission"
+        );
+        (
+            endpoint.clone(),
+            format!("{endpoint}/.well-known/jwks.json"),
+        )
+    } else {
+        (motor_lease::ISSUER.into(), motor_lease::JWKS_URL.into())
+    };
     ensure!(
         !config.host_id.is_empty() && !config.resolvers.is_empty(),
         "host identity and resolvers are required"
@@ -87,7 +103,7 @@ async fn main() -> Result<()> {
         );
     }
     let (journal, snapshot) = FileJournal::open(&config.journal_dir)?;
-    let runtime = Runtime::new(
+    let runtime = Runtime::with_broker(
         config.host_id,
         Host::new(tenants, snapshot, Box::new(journal)),
         Arc::new(Helper {
@@ -95,6 +111,8 @@ async fn main() -> Result<()> {
             storage: config.storage,
             guest_init,
         }),
+        broker_endpoint,
+        jwks_url,
     );
     runtime
         .fetch_keys

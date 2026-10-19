@@ -1,0 +1,17 @@
+[Unit]
+Description=Boot-only operator tenant image qualification
+After=motor-tenant-agent.service
+Requires=motor-tenant-agent.service
+ConditionKernelCommandLine=systemd.wants=motor-qualification.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+Environment=HOME=/tenant
+Environment=CARGO_HOME=/tenant/cargo-home
+Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup
+Environment=PATH=/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=/bin/sh -c 'until test -f /tenant/qualification/run.py; do sleep 1; done; exec /usr/bin/python3 /tenant/qualification/run.py'
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0

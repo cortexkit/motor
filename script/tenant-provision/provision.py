@@ -41,10 +41,12 @@ def component(value):
 
 def checked(config):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
-               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers"}
+               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers", "capture_console"}
     if set(config) - allowed:
         raise ValueError("unknown provisioning key")
     c = dict(config)
+    if "capture_console" in c and type(c["capture_console"]) is not bool:
+        raise ValueError("capture_console must be boolean")
     for name in ("tenant", "vm", "image_version"):
         component(c[name])
     if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
@@ -169,8 +171,16 @@ def agent(root, request):
             raise RuntimeError(f"guest refused base preparation: {reply}")
 
 
-def build_base(c, image, base):
+def boot_args(image):
+    args = json.loads((image / "manifest.json").read_text())["boot_args"]
+    if not isinstance(args, str) or not args.strip() or any(ch in args for ch in "\r\n\0"):
+        raise ValueError("manifest boot_args must be a nonempty single line")
+    return args
+
+
+def build_base(c, image, base, console=None):
     """Kernel boot happens only here, with an unmounted placeholder /dev/vdb."""
+    args_from_manifest = boot_args(image)
     base.parent.mkdir(parents=True, exist_ok=True)
     state = Path(tempfile.mkdtemp(prefix=".base-", dir=base.parent))
     boundary = Path(tempfile.mkdtemp(prefix="provision-", dir=ROOT / "jail"))
@@ -213,7 +223,9 @@ def build_base(c, image, base):
                 "--cgroup", f"memory.max={(c['guest_ram_mib'] + c['memory_headroom_mib']) * 1048576}",
                 "--cgroup", f"pids.max={c['vcpu_ceiling'] + 64}", "--cgroup", f"io.weight=default {c['io_weight']}",
                 "--", "--api-sock", "/api.sock"]
-        proc = subprocess.Popen([str(a) for a in args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([str(a) for a in args], stdin=subprocess.DEVNULL,
+                                stdout=console if console is not None else subprocess.DEVNULL,
+                                stderr=console if console is not None else None)
         deadline = time.monotonic() + 10
         while True:
             try:
@@ -224,7 +236,7 @@ def build_base(c, image, base):
                     raise RuntimeError("base Firecracker did not become ready")
                 time.sleep(.02)
         for path, body in [("/machine-config", {"vcpu_count": c["vcpu_ceiling"], "mem_size_mib": c["guest_ram_mib"], "smt": False}),
-                           ("/boot-source", {"kernel_image_path": "/kernel", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro"}),
+                           ("/boot-source", {"kernel_image_path": "/kernel", "boot_args": args_from_manifest}),
                            ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": True, "is_read_only": True}),
                            ("/drives/tenant", {"drive_id": "tenant", "path_on_host": "/tenant.img", "is_root_device": False, "is_read_only": False}),
                            ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "base0", "guest_mac": "06:00:ac:10:00:02"}),
@@ -273,7 +285,7 @@ def build_base(c, image, base):
     sync_dir(base.parent)
 
 
-def provision(c, make_base=build_base, execute=run):
+def provision(c, make_base=build_base, execute=run, stage=None):
     home = ROOT / "tenants" / c["tenant"]
     image = ROOT / "tenant-images" / c["image_version"]
     base = base_path(c, image)
@@ -320,6 +332,8 @@ def provision(c, make_base=build_base, execute=run):
         execute("mount", "-o", "loop", disk, mount)
         try:
             atomic(Path(mount) / "runner-args", runner_args(c))
+            if stage is not None:
+                stage(Path(mount))
         finally:
             execute("umount", mount)
     with disk.open("rb") as file:
@@ -328,6 +342,7 @@ def provision(c, make_base=build_base, execute=run):
     record = {k: v for k, v in c.items() if k not in {"tenant", "sub", "vm", "resolvers"}}
     record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
     atomic(registry, json.dumps(record, indent=2) + "\n")
+    registry.chmod(0o644)
     bindings[c["vm"]] = {"tenant": c["tenant"], "sub": c["sub"]}
     atomic(BINDINGS, json.dumps(bindings, indent=2) + "\n")
     # The host agent can read the binding map, but only root may replace it.

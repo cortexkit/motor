@@ -134,6 +134,46 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(p.base_path(a, self.image), self.image / "base/2-18432")
         self.assertEqual(p.base_path(b, self.image), self.image / "base/1-8192")
 
+    def test_boot_args_are_the_exact_manifest_value(self):
+        path = self.image / "manifest.json"
+        manifest = json.loads(path.read_text())
+        expected = "console=ttyS0 root=/dev/vda ro init=/sbin/motor-init net.ifnames=0"
+        manifest["boot_args"] = expected
+        path.write_text(json.dumps(manifest))
+        self.assertEqual(p.boot_args(self.image), expected)
+        for bad in ("", "x\ny", 123):
+            manifest["boot_args"] = bad
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                p.boot_args(self.image)
+
+    def test_console_option_is_boolean_and_absent_on_normal_provisioning(self):
+        self.assertNotIn("capture_console", config())
+        value = config()
+        value["capture_console"] = True
+        self.assertTrue(p.checked(value)["capture_console"])
+        value["capture_console"] = "true"
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            p.checked(value)
+
+    def test_qualification_payload_is_staged_only_during_initial_mount(self):
+        events = []
+        def execute(*args):
+            events.append(args[0])
+            if args[0] == "fallocate":
+                args[-1].touch()
+        def make_base(_c, _image, path):
+            path.mkdir(parents=True)
+        def stage(mount):
+            self.assertEqual(events[-1], "mount")
+            self.assertTrue((mount / "runner-args").is_file())
+            events.append("stage")
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": 2**63})):
+            p.provision(config(), make_base, execute, stage=stage)
+        self.assertLess(events.index("mount"), events.index("stage"))
+        self.assertLess(events.index("stage"), events.index("umount"))
+        self.assertEqual((p.REGISTRY / "a.json").stat().st_mode & 0o777, 0o644)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

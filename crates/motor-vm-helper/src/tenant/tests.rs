@@ -4,6 +4,7 @@ use serde_json::json;
 pub(crate) fn registry(name: &str) -> Registry {
     let root = PathBuf::from(TENANTS).join(name);
     Registry {
+        capture_console: false,
         disk: root.join("disk.img"),
         generation: root.join("generation"),
         suspend: root.join("suspend"),

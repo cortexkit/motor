@@ -387,6 +387,20 @@ impl Backend for LinuxTenants {
                 }
             }
             let mut cmd = Command::new(binary_root.join("jailer"));
+            // The root-managed registry can opt into a fixed console file, never
+            // a caller-selected output path. Keep it across suspend and restore.
+            let console = if r.capture_console {
+                Stdio::from(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(r.disk.with_file_name("console.log"))?,
+                )
+            } else {
+                Stdio::null()
+            };
             cmd.args(["--id", &id, "--exec-file"])
                 .arg(binary_root.join("firecracker"))
                 .args([
@@ -399,7 +413,7 @@ impl Backend for LinuxTenants {
                 .arg(&boundary)
                 .args(["--", "--api-sock", "/api.sock"])
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(console)
                 .stderr(Stdio::inherit())
                 .env_clear();
             unsafe {

@@ -164,3 +164,101 @@ also run `/usr/local/libexec/hosted_image_check.py --tenant` inside the guest
 to probe XFS FICLONE between `/tenant/state` and both bound workspace roots.
 These live-guest checks require the dedicated operator host and must not be
 counted as passing when skipped.
+
+## Operator qualification
+
+`qualify.py` is an operator-only lane for an already built image. Run it as root
+on the dedicated Linux KVM server, **not** through the remote-job runner. It
+refuses an existing helper socket, registered tenants, tenant jails, tenant taps,
+tenant firewall table or base-boot network namespaces. It will not stop or
+replace an installed helper. Stop here if the host already serves tenant VMs;
+use a dedicated qualification host instead. Ordinary non-VM fleet jobs need not
+be stopped, but schedule the snapshot window off peak.
+
+Build the current checkout's real host/helper/fake-broker binaries and a Linux
+runner **library test executable** first. The test executable is delivered to
+the guest; neither Cargo sources nor a new runner binary are installed over the
+image's runner. Use a target compatible with the image's libc (or a static musl
+build). An incompatible or absent test executable is a **FAIL**, never a skip.
+For a native Linux toolchain compatible with the image:
+
+```sh
+BUILD="$PWD/target/tenant-qualification"
+mkdir -p "$BUILD"
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
+  cargo build --locked -j4 -p motor-host -p motor-vm-helper -p motor-lease --bins
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
+  cargo test --locked -j4 -p motor-runner --lib --no-run --message-format=json \
+  > "$BUILD/runner-tests.jsonl"
+TEST_BINARY=$(python3 -c 'import json,sys; a=[v["executable"] for l in open(sys.argv[1]) if (v:=json.loads(l)).get("reason")=="compiler-artifact" and v.get("target",{}).get("name")=="motor_runner" and v.get("executable")]; assert len(a)==1,a; print(a[0])' "$BUILD/runner-tests.jsonl")
+# Select two host CPUs excluding any CPUs reserved for Windows jobs.
+sudo python3 script/tenant-image/qualify.py \
+  --image /srv/build/vm/tenant-images/IMAGE_VERSION \
+  --bin-dir "$BUILD/debug" --runner-test-binary "$TEST_BINARY" \
+  --cpuset 0-1 --results /srv/build/qualification/UNUSED_RUN_NAME
+```
+
+Prerequisites are Python 3.9+, systemd 257+ (including `systemd-debug-generator`
+and binary kernel credentials), unified delegated CPU/cpuset/memory/pids/I/O
+controllers, XFS with reflink, OpenSSL with Ed25519, Git, xfsprogs, util-linux,
+iproute2, nftables and the pinned Firecracker/jailer 1.17.0. No packages or host
+users are installed. The admission server runs as `nobody` by default; choose a
+different existing unprivileged account with `--host-user` if necessary.
+
+Budget, **not measured results**: allow 5–15 minutes after builds, approximately
+53 GiB peak incremental disk plus the delivered executable/logs, and about
+17 GiB host RAM. Builds can add 5–20 minutes and their own Cargo scratch. The
+harness requires **224 GiB free on `/srv/build` after builds**: a 170 GiB floor
+plus a 54 GiB allocation allowance. It rechecks the floor plus snapshot bytes
+before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a fully allocated 20 GiB XFS
+disk, a 16 GiB size base and one 16 GiB suspend image. Snapshot `memory.high` is
+14 GiB only during the helper's paused snapshot window; I/O weight is 10.
+These settings are a qualification workload, not production capacity approval.
+
+The source release is never changed: an exclusive temporary image version
+hard-links its read-only kernel/rootfs and copies the manifest with boot-only
+extra arguments. Provisioning builds a new size base from `manifest.boot_args`.
+The systemd debug generator receives `motor-qualification.service` as a binary
+kernel credential and wants it only on this boot. Its kernel-command-line
+condition is a second opt-in fence. A boot-only drop-in sends the existing image
+check directly to ttyS0, avoiding journald prefixes on exact evidence lines.
+The unit waits for real tenant attachment, runs `hosted_image_check.py --tenant`
+and the delivered `isolation::tests::hosted_job_cannot_open_vsock --ignored
+--exact` test as root, and later checks for failed guest units. There is no
+privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
+
+The harness starts the real `motor-vm-helper` in a delegated transient unit and
+the real TLS `motor-host` admission server. A separate `motor-lease` fake broker
+issues a requester-bound lease for each job. The fake broker's seed is never
+passed to the host. TLS SPKI pinning, the challenge signature, the runner Hello,
+Git bundle upload, output frames, nonzero exit 23, second-job target path/inode
+and sentinel reuse are all checked. The helper performs suspend/restore with
+its normal quiesce/freeze/thaw and durable-snapshot implementation; fallback to
+a fresh base fails qualification. A third leased job proves persistence after
+restore. This tests the production admission/launch path with a fake **control
+plane**, not a real broker deployment or a billing qualification.
+
+Every step prints PASS/FAIL and raw evidence; unattempted steps are FAIL. The
+guest checker's complete success lines must equal `qualify.py`'s `LIVE` and
+`TENANT` constants, including the parenthesized check lists. These are the
+literal lines printed by `guest/hosted_image_check.py`, not substring matches. Output, manifests and summary stay under
+`--results`, outside Cargo target directories; credentials are not logged.
+Teardown stops the guest through the helper before stopping its unit, removes
+only disposable qualification resources, and prints process/tap/firewall/mount/
+failed-unit evidence. Existing unrelated failed host units are reported as a
+baseline, not cleared. Cleanup errors fail qualification and identify retained
+paths; never recursively delete them while mounts or VMMs remain. SIGINT and
+SIGTERM trigger teardown; SIGKILL or host loss cannot do so.
+
+Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, and the
+host/fake-broker logs. **No live qualification result is claimed by the portable
+tests or by merely building this harness.**
+
+Portable harness tests:
+
+```sh
+python3 -W error script/tenant-image/test_qualify.py
+python3 -W error script/tenant-provision/test_provision.py
+```

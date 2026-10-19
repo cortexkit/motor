@@ -68,3 +68,10 @@ only objects for tenants whose registries were removed. Existing live counters
 and other tenants' chains are never flushed or recreated. Incomplete live object
 sets are refused rather than reset; stopping or suspending a VM does not disable
 its registered tenant or delete its cumulative counter.
+
+The optional root-managed registry flag `capture_console` defaults to false.
+When true, tenant VMM stdout appends to the fixed `console.log` beside that
+tenant's disk (root-only, no symlink following). This supports operator image
+qualification across base load and suspend/restore; no output path is accepted
+from helper RPC callers. Base-kernel-boot console capture is separately owned
+by the provisioner.
