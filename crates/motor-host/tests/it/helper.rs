@@ -1,10 +1,29 @@
 use super::scratch;
-use motor_host::helper::{exchange_control, read_json, write_json, Control, Helper};
+use motor_host::helper::{
+    control_read_deadline, exchange_control, read_json, write_json, Control, Helper,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+
+#[test]
+fn fresh_attach_read_deadline_outlasts_guest_runner_readiness_wait() {
+    let attach = control_read_deadline(&json!({"op":"attach_tenant"}));
+    assert_eq!(attach, motor_protocol::TENANT_ATTACH_READ_DEADLINE);
+    assert!(
+        attach > motor_protocol::TENANT_RUNNER_READINESS_WAIT,
+        "host attach read deadline {attach:?} must exceed the guest readiness wait"
+    );
+    assert!(
+        control_read_deadline(&json!({"op":"attach_tenant","recovery_required":true})) > attach
+    );
+    assert_eq!(
+        control_read_deadline(&json!({"op":"status"})),
+        std::time::Duration::from_secs(30)
+    );
+}
 
 #[test]
 fn delayed_guest_control_reply_succeeds_without_retry() {

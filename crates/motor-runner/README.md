@@ -37,6 +37,10 @@ only on an ack for that event's sequence. Started and terminal events are
 persisted with job transitions, even while no client or event relay is open.
 Tenant job units add `TasksMax=4096` and deny `AF_VSOCK` for both offline and
 outbound jobs, so neither can reach the host's control sockets.
+A tenant runner is root inside its VM, so it runs its privileged helpers
+(setfacl, chown, chmod, systemctl, systemd-run and the network tools) directly
+with sudo's reset environment instead of through `sudo -n`, and skips the sudo
+grant inventory. `serve` refuses `--tenant-vm` when not running as root.
 
 `motor-runner tenant-agent` runs as root and serves port 54, also restricted
 to the host CID. It handles `attach_tenant`, `post_restore`, `cancel`, `drain`,
@@ -47,7 +51,12 @@ Fresh attachment mounts the XFS tenant disk at `/tenant`, binds the fixed
 cross-bind-mount reflinks before starting the transient
 `motor-tenant-runner.service` unit. Runner options are read from
 `/tenant/runner-args`; its state root is `/tenant/state` and Cargo home is
-`/tenant/cargo-home`. Restore only refreshes the clock and entropy; it does
+`/tenant/cargo-home`. Attachment sets the tenant host name and maps it in
+`/etc/hosts`, but gives the VM itself no nameserver: the attach request's
+resolvers are validated only, and `net` jobs get their own resolv.conf inside
+their namespaces. The agent waits
+`motor_protocol::TENANT_RUNNER_READINESS_WAIT` for the runner to listen; the
+host's attach read deadline is derived from it with a margin. Restore only refreshes the clock and entropy; it does
 not remount the disk or restart the runner.
 Attachment refuses symlinks, non-root-owned directories and writable-by-others
 directories in persisted mount paths, and pins bind sources with open directory

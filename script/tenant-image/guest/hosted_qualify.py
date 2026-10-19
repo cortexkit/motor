@@ -11,6 +11,69 @@ import time
 from typing import Any
 
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
+NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files, "
+                "sudo and lookup fast with an unreachable resolver, runner ready within 10 s")
+# The resolver an earlier attach wrote into the VM. The VM itself has no route
+# to it, which is exactly what made each sudo call wait out DNS timeouts.
+UNREACHABLE_RESOLVER = "1.1.1.1"
+FAST_S = 3.0
+READY_S = 10.0
+
+
+def nameservers(text):
+    return [line.split()[1] for line in text.splitlines()
+            if len(line.split()) >= 2 and line.split()[0] == "nameserver"]
+
+
+def runner_ready_seconds(start_monotonic_us, ready_realtime_s, now_realtime_s, now_monotonic_s):
+    """Seconds from the runner unit's start to the attach completion marker.
+
+    systemd reports the start on the monotonic clock and the marker's mtime is
+    on the wall clock; both are converted with the clocks' current offset.
+    """
+    if start_monotonic_us <= 0:
+        raise ValueError("tenant runner has no start timestamp")
+    started = start_monotonic_us / 1e6 + (now_realtime_s - now_monotonic_s)
+    return ready_realtime_s - started
+
+
+def timed(*args):
+    start = time.monotonic()
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    return result.returncode, result.stdout, time.monotonic() - start
+
+
+def name_service_probe():
+    resolv = Path("/etc/resolv.conf")
+    original = resolv.read_text()
+    print(f"guest resolv.conf: {original!r}", flush=True)
+    if nameservers(original):
+        raise RuntimeError(f"the VM's own resolv.conf names resolvers: {nameservers(original)}")
+    host = socket.gethostname()
+    hosts = Path("/etc/hosts").read_text()
+    print(f"guest hostname {host!r}; /etc/hosts: {hosts!r}", flush=True)
+    if not any(host in line.split()[1:] for line in hosts.splitlines() if not line.startswith("#")):
+        raise RuntimeError(f"/etc/hosts does not map the host name {host}")
+    try:
+        resolv.write_text(f"nameserver {UNREACHABLE_RESOLVER}\n")
+        lookup = timed("getent", "ahosts", host)
+        sudo = timed("sudo", "-n", "true")
+    finally:
+        resolv.write_text(original)
+    for name, (code, output, elapsed) in (("getent ahosts", lookup), ("sudo -n true", sudo)):
+        print(f"{name} with nameserver {UNREACHABLE_RESOLVER}: exit={code} elapsed_s={elapsed:.3f} "
+              f"output={output!r}", flush=True)
+        if code or elapsed >= FAST_S:
+            raise RuntimeError(f"{name} took {elapsed:.3f} s (exit {code}) with an unreachable resolver")
+    start = int(subprocess.run(["systemctl", "show", "-P", "ExecMainStartTimestampMonotonic",
+                                "motor-tenant-runner.service"], stdout=subprocess.PIPE, text=True,
+                               check=True).stdout.strip() or 0)
+    ready = runner_ready_seconds(start, Path("/run/motor-tenant-generation").stat().st_mtime,
+                                 time.clock_gettime(time.CLOCK_REALTIME), time.monotonic())
+    print(f"tenant runner start to attach completion: {ready:.3f} s", flush=True)
+    if not 0 <= ready < READY_S:
+        raise RuntimeError(f"tenant runner took {ready:.3f} s to become ready")
+    print(NAME_SERVICE, flush=True)
 
 
 def runner_diagnostics():
@@ -132,6 +195,7 @@ def main():
             raise RuntimeError("tenant runner did not become active after attachment")
         time.sleep(.1)
     run("/usr/local/libexec/hosted_image_check.py", "--tenant")
+    name_service_probe()
     root = Path("/tenant/qualification")
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)

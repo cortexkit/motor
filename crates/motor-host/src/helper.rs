@@ -151,16 +151,7 @@ impl Control for Helper {
         let stream = self
             .relay(tenant, 54)
             .with_context(|| format!("tenant {tenant} control port54 open relay"))?;
-        exchange_control(
-            stream,
-            tenant,
-            request,
-            Duration::from_secs(if request["recovery_required"] == true {
-                600
-            } else {
-                30
-            }),
-        )
+        exchange_control(stream, tenant, request, control_read_deadline(request))
     }
     fn suspend(&self, tenant: &str) -> Result<()> {
         self.request(json!({"op":"suspend", "tenant":tenant}))?;
@@ -168,6 +159,19 @@ impl Control for Helper {
     }
     fn available_bytes(&self) -> Result<u64> {
         available_bytes(&self.storage)
+    }
+}
+
+/// How long the host waits for the guest's reply to a control request. A
+/// fresh attach starts the tenant runner, so its deadline is derived from the
+/// guest's runner-readiness wait; recovery also checks the tenant disk.
+pub fn control_read_deadline(request: &Value) -> Duration {
+    if request["recovery_required"] == true {
+        Duration::from_secs(600)
+    } else if request["op"] == "attach_tenant" {
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE
+    } else {
+        Duration::from_secs(30)
     }
 }
 

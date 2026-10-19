@@ -40,10 +40,13 @@ GIB = 1024**3
 LIVE = ("hosted image live inventory: 10 checks passed (overlay, read-only lower, tmpfs, size, "
         "PID 1, accounts, services, network, private writes, denied lower writes)")
 TENANT = "hosted image tenant inventory: 3 checks passed (XFS, FICLONE to /Users and /home)"
+NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files, "
+                "sudo and lookup fast with an unreachable resolver, runner ready within 10 s")
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
-STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "vsock isolation",
-         "first job", "warm target reuse", "suspend", "restore", "post-restore job", "guest units", "teardown")
+STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
+         "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+         "guest units", "teardown")
 
 
 def module(name, path):
@@ -763,6 +766,7 @@ class Harness:
             self.step("provision and boot", self.provision)
             self.step("live inventory", lambda: self.expect_console(LIVE))
             self.step("tenant inventory", lambda: self.expect_console(TENANT))
+            self.step("name service", lambda: self.expect_console(NAME_SERVICE))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,

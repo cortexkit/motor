@@ -199,6 +199,57 @@ class QualificationTests(unittest.TestCase):
         self.assertIn("actual daemon error canary", state["journal"]["stdout"])
         self.assertEqual(state["socket"]["peer"]["pid"], 123)
 
+    def test_guest_name_service_line_matches_the_host_expectation(self):
+        guest = q.module("guest_name_service", q.HERE / "guest/hosted_qualify.py")
+        self.assertEqual(guest.NAME_SERVICE, q.NAME_SERVICE)
+        self.assertIn("name service", q.STEPS)
+        self.assertLess(q.STEPS.index("tenant inventory"), q.STEPS.index("name service"))
+        self.assertLess(q.STEPS.index("name service"), q.STEPS.index("vsock isolation"))
+
+    def test_guest_nameserver_parsing_ignores_comments_and_options(self):
+        guest = q.module("guest_nameservers", q.HERE / "guest/hosted_qualify.py")
+        self.assertEqual(guest.nameservers(""), [])
+        self.assertEqual(guest.nameservers("# nameserver 9.9.9.9\noptions timeout:1\n"), [])
+        self.assertEqual(guest.nameservers("nameserver 1.1.1.1\nnameserver 9.9.9.9\n"), ["1.1.1.1", "9.9.9.9"])
+
+    def test_guest_runner_readiness_converts_monotonic_start_to_wall_clock(self):
+        guest = q.module("guest_readiness", q.HERE / "guest/hosted_qualify.py")
+        # Wall clock is 1000 s ahead of the monotonic clock; the runner started
+        # at monotonic 50 s (wall 1050 s) and the marker was written at 1052.5 s.
+        self.assertAlmostEqual(guest.runner_ready_seconds(50_000_000, 1052.5, 1100.0, 100.0), 2.5)
+        with self.assertRaises(ValueError):
+            guest.runner_ready_seconds(0, 1052.5, 1100.0, 100.0)
+
+    def test_guest_name_service_probe_fails_on_a_slow_sudo_and_restores_resolv_conf(self):
+        guest = q.module("guest_slow_sudo", q.HERE / "guest/hosted_qualify.py")
+        files = {"/etc/resolv.conf": "", "/etc/hosts": "127.0.0.1\tlocalhost\n127.0.1.1\ttenant-a\n"}
+        def read_text(path):
+            return files[str(path)]
+        def write_text(path, text):
+            files[str(path)] = text
+        def timed(*args):
+            self.assertEqual(files["/etc/resolv.conf"], "nameserver 1.1.1.1\n")
+            return (0, "", 12.0 if args[0] == "sudo" else 0.01)
+        with mock.patch.object(guest.Path, "read_text", read_text), \
+                mock.patch.object(guest.Path, "write_text", write_text), \
+                mock.patch.object(guest.socket, "gethostname", return_value="tenant-a"), \
+                mock.patch.object(guest, "timed", side_effect=timed), mock.patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "sudo -n true took 12.000 s"):
+                guest.name_service_probe()
+        self.assertEqual(files["/etc/resolv.conf"], "")
+
+    def test_guest_name_service_probe_refuses_a_vm_nameserver_or_unmapped_host_name(self):
+        guest = q.module("guest_vm_nameserver", q.HERE / "guest/hosted_qualify.py")
+        for files, message in (
+                ({"/etc/resolv.conf": "nameserver 1.1.1.1\n", "/etc/hosts": "127.0.1.1\ttenant-a\n"}, "names resolvers"),
+                ({"/etc/resolv.conf": "", "/etc/hosts": "127.0.1.1\tmotor-tenant\n"}, "does not map")):
+            with mock.patch.object(guest.Path, "read_text", lambda path, files=files: files[str(path)]), \
+                    mock.patch.object(guest.socket, "gethostname", return_value="tenant-a"), \
+                    mock.patch.object(guest, "timed", side_effect=AssertionError("probe ran")), \
+                    mock.patch("builtins.print"):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    guest.name_service_probe()
+
     def test_normal_image_does_not_install_or_want_qualification_unit(self):
         installer = q.module("qualification_install_policy", q.HERE / "install-guest.py")
         with tempfile.TemporaryDirectory() as tmp:

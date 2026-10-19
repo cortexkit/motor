@@ -14,10 +14,7 @@ const IP: &str = "/usr/sbin/ip";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
 fn sudo(path: &str, args: &[&str]) -> io::Result<String> {
-    let output = Command::new("/usr/bin/sudo")
-        .args(["-n", path])
-        .args(args)
-        .output()?;
+    let output = crate::privilege::command(path).args(args).output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "network {path} {}: {} ({})",
@@ -36,9 +33,14 @@ pub(crate) fn probe() -> io::Result<()> {
     }
     // Permission queries never execute the mutating probe commands. Keep the
     // shared inventory in sync with attach and cleanup, including namespace entry.
-    let commands: Vec<Vec<String>> = serde_json::from_str(include_str!(
-        "../../../script/runner/network-sudo-probes.json"
-    ))?;
+    // A root runner that runs its helpers directly has no grants to query.
+    let commands: Vec<Vec<String>> = if crate::privilege::uses_sudo() {
+        serde_json::from_str(include_str!(
+            "../../../script/runner/network-sudo-probes.json"
+        ))?
+    } else {
+        Vec::new()
+    };
     for command in commands {
         let output = Command::new("/usr/bin/sudo")
             .args(["-n", "-l"])

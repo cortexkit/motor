@@ -142,6 +142,12 @@ async fn main() -> io::Result<()> {
             if let Err(error) = motor_protocol::logging::init(LOG_PREFIX) {
                 eprintln!("{LOG_PREFIX} logging unavailable: {error}");
             }
+            // A tenant runner is root inside its own VM; its privileged helpers
+            // run directly, starting with the ones Runner::open itself needs.
+            #[cfg(target_os = "linux")]
+            if config.tenant_vm {
+                motor_runner::run_helpers_directly_as_root()?;
+            }
             let runner = Runner::open(config)?;
             #[cfg(unix)]
             {

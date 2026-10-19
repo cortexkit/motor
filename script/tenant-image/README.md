@@ -316,10 +316,19 @@ The systemd debug generator receives `motor-qualification.service` as a binary
 kernel credential and wants it only on this boot. Its kernel-command-line
 condition is a second opt-in fence. A boot-only drop-in sends the existing image
 check directly to ttyS0, avoiding journald prefixes on exact evidence lines.
-The unit waits for real tenant attachment, runs `hosted_image_check.py --tenant`
-and the delivered `isolation::tests::hosted_job_cannot_open_vsock --ignored
---exact` test as root, and later checks for failed guest units. There is no
+The unit waits for real tenant attachment, runs `hosted_image_check.py --tenant`,
+the name-service probe below, and the delivered
+`isolation::tests::hosted_job_cannot_open_vsock --ignored --exact` test as
+root, and later checks for failed guest units. There is no
 privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
+
+The name-service probe checks what once stalled tenant runner startup. Attach
+must not give the VM itself a nameserver (only `net` jobs get resolvers, inside
+their own namespaces), and `/etc/hosts` must map the tenant host name, because
+sudo looks that name up. With `nameserver 1.1.1.1`, which the VM cannot reach,
+temporarily in place, `getent ahosts <hostname>` and `sudo -n true` must each
+finish within 3 s. The runner unit's start to the attach completion marker must
+take under 10 s. The step passes only on the exact `NAME_SERVICE` line.
 
 The harness copies `motor-vm-helper`, `motor-host` and `motor-fake-broker` into
 a fresh root-owned mode-0755 bin directory before invoking them. Its helper config is root-owned mode 0600.
@@ -379,7 +388,11 @@ Base boot retries only transport failures before the initial `CONNECT 54`
 handshake completes, for at most 60 seconds. Host guest-control diagnostics name
 the tenant operation, request/reply stage, blocking-fd status and elapsed read
 budget; a blocking attach read deadline is described as initialization waiting
-for runner readiness, not bare EAGAIN. The boot-only qualification payload also
+for runner readiness, not bare EAGAIN. The host's fresh-attach read deadline is
+`motor_protocol::TENANT_ATTACH_READ_DEADLINE`, derived from the guest's
+`TENANT_RUNNER_READINESS_WAIT` plus a setup margin, so the guest's own
+"timed out waiting for runner readiness" error arrives before the host gives up.
+The boot-only qualification payload also
 prints bounded runner-unit journal/MainPID/socket-peer snapshots during startup,
 and forwards the transient runner's own output to the console. These are
 diagnostics, not a substitute for the existing PID-bound readiness check.

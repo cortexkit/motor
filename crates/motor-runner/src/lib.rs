@@ -10,6 +10,9 @@ mod engine;
 mod isolation;
 pub mod network;
 mod platform;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod privilege;
 mod return_paths;
 mod server;
 mod spool;
@@ -35,6 +38,8 @@ pub use writer::CacheFill;
 
 pub use backend::BackendKind;
 pub use engine::{Config, Runner, DEFAULT_FREE_SPACE_FLOOR_BYTES};
+#[cfg(target_os = "linux")]
+pub use privilege::run_helpers_directly_as_root;
 pub use server::serve;
 pub use storage::{JobState, REPLAY_BYTES, RETENTION_MS};
 #[cfg(target_os = "linux")]
