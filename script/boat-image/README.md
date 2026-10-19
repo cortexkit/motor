@@ -44,8 +44,9 @@ or ioctl failure aborts installation rather than changing copy semantics.
 
 This keeps the server's reflink contract and cache behavior unchanged; a copy
 fallback would broaden runner semantics and hide unsupported storage. The live
-runner-host run (below) installed and used this volume for real jobs in all three
-phases. Sparse
+runner-host run (below) installed and used this volume for real jobs on the
+original sandbox, on a clone created from its snapshot, and on that clone after
+stop/resume. Sparse
 capacity reserves no outer ext4 space: monitor **both** filesystems' free space.
 The snapshot probe drains/stops the daemon, syncs, and unmounts `/Users` and XFS
 before saving the disk snapshot; it never snapshots a live loop filesystem and
