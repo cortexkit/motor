@@ -12,20 +12,19 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
-import ipaddress
 import json
 import os
 from pathlib import Path
 import shlex
 import signal
-import socket
-import ssl
 import statistics
 import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
+
+from reach import tcp_probe
 
 API = "https://boat.dev/api/v1"
 READY = {"ready", "idle", "running"}
@@ -145,34 +144,6 @@ def save(path, data, key=""):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-
-
-def tcp_probe(address, port, certificate, timeout=4):
-    start = time.monotonic()
-    result = {"address": address, "port": port, "tls": True}
-    try:
-        ipaddress.ip_address(address)
-        context = ssl.create_default_context(cadata=certificate)
-        context.check_hostname = False
-        challenge = (uuid.uuid4().hex + "\n").encode()
-        with socket.create_connection((address, port), timeout=timeout) as raw:
-            result["tcp_seconds"] = time.monotonic() - start
-            with context.wrap_socket(raw, server_hostname="boat-probe") as stream:
-                result["tls_seconds"] = time.monotonic() - start
-                stream.sendall(challenge)
-                received = b""
-                expected = b"boat-probe:" + challenge
-                while len(received) < len(expected):
-                    chunk = stream.recv(256)
-                    if not chunk:
-                        break
-                    received += chunk
-                result["verified_echo"] = received == expected
-                result["tls_version"] = stream.version()
-    except (OSError, ValueError) as error:
-        result["error"] = str(error)
-    result["seconds"] = time.monotonic() - start
-    return result
 
 
 class Probe:
@@ -395,10 +366,16 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                     for _ in range(30):
                         response = client.request("GET", "/deletion-operations/" + operation)
                         event["operation"] = response["operation"]
+                        resource["deletion_state"] = response["operation"]
                         if response["operation"]["status"] == "completed":
                             resource["deleted"] = True
                             break
+                        if response["operation"].get("stage") == "waiting_for_uploads":
+                            event["purge_pending"] = True
+                            break
                         pause(2)
+                    if event.get("purge_pending"):
+                        break
                     if not resource.get("deleted"):
                         raise ProbeError("deletion accepted but not completed; retry --cleanup")
                 else:
@@ -429,14 +406,14 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                 checkpoint()
             if attempt + 1 < attempts:
                 pause(2)
-        if not resource.get("deleted") and resource["kind"] == "sandbox":
+        if not resource.get("deleted") and resource["kind"] == "sandbox" and not resource.get("deletion_operation"):
             try:
                 resource["fallback_stop"] = client.request("POST", path + "/stop", {})
             except Exception as error:
                 resource["fallback_stop_error"] = str(error)
     data["cleanup_complete"] = not data["pending_creates"] and all(r.get("deleted") for r in data["resources"])
     data["cleanup_summary"] = ("All created sandboxes and named snapshots deleted." if data["cleanup_complete"] else
-                               "CLEANUP INCOMPLETE: retry --cleanup with delete scope; archived is not deleted.")
+                               "CLEANUP INCOMPLETE: inspect API errors/deletion operations; an accepted deletion may await upload URL expiry.")
     checkpoint()
 
 
@@ -482,6 +459,10 @@ This is an environment probe, not a motor-runner token-enforcement test.
 
 {{cleanup_summary}}
 
+## SSH-focused checks
+
+{{ssh_table}}
+
 ## Operator conclusion (fill only from returned evidence)
 
 - Can the existing systemd job sandbox run unchanged? **Unassessed.**
@@ -508,13 +489,33 @@ def render(data, path):
                                                 for c in data.get("toolchain_cycles", [])])]
     rows = ["| Measurement | Seconds |", "| --- | --- |"]
     rows.extend(f"| {name} | {display(value)} |" for name, value in timing)
-    cleanup_rows = ["| Resource | Deleted | Boat usage (seconds / dollars) |", "| --- | --- | --- |"]
+    cleanup_rows = ["| Resource | Fully purged | Deletion status / stage / expectedBy | Boat usage (seconds / dollars) |",
+                    "| --- | --- | --- | --- |"]
+    purge_pending = False
     for r in data.get("resources", []):
         usage = r.get("usage", {})
+        operation = r.get("deletion_state", {})
+        if not operation:
+            operation = next((event["operation"] for event in reversed(data.get("cleanup", []))
+                              if event.get("id") == r["id"] and "operation" in event), {})
+        purge_pending |= operation.get("stage") == "waiting_for_uploads" and not r.get("deleted", False)
         cleanup_rows.append(f"| {r['kind']} {r['id']} | {display(r.get('deleted', False))} | "
+                            f"{display([operation.get('status'), operation.get('stage'), operation.get('expectedBy')])} | "
                             f"{display([usage.get('seconds'), usage.get('dollars')])} |")
     fields = {name: display(data.get(name, "unmeasured")) for name in
               ("run_id", "started_at", "finished_at", "measurements_complete", "error", "cleanup_summary")}
+    fields["error"] = display(data["error"]) if data.get("error") is not None else "none recorded"
+    if purge_pending:
+        fields["cleanup_summary"] = "Deletion accepted; final data purge awaits upload URL expiry (see expectedBy above)."
+    ssh = data.get("ssh_reach")
+    fields["ssh_table"] = "Not requested."
+    if ssh:
+        ssh_rows = ["| Step | Result | Seconds to result / echo |", "| --- | --- | --- |"]
+        for check in ssh.get("checks", []):
+            evidence = check["evidence"]
+            elapsed = evidence.get("seconds_to_echo", evidence.get("seconds"))
+            ssh_rows.append(f"| {check['name']} | {check['status']} | {display(elapsed)} |")
+        fields["ssh_table"] = "\n".join(ssh_rows) + "\n\nFull evidence: `ssh_reach.checks` and `ssh_reach.phases`."
     fields.update(timing_table="\n".join(rows), cleanup_table="\n".join(cleanup_rows),
                   toolchain_bytes=display(data.get("toolchain", {}).get("installed_bytes", "unmeasured")),
                   few_gb=display(data.get("toolchain", {}).get("few_gb_installed", "unmeasured")),
@@ -550,6 +551,7 @@ def main():
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
+    parser.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
     args = parser.parse_args()
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
@@ -575,7 +577,12 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     try:
         if not args.cleanup:
-            Probe(client, data, checkpoint, minutes=args.max_minutes).run()
+            runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
+            if args.ssh_reach:
+                from ssh_reach import SSHReach
+                SSHReach(runner).run()
+            else:
+                runner.run()
             data["measurements_complete"] = True
     except (Exception, KeyboardInterrupt) as error:
         data["error"] = scrub(str(error), key)
@@ -590,7 +597,8 @@ def main():
     print(json.dumps(scrub(data, key), indent=2))
     if args.cleanup:
         return 0 if data.get("cleanup_complete") else 1
-    return 0 if data.get("measurements_complete") and data.get("cleanup_complete") and not data.get("error") else 1
+    return 0 if (data.get("measurements_complete") and data.get("cleanup_complete") and not data.get("error") and
+                 data.get("ssh_reach", {}).get("all_passed", True)) else 1
 
 
 if __name__ == "__main__":

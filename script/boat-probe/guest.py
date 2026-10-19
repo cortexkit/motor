@@ -124,10 +124,11 @@ def inspect(base):
 SERVER = r'''
 import pathlib, socket, ssl, sys
 base, port = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+loopback = sys.argv[3] == 'loopback'
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(base / 'cert.pem', base / 'key.pem')
-dual = socket.has_dualstack_ipv6()
-with socket.create_server(('::' if dual else '0.0.0.0', port),
+dual = socket.has_dualstack_ipv6() and not loopback
+with socket.create_server(('127.0.0.1' if loopback else '::' if dual else '0.0.0.0', port),
                           family=socket.AF_INET6 if dual else socket.AF_INET,
                           dualstack_ipv6=dual, backlog=16) as listener:
     while True:
@@ -147,7 +148,7 @@ with socket.create_server(('::' if dual else '0.0.0.0', port),
 '''
 
 
-def listener(base, port):
+def listener(base, port, loopback=False):
     import socket
     import ssl
     if not (base / "cert.pem").exists():
@@ -172,14 +173,19 @@ def listener(base, port):
 
     if not healthy():
         with (base / "server.log").open("ab") as log:
-            process = subprocess.Popen([sys.executable, str(base / "server.py"), str(base), str(port)],
+            process = subprocess.Popen([sys.executable, str(base / "server.py"), str(base), str(port), "loopback" if loopback else "public"],
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                        start_new_session=True)
         (base / "server.pid").write_text(str(process.pid))
         until = time.monotonic() + 10
         while time.monotonic() < until and not healthy():
             time.sleep(0.1)
+    sockets = command(["ss", "-H", "-ltnp", "sport", "=", ":" + str(port)])
+    addresses = [line.split()[3] for line in sockets.get("stdout", "").splitlines()
+                 if len(line.split()) >= 4 and line.split()[0] == "LISTEN"]
     return {"ready": healthy(), "pid": (base / "server.pid").read_text(),
+            "bind_address": "127.0.0.1" if loopback else "dual-stack" if socket.has_dualstack_ipv6() else "0.0.0.0",
+            "listening_sockets": sockets, "listening_addresses": addresses,
             "certificate_pem": (base / "cert.pem").read_text(),
             "server_log": (base / "server.log").read_text()}
 
@@ -237,15 +243,15 @@ def toolchain_check(base):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("inspect", "listener", "persistence", "toolchain-install", "toolchain", "toolchain-check", "firewall-read", "firewall-open"))
+    parser.add_argument("phase", choices=("inspect", "listener", "listener-loopback", "persistence", "toolchain-install", "toolchain", "toolchain-check", "firewall-read", "firewall-open"))
     parser.add_argument("base", type=Path)
     parser.add_argument("--port", type=int, default=9443)
     parser.add_argument("--toolchain-version", choices=("1.85.1", "1.86.0", "1.87.0"), default="1.85.1")
     args = parser.parse_args()
     args.base = args.base.resolve()
     args.base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if args.phase == "listener":
-        out = listener(args.base, args.port)
+    if args.phase in {"listener", "listener-loopback"}:
+        out = listener(args.base, args.port, args.phase == "listener-loopback")
     elif args.phase == "toolchain-install":
         out = toolchain_install(args.base, args.toolchain_version)
     elif args.phase.startswith("firewall-"):

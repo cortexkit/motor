@@ -8,15 +8,22 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("boat_probe", HERE / "probe.py")
 if spec is None or spec.loader is None:
     raise ImportError("cannot load the Boat probe beside its tests")
 probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(probe)
+sys.path.insert(0, str(HERE))
+try:
+    spec.loader.exec_module(probe)
+    import ssh_reach
+finally:
+    sys.path.pop(0)
+reach = sys.modules["reach"]
 
 
 def evidence(resources=()):
@@ -136,6 +143,48 @@ class ParsingTests(unittest.TestCase):
             self.assertIn("unmeasured", text)
             self.assertIn("**Unassessed.**", text)
             self.assertNotIn("{{", text)
+            self.assertIn("Error: none recorded", text)
+
+
+    def test_render_explains_pending_purge_from_an_older_checkpoint(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789", "deletion_operation": "bdop_test"}])
+        data["cleanup"] = [{"id": "bx_23456789", "operation":
+                            {"status": "blocked", "stage": "waiting_for_uploads", "expectedBy": "2026-10-19T19:00:00Z"}}]
+        data["cleanup_summary"] = "retry --cleanup with delete scope"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.md"
+            probe.render(data, path)
+            text = path.read_text()
+        self.assertIn("Deletion accepted; final data purge awaits upload URL expiry", text)
+        self.assertIn("2026-10-19T19:00:00Z", text)
+        self.assertNotIn("with delete scope", text)
+
+
+    def test_standalone_reach_verifies_exact_echo_over_tls(self):
+        context, raw, stream = MagicMock(), MagicMock(), MagicMock()
+        raw.__enter__.return_value = raw
+        context.wrap_socket.return_value.__enter__.return_value = stream
+        stream.recv.side_effect = [b"boat-probe:", b"challenge\n"]
+        stream.version.return_value = "TLSv1.3"
+        with patch.object(reach.ssl, "create_default_context", return_value=context), \
+             patch.object(reach.socket, "create_connection", return_value=raw) as connect, \
+             patch.object(reach.uuid, "uuid4", return_value=type("Uuid", (), {"hex": "challenge"})()):
+            result = reach.tcp_probe("2001:db8::2", 9443, "PUBLIC CERT")
+        self.assertTrue(result["verified_echo"])
+        self.assertEqual(result["tls_version"], "TLSv1.3")
+        connect.assert_called_once_with(("2001:db8::2", 9443), timeout=4)
+        stream.sendall.assert_called_once_with(b"challenge\n")
+
+    def test_standalone_reach_rejects_wrong_echo(self):
+        context, raw, stream = MagicMock(), MagicMock(), MagicMock()
+        raw.__enter__.return_value = raw
+        context.wrap_socket.return_value.__enter__.return_value = stream
+        stream.recv.side_effect = [b"wrong\n", b""]
+        with patch.object(reach.ssl, "create_default_context", return_value=context), \
+             patch.object(reach.socket, "create_connection", return_value=raw):
+            result = reach.tcp_probe("2001:db8::2", 9443, "PUBLIC CERT")
+        self.assertFalse(result["verified_echo"])
+
 
 
 class CleanupTests(unittest.TestCase):
@@ -183,6 +232,20 @@ class CleanupTests(unittest.TestCase):
         probe.cleanup(client, data, lambda: None, attempts=1, pause=lambda _: None)
         self.assertFalse(data["cleanup_complete"])
         self.assertFalse(any(call[0] == "DELETE" for call in client.calls))
+
+    def test_waiting_for_uploads_is_pending_purge_not_missing_delete_scope(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789", "usage": {}}])
+        operation = deleting("processing")
+        operation["operation"].update(stage="waiting_for_uploads", expectedBy="2026-10-19T19:00:00Z")
+        client = FakeClient({("DELETE", "/sandboxes/bx_23456789"): operation,
+                             ("GET", "/deletion-operations/bdop_test"): operation})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertFalse(data["cleanup_complete"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(data["resources"][0]["deletion_state"]["stage"], "waiting_for_uploads")
+        self.assertNotIn("fallback_stop", data["resources"][0])
+        self.assertIn("upload URL expiry", data["cleanup_summary"])
+        self.assertNotIn("with delete scope", data["cleanup_summary"])
 
     def test_lost_create_response_recovers_same_idempotency_key_and_body(self):
         data = evidence()
@@ -244,6 +307,115 @@ class CleanupTests(unittest.TestCase):
             self.assertNotIn("boat_NOT_REAL", output.getvalue())
             self.assertTrue(json.loads(output.getvalue())["cleanup_complete"])
             self.assertNotIn("boat_NOT_REAL", (destination / "results.md").read_text())
+
+
+class SSHTests(unittest.TestCase):
+    def test_ipv4_ssh_endpoint_wins_over_ipv6_machine_ip(self):
+        route = ssh_reach.endpoint({"sshEndpoint": "192.0.2.3:22001", "machineIp": "2001:db8::2"})
+        self.assertEqual((route["host"], route["port"], route["family"]), ("192.0.2.3", 22001, 4))
+        self.assertEqual(ssh_reach.endpoint({"machineIp": "192.0.2.4"})["port"], 22)
+
+    def test_api_host_key_is_only_trust_anchor_and_ssh_never_uses_tofu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "known_hosts"
+            ssh_reach.pin_host(path, "bx_23456789", {"hostKey": "ssh-ed25519 dGVzdC1rZXk="})
+            self.assertEqual(path.read_text(), "bx_23456789 ssh-ed25519 dGVzdC1rZXk=\n")
+            argv = ssh_reach.ssh_argv({"host": "192.0.2.3", "port": 22001}, Path(tmp) / "key", path, "bx_23456789")
+        for option in ("StrictHostKeyChecking=yes", "GlobalKnownHostsFile=/dev/null", "UpdateHostKeys=no",
+                       "IdentityAgent=none", "IdentitiesOnly=yes", "ControlPath=none"):
+            self.assertIn(option, argv)
+        self.assertIn("UserKnownHostsFile=" + str(path), argv)
+        self.assertIn("HostKeyAlias=bx_23456789", argv)
+        self.assertIn("-4", argv)
+        self.assertNotIn("accept-new", " ".join(argv))
+
+    def test_missing_or_multiline_host_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for key in ("", "ssh-ed25519 dGVzdA==\nother injected", "unknown dGVzdA=="):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    ssh_reach.pin_host(Path(tmp) / "known_hosts", "bx_23456789", {"hostKey": key})
+
+    def test_refusal_requires_authenticated_connection_and_no_command_marker(self):
+        auth = 'Authenticated to host using "publickey".\n'
+        self.assertTrue(ssh_reach.refused({"exit_code": 1, "stderr": auth, "stdout": ""}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": "Permission denied (publickey)."}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": auth + "Connection reset"}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 0, "stderr": auth, "stdout": "marker"}, "marker"))
+
+    def test_allowed_command_is_reported_fail_for_forward_only_requirement(self):
+        runner = type("Runner", (), {"data": {"run_id": "unit"}, "checkpoint": lambda self: None})()
+        measurement = ssh_reach.SSHReach(runner)
+        result = {"exit_code": 0, "stdout": "boat-ssh-unit\n", "stderr": 'Authenticated to host using "publickey".'}
+        with patch.object(ssh_reach, "process", return_value=result):
+            measurement.connection(["ssh", "user@192.0.2.3"], "restricted.command_refused", refuse=True)
+        self.assertEqual(measurement.data["checks"][0]["status"], "FAIL")
+
+    def test_restrict_rewrites_only_tested_key_and_removes_its_unrestricted_duplicates(self):
+        public = "ssh-ed25519 dGVzdC1rZXk= tested"
+        unrelated = "ssh-ed25519 b3RoZXIta2V5 unrelated"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".ssh/authorized_keys"
+            path.parent.mkdir()
+            path.write_text(public + "\n" + unrelated + "\n" + public + "\n")
+            environment = dict(os.environ, HOME=tmp)
+            result = ssh_reach.subprocess.run([sys.executable, "-c", ssh_reach.AUTHORIZED_KEYS, public, "restrict",
+                                              'restrict,port-forwarding,permitopen="127.0.0.1:9443"'],
+                                             capture_output=True, text=True, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            expected = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+            self.assertEqual(observed["after"], [expected])
+            self.assertEqual(path.read_text().splitlines(), [unrelated, expected])
+
+    def test_tunnel_uses_no_session_channel_and_reaps_local_ssh(self):
+        child = MagicMock()
+        child.poll.return_value = None
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(ssh_reach.subprocess, "Popen", return_value=child) as launch, \
+             patch.object(ssh_reach, "tcp_probe", return_value={"verified_echo": True}):
+            result = ssh_reach.forward(["ssh", "-4", "user@192.0.2.3"], "PUBLIC CERT", Path(tmp))
+        argv = launch.call_args.args[0]
+        self.assertIn("-N", argv)
+        self.assertIn("-L", argv)
+        self.assertTrue(any(part.endswith(":127.0.0.1:9443") for part in argv))
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once()
+        self.assertTrue(result["verified_echo"])
+        self.assertTrue(result["tunnel_process_reaped"])
+
+    def test_private_api_credential_not_in_local_ssh_environment(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+        with patch.dict(os.environ, {"BOAT_API_KEY": "not-for-ssh"}), \
+             patch.object(ssh_reach.subprocess, "run", return_value=completed) as run:
+            ssh_reach.process(["ssh", "-V"])
+        self.assertNotIn("BOAT_API_KEY", run.call_args.kwargs["env"])
+
+    def test_resume_refresh_does_not_reauthorize_tested_key_before_persistence_checks(self):
+        runner = MagicMock()
+        runner.data = {"run_id": "unit"}
+        runner.create.return_value = ({"id": "bx_23456789", "vcpu": 8, "memoryGB": 16}, {})
+        measurement = ssh_reach.SSHReach(runner)
+        public = "ssh-ed25519 dGVzdA== tested"
+        witness_public = "ssh-ed25519 d2l0bmVzcw== witness"
+        restricted = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+        def generated(argv, **kwargs):
+            if argv[0] == "ssh-keygen":
+                path = Path(argv[-1])
+                path.write_text("not-a-real-private-key")
+                path.with_suffix(".pub").write_text(public if path.name.startswith("probe") else witness_public)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+        response = {"hostKey": "ssh-ed25519 dGVzdA==", "sshEndpoint": "192.0.2.3:22001", "machineIp": "2001:db8::2"}
+        with patch.object(ssh_reach, "process", side_effect=generated), \
+             patch.object(measurement, "authorize", return_value=response) as authorize, \
+             patch.object(measurement, "phase") as phase, patch.object(measurement, "resume"), \
+             patch.object(measurement, "key_lines", side_effect=[{"matching_keys": 1, "after": [public]},
+                                                               {"after": [restricted]}, {"after": [restricted]}]):
+            measurement.run()
+        self.assertEqual([call.args[1] for call in authorize.call_args_list],
+                         [public, witness_public, public, witness_public])
+        self.assertEqual([call.args[1] for call in phase.call_args_list],
+                         ["initial", "old_key_before_reauthorize", "reauthorized", "restricted", "restricted_after_resume"])
+        self.assertTrue(measurement.data["local_private_keys_removed"])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,56 @@ exec, stop, resume, **delete/delete-own**, snapshot read/write, and provider usa
 access. An archive/stop-only key is not sufficient. No vault enrollment is created
 by this probe; the operator supplies their existing authorized reader.
 
+### SSH reachability from an IPv4-only Mac
+
+`--ssh-reach` is a separate focused mode; it also requires local `ssh` and
+`ssh-keygen`, and the Boat key's `ssh` action:
+
+```sh
+<key reader> | python3 script/boat-probe/probe.py --key-stdin --ssh-reach \
+  --output .cortexkit/internal-docs/research/boat-ssh --max-minutes 10
+```
+
+It creates one fresh `large`, generates throwaway Ed25519 tested/witness keys in
+an owner-only temporary directory, and authorizes only their public keys through
+`POST /sandboxes/{id}/sshkey`. It records `sshEndpoint` versus `machineIp`, prefers
+the returned endpoint, and forces an IPv4 SSH connection. Known-hosts contains
+only the API-returned host key. `StrictHostKeyChecking=yes`, a private known-hosts
+file and alias, no global known-hosts, no DNS trust, no updates, no agent, no
+password fallback and no multiplexing prevent TOFU or an old session from masking
+a failure.
+
+The mode separately measures an SSH command and a **loopback-only** TLS echo
+service reached through `ssh -N -L` to `127.0.0.1:9443`. It does not open 9443 in
+UFW or expose the TLS service publicly. It stops/resumes twice, records host-key
+and endpoint changes, tests the old private key before reauthorizing that tested
+key, then writes exactly
+`restrict,port-forwarding,permitopen="127.0.0.1:9443"` on its authorized_keys line.
+It tests command refusal, shell refusal and allowed forwarding independently,
+then resumes and tests the same restriction again.
+
+The shell test requests a shell without a PTY: refusal to allocate a PTY alone
+does not establish shell refusal. Restriction persistence compares the exact
+tested line and reports normalization/whitespace changes as FAIL with the raw
+before/after lines for inspection.
+
+A different throwaway witness public key obtains the refreshed host key after
+resume. Reinstalling the tested key before checking persistence could normalize
+its options and invalidate the test, so that never happens during the restricted
+resume check. The script preserves all unrelated authorized_keys lines and
+collapses duplicate lines only for its own tested key. The private keys are never
+logged and are removed locally; each local SSH tunnel is terminated and reaped.
+
+Every check has PASS/FAIL plus raw evidence under `ssh_reach`. An authentication
+or route failure does not count as successful shell refusal. OpenSSH's `restrict`
+option does not itself forbid command execution; the mode measures the requested
+combination rather than assuming it creates a forwarding-only login or silently
+adding a forced command. Negative capability findings are FAIL, not a rewritten
+expectation. Overall exit also remains nonzero while final data purge is pending.
+Allow roughly **3–8 large-sandbox minutes**, plus asynchronous purge latency; this
+is an estimate, not a measured SSH result. No toolchain or named snapshot is
+created in this mode. Boat SSH reference: <https://docs.boat.dev/ssh-access>.
+
 The output directory must not exist. It contains an owner-only `results.json`
 checkpoint and a rendered `results.md`; the same JSON is printed to stdout after
 cleanup. Keep evidence under ignored `.cortexkit/internal-docs/`, outside build
@@ -92,9 +142,14 @@ after 23 hours). Snapshot names are unique and checkpointed before saving.
 
 Sandbox deletion sends the required `X-Ascii-Confirm-Delete` header and polls the
 returned deletion operation. A 202 or an archived/hidden sandbox is **not** marked
-clean. Pending/blocked deletion, missing delete scope or a snapshot save still in
-flight is printed as incomplete and exits nonzero; fallback stop is attempted to
-limit spend. Re-run immediately with a suitably scoped key:
+fully purged. Pending/blocked deletion, missing delete scope or a snapshot save
+still in flight is printed as incomplete and exits nonzero. A deletion operation
+at `waiting_for_uploads` means deletion was authorized and accepted, but stored
+data awaits expiry of existing upload URLs (`expectedBy`); a different key scope
+does not accelerate it. The harness reports this state without several minutes
+of redundant polling. It attempts fallback stop only when no deletion operation
+was accepted. Retry after the operation's reported `expectedBy`, or immediately
+after correcting an actual permission error:
 
 ```sh
 <key reader> | python3 script/boat-probe/probe.py --key-stdin \
@@ -104,6 +159,11 @@ limit spend. Re-run immediately with a suitably scoped key:
 Recovery operates only on the checkpoint's recorded IDs/names. Treat checkpoint
 files as trusted input, not files obtained from an untrusted sandbox. A completed
 cleanup reports each resource as deleted and `cleanup_complete: true`.
+
+`Error: none recorded` in rendered findings means no measurement exception was
+caught. It does not override `cleanup_complete: false` or a failed network probe.
+Older output used `Error: "unmeasured"` for the same absent JSON `error` field;
+that was a rendering placeholder, not a provider error or an unrun measurement.
 
 ## Portable verification
 
