@@ -17,7 +17,7 @@ mod guest {
     use motor_winagent::{
         CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CACHE_MOUNT, CHUNK_BYTES, CacheAce, CacheTimings,
         Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
-        SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
+        SMBIOS_NONCE_PREFIX, Stream,
         cache::{prepare_cache, select_cache_disk, storage_serial},
         cache_has_modify_grant,
         cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
@@ -160,7 +160,7 @@ mod guest {
     }
     impl Port {
         fn open(stop: Arc<Handle>) -> io::Result<Self> {
-            let path = wide(&format!("\\\\.\\Global\\{VIRTIO_PORT_NAME}"));
+            let path = wide(&motor_winagent::transport::port_path());
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 let handle = unsafe {
@@ -176,6 +176,10 @@ mod guest {
                 };
                 match Handle::new(handle) {
                     Ok(handle) => {
+                        #[cfg(feature = "hyperv-spike")]
+                        motor_winagent::transport::configure_com(unsafe {
+                            std::os::windows::io::BorrowedHandle::borrow_raw(handle.0)
+                        })?;
                         return Ok(Self {
                             handle: Arc::new(handle),
                             stop,
@@ -341,6 +345,11 @@ mod guest {
             .map_err(|_| invalid("PowerShell output is not UTF-8"))
     }
     fn boot_nonce() -> io::Result<String> {
+        if cfg!(feature = "hyperv-spike") {
+            return motor_winagent::transport::hyperv_nonce(&std::fs::read_to_string(
+                motor_winagent::transport::HYPERV_NONCE_FILE,
+            )?);
+        }
         let strings = powershell(
             "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); (Get-CimInstance Win32_ComputerSystem).OEMStringArray",
         )?;
@@ -553,6 +562,32 @@ mod guest {
     }
     impl Cache {
         fn mount(user: &User, reporter: &CacheReporter) -> io::Result<Self> {
+            if cfg!(feature = "hyperv-spike") {
+                // This spike measures one disposable OS disk, not cache reuse.
+                // Keep the same empty-folder checks and SID-only Modify grant;
+                // C:\t and all command writes disappear with the OS overlay.
+                reporter.step(CacheStep::MountDirectory, || {
+                    motor_winagent::cache::empty_mount_directory(Path::new(CACHE_MOUNT))
+                })?;
+                let updated = reporter.step(CacheStep::FolderAcl, || {
+                    Self::grant_access(
+                        CACHE_MOUNT.trim_end_matches('\\'),
+                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                        user,
+                        true,
+                    )
+                })?;
+                return Ok(Self {
+                    volume: String::new(),
+                    clean: false,
+                    acl_updated: false,
+                    mountpoint_acl_updated: updated,
+                    timings: CacheTimings {
+                        folder_acl_updated: updated,
+                        ..Default::default()
+                    },
+                });
+            }
             let started = Instant::now();
             let number = reporter.step(CacheStep::DiskSelection, || cache_disk(reporter))?;
             let disk_selection_ms = started.elapsed().as_millis() as u64;
@@ -743,6 +778,10 @@ mod guest {
             }
         }
         fn dismount(&mut self) -> io::Result<()> {
+            if cfg!(feature = "hyperv-spike") {
+                self.clean = true;
+                return Ok(());
+            }
             let handle = self.open_volume()?;
             let mut returned = 0;
             unsafe {

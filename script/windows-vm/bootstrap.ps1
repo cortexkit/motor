@@ -7,6 +7,8 @@ $ProgressPreference = 'SilentlyContinue'
 $seed = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\bootstrap.ps1") } | Select-Object -First 1
 if (-not $seed) { throw 'Provisioning CD not found' }
 $JobBaseline = $JobBaseline -or (Test-Path "$($seed.DriveLetter):\job-baseline")
+$HyperVSpike = Test-Path "$($seed.DriveLetter):\hyperv-spike"
+if ($HyperVSpike -and -not $JobBaseline) { throw 'Hyper-V seed must be a job baseline' }
 New-Item C:\build\provision -ItemType Directory -Force | Out-Null
 Copy-Item "$($seed.DriveLetter):\*.ps1" C:\build\provision -Force
 if ($JobBaseline) {
@@ -22,14 +24,20 @@ Remove-Item C:\build\provision\FAILED.txt -Force -ErrorAction SilentlyContinue
 try {
     if ($JobBaseline) { Unregister-ScheduledTask -TaskName MotorBootstrap -Confirm:$false -ErrorAction SilentlyContinue }
     # Provisioning needs a NIC for Windows Update and official tool installers.
-    $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
-    if (-not $nic) {
-        $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf") } | Select-Object -First 1
-        if (-not $drivers) { throw 'Official virtio-win driver CD not found' }
-        & pnputil /add-driver "$($drivers.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf" /install
-        # Already-staged drivers can return a nonzero status despite a working NIC.
+    if ($HyperVSpike) {
+        # Hyper-V's synthetic NIC uses the inbox Server driver, not NetKVM.
+        $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Hyper-V*' -and $_.Status -eq 'Up' }
+        if (-not $nic) { throw 'Hyper-V provisioning network unavailable' }
+    } else {
         $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
-        if (-not $nic) { throw "VirtIO network unavailable after pnputil: $LASTEXITCODE" }
+        if (-not $nic) {
+            $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf") } | Select-Object -First 1
+            if (-not $drivers) { throw 'Official virtio-win driver CD not found' }
+            & pnputil /add-driver "$($drivers.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf" /install
+            # Already-staged drivers can return a nonzero status despite a working NIC.
+            $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
+            if (-not $nic) { throw "VirtIO network unavailable after pnputil: $LASTEXITCODE" }
+        }
     }
 
     # Clear autologon and replace the temporary setup passwords with random,
@@ -99,7 +107,7 @@ Match Group administrators
     & C:\build\provision\setup-guest.ps1 -JobBaseline:$JobBaseline
     if (-not $?) { throw 'Guest toolchain setup failed' }
     if ($JobBaseline) {
-        & C:\build\provision\setup-job-baseline.ps1
+        & C:\build\provision\setup-job-baseline.ps1 -HyperVSpike:$HyperVSpike
         if (-not $?) { throw 'Job baseline setup failed' }
         foreach ($option in @('/dlv', '/xpr')) {
             & cscript.exe //nologo C:\Windows\System32\slmgr.vbs $option
