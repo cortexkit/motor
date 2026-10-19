@@ -326,6 +326,9 @@ def main():
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
     for binary in ('motor-runner', 'motor-host'):
         run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)
+    run('install', '-o', 'root', '-g', 'root', '-m', '0755', '/srv/build/target/release/motor-runner',
+        '/usr/local/libexec/motor-runner-permissions')
+    run('/usr/local/bin/motor-runner', 'check-permissions-helper')
     configure(pins)
     # Starting motor-boat.service checks its configured flags and socket readiness without a job.
     service_preflight()

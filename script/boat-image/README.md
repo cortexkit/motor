@@ -152,6 +152,20 @@ disposable clone. Never expose it as a production endpoint.
 
 ## Disk budget
 
+Recursive mode repair is implemented by the runner's native `physical-chmod`
+operation, not by a version-dependent coreutils `chmod -P`. It pins every root
+and ancestor with `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)`, opens children with
+`O_NOFOLLOW`, skips symlink inodes by `fstat`, and changes modes through pinned
+descriptors. The kernel-owned `/proc/self/fd` link is used for `fchmodat` so FIFO,
+socket and device inodes need not be opened for I/O; it never resolves a
+job-controlled symlink. Trusted sudo invokes the fixed root0755 copy at
+`/usr/local/libexec/motor-runner-permissions`, never a caller-selected executable.
+The fleet's narrow operator-only sudo template and administrator installer are
+under `script/runner/`; deploy refuses a new candidate until helper ownership,
+code digest and both exact command forms are valid. Boat runs the trusted unit
+as root and installs that same fixed helper, without granting jobs sudo. No
+setuid helper or shell command is delegated.
+
 The Boat unit explicitly sets a **24 GiB admission floor** and **32 GiB soft
 eviction goal**; neither is inferred from the provider label or filesystem size.
 An operator-reported cold Cargo build used about 20 GiB, so 24 GiB reserves that

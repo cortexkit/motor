@@ -370,9 +370,7 @@ fn private_writer_tree(path: &Path, account: WriterAccount) {
     )
     .unwrap();
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .arg(path),
+        &mut crate::permissions::command(crate::permissions::Policy::Private, &[path]).unwrap(),
     )
     .unwrap();
 }

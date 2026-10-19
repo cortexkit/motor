@@ -1240,11 +1240,10 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
             ])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
-            .arg(path),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::OwnerWrite,
+        &[path],
+    )?)?;
     fs::create_dir_all(marker.parent().unwrap())?;
     fs::write(marker, identity)?;
     Ok(())
@@ -1384,11 +1383,10 @@ fn prepare_job_home(path: &Path) -> io::Result<()> {
             ])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .arg(path),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::Private,
+        &[path],
+    )?)?;
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/chmod", "0700", "--"])
@@ -1455,11 +1453,10 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
             .args(["-n", "/usr/bin/chown", "-R", "-P", &owner, "--"])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
-            .arg(path),
-    )
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::OwnerWrite,
+        &[path],
+    )?)
 }
 
 pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
@@ -1512,11 +1509,10 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
             .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
             .args(paths),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .args(paths),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::Private,
+        paths,
+    )?)?;
     Ok(())
 }
 

@@ -22,6 +22,14 @@ fi
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 test -x "$candidate"
 "$candidate" --version
+if helper_api=$("$candidate" permission-helper-digest 2>&1); then
+  "$candidate" check-permissions-helper
+else
+  case "$helper_api" in
+    *'usage: motor-runner serve|connect'*) ;; # Older candidates do not use this helper.
+    *) printf '%s\n' "$helper_api" >&2; echo 'Candidate helper capability probe failed' >&2; exit 1;;
+  esac
+fi
 # Stage without touching the executable inode of the currently serving daemon.
 install -m 755 "$candidate" "$live.new"
 admission_held=false

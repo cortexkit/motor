@@ -12,6 +12,19 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|arg| arg == "physical-chmod") {
+        return motor_runner::physical_chmod(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args == ["permission-helper-digest"] {
+        println!("{}", motor_runner::permission_helper_digest());
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args == ["check-permissions-helper"] {
+        return motor_runner::check_permissions_helper();
+    }
+    #[cfg(target_os = "linux")]
     if args.first().is_some_and(|arg| arg == "tenant-agent") {
         if args.len() != 1 {
             return Err(io::Error::other("tenant-agent takes no arguments"));

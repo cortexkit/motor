@@ -1,5 +1,6 @@
 """Run with python3 -m unittest -v script/runner/test_deploy.py."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -7,11 +8,34 @@ import tempfile
 import unittest
 
 DEPLOY = Path(__file__).with_name("deploy.sh").resolve()
+policy_spec = importlib.util.spec_from_file_location('runner_permissions_policy', DEPLOY.with_name('permissions_policy.py'))
+if policy_spec is None or policy_spec.loader is None:
+    raise ImportError('cannot load permissions sudo policy renderer')
+policy = importlib.util.module_from_spec(policy_spec)
+policy_spec.loader.exec_module(policy)
+
+
+class PermissionsPolicyTests(unittest.TestCase):
+    def test_only_fixed_native_operations_are_granted_to_the_trusted_operator(self):
+        template = DEPLOY.with_name('permissions-helper.sudoers').read_text()
+        accounts = {'ubuntu':1000,'motor-job':997,'motor-cache':996,'alias':997,'root':0}
+        rendered = policy.render(template, 'ubuntu', accounts.__getitem__)
+        row = next(line for line in rendered.splitlines() if 'NOPASSWD:' in line)
+        self.assertEqual(row.split('NOPASSWD: ',1)[1].split(', '), [
+            '/usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *',
+            '/usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *'])
+        for operator in ('motor-job','motor-cache','alias','root','ubuntu\nALL=(ALL) ALL'):
+            with self.subTest(operator=operator), self.assertRaises(ValueError):
+                policy.render(template, operator, accounts.__getitem__)
+        with self.assertRaises(ValueError):
+            policy.render(template.replace('physical-chmod owner-rwX', 'serve'), 'ubuntu', accounts.__getitem__)
+        with self.assertRaises(ValueError):
+            policy.render(template + '\n#include /tmp/untrusted\n', 'ubuntu', accounts.__getitem__)
 
 
 class DeployTests(unittest.TestCase):
     def run_deploy(self, job, *, resume=True, drain="timeout", fail_start=False,
-                    instance="main", default_state_root=False, decoys=False, drain_timeout=None):
+                    instance="main", default_state_root=False, decoys=False, drain_timeout=None, helper_valid=True):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
@@ -20,6 +44,7 @@ class DeployTests(unittest.TestCase):
                           else root / "state")
             state = state_root / instance / "jobs/job"
             state.mkdir(parents=True)
+            (root / 'admission').write_text('open')
             (state / "record.json").write_text(json.dumps(job))
             if decoys:
                 for decoy in (root / "state/windows/jobs/wrong-root",
@@ -31,6 +56,10 @@ class DeployTests(unittest.TestCase):
 echo "$*" >> "$LOG"
 case "$1" in
 --version) echo motor-runner-test;;
+permission-helper-digest)
+  if [ "$HELPER_VALID" = legacy ]; then echo 'usage: motor-runner serve|connect' >&2; exit 1; fi
+  echo native-digest;;
+check-permissions-helper) [ "$HELPER_VALID" = true ] || exit 1;;
 drain)
   echo closed > "$ADMISSION"
   if [ "$DRAIN" = complete ]; then
@@ -68,6 +97,7 @@ fi
                        LOG=str(root / "log"), ADMISSION=str(root / "admission"),
                        RESUME=str(resume).lower(), DRAIN=drain,
                        FAIL_START=str(fail_start).lower(), START_FAILED=str(root / "failed"))
+            env['HELPER_VALID'] = str(helper_valid).lower()
             if default_state_root:
                 env.pop("RUNNER_STATE_ROOT")
             env.pop("RUNNER_DRAIN_TIMEOUT_S", None)
@@ -90,6 +120,21 @@ fi
         self.assertIn("all survivors are restart-recoverable", result.stderr)
         self.assertIn("systemctl --user stop", log)
         self.assertEqual(admission, "open")
+
+    def test_missing_helper_grant_aborts_before_drain_or_stop(self):
+        result, log, admission = self.run_deploy(self.job(), drain='complete', helper_valid=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('check-permissions-helper', log)
+        self.assertNotIn('drain --', log)
+        self.assertNotIn('systemctl', log)
+        self.assertEqual(admission, 'open')
+
+    def test_legacy_candidate_without_native_helper_still_drains_normally(self):
+        result, log, admission = self.run_deploy(self.job(), drain='complete', helper_valid='legacy')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('check-permissions-helper', log)
+        self.assertIn('drain --', log)
+        self.assertEqual(admission, 'open')
 
     def test_completed_drain_reports_reattach_count_and_uses_ten_minute_default(self):
         result, log, admission = self.run_deploy(

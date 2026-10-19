@@ -31,6 +31,13 @@ cache size the runner is deployed with, because the cache-reader tests compare
 against it. The paths are fixed in the script; read its first lines before
 running it on a host laid out differently.
 
+Before privileged isolation fixtures, the gate builds the ordinary runner binary
+and runs `check-permissions-helper`. An administrator must first install the
+matching root-owned helper and narrow sudo fragment with
+`script/runner/install-permissions-helper.sh`. Test harness executables are never
+run under sudo as helpers. The fixed helper path, ownership/modes, code digest
+and both delegated command forms are checked before the operator lanes.
+
 ## Run it
 
 From the root of the checkout:
