@@ -185,6 +185,55 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NET_IPIP must be disabled"):
             image.check_kernel(path)
 
+    def test_resolved_kernel_rejects_modular_or_missing_nft_reject_stack(self):
+        path = self.root / "kernel.config"
+        for name in ("NFT_REJECT", "NFT_REJECT_INET", "NFT_REJECT_IPV4", "NFT_REJECT_IPV6",
+                     "NF_REJECT_IPV4", "NF_REJECT_IPV6", "IPV6", "NETFILTER_NETLINK", "NF_TABLES_IPV4",
+                     "NF_TABLES_IPV6", "NF_NAT_MASQUERADE", "NF_DEFRAG_IPV4", "NF_DEFRAG_IPV6"):
+            for value in ("m", "n"):
+                with self.subTest(name=name, value=value):
+                    path.write_text(resolved_config().replace(f"CONFIG_{name}=y", f"CONFIG_{name}={value}"))
+                    with self.assertRaisesRegex(ValueError, f"CONFIG_{name} must be built in"):
+                        image.check_kernel(path)
+
+    def test_module_load_requests_are_removed_without_masking_the_loader(self):
+        directories = ("etc/modules-load.d", "run/modules-load.d", "usr/local/lib/modules-load.d",
+                       "usr/lib/modules-load.d", "lib/modules-load.d")
+        for relative in directories:
+            directory = self.root / relative
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "vendor.conf").write_text("loop\nfuse\n")
+            (directory / "empty.conf").write_text("")
+        legacy = self.root / "etc/modules"
+        legacy.write_text("loop\n")
+        target = self.root / "preserve.txt"
+        target.write_text("not a module config\n")
+        (self.root / "etc/modules-load.d/link.conf").symlink_to(target)
+        guest.clear_module_load_requests(self.root)
+        self.assertEqual(guest.verify_no_module_load_requests(self.root), [])
+        for relative in directories:
+            self.assertEqual(list((self.root / relative).iterdir()), [])
+        self.assertEqual(legacy.read_text(), "")
+        self.assertEqual(target.read_text(), "not a module config\n")
+        unit = self.root / "etc/systemd/system/systemd-modules-load.service"
+        self.assertFalse(unit.exists())
+        self.assertFalse(unit.is_symlink())
+        dropin = self.root / "etc/systemd/system/systemd-modules-load.service.d/10-motor-console.conf"
+        self.assertIn("StandardError=journal+console", dropin.read_text())
+
+    def test_even_empty_modules_load_config_fails_image_verification(self):
+        directory = self.root / "etc/modules-load.d"
+        directory.mkdir(parents=True)
+        (directory / "empty.conf").write_text("")
+        with self.assertRaisesRegex(ValueError, "must not request loadable"):
+            guest.verify_no_module_load_requests(self.root)
+
+    def test_failed_motor_units_forward_their_own_output_to_console(self):
+        for name in ("motor-net-rules.service", "motor-tenant-agent.service"):
+            unit = (HERE / "guest" / name).read_text().splitlines()
+            self.assertIn("StandardOutput=journal+console", unit)
+            self.assertIn("StandardError=journal+console", unit)
+
     def test_capability_probe_rejects_missing_support_or_unexpected_success(self):
         for code, error in ((0, "tenant-agent takes no arguments"), (1, "unknown operation")):
             result = subprocess.CompletedProcess([], code, stderr=error)

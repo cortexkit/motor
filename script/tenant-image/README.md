@@ -27,6 +27,11 @@ The other inputs are:
   `kernel-options.txt` requests built-in XFS (including reflink), overlayfs,
   ext4, virtio block/network/vsock and the systemd job-isolation prerequisites.
   The resolved configuration, not just the requested options, is checked.
+  All nftables inet reject variants and IPv4/IPv6 reject helpers are required
+  built-in: defconfig otherwise leaves reject expressions modular, which cannot
+  work with the locked, module-store-free guest. Counter, metadata, payload and
+  interval-set expressions are part of `NF_TABLES` itself in Linux 6.1; there is
+  no separate `NFT_COUNTER` option at this pin.
 - Debian trixie from the dated Debian snapshot in `versions.txt`. Packages,
   including Python 3, C/clang/lld, SQLite, mingw win32, binaryen and hivex, are
   resolved from that signed snapshot. Systemd must be at least 257 for
@@ -117,6 +122,13 @@ then listens on vsock. The rules use `eth0` (`net.ifnames=0`) instead of the
 host installer's physical-interface name. IPv4 forwarding is enabled, kernel
 module loading is disabled, and generic firewall/update/network services are
 masked; only the agent configures tenant networking. No SSH login is installed.
+The nft and tenant-agent units forward their own stdout/stderr to the serial
+console, so an nft startup failure remains visible even when it prevents the
+agent and opt-in qualification unit from starting. Static module-load directories
+and the legacy `/etc/modules` list are cleared and checked during image creation;
+even an empty `.conf` is removed because it can activate the loader through
+`ConditionDirectoryNotEmpty`. The loader is not masked or allowed to fail. Its
+own output also forwards to the console if it is unexpectedly activated.
 `systemd-remount-fs.service` is masked as well: the init script has already set
 up both roots, and the kernel's `ro` flag must not remount the RAM overlay read-only.
 
@@ -167,6 +179,20 @@ also run `/usr/local/libexec/hosted_image_check.py --tenant` inside the guest
 to probe XFS FICLONE between `/tenant/state` and both bound workspace roots.
 These live-guest checks require the dedicated operator host and must not be
 counted as passing when skipped.
+
+## Rebuilding guest boot policy
+
+A kernel-feature, module-load policy or guest-unit change requires a **new image
+version**, using the normal `build.py build NEW_VERSION --runner ...` path. Do
+not replace only the kernel or edit an existing completed rootfs in place: that
+would retain old guest-unit/module configuration and break the manifest's artifact
+hashes. Reuse the original verified runner binary when no runner code change is
+intended; the builder executes it inside the newly built userland as before.
+Allow the full tool-image build's scratch budget and network access, then run
+artifact inventory and the complete operator qualification on the new version.
+`build.py check-kernel` rejects configurations with `NFT_REJECT` or its family
+companions set to `m`: those modules cannot be loaded in a guest that has no
+module store and locks module loading.
 
 ## Operator qualification
 

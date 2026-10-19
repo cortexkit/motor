@@ -12,6 +12,9 @@ import urllib.request
 
 BUILD = Path("/srv/build")
 PREFIX = Path("/usr/local/lib/motor")
+GUEST_SERVICES = ("motor-tenant-agent.service", "motor-net-rules.service", "motor-image-check.service")
+MODULE_LOAD_DIRS = ("etc/modules-load.d", "run/modules-load.d", "usr/local/lib/modules-load.d",
+                    "usr/lib/modules-load.d", "lib/modules-load.d")
 
 
 def run(*args, capture=False) -> str:
@@ -91,6 +94,45 @@ def install_tools(pins):
                       PATH=f"{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 
 
+def install_services(source, destination):
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in GUEST_SERVICES:
+        shutil.copy2(source / name, destination / name)
+
+
+def clear_module_load_requests(root):
+    # Required drivers are built in. Even an empty vendor .conf can start the
+    # loader via ConditionDirectoryNotEmpty, despite the missing module store.
+    for relative in MODULE_LOAD_DIRS:
+        directory = root / relative
+        if directory.exists():
+            for path in directory.iterdir():
+                if path.is_dir() and not path.is_symlink():
+                    raise ValueError(f"unexpected directory in module-load configuration: {path}")
+                path.unlink()
+    legacy = root / "etc/modules"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.unlink(missing_ok=True)
+    legacy.write_text("")
+    dropin = root / "etc/systemd/system/systemd-modules-load.service.d/10-motor-console.conf"
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    dropin.write_text("[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n")
+
+
+def verify_no_module_load_requests(root):
+    entries = []
+    for relative in MODULE_LOAD_DIRS:
+        directory = root / relative
+        if directory.exists():
+            entries.extend(str(path) for path in directory.iterdir())
+    legacy = root / "etc/modules"
+    if legacy.exists() and legacy.read_text().strip():
+        entries.append(str(legacy))
+    if entries:
+        raise ValueError(f"image must not request loadable kernel modules: {entries}")
+    return []
+
+
 def configure(pins):
     for account in ("motor-job", "motor-cache"):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
@@ -103,8 +145,8 @@ def configure(pins):
     Path("/sbin/motor-init").chmod(0o755)
     shutil.copy2(BUILD / "guest/hosted_image_check.py", "/usr/local/libexec/hosted_image_check.py")
     Path("/usr/local/libexec/hosted_image_check.py").chmod(0o755)
-    for service in (BUILD / "guest").glob("*.service"):
-        shutil.copy2(service, Path("/etc/systemd/system", service.name))
+    install_services(BUILD / "guest", Path("/etc/systemd/system"))
+    clear_module_load_requests(Path("/"))
     rules = (BUILD / "script/runner/motor-net.nft").read_text()
     if rules.count("enp6s0") != 3:
         raise ValueError("unexpected runner network interface template")
@@ -137,6 +179,7 @@ def verify(pins):
     if int(systemd.split()[1]) < 257:
         raise ValueError("runner isolation requires systemd >=257 (PrivatePIDs)")
     inventory = {"systemd": systemd, "rust_toolchains": {}}
+    inventory["static_module_load_requests"] = verify_no_module_load_requests(Path("/"))
     for name, command in (("node", "node"), ("npm", "npm"), ("bun", "bun"), ("pnpm", "pnpm")):
         actual = run(command, "--version", capture=True).removeprefix("v")
         if actual != pins[name]:

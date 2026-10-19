@@ -6,4 +6,6 @@ Before=motor-tenant-agent.service
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/motor-net.nft
+StandardOutput=journal+console
+StandardError=journal+console
 RemainAfterExit=yes

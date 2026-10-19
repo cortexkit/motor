@@ -37,6 +37,8 @@ SECCOMP=y
 SECCOMP_FILTER=y
 UNIX=y
 INET=y
+# Inet nftables needs IPv6 code even when guest IPv6 networking is disabled.
+IPV6=y
 BPF_SYSCALL=y
 CGROUP_BPF=y
 BPF_JIT=y
@@ -48,13 +50,27 @@ NET_IPIP=n
 IPV6_GRE=n
 IPV6_TUNNEL=n
 NETFILTER=y
+NETFILTER_NETLINK=y
 NF_TABLES=y
 NF_TABLES_INET=y
+NF_TABLES_IPV4=y
+NF_TABLES_IPV6=y
 NF_CONNTRACK=y
+NF_DEFRAG_IPV4=y
+NF_DEFRAG_IPV6=y
 NF_NAT=y
+NF_NAT_MASQUERADE=y
 NFT_CT=y
 NFT_NAT=y
 NFT_MASQ=y
+# Defconfig can retain modular reject companions even after the core is enabled.
+# The inet TCP-reset and icmpx rules must work with no loadable module store.
+NFT_REJECT=y
+NFT_REJECT_INET=y
+NFT_REJECT_IPV4=y
+NFT_REJECT_IPV6=y
+NF_REJECT_IPV4=y
+NF_REJECT_IPV6=y
 VETH=y
 DEVTMPFS=y
 DEVTMPFS_MOUNT=y

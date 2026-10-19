@@ -50,10 +50,16 @@ class QualificationTests(unittest.TestCase):
         self.assertLess(len(args.encode()), 4096)
 
     def test_normal_image_does_not_install_or_want_qualification_unit(self):
-        installer = (q.HERE / "install-guest.py").read_text()
-        # The existing image installer must not ship or enable the root payload.
-        self.assertNotIn("motor-qualification", installer)
-        self.assertNotIn("hosted_qualify", installer)
+        installer = q.module("qualification_install_policy", q.HERE / "install-guest.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            source, installed = Path(tmp) / "source", Path(tmp) / "installed"
+            source.mkdir()
+            production = ("motor-tenant-agent.service", "motor-net-rules.service", "motor-image-check.service")
+            for name in (*production, "motor-qualification.service"):
+                (source / name).write_text("fixture service\n")
+            installer.install_services(source, installed)
+            self.assertEqual(sorted(path.name for path in installed.iterdir()), sorted(production))
+            self.assertFalse((installed / "motor-qualification.service").exists())
         for path in (q.HERE / "guest").glob("*.service"):
             if path.name != "motor-qualification.service":
                 self.assertNotIn("motor-qualification", path.read_text())

@@ -10,6 +10,8 @@ Environment=CARGO_HOME=/usr/local/lib/motor/cargo
 Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup
 Environment=PATH=/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ExecStart=/usr/local/bin/motor-runner tenant-agent
+StandardOutput=journal+console
+StandardError=journal+console
 Restart=on-failure
 RestartSec=1
 
