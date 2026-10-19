@@ -158,9 +158,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-cow"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93873b1ef2a63aeaf95e7796cf7d6ff34522a6aebc43e58e62178911c5c26650"
+checksum = "627c727f8b5252a2ac7fb676d79eeb019ca650ba03e4c3ac0f8c75315c02db63"
 dependencies = [
  "async-trait",
  "libc",
