@@ -209,6 +209,47 @@ def provider_access_denied(access):
         for path,row in access['files'].items()) and all(not row.get('ascii_token_present') for row in access['processes'].values())
 
 
+def prepared_image_digest(revision, inventory):
+    inputs = {'revision':revision, 'packages':inventory['packages'], 'apt_release_files':inventory['apt_release_files']}
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',',':')).encode()).hexdigest()
+
+
+def snapshot_metadata(snapshot):
+    if snapshot.get('status') != 'ready' or not isinstance(snapshot.get('snapshotId'), str) or type(snapshot.get('sizeBytes')) is not int:
+        raise ValueError('ready named snapshot lacks documented artifact id/size')
+    return {'name':snapshot['name'], 'id':snapshot['snapshotId'], 'size_bytes':snapshot['sizeBytes'], 'state':snapshot}
+
+
+SNAPSHOT_HYGIENE = r'''
+import json, pathlib, pwd, sys
+
+def image_hygiene(homes, blob, identity):
+    paths = sorted({pathlib.Path(home)/'.ssh/authorized_keys' for home in homes})
+    checked = []
+    for path in paths:
+        if path.exists():
+            lines = path.read_text().splitlines()
+            kept = [line for line in lines if blob not in line.split()]
+            if kept != lines:
+                path.write_text('\n'.join(kept)+'\n')
+            if any(blob in line.split() for line in path.read_text().splitlines()):
+                raise RuntimeError('probe authorization still present')
+            checked.append(str(path))
+    identity.unlink(missing_ok=True)
+    if identity.exists() or identity.is_symlink():
+        raise RuntimeError('sandbox identity still present')
+    configs = [pathlib.Path(home)/'.config/ascii/boat/config.json' for home in homes]
+    if any(path.exists() or path.is_symlink() for path in configs):
+        raise RuntimeError('Boat CLI config is present before snapshot')
+    return {'identity_absent':True,'boat_cli_configs_absent':True,'probe_authorizations_absent':True,
+        'authorized_key_files_checked':checked,'private_key_uploads':0}
+
+if __name__ == '__main__':
+    homes = [account.pw_dir for account in pwd.getpwall() if account.pw_dir.startswith('/')]
+    print(json.dumps(image_hygiene(homes, sys.argv[1].split()[1], pathlib.Path('/etc/motor/tenant/id'))))
+'''
+
+
 def policy_checks(host):
     actual = dict(line.split(None, 1) for line in host["sshd"]["stdout"].splitlines() if " " in line)
     return {key: host["sshd"].get("exit_code") == 0 and actual.get(key) == value for key, value in POLICY.items()}
@@ -292,6 +333,60 @@ class RunnerHost:
         self.data.setdefault("ssh_metadata", []).append(response)
         return ssh_argv(endpoint(response), directory / "key", directory / "known_hosts", sid)
 
+    def quiesce_image(self, sid, public, label):
+        audit = json.loads(self.execute(sid, 'sudo -n -E python3 -c ' + shlex.quote(SOURCE + '\nimport json; print(json.dumps(credential_audit()))'))['stdout'])
+        self.check(label + '.no_account_credentials', audit['clean'], audit)
+        if not audit['clean']:
+            raise ValueError('refusing to snapshot credentials or incomplete evidence')
+        self.execute(sid, 'sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat')
+        hygiene = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
+        self.check(label + '.identity_and_probe_keys_absent', all(hygiene[k] is True for k in ('identity_absent','boat_cli_configs_absent','probe_authorizations_absent')), hygiene)
+        self.execute(sid, 'sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync')
+        return hygiene
+
+    def save_snapshot(self, sid, name, retained=False):
+        resource = {'kind':'named-snapshot','id':name}
+        self.probe.data['resources'].append(resource)
+        self.probe.checkpoint()
+        start = time.monotonic()
+        self.probe.request('POST', '/named-snapshots', {'sandboxId':sid,'name':name})
+        while True:
+            state = self.probe.request('GET', '/named-snapshots/' + name)['snapshot']
+            if state['status'] == 'ready':
+                break
+            if state['status'] == 'failed':
+                raise ValueError('named snapshot failed')
+            time.sleep(2)
+        metadata = snapshot_metadata(state)
+        if retained:
+            resource.update(operator_retained=True, snapshot_id=metadata['id'], size_bytes=metadata['size_bytes'])
+        self.probe.checkpoint()
+        return dict(metadata, seconds=time.monotonic()-start, resource=resource)
+
+    def retain_prepared(self, sid, public, revision, inventory):
+        digest = prepared_image_digest(revision, inventory)
+        name = 'motor-boat-prepared-' + digest[:12]
+        try:
+            existing = self.probe.request('GET', '/named-snapshots/' + name)['snapshot']
+        except Exception as error:
+            if getattr(error, 'status', None) != 404:
+                raise
+            existing = None
+        if existing and existing['status'] == 'ready':
+            metadata = snapshot_metadata(existing)
+            resource = {'kind':'named-snapshot','id':name,'operator_retained':True,'snapshot_id':metadata['id'],'size_bytes':metadata['size_bytes']}
+            self.probe.data['resources'].append(resource)
+            metadata['reused_existing'] = True
+        else:
+            hygiene = self.quiesce_image(sid, public, 'prepared_image')
+            metadata = self.save_snapshot(sid, name, retained=True)
+            metadata.update(hygiene=hygiene, state_unmounted=True)
+        invocation = ['python3.14', str(ROOT/'script/boat-probe/probe.py'), '--key-stdin', '--cleanup', str(self.probe.results_path), '--delete-retained-images']
+        metadata.update(recipe_digest=digest, operator_retained=True, real_jobs_qualified=False,
+                        delete_command=shlex.join(invocation), credential_input='stdin: pipe the same authorized key reader used for this run')
+        self.data['prepared_image'] = metadata
+        self.probe.checkpoint()
+
     def phase(self, sid, label, directory, public, repository, client, first_started=None):
         record = {"name": label}
         self.data["phases"].append(record)
@@ -373,10 +468,17 @@ class RunnerHost:
             if generated.get("exit_code") != 0:
                 raise ValueError("temporary SSH key generation failed")
             public = (directory / "key.pub").read_text().strip()
-            item, self.data["create"] = self.probe.create()
+            source_image = getattr(self.probe, 'from_prepared_image', None)
+            if source_image:
+                self.data['prepared_source'] = snapshot_metadata(self.probe.request('GET', '/named-snapshots/' + source_image)['snapshot'])
+                self.data['prepared_source']['borrowed_not_deleted'] = True
+            item, self.data["create"] = self.probe.create(source_image)
             sid = item["id"]
             if item.get("vcpu") != 8 or item.get("memoryGB") != 16:
                 raise ValueError("unexpected large sandbox sizing")
+            if source_image:
+                self.probe.wait_hydrated(sid)
+                self.execute(sid, 'sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat')
             argv = self.route(sid, directory, public)
             bundle = directory / "motor.bundle"
             subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], cwd=ROOT, check=True, stdout=sys.stderr)
@@ -386,7 +488,9 @@ class RunnerHost:
             if sent.returncode:
                 raise ValueError("source upload over pinned SSH failed: " + sent.stderr.decode(errors="replace"))
             install = (f"cd /home/user && echo '{sha}  motor.bundle' | sha256sum -c - && "
-                       "sudo -n mkdir -p /srv/build && sudo -n git clone motor.bundle /srv/build/source && "
+                       "sudo -n mkdir -p /srv/build && if sudo -n test -d /srv/build/source/.git; then "
+                       "sudo -n git -C /srv/build/source fetch /home/user/motor.bundle HEAD; else "
+                       "sudo -n git clone motor.bundle /srv/build/source; fi && "
                        f"sudo -n git -C /srv/build/source checkout --detach {revision}")
             started = time.monotonic()
             self.data["source_upload"] = self.execute(sid, install)
@@ -394,6 +498,9 @@ class RunnerHost:
             self.probe.checkpoint()
             self.data["install"] = self.execute(sid, f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}", timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
             self.data["install_seconds"] = time.monotonic() - started
+            if getattr(self.probe, 'retain_prepared_image', False):
+                inventory = json.loads(self.execute(sid, 'sudo -n cat /var/lib/motor-boat/inventory.json')['stdout'])
+                self.retain_prepared(sid, public, revision, inventory)
             with tempfile.TemporaryDirectory(prefix="boat-job-", dir=ROOT / ".cortexkit") as repo:
                 repository = Path(repo)
                 (repository / "src").mkdir()
@@ -403,24 +510,9 @@ class RunnerHost:
                 for command in (["git", "init", "-q"], ["git", "add", "."], ["git", "-c", "user.name=Boat probe", "-c", "user.email=probe@invalid", "commit", "-qm", "probe input"]):
                     subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)
                 self.phase(sid, "initial", directory, public, repository, client)
-                audit = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(SOURCE + "\nimport json; print(json.dumps(credential_audit()))"))["stdout"])
-                self.check("snapshot.no_account_credentials", audit["clean"], audit)
-                if not audit["clean"]:
-                    raise ValueError("refusing to snapshot account credentials or incomplete audit")
-                self.execute(sid, "sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat && sudo -n rm -f /etc/motor/tenant/id && test ! -e /etc/motor/tenant/id && sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync")
+                hygiene = self.quiesce_image(sid, public, 'snapshot')
                 name = "motor-runner-" + self.probe.data["run_id"]
-                self.probe.data["resources"].append({"kind": "named-snapshot", "id": name})
-                self.probe.checkpoint()
-                start = time.monotonic()
-                self.probe.request("POST", "/named-snapshots", {"sandboxId": sid, "name": name})
-                while True:
-                    snapshot = self.probe.request("GET", "/named-snapshots/" + name)["snapshot"]
-                    if snapshot["status"] == "ready":
-                        break
-                    if snapshot["status"] == "failed":
-                        raise ValueError("named snapshot failed")
-                    time.sleep(2)
-                self.data["snapshot"] = {"seconds": time.monotonic()-start, "state": snapshot, "tenant_id_absent": True, "state_unmounted": True}
+                self.data['snapshot'] = dict(self.save_snapshot(sid, name), hygiene=hygiene, state_unmounted=True)
                 original = next(r for r in self.probe.data["resources"] if r["id"] == sid)
                 subset = {"resources": [original], "pending_creates": [], "cleanup": self.probe.data["cleanup"]}
                 cleanup(self.probe.client, subset, self.probe.checkpoint)
@@ -443,4 +535,6 @@ class RunnerHost:
                 self.check("sshd.dropin_survives_resume", before.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") == after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") and bool(after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf")), {"before": before, "after": after})
         self.data["local_private_keys_removed"] = not directory.exists()
         self.data["all_passed"] = bool(self.data["checks"]) and all(c["status"] == "PASS" for c in self.data["checks"])
+        if self.data.get('prepared_image'):
+            self.data['prepared_image']['real_jobs_qualified'] = self.data['all_passed']
         self.probe.checkpoint()

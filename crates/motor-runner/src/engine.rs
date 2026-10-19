@@ -93,6 +93,8 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) windows_phase: Option<Arc<dyn Fn(motor_winagent::Phase) + Send + Sync>>,
     pub free_space_floor_bytes: u64,
+    /// Optional soft reclaim goal; absent preserves twice the admission floor.
+    pub free_space_eviction_bytes: Option<u64>,
     /// Only catalogued workspaces beneath these roots may be pressure-evicted.
     pub workspace_roots: Vec<PathBuf>,
     /// Authorized destinations for caller workspaces, heads and siblings.
@@ -253,6 +255,7 @@ impl Config {
             #[cfg(test)]
             windows_prep_executable: None,
             free_space_floor_bytes: DEFAULT_FREE_SPACE_FLOOR_BYTES,
+            free_space_eviction_bytes: None,
             workspace_roots: vec![PathBuf::from("/Users")],
             owned_workspace_roots: vec![PathBuf::from("/Users")],
             drop_timeout: Duration::from_secs(60),
@@ -740,6 +743,14 @@ impl Runner {
             return Err(invalid("--boat-profile requires an explicit measured --boat-memory-max-bytes budget of at least 1 GiB; other profiles must not override memory"));
         }
         backend.validate(&config)?;
+        if config
+            .free_space_eviction_bytes
+            .is_some_and(|soft| soft <= config.free_space_floor_bytes)
+        {
+            return Err(invalid(
+                "disk eviction threshold must be above the refusal floor",
+            ));
+        }
         #[cfg(test)]
         let cpus = config
             .cpu_topology

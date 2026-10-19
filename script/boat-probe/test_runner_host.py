@@ -5,6 +5,7 @@ import io
 from unittest.mock import patch, Mock
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,6 +69,39 @@ class RunnerHostTests(unittest.TestCase):
         compile(host.HOST, "host", "exec")
         self.assertIn("memory.max", host.JOB)
         self.assertNotEqual(host.PORT, 9443)
+        compile(host.SNAPSHOT_HYGIENE, 'snapshot-hygiene', 'exec')
+
+    def test_prepared_digest_tracks_source_and_signed_package_inputs_not_processes(self):
+        inventory = {'packages':'pkg\t1\n', 'apt_release_files':{'noble':{'date':'fixed','sha256':'abc'}}, 'processes':[1]}
+        digest = host.prepared_image_digest('rev1', inventory)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, host.prepared_image_digest('rev1', dict(inventory, processes=[99])))
+        self.assertNotEqual(digest, host.prepared_image_digest('rev2', inventory))
+        self.assertNotEqual(digest, host.prepared_image_digest('rev1', dict(inventory, packages='pkg\t2\n')))
+        ready = host.snapshot_metadata({'name':'image','status':'ready','snapshotId':'artifact-id','sizeBytes':123})
+        self.assertEqual((ready['name'],ready['id'],ready['size_bytes']), ('image','artifact-id',123))
+        with self.assertRaises(ValueError):
+            host.snapshot_metadata({'name':'image','status':'ready'})
+
+    def test_snapshot_hygiene_removes_probe_authorization_and_identity_but_refuses_cli_config(self):
+        namespace = {'__name__':'snapshot_test'}
+        exec(host.SNAPSHOT_HYGIENE, namespace)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            keys = home / '.ssh/authorized_keys'
+            keys.parent.mkdir()
+            keys.write_text('ssh-ed25519 tested probe\nssh-ed25519 witness keep\n')
+            identity = home/'tenant-id'
+            identity.write_text('probe')
+            result = namespace['image_hygiene']([str(home)], 'tested', identity)
+            self.assertTrue(result['probe_authorizations_absent'])
+            self.assertEqual(keys.read_text(), 'ssh-ed25519 witness keep\n')
+            self.assertFalse(identity.exists())
+            config = home/'.config/ascii/boat/config.json'
+            config.parent.mkdir(parents=True)
+            config.write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'CLI config'):
+                namespace['image_hygiene']([str(home)], 'tested', identity)
 
     def test_isolation_refusal_is_failure_not_an_empty_stdout_json_parse(self):
         self.assertEqual(host.isolation_result_checks({'code':200, 'stdout':''}, {}), {'isolation_job_completed':False})

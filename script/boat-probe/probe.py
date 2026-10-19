@@ -15,6 +15,7 @@ import contextlib
 from datetime import datetime, timezone
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import signal
@@ -345,7 +346,11 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                 data["cleanup"].append({"pending_create": pending, "error": str(error)})
                 if attempt + 1 < attempts:
                     pause(2)
+    def retained_image(resource):
+        return resource['kind'] == 'named-snapshot' and resource.get('operator_retained') is True
     for resource in reversed(data["resources"]):
+        if retained_image(resource):
+            continue
         if resource.get("deleted"):
             continue
         sid = resource["id"]
@@ -414,9 +419,20 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                 resource["fallback_stop"] = client.request("POST", path + "/stop", {})
             except Exception as error:
                 resource["fallback_stop_error"] = str(error)
-    data["cleanup_complete"] = not data["pending_creates"] and all(r.get("deleted") for r in data["resources"])
+    retained = [r for r in data['resources'] if retained_image(r) and not r.get('deleted')]
+    data['operator_retained_resources'] = retained
+    data["cleanup_complete"] = not data["pending_creates"] and all(r.get("deleted") or retained_image(r) for r in data["resources"])
+    prepared = data.get('runner_host', {}).get('prepared_image')
+    if prepared:
+        for resource in data['resources']:
+            if resource['kind'] == 'named-snapshot' and resource['id'] == prepared['name']:
+                prepared.update(deleted=bool(resource.get('deleted')), operator_retained=retained_image(resource) and not resource.get('deleted'))
     data["cleanup_summary"] = ("All created sandboxes and named snapshots deleted." if data["cleanup_complete"] else
-                               "CLEANUP INCOMPLETE: inspect API errors/deletion operations; an accepted deletion may await upload URL expiry.")
+                                "CLEANUP INCOMPLETE: inspect API errors/deletion operations; an accepted deletion may await upload URL expiry.")
+    if retained:
+        if data['cleanup_complete']:
+            data['cleanup_summary'] = 'All non-retained execution resources deleted.'
+        data['cleanup_summary'] += f" {len(retained)} prepared image(s) explicitly retained by the operator; not deleted."
     checkpoint()
 
 
@@ -558,7 +574,16 @@ def main(report_stream=None):
     mode.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
     mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh large; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
     mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
+    parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
+    parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
+    parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
     args = parser.parse_args()
+    if (args.prepared_image or args.from_prepared_image) and not args.runner_host:
+        parser.error('prepared image options require --runner-host')
+    if args.from_prepared_image and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.from_prepared_image):
+        parser.error('invalid prepared named-snapshot handle')
+    if args.delete_retained_images and not args.cleanup:
+        parser.error('--delete-retained-images requires --cleanup')
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
         args.write_template.write_text(TEMPLATE)
@@ -573,6 +598,9 @@ def main(report_stream=None):
     if args.cleanup:
         path = args.cleanup
         data = json.loads(path.read_text())
+        if args.delete_retained_images:
+            for resource in data['resources']:
+                resource.pop('operator_retained', None)
     else:
         args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
         path = args.output / "results.json"
@@ -584,6 +612,9 @@ def main(report_stream=None):
     try:
         if not args.cleanup:
             runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
+            runner.results_path = path.resolve()
+            runner.retain_prepared_image = args.prepared_image
+            runner.from_prepared_image = args.from_prepared_image
             if args.runner_host:
                 from runner_host import RunnerHost
                 RunnerHost(runner).run()

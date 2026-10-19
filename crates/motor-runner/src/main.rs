@@ -239,6 +239,9 @@ fn configure_options(
             "--free-space-floor-bytes" => {
                 config.free_space_floor_bytes = value.parse().map_err(io::Error::other)?
             }
+            "--free-space-eviction-bytes" => {
+                config.free_space_eviction_bytes = Some(value.parse().map_err(io::Error::other)?)
+            }
             "--workspace-root" => config.workspace_roots.push(value.into()),
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,

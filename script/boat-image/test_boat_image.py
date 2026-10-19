@@ -81,6 +81,8 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
         self.assertIn('--reserve-daemon-core false', unit)
+        self.assertIn('--free-space-floor-bytes 25769803776', unit)
+        self.assertIn('--free-space-eviction-bytes 34359738368', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)

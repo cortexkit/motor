@@ -16,7 +16,7 @@ Environment=TMPDIR=/var/lib/motor-boat/tmp
 UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
 ExecStartPre=+/usr/bin/python3 /usr/local/libexec/motor-boat-credentials.py --output /run/motor-boat-credentials.json
 ExecStartPre=+/usr/local/libexec/motor-boat-network
-ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py serve --boat-profile --tenant-vm --tenant-socket-dir /run/motor-tenant --reserve-daemon-core false --backend host --instance boat --state-root /var/lib/motor-boat/state --build-slot-root /var/lib/motor-boat/slots --max-weight @VCPUS@ --rustc-slots @VCPUS@ --sccache-size-gib 8 --job-network veth
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py serve --boat-profile --tenant-vm --tenant-socket-dir /run/motor-tenant --reserve-daemon-core false --free-space-floor-bytes 25769803776 --free-space-eviction-bytes 34359738368 --backend host --instance boat --state-root /var/lib/motor-boat/state --build-slot-root /var/lib/motor-boat/slots --max-weight @VCPUS@ --rustc-slots @VCPUS@ --sccache-size-gib 8 --job-network veth
 ExecStartPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --wait-ready
 Restart=on-failure
 RestartSec=2

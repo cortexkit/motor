@@ -520,5 +520,42 @@ class JsonStdoutTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())['error'], 'invalid probe arguments')
 
 
+class PreparedImageCleanupTests(unittest.TestCase):
+    def test_sandbox_is_never_retained_even_if_checkpoint_has_the_flag(self):
+        data = evidence([{'kind':'sandbox','id':'bx_12345678','operator_retained':True}])
+        client = FakeClient({('GET','/sandboxes/bx_12345678/usage'):{},
+                             ('DELETE','/sandboxes/bx_12345678'):{'operation':{'id':'operation'}},
+                             ('GET','/deletion-operations/operation'):{'operation':{'status':'completed'}}})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertTrue(data['resources'][0]['deleted'])
+        self.assertEqual(data['operator_retained_resources'], [])
+
+    def test_only_explicit_retained_image_survives_and_measurement_snapshot_is_deleted(self):
+        image = {'kind':'named-snapshot','id':'prepared','operator_retained':True}
+        measurement = {'kind':'named-snapshot','id':'measurement'}
+        data = evidence([image, measurement])
+        client = FakeClient({('DELETE','/named-snapshots/measurement'):{'status':'deleted'}})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertTrue(data['cleanup_complete'])
+        self.assertEqual([r['id'] for r in data['operator_retained_resources']], ['prepared'])
+        self.assertFalse(data['resources'][0].get('deleted', False))
+        self.assertTrue(data['resources'][1]['deleted'])
+        self.assertIn('not deleted', data['cleanup_summary'])
+
+    def test_explicit_delete_retained_images_cleanup_removes_the_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'results.json'
+            path.write_text(json.dumps(evidence([{'kind':'named-snapshot','id':'prepared','operator_retained':True}])))
+            client = FakeClient({('DELETE','/named-snapshots/prepared'):{'status':'deleted'}})
+            output = io.StringIO()
+            with patch('sys.argv', ['probe.py','--cleanup',str(path),'--delete-retained-images']), \
+                 patch.object(probe,'read_key',return_value='fake-key'), patch.object(probe,'Client',return_value=client), \
+                 patch.object(probe.signal,'signal'), contextlib.redirect_stdout(output):
+                self.assertEqual(probe.main(), 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result['operator_retained_resources'], [])
+            self.assertTrue(result['resources'][0]['deleted'])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

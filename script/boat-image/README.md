@@ -150,6 +150,21 @@ ordinary runner Unix socket. Its unit is installed but never enabled; only the
 probe starts it, stops it before snapshot, and restarts it explicitly on the
 disposable clone. Never expose it as a production endpoint.
 
+## Disk budget
+
+The Boat unit explicitly sets a **24 GiB admission floor** and **32 GiB soft
+eviction goal**; neither is inferred from the provider label or filesystem size.
+An operator-reported cold Cargo build used about 20 GiB, so 24 GiB reserves that
+footprint plus 4 GiB of working headroom rather than admitting a cold build with
+only 4 GiB free. The 32 GiB goal starts reclaiming inactive caches earlier. Both
+fit the roughly 63 GiB free measured inside this 64 GiB XFS volume. These are
+admission/reclamation thresholds, not a disk quota or a guarantee for arbitrary
+artifact sizes; active workspaces and cache-ownership protections are unchanged.
+The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
+`--free-space-floor-bytes` flag sets the floor; new
+`--free-space-eviction-bytes` optionally overrides the soft goal and must exceed
+the floor, otherwise the original twice-floor rule applies.
+
 ## Fast startup checks and failure evidence
 
 Before long tool builds, the installer dry-runs the network helper: it requires
@@ -231,6 +246,36 @@ Live-mode stdout is one JSON report even on fatal setup/argument failures;
 incidental local command progress goes to stderr. A refused isolation job is a
 failed check with its terminal/refusal reason, not an attempt to parse its empty
 guest stdout, and a refused job is never counted as snapshot-to-first-job timing.
+
+## Optional prepared image retention
+
+`--prepared-image` explicitly opts into saving a tool-populated base as
+`motor-boat-prepared-<digest-short>`. The digest includes the exact source commit,
+installed package versions and signed Release metadata, so live-archive rebuild
+inputs are identified rather than silently overwriting a previous base. A ready
+image with that same name is reused, not replaced. Results record its name,
+`id` (Boat snapshotId), restored-content size, full digest and exact deletion
+invocation; pipe the API-key reader command from the **Operator probe** example
+above into that deletion invocation's stdin.
+Named snapshot storage continues to be billed until the operator deletes it.
+
+Before any new prepared or measurement snapshot, the probe requires no tenant
+identity, no Boat CLI configs/credential candidates and no authorization for its
+throwaway SSH public key; no private SSH key is ever uploaded. It stops the
+services, syncs and unmounts the XFS state. Prepared capture happens before any
+real job, so its result explicitly remains unqualified if subsequent job checks
+fail. This is a retry cache, not a claim that jobs already passed.
+
+On a later run, `--from-prepared-image NAME` creates a fresh noEnv large from that
+operator-owned base, reapplies the current source/recipe using the persisted
+Cargo/tool caches, and still performs **all** real-job, security, snapshot and
+resume checks. It never treats cache restoration as a substitute for them.
+Every sandbox and measurement snapshot is deleted normally. Only the explicitly
+retained prepared image is excluded from requested cleanup; it is listed under
+`operator_retained_resources` and the summary states that it was not deleted.
+`--cleanup RESULTS.json --delete-retained-images` explicitly deletes it too.
+No image is retained by default, and a borrowed source image is not owned/deleted
+by the new run.
 
 Portable tests run via `python3 scripts/run-script-tests.py`. They validate pins,
 checksum rejection and evidence parsing, **not** live installation or isolation.

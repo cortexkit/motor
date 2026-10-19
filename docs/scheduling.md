@@ -123,7 +123,8 @@ The runner checks free space on the filesystem holding its state before it
 accepts an upload, and again before setup.
 
 - The hard floor is `serve --free-space-floor-bytes N`, default 128 GiB
-  (137438953472 bytes); 0 disables the check. The soft goal is twice the floor.
+  (137438953472 bytes); 0 disables the check. The soft goal defaults to twice the
+  floor; `--free-space-eviction-bytes N` explicitly sets a reclaim goal above it.
 - Below the soft goal, the runner first cleans up: it evicts workspaces not
   used for 30 minutes, least recently used first, and stale staging. Under the
   hard floor it also evicts recently used workspaces until it reaches the soft

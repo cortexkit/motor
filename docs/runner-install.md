@@ -153,6 +153,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--rustc-slots N` | 24 | Machine-wide limit on concurrent compiler processes, enforced by the build-slot supervisor (`crates/prefrontal-build-slot`). |
 | `--sccache-size-gib N` | 200 | Compile cache cap. |
 | `--free-space-floor-bytes N` | 137438953472 (128 GiB) | Disk admission floor; 0 disables. |
+| `--free-space-eviction-bytes N` | twice the floor | Optional soft reclaim goal, strictly above the hard floor. Does not change admission while the hard reserve is available. |
 | `--workspace-root PATH` | `/Users` | Adds a root under which idle workspaces may be evicted. |
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
 | `--backend host\|windows-vm` | `host` | Job backend. A third value, `vm`, is parsed but refused at startup in this build. |
