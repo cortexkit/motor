@@ -7,6 +7,77 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn trace(event: &str, detail: serde_json::Value) {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    eprintln!(
+        "EVIDENCE transport {}",
+        serde_json::json!({"event": event, "unix_ms": unix_ms, "detail": detail})
+    );
+}
+
+struct TracedIo<T> {
+    inner: T,
+    read: usize,
+    written: usize,
+}
+impl<T: io::Read> io::Read for TracedIo<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        trace(
+            "read-start",
+            serde_json::json!({"requested":bytes.len(), "total":self.read}),
+        );
+        let started = Instant::now();
+        let result = self.inner.read(bytes);
+        match &result {
+            Ok(count) => {
+                self.read += count;
+                trace(
+                    "read-done",
+                    serde_json::json!({"bytes":count,"total":self.read,"elapsed_ms":started.elapsed().as_millis()}),
+                );
+            }
+            Err(error) => trace(
+                "read-error",
+                serde_json::json!({"error":error.to_string(),"os_code":error.raw_os_error()}),
+            ),
+        }
+        result
+    }
+}
+impl<T: io::Write> io::Write for TracedIo<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        trace(
+            "write-start",
+            serde_json::json!({"requested":bytes.len(),"total":self.written}),
+        );
+        let started = Instant::now();
+        let result = self.inner.write(bytes);
+        match &result {
+            Ok(count) => {
+                self.written += count;
+                trace(
+                    "write-done",
+                    serde_json::json!({"bytes":count,"total":self.written,"elapsed_ms":started.elapsed().as_millis()}),
+                );
+            }
+            Err(error) => trace(
+                "write-error",
+                serde_json::json!({"error":error.to_string(),"os_code":error.raw_os_error()}),
+            ),
+        }
+        result
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        trace("flush-start", serde_json::json!({"written":self.written}));
+        let result = self.inner.flush();
+        trace("flush-done", serde_json::json!({"ok":result.is_ok()}));
+        result
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Args {
     pipe: String,
@@ -132,12 +203,26 @@ struct Probe {
     command_ms: f64,
 }
 
-fn conversation<T: io::Read + io::Write>(mut pipe: T, args: &Args) -> io::Result<Probe> {
+fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Probe> {
+    let mut pipe = TracedIo {
+        inner: pipe,
+        read: 0,
+        written: 0,
+    };
     let mut session = Session::new(Peer::Host, &args.nonce)?;
     let receive = |session: &mut Session, pipe: &mut _| -> io::Result<Frame> {
-        session
+        trace(
+            "await-frame",
+            serde_json::json!({"state":format!("{:?}",session.state())}),
+        );
+        let frame = session
             .receive(pipe)?
-            .ok_or_else(|| invalid("unexpected EOF"))
+            .ok_or_else(|| invalid("unexpected EOF"))?;
+        trace(
+            "received-frame",
+            serde_json::json!({"state":format!("{:?}",session.state())}),
+        );
+        Ok(frame)
     };
     match receive(&mut session, &mut pipe)? {
         frame @ Frame::Hello { .. } => println!("PASS Hello {}", serde_json::to_string(&frame)?),
@@ -147,6 +232,10 @@ fn conversation<T: io::Read + io::Write>(mut pipe: T, args: &Args) -> io::Result
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_millis();
+    trace(
+        "hello-validated",
+        serde_json::json!({"hello_unix_ms":hello_unix_ms}),
+    );
     loop {
         match receive(&mut session, &mut pipe)? {
             Frame::CacheMounted { timings } => {
@@ -162,7 +251,20 @@ fn conversation<T: io::Read + io::Write>(mut pipe: T, args: &Args) -> io::Result
             frame => return Err(invalid(format!("cache preparation failed: {frame:?}"))),
         }
     }
-    session.send(&mut pipe, &Frame::ReceiveTree { bytes: tree(args)? })?;
+    trace("tree-build-start", serde_json::json!({}));
+    let bytes = tree(args)?;
+    use sha2::Digest;
+    trace(
+        "tree-built",
+        serde_json::json!({"bytes":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
+    );
+    trace(
+        "send-receive-tree-start",
+        serde_json::json!({"bytes":bytes.len()}),
+    );
+    session.send(&mut pipe, &Frame::ReceiveTree { bytes })?;
+    trace("send-receive-tree-done", serde_json::json!({}));
+    trace("send-tree-end-start", serde_json::json!({}));
     session.send(
         &mut pipe,
         &Frame::TreeEnd {
@@ -175,10 +277,12 @@ fn conversation<T: io::Read + io::Write>(mut pipe: T, args: &Args) -> io::Result
             },
         },
     )?;
+    trace("send-tree-end-done", serde_json::json!({}));
     if receive(&mut session, &mut pipe)? != (Frame::TreeReceived {}) {
         return Err(invalid("expected tree_received"));
     }
     let command = Instant::now();
+    trace("command-start", serde_json::json!({}));
     session.send(&mut pipe, &Frame::Start {})?;
     if receive(&mut session, &mut pipe)? != (Frame::Started {}) {
         return Err(invalid("expected started"));
@@ -200,6 +304,7 @@ fn conversation<T: io::Read + io::Write>(mut pipe: T, args: &Args) -> io::Result
         }
     }
     let command_ms = command.elapsed().as_secs_f64() * 1000.0;
+    trace("command-exit", serde_json::json!({"command_ms":command_ms}));
     let stdout = String::from_utf8(stdout).map_err(io::Error::other)?;
     for required in [
         "PASS standard-account",
@@ -235,6 +340,7 @@ fn probe(args: &Args) -> io::Result<Probe> {
     use std::os::windows::fs::OpenOptionsExt;
     let path = format!(r"\\.\pipe\{}", args.pipe);
     let deadline = Instant::now() + std::time::Duration::from_secs(120);
+    trace("pipe-connect-start", serde_json::json!({"pipe":args.pipe}));
     let pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
@@ -251,6 +357,7 @@ fn probe(args: &Args) -> io::Result<Probe> {
             Err(error) => return Err(error),
         }
     };
+    trace("pipe-connected", serde_json::json!({"pipe":args.pipe}));
     conversation(pipe, args)
 }
 
@@ -269,7 +376,7 @@ fn run() -> io::Result<()> {
     let values: Vec<_> = std::env::args().skip(1).collect();
     if values == ["--version"] {
         println!(
-            "motor Hyper-V spike protocol {}",
+            "motor Hyper-V spike protocol {} trace=1",
             motor_winagent::PROTOCOL_VERSION
         );
         return Ok(());
@@ -304,6 +411,28 @@ mod tests {
             host: "HOST-1".into(),
             result: "C:\\result.json".into(),
         }
+    }
+
+    #[test]
+    fn tracing_preserves_stream_bytes_counts_and_eof_errors() {
+        let mut stream = TracedIo {
+            inner: io::Cursor::new(vec![1, 2, 3]),
+            read: 0,
+            written: 0,
+        };
+        let mut bytes = [0; 2];
+        io::Read::read_exact(&mut stream, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2]);
+        io::Write::write_all(&mut stream, &[9, 8, 7]).unwrap();
+        io::Write::flush(&mut stream).unwrap();
+        assert_eq!((stream.read, stream.written), (2, 3));
+        assert_eq!(stream.inner.get_ref(), &[1, 2, 9, 8, 7]);
+        assert_eq!(
+            io::Read::read_exact(&mut stream, &mut bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     struct ScriptedPipe {

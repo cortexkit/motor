@@ -15,7 +15,7 @@ function Assert-Refused([scriptblock]$Check, [string]$Reason) {
 }
 Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion)"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
-foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
+foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/build-probe.ps1','script/hyperv-spike/diagnostics.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
     Test-SpikeLogic "parse-$relative" {
         $tokens = $null; $errors = $null
         [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $repo $relative), [ref]$tokens, [ref]$errors)
@@ -58,6 +58,21 @@ Test-SpikeLogic 'host-files-denies-local-unc-and-agent-secret' {
 }
 . "$PSScriptRoot/common.ps1"
 . "$PSScriptRoot/boot-files.ps1"
+. "$PSScriptRoot/diagnostics.ps1"
+Test-SpikeLogic 'guest-evidence-never-descends-through-reparse-ancestors' {
+    $visited = [Collections.Generic.List[string]]::new()
+    $read = {
+        param($path)
+        $leaf = Split-Path $path -Leaf
+        $visited.Add($leaf)
+        if ($leaf -eq 'Temp') { throw 'Followed a guest reparse ancestor' }
+        $attributes = if ($leaf -eq 'Local') { [IO.FileAttributes]::ReparsePoint } else { [IO.FileAttributes]::Directory }
+        [pscustomobject]@{ FullName=$path; Attributes=$attributes }
+    }
+    $item = Get-SpikePlainGuestItem ([IO.Path]::GetTempPath()) 'Users\motor-job\AppData\Local\Temp\motor-tree.tar' $read
+    Assert-Logic ($null -eq $item -and ($visited -join ',') -eq 'Users,motor-job,AppData,Local')
+    Assert-Refused { Get-SpikePlainGuestItem ([IO.Path]::GetTempPath()) 'Users\..\Windows' $read } 'Invalid guest diagnostic path'
+}
 Test-SpikeLogic 'bcdboot-arguments-bind-source-and-explicit-esp-with-verbose-output' {
     $arguments = @(Get-SpikeBcdBootArguments 'F:\Windows' 'E')
     Assert-Logic (($arguments -join '|') -eq 'F:\Windows|/s|E:|/f|UEFI|/v')

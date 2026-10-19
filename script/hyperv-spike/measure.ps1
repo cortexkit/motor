@@ -1,17 +1,19 @@
 <#
 .SYNOPSIS
-Measure five fresh offline Hyper-V jobs; never treats an incomplete run as a sample.
+Measure five fresh offline jobs, or one diagnostic run that reports no median.
 .EXAMPLE
 .\measure.ps1 -Root C:\motor-spike\hyperv
 .NOTES
-Run elevated after provision.ps1 succeeds. Budget 5-15 minutes; at most one
+Run elevated after provision.ps1 succeeds. Parent hashing is outside the phase
+timings and may dominate wall time; each client has a 300 s cap. Uses at most one
 8 GiB / 4 vCPU VM and one disposable differencing VHDX. Keeps raw logs and JSON.
 #>
-param([string]$Root = 'C:\motor-spike\hyperv')
+param([string]$Root = 'C:\motor-spike\hyperv', [string]$ClientPath = '', [switch]$DiagnosticOnly)
 . "$PSScriptRoot\common.ps1"
+. "$PSScriptRoot\diagnostics.ps1"
 $Root = [IO.Path]::GetFullPath($Root)
 $parent = Join-Path $Root 'parent.vhdx'
-$client = Join-Path $Root 'hyperv-spike.exe'
+$client = if ($ClientPath) { (Resolve-Path -LiteralPath $ClientPath).Path } else { Join-Path $Root 'hyperv-spike.exe' }
 $lock = $null
 $transcript = $false
 $rows = @()
@@ -32,7 +34,9 @@ try {
     $canary = Join-Path $Root ('host-only-' + [Guid]::NewGuid().ToString('N') + '.txt')
     Set-Content $canary ([Guid]::NewGuid().ToString('N')) -Encoding ascii
     Assert-Spike (Test-Path $canary) 'real-host-canary-exists' "path=$canary SHA256=$((Get-FileHash $canary).Hash) (contents never staged)"
-    for ($run = 1; $run -le 5; $run++) {
+    $runCount = if ($DiagnosticOnly) { 1 } else { 5 }
+    Write-Host "EVIDENCE measurement-mode diagnosticOnly=$DiagnosticOnly runs=$runCount client=$client"
+    for ($run = 1; $run -le $runCount; $run++) {
         $id = [Guid]::NewGuid().ToString('N')
         $name = "motor-hv-$id"
         $pipe = $name
@@ -66,13 +70,18 @@ try {
             Assert-Spike ((Get-VMComPort -VMName $name -Number 1).Path -eq "\\.\pipe\$pipe") 'com1-pipe-mapping' $pipe
             $createMs = $create.Elapsed.TotalMilliseconds
             $bootStart = Get-SpikeUnixMs
+            Write-Host "EVIDENCE start-vm-begin unix_ms=$bootStart"
             Start-VM -Name $name
+            Write-Host "EVIDENCE start-vm-return unix_ms=$(Get-SpikeUnixMs)"
             # Start-Process on Windows joins ArgumentList; quote every value so
             # spaces in the root/canary path remain part of a single argument.
             $clientArgs = @('--pipe', $pipe, '--nonce', $id, '--canary', $canary, '--host', $env:COMPUTERNAME, '--result', $result)
             $quotedArgs = @($clientArgs | ForEach-Object { '"' + $_ + '"' })
             $process = Start-Process -FilePath $client -ArgumentList $quotedArgs -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -NoNewWindow
+            Write-Host "EVIDENCE probe-start pid=$($process.Id) unix_ms=$(Get-SpikeUnixMs)"
             if (-not $process.WaitForExit(300000)) {
+                Get-VM -Name $name | Select-Object Name,State,Status,Uptime,CPUUsage,MemoryAssigned | Format-List | Out-Host
+                Write-Host "EVIDENCE probe-timeout unix_ms=$(Get-SpikeUnixMs) pid=$($process.Id)"
                 $process.Kill(); $process.WaitForExit()
                 throw 'FAIL probe-timeout (300s total, includes boot/Hello/command/protocol completion)'
             }
@@ -87,9 +96,16 @@ try {
             $teardown = [Diagnostics.Stopwatch]::StartNew()
             try {
                 if ($process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+                if (-not $probe) {
+                    foreach ($path in @($stdout,$stderr)) { if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path | Out-Host } }
+                }
                 if ($probe) { Wait-SpikeOff $name 60 }
             } finally {
                 Remove-SpikeVM $name
+                if (-not $probe -and (Test-Path -LiteralPath $child)) {
+                    try { Save-SpikeGuestEvidence $child (Join-Path $batch "run-$run-guest") }
+                    catch { Write-Host "FAIL diagnostic-harvest $_ (cleanup still required)" }
+                }
                 if (Test-Path $child) { Remove-Item $child -Force }
                 if (Test-Path $vmDirectory) { Remove-Item $vmDirectory -Recurse -Force }
                 Assert-Spike (-not (Test-Path $child) -and -not (Test-Path $vmDirectory)) 'disk-and-vm-directory-removed' "$child $vmDirectory"
@@ -124,6 +140,10 @@ try {
         if ($transcript) { Stop-Transcript | Out-Host }
         if ($lock) { $lock.Dispose() }
     }
+}
+if ($DiagnosticOnly) {
+    Write-Host 'DIAGNOSTIC single run completed; five-run measurement not performed and no median reported'
+    return
 }
 & $client --summary (Join-Path $batch 'samples.json') | Tee-Object -FilePath (Join-Path $batch 'summary.log') | Out-Host
 Assert-Spike ($LASTEXITCODE -eq 0) 'five-run-summary' $batch
