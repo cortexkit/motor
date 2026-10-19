@@ -1,11 +1,49 @@
 #!/usr/bin/python3
 """Root qualification payload, staged only on a disposable tenant disk."""
 import os
+import json
 from pathlib import Path
+import socket
+import struct
 import subprocess
+import threading
 import time
+from typing import Any
 
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
+
+
+def runner_diagnostics():
+    state: dict[str, Any] = {}
+    for name, args in (
+        ("unit", ["systemctl", "show", "motor-tenant-runner.service", "-p", "MainPID", "-p", "ActiveState", "-p", "SubState", "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecStart"]),
+        ("journal", ["journalctl", "-b", "-u", "motor-tenant-runner.service", "--no-pager", "-n", "80", "-o", "short-monotonic"]),
+    ):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=2)
+            state[name] = dict(code=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        except Exception as error:
+            state[name] = dict(error=f"{type(error).__name__}: {error}")
+    path = Path("/tenant/state/main/runner.sock")
+    try:
+        info = path.lstat()
+        socket_state: dict[str, Any] = dict(path=str(path), mode=oct(info.st_mode), uid=info.st_uid, inode=info.st_ino)
+        state["socket"] = socket_state
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(.25)
+            peer.connect(str(path))
+            pid, uid, gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, getattr(socket, "SO_PEERCRED"), 12))
+            socket_state["peer"] = dict(pid=pid, uid=uid, gid=gid)
+    except Exception as error:
+        state["socket_error"] = f"{type(error).__name__}: {error}"
+    print("GUEST_RUNNER_DIAGNOSTIC " + json.dumps(state), flush=True)
+
+
+def diagnostic_window(stop):
+    for _ in range(8):
+        runner_diagnostics()
+        if stop.wait(4):
+            return
 
 
 def run(*args, **kwargs):
@@ -51,8 +89,14 @@ def main():
 
 
 if __name__ == "__main__":
+    stop = threading.Event()
+    diagnostics = threading.Thread(target=diagnostic_window, args=(stop,), daemon=True)
+    diagnostics.start()
     try:
         main()
     except Exception as error:
         print(f"FAIL guest qualification: {error}", flush=True)
         raise
+    finally:
+        stop.set()
+        diagnostics.join(timeout=5)

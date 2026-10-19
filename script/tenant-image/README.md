@@ -376,7 +376,14 @@ subprocess failures retain their real exit status/stdout/stderr. The terminal
 prints bounded log tails while full artifacts remain on disk.
 
 Base boot retries only transport failures before the initial `CONNECT 54`
-handshake completes, for at most 60 seconds. Firecracker can close such an early
+handshake completes, for at most 60 seconds. Host guest-control diagnostics name
+the tenant operation, request/reply stage, blocking-fd status and elapsed read
+budget; a blocking attach read deadline is described as initialization waiting
+for runner readiness, not bare EAGAIN. The boot-only qualification payload also
+prints bounded runner-unit journal/MainPID/socket-peer snapshots during startup,
+and forwards the transient runner's own output to the console. These are
+diagnostics, not a substitute for the existing PID-bound readiness check.
+Firecracker can close such an early
 connection while the guest vsock device exists but its agent has not started.
 Once a guest control request is submitted, EOF or a refusal is fatal, not retried;
 a repeated prepare request could hide an unknown operation outcome. A readiness

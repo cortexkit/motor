@@ -152,9 +152,11 @@ def qualification_args(original):
     # Direct tty output preserves exact evidence lines; journald's console
     # forwarding can prepend an identifier and PID to the checker's stdout.
     console = base64.b64encode(b"[Service]\nStandardOutput=tty\nStandardError=tty\nTTYPath=/dev/ttyS0\n").decode()
+    runner_console = base64.b64encode(b"[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n").decode()
     return (original + " systemd.wants=motor-image-check.service systemd.wants=motor-qualification.service"
             + " systemd.set_credential_binary=systemd.extra-unit.motor-qualification.service:" + unit
-            + " systemd.set_credential_binary=systemd.unit-dropin.motor-image-check.service:" + console)
+            + " systemd.set_credential_binary=systemd.unit-dropin.motor-image-check.service:" + console
+            + " systemd.set_credential_binary=systemd.unit-dropin.motor-tenant-runner.service:" + runner_console)
 
 
 def exact_line(text, expected):

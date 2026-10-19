@@ -181,6 +181,23 @@ class QualificationTests(unittest.TestCase):
         self.assertNotIn("[Install]", unit)
         self.assertNotIn("systemd.wants=motor-qualification.service", original)
         self.assertLess(len(args.encode()), 4096)
+        runner = next(value.split(":", 1)[1] for value in args.split() if value.startswith("systemd.set_credential_binary=systemd.unit-dropin.motor-tenant-runner.service:"))
+        self.assertIn("StandardError=journal+console", base64.b64decode(runner).decode())
+
+    def test_guest_runner_diagnostics_include_unit_journal_and_actual_socket_peer(self):
+        diagnostics = q.module("guest_runner_diagnostics", q.HERE / "guest/hosted_qualify.py")
+        def output(args, **_kwargs):
+            text = "MainPID=123\nActiveState=active\n" if args[0] == "systemctl" else "actual daemon error canary\n"
+            return subprocess.CompletedProcess(args, 0, stdout=text, stderr="")
+        with mock.patch.object(diagnostics.socket, "SO_PEERCRED", 17, create=True), mock.patch.object(diagnostics.subprocess, "run", side_effect=output), mock.patch.object(diagnostics.Path, "lstat", return_value=SimpleNamespace(st_mode=0o140600, st_uid=0, st_ino=9)), mock.patch.object(diagnostics.socket, "socket") as socket_factory, mock.patch("builtins.print") as printed:
+            socket_factory.return_value.__enter__.return_value.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
+            diagnostics.runner_diagnostics()
+        line = printed.call_args.args[0]
+        self.assertTrue(line.startswith("GUEST_RUNNER_DIAGNOSTIC "))
+        state = json.loads(line.split(" ", 1)[1])
+        self.assertIn("MainPID=123", state["unit"]["stdout"])
+        self.assertIn("actual daemon error canary", state["journal"]["stdout"])
+        self.assertEqual(state["socket"]["peer"]["pid"], 123)
 
     def test_normal_image_does_not_install_or_want_qualification_unit(self):
         installer = q.module("qualification_install_policy", q.HERE / "install-guest.py")

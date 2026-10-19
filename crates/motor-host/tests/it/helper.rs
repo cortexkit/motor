@@ -1,10 +1,71 @@
 use super::scratch;
-use motor_host::helper::{read_json, write_json, Control, Helper};
+use motor_host::helper::{exchange_control, read_json, write_json, Control, Helper};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+
+#[test]
+fn delayed_guest_control_reply_succeeds_without_retry() {
+    let (host, mut guest) = UnixStream::pair().unwrap();
+    let peer = std::thread::spawn(move || {
+        assert_eq!(read_json(&mut guest).unwrap()["op"], "attach_tenant");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_json(&mut guest, &json!({"ok":true})).unwrap();
+    });
+    assert_eq!(
+        exchange_control(
+            host,
+            "tenant",
+            &json!({"op":"attach_tenant"}),
+            std::time::Duration::from_secs(1)
+        )
+        .unwrap(),
+        json!({"ok":true})
+    );
+    peer.join().unwrap();
+}
+
+#[test]
+fn guest_control_read_deadline_names_initialization_and_header_operation() {
+    let (host, mut guest) = UnixStream::pair().unwrap();
+    let peer = std::thread::spawn(move || {
+        read_json(&mut guest).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    });
+    let error = exchange_control(
+        host,
+        "tenant",
+        &json!({"op":"attach_tenant"}),
+        std::time::Duration::from_millis(30),
+    )
+    .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("tenant initialization timed out waiting for runner readiness"),
+        "{detail}"
+    );
+    assert!(detail.contains("operation=attach_tenant"), "{detail}");
+    assert!(detail.contains("read guest JSON frame header"), "{detail}");
+    peer.join().unwrap();
+}
+
+#[test]
+fn unexpected_nonblocking_guest_control_is_not_mislabeled_timeout() {
+    let (host, _guest) = UnixStream::pair().unwrap();
+    host.set_nonblocking(true).unwrap();
+    let error = exchange_control(
+        host,
+        "tenant",
+        &json!({"op":"attach_tenant"}),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("nonblocking=true"), "{detail}");
+    assert!(!detail.contains("timed out waiting"), "{detail}");
+}
 
 fn descriptor_reply(stream: &UnixStream, fd: &UnixStream) {
     let bytes = b"{\"result\":\"relay\",\"fd_count\":1}\n";
