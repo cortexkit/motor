@@ -6,6 +6,11 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "hyperv-spike")]
+    if std::env::args().skip(1).eq(["--build-info"]) {
+        println!("motor-winagent hyperv-spike agent_diag=2 queue_config=0,2097152 protocol=4");
+        return Ok(());
+    }
     guest::run()
 }
 
@@ -220,6 +225,7 @@ mod guest {
                                         Err(error) => diagnostic!("COM status error: {error}"),
                                     }
                                     tick += 1;
+                                    crate::hyperv_diag::sync();
                                     thread::sleep(Duration::from_millis(500));
                                 }
                             });
@@ -344,8 +350,6 @@ mod guest {
         let _ = service();
     }
     fn service() -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(feature = "hyperv-spike")]
-        crate::hyperv_diag::init();
         let stop = Arc::new(Handle::event()?);
         let handler_stop = stop.clone();
         let status =
@@ -373,8 +377,18 @@ mod guest {
             })
         };
         report(ServiceState::Running, 0)?;
+        #[cfg(feature = "hyperv-spike")]
+        if let Err(error) = crate::hyperv_diag::init() {
+            report(
+                ServiceState::Stopped,
+                error.raw_os_error().unwrap_or(1) as u32,
+            )?;
+            return Err(error.into());
+        }
         let result = serve(stop.clone());
         diagnostic!("service result: {result:?}");
+        #[cfg(feature = "hyperv-spike")]
+        crate::hyperv_diag::sync();
         stop.signal();
         report(ServiceState::Stopped, if result.is_ok() { 0 } else { 1 })?;
         result.map_err(Into::into)

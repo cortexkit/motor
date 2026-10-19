@@ -80,6 +80,33 @@ EVIDENCE transport {"event":"read-start","unix_ms":104,"detail":{"requested":1,"
     Assert-Logic ($progress.last_protocol_wait -ceq 'AwaitTreeReceived' -and $progress.last_transport_event -ceq 'read-start')
     Assert-Logic ($progress.tree_end_send_done_unix_ms -eq 102)
 }
+Test-SpikeLogic 'comparison-records-both-failed-arms-from-finally' {
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'measure.ps1'), [ref]$tokens, [ref]$errors)
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'serial-comparison.json' }, $true)
+    $writer = $node.Parent
+    while ($writer -and $writer -isnot [Management.Automation.Language.IfStatementAst]) { $writer = $writer.Parent }
+    Assert-Logic ($null -ne $writer)
+    $inFinally = $false
+    $parent = $writer.Parent
+    while ($parent) {
+        if ($parent -is [Management.Automation.Language.TryStatementAst] -and $parent.Finally -and $writer.Extent.StartOffset -ge $parent.Finally.Extent.StartOffset -and $writer.Extent.EndOffset -le $parent.Finally.Extent.EndOffset) { $inFinally = $true }
+        $parent = $parent.Parent
+    }
+    Assert-Logic $inFinally
+    $batch = Join-Path ([IO.Path]::GetTempPath()) ('motor-comparison-' + [Guid]::NewGuid().ToString('N'))
+    New-Item $batch -ItemType Directory | Out-Null
+    try {
+        $CompareSerialQueues = $true; $comparison = @(); $cleanupOkay = $true; $probe = $null
+        $run = 1; $activeQueueBytes = 0; $runFailure = 'control timeout'; $controlFailure = $runFailure
+        Invoke-Expression $writer.Extent.Text
+        $run = 2; $activeQueueBytes = 2097152; $runFailure = 'requested timeout'; $controlFailure = $null
+        Invoke-Expression $writer.Extent.Text
+        $outcomes = Get-Content (Join-Path $batch 'serial-comparison.json') -Raw | ConvertFrom-Json
+        Assert-Logic ($outcomes.Count -eq 2 -and -not $outcomes[0].completed -and -not $outcomes[1].completed)
+        Assert-Logic ($outcomes[1].failure -ceq 'requested timeout' -and $outcomes[1].cleanup)
+    } finally { Remove-Item $batch -Recurse -Force }
+}
 Test-SpikeLogic 'native-argument-quoting-keeps-quotes-spaces-and-trailing-slashes' {
     Assert-Logic ((Convert-SpikeNativeArgument '') -ceq '""')
     Assert-Logic ((Convert-SpikeNativeArgument 'a b') -ceq '"a b"')

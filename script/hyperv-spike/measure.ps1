@@ -48,6 +48,7 @@ try {
     for ($run = 1; $run -le $runCount; $run++) {
         $activeQueueBytes = if ($CompareSerialQueues -and $run -eq 1) { 0 } else { $SerialQueueBytes }
         $controlFailure = $null
+        $runFailure = $null
         $id = [Guid]::NewGuid().ToString('N')
         $name = "motor-hv-$id"
         $pipe = $name
@@ -85,6 +86,7 @@ try {
                     Assert-Spike ((Get-FileHash -LiteralPath $agent.FullName).Hash -eq $agentHash) 'overlay-agent-hash' $agentHash
                     Assert-Spike ((Get-Acl -LiteralPath $agent.FullName).Sddl -eq $beforeAcl) 'overlay-agent-acl-preserved' $beforeAcl
                     [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
+                    [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash queue=$activeQueueBytes nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
                     Write-Host "EVIDENCE overlay-serial-queue run=$run bytes=$activeQueueBytes"
                 }
             }
@@ -144,6 +146,7 @@ try {
             Write-Host "EVIDENCE boot-timeline $($timeline | ConvertTo-Json -Compress)"
             Assert-Spike ($helloMs -ge 0 -and $helloMs -le 120000) 'boot-to-validated-Hello' "run=$run ms=$helloMs"
         } catch {
+            $runFailure = $_.Exception.Message
             if ($CompareSerialQueues -and $run -eq 1 -and $_.Exception.Message -match 'FAIL probe-(timeout|exit)') {
                 $controlFailure = $_.Exception.Message
                 Write-Host "DIAGNOSTIC default-queue control failed: $controlFailure (not an accepted sample)"
@@ -178,11 +181,11 @@ try {
                 $timeline['teardown_done_unix_ms'] = Get-SpikeUnixMs
                 $timeline | ConvertTo-Json | Set-Content (Join-Path $batch "run-$run-timeline.json") -Encoding UTF8
                 Write-Host "EVIDENCE full-timeline $($timeline | ConvertTo-Json -Compress)"
+                if ($CompareSerialQueues) {
+                    $comparison += [ordered]@{ run=$run; queue_bytes=$activeQueueBytes; completed=($cleanupOkay -and $null -eq $runFailure -and $null -ne $probe); failure=$runFailure; control_failure=$controlFailure; cleanup=$cleanupOkay }
+                    ConvertTo-Json -InputObject $comparison -Depth 5 | Set-Content (Join-Path $batch 'serial-comparison.json') -Encoding UTF8
+                }
             }
-        }
-        if ($CompareSerialQueues) {
-            $comparison += [ordered]@{ run=$run; queue_bytes=$activeQueueBytes; completed=($null -eq $controlFailure -and $null -ne $probe); control_failure=$controlFailure; cleanup=$cleanupOkay }
-            ConvertTo-Json -InputObject $comparison -Depth 5 | Set-Content (Join-Path $batch 'serial-comparison.json') -Encoding UTF8
         }
         if ($controlFailure) {
             Assert-Spike $cleanupOkay 'failed-control-cleanup-complete' $run

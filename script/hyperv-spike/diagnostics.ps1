@@ -46,7 +46,12 @@ function Save-SpikeGuestEvidence([string]$Disk, [string]$Directory) {
             Get-FileHash -LiteralPath $agent.FullName | Format-List | Out-String | Set-Content (Join-Path $Directory 'agent-hash.txt') -Encoding UTF8
         }
         $serialLog = Get-SpikePlainGuestItem $volume 'ProgramData\Motor\hyperv-agent.log'
-        if ($serialLog) { Copy-Item -LiteralPath $serialLog.FullName -Destination (Join-Path $Directory 'hyperv-agent.log') }
+        if ($serialLog) {
+            Copy-Item -LiteralPath $serialLog.FullName -Destination (Join-Path $Directory 'hyperv-agent.log')
+            [ordered]@{ present=$true; bytes=$serialLog.Length; path=$serialLog.FullName } | ConvertTo-Json | Set-Content (Join-Path $Directory 'agent-log-state.json') -Encoding UTF8
+        } else {
+            [ordered]@{ present=$false; reason='absent or reparse path' } | ConvertTo-Json | Set-Content (Join-Path $Directory 'agent-log-state.json') -Encoding UTF8
+        }
         $files = @()
         $users = Get-SpikePlainGuestItem $volume 'Users'
         $profiles = if ($users) { @(Get-ChildItem -LiteralPath $users.FullName -Directory | Where-Object Name -Like 'motor-job*') } else { @() }

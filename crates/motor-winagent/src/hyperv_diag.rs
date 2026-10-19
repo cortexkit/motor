@@ -1,7 +1,7 @@
 //! Private diagnostics for the opt-in Hyper-V serial experiment.
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{self, Seek, SeekFrom, Write},
     sync::{Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -9,16 +9,38 @@ use std::{
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
 static START: OnceLock<Instant> = OnceLock::new();
 
-pub fn init() {
+pub fn init() -> io::Result<()> {
+    use sha2::Digest;
     let _ = START.set(Instant::now());
-    if let Ok(file) = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(r"C:\ProgramData\Motor\hyperv-agent.log")
-    {
-        let _ = LOG.set(Mutex::new(file));
-    }
+        .write(true)
+        .truncate(false)
+        .open(r"C:\ProgramData\Motor\hyperv-agent.log")?;
+    file.seek(SeekFrom::End(0))?;
+    let executable = std::env::current_exe()?;
+    let hash = sha2::Sha256::digest(std::fs::read(&executable)?);
+    writeln!(
+        file,
+        "agent_diag=2 feature=hyperv-spike exe={} sha256={hash:x}",
+        executable.display()
+    )?;
+    // Flush file creation and startup identity before any serial operation.
+    // A forced VM stop otherwise need not preserve an open cached log file.
+    file.sync_all()?;
+    LOG.set(Mutex::new(file))
+        .map_err(|_| io::Error::other("Hyper-V diagnostic log already initialized"))?;
     event("service starting");
+    sync();
+    Ok(())
+}
+
+pub fn sync() {
+    if let Some(log) = LOG.get()
+        && let Ok(file) = log.lock()
+    {
+        let _ = file.sync_data();
+    }
 }
 
 pub fn event(message: &str) {
