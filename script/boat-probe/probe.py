@@ -551,7 +551,9 @@ def main():
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
-    parser.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
+    mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh large; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
     args = parser.parse_args()
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
@@ -578,7 +580,10 @@ def main():
     try:
         if not args.cleanup:
             runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
-            if args.ssh_reach:
+            if args.runner_prerequisites:
+                from runner_prerequisites import run
+                run(runner)
+            elif args.ssh_reach:
                 from ssh_reach import SSHReach
                 SSHReach(runner).run()
             else:

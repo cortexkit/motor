@@ -20,6 +20,28 @@ exec, stop, resume, **delete/delete-own**, snapshot read/write, and provider usa
 access. An archive/stop-only key is not sufficient. No vault enrollment is created
 by this probe; the operator supplies their existing authorized reader.
 
+### Runner host prerequisites (no installs)
+
+```sh
+<key reader> | python3 script/boat-probe/probe.py --key-stdin --runner-prerequisites \
+  --output .cortexkit/internal-docs/research/boat-runner-prerequisites --max-minutes 5
+```
+
+Allow about **one minute**, plus cleanup. Creates one `large`, records
+`/etc/os-release`, systemd version and an actual `PrivatePIDs=yes` transient
+unit, effective SSH policy/configuration, and root open plus
+`KVM_GET_API_VERSION` on `/dev/kvm`. Nested-module flags are recorded separately;
+an API version alone does not prove a nested guest boots. No VM is created, no
+tools are installed, and PID 1 and sshd are never replaced. Unsupported
+`PrivatePIDs` is retained as raw evidence, not hidden by dropping the property.
+Creation uses `noEnv: true` so Boat attaches no account environment, secrets or
+credentials. An account-credential audit enumerates sensitive
+environment variable names and credential paths in `/root`, `/home/user` and
+`/etc`, without logging their values or contents; scan errors prevent a clean
+audit. This is a bounded detection check, not proof that arbitrary hidden secrets
+cannot exist. The ordinary cleanup/recovery contract below applies. Prerequisite success means
+evidence was collected, not that all runner capabilities passed.
+
 ### SSH reachability from an IPv4-only Mac
 
 `--ssh-reach` is a separate focused mode; it also requires local `ssh` and
