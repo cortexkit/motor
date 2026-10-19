@@ -241,3 +241,277 @@ async fn streamed_elapsed_queue_time_sets_a_local_deadline() {
     assert!(withdrawn.load(Ordering::SeqCst));
     follow.abort();
 }
+
+struct SpillPeer {
+    withdrawn: Arc<AtomicBool>,
+    direct: bool,
+}
+impl Connector for SpillPeer {
+    fn connect(
+        &self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        let withdrawn = self.withdrawn.clone();
+        let direct = self.direct;
+        Box::pin(async move {
+            let (client, mut peer) = tokio::io::duplex(65536);
+            tokio::spawn(async move {
+                assert!(matches!(
+                    read_frame_async(&mut peer).await.unwrap(),
+                    Some(Frame::Hello { .. })
+                ));
+                write_frame_async(
+                    &mut peer,
+                    &Frame::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        started: true,
+                        gate_jobs: true,
+                        platforms: vec!["linux".into()],
+                        default_branch_tip: false,
+                        return_paths: false,
+                    },
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(frame)) = read_frame_async(&mut peer).await {
+                    match frame {
+                        Frame::Have { repositories, .. } => write_frame_async(
+                            &mut peer,
+                            &Frame::HaveReply {
+                                repositories,
+                                git_dependencies: Some(Vec::new()),
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                        Frame::Run(run) => {
+                            write_frame_async(&mut peer, &Frame::Accepted(Accepted::new(id, 0)))
+                                .await
+                                .unwrap();
+                            if direct {
+                                crate::hosted::boat_tests::send_result(&mut peer, id, 0).await;
+                                return;
+                            }
+                            assert_eq!(run.queue_wait_limit_s, 0);
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::Heartbeat {
+                                    queue_wait_ms: Some(0),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        Frame::Withdraw { job_id, .. } => {
+                            assert_eq!(id, job_id);
+                            withdrawn.store(true, Ordering::SeqCst);
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::WithdrawReply {
+                                    outcome: WithdrawOutcome::Withdrawn,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::Terminal(
+                                    TerminalRecord::new(
+                                        id,
+                                        Outcome::RefusedBeforeStart {
+                                            reason: RefusalReason::QueueWaitExceeded,
+                                        },
+                                        0,
+                                        0,
+                                        0,
+                                    )
+                                    .with_ran(Ran::None),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                            return;
+                        }
+                        Frame::Heartbeat { .. } => {}
+                        _ => panic!("unexpected build-server frame"),
+                    }
+                }
+            });
+            Ok(Box::new(client) as Box<dyn Duplex>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
+    let boat = crate::hosted::boat_tests::Boat::new(1, true).await;
+    let scratch = ScratchDir::new("motor-spill-stream");
+    let repo = scratch.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let mut results = Vec::new();
+    for direct in [true, false] {
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let motor = Motor::with_connector(
+            boat.config.clone(),
+            &scratch.join(if direct {
+                "direct-state"
+            } else {
+                "spill-state"
+            }),
+            Arc::new(SpillPeer {
+                withdrawn: withdrawn.clone(),
+                direct,
+            }),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        motor
+            .storage
+            .create(id, 30, None, Some("test".into()), false)
+            .unwrap();
+        let path = repo.to_str().unwrap();
+        let request = RunRequest::new(path, path, path, "exit 23").with_timeout(30);
+        let (tx, mut rx) = mpsc::channel(32);
+        let (_wake, wake) = watch::channel(false);
+        let job = motor.clone();
+        let task = tokio::spawn(async move {
+            job.run_job(
+                id,
+                (request, crate::ReturnOptions::default()),
+                Vec::new(),
+                (30, !direct),
+                &tx,
+                wake,
+            )
+            .await
+        });
+        let mut output = Vec::new();
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await.unwrap().unwrap() {
+                    StreamRecord::Output(record) => output.extend(record.bytes.0),
+                    StreamRecord::Terminal(terminal) => break terminal,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(withdrawn.load(Ordering::SeqCst), !direct);
+        if !direct {
+            let state = motor.hosted_state(id).unwrap();
+            assert!(state.spill_wait_ms.is_some());
+            assert_eq!(state.placement.unwrap().host, "boat:test");
+            assert!(state.finish_done);
+        }
+        results.push((output, terminal.outcome, terminal.ran));
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[1].0, b"same output\n");
+    assert_eq!(results[1].1, Outcome::Exit { code: 23 });
+    assert_eq!(boat.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(boat.attaches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(path, _)| path.ends_with("/release")));
+}
+
+#[tokio::test]
+async fn boat_finish_is_first_for_terminal_refusal_and_unknown_and_never_releases() {
+    use crate::hosted::{test_http::Http, HostedJobState};
+    use std::sync::Mutex;
+    let observed = Arc::new(Mutex::new(None::<Arc<Storage>>));
+    let observe = observed.clone();
+    let http = Http::new(move |path, _| {
+        assert!(
+            path.ends_with("/finish"),
+            "Boat booking must never be released"
+        );
+        let id = Uuid::parse_str(path.split('/').nth(3).unwrap()).unwrap();
+        let guard = observe.lock().unwrap();
+        let job = guard.as_ref().unwrap().job(id).unwrap();
+        assert!(job.local_terminal.is_none());
+        assert!(job.terminal_observed_at_ms.is_none());
+        (
+            200,
+            serde_json::json!({"job_id":id,"settled_vcpu_ms":500,"released_vcpu_ms":59500}),
+        )
+    })
+    .await;
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    let scratch = ScratchDir::new("boat-finish-first");
+    let config = Config {
+        runner_instance: "test".into(),
+        broker_url: Some(http.url.clone()),
+        broker_token_source: crate::BrokerTokenSource::Fake,
+        ..Config::default()
+    };
+    let motor = Motor::open(config.clone(), &scratch.join("state")).unwrap();
+    *observed.lock().unwrap() = Some(motor.storage.clone());
+    for path in ["terminal", "refusal", "unknown"] {
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 30, None, None, false).unwrap();
+        let mut route = HostedJobState::new(&config);
+        route.placement = Some(motor_lease::Placement {
+            host: "boat:test".into(),
+            vm: Some("test".into()),
+        });
+        route.max_runtime_s = Some(30);
+        route.lease_attempted = true;
+        if path == "terminal" {
+            route.terminal = Some(
+                TerminalRecord::new(id, Outcome::Exit { code: 23 }, 0, 0, 0).with_ran(Ran::Remote),
+            );
+        }
+        motor.storage.hosted_route(id, route).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        if path == "refusal" {
+            motor
+                .refused(
+                    id,
+                    RefusalReason::Unreachable,
+                    None,
+                    Some("hosted_connect_failed".into()),
+                    &tx,
+                )
+                .await
+                .unwrap();
+        } else {
+            motor.finish_hosted(id, false, &tx).await.unwrap();
+        }
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            StreamRecord::Terminal(_)
+        ));
+        assert!(motor.hosted_state(id).unwrap().finish_done);
+    }
+    assert_eq!(http.requests.lock().unwrap().len(), 3);
+    let bodies = http.requests.lock().unwrap();
+    assert_eq!(bodies[0].1["outcome"], "exit");
+    assert_eq!(bodies[1].1["outcome"], "lost");
+    assert_eq!(bodies[2].1["outcome"], "lost");
+}

@@ -116,6 +116,10 @@ impl State {
         self.jobs.retain(|id, job| {
             self.active_jobs.contains_key(id)
                 || job.pending_cancel
+                || job
+                    .hosted
+                    .as_ref()
+                    .is_some_and(|s| s.pending_finish.is_some())
                 || job.terminal_observed_at_ms.is_none()
                 || job.terminal_delivered_at_ms.is_none()
                 || job.retain_until_ms.is_none_or(|until| until > now)
@@ -169,6 +173,28 @@ impl Drop for JobLease {
 }
 
 impl Storage {
+    pub(crate) fn pending_finishes(&self) -> Vec<(Uuid, crate::HostedJobState)> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let state = job.hosted.as_ref()?;
+                if state.finish_done
+                    || (state.pending_finish.is_none()
+                        && (state.terminal.is_none()
+                            || state
+                                .placement
+                                .as_ref()
+                                .is_none_or(|p| !p.host.starts_with("boat:"))))
+                {
+                    return None;
+                }
+                Some((*id, state.clone()))
+            })
+            .collect()
+    }
     pub fn return_result(&self, result: ReturnResult) -> io::Result<()> {
         let id = result.job_id;
         self.update(|state| {

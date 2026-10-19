@@ -1,16 +1,20 @@
-//! Broker credentials and saved job routes are separate from SSH. Jobs already
-//! placed on a hosted runner keep that route even if `hosted_runners` is disabled;
-//! reconnecting those jobs must never open an SSH connection.
+//! Broker credentials and saved routes are independent of the build-server SSH
+//! connector. Hosted jobs keep their route even after hosted routing is disabled.
 pub(crate) mod account;
+pub(crate) mod check;
+mod finish;
+pub(crate) mod placement;
+mod ssh;
+#[cfg(test)]
+pub(crate) mod test_http;
 mod tls;
 
 use crate::{config::BrokerTokenSource, storage::Storage, transport::Channel, Config};
 use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
-use motor_lease::{
-    LeaseRequest, LeaseResponse, Placement, ReattachRequest, ReleaseRequest, RequesterJwk,
-};
+use motor_lease::{LeaseRequest, Placement, ReattachRequest, ReleaseRequest, RequesterJwk};
 use motor_protocol::{HostedTerminal, RefusalReason, RunRequest, TerminalRecord, Uuid};
+use placement::Lease;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -41,6 +45,12 @@ pub struct HostedJobState {
     pub billing: BillingStatus,
     pub terminal: Option<TerminalRecord>,
     #[serde(default)]
+    pub(crate) pending_finish: Option<placement::Finish>,
+    #[serde(default)]
+    pub(crate) finish_done: bool,
+    #[serde(default)]
+    pub spill_wait_ms: Option<u64>,
+    #[serde(default)]
     pub(crate) lease_attempted: bool,
     #[serde(default)]
     pub(crate) placement_attempts: u8,
@@ -62,9 +72,14 @@ impl HostedJobState {
             ..Self::default()
         }
     }
-    pub(crate) fn lease(&mut self, lease: &LeaseResponse) {
+    pub(crate) fn lease(&mut self, lease: &Lease) {
         self.placement = Some(lease.placement.clone());
-        self.endpoint = Some(lease.endpoint.clone());
+        self.endpoint = Some(
+            lease
+                .ssh
+                .as_ref()
+                .map_or_else(|| lease.endpoint.clone(), |ssh| ssh.endpoint.clone()),
+        );
         self.endpoint_spki_sha256 = Some(lease.endpoint_spki_sha256.clone());
         self.max_runtime_s = Some(lease.max_s);
     }
@@ -93,6 +108,10 @@ pub(crate) enum Error {
     Auth,
     Expired,
     Spki,
+    SshKey,
+    Provisioning(u64),
+    SandboxLost,
+    BrokerRefused,
     HostFull,
     Capacity,
     Connect,
@@ -118,6 +137,10 @@ impl Error {
             Self::Auth => "hosted_auth",
             Self::Expired => "hosted_expired",
             Self::Spki => "hosted_spki_mismatch",
+            Self::SshKey => "hosted_ssh_host_key_mismatch",
+            Self::Provisioning(_) => "hosted_provisioning",
+            Self::SandboxLost => "hosted_sandbox_lost",
+            Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull => "hosted_host_full",
             Self::Capacity => "hosted_capacity",
             Self::Connect => "hosted_connect_failed",
@@ -143,12 +166,15 @@ impl Error {
             Self::Auth
             | Self::Expired
             | Self::Spki
+            | Self::SshKey
             | Self::AccountNotFound
             | Self::AccountAuthRequired
             | Self::AccountPermanent
             | Self::AccountInvalid => RefusalReason::RunnerAuthenticationFailed,
             Self::HostFull | Self::Capacity => RefusalReason::RunnerFull,
-            Self::Connect | Self::Broker | Self::AccountTransient(_) => RefusalReason::Unreachable,
+            Self::Connect | Self::Broker | Self::AccountTransient(_) | Self::Provisioning(_) => {
+                RefusalReason::Unreachable
+            }
             Self::Platform => RefusalReason::PlatformUnsupported,
             _ => RefusalReason::RequestRejected,
         }
@@ -163,6 +189,7 @@ impl Error {
     pub(crate) fn retry_after_ms(self) -> Option<u64> {
         match self {
             Self::AccountTransient(delay) => delay,
+            Self::Provisioning(delay) => Some(delay),
             _ => None,
         }
     }
@@ -321,6 +348,7 @@ impl Client {
             return Err(Error::Auth);
         }
         if !reply.status().is_success() {
+            let status = reply.status().as_u16();
             let code = reply.json::<serde_json::Value>().await.ok();
             return Err(
                 match code
@@ -335,7 +363,21 @@ impl Client {
                     Some("job_released") => Error::Released,
                     Some("budget_exhausted") => Error::Budget,
                     Some("platform_unsupported") => Error::Platform,
+                    Some("sandbox_lost") if status == 409 => Error::SandboxLost,
+                    Some("provisioning") => Error::Provisioning(
+                        code.as_ref()
+                            .and_then(|v| v.get("retry_after_ms"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1000),
+                    ),
                     Some("job_conflict" | "bad_request") => Error::Rejected,
+                    other if status == 409 => {
+                        let broker_code = other
+                            .filter(|code| motor_lease::valid_name(code))
+                            .unwrap_or("invalid_error_code");
+                        tracing::warn!(broker_code, "unrecognized hosted broker conflict");
+                        Error::BrokerRefused
+                    }
                     _ => Error::Broker,
                 },
             );
@@ -343,6 +385,14 @@ impl Client {
         reply.json().await.map_err(|_| Error::Broker)
     }
     pub(crate) async fn release(&self, id: Uuid) -> Result<(), Error> {
+        if self
+            .route
+            .placement
+            .as_ref()
+            .is_some_and(|p| p.host.starts_with("boat:"))
+        {
+            return Err(Error::Admitted);
+        }
         self.post::<_, motor_lease::ReleaseReply>(
             &format!("/v1/leases/{id}/release"),
             &ReleaseRequest::default(),
@@ -352,38 +402,40 @@ impl Client {
     }
     pub(crate) async fn attach(&self, id: Uuid, storage: &Storage) -> Result<Channel, Error> {
         let key = requester()?;
-        let lease: LeaseResponse = self
-            .post(&format!("/v1/leases/{id}/reattach"), &reattach_body(&key))
+        let lease: Lease = self
+            .post_ready(&format!("/v1/leases/{id}/reattach"), &reattach_body(&key))
             .await?;
         if self
             .route
             .placement
             .as_ref()
             .is_some_and(|p| p != &lease.placement)
-            || self
-                .route
-                .endpoint
-                .as_ref()
-                .is_some_and(|e| e != &lease.endpoint)
-            || self
-                .route
-                .endpoint_spki_sha256
-                .as_ref()
-                .is_some_and(|p| p != &lease.endpoint_spki_sha256)
+            || (lease.ssh.is_none()
+                && (self
+                    .route
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|e| e != &lease.endpoint)
+                    || self
+                        .route
+                        .endpoint_spki_sha256
+                        .as_ref()
+                        .is_some_and(|p| p != &lease.endpoint_spki_sha256)))
         {
             return Err(Error::Auth);
         }
         storage
             .hosted_update(id, |state| state.lease(&lease))
             .map_err(|_| Error::Broker)?;
-        tls::connect(id, &lease, &key, motor_lease::Purpose::Attach).await
+        self.connect(id, &lease, &key, motor_lease::Purpose::Attach)
+            .await
     }
     pub(crate) async fn run(
         &self,
         id: Uuid,
         request: &RunRequest,
         storage: &Arc<Storage>,
-    ) -> Result<(Channel, LeaseResponse), Error> {
+    ) -> Result<(Channel, Lease), Error> {
         let salt = storage.hosted_salt().map_err(|_| Error::Auth)?;
         let mut body = match storage
             .job(id)
@@ -434,7 +486,9 @@ impl Client {
                     state.retry_iat = Some(now_s());
                 })
                 .map_err(|_| Error::Broker)?;
-            let lease: LeaseResponse = match self.post_authorized("/v1/leases", &body, bearer).await
+            let lease: Lease = match self
+                .post_ready_authorized("/v1/leases", &body, bearer)
+                .await
             {
                 Ok(l) => l,
                 Err(Error::Broker) if attempt < 2 => continue,
@@ -459,11 +513,68 @@ impl Client {
             if lease.max_s < 10 {
                 return Err(Error::Short);
             }
-            match tls::connect(id, &lease, &key, motor_lease::Purpose::Run).await {
+            match self
+                .connect(id, &lease, &key, motor_lease::Purpose::Run)
+                .await
+            {
                 Ok(channel) => return Ok((channel, lease)),
+                Err(e) if lease.ssh.is_some() => return Err(e),
                 Err(e) if e.replaceable() && attempt < 2 => continue,
                 Err(e) => return Err(e),
             }
+        }
+    }
+    async fn post_ready<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<R, Error> {
+        self.post_ready_authorized(path, body, self.bearer().await?)
+            .await
+    }
+    async fn post_ready_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+        mut bearer: String,
+    ) -> Result<R, Error> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer))
+                .await
+                .unwrap_or(Err(Error::Provisioning(1000)))
+            {
+                Err(Error::Provisioning(ms)) => {
+                    let delay = Duration::from_millis(ms.clamp(100, 20_000));
+                    if tokio::time::Instant::now() + delay >= deadline {
+                        return Err(Error::Provisioning(ms));
+                    }
+                    tokio::time::sleep(delay).await;
+                    bearer = tokio::time::timeout_at(deadline, self.bearer())
+                        .await
+                        .unwrap_or(Err(Error::Provisioning(ms)))?;
+                }
+                result => return result,
+            }
+        }
+    }
+    async fn connect(
+        &self,
+        id: Uuid,
+        lease: &Lease,
+        key: &SigningKey,
+        purpose: motor_lease::Purpose,
+    ) -> Result<Channel, Error> {
+        if lease.ssh.is_some() {
+            let claims = tls::claims(id, lease, key, purpose)?;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let pipe = ssh::connect(lease, key).await?;
+                tls::authenticate(pipe, lease, key, &claims).await
+            })
+            .await
+            .unwrap_or(Err(Error::Connect))
+        } else {
+            tls::connect(id, lease, key, purpose).await
         }
     }
 }
@@ -482,5 +593,7 @@ pub(crate) async fn wait_after_iat(iat: u64) {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod boat_tests;
 #[cfg(test)]
 mod tests;

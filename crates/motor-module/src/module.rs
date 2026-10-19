@@ -499,7 +499,7 @@ impl Handler {
     /// Requests on a route the daemon attested as `Principal::Direct`. Enabling
     /// `admit_direct_exec` permits these local non-agent callers to start jobs and
     /// attach to, cancel or check jobs their route started or whose secret they
-    /// hold; nothing else.
+    /// hold, plus the credential-only hosted operator check.
     async fn handle_direct(
         &self,
         ctx: RequestCtx,
@@ -509,7 +509,7 @@ impl Handler {
         let op = envelope.op.as_str();
         if !matches!(
             op,
-            "exec.run" | "exec.attach" | "exec.cancel" | "exec.status"
+            "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" | "hosted.check"
         ) {
             return Ok(HandlerOutcome::Error {
                 code: "motor_op_not_permitted_for_principal".into(),
@@ -521,7 +521,16 @@ impl Handler {
             serde_json::from_value(params).map_err(io::Error::other)
         }
         match op {
+            "hosted.check" => response(
+                crate::hosted::check::check(self.account_tokens.as_ref(), &self.config).await,
+            ),
             "exec.run" => {
+                #[derive(Deserialize, Default)]
+                struct SpillOptions {
+                    #[serde(default)]
+                    allow_spill: bool,
+                }
+                let spill: SpillOptions = parse(envelope.params.clone())?;
                 let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
                 let request: RunRequest = parse(envelope.params)?;
                 let motor = self.initialized()?;
@@ -547,10 +556,11 @@ impl Handler {
                         return Ok(HandlerOutcome::Streamed);
                     }
                 };
-                let stream = motor.run_direct_with_returns(
+                let stream = motor.run_direct_with_spill(
                     request,
                     self.attribution(route, envelope.preset),
                     returns,
+                    spill.allow_spill,
                 )?;
                 motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
                 self.direct_jobs

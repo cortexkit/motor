@@ -1,5 +1,5 @@
 use super::{now_s, Error};
-use crate::transport::Channel;
+use crate::transport::{Channel, Duplex};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use motor_lease::{Claims, LeaseResponse, Prelude, Purpose, Version1};
@@ -117,7 +117,7 @@ pub(super) async fn connect(
         // SNI is only a TLS routing hint. The verifier above uses neither names
         // nor trust roots: the lease's SPKI is the sole certificate identity.
         let name = ServerName::try_from("hosted.invalid").map_err(|_| Error::Connect)?;
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
             .await
             .map_err(|e| {
@@ -127,38 +127,45 @@ pub(super) async fn connect(
                     Error::Connect
                 }
             })?;
-        // This is the first write of the token, strictly after certificate pinning
-        // and TLS proof of possession of the certificate's private key.
-        write(
-            &mut tls,
-            &Prelude::LeaseHello {
-                v: Version1,
-                token: lease.job_token.clone(),
-                requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
-            },
-        )
-        .await
-        .map_err(|_| Error::Connect)?;
-        let challenge = match read(&mut tls).await.map_err(|_| Error::Connect)? {
-            Prelude::Challenge(c) => c,
-            Prelude::LeaseRefused { reason } => return Err(Error::from_host(&reason)),
-            _ => return Err(Error::Auth),
-        };
-        let sig = motor_lease::sign_challenge(&challenge, &claims, key, now_s())
-            .map_err(|_| Error::Auth)?;
-        write(&mut tls, &Prelude::ChallengeResponse { sig })
-            .await
-            .map_err(|_| Error::Connect)?;
-        match read(&mut tls).await.map_err(|_| Error::Connect)? {
-            Prelude::LeaseOk {} => Channel::from_hosted(Box::new(tls))
-                .await
-                .map_err(|_| Error::Connect),
-            Prelude::LeaseRefused { reason } => Err(Error::from_host(&reason)),
-            _ => Err(Error::Auth),
-        }
+        authenticate(Box::new(tls), lease, key, &claims).await
     })
     .await
     .unwrap_or(Err(Error::Connect))
+}
+
+// Both transports authenticate the server before handing us a pipe. No token
+// is written until either the TLS SPKI or the SSH host key has been pinned.
+pub(super) async fn authenticate(
+    mut pipe: Box<dyn Duplex>,
+    lease: &LeaseResponse,
+    key: &SigningKey,
+    claims: &Claims,
+) -> Result<Channel, Error> {
+    write(
+        &mut pipe,
+        &Prelude::LeaseHello {
+            v: Version1,
+            token: lease.job_token.clone(),
+            requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
+        },
+    )
+    .await
+    .map_err(|_| Error::Connect)?;
+    let challenge = match read(&mut pipe).await.map_err(|_| Error::Connect)? {
+        Prelude::Challenge(c) => c,
+        Prelude::LeaseRefused { reason } => return Err(Error::from_host(&reason)),
+        _ => return Err(Error::Auth),
+    };
+    let sig =
+        motor_lease::sign_challenge(&challenge, claims, key, now_s()).map_err(|_| Error::Auth)?;
+    write(&mut pipe, &Prelude::ChallengeResponse { sig })
+        .await
+        .map_err(|_| Error::Connect)?;
+    match read(&mut pipe).await.map_err(|_| Error::Connect)? {
+        Prelude::LeaseOk {} => Channel::from_hosted(pipe).await.map_err(|_| Error::Connect),
+        Prelude::LeaseRefused { reason } => Err(Error::from_host(&reason)),
+        _ => Err(Error::Auth),
+    }
 }
 pub(super) async fn write<W: AsyncWrite + Unpin>(
     writer: &mut W,

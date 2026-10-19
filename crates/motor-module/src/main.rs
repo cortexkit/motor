@@ -23,6 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Some("run") => std::process::exit(motor_module::cli::main(&args[1..]).await.into()),
+        Some("hosted-check") => std::process::exit(
+            motor_module::cli::hosted_check_main(&args[1..])
+                .await
+                .into(),
+        ),
         Some("attach") => {
             std::process::exit(motor_module::cli::attach_main(&args[1..]).await.into())
         }

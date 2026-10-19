@@ -53,6 +53,7 @@ pub const HEADLINE: &str = "run a command on the remote build server (ck motor r
 pub const TOP_HELP: &str = "\
 usage: ck motor run [OPTIONS] -- COMMAND...
        ck motor attach JOB_ID [--secret-file PATH] [--status]
+       ck motor hosted-check
 
 Runs COMMAND on the remote build server and streams its output here.
 See `ck motor run --help` for the options and exit statuses.";
@@ -77,6 +78,7 @@ and stderr here as they arrive.
   --return-path PATH  return this absolute workspace file (repeatable, at most 64)
   --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
   --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
+  --allow-spill       allow this gate job to spill to hosted capacity when configured
 
 The words after -- are joined with single spaces into one command line, which
 bash runs on the runner (bash -c). Quote shell syntax as one argument:
@@ -112,6 +114,7 @@ pub struct RunArgs {
     pub secret_file: Option<PathBuf>,
     pub return_paths: Vec<String>,
     pub return_max_bytes: Option<u64>,
+    pub allow_spill: bool,
 }
 
 /// Parse the words after `ck motor run`. An option takes its value as the
@@ -132,6 +135,10 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
         if word == "-h" || word == "--help" {
             return Ok(Invocation::Help);
+        }
+        if word == "--allow-spill" {
+            parsed.allow_spill = true;
+            continue;
         }
         let (name, inline) = match word.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(value.to_string())),
@@ -778,6 +785,7 @@ pub struct SubcClient {
     route: RouteHandle,
     module_id: String,
     returns: crate::ReturnOptions,
+    allow_spill: bool,
 }
 
 impl SubcClient {
@@ -817,6 +825,7 @@ impl SubcClient {
             route,
             module_id,
             returns: crate::ReturnOptions::default(),
+            allow_spill: false,
         })
     }
 
@@ -885,8 +894,11 @@ fn connection_error(error: CallError) -> SubmitError {
 #[async_trait]
 impl ExecClient for SubcClient {
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
-        self.subscribe("exec.run", self.returns.params(request), None)
-            .await
+        let mut params = self.returns.params(request);
+        if self.allow_spill {
+            params["allow_spill"] = json!(true);
+        }
+        self.subscribe("exec.run", params, None).await
     }
 
     async fn attach(
@@ -1001,6 +1013,7 @@ pub async fn main(args: &[String]) -> u8 {
             .return_max_bytes
             .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
     };
+    client.allow_spill = args.allow_spill;
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     drive_run(
@@ -1012,6 +1025,54 @@ pub async fn main(args: &[String]) -> u8 {
         &mut interrupts,
     )
     .await
+}
+
+/// Ask the running module to mint a vault token, without enabling hosted jobs.
+pub async fn hosted_check_main(args: &[String]) -> u8 {
+    if !args.is_empty() {
+        eprintln!("usage: ck motor hosted-check");
+        return EXIT_USAGE;
+    }
+    let workspace = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => return EXIT_REFUSED,
+    };
+    let client = match SubcClient::connect(&workspace).await {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("hosted-check: module unavailable");
+            return EXIT_REFUSED;
+        }
+    };
+    let result = client
+        .consumer
+        .request(
+            &client.route,
+            direct_envelope("hosted.check", json!({}), None),
+            CallOptions::default(),
+        )
+        .await;
+    match result
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::hosted::check::Check>(&bytes).ok())
+    {
+        Some(check) => {
+            let ok = check.status == "ok";
+            println!(
+                "{}",
+                serde_json::to_string(&check).expect("serializable hosted check")
+            );
+            if ok {
+                0
+            } else {
+                EXIT_REFUSED
+            }
+        }
+        None => {
+            eprintln!("hosted-check: module refused or unavailable");
+            EXIT_REFUSED
+        }
+    }
 }
 
 pub async fn attach_main(args: &[String]) -> u8 {
@@ -1163,6 +1224,7 @@ mod tests {
                 secret_file: None,
                 return_paths: Vec::new(),
                 return_max_bytes: None,
+                allow_spill: false,
             }
         );
         assert_eq!(command_line(&args.command), "cargo test -p x");
@@ -1175,6 +1237,11 @@ mod tests {
         };
         assert_eq!(args.timeout, DEFAULT_TIMEOUT_SECS);
         assert_eq!(args.vcpus, None);
+        assert!(!args.allow_spill);
+        let Ok(Invocation::Run(args)) = parse_args(&words("--allow-spill -- true")) else {
+            panic!("expected a run")
+        };
+        assert!(args.allow_spill);
         assert!(args.env.is_empty() && args.siblings.is_empty());
         // Everything after -- belongs to the command, options included.
         let Ok(Invocation::Run(args)) = parse_args(&words("-- ls --help")) else {
