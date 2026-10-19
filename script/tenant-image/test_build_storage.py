@@ -20,18 +20,27 @@ def row(identifier, path):
     return f"{identifier} 1 0:2 / {escaped} rw - tmpfs stub rw\n"
 
 
+def virtual_stat():
+    inodes = {}
+    def lookup(path):
+        number = inodes.setdefault(str(path), len(inodes) + 1)
+        return os.stat_result((0o40755, number, 1, 1, 0, 0, 0, 0, 0, 0))
+    return lookup
+
+
 class BuildStorageTests(unittest.TestCase):
     def test_mount_fence_decodes_paths_and_does_not_match_sibling_prefix(self):
         text = ROOT + row(2, "/stage space/root/dev") + row(3, "/stage space-old/root/dev")
-        self.assertEqual(storage.mounts_under(Path("/stage space"), text), [(2, Path("/stage space/root/dev"))])
+        lookup = virtual_stat()
+        self.assertEqual(storage.mounts_under(Path("/stage space"), text, lookup), [(2, Path("/stage space/root/dev"))])
         with self.assertRaisesRegex(RuntimeError, "/stage space/root/dev"):
-            storage.assert_unmounted(Path("/stage space"), lambda: text)
-        storage.assert_unmounted(Path("/other"), lambda: text)
+            storage.assert_unmounted(Path("/stage space"), lambda: text, lookup)
+        storage.assert_unmounted(Path("/other"), lambda: text, lookup)
 
     def test_empty_or_malformed_mountinfo_never_means_unmounted(self):
         for text in ("", "broken", "1 0 8:1 / relative rw - xfs /dev/root rw\n"):
             with self.subTest(text=text), self.assertRaises(ValueError):
-                storage.assert_unmounted(Path("/stage"), lambda: text)
+                storage.assert_unmounted(Path("/stage"), lambda: text, virtual_stat())
 
     def test_blocking_unmounts_are_deepest_first_and_remove_stacked_mounts(self):
         entries = [(2, Path("/stage/root/dev")), (3, Path("/stage/root/dev/pts")),
@@ -46,7 +55,7 @@ class BuildStorageTests(unittest.TestCase):
             matches = [entry for entry in entries if entry[1] == Path(argv[-1])]
             entries.remove(max(matches))
         with mock.patch("builtins.print"):
-            storage.unmount_tree(Path("/stage"), read, execute)
+            storage.unmount_tree(Path("/stage"), read, execute, virtual_stat())
         self.assertEqual(entries, [])
         self.assertEqual(commands[0][-1], "/stage/root/dev/shm/deep")
         self.assertEqual(commands[1][-1], "/stage/root/dev/pts")
@@ -57,10 +66,51 @@ class BuildStorageTests(unittest.TestCase):
         error = subprocess.CalledProcessError(32, ["umount"], stderr="target is busy")
         execute = mock.Mock(side_effect=error)
         with self.assertRaisesRegex(RuntimeError, "/stage/root/dev.*target is busy"):
-            storage.unmount_tree(Path("/stage"), lambda: text, execute)
+            storage.unmount_tree(Path("/stage"), lambda: text, execute, virtual_stat())
         self.assertEqual(execute.call_count, 1)
         with self.assertRaisesRegex(RuntimeError, "mount remains.*dev"):
-            storage.unmount_tree(Path("/stage"), lambda: text, mock.Mock())
+            storage.unmount_tree(Path("/stage"), lambda: text, mock.Mock(), virtual_stat())
+
+    def test_mount_fence_matches_directory_identity_through_another_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source, alias = base / "source", base / "alias"
+            stage = source / "stage"
+            (stage / "dev").mkdir(parents=True)
+            alias.symlink_to(source, target_is_directory=True)
+            mounted = alias / "stage/dev"
+            text = ROOT + row(2, mounted)
+            self.assertNotIn(str(stage), str(mounted))
+            self.assertEqual(storage.mounts_under(stage, text), [(2, mounted)])
+            with self.assertRaisesRegex(RuntimeError, "alias/stage/dev"):
+                storage.assert_unmounted(stage, lambda: text)
+
+    def test_mount_on_stage_alias_is_found_even_when_it_hides_the_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source, alias = base / "source", base / "alias"
+            stage = source / "stage"
+            stage.mkdir(parents=True)
+            alias.symlink_to(source, target_is_directory=True)
+            mounted = alias / "stage"
+            real = stage.stat()
+            def lookup(path):
+                if path == mounted:
+                    return os.stat_result((0o40755, 1, real.st_dev + 1, 1, 0, 0, 0, 0, 0, 0))
+                return os.stat(path)
+            self.assertEqual(storage.mounts_under(stage, ROOT + row(2, mounted), lookup), [(2, mounted)])
+
+    def test_private_view_rejects_shared_or_unmounted_storage(self):
+        root = Path("/var/lib/motor-vm")
+        for flags in ("", "master:9"):
+            text = ROOT + f"2 1 8:1 /vm {root} rw {flags} - xfs /dev/root rw\n"
+            self.assertEqual(storage.require_private_view(root, lambda: text)["mount_ids"], [2])
+        for flags in ("shared:2", "shared:2 master:9", "unbindable"):
+            text = ROOT + f"2 1 8:1 /vm {root} rw {flags} - xfs /dev/root rw\n"
+            with self.subTest(flags=flags), self.assertRaisesRegex(RuntimeError, "private or slave"):
+                storage.require_private_view(root, lambda: text)
+        with self.assertRaisesRegex(RuntimeError, "not a mountpoint"):
+            storage.require_private_view(root, lambda: ROOT)
 
     def test_allocated_bytes_ignore_sparse_holes_links_and_mounted_subtrees(self):
         with tempfile.TemporaryDirectory() as tmp:

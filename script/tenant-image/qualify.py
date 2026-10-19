@@ -24,12 +24,16 @@ import urllib.request
 import uuid
 from typing import Any
 
+from build_storage import mounts_under, require_private_view
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
 HELPER_SOCKET = Path("/run/motor-vm-helper.sock")
+MOUNTINFO = Path("/proc/self/mountinfo")
+FORWARDING = Path("/proc/sys/net/ipv4/ip_forward")
 FLOOR = 170 * 1024**3
 GIB = 1024**3
 LIVE = ("hosted image live inventory: 10 checks passed (overlay, read-only lower, tmpfs, size, "
@@ -66,6 +70,33 @@ def error_evidence(error):
             value = getattr(error, name, None)
             details[name] = value.decode(errors="replace") if isinstance(value, bytes) else value
     return details
+
+
+def unit_not_loaded(result):
+    output = result.stdout or b""
+    error = result.stderr or b""
+    text = (output + error).decode(errors="replace").lower()
+    return result.returncode in (1, 4, 5) and ("not loaded" in text or "could not be found" in text or "loadstate=not-found" in text)
+
+
+def remove_owned_tree(path):
+    def missing_only(_function, _path, error):
+        if not isinstance(error[1], FileNotFoundError):
+            raise error[1]
+    shutil.rmtree(path, onerror=missing_only)
+
+
+def stage_program(source, destination, own=os.chown):
+    destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    own(destination.parent, 0, 0)
+    destination.parent.chmod(0o755)
+    with source.open("rb") as incoming, destination.open("xb") as output:
+        shutil.copyfileobj(incoming, output)
+    destination.chmod(0o755)
+    own(destination, 0, 0)
+    info = destination.lstat()
+    return dict(source=str(source), path=str(destination), uid=info.st_uid, gid=info.st_gid,
+                mode=oct(info.st_mode & 0o7777), sha256=hashlib.sha256(destination.read_bytes()).hexdigest())
 
 
 def qualification_args(original):
@@ -128,6 +159,12 @@ def run_request(identifier, commit, tree, bundle, command):
                 bundles=[dict(index=0, repository=WORKSPACE, length=len(bundle), sha256=hashlib.sha256(bundle).hexdigest())])
 
 
+def helper_unit_command(unit, binary, config):
+    return ["systemd-run", "--collect", "--unit", unit, "--property=Delegate=yes", "--property=DelegateSubgroup=helper",
+            "--property=Requires=motor-vm-storage-private.service", "--property=After=motor-vm-storage-private.service",
+            "--property=KillMode=control-group", binary, "--config", config]
+
+
 def assert_job(frames, code, expected_stdout, expected_stderr):
     streams = {"stdout": bytearray(), "stderr": bytearray()}
     terminals = []
@@ -156,6 +193,7 @@ class Harness:
         self.verdicts = {}
         self.name = "qualify-" + uuid.uuid4().hex[:12]
         self.work = ROOT / self.name
+        self.binary_dir = self.work / "bin"
         self.image = ROOT / "tenant-images" / self.name
         self.home = ROOT / "tenants" / self.name
         self.registry = REGISTRY / (self.name + ".json")
@@ -176,11 +214,12 @@ class Harness:
         self.log.flush()
         print(json.dumps(record), flush=True)
 
-    def run(self, *args, input=None, **kwargs):
+    def run(self, *args, input=None, allow_missing_unit=False, **kwargs):
         result = subprocess.run([str(a) for a in args], input=input, capture_output=True, timeout=600, **kwargs)
         self.record("command", argv=[str(a) for a in args], code=result.returncode,
                     stdout=result.stdout.decode(errors="replace"), stderr=result.stderr.decode(errors="replace"))
-        if result.returncode:
+        missing = allow_missing_unit and str(args[0]) == "systemctl" and unit_not_loaded(result)
+        if result.returncode and not missing:
             raise RuntimeError(f"command failed: {args[0]} (exit {result.returncode})")
         return result.stdout
 
@@ -220,8 +259,13 @@ class Harness:
             time.sleep(.1)
 
     def console(self):
-        return "\n".join(p.read_text(errors="replace") for p in
-                         [self.results / "base-console.log", self.home / "console.log"] if p.exists())
+        chunks = []
+        for path in (self.results / "base-console.log", self.home / "console.log"):
+            try:
+                chunks.append(path.read_text(errors="replace"))
+            except FileNotFoundError:
+                pass
+        return "\n".join(chunks)
 
     def expect_console(self, line):
         def check():
@@ -255,6 +299,22 @@ class Harness:
         path.write_text(json.dumps(body, indent=2) + "\n")
         path.chmod(mode)
 
+    def wait_for_helper(self, unit):
+        def ready():
+            state = self.run("systemctl", "show", unit, "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
+                             "-p", "Result", "-p", "ExecMainStatus", allow_missing_unit=True).decode()
+            if not state.strip() or any(setting in state.splitlines() for setting in ("ActiveState=failed", "ActiveState=inactive", "LoadState=not-found")):
+                journal = self.run("journalctl", "-u", unit, "--no-pager", "-n", "80").decode()
+                raise RuntimeError(f"helper exited before listening: {state}; journal: {journal}")
+            if HELPER_SOCKET.exists():
+                try:
+                    self.helper("adopt")
+                    return True
+                except (FileNotFoundError, ConnectionRefusedError, PermissionError):
+                    pass
+            return False
+        self.wait(ready, "helper listener did not appear", 30)
+
     def launch(self, binary, *args, host_user=False):
         output = (self.results / (Path(binary).name + ".log")).open("ab", buffering=0)
         process = subprocess.Popen([str(binary), *map(str, args)], stdout=output, stderr=output,
@@ -275,6 +335,7 @@ class Harness:
     def preflight(self):
         if sys.platform != "linux" or os.geteuid() != 0 or self.uid == 0:
             raise RuntimeError("requires Linux root and a non-root --host-user")
+        self.record("vm_storage_propagation", evidence=require_private_view(ROOT))
         guard(shutil.disk_usage(ROOT).free, 54 * GIB)
         if HELPER_SOCKET.exists() or HELPER_SOCKET.is_symlink() or any(REGISTRY.glob("*.json")):
             raise RuntimeError("refusing an existing helper socket or registered tenants; never interrupt a live helper")
@@ -304,11 +365,14 @@ class Harness:
         for directory in (ROOT, REGISTRY, BINDINGS.parent, ROOT / "tenants", ROOT / "jail"):
             directory.mkdir(parents=True, exist_ok=True)
             self.provisioner.trusted(directory)
+        alias_output = self.run("unshare", "--mount", "--propagation", "private", "--", "python3", HERE / "test_mount_alias_root.py").decode()
+        if not exact_line(alias_output, "PASS real bind-alias mount fence: 2 checks passed"):
+            raise RuntimeError("real bind-alias fixture did not report both checks; no skip is a pass")
         baseline = self.host_state()
         if baseline["netns"] or baseline["tenant_taps"] or baseline["tenant_table"] or baseline["tenant_vmm"]:
             raise RuntimeError(f"pre-existing tenant/provision resources require investigation: {baseline}")
         self.baseline = baseline
-        self.forwarding_before = Path("/proc/sys/net/ipv4/ip_forward").read_text()
+        self.forwarding_before = FORWARDING.read_text()
         self.base_jails_before = set((ROOT / "jail").glob("provision-*"))
         self.bindings_before = BINDINGS.read_bytes() if BINDINGS.exists() else None
         if self.bindings_before is not None and json.loads(self.bindings_before):
@@ -326,13 +390,16 @@ class Harness:
                     tenant_table=any(v.get("table", {}).get("name") == "motor_tenant" for v in nft["nftables"]),
                     failed_units=failed.splitlines(),
                     netns=[line for line in netns.splitlines() if line.startswith("base-")],
-                    ipv4_forwarding=Path("/proc/sys/net/ipv4/ip_forward").read_text().strip(),
+                    ipv4_forwarding=FORWARDING.read_text().strip(),
                     tenant_vmm=[line for line in processes.splitlines()
                                 if re.search(r"--id[ =](tenant-[0-9]+|base-[0-9a-f]+)(?:\s|$)", line)])
 
     def provision(self):
         self.work.mkdir(mode=0o755)
         self.owned = True
+        for name in ("motor-vm-helper", "motor-host", "motor-fake-broker"):
+            self.record("staged_program", **stage_program(self.args.bin_dir.resolve() / name, self.binary_dir / name))
+        self.record("staged_program", **stage_program(Path("/usr/bin/true"), self.binary_dir / "unused-job-loader"))
         self.image.mkdir(mode=0o755)
         source = self.args.image.resolve()
         manifest = json.loads((source / "manifest.json").read_text())
@@ -366,23 +433,24 @@ class Harness:
             self.provisioner.provision(self.config, make_base=base, stage=stage)
         # The helper has one inert job slot because its existing configuration
         # requires one. Only persistent-tenant operations are sent by this lane.
-        snapshot = dict(vmstate="/unused", memory="/unused", rootfs="/unused", record="/unused")
+        (self.work / "unused-job-snapshots").mkdir(mode=0o700)
+        snapshot = {name: str(self.work / "unused-job-snapshots" / name) for name in ("vmstate", "memory", "rootfs", "record")}
         helper_config = dict(allowed_uids=[self.uid], socket_gid=self.gid, uid_base=290000,
                              job_account_range=dict(base=300000, count=1),
                              slots=[dict(cpus=self.args.cpuset, mems="0", cpu_max="100000 100000",
                                          memory_max=GIB, io_weight=10, io_max=None)],
                              jailer="/usr/local/lib/firecracker/1.17.0/jailer",
-                             firecracker="/usr/local/lib/firecracker/1.17.0/firecracker", loader="/usr/bin/true",
+                             firecracker="/usr/local/lib/firecracker/1.17.0/firecracker", loader=str(self.binary_dir / "unused-job-loader"),
                              job_snapshot=snapshot, scan_snapshot=snapshot, hugepages_per_slot=1,
                              agent_port=52, proxy_port=53)
         self.json_file(self.work / "helper.json", helper_config)
+        os.chown(self.work / "helper.json", 0, 0)
+        self.json_file(self.results / "helper-config.json", helper_config)
         unit = self.name + "-helper.service"
         self.units.append(unit)
         self.started_helper = True
-        self.run("systemd-run", "--collect", "--unit", unit, "--property=Delegate=yes", "--property=DelegateSubgroup=helper",
-                 "--property=KillMode=control-group", self.args.bin_dir.resolve() / "motor-vm-helper",
-                 "--config", self.work / "helper.json")
-        self.wait(HELPER_SOCKET.exists, "helper listener did not appear", 30)
+        self.run(*helper_unit_command(unit, self.binary_dir / "motor-vm-helper", self.work / "helper.json"))
+        self.wait_for_helper(unit)
         self.start_admission()
         # Admission itself does the first ensure, disk substitution and attachment.
         # This job also proves real output and an intentional nonzero exit return.
@@ -407,7 +475,7 @@ class Harness:
                       endpoint=f"127.0.0.1:{self.port}", endpoint_spki_sha256=self.pin, kid="qualification",
                       signing_seed=b64(broker_seed), registered_hosts=[dict(host=self.name, public_key=host_jwk)])
         self.json_file(self.work / "broker.json", broker)
-        self.launch(self.args.bin_dir.resolve() / "motor-fake-broker", "--runner-instance", self.name,
+        self.launch(self.binary_dir / "motor-fake-broker", "--runner-instance", self.name,
                     "--config", self.work / "broker.json", "--listen", f"127.0.0.1:{self.broker_port}", "--max-s", "30")
         self.wait(lambda: listening(self.broker_port), "fake broker did not start", 30)
         private = self.work / "host-private"
@@ -426,7 +494,7 @@ class Harness:
                       admin_socket=str(private / "admin.sock"), storage=str(ROOT),
                       fake_broker_url=f"http://127.0.0.1:{self.broker_port}")
         self.json_file(self.work / "host.json", config, 0o644)
-        self.launch(self.args.bin_dir.resolve() / "motor-host", self.work / "host.json", host_user=True)
+        self.launch(self.binary_dir / "motor-host", self.work / "host.json", host_user=True)
         self.wait(lambda: listening(self.port), "host admission did not start", 30)
 
     def job(self, number):
@@ -536,25 +604,30 @@ class Harness:
                 errors.append(describe_error(error))
 
         attempt(self.stop_processes)
-        if self.started_helper and self.registry.exists():
-            attempt(lambda: self.helper("stop_tenant"))
+        if self.started_helper and self.registry.exists() and HELPER_SOCKET.exists():
+            try:
+                self.helper("stop_tenant")
+            except (FileNotFoundError, ConnectionRefusedError):
+                self.record("helper_already_gone", tenant=self.name)
+            except Exception as error:
+                errors.append(describe_error(error))
         for unit in reversed(self.units):
             attempt(lambda unit=unit: self.run("systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState",
-                                               "-p", "Result", "-p", "ExecMainCode", "-p", "ExecMainStatus", "-p", "ControlGroup"))
+                                               "-p", "Result", "-p", "ExecMainCode", "-p", "ExecMainStatus", "-p", "ControlGroup", allow_missing_unit=True))
             attempt(lambda unit=unit: self.run("journalctl", "-u", unit, "--no-pager", "--output=short-monotonic"))
-            attempt(lambda unit=unit: self.run("systemctl", "stop", unit))
+            attempt(lambda unit=unit: self.run("systemctl", "stop", unit, allow_missing_unit=True))
             # Reset only this invocation's failed unit, never unrelated failures.
-            subprocess.run(["systemctl", "reset-failed", unit], capture_output=True, timeout=30)
+            attempt(lambda unit=unit: self.run("systemctl", "reset-failed", unit, allow_missing_unit=True))
         if self.owned:
             (self.results / "console.log").write_text(self.console())
-            mounts = Path("/proc/self/mountinfo").read_text()
+            mounts = MOUNTINFO.read_text()
             owned_paths = [self.work, self.home, self.image, ROOT / "jail/tenants" / self.name]
             extra_jails = set((ROOT / "jail").glob("provision-*")) - self.base_jails_before
             if extra_jails:
                 errors.append(f"base provisioning jails remain: {sorted(map(str, extra_jails))}")
                 owned_paths.extend(sorted(extra_jails))
-            mounted = [line for line in mounts.splitlines()
-                       if any(str(path) in line for path in owned_paths)]
+            mounted = sorted({str(point) for path in owned_paths if path.exists()
+                              for _, point in mounts_under(path, mounts)})
             self.record("teardown_mounts", remaining=mounted)
             if (self.home / "disk.img").exists():
                 loops = self.run("losetup", "-j", self.home / "disk.img").decode().strip()
@@ -576,7 +649,10 @@ class Harness:
                     attempt(lambda: self.run("nft", "delete", "table", "inet", "motor_tenant"))
                 self.registry.unlink(missing_ok=True)
                 if BINDINGS.exists():
-                    current = json.loads(BINDINGS.read_text())
+                    try:
+                        current = json.loads(BINDINGS.read_text())
+                    except FileNotFoundError:
+                        current = {}
                     expected = {self.name: dict(tenant=self.name, sub=self.config["sub"])} if hasattr(self, "config") else {}
                     if current not in ({}, expected):
                         errors.append("host bindings changed concurrently; refusing to overwrite")
@@ -587,10 +663,10 @@ class Harness:
                         BINDINGS.chmod(0o644)
                 for path in owned_paths:
                     if path.exists():
-                        shutil.rmtree(path)
+                        remove_owned_tree(path)
                 if self.started_helper:
                     HELPER_SOCKET.unlink(missing_ok=True)
-                Path("/proc/sys/net/ipv4/ip_forward").write_text(self.forwarding_before)
+                FORWARDING.write_text(self.forwarding_before)
         after = self.host_state()
         self.record("teardown_state", state=after)
         for key in ("tenant_vmm", "tenant_taps", "tenant_table", "netns"):

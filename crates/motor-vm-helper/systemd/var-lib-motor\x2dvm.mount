@@ -1,5 +1,6 @@
 [Unit]
 Description=Root-trusted bind view of Motor VM storage
+Wants=motor-vm-storage-private.service
 
 [Mount]
 What=/srv/build/vm

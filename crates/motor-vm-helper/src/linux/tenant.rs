@@ -90,7 +90,7 @@ impl LinuxTenants {
         tenant_network::install(&registries)?;
         for r in registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
-                fs::trusted(&std::fs::symlink_metadata(ancestor)?)?;
+                fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
             }
             let file = OpenOptions::new()
                 .read(true)
@@ -315,7 +315,7 @@ impl Backend for LinuxTenants {
             boundary_created = true;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&boundary, std::fs::Permissions::from_mode(0o700))?;
-            fs::trusted(&std::fs::symlink_metadata(&boundary)?)?;
+            fs::trusted(&boundary, &std::fs::symlink_metadata(&boundary)?)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             std::fs::create_dir(root.join("state"))?;
             std::fs::set_permissions(root.join("state"), std::fs::Permissions::from_mode(0o700))?;

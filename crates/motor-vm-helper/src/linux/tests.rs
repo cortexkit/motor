@@ -10,6 +10,35 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(&p).unwrap();
     p
 }
+
+#[test]
+fn trust_refusal_names_the_exact_path_owner_and_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = scratch("trust-diagnostic");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let error = fs::trusted(&path, &metadata).unwrap_err().0;
+    assert!(error.contains(&format!("path={}", path.display())));
+    assert!(error.contains(&format!("uid={}", metadata.uid())));
+    assert!(error.contains(&format!("gid={}", metadata.gid())));
+    assert!(error.contains("mode=0777"));
+    assert!(error.contains("symlink=false"));
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[test]
+fn trust_refusal_names_the_symlink_not_its_target() {
+    let root = scratch("trust-link");
+    let path = root.join("loader");
+    symlink("real-loader", &path).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let error = fs::trusted(&path, &metadata).unwrap_err().0;
+    assert!(error.contains(&format!("path={}", path.display())));
+    assert!(error.contains("symlink=true"));
+    assert!(error.contains("mode=0777"));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
 fn peer() -> Peer {
     Peer {
         uid: unsafe { libc::geteuid() },

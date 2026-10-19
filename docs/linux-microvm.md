@@ -32,7 +32,11 @@ JSON configuration. It is a bind mount of the root-owned `/srv/build/vm`
 directory on the XFS build disk. All ancestors of the mounted view are root-owned;
 `/srv/build` itself may remain owned by the unprivileged build account. Root VM
 services must use the mounted view, not the source spelling. Renaming the source
-from its writable parent does not move an already established bind mount.
+from its writable parent does not move an already established bind mount. The
+`motor-vm-storage-private.service` companion makes the protected view recursively
+private after the bind is mounted; a shared bind would otherwise propagate
+chroot mounts back into the source alias. The helper requires that companion,
+and `script/tenant-image/qualify.py` refuses a shared view before starting a VM.
 
 - Linux with cgroup v2, `openat2`, pidfds, `cgroup.kill` and `/dev/userfaultfd`,
   and XFS with reflink support at `/srv/build`.
@@ -59,13 +63,22 @@ sudo install -m 0755 target/release/motor-vm-helper /usr/local/libexec/motor-vm-
 sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-helper.service /etc/systemd/system/
 sudo install -d -o root -g root -m 0755 /srv/build/vm /var/lib/motor-vm
 sudo install -m 0644 'crates/motor-vm-helper/systemd/var-lib-motor\x2dvm.mount' /etc/systemd/system/
+sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage-private.service /etc/systemd/system/
 # Write /etc/motor-vm-helper.json, using crates/motor-vm-helper/fixtures/helper.json
 # as the shape: allowed uid, socket group, CPU topology and job-account range.
 sudo systemctl daemon-reload
 sudo systemctl enable --now 'var-lib-motor\x2dvm.mount'
+sudo systemctl start motor-vm-storage-private.service
+systemctl is-active motor-vm-storage-private.service
+findmnt --noheadings --output PROPAGATION /var/lib/motor-vm
 mountpoint /var/lib/motor-vm
 sudo systemctl enable --now motor-vm-helper
 ```
+
+The propagation query must report `private`, not `shared`. Install the companion
+before activation; the mount wants it, and `BindsTo=` stops it if the bind goes
+away so a later activation reapplies privacy. Apply storage-unit changes only
+after stopping/draining VMs, not during a qualification run.
 
 The helper unit requires the mounted view through `RequiresMountsFor=`. Install
 and activate the mount before image builds or provisioning as well. Existing

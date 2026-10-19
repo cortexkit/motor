@@ -211,28 +211,48 @@ pub fn trusted_file(path: &Path) -> Result<File> {
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
             current.push(name);
-            let meta = std::fs::symlink_metadata(&current)?;
-            trusted(&meta)?;
+            let meta = std::fs::symlink_metadata(&current).map_err(|error| {
+                Error(format!(
+                    "cannot inspect helper input {}: {error}",
+                    current.display()
+                ))
+            })?;
+            trusted(&current, &meta)?;
         } else if !matches!(component, std::path::Component::RootDir) {
-            return Err(Error(
-                "trusted path must be absolute without traversal".into(),
-            ));
+            return Err(Error(format!(
+                "trusted path must be absolute without traversal: {}",
+                path.display()
+            )));
         }
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error("trusted input is not a regular file".into()));
+        .open(path)
+        .map_err(|error| {
+            Error(format!(
+                "cannot open trusted helper input {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error(format!(
+            "trusted input is not a regular file: path={} uid={} gid={} mode={:04o}",
+            path.display(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode() & 0o7777
+        )));
     }
     Ok(file)
 }
-pub fn trusted(meta: &Metadata) -> Result<()> {
+pub fn trusted(path: &Path, meta: &Metadata) -> Result<()> {
     if meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.file_type().is_symlink() {
-        return Err(Error(
-            "helper input or directory must be root-owned, non-writable and not a symlink".into(),
-        ));
+        return Err(Error(format!(
+            "helper input or directory must be root-owned, non-writable and not a symlink: path={} uid={} gid={} mode={:04o} symlink={}",
+            path.display(), meta.uid(), meta.gid(), meta.mode() & 0o7777, meta.file_type().is_symlink()
+        )));
     }
     Ok(())
 }

@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -28,6 +29,103 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_program_staging_copies_bytes_not_symlink_or_writable_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "built-program"
+            source.write_bytes(b"reviewed program\n")
+            source.chmod(0o777)
+            link = root / "loader-link"
+            link.symlink_to(source)
+            destination = root / "trusted/bin/loader"
+            own = mock.Mock()
+            evidence = q.stage_program(link, destination, own=own)
+            self.assertEqual(destination.read_bytes(), b"reviewed program\n")
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(destination.stat().st_mode & 0o7777, 0o755)
+            self.assertEqual(source.stat().st_mode & 0o7777, 0o777)
+            own.assert_any_call(destination.parent, 0, 0)
+            own.assert_any_call(destination, 0, 0)
+            self.assertEqual(evidence["mode"], "0o755")
+            with self.assertRaises(FileExistsError):
+                q.stage_program(source, destination, own=own)
+
+    def test_not_loaded_unit_is_idempotent_but_access_denied_is_not(self):
+        harness = object.__new__(q.Harness)
+        harness.record = mock.Mock()
+        gone = subprocess.CompletedProcess([], 5, stdout=b"", stderr=b"Unit gone.service not loaded.\n")
+        with mock.patch.object(q.subprocess, "run", return_value=gone):
+            self.assertEqual(harness.run("systemctl", "stop", "gone.service", allow_missing_unit=True), b"")
+            with self.assertRaises(RuntimeError):
+                harness.run("systemctl", "stop", "gone.service")
+        denied = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"Access denied\n")
+        with mock.patch.object(q.subprocess, "run", return_value=denied), self.assertRaises(RuntimeError):
+            harness.run("systemctl", "stop", "gone.service", allow_missing_unit=True)
+
+    def test_helper_exit_reports_state_and_exact_journal_without_timeout(self):
+        harness = object.__new__(q.Harness)
+        harness.run = mock.Mock(side_effect=[b"LoadState=not-found\nActiveState=inactive\nExecMainStatus=1\n",
+                                             b"helper refusal: path=/trusted/loader uid=0 gid=0 mode=0777 symlink=true\n"])
+        with self.assertRaisesRegex(RuntimeError, "helper exited.*(?s:.*path=/trusted/loader uid=0)"):
+            harness.wait_for_helper("failed.service")
+        self.assertEqual(harness.run.call_count, 2)
+
+    def test_missing_tree_is_already_removed_but_permission_errors_propagate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q.remove_owned_tree(Path(tmp) / "missing")
+        def denied(path, onerror):
+            error = PermissionError("denied")
+            onerror(None, path, (PermissionError, error, None))
+        with mock.patch.object(q.shutil, "rmtree", side_effect=denied), self.assertRaises(PermissionError):
+            q.remove_owned_tree(Path("/not-used"))
+
+    def test_teardown_twice_tolerates_missing_helper_and_owned_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry, bindings, socket = root / "registry", root / "bindings.json", root / "helper.sock"
+            registry.mkdir()
+            mountinfo, forwarding = root / "mountinfo", root / "forwarding"
+            mountinfo.write_text("1 0 8:1 / / rw - xfs /dev/root rw\n")
+            forwarding.write_text("1\n")
+            harness = object.__new__(q.Harness)
+            harness.args = SimpleNamespace(tap_index=254)
+            harness.name = "owned-fixture"
+            harness.results = root / "results"
+            harness.results.mkdir()
+            harness.work, harness.home, harness.image = root / "work", root / "tenants/owned-fixture", root / "image"
+            harness.registry = registry / "owned-fixture.json"
+            harness.registry.write_text("{}\n")
+            for path in (harness.work, harness.home, harness.image):
+                path.mkdir(parents=True)
+            harness.units, harness.processes = ["gone.service"], []
+            harness.started_helper = harness.owned = True
+            harness.bindings_before = None
+            harness.base_jails_before = set()
+            harness.forwarding_before = "0\n"
+            harness.baseline = dict(failed_units=[])
+            harness.record = mock.Mock()
+            harness.helper = mock.Mock()
+            harness.run = mock.Mock(return_value=b"")
+            harness.console = mock.Mock(return_value="retained console\n")
+            harness.host_state = mock.Mock(return_value=dict(tenant_vmm=[], tenant_taps=[], tenant_table=False,
+                                                            netns=[], failed_units=[], ipv4_forwarding="0"))
+            with mock.patch.multiple(q, ROOT=root, REGISTRY=registry, BINDINGS=bindings, HELPER_SOCKET=socket,
+                                     MOUNTINFO=mountinfo, FORWARDING=forwarding):
+                harness.teardown()
+                harness.teardown()
+            harness.helper.assert_not_called()
+            self.assertFalse(harness.registry.exists())
+            self.assertFalse(harness.work.exists())
+            self.assertEqual(forwarding.read_text(), "0\n")
+            harness.run.assert_any_call("systemctl", "stop", "gone.service", allow_missing_unit=True)
+
+    def test_transient_helper_waits_for_the_real_host_private_storage_unit(self):
+        command = q.helper_unit_command("qualification.service", Path("/bin/helper"), Path("/config.json"))
+        self.assertIn("--property=Requires=motor-vm-storage-private.service", command)
+        self.assertIn("--property=After=motor-vm-storage-private.service", command)
+        self.assertIn("--property=DelegateSubgroup=helper", command)
+        self.assertEqual(command[-3:], [Path("/bin/helper"), "--config", Path("/config.json")])
+
     def test_qualification_and_provisioning_use_the_same_trusted_bind_root(self):
         provision = q.module("qualification_layout_provision", q.HERE.parent / "tenant-provision/provision.py")
         self.assertEqual(q.ROOT, Path("/var/lib/motor-vm"))

@@ -106,9 +106,11 @@ that still contains `.work`. Before manually
 removing a failed version to retry, check that no mounts remain under `.work`.
 Never recursively delete a chroot with live bind mounts. The rootfs subprocess
 runs in a private mount namespace, with its /dev subtree private too. Cleanup
-parses that namespace's mountinfo and performs blocking, non-lazy unmounts deepest
-first, including nested or stacked mounts. It refuses busy/unchanged mounts by
-name. The parent checks its own mountinfo before artifact promotion and again
+parses that namespace's mountinfo and identifies stage descendants by directory
+`(st_dev, st_ino)` ancestry (including the same directory through another bind
+alias), not by a mountpoint pathname prefix. It performs blocking, non-lazy
+unmounts deepest first, including nested or stacked mounts. It refuses
+busy/unchanged mounts by name. The parent checks its own mountinfo before artifact promotion and again
 immediately before stage removal; a failed fence retains staging and publishes
 no manifest. Successful builders remove scratch, then write `manifest.json` as
 their completion record. `python3 build.py check-mounts RETAINED_VERSION` is the
@@ -230,7 +232,15 @@ module store and locks module loading.
 `qualify.py` is an operator-only lane for an already built image. Run it as root
 on the dedicated Linux KVM server, **not** through the remote-job runner. It
 refuses an existing helper socket, registered tenants, tenant jails, tenant taps,
-tenant firewall table or base-boot network namespaces. It will not stop or
+tenant firewall table or base-boot network namespaces. `/var/lib/motor-vm` must
+be a mount with no shared propagation peer, so child mounts cannot be replicated
+back through `/srv/build/vm`. Install `motor-vm-storage-private.service` alongside
+the bind unit using [the VM storage install steps](../../docs/linux-microvm.md#install);
+it runs `mount --make-rprivate` on that view. Before any VM the harness also
+runs `test_mount_alias_root.py` in a private namespace: real bind-alias mounts
+must be detected/refused and then removed by the inode-aware cleanup helper.
+That privileged check is mandatory, not counted as passing when unavailable.
+It will not stop or
 replace an installed helper. Stop here if the host already serves tenant VMs;
 use a dedicated qualification host instead. Ordinary non-VM fleet jobs need not
 be stopped, but schedule the snapshot window off peak.
@@ -304,6 +314,19 @@ and the delivered `isolation::tests::hosted_job_cannot_open_vsock --ignored
 --exact` test as root, and later checks for failed guest units. There is no
 privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
 
+The harness copies `motor-vm-helper`, `motor-host` and `motor-fake-broker` into
+a fresh root-owned mode-0755 bin directory before invoking them. Its helper config is root-owned mode 0600.
+The legacy job-slot configuration still requires a loader even though this lane
+uses only persistent tenant operations; a regular mode 0755 copy of the system
+`true` program satisfies that startup input check without pointing at a system
+symlink. No legacy job VM is exercised or claimed. Firecracker/jailer remain the
+fixed, root-managed 1.17.0 installation. Startup reads the helper's unit state
+and journal, then sends the read-only `adopt` RPC (which observes the tenant
+without waking it) to prove the daemon is accepting requests, rather than merely
+waiting for a socket pathname. If an input fails the helper's root-owner,
+non-writable and no-symlink checks, the early-exit diagnostic names that input
+or ancestor with its uid/gid, mode and symlink status.
+
 The harness starts the real `motor-vm-helper` in a delegated transient unit and
 the real TLS `motor-host` admission server. A separate `motor-lease` fake broker
 issues a requester-bound lease for each job. The fake broker's seed is never
@@ -324,7 +347,9 @@ Teardown stops the guest through the helper before stopping its unit, removes
 only disposable qualification resources, and prints process/tap/firewall/mount/
 failed-unit evidence. Existing unrelated failed host units are reported as a
 baseline, not cleared. Cleanup errors fail qualification and identify retained
-paths; never recursively delete them while mounts or VMMs remain. SIGINT and
+paths; never recursively delete them while mounts or VMMs remain. Already
+unloaded units and missing owned files are treated as removed; access-denied,
+busy-mount and other real cleanup failures still fail the lane. SIGINT and
 SIGTERM trigger teardown; SIGKILL or host loss cannot do so.
 
 Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, the

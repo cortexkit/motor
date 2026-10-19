@@ -8,7 +8,7 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 GIB = 1024**3
 FREE_FLOOR = 170 * GIB
@@ -18,8 +18,7 @@ def read_mountinfo():
     return Path("/proc/self/mountinfo").read_text()
 
 
-def mounts_under(root, text):
-    root = Path(os.path.abspath(root))
+def mount_records(text):
     result = []
     lines = text.splitlines()
     if not lines:
@@ -31,19 +30,47 @@ def mounts_under(root, text):
         path = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4]))
         if not path.is_absolute():
             raise ValueError(f"nonabsolute mountpoint in mountinfo at line {number}")
-        if path == root or root in path.parents:
-            result.append((int(fields[0]), path))
+        separator = fields.index("-")
+        result.append((int(fields[0]), path, fields[6:separator]))
+    return result
+
+
+def mounts_under(root, text, stat_path: Callable[[Path], Any] = os.stat):
+    root = Path(os.path.abspath(root))
+    cache = {}
+    def identity(path):
+        if path not in cache:
+            try:
+                info = stat_path(path)
+                cache[path] = (info.st_dev, info.st_ino)
+            except FileNotFoundError:
+                cache[path] = None
+            except OSError as error:
+                raise RuntimeError(f"cannot resolve mount ancestry at {path}: {error}") from error
+        return cache[path]
+    expected = identity(root)
+    if expected is None:
+        raise ValueError(f"stage directory does not exist: {root}")
+    expected_parent = identity(root.parent)
+    result = []
+    for identifier, path, _ in mount_records(text):
+        # A bind alias has another pathname but the same directory object.
+        # Compare every mount's ancestry, not just the caller's path prefix.
+        if any(identity(parent) == expected or
+               (expected_parent is not None and parent.name == root.name and identity(parent.parent) == expected_parent)
+               for parent in (path, *path.parents)):
+            result.append((identifier, path))
     return sorted(result, key=lambda row: (len(row[1].parts), row[0]), reverse=True)
 
 
-def assert_unmounted(root, reader=read_mountinfo):
-    remaining = mounts_under(root, reader())
+def assert_unmounted(root, reader=read_mountinfo, stat_path: Callable[[Path], Any] = os.stat):
+    remaining = mounts_under(root, reader(), stat_path)
     if remaining:
         raise RuntimeError("refusing stage removal with mounted paths: " + ", ".join(str(path) for _, path in remaining))
 
 
-def unmount_tree(root, reader=read_mountinfo, execute=subprocess.run):
-    remaining = mounts_under(root, reader())
+def unmount_tree(root, reader=read_mountinfo, execute=subprocess.run, stat_path: Callable[[Path], Any] = os.stat):
+    remaining = mounts_under(root, reader(), stat_path)
     attempts = 0
     while remaining:
         path = remaining[0][1]
@@ -51,15 +78,26 @@ def unmount_tree(root, reader=read_mountinfo, execute=subprocess.run):
             execute(["umount", "--", str(path)], check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as error:
             raise RuntimeError(f"blocking umount failed for {path}: exit {error.returncode}; {error.stderr}") from error
-        updated = mounts_under(root, reader())
+        updated = mounts_under(root, reader(), stat_path)
         if updated == remaining:
             raise RuntimeError(f"mount remains after blocking umount: {path}")
         remaining = updated
         attempts += 1
         if attempts >= 4096 and remaining:
             raise RuntimeError(f"mount tree kept changing during cleanup: {remaining[0][1]}")
-    assert_unmounted(root, reader)
+    assert_unmounted(root, reader, stat_path)
     print(f"chroot cleanup: {attempts} blocking unmounts; no mounts below {root}", flush=True)
+
+
+def require_private_view(root, reader=read_mountinfo):
+    root = Path(os.path.abspath(root))
+    entries = [row for row in mount_records(reader()) if row[1] == root]
+    if not entries:
+        raise RuntimeError(f"protected VM view is not a mountpoint: {root}")
+    for identifier, _, flags in entries:
+        if any(flag.startswith("shared:") for flag in flags) or "unbindable" in flags:
+            raise RuntimeError(f"protected VM view must be private or slave, not shared/unbindable: {root} (mount {identifier}, {flags})")
+    return dict(mountpoint=str(root), mount_ids=[row[0] for row in entries], optional_fields=[row[2] for row in entries])
 
 
 def allocated_bytes(root, reader=read_mountinfo):

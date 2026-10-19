@@ -66,15 +66,15 @@ impl LinuxMachine {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(BUILD_ROOT)?;
-        fs::trusted(&base.metadata()?)?;
+        fs::trusted(Path::new(BUILD_ROOT), &base.metadata()?)?;
         for ancestor in Path::new(BUILD_ROOT).ancestors() {
-            fs::trusted(&std::fs::symlink_metadata(ancestor)?)?;
+            fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
         }
         let jail = Path::new(BUILD_ROOT).join("jail");
         if !jail.try_exists()? {
             std::fs::create_dir(&jail)?;
         }
-        fs::trusted(&std::fs::symlink_metadata(&jail)?)?;
+        fs::trusted(&jail, &std::fs::symlink_metadata(&jail)?)?;
         let cgroups = cgroup::Cgroups::discover()?;
         let tenants =
             crate::tenant::Controller(tenant::LinuxTenants::new(&config, cgroups.root.clone()));
@@ -111,7 +111,7 @@ impl LinuxMachine {
     fn remove_paths(&self, slot: usize) -> Result<()> {
         let boundary = self.boundary(slot);
         if boundary.try_exists()? {
-            fs::trusted(&std::fs::symlink_metadata(&boundary)?)?;
+            fs::trusted(&boundary, &std::fs::symlink_metadata(&boundary)?)?;
             // Unmount all descendants, not just today's two bind mounts: an
             // interrupted upgrade must not leave a mount referencing job data.
             let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
