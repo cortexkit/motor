@@ -73,6 +73,7 @@ pub enum Refusal {
     Expired,
     HostFull,
     Capacity,
+    InternalFailure,
 }
 impl Refusal {
     pub fn wire(self) -> &'static str {
@@ -81,6 +82,7 @@ impl Refusal {
             Self::Expired => "expired",
             Self::HostFull => "host_full",
             Self::Capacity => "capacity",
+            Self::InternalFailure => "internal_failure",
         }
     }
 }

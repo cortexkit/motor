@@ -107,8 +107,9 @@ class QualificationTests(unittest.TestCase):
             harness.helper = mock.Mock()
             harness.run = mock.Mock(return_value=b"")
             harness.console = mock.Mock(return_value="retained console\n")
+            external = "motor-job-unrelated.service loaded failed failed unrelated fleet job"
             harness.host_state = mock.Mock(return_value=dict(tenant_vmm=[], tenant_taps=[], tenant_table=False,
-                                                            netns=[], failed_units=[], ipv4_forwarding="0"))
+                                                            netns=[], failed_units=[external], ipv4_forwarding="0"))
             with mock.patch.multiple(q, ROOT=root, REGISTRY=registry, BINDINGS=bindings, HELPER_SOCKET=socket,
                                      MOUNTINFO=mountinfo, FORWARDING=forwarding):
                 harness.teardown()
@@ -118,6 +119,40 @@ class QualificationTests(unittest.TestCase):
             self.assertFalse(harness.work.exists())
             self.assertEqual(forwarding.read_text(), "0\n")
             harness.run.assert_any_call("systemctl", "stop", "gone.service", allow_missing_unit=True)
+            harness.record.assert_any_call("unrelated_new_failed_units", units=[external])
+            self.assertFalse(any(call.args[:3] == ("systemctl", "reset-failed", "motor-job-unrelated.service") for call in harness.run.call_args_list))
+
+    def test_failed_unit_ownership_uses_exact_names_or_tenant_components(self):
+        units, tenant = ["owned-helper.service"], "tenant-id"
+        self.assertTrue(q.owned_unit("owned-helper.service", "", units, tenant))
+        self.assertTrue(q.owned_unit("child.service", "/system.slice/tenants/tenant-id/child.service", units, tenant))
+        self.assertFalse(q.owned_unit("owned-helper.service-other", "/system.slice/other", units, tenant))
+        self.assertFalse(q.owned_unit("tenant-id-unrelated.service", "/system.slice/tenant-id-other/child.service", units, tenant))
+
+    def test_host_journal_archive_preserves_state_but_excludes_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "host-private"
+            journal = private / "journal"
+            (journal / "outbox-expired").mkdir(parents=True)
+            (journal / "journal.json").write_text('{"counter":42,"vms":{}}\n')
+            (journal / "journal.new").write_text("transient crash evidence")
+            (journal / "outbox-expired/1-0.json").write_text('{"job":"id"}\n')
+            (private / "seed").write_text("secret seed")
+            (journal / "not-state.key").write_text("not archived")
+            output = root / "results/host-state"
+            copied = q.archive_journal(journal, output)
+            assert copied is not None
+            self.assertEqual(set(copied), {"journal.json", "journal.new", "outbox-expired/1-0.json"})
+            self.assertEqual((output / "journal.json").read_text(), '{"counter":42,"vms":{}}\n')
+            self.assertFalse((output / "seed").exists())
+            self.assertFalse((output / "not-state.key").exists())
+            self.assertEqual((output / "journal.json").stat().st_mode & 0o777, 0o600)
+            (journal / "journal.json").unlink()
+            (journal / "journal.json").symlink_to(private / "seed")
+            with self.assertRaises(OSError):
+                q.archive_journal(journal, root / "no-link-read")
+            self.assertFalse((root / "no-link-read/journal.json").exists())
 
     def test_transient_helper_waits_for_the_real_host_private_storage_unit(self):
         command = q.helper_unit_command("qualification.service", Path("/bin/helper"), Path("/config.json"))

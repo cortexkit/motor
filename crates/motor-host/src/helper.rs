@@ -36,6 +36,7 @@ impl Helper {
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
         let bytes = serde_json::to_vec(&request)?;
+        tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], "helper_request");
         ensure!(bytes.len() < 4096, "helper request too large");
         stream.write_all(&bytes)?;
         stream.write_all(b"\n")?;
@@ -48,7 +49,13 @@ impl Helper {
             bytes.extend_from_slice(&buffer[..n]);
         }
         let reply: Value = serde_json::from_slice(&bytes)?;
-        ensure!(reply["result"] != "error", "helper refused request");
+        tracing::info!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], "helper_reply");
+        ensure!(
+            reply["result"] != "error",
+            "helper refused {}: {}",
+            request["op"],
+            reply["message"]
+        );
         Ok((reply, fds))
     }
 }
@@ -114,9 +121,10 @@ impl Control for Helper {
                 result => {
                     let detail: String = format!("{result:?}").chars().take(4096).collect();
                     tracing::error!(tenant, detail, "tenant_recovery_or_initialization_failed");
-                    return Err(
-                        crate::state::Error::Refused(crate::state::Refusal::Capacity).into(),
-                    );
+                    return Err(crate::state::Error::Refused(
+                        crate::state::Refusal::InternalFailure,
+                    ))
+                    .context(format!("guest tenant initialization failed: {detail}"));
                 }
             }
             if recovery {

@@ -59,6 +59,11 @@ fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
             "hosted_capacity",
         ),
         (
+            Error::InternalFailure,
+            RefusalReason::RequestRejected,
+            "hosted_internal_failure",
+        ),
+        (
             Error::Connect,
             RefusalReason::Unreachable,
             "hosted_connect_failed",
@@ -99,6 +104,30 @@ fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
     }
     assert!(!Error::Auth.replaceable());
     assert!(!Error::Expired.replaceable());
+    assert!(!Error::InternalFailure.replaceable());
+}
+
+#[tokio::test]
+async fn hosted_internal_failure_is_not_retried_before_or_after_lease_ok() {
+    for behavior in [
+        Behavior::Refuse("internal_failure"),
+        Behavior::RefuseHello("internal_failure"),
+    ] {
+        let h = Harness::new(behavior).await;
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let storage = stored(&scratch, id, h.route.clone());
+        assert_eq!(
+            Client::new(h.route.clone())
+                .run(id, &Harness::request(&scratch.0), &storage)
+                .await
+                .err(),
+            Some(Error::InternalFailure)
+        );
+        assert_eq!(h.requests.lock().unwrap().len(), 1);
+        assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

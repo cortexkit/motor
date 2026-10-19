@@ -168,7 +168,7 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
                     .unwrap_err()
                     .downcast_ref::<motor_host::state::Error>(),
                 Some(motor_host::state::Error::Refused(
-                    motor_host::state::Refusal::Capacity
+                    motor_host::state::Refusal::InternalFailure
                 ))
             ));
         }

@@ -173,3 +173,11 @@ broker identity used by the fake broker's fixtures. Without this field the
 production broker/JWKS URLs are unchanged. Never enable this field for a
 customer-serving host. `script/tenant-image/qualify.py` uses it only with an
 isolated journal and disposable tenant for operator qualification.
+
+Guest initialization, quota I/O and job-relay failures are `lease_refused` with
+`reason: "internal_failure"`, not retryable capacity. Host logs retain the exact
+guest/helper error and stage-specific wake/quota/relay records; clients receive
+only the generic typed reason. Actual capacity/host-full/expiry/auth refusals keep
+their previous meanings. The hosted client recognizes internal failure both in
+the lease prelude and after lease acceptance while awaiting the runner Hello,
+and does not request replacement leases for it.

@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Default)]
 struct Fake {
+    fail: Mutex<Option<&'static str>>,
     calls: Mutex<Vec<String>>,
     peers: Mutex<Vec<UnixStream>>,
 }
@@ -19,14 +20,23 @@ impl Control for Fake {
     }
     fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
         self.calls.lock().unwrap().push("wake".into());
+        if *self.fail.lock().unwrap() == Some("wake") {
+            bail!("unsafe guest /usr/local/lib");
+        }
         Ok(1)
     }
     fn quota(&self, _: &str, vcpus: u32) -> Result<()> {
         self.calls.lock().unwrap().push(format!("quota:{vcpus}"));
+        if *self.fail.lock().unwrap() == Some("quota") {
+            bail!("quota control I/O failure");
+        }
         Ok(())
     }
     fn relay(&self, _: &str, port: u32) -> Result<UnixStream> {
         self.calls.lock().unwrap().push(format!("relay:{port}"));
+        if port == 52 && *self.fail.lock().unwrap() == Some("relay") {
+            bail!("vsock connect failed: diagnostic canary");
+        }
         if port != 52 {
             bail!("no lifecycle stream in this fixture");
         }
@@ -69,6 +79,30 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
         .thumbprint()
         .unwrap();
     (runtime, fake, broker, requester, c)
+}
+
+#[tokio::test]
+async fn wake_quota_and_relay_failures_are_internal_not_capacity() {
+    for stage in ["wake", "quota", "relay"] {
+        let (runtime, fake, broker, requester, claims) = fixture();
+        *fake.fail.lock().unwrap() = Some(stage);
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(runtime, server));
+        let challenge = hello(&mut client, &broker, &requester, &claims).await;
+        assert_eq!(
+            respond(&mut client, &requester, &claims, challenge).await,
+            json!({"type":"lease_ok"})
+        );
+        write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut client).await.unwrap(),
+            json!({"type":"lease_refused","reason":"internal_failure"}),
+            "{stage}"
+        );
+        assert!(task.await.unwrap().is_err());
+    }
 }
 async fn hello(
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
@@ -504,6 +538,9 @@ async fn waiting_refusal(reason: motor_host::state::Refusal) {
                     unix_ms(),
                 )
                 .unwrap();
+            }
+            Refusal::InternalFailure => {
+                panic!("internal failures occur during delivery, not admission waiting")
             }
         }
     }

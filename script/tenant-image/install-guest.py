@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import urllib.request
 
@@ -15,6 +16,7 @@ PREFIX = Path("/usr/local/lib/motor")
 GUEST_SERVICES = ("motor-tenant-agent.service", "motor-net-rules.service", "motor-image-check.service")
 MODULE_LOAD_DIRS = ("etc/modules-load.d", "run/modules-load.d", "usr/local/lib/modules-load.d",
                     "usr/lib/modules-load.d", "lib/modules-load.d")
+AGENT_VALIDATED_PATHS = (Path("/tenant"), Path("/Users"), Path("/home"), PREFIX / "cargo/bin")
 
 
 def run(*args, capture=False) -> str:
@@ -133,12 +135,43 @@ def verify_no_module_load_requests(root):
     return []
 
 
+def agent_path_components(root):
+    paths = {root}
+    for path in AGENT_VALIDATED_PATHS:
+        current = root
+        for part in path.parts[1:]:
+            current = current / part
+            paths.add(current)
+    return sorted(paths, key=lambda path: (len(path.parts), str(path)))
+
+
+def normalize_agent_paths(root, own=os.chown):
+    for path in agent_path_components(root):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"image agent path is not a real directory: {path}")
+        own(path, 0, 0)
+        path.chmod(0o755)
+
+
+def verify_agent_paths(root, owner=0):
+    # AGENT_VALIDATED_PATHS drives both normalization and this component walk.
+    # Like the guest agent, require real directories, the expected uid, and no
+    # group/other write permission on the final path and every ancestor.
+    for path in agent_path_components(root):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o022:
+            raise ValueError(f"unsafe image agent directory {path}: uid={metadata.st_uid} mode={metadata.st_mode & 0o7777:04o}; expected uid={owner}, real directory, no group/other write")
+    return [str(path) for path in AGENT_VALIDATED_PATHS]
+
+
 def configure(pins):
     for account in ("motor-job", "motor-cache"):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
             "--shell", "/usr/sbin/nologin", account)
     for directory in ("tenant", "Users", "home", "overlay", ".lower", "usr/local/libexec", "etc/nftables.d"):
         Path("/", directory).mkdir(parents=True, exist_ok=True)
+    normalize_agent_paths(Path("/"))
     shutil.copy2(BUILD / "motor-runner", "/usr/local/bin/motor-runner")
     Path("/usr/local/bin/motor-runner").chmod(0o755)
     shutil.copy2(BUILD / "guest/motor-init", "/sbin/motor-init")
@@ -179,6 +212,7 @@ def verify(pins):
     if int(systemd.split()[1]) < 257:
         raise ValueError("runner isolation requires systemd >=257 (PrivatePIDs)")
     inventory = {"systemd": systemd, "rust_toolchains": {}}
+    inventory["agent_validated_paths"] = verify_agent_paths(Path("/"))
     inventory["static_module_load_requests"] = verify_no_module_load_requests(Path("/"))
     for name, command in (("node", "node"), ("npm", "npm"), ("bun", "bun"), ("pnpm", "pnpm")):
         actual = run(command, "--version", capture=True).removeprefix("v")

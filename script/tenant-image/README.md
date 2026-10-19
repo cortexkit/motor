@@ -161,6 +161,13 @@ own output also forwards to the console if it is unexpectedly activated.
 `systemd-remount-fs.service` is masked as well: the init script has already set
 up both roots, and the kernel's `ro` flag must not remount the RAM overlay read-only.
 
+The image installer uses one canonical agent-path list for both root:root mode 0755
+normalization and build-time component validation: /tenant, /Users, /home and
+the image CARGO_HOME/bin. Every ancestor is checked with the agent's real-directory,
+uid 0 and no-group/other-write rule. Debian's root:staff mode 2775 /usr/local defaults
+are not accepted as immutable tool inputs, even when a version probe runs fine.
+The checked path list is recorded in tools.json before the image can complete.
+
 The agent receives `CARGO_HOME=/usr/local/lib/motor/cargo` as the **immutable
 bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/tenant`. It
 mounts the provisioned XFS `/dev/vdb`, binds its tool `bin` read-only onto
@@ -347,9 +354,15 @@ Teardown stops the guest through the helper before stopping its unit, removes
 only disposable qualification resources, and prints process/tap/firewall/mount/
 failed-unit evidence. Existing unrelated failed host units are reported as a
 baseline, not cleared. Cleanup errors fail qualification and identify retained
-paths; never recursively delete them while mounts or VMMs remain. Already
+paths; never recursively delete them while mounts or VMMs remain. Before removal,
+the harness archives only the host journal/outbox subtree (not signer seeds,
+TLS keys or broker credentials), both before stopping the host and after it
+stops; the full helper journal is captured after stop as well. Already
 unloaded units and missing owned files are treated as removed; access-denied,
-busy-mount and other real cleanup failures still fail the lane. SIGINT and
+busy-mount and other real cleanup failures still fail the lane. Failed host
+units affect the teardown verdict only if this run created their exact names or
+their control-group path contains the exact tenant-id component. Unrelated new
+fleet failures are printed/archived, never reset or cleared. SIGINT and
 SIGTERM trigger teardown; SIGKILL or host loss cannot do so.
 
 Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, the

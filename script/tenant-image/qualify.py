@@ -8,13 +8,14 @@ import hmac
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
 import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -79,6 +80,10 @@ def unit_not_loaded(result):
     return result.returncode in (1, 4, 5) and ("not loaded" in text or "could not be found" in text or "loadstate=not-found" in text)
 
 
+def owned_unit(name, control_group, units, tenant):
+    return name in units or tenant in PurePosixPath(control_group).parts
+
+
 def remove_owned_tree(path):
     def missing_only(_function, _path, error):
         if not isinstance(error[1], FileNotFoundError):
@@ -97,6 +102,45 @@ def stage_program(source, destination, own=os.chown):
     info = destination.lstat()
     return dict(source=str(source), path=str(destination), uid=info.st_uid, gid=info.st_gid,
                 mode=oct(info.st_mode & 0o7777), sha256=hashlib.sha256(destination.read_bytes()).hexdigest())
+
+
+def archive_journal(source, destination):
+    try:
+        directory = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    copied = []
+    def copy_file(parent, name, output, label):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            return
+        with os.fdopen(fd, "rb") as incoming:
+            if not stat.S_ISREG(os.fstat(incoming.fileno()).st_mode):
+                raise RuntimeError(f"host journal entry is not regular: {label}")
+            target = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(target, "wb") as outgoing:
+                shutil.copyfileobj(incoming, outgoing)
+        copied.append(label)
+    try:
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for name in ("journal.json", "journal.new"):
+            copy_file(directory, name, destination / name, name)
+        try:
+            expired = os.open("outbox-expired", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        except FileNotFoundError:
+            expired = None
+        if expired is not None:
+            try:
+                (destination / "outbox-expired").mkdir(mode=0o700, exist_ok=True)
+                for name in os.listdir(expired):
+                    if name.endswith(".json"):
+                        copy_file(expired, name, destination / "outbox-expired" / name, "outbox-expired/" + name)
+            finally:
+                os.close(expired)
+    finally:
+        os.close(directory)
+    return copied
 
 
 def qualification_args(original):
@@ -594,6 +638,15 @@ class Harness:
                     process.kill()
                     process.wait(timeout=10)
 
+    def archive_host_state(self, phase):
+        copied = archive_journal(self.work / "host-private/journal", self.results / "host-state" / phase)
+        self.record("host_state_archive" if copied is not None else "host_state_absent", phase=phase, files=copied)
+        config = self.work / "host.json"
+        try:
+            shutil.copyfile(config, self.results / "host-config.json")
+        except FileNotFoundError:
+            pass
+
     def teardown(self):
         errors = []
 
@@ -603,7 +656,9 @@ class Harness:
             except Exception as error:
                 errors.append(describe_error(error))
 
+        attempt(lambda: self.archive_host_state("before-stop"))
         attempt(self.stop_processes)
+        attempt(lambda: self.archive_host_state("after-host-stop"))
         if self.started_helper and self.registry.exists() and HELPER_SOCKET.exists():
             try:
                 self.helper("stop_tenant")
@@ -616,6 +671,10 @@ class Harness:
                                                "-p", "Result", "-p", "ExecMainCode", "-p", "ExecMainStatus", "-p", "ControlGroup", allow_missing_unit=True))
             attempt(lambda unit=unit: self.run("journalctl", "-u", unit, "--no-pager", "--output=short-monotonic"))
             attempt(lambda unit=unit: self.run("systemctl", "stop", unit, allow_missing_unit=True))
+            def save_journal(unit=unit):
+                output = self.run("journalctl", "-u", unit, "--no-pager", "--output=short-monotonic")
+                (self.results / (unit + ".journal.log")).write_bytes(output)
+            attempt(save_journal)
             # Reset only this invocation's failed unit, never unrelated failures.
             attempt(lambda unit=unit: self.run("systemctl", "reset-failed", unit, allow_missing_unit=True))
         if self.owned:
@@ -673,8 +732,18 @@ class Harness:
             if after[key]:
                 errors.append(f"leftover {key}: {after[key]}")
         baseline_failed = getattr(self, "baseline", {}).get("failed_units", [])
-        if after["failed_units"] != baseline_failed:
-            errors.append(f"new failed host units: {after['failed_units']}")
+        baseline_names = {line.split()[0] for line in baseline_failed if line.split()}
+        unrelated = []
+        for line in after["failed_units"]:
+            name = line.split()[0]
+            if name in baseline_names:
+                continue
+            group = self.run("systemctl", "show", name, "-p", "ControlGroup", "--value", allow_missing_unit=True).decode().strip()
+            if owned_unit(name, group, self.units, self.name):
+                errors.append(f"owned failed host unit: {line}")
+            else:
+                unrelated.append(line)
+        self.record("unrelated_new_failed_units", units=unrelated)
         if self.owned and after["ipv4_forwarding"] != self.forwarding_before.strip():
             errors.append("host IPv4 forwarding was not restored")
         if self.owned:

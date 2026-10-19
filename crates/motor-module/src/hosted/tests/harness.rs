@@ -53,6 +53,7 @@ pub enum Behavior {
     ConnectFailure,
     DropHave,
     Refuse(&'static str),
+    RefuseHello(&'static str),
     DropTerminal,
     WrongHost,
     DropRunAck,
@@ -228,6 +229,17 @@ impl Harness {
                         else {
                             return;
                         };
+                        if let Behavior::RefuseHello(reason) = behavior {
+                            super::super::tls::write(
+                                &mut tls,
+                                &Prelude::LeaseRefused {
+                                    reason: reason.into(),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            return;
+                        }
                         motor_protocol::write_frame_async(
                             &mut tls,
                             &Frame::Hello {

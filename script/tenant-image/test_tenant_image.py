@@ -313,6 +313,48 @@ class ImageTests(unittest.TestCase):
             self.assertIn("StandardOutput=journal+console", unit)
             self.assertIn("StandardError=journal+console", unit)
 
+    def test_agent_directory_normalization_and_verification_share_all_components(self):
+        relatives = ("tenant", "Users", "home", "usr/local/lib/motor/cargo/bin")
+        for relative in relatives:
+            (self.root / relative).mkdir(parents=True, exist_ok=True)
+        components = ("", "tenant", "Users", "home", "usr", "usr/local", "usr/local/lib",
+                      "usr/local/lib/motor", "usr/local/lib/motor/cargo", "usr/local/lib/motor/cargo/bin")
+        for relative in components:
+            (self.root / relative).chmod(0o2775)
+        with self.assertRaisesRegex(ValueError, "unsafe image agent directory"):
+            guest.verify_agent_paths(self.root, owner=os.getuid())
+        own = mock.Mock()
+        guest.normalize_agent_paths(self.root, own=own)
+        self.assertEqual(guest.verify_agent_paths(self.root, owner=os.getuid()),
+                         ["/tenant", "/Users", "/home", "/usr/local/lib/motor/cargo/bin"])
+        for relative in components:
+            path = self.root / relative
+            own.assert_any_call(path, 0, 0)
+            self.assertEqual(path.stat().st_mode & 0o7777, 0o755)
+            path.chmod(0o2775)
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "unsafe image agent directory"):
+                guest.verify_agent_paths(self.root, owner=os.getuid())
+            path.chmod(0o755)
+
+    def test_agent_image_path_checks_do_not_follow_symlinks_or_accept_wrong_owner(self):
+        for path in ("tenant", "Users", "home", "usr/local/lib/motor/cargo/bin"):
+            (self.root / path).mkdir(parents=True, exist_ok=True)
+        guest.normalize_agent_paths(self.root, own=mock.Mock())
+        with self.assertRaisesRegex(ValueError, "expected uid="):
+            guest.verify_agent_paths(self.root, owner=os.getuid() + 1)
+        library = self.root / "usr/local/lib"
+        import shutil
+        shutil.rmtree(library)
+        target = self.root / "elsewhere"
+        target.mkdir()
+        target.chmod(0o777)
+        library.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "not a real directory"):
+            guest.normalize_agent_paths(self.root, own=mock.Mock())
+        with self.assertRaisesRegex(ValueError, "unsafe image agent directory"):
+            guest.verify_agent_paths(self.root, owner=os.getuid())
+        self.assertEqual(target.stat().st_mode & 0o7777, 0o777)
+
     def test_capability_probe_rejects_missing_support_or_unexpected_success(self):
         for code, error in ((0, "tenant-agent takes no arguments"), (1, "unknown operation")):
             result = subprocess.CompletedProcess([], code, stderr=error)
