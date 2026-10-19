@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch, Mock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("boat_image_install", HERE / "install.py")
@@ -74,6 +75,56 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(start.budget(16*(1<<30)+123, 1<<30), 15569256448)
         with self.assertRaises(ValueError):
             start.budget(1<<30, 1<<29)
+
+    def test_apt_index_failure_is_fatal_and_transient_retry_is_bounded(self):
+        failed = Mock(returncode=100, stdout="", stderr="503 Service Unavailable")
+        with patch.object(install.subprocess, 'run', return_value=failed) as run:
+            pauses = []
+            with self.assertRaisesRegex(RuntimeError, "refusing package installation"):
+                install.apt_update(pause=pauses.append)
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual(pauses, [1, 2])
+            self.assertIn('APT::Update::Error-Mode=any', run.call_args.args[0])
+        failed.stderr = 'signature verification failed'
+        with patch.object(install.subprocess, 'run', return_value=failed) as run:
+            with self.assertRaises(RuntimeError):
+                install.apt_update(pause=lambda _: None)
+            self.assertEqual(run.call_count, 1)
+
+    def test_archive_preflight_retries_official_indexes_only(self):
+        calls = []
+        def fetch(url, timeout):
+            calls.append(url)
+            if 'security.ubuntu.com' in url:
+                raise install.urllib.error.HTTPError(url, 503, 'unavailable', {}, None)
+            response = Mock(status=200)
+            response.read.return_value = b'-----BEGIN PGP SIGNED MESSAGE-----\n'
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            return response
+        evidence = install.archive_preflight(self.pins, fetch=fetch, pause=lambda _: None)
+        self.assertEqual(evidence[0]['attempts'][0]['status'], 200)
+        self.assertEqual(len(evidence[2]['attempts']), 3)
+        self.assertEqual(evidence[2]['attempts'][-1]['status'], 503)
+        self.assertTrue(all(url.startswith(('https://archive.ubuntu.com/', 'https://security.ubuntu.com/')) for url in calls))
+
+    def test_unsigned_or_third_party_sources_and_missing_release_dates_refuse(self):
+        self.assertIn('Dir::Etc::sourcelist=/dev/null', install.APT_OPTIONS)
+        self.assertIn('Dir::Etc::sourceparts=/etc/apt/motor-boat.sources.d', install.APT_OPTIONS)
+        self.assertIn('Acquire::AllowInsecureRepositories=false', install.APT_OPTIONS)
+        self.assertIn('APT::Get::AllowUnauthenticated=false', install.APT_OPTIONS)
+        with self.assertRaises(ValueError):
+            install.validate(dict(self.pins, ubuntu_archive='https://untrusted.invalid/ubuntu'))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for suite in ('noble', 'noble-updates', 'noble-security'):
+                (root / (suite + '_InRelease')).write_text('-----BEGIN PGP SIGNED MESSAGE-----\nDate: Wed, 01 Jan 2025 12:00:00 UTC\n')
+            manifest = install.release_manifest(root)
+            self.assertEqual(len(manifest), 3)
+            self.assertEqual(manifest['noble_InRelease']['date'], 'Wed, 01 Jan 2025 12:00:00 UTC')
+            (root / 'noble_InRelease').write_text('Date: Wed, 01 Jan 2025 12:00:00 UTC\n')
+            with self.assertRaises(ValueError):
+                install.release_manifest(root)
 
 
 if __name__ == "__main__":

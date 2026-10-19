@@ -11,7 +11,7 @@ sudo python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)"
 sudo systemctl start motor-boat
 ```
 
-`pins.json` fixes the dated, signed Ubuntu package archive, Rust/rustup, Node,
+`pins.json` fixes the official signed Ubuntu source URLs, Rust/rustup, Node,
 Bun, pnpm and NATS versions, and hashes the existing Cargo-tool and sccache
 build inputs. Release archives are checked against their publishers' SHA-256
 lists; pnpm uses the exact version's published SHA-512 integrity. Rustup and
@@ -22,7 +22,14 @@ because stock sccache touches cache files even for a hit. Anonymous commons
 access is tested inside Boat before installing its nine pinned mutation tools.
 No credential is forwarded if a public fetch fails. The resulting inventory
 records versions, package resolution, runner source revision and binary hash.
-These are reproducible input pins, not a claim that independently linked Rust
+The Ubuntu snapshot backend was unavailable, so rebuilds use the signed live official archive and record every installed package version plus all three Release dates; job-to-job reproducibility comes from the immutable named Boat snapshot, not from rebuilding the same OS packages later.
+APT uses an isolated source/list directory containing only archive.ubuntu.com and
+security.ubuntu.com, with Ubuntu's archive keyring and normal signature checks.
+Every index refresh uses `APT::Update::Error-Mode=any`; transient 5xx errors get
+at most three attempts with bounded backoff, and any remaining error aborts
+before package installation. The guest preflight records those same three official
+indexes, separately from APT's actual signature verification.
+These are reproducible tool/source pins, not a claim that independently linked Rust
 binaries have identical hashes. Reapplying a successful install reuses the disk,
 accounts, pinned Cargo tools and patched sccache build marker.
 

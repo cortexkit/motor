@@ -11,13 +11,20 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 BUILD = Path("/srv/build")
 STATE = Path("/var/lib/motor-boat")
+APT_LISTS = Path('/var/lib/apt/lists/motor-boat')
+APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourceparts=/etc/apt/motor-boat.sources.d',
+               '-o', 'Dir::State::lists=' + str(APT_LISTS), '-o', 'Acquire::AllowInsecureRepositories=false',
+               '-o', 'APT::Get::AllowUnauthenticated=false']
 
 
 def run(*args, capture=False):
@@ -56,7 +63,63 @@ def published(url, filename, sums="SHASUMS256.txt"):
     return path
 
 
+def apt_update(attempts=3, pause=time.sleep):
+    for attempt in range(attempts):
+        result = subprocess.run(["apt-get", "update", *APT_OPTIONS, "-o", "APT::Update::Error-Mode=any"],
+                                capture_output=True, text=True)
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        if result.returncode == 0:
+            return
+        transient = bool(re.search(r"\b50[0234]\b", result.stdout + result.stderr))
+        if not transient or attempt + 1 == attempts:
+            raise RuntimeError("Ubuntu package index refresh failed; refusing package installation or cached-index fallback")
+        pause(2 ** attempt)
+
+
+def archive_preflight(pins, fetch=urllib.request.urlopen, pause=time.sleep):
+    urls = [f"{pins['ubuntu_archive']}/dists/{suite}/InRelease" for suite in ('noble', 'noble-updates')]
+    urls.append(f"{pins['ubuntu_security']}/dists/noble-security/InRelease")
+    evidence = []
+    for url in urls:
+        record = {"url": url, "attempts": []}
+        evidence.append(record)
+        for attempt in range(3):
+            try:
+                with fetch(url, timeout=12) as response:
+                    body = response.read()
+                    record["attempts"].append({"status": response.status, "bytes": len(body),
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                        "pgp_signed": body.startswith(b"-----BEGIN PGP SIGNED MESSAGE-----")})
+                break
+            except urllib.error.HTTPError as error:
+                record["attempts"].append({"status": error.code})
+                error.close()
+                if error.code < 500 or attempt == 2:
+                    break
+                pause(2 ** attempt)
+            except OSError as error:
+                record["attempts"].append({"error": str(error)})
+                break
+    return evidence
+
+
+def release_manifest(directory=APT_LISTS):
+    records = {}
+    for path in directory.glob('*_InRelease'):
+        text = path.read_text()
+        dates = re.findall(r'(?m)^Date: (.+)$', text)
+        if len(dates) != 1 or not text.startswith('-----BEGIN PGP SIGNED MESSAGE-----'):
+            raise ValueError('missing signed Ubuntu Release Date: ' + path.name)
+        records[path.name] = {'date': dates[0], 'sha256': digest(path)}
+    if len(records) != 3:
+        raise ValueError('expected exactly three official Ubuntu Release indexes')
+    return records
+
+
 def validate(pins):
+    if pins['ubuntu_archive'] != 'https://archive.ubuntu.com/ubuntu' or pins['ubuntu_security'] != 'https://security.ubuntu.com/ubuntu':
+        raise ValueError('only official signed Ubuntu archive sources are allowed')
     if pins["probe_port"] == 9443 or not 1024 <= pins["probe_port"] <= 65535:
         raise ValueError("probe bridge must not claim the endpoint port")
     for key in ("rustup", "rust_default", "node", "bun", "nats", "pnpm"):
@@ -187,12 +250,18 @@ def configure(pins):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--revision", required=True, help="exact clean source commit to build")
+    parser.add_argument("--revision", help="exact clean source commit to build")
+    parser.add_argument("--apt-preflight-only", action="store_true", help="record official archive index reachability without changing the guest")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("apply as root")
     pins = json.loads((HERE / "pins.json").read_text())
     validate(pins)
+    if args.apt_preflight_only:
+        print(json.dumps(archive_preflight(pins)))
+        return
+    if not args.revision:
+        parser.error("installation requires --revision")
     if run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True) != args.revision:
         raise ValueError("source revision differs")
     if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", capture=True):
@@ -203,22 +272,27 @@ def main():
     manager = run("systemctl", "show", "--property=Version", "--value", capture=True)
     if int(manager.split(".")[0]) < pins["systemd_min"]:
         raise ValueError("unsupported systemd manager")
-    # The dated Ubuntu archive is signed; apt verifies package hashes against its index.
-    Path("/etc/apt/sources.list.d/ubuntu.sources").write_text(
-        f"Types: deb\nURIs: https://snapshot.ubuntu.com/ubuntu/{pins['ubuntu_snapshot']}/\n"
-        "Suites: noble noble-updates noble-security\nComponents: main universe restricted multiverse\n"
-        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+    # An isolated source/list directory excludes Boat's third-party repositories.
+    sources = Path('/etc/apt/motor-boat.sources.d')
+    sources.mkdir(exist_ok=True)
+    (sources / 'ubuntu.sources').write_text(
+        f"Types: deb\nURIs: {pins['ubuntu_archive']}\nSuites: noble noble-updates\n"
+        "Components: main universe restricted multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n"
+        f"Types: deb\nURIs: {pins['ubuntu_security']}\nSuites: noble-security\n"
+        "Components: main universe restricted multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
     os.environ["DEBIAN_FRONTEND"] = "noninteractive"
-    run("apt-get", "update")
+    (APT_LISTS / 'partial').mkdir(parents=True, exist_ok=True)
+    apt_update()
+    releases = release_manifest()
     # Keep provider-managed init and SSH binaries; only our SSH drop-in is installed.
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
-    run("apt-get", "install", "-y", "--no-install-recommends", *pins["packages"])
+    run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *pins["packages"])
     tools(pins)
     os.chdir(ROOT)
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner")
     run("install", "-m", "0755", "/srv/build/target/release/motor-runner", "/usr/local/bin/motor-runner")
     configure(pins)
-    inventory = {name: run(*command, capture=True) for name, command in {
+    inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],
         "node": ["node", "--version"], "bun": ["bun", "--version"],
         "pnpm": ["pnpm", "--version"],
@@ -226,7 +300,7 @@ def main():
         "sccache": ["sccache", "--version"], "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
-                     packages=run("dpkg-query", "-W", capture=True))
+                     packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases)
     for key, expected in {"node": "v" + pins["node"], "bun": pins["bun"], "pnpm": pins["pnpm"],
                           "nats": "nats-server: v" + pins["nats"], "sccache": "sccache 0.18.0"}.items():
         if inventory[key] != expected:

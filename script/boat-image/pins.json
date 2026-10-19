@@ -1,7 +1,8 @@
 {
   "schema": 1,
   "ubuntu": "24.04",
-  "ubuntu_snapshot": "20261019T000000Z",
+  "ubuntu_archive": "https://archive.ubuntu.com/ubuntu",
+  "ubuntu_security": "https://security.ubuntu.com/ubuntu",
   "rustup": "1.28.2",
   "rust_default": "1.99.0",
   "rust_toolchains": ["1.89.0", "1.91.0", "1.96.0", "1.99.0"],

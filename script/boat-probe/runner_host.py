@@ -230,10 +230,12 @@ class RunnerHost:
                 raise ValueError("source upload over pinned SSH failed: " + sent.stderr.decode(errors="replace"))
             install = (f"cd /home/user && echo '{sha}  motor.bundle' | sha256sum -c - && "
                        "sudo -n mkdir -p /srv/build && sudo -n git clone motor.bundle /srv/build/source && "
-                       f"sudo -n git -C /srv/build/source checkout --detach {revision} && "
-                       f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}")
+                       f"sudo -n git -C /srv/build/source checkout --detach {revision}")
             started = time.monotonic()
-            self.data["install"] = self.execute(sid, install, timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
+            self.data["source_upload"] = self.execute(sid, install)
+            self.data["apt_preflight"] = json.loads(self.execute(sid, "sudo -n python3 /srv/build/source/script/boat-image/install.py --apt-preflight-only", timeout=180)["stdout"])
+            self.probe.checkpoint()
+            self.data["install"] = self.execute(sid, f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}", timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
             self.data["install_seconds"] = time.monotonic() - started
             with tempfile.TemporaryDirectory(prefix="boat-job-", dir=ROOT / ".cortexkit") as repo:
                 repository = Path(repo)
