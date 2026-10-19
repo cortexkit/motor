@@ -76,7 +76,17 @@ def process_snapshot(state):
                 stat = (task / "stat").read_text().rsplit(")", 1)[1].split()
                 threads.append(dict(tid=int(task.name), comm=(task / "comm").read_text().strip(),
                                     state=stat[0], wchan=(task / "wchan").read_text().strip()))
-            snapshot.append(dict(pid=pid, cmdline=cmdline, threads=threads))
+            fds = {}
+            for fd in sorted((proc / "fd").iterdir(), key=lambda p: int(p.name))[:32]:
+                try:
+                    fds[fd.name] = os.readlink(fd)
+                except OSError as error:
+                    fds[fd.name] = f"{type(error).__name__}"
+            try:
+                stack = (proc / "stack").read_text()[-1200:]
+            except OSError as error:
+                stack = f"{type(error).__name__}: {error}"
+            snapshot.append(dict(pid=pid, cmdline=cmdline, threads=threads, fds=fds, stack=stack))
         except OSError as error:
             snapshot.append(dict(pid=pid, error=f"{type(error).__name__}: {error}"))
     return snapshot
