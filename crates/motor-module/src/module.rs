@@ -241,6 +241,8 @@ pub struct Handler {
     run_count: Arc<std::sync::atomic::AtomicUsize>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
+    health_cache: Arc<Mutex<crate::health_cache::HealthCache>>,
+    health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
 }
 fn module_data_dir() -> io::Result<PathBuf> {
@@ -268,6 +270,8 @@ impl Handler {
             run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
+            health_cache: Arc::new(Mutex::new(crate::health_cache::HealthCache::default())),
+            health_sampler: Arc::new(Mutex::new(crate::health_cache::Sampler::default())),
             write_engram_catalog: false,
         }
     }
@@ -296,6 +300,11 @@ impl Handler {
         if let Some(startup) = startup {
             startup.abort();
             let _ = startup.await;
+        }
+        let sampler = self.health_sampler.lock().unwrap().0.take();
+        if let Some(sampler) = sampler {
+            sampler.abort();
+            let _ = sampler.await;
         }
         if let Some(ssh) = self.ssh.get() {
             ssh.shutdown().await;
@@ -358,6 +367,7 @@ impl Handler {
                     }
                     self.ssh.set(ssh).ok();
                     self.motor.set(motor).ok();
+                    self.start_health_sampler();
                     *self.startup_error.lock().unwrap() = None;
                     if let Some(ready) = first_attempt.take() {
                         let _ = ready.send(());
@@ -382,6 +392,32 @@ impl Handler {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
         }
+    }
+    fn start_health_sampler(&self) {
+        let mut sampler = self.health_sampler.lock().unwrap();
+        if sampler.0.is_some() {
+            return;
+        }
+        let motor = self.motor.get().expect("storage initialized").clone();
+        let cache = Arc::clone(&self.health_cache);
+        sampler.0 = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::health_cache::REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let sample = tokio::time::timeout(
+                    crate::health_cache::SAMPLE_TIMEOUT,
+                    motor.runner_health(),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
+                cache
+                    .lock()
+                    .unwrap()
+                    .update(sample, std::time::Instant::now());
+            }
+        }));
     }
     fn attribution(&self, handle: RouteHandle, preset: Option<String>) -> Option<JobAttribution> {
         let routes = self.routes.lock().unwrap();
@@ -678,20 +714,25 @@ impl ModuleHandler for Handler {
                 .and_then(|ssh| crate::Connector::refusal(ssh.as_ref()))
                 .map(str::to_owned)
         };
-        let detail = crate::diagnostics::health_detail();
-        let detail = Some(match &reason {
-            Some(reason) => format!("{reason}; {detail}"),
-            None => detail,
-        });
-        HealthReport {
-            status: if reason.is_some() {
-                HealthStatus::Failing
-            } else {
-                HealthStatus::Ok
-            },
-            detail,
-            metrics: None,
+        let mut report = self
+            .health_cache
+            .lock()
+            .unwrap()
+            .report(std::time::Instant::now());
+        let diagnostics = crate::diagnostics::health_detail();
+        if let Some(reason) = reason {
+            report.status = HealthStatus::Failing;
+            report.detail = Some(format!(
+                "{reason}; {diagnostics}; {}",
+                report.detail.unwrap_or_default()
+            ));
+        } else {
+            report.detail = Some(format!(
+                "{}; {diagnostics}",
+                report.detail.unwrap_or_default()
+            ));
         }
+        report
     }
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let result = async {
@@ -976,6 +1017,76 @@ mod admission_tests {
         drop(replacement);
         drop(permits);
         assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    struct CountingConnector(Arc<AtomicUsize>);
+    impl crate::Connector for CountingConnector {
+        fn connect(
+            &self,
+            _: Uuid,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::Duplex>>> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(io::Error::other("offline")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_reads_only_cache_without_runner_calls() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-health-cache");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut motor = Motor::open(Config::default(), &scratch).unwrap();
+        motor.set_connector(Arc::new(CountingConnector(calls.clone())));
+        let handler = Handler::new(Config::default()).with_motor(motor);
+        let sample: RunnerHealth = serde_json::from_value(json!({
+            "runner_version": "cached", "since_ms": 0, "window_minutes": 60,
+            "free_bytes": 100, "queue_depth": 2, "running": [],
+            "counts": {"accepted": 0, "refusals": {}, "evictions": 0, "eviction_bytes": 0,
+                "eviction_failures": 0, "soft_goal_unmet_passes": 0, "skipped_recent": 0},
+            "permits_held": 4, "permits_cap": 8,
+            "queue_wait_1h": {"p50_ms": 1000, "p90_ms": 90000, "refusals": 1}
+        }))
+        .unwrap();
+        handler
+            .health_cache
+            .lock()
+            .unwrap()
+            .update(Some(sample), std::time::Instant::now());
+        let report = tokio::time::timeout(Duration::from_millis(100), handler.health())
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "health.check must never connect to the runner"
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.metrics.unwrap()["build_server"]["permits_held"], 4);
+        assert!(report.detail.unwrap().starts_with("build server busy:"));
+        handler.start_health_sampler();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handler.shutdown().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the background sampler owns runner calls"
+        );
     }
 }
 

@@ -35,6 +35,16 @@ async fn started_is_recorded_only_after_setup_with_capacity_wait() {
     let result = terminal(&runner, request.job_id).await;
     assert_eq!(result.outcome, Outcome::Exit { code: 0 });
     assert_eq!(result.queue_wait_ms, 25);
+    let wait = runner
+        .runner_status()
+        .health
+        .unwrap()
+        .queue_wait_1h
+        .unwrap();
+    // The warm build contributes a zero-wait sample alongside this job.
+    assert_eq!(wait.p50_ms, 0);
+    assert_eq!(wait.p90_ms, 25);
+    assert_eq!(wait.refusals, 0);
     let frames = runner.replay(request.job_id, 0).unwrap();
     assert_eq!(
         frames.first(),

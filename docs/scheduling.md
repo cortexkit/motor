@@ -179,3 +179,17 @@ job count, jobs grouped by requested vCPU size, and queue-wait refusals in the
 rolling 24-hour window.
 Repositories are grouped by the basename of their main checkout, so its worktrees
 share one total; the report is rebuilt from retained job records after restart.
+
+The report adds optional host load, logical CPU threads, available memory,
+held/capped vCPU permits (including workspace setup), and hourly queue-wait
+percentiles and refusals. Disk free bytes and pending queue depth retain their
+existing fields. Hourly counts use sixty minute buckets and reset on restart;
+the nearest-rank p50/p90 use the same capacity wait as `started`, not time behind
+another job in the same checkout. Empty windows report zero. Active jobs and
+underused reservations are indexed on record saves, so probes do not scan all
+retained records under the state lock. Tests:
+`host_sample_parses_proc_load_threads_and_available_bytes`,
+`health_reports_reserved_permits_pending_jobs_and_optional_wire_fields`,
+`queue_wait_percentiles_and_refusals_expire_with_hourly_buckets`,
+`started_is_recorded_only_after_setup_with_capacity_wait`,
+`workspace_owner_wait_does_not_spend_queue_wait_budget`.

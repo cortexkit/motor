@@ -55,7 +55,7 @@ async fn runner_health_op_returns_live_runner_values() {
             break;
         }
     }
-    let expected = f.runner.runner_status().health.unwrap();
+    let mut expected = f.runner.runner_status().health.unwrap();
     assert_eq!(expected.free_bytes, Some(987_654_321));
     assert_eq!(expected.queue_depth, 0);
     assert_eq!(expected.since_ms, f.clock.load(Ordering::SeqCst));
@@ -75,6 +75,10 @@ async fn runner_health_op_returns_live_runner_values() {
         panic!("runner.health must return one response");
     };
     let report: RunnerHealth = serde_json::from_slice(&bytes).unwrap();
+    // Host load and memory can change between the two independent probes.
+    expected.load_1m = report.load_1m.clone();
+    expected.threads = report.threads;
+    expected.mem_available_bytes = report.mem_available_bytes;
     assert_eq!(report, expected);
     motor
         .cancel(CancelRequest::new(stream.job_id))

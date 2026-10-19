@@ -1439,6 +1439,7 @@ impl Runner {
             std::fs::remove_dir_all(directory)?;
             File::open(directory.parent().unwrap())?.sync_all()?;
             inner.jobs.remove(&id);
+            self.core.repository_usage.lock().unwrap().remove(id);
         }
         Ok(())
     }
@@ -2606,7 +2607,8 @@ impl Runner {
     }
     pub fn status(&self) -> StatusReply {
         let inner = self.core.inner.lock().unwrap();
-        StatusReply::new(
+        self.status_with_jobs(
+            &inner,
             inner.jobs.values().filter(|j| j.pending()).count() as u32,
             inner
                 .jobs
@@ -2614,6 +2616,17 @@ impl Runner {
                 .filter(|j| j.state == JobState::Running)
                 .map(|j| RunningJob::new(j.id, j.key(), j.weight))
                 .collect(),
+        )
+    }
+    fn status_with_jobs(
+        &self,
+        inner: &Inner,
+        queue_depth: u32,
+        running: Vec<RunningJob>,
+    ) -> StatusReply {
+        StatusReply::new(
+            queue_depth,
+            running,
             true,
             inner
                 .catalog
@@ -3163,6 +3176,7 @@ impl Runner {
             match fs::remove_dir_all(self.record_path(id).parent().unwrap()) {
                 Ok(()) => {
                     inner.jobs.remove(&id);
+                    self.core.repository_usage.lock().unwrap().remove(id);
                 }
                 Err(error) => {
                     tracing::warn!(%id, %error, "expired job deletion failed; retaining its record and continuing maintenance")
@@ -3921,6 +3935,10 @@ impl Runner {
             drop(inner);
             return self.failed_launch(id, launch.execution, error, true, "start_not_persisted");
         }
+        self.core.health.lock().unwrap().record_queue_wait(
+            j.started_ms.unwrap(),
+            j.started.as_ref().unwrap().queue_wait_ms,
+        );
         let mut execution = launch.execution;
         // Pipe handles must exist before the command can fill its output pipes.
         let output = match execution.output() {

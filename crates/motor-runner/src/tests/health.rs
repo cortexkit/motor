@@ -1,6 +1,94 @@
 use super::super::health as runner_health;
 use super::*;
 
+#[test]
+fn host_sample_parses_proc_load_threads_and_available_bytes() {
+    let sample = runner_health::host_sample(
+        "1.25 2.34 3.45 4/567 890\n",
+        "processor : 0\nmodel name : CPU\nprocessor : 1\n",
+        "MemTotal: 9999 kB\nMemAvailable: 1234 kB\n",
+    );
+    assert_eq!(
+        sample,
+        (
+            serde_json::Number::from_f64(1.25),
+            Some(2),
+            Some(1234 * 1024)
+        )
+    );
+    assert_eq!(runner_health::host_sample("", "", ""), (None, None, None));
+    assert_eq!(
+        runner_health::host_sample("NaN 0 0 x/y", "processor: nope", "MemAvailable: nope kB"),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn queue_wait_percentiles_and_refusals_expire_with_hourly_buckets() {
+    let mut health = runner_health::Health::new(0);
+    for wait in 1..=10 {
+        health.record_queue_wait(60_000, wait * 1000);
+    }
+    health.refusal(60_000, &RefusalReason::QueueWaitExceeded);
+    health.refusal(60_000, &RefusalReason::RunnerFull);
+    assert_eq!(
+        health.queue_wait(3_600_000),
+        HealthQueueWait {
+            p50_ms: 5000,
+            p90_ms: 9000,
+            refusals: 1
+        }
+    );
+    assert_eq!(health.queue_wait(3_660_000), HealthQueueWait::default());
+}
+
+#[test]
+fn health_reports_reserved_permits_pending_jobs_and_optional_wire_fields() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.max_weight = 8;
+    config.free_space_probe = Arc::new(|_| Ok(123_456));
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request.clone()).unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&request.job_id).unwrap();
+        job.state = JobState::Queued;
+        runner.save(job).unwrap();
+        inner.starting.insert(request.job_id);
+    }
+    let report = runner.runner_status().health.unwrap();
+    assert_eq!(report.free_bytes, Some(123_456));
+    assert_eq!(report.permits_held, Some(2));
+    assert_eq!(report.permits_cap, Some(8));
+    assert_eq!(report.queue_depth, 1);
+    assert!(report.running.is_empty());
+    assert_eq!(report.queue_wait_1h, Some(HealthQueueWait::default()));
+    #[cfg(target_os = "linux")]
+    {
+        assert!(report.load_1m.is_some());
+        assert!(report.threads.is_some_and(|n| n > 0));
+        assert!(report.mem_available_bytes.is_some_and(|n| n > 0));
+    }
+    let mut legacy = serde_json::to_value(report).unwrap();
+    for key in [
+        "load_1m",
+        "threads",
+        "mem_available_bytes",
+        "permits_held",
+        "permits_cap",
+        "queue_wait_1h",
+    ] {
+        legacy.as_object_mut().unwrap().remove(key);
+    }
+    let decoded: RunnerHealth = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(decoded.load_1m.is_none());
+    assert!(decoded.queue_wait_1h.is_none());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+}
+
 fn recorded_job(
     repository: &str,
     workspace: &str,

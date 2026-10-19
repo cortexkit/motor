@@ -75,6 +75,19 @@ Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
 `health_flow_reaches_only_the_read_only_health_report`,
 `other_reserved_principals_are_refused_at_bind`.
 
+The daemon's `health.check` reads an in-memory build-server sample, refreshed in
+the background every 15 seconds with a ten-second timeout; it never connects to
+the runner itself. Metrics include host capacity, hourly queue wait, and the top
+five repositories by reserved vCPU-hours over 24 hours. A failed sample makes
+runner fields null; three consecutive failures or two minutes without a
+successful sample degrade module health. Busy queues alone remain healthy.
+Startup and credential failures still report failing health, and the existing
+unreachable-refusal diagnostics remain in the detail. Tests:
+`health_check_reads_only_cache_without_runner_calls`,
+`busy_server_is_healthy_and_metrics_have_cli_shape`,
+`idle_cache_stales_after_two_minutes_and_recovers`,
+`unreachable_samples_are_null_and_three_failures_degrade`.
+
 For scoped `exec.run` requests, `ck-motor` stores the caller's session, scope
 reference and epoch, and the optional `preset` with the job, for attribution
 only. It never validates or chooses presets. Test:

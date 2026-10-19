@@ -4221,6 +4221,15 @@ async fn workspace_owner_wait_does_not_spend_queue_wait_budget() {
         terminal(&runner, waiting.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
+    let wait = runner
+        .runner_status()
+        .health
+        .unwrap()
+        .queue_wait_1h
+        .unwrap();
+    assert_eq!(wait.p50_ms, 0);
+    assert_eq!(wait.p90_ms, 0);
+    assert_eq!(wait.refusals, 0);
 }
 
 #[test]
