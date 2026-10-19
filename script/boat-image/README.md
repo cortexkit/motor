@@ -43,8 +43,9 @@ between the state mount and workspace bind, and checks the bytes. A loop-image
 or ioctl failure aborts installation rather than changing copy semantics.
 
 This keeps the server's reflink contract and cache behavior unchanged; a copy
-fallback would broaden runner semantics and hide unsupported storage. Loop/XFS
-availability and actual warm/cache use still need the live job probe. Sparse
+fallback would broaden runner semantics and hide unsupported storage. The live
+runner-host run (below) installed and used this volume for real jobs in all three
+phases. Sparse
 capacity reserves no outer ext4 space: monitor **both** filesystems' free space.
 The snapshot probe drains/stops the daemon, syncs, and unmounts `/Users` and XFS
 before saving the disk snapshot; it never snapshots a live loop filesystem and
@@ -206,8 +207,10 @@ set -o pipefail
   --output .cortexkit/internal-docs/research/boat-runner-host --max-minutes 30
 ```
 
-Expect **20–30 minutes** for cold tool builds/downloads, plus cleanup (unmeasured
-until the operator runs it). The Mac first builds the small `boat_probe` example;
+Expect about **10 minutes** of sandbox time when starting from a prepared image
+(the measured run below took 9 minutes plus asynchronous purge), and longer for a
+cold first build of every tool; the cold path was not timed in that run. The Mac
+first builds the small `boat_probe` example;
 no paid sandbox exists during that local build. It uses `Motor::with_connector`
 and `Motor::run`, so snapshot capture, bundle transfer, admission, streamed output
 and terminal handling are production client code, not a Python wire imitation.
@@ -290,6 +293,63 @@ retained prepared image is excluded from requested cleanup; it is listed under
 `--cleanup RESULTS.json --delete-retained-images` explicitly deletes it too.
 No image is retained by default, and a borrowed source image is not owned/deleted
 by the new run.
+
+## Measured on Boat (2026-10-19)
+
+One `--runner-host --prepared-image --from-prepared-image
+motor-boat-prepared-99da3e87bb31` run at source revision `5ffcb1a`, on `large`
+(8 vCPU, 16 GB), 21:57–22:06 UTC. Raw evidence is the run's `results.json`; its
+`results.md` is rendered from it. The verdict **passed**: 107 of 107 checks, 34 in
+each of the `initial`, `snapshot_clone` and `resumed` phases plus four snapshot
+hygiene checks and `sshd.dropin_survives_resume`.
+
+- **Real jobs, through the production client** over the API-pinned SSH forward:
+  the exit job returned code 23 with its output, the offline Rust 1.99.0 build
+  printed `boat-hello`, in every phase. Each job took 1.0–1.4 s end to end from
+  the Mac, 2.5–4.1 s right after resume.
+- **Isolation, read by the job itself:** user `motor-job`, interfaces `["lo"]`, a
+  network and mount namespace different from the host's, private writable
+  `/dev/shm`, NoNewPrivs with zero effective and bounding capabilities, `/proc`
+  mounted `subset=pid` with hidden other-user processes, `ps` showing only its
+  own processes, EPERM signalling the runner, and no Boat token in its
+  environment or readable files.
+- **PID namespace: not private.** The job's `pid` namespace equals the host's
+  (`pid:[4026531836]` in all phases). Boat's systemd 255 has no
+  `PrivatePIDs=yes`, so this profile substitutes the `/proc` and signal controls
+  above and admits exactly one job per sandbox (see the isolation profile).
+- **cgroup limits** from the job's own `memory.max`, `cpu.max`, `pids.max`:
+  `cpu.max` `800000 100000` (8 vCPUs) with `nproc` 8, `pids.max` 4096, and
+  `memory.max` equal to the start wrapper's budget:
+
+  | Phase | MemAvailable before runner | Runner idle | memory.max | MiB |
+  | --- | --- | --- | --- | --- |
+  | initial (prepared image + recipe) | 14,657,724,416 | 14,467,072 | 14,105,444,352 | 13452 |
+  | snapshot_clone (first start of a clone) | 14,627,483,648 | 48,721,920 | 14,041,481,216 | 13391 |
+  | resumed (clone after stop/resume) | 14,649,823,232 | 15,581,184 | 14,097,055,744 | 13444 |
+
+  The budget is remeasured on every start, so it varies by tens of MiB. The
+  first start of a clone measured the runner at 48.7 MB idle instead of about
+  15 MB, giving the lowest budget, 13391 MiB. Anything that advertises a fixed
+  job memory for Boat must use the lowest observed value, not 13444.
+- **Timing** (from the Mac): create from the prepared image to Boat-ready 2.7 s;
+  source upload plus recipe reapply 63.6 s; prepared image save 12.0 s;
+  measurement snapshot save 19.1 s; create from snapshot to Boat-ready 5.4 s and
+  **to first finished job 68.1 s**. About 50 s of the 68.1 s is waiting for
+  Boat's `hydrated` flag (ready at 5.2 s, hydrated at 55.8 s), which the probe
+  requires before using the sandbox; whether jobs can safely start before full
+  hydration was not measured. Stop to `archived` took 75.7 s; resume to ready
+  8.3 s and to hydrated 93.7 s.
+- **Images:** the prepared image `motor-boat-prepared-5c81106dd6cc` (snapshot
+  `d37f0a2c-5bf5-4b3d-ab59-aaf661d66480`, 8,718,008,320 bytes) is retained and
+  qualified by these real jobs. The measurement snapshot (8,727,703,552 bytes)
+  was deleted. The earlier base `motor-boat-prepared-99da3e87bb31`
+  (8,764,968,960 bytes) was only borrowed as this run's source and is no longer
+  needed.
+- **Cleanup:** both sandboxes' deletions were accepted and wait for upload URL
+  expiry (`waiting_for_uploads`, purge expected about six hours later). Provider
+  usage: 352 s / $0.00352 and 377 s / $0.00377. That pending purge made the old
+  harness exit 1 despite a passing verdict; the harness now exits on the verdict
+  and reports `cleanup_state` separately.
 
 Portable tests run via `python3 scripts/run-script-tests.py`. They validate pins,
 checksum rejection and evidence parsing, **not** live installation or isolation.

@@ -96,8 +96,7 @@ Every check has PASS/FAIL plus raw evidence under `ssh_reach`. An authentication
 or route failure does not count as successful shell refusal. OpenSSH's `restrict`
 option does not itself forbid command execution, so this mode tests the requested
 forced-command line instead of assuming it creates a forwarding-only login.
-Negative capability findings are FAIL, not a rewritten expectation. Overall exit
-also remains nonzero while final data purge is pending.
+Negative capability findings are FAIL, not a rewritten expectation.
 Allow roughly **3–8 large-sandbox minutes**, plus asynchronous purge latency; this
 is an estimate, not a measured SSH result. No toolchain or named snapshot is
 created in this mode. Boat SSH reference: <https://docs.boat.dev/ssh-access>.
@@ -174,14 +173,16 @@ after 23 hours). Snapshot names are unique and checkpointed before saving.
 
 Sandbox deletion sends the required `X-Ascii-Confirm-Delete` header and polls the
 returned deletion operation. A 202 or an archived/hidden sandbox is **not** marked
-fully purged. Pending/blocked deletion, missing delete scope or a snapshot save
-still in flight is printed as incomplete and exits nonzero. A deletion operation
+fully purged (`cleanup_complete` stays false). Missing delete scope, a deletion
+that Boat never accepted or a snapshot save still in flight is reported as
+`cleanup_state: "incomplete"`. A deletion operation
 at `waiting_for_uploads` means deletion was authorized and accepted, but stored
 data awaits expiry of existing upload URLs (`expectedBy`); a different key scope
-does not accelerate it. The harness reports this state without several minutes
-of redundant polling. It attempts fallback stop only when no deletion operation
-was accepted. Retry after the operation's reported `expectedBy`, or immediately
-after correcting an actual permission error:
+does not accelerate it. The harness reports this as `cleanup_state:
+"purge_pending"` without several minutes of redundant polling. It attempts
+fallback stop only when no deletion operation was accepted. Retry after the
+operation's reported `expectedBy` to confirm the purge, or immediately after
+correcting an actual permission error:
 
 ```sh
 <key reader> | python3 script/boat-probe/probe.py --key-stdin \
@@ -192,8 +193,23 @@ Recovery operates only on the checkpoint's recorded IDs/names. Treat checkpoint
 files as trusted input, not files obtained from an untrusted sandbox. A completed
 cleanup reports each resource as deleted and `cleanup_complete: true`.
 
+The exit status reports the measurement verdict, and cleanup separately:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Verdict passed (JSON `verdict.passed`); cleanup is `complete` or `purge_pending` |
+| 1 | Verdict failed: measurements incomplete, an error, or a mode's checks did not all pass (`verdict.reasons`) |
+| 3 | `cleanup_state: "incomplete"`: resources may still exist; retry `--cleanup` (checked before the verdict) |
+
+`--cleanup` exits 0 unless cleanup is still incomplete. A Boat purge pending after
+accepted deletes never fails a run: nothing is left running and retrying cannot
+speed it up.
+
 `Error: none recorded` in rendered findings means no measurement exception was
 caught. It does not override `cleanup_complete: false` or a failed network probe.
+A `--runner-host` checkpoint renders a runner-host report instead: verdict and
+failing check names, per-phase job codes and cgroup limits, install/snapshot
+timings, the per-phase job memory budget, snapshots and cleanup.
 Older output used `Error: "unmeasured"` for the same absent JSON `error` field;
 that was a rendering placeholder, not a provider error or an unrun measurement.
 

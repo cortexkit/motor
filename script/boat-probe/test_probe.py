@@ -251,6 +251,7 @@ class CleanupTests(unittest.TestCase):
                              ("GET", "/deletion-operations/bdop_test"): operation})
         probe.cleanup(client, data, lambda: None, pause=lambda _: None)
         self.assertFalse(data["cleanup_complete"])
+        self.assertEqual(data["cleanup_state"], "purge_pending")
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(data["resources"][0]["deletion_state"]["stage"], "waiting_for_uploads")
         self.assertNotIn("fallback_stop", data["resources"][0])
@@ -555,6 +556,144 @@ class PreparedImageCleanupTests(unittest.TestCase):
             result = json.loads(output.getvalue())
             self.assertEqual(result['operator_retained_resources'], [])
             self.assertTrue(result['resources'][0]['deleted'])
+
+
+def waiting_for_uploads(sid="bx_23456789"):
+    return {"kind": "sandbox", "id": sid, "deletion_operation": "bdop_test",
+            "deletion_state": {"status": "blocked", "stage": "waiting_for_uploads", "expectedBy": "2026-10-20T04:00:00Z"}}
+
+
+class ExitStatusTests(unittest.TestCase):
+    def test_cleanup_state_separates_accepted_purge_from_possible_leaks(self):
+        retained = {"kind": "named-snapshot", "id": "prepared", "operator_retained": True}
+        deleted = {"kind": "named-snapshot", "id": "measurement", "deleted": True}
+        self.assertEqual(probe.cleanup_state(evidence([retained, deleted])), "complete")
+        self.assertEqual(probe.cleanup_state(evidence([retained, deleted, waiting_for_uploads()])), "purge_pending")
+        undeleted_snapshot = dict(waiting_for_uploads(), kind="named-snapshot")
+        other_stage = waiting_for_uploads()
+        other_stage["deletion_state"] = {"status": "processing", "stage": "removing"}
+        never_accepted = {"kind": "sandbox", "id": "bx_23456789"}
+        for leak in (undeleted_snapshot, other_stage, never_accepted):
+            with self.subTest(leak=leak):
+                self.assertEqual(probe.cleanup_state(evidence([waiting_for_uploads(), leak])), "incomplete")
+        unrecorded = evidence([waiting_for_uploads()])
+        unrecorded["pending_creates"] = [{"idempotency": "key", "body": {}}]
+        self.assertEqual(probe.cleanup_state(unrecorded), "incomplete")
+
+    def test_exit_status_follows_the_verdict_and_reports_leaks_with_three(self):
+        passed = dict(evidence([waiting_for_uploads()]), measurements_complete=True,
+                      runner_host={"all_passed": True})
+        self.assertEqual(probe.exit_status(passed), 0)
+        for change in ({"runner_host": {"all_passed": False}}, {"ssh_reach": {}}, {"error": "boom"},
+                       {"measurements_complete": False}):
+            with self.subTest(change=change):
+                self.assertEqual(probe.exit_status(dict(passed, **change)), 1)
+        leaked = dict(passed, resources=[{"kind": "sandbox", "id": "bx_23456789"}])
+        self.assertEqual(probe.exit_status(leaked), 3)
+        self.assertEqual(probe.exit_status(dict(leaked, error="boom")), 3)
+        self.assertEqual(probe.exit_status(evidence([waiting_for_uploads()]), cleanup_only=True), 0)
+
+    def test_passed_runner_host_with_pending_purge_exits_zero_and_reports_cleanup_separately(self):
+        def passing(host):
+            host.probe.data["resources"].append({"kind": "sandbox", "id": "bx_23456789"})
+            host.data.update(checks=[{"name": "initial.exit", "status": "PASS", "evidence": {}}], all_passed=True)
+        operation = deleting("blocked")
+        operation["operation"].update(stage="waiting_for_uploads", expectedBy="2026-10-20T04:00:00Z")
+        client = FakeClient({("GET", "/sandboxes/bx_23456789/usage"): {"seconds": 1, "dollars": 0.00001},
+                             ("DELETE", "/sandboxes/bx_23456789"): operation,
+                             ("GET", "/deletion-operations/bdop_test"): operation})
+        runner_host = sys.modules.get("runner_host")
+        if runner_host is None:
+            sys.path.insert(0, str(HERE))
+            try:
+                import runner_host
+            finally:
+                sys.path.pop(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with patch("sys.argv", ["probe.py", "--runner-host", "--output", str(Path(tmp) / "run")]), \
+                 patch.object(probe, "read_key", return_value="fake-key"), patch.object(probe, "Client", return_value=client), \
+                 patch.object(runner_host.RunnerHost, "run", passing), patch.object(probe.signal, "signal"), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(probe.main(), 0)
+            result = json.loads(output.getvalue())
+            findings = (Path(tmp) / "run" / "results.md").read_text()
+        self.assertFalse(result["cleanup_complete"])
+        self.assertEqual(result["cleanup_state"], "purge_pending")
+        self.assertEqual(result["verdict"], {"passed": True, "reasons": []})
+        self.assertEqual(result["exit_status"], 0)
+        self.assertIn("Runner-host verdict: **PASSED**", findings)
+        self.assertIn('Cleanup state (reported separately from the verdict): "purge_pending"', findings)
+
+
+def runner_phase(name, memory_max, code=23):
+    job = {"user": "motor-job", "interfaces": ["lo"], "nproc": "8", "namespaces": {"pid": "pid:[1]"},
+           "limits": {"memory.max": str(memory_max), "cpu.max": "800000 100000", "pids.max": "4096"}}
+    return {"name": name,
+            "host": {"namespaces": {"pid": "pid:[1]"},
+                     "memory_budget": {"mem_available_bytes": memory_max + (600 << 20), "runner_idle_bytes": 88 << 20,
+                                       "margin_bytes": 512 << 20, "memory_max_bytes": memory_max}},
+            "exit": {"seconds": 1.234, "result": {"code": code}}, "rust": {"seconds": 1.5, "result": {"code": 0}},
+            "isolation": {"seconds": 1.0, "result": {"code": 0, "stdout": json.dumps(job)}}}
+
+
+class RunnerHostRenderTests(unittest.TestCase):
+    def runner_data(self, status="PASS"):
+        data = evidence([waiting_for_uploads(), {"kind": "named-snapshot", "id": "motor-boat-prepared-abc",
+                                                  "operator_retained": True}])
+        data.update(measurements_complete=True, runner_host={
+            "all_passed": status == "PASS", "source_revision": "a" * 40,
+            "checks": [{"name": "initial.exit", "status": "PASS"}, {"name": "resumed.memory_limit", "status": status},
+                       {"name": "sshd.dropin_survives_resume", "status": "PASS"}],
+            "phases": [runner_phase("initial", 13452 << 20), runner_phase("resumed", 13391 << 20)],
+            "create": {"seconds_to_ready": 2.72}, "install_seconds": 63.62, "snapshot_create_to_first_job_seconds": 68.105,
+            "create_from_snapshot": {"seconds_to_ready": 5.41},
+            "snapshot": {"name": "motor-runner-x", "id": "snap-1", "size_bytes": 7, "seconds": 19.05},
+            "prepared_image": {"name": "motor-boat-prepared-abc", "id": "snap-2", "size_bytes": 8, "seconds": 12.03,
+                               "operator_retained": True, "real_jobs_qualified": True, "delete_command": "probe --cleanup x"}})
+        return data
+
+    def rendered(self, data):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.md"
+            probe.render(data, path)
+            return path.read_text()
+
+    def test_runner_host_report_shows_verdict_phases_timings_and_memory_not_the_environment_template(self):
+        text = self.rendered(self.runner_data())
+        self.assertIn("Runner-host verdict: **PASSED**. Checks: 3 of 3 passed.", text)
+        self.assertIn("Exit status under the current rules: 0 (the run did not record one)", text)
+        self.assertIn('| initial | 1 of 1 | 23 | 0 | [1.23, 1.5, 1.0] | "motor-job" | ["lo"] | "14105444352" | '
+                      '"800000 100000" | "4096" | "8" | true |', text)
+        self.assertIn("| Create from measurement snapshot to first finished job | 68.1 |", text)
+        self.assertIn("| Source upload and recipe install | 63.6 |", text)
+        self.assertIn("| resumed | ", text)
+        self.assertIn("| 13391 | ", text)
+        self.assertIn("Smallest job memory budget across phases: 13391 MiB.", text)
+        self.assertIn("Checks outside a phase: sshd.dropin_survives_resume PASS.", text)
+        self.assertIn("| named-snapshot motor-boat-prepared-abc | retained by operator |", text)
+        self.assertIn("`probe --cleanup x`", text)
+        self.assertIn("final data purge awaits upload URL expiry", text)
+        for stale in ("Unassessed", "{{", "environment probe"):
+            self.assertNotIn(stale, text)
+
+    def test_failed_check_is_named_and_fails_the_rendered_verdict(self):
+        data = self.runner_data(status="FAIL")
+        data["exit_status"] = 1
+        text = self.rendered(data)
+        self.assertIn("Runner-host verdict: **FAILED**. Checks: 2 of 3 passed.", text)
+        self.assertIn('Failing checks: ["resumed.memory_limit"].', text)
+        self.assertIn('Reasons: ["runner_host checks did not all pass"].', text)
+        self.assertIn("Exit status: 1", text)
+
+    def test_missing_runner_evidence_stays_unmeasured(self):
+        data = evidence()
+        data["runner_host"] = {"checks": [], "phases": [{"name": "initial"}], "all_passed": False}
+        text = self.rendered(data)
+        self.assertIn("**FAILED**", text)
+        self.assertIn("| Create from measurement snapshot to first finished job | \"unmeasured\" |", text)
+        self.assertIn("Smallest job memory budget across phases: unmeasured MiB.", text)
+        self.assertNotIn("{{", text)
 
 
 if __name__ == "__main__":
