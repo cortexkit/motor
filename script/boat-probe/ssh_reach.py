@@ -118,7 +118,8 @@ def authenticated(result):
 def refused(result, marker):
     code = result.get("exit_code")
     channel_refused = any(text in result.get("stderr", "") for text in
-                          ("exec request failed", "shell request failed", "administratively prohibited"))
+                          ("exec request failed", "shell request failed", "PTY allocation request failed",
+                           "administratively prohibited"))
     return (authenticated(result) and code not in {None, 0} and (code != 255 or channel_refused) and
             marker not in result.get("stdout", ""))
 

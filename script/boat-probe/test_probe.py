@@ -348,6 +348,8 @@ class SSHTests(unittest.TestCase):
     def test_refusal_requires_authenticated_connection_and_no_command_marker(self):
         auth = 'Authenticated to host using "publickey".\n'
         self.assertTrue(ssh_reach.refused({"exit_code": 1, "stderr": auth, "stdout": ""}, "marker"))
+        self.assertTrue(ssh_reach.refused({"exit_code": 255, "stderr": auth + "PTY allocation request failed on channel 0\n",
+                                           "stdout": ""}, "marker"))
         self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": "Permission denied (publickey)."}, "marker"))
         self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": auth + "Connection reset"}, "marker"))
         self.assertFalse(ssh_reach.refused({"exit_code": 0, "stderr": auth, "stdout": "marker"}, "marker"))
