@@ -23,6 +23,76 @@ pub fn read_serial(
     }
 }
 
+/// Hyper-V socket service ID that Motor's agent listens on. The host must
+/// register this GUID under GuestCommunicationServices before it can connect.
+pub const HVSOCK_SERVICE_ID: &str = "92c268b0-cddd-40a4-a664-f32e50ad35ea";
+/// Optional overlay file choosing the guest listener's VM ID: `wildcard`
+/// (the default when absent) or `parent`.
+pub const HVSOCK_LISTEN_FILE: &str = r"C:\ProgramData\Motor\hyperv-listen.txt";
+/// HV_GUID_PARENT: names the parent partition (the Hyper-V host).
+pub const HV_GUID_PARENT: u128 = 0xa42e7cda_d03f_480c_9cc2_a4de20abb878;
+/// HV_GUID_LOOPBACK: a connection from inside the same partition.
+pub const HV_GUID_LOOPBACK: u128 = 0xe0e16197_dd56_4a10_9195_5ee7a155a838;
+
+/// Parse a textual GUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, optional
+/// braces, any case) into the integer form `windows_sys::core::GUID::from_u128`
+/// takes, whose fields map onto the textual groups in order.
+pub fn parse_guid(text: &str) -> io::Result<u128> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid GUID");
+    let text = text.trim();
+    let text = match text.strip_prefix('{') {
+        Some(rest) => rest.strip_suffix('}').ok_or_else(invalid)?,
+        None => text,
+    };
+    let groups: Vec<&str> = text.split('-').collect();
+    if groups.iter().map(|group| group.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12]
+        || !groups
+            .iter()
+            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(invalid());
+    }
+    u128::from_str_radix(&groups.concat(), 16).map_err(|_| invalid())
+}
+
+/// Which VM ID the guest agent's listener binds. `Wildcard` is the documented
+/// listener form; it accepts any partition, so the agent refuses loopback
+/// peers (`hvsock_peer_allowed`) and accepts only one connection. `Parent`
+/// binds HV_GUID_PARENT to accept only the host, but Microsoft documents that
+/// ID as a connect address, so it is kept as an alternative to try if the
+/// wildcard bind does not work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenAddress {
+    Wildcard,
+    Parent,
+}
+
+impl ListenAddress {
+    pub fn vm_id(self) -> u128 {
+        match self {
+            Self::Wildcard => 0,
+            Self::Parent => HV_GUID_PARENT,
+        }
+    }
+}
+
+pub fn hvsock_listen_address(text: Option<&str>) -> io::Result<ListenAddress> {
+    match text.map(str::trim) {
+        None | Some("wildcard") => Ok(ListenAddress::Wildcard),
+        Some("parent") => Ok(ListenAddress::Parent),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hyper-V listen address must be wildcard or parent",
+        )),
+    }
+}
+
+/// A job process inside the guest could reach the agent's listener over
+/// loopback; only a connection from another partition (the host) is accepted.
+pub fn hvsock_peer_allowed(peer_vm_id: u128) -> bool {
+    peer_vm_id != HV_GUID_LOOPBACK
+}
+
 pub fn hyperv_queue_bytes(text: Option<&str>) -> io::Result<u32> {
     match text.map(str::trim) {
         None => Ok(HYPERV_QUEUE_BYTES),
@@ -127,6 +197,62 @@ pub fn serial_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guid_text_maps_onto_from_u128_field_order() {
+        // The published HV_GUID_PARENT text and its from_u128 constant must agree.
+        assert_eq!(
+            parse_guid("a42e7cda-d03f-480c-9cc2-a4de20abb878").unwrap(),
+            HV_GUID_PARENT
+        );
+        assert_eq!(
+            parse_guid("{E0E16197-DD56-4A10-9195-5EE7A155A838}").unwrap(),
+            HV_GUID_LOOPBACK
+        );
+        assert_eq!(
+            parse_guid(HVSOCK_SERVICE_ID).unwrap(),
+            0x92c268b0_cddd_40a4_a664_f32e50ad35ea
+        );
+        for bad in [
+            "",
+            "a42e7cda-d03f-480c-9cc2",
+            "a42e7cdad03f480c9cc2a4de20abb878",
+            "a42e7cda-d03f-480c-9cc2-a4de20abb87g",
+            "{a42e7cda-d03f-480c-9cc2-a4de20abb878",
+            "a42e7cda-d03f-480c-9cc2-a4de20abb8789",
+            "+42e7cda-d03f-480c-9cc2-a4de20abb878",
+        ] {
+            assert!(parse_guid(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn listen_address_defaults_to_wildcard_and_refuses_unknown_values() {
+        assert_eq!(
+            hvsock_listen_address(None).unwrap(),
+            ListenAddress::Wildcard
+        );
+        assert_eq!(
+            hvsock_listen_address(Some("wildcard\r\n")).unwrap(),
+            ListenAddress::Wildcard
+        );
+        assert_eq!(
+            hvsock_listen_address(Some("parent")).unwrap(),
+            ListenAddress::Parent
+        );
+        assert_eq!(ListenAddress::Wildcard.vm_id(), 0);
+        assert_eq!(ListenAddress::Parent.vm_id(), HV_GUID_PARENT);
+        for bad in ["", "loopback", "Parent", "children"] {
+            assert!(hvsock_listen_address(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn loopback_peer_is_refused_and_other_partitions_are_not() {
+        assert!(!hvsock_peer_allowed(HV_GUID_LOOPBACK));
+        assert!(hvsock_peer_allowed(HV_GUID_PARENT));
+        assert!(hvsock_peer_allowed(0x1234));
+    }
 
     #[test]
     fn serial_read_retries_timeouts_and_bounds_each_operation() {

@@ -7,6 +7,10 @@ use std::{
 };
 
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+// A second handle to the same log, used only for flushing to disk. Flushing
+// through it does not hold the writers' mutex, so a slow disk flush cannot
+// stall a thread that logs from inside its I/O path.
+static SYNC: OnceLock<File> = OnceLock::new();
 static START: OnceLock<Instant> = OnceLock::new();
 
 pub fn init() -> io::Result<()> {
@@ -22,12 +26,18 @@ pub fn init() -> io::Result<()> {
     let hash = sha2::Sha256::digest(std::fs::read(&executable)?);
     writeln!(
         file,
-        "agent_diag=3 feature=hyperv-spike exe={} sha256={hash:x}",
+        "agent_diag=3 feature=hyperv-spike transport={} exe={} sha256={hash:x}",
+        if cfg!(feature = "hyperv-hvsock") {
+            "hvsock"
+        } else {
+            "com"
+        },
         executable.display()
     )?;
     // Flush file creation and startup identity before any serial operation.
     // A forced VM stop otherwise need not preserve an open cached log file.
     file.sync_all()?;
+    let _ = SYNC.set(file.try_clone()?);
     LOG.set(Mutex::new(file))
         .map_err(|_| io::Error::other("Hyper-V diagnostic log already initialized"))?;
     event("service starting");
@@ -36,9 +46,7 @@ pub fn init() -> io::Result<()> {
 }
 
 pub fn sync() {
-    if let Some(log) = LOG.get()
-        && let Ok(file) = log.lock()
-    {
+    if let Some(file) = SYNC.get() {
         let _ = file.sync_data();
     }
 }

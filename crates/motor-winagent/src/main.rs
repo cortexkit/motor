@@ -8,14 +8,20 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "hyperv-spike")]
     if std::env::args().skip(1).eq(["--build-info"]) {
-        println!(
-            "motor-winagent hyperv-spike agent_diag=3 partial_read=4096,250ms queue_config=0,2097152 protocol=4"
-        );
+        if cfg!(feature = "hyperv-hvsock") {
+            println!("motor-winagent hyperv-spike agent_diag=3 transport=hvsock protocol=4");
+        } else {
+            println!(
+                "motor-winagent hyperv-spike agent_diag=3 transport=com partial_read=4096,250ms queue_config=0,2097152 protocol=4"
+            );
+        }
         return Ok(());
     }
     guest::run()
 }
 
+#[cfg(all(windows, feature = "hyperv-hvsock"))]
+mod hvsock;
 #[cfg(all(windows, feature = "hyperv-spike"))]
 mod hyperv_diag;
 #[cfg(windows)]
@@ -167,7 +173,10 @@ mod guest {
 
     #[derive(Clone)]
     struct Port {
+        #[cfg(not(feature = "hyperv-hvsock"))]
         handle: Arc<Handle>,
+        #[cfg(feature = "hyperv-hvsock")]
+        socket: Arc<crate::hvsock::Socket>,
         stop: Arc<Handle>,
         #[cfg(feature = "hyperv-spike")]
         read_total: Arc<std::sync::atomic::AtomicU64>,
@@ -175,6 +184,39 @@ mod guest {
         write_total: Arc<std::sync::atomic::AtomicU64>,
     }
     impl Port {
+        #[cfg(feature = "hyperv-hvsock")]
+        fn open(stop: Arc<Handle>) -> io::Result<Self> {
+            let address = motor_winagent::transport::hvsock_listen_address(
+                match std::fs::read_to_string(motor_winagent::transport::HVSOCK_LISTEN_FILE) {
+                    Ok(text) => Some(text),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                }
+                .as_deref(),
+            )?;
+            // Same bound as the host client's overall cap: the host dials as
+            // soon as the VM starts, so a longer silence means no host exists.
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let (socket, peer) = crate::hvsock::accept_host(stop.0, deadline, address)?;
+            diagnostic!("hvsock accepted peer vm_id={peer:032x} listen={address:?}");
+            // Make the diagnostic log durable while the job runs, so a forced
+            // VM stop still leaves the byte counters on disk.
+            let sync_stop = stop.clone();
+            thread::spawn(move || {
+                while !sync_stop.signalled() {
+                    crate::hyperv_diag::sync();
+                    thread::sleep(Duration::from_millis(500));
+                }
+            });
+            Ok(Self {
+                socket: Arc::new(socket),
+                stop,
+                read_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                write_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            })
+        }
+
+        #[cfg(not(feature = "hyperv-hvsock"))]
         fn open(stop: Arc<Handle>) -> io::Result<Self> {
             let path = wide(&motor_winagent::transport::port_path());
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -279,6 +321,18 @@ mod guest {
                     "service stopped",
                 ));
             }
+            #[cfg(feature = "hyperv-hvsock")]
+            {
+                let count = self.socket.transfer(self.stop.0, bytes, length, write)?;
+                self.record_transfer(count as u32, write);
+                Ok(count)
+            }
+            #[cfg(not(feature = "hyperv-hvsock"))]
+            self.transfer_file(bytes, length, write)
+        }
+
+        #[cfg(not(feature = "hyperv-hvsock"))]
+        fn transfer_file(&self, bytes: *mut u8, length: usize, write: bool) -> io::Result<usize> {
             let event = Handle::event()?;
             // The stack OVERLAPPED, event and caller buffer remain alive until
             // completion, including after cancellation has been requested.
@@ -381,13 +435,15 @@ mod guest {
             if bytes.is_empty() {
                 Ok(0)
             } else {
-                #[cfg(feature = "hyperv-spike")]
+                // Only the COM port needs timeout retries; on a socket, and on
+                // virtio-serial, a zero-byte read means the host closed.
+                #[cfg(all(feature = "hyperv-spike", not(feature = "hyperv-hvsock")))]
                 {
                     motor_winagent::transport::read_serial(bytes, |chunk| {
                         self.transfer(chunk.as_mut_ptr(), chunk.len(), false)
                     })
                 }
-                #[cfg(not(feature = "hyperv-spike"))]
+                #[cfg(any(not(feature = "hyperv-spike"), feature = "hyperv-hvsock"))]
                 {
                     self.transfer(bytes.as_mut_ptr(), bytes.len(), false)
                 }

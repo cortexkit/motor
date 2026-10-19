@@ -91,9 +91,17 @@ impl<T: io::Write> io::Write for TracedIo<T> {
     }
 }
 
+/// How the host reaches the guest agent: the named pipe Hyper-V maps to the
+/// VM's COM1, or a Hyper-V socket to the VM's ID and Motor's service ID.
+#[derive(Debug, PartialEq)]
+enum Channel {
+    Pipe(String),
+    HvSock(u128),
+}
+
 #[derive(Debug, PartialEq)]
 struct Args {
-    pipe: String,
+    channel: Channel,
     nonce: String,
     canary: String,
     host: String,
@@ -104,7 +112,7 @@ struct Args {
 fn arguments(values: &[String]) -> io::Result<Args> {
     if values.len() != 10 && values.len() != 12 {
         return Err(invalid(
-            "expected --pipe NAME --nonce UUID --canary PATH --host NAME --result PATH",
+            "expected --pipe NAME|--vm-id GUID --nonce UUID --canary PATH --host NAME --result PATH",
         ));
     }
     let mut pairs = BTreeMap::new();
@@ -118,13 +126,25 @@ fn arguments(values: &[String]) -> io::Result<Args> {
         Some("65536") => 65536,
         _ => return Err(invalid("stress bytes must be 0 or 65536")),
     };
+    let channel = match (pairs.remove("--pipe"), pairs.remove("--vm-id")) {
+        (Some(pipe), None) => {
+            if !pipe.starts_with("motor-hv-")
+                || !pipe.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(invalid("unsafe pipe name"));
+            }
+            Channel::Pipe(pipe)
+        }
+        (None, Some(vm_id)) => Channel::HvSock(motor_winagent::transport::parse_guid(&vm_id)?),
+        _ => return Err(invalid("exactly one of --pipe or --vm-id is required")),
+    };
     let mut take = |key| {
         pairs
             .remove(key)
             .ok_or_else(|| invalid(format!("missing {key}")))
     };
     let args = Args {
-        pipe: take("--pipe")?,
+        channel,
         nonce: take("--nonce")?,
         canary: take("--canary")?,
         host: take("--host")?,
@@ -135,14 +155,6 @@ fn arguments(values: &[String]) -> io::Result<Args> {
         return Err(invalid("unknown option"));
     }
     motor_winagent::transport::hyperv_nonce(&args.nonce)?;
-    if !args.pipe.starts_with("motor-hv-")
-        || !args
-            .pipe
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(invalid("unsafe pipe name"));
-    }
     if !args.canary.starts_with("C:\\")
         || args.canary.contains(['\r', '\n', '\0'])
         || args.result.is_empty()
@@ -398,9 +410,13 @@ fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Pro
 #[cfg(windows)]
 fn probe(args: &Args) -> io::Result<Probe> {
     use std::os::windows::fs::OpenOptionsExt;
-    let path = format!(r"\\.\pipe\{}", args.pipe);
+    let pipe_name = match &args.channel {
+        Channel::Pipe(name) => name,
+        Channel::HvSock(vm_id) => return conversation(hvsock::dial(*vm_id)?, args),
+    };
+    let path = format!(r"\\.\pipe\{pipe_name}");
     let deadline = Instant::now() + std::time::Duration::from_secs(120);
-    trace("pipe-connect-start", serde_json::json!({"pipe":args.pipe}));
+    trace("pipe-connect-start", serde_json::json!({"pipe":pipe_name}));
     let pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
@@ -417,26 +433,141 @@ fn probe(args: &Args) -> io::Result<Probe> {
             Err(error) => return Err(error),
         }
     };
-    trace("pipe-connected", serde_json::json!({"pipe":args.pipe}));
+    trace("pipe-connected", serde_json::json!({"pipe":pipe_name}));
     conversation(pipe, args)
 }
 
 #[cfg(not(windows))]
-fn probe(_args: &Args) -> io::Result<Probe> {
+fn probe(args: &Args) -> io::Result<Probe> {
     // Keep the protocol client typechecked on portable hosts without pretending
     // that an in-memory stream proves Hyper-V connectivity.
     let _ = conversation::<io::Cursor<Vec<u8>>>;
+    let channel = match &args.channel {
+        Channel::Pipe(name) => format!("pipe {name}"),
+        Channel::HvSock(vm_id) => format!("hvsock {vm_id:032x}"),
+    };
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "measurement requires Windows Hyper-V",
+        format!("measurement over {channel} requires Windows Hyper-V"),
     ))
+}
+
+/// Host side of the Hyper-V socket: dial the job VM's ID on Motor's service ID.
+#[cfg(windows)]
+mod hvsock {
+    use super::trace;
+    use std::{
+        collections::BTreeSet,
+        io,
+        mem::{size_of, zeroed},
+        time::{Duration, Instant},
+    };
+    use windows_sys::{
+        Win32::{
+            Networking::WinSock::{
+                AF_HYPERV, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSADATA,
+                WSAGetLastError, WSAStartup, closesocket, connect, recv, send, socket,
+            },
+            System::Hypervisor::{HV_PROTOCOL_RAW, SOCKADDR_HV},
+        },
+        core::GUID,
+    };
+
+    pub struct Stream(SOCKET);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe {
+                closesocket(self.0);
+            }
+        }
+    }
+    impl io::Read for Stream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let length = bytes.len().min(i32::MAX as usize) as i32;
+            match unsafe { recv(self.0, bytes.as_mut_ptr(), length, 0) } {
+                SOCKET_ERROR => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
+                count => Ok(count as usize),
+            }
+        }
+    }
+    impl io::Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let length = bytes.len().min(i32::MAX as usize) as i32;
+            match unsafe { send(self.0, bytes.as_ptr(), length, 0) } {
+                SOCKET_ERROR => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
+                count => Ok(count as usize),
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Retry until the agent's listener is up or 120 s pass (the same budget as
+    /// the named-pipe path). Every distinct error code is traced once, so a
+    /// permanent refusal such as a missing service registration stays visible.
+    pub fn dial(vm_id: u128) -> io::Result<Stream> {
+        let service =
+            motor_winagent::transport::parse_guid(motor_winagent::transport::HVSOCK_SERVICE_ID)?;
+        let started = unsafe {
+            let mut data: WSADATA = zeroed();
+            WSAStartup(0x0202, &mut data)
+        };
+        if started != 0 {
+            return Err(io::Error::from_raw_os_error(started));
+        }
+        let address = SOCKADDR_HV {
+            Family: AF_HYPERV,
+            Reserved: 0,
+            VmId: GUID::from_u128(vm_id),
+            ServiceId: GUID::from_u128(service),
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        trace(
+            "hvsock-connect-start",
+            serde_json::json!({"vm_id":format!("{vm_id:032x}"),"service_id":format!("{service:032x}")}),
+        );
+        let mut attempts = 0u32;
+        let mut seen = BTreeSet::new();
+        loop {
+            attempts += 1;
+            let error = unsafe {
+                let candidate = socket(i32::from(AF_HYPERV), SOCK_STREAM, HV_PROTOCOL_RAW as i32);
+                if candidate == INVALID_SOCKET {
+                    return Err(io::Error::from_raw_os_error(WSAGetLastError()));
+                }
+                if connect(
+                    candidate,
+                    (&raw const address).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_HV>() as i32,
+                ) == 0
+                {
+                    trace("hvsock-connected", serde_json::json!({"attempts":attempts}));
+                    return Ok(Stream(candidate));
+                }
+                let error = WSAGetLastError();
+                closesocket(candidate);
+                error
+            };
+            if seen.insert(error) {
+                trace(
+                    "hvsock-connect-error",
+                    serde_json::json!({"os_code":error,"attempt":attempts,"error":io::Error::from_raw_os_error(error).to_string()}),
+                );
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 fn run() -> io::Result<()> {
     let values: Vec<_> = std::env::args().skip(1).collect();
     if values == ["--version"] {
         println!(
-            "motor Hyper-V spike protocol {} trace=3",
+            "motor Hyper-V spike protocol {} trace=3 transports=pipe,hvsock",
             motor_winagent::PROTOCOL_VERSION
         );
         return Ok(());
@@ -465,7 +596,7 @@ mod tests {
     use super::*;
     fn args() -> Args {
         Args {
-            pipe: "motor-hv-test".into(),
+            channel: Channel::Pipe("motor-hv-test".into()),
             nonce: "0123456789abcdef0123456789abcdef".into(),
             canary: "C:\\motor spike\\it's private.txt".into(),
             host: "HOST-1".into(),
@@ -575,8 +706,11 @@ mod tests {
     #[test]
     fn arguments_preserve_paths_and_refuse_unknown_duplicate_and_unsafe_options() {
         let a = args();
+        let Channel::Pipe(pipe) = &a.channel else {
+            unreachable!()
+        };
         let values = [
-            "--pipe", &a.pipe, "--nonce", &a.nonce, "--canary", &a.canary, "--host", &a.host,
+            "--pipe", pipe, "--nonce", &a.nonce, "--canary", &a.canary, "--host", &a.host,
             "--result", &a.result,
         ]
         .map(str::to_owned);
@@ -600,6 +734,47 @@ mod tests {
             bad[index] = value.into();
             assert!(arguments(&bad).is_err());
         }
+    }
+    #[test]
+    fn hvsock_channel_takes_a_vm_guid_and_never_both_or_neither_channel() {
+        let a = args();
+        let mut values = [
+            "--vm-id",
+            "{4AE3C7F2-1D39-4C6B-9E58-0123456789AB}",
+            "--nonce",
+            &a.nonce,
+            "--canary",
+            &a.canary,
+            "--host",
+            &a.host,
+            "--result",
+            &a.result,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            arguments(&values).unwrap().channel,
+            Channel::HvSock(0x4ae3c7f2_1d39_4c6b_9e58_0123456789ab)
+        );
+        values[1] = "not-a-guid".into();
+        assert!(arguments(&values).is_err());
+        values[1] = "4ae3c7f2-1d39-4c6b-9e58-0123456789ab".into();
+        values.extend(["--pipe".to_owned(), "motor-hv-test".to_owned()]);
+        assert!(
+            arguments(&values)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+        values.truncate(10);
+        values[0] = "--stress-bytes".into();
+        values[1] = "0".into();
+        assert!(
+            arguments(&values)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
     }
     #[test]
     fn tar_contains_only_script_and_quoted_canary_not_host_content() {

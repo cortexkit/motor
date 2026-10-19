@@ -153,3 +153,50 @@ function Test-SpikePipeAbsent([string]$Pipe) {
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
 }
+
+# Motor's Hyper-V socket service ID. It must equal HVSOCK_SERVICE_ID in
+# crates/motor-winagent/src/transport.rs; a portable test compares the two.
+$SpikeHvsockServiceId = '92c268b0-cddd-40a4-a664-f32e50ad35ea'
+# Marker value written into the service registration so install/uninstall only
+# ever touch a key this spike created.
+$SpikeHvsockOwner = 'motor-hyperv-spike'
+
+function Get-SpikeServiceKeyPath {
+    return "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\$SpikeHvsockServiceId"
+}
+
+# Decide what install or uninstall must do with the registration, given whether
+# the key exists and the owner marker it carries. Never overwrites or deletes a
+# key with the same GUID that something else created.
+function Get-SpikeServiceKeyAction([ValidateSet('install','uninstall')][string]$Operation, [bool]$Exists, [string]$Owner) {
+    if ($Exists -and $Owner -ne $SpikeHvsockOwner) {
+        throw "FAIL hvsock-service-key-not-owned existing key has owner '$Owner'; refusing to $Operation"
+    }
+    if ($Operation -eq 'install') { if ($Exists) { return 'present' } else { return 'create' } }
+    if ($Exists) { return 'remove' } else { return 'absent' }
+}
+
+function Get-SpikeServiceKeyState([string]$Path = (Get-SpikeServiceKeyPath)) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ exists=$false; owner=''; element_name='' } }
+    $key = Get-ItemProperty -LiteralPath $Path
+    $owner = if ($key.PSObject.Properties['MotorOwner']) { [string]$key.MotorOwner } else { '' }
+    $name = if ($key.PSObject.Properties['ElementName']) { [string]$key.ElementName } else { '' }
+    return [pscustomobject]@{ exists=$true; owner=$owner; element_name=$name }
+}
+
+# Options that only make sense for one transport are refused up front, before
+# any VM or disk is created.
+function Assert-SpikeTransportOptions([string]$Transport, [string]$GuestAgentPath, [bool]$CompareSerialQueues, [int]$SerialQueueBytes) {
+    if ($Transport -eq 'hvsock') {
+        # The sealed parent's agent speaks COM; the socket agent is injected per job.
+        if (-not $GuestAgentPath) { throw 'FAIL hvsock-requires-agent-override pass -GuestAgentPath with an agent built by build-probe.ps1 -Transport hvsock' }
+        if ($CompareSerialQueues -or $SerialQueueBytes -ne 2097152) { throw 'FAIL hvsock-refuses-serial-options serial queue options apply only to -Transport com' }
+    } elseif ($Transport -ne 'com') { throw "FAIL unknown-transport $Transport" }
+}
+
+function Get-SpikeClientArgs([string]$Transport, [string]$Pipe, [string]$VmId, [string]$Nonce, [string]$Canary, [string]$HostName, [string]$Result, [int]$StressBytes) {
+    $channel = if ($Transport -eq 'hvsock') { @('--vm-id', $VmId) } else { @('--pipe', $Pipe) }
+    $arguments = $channel + @('--nonce', $Nonce, '--canary', $Canary, '--host', $HostName, '--result', $Result)
+    if ($StressBytes) { $arguments += @('--stress-bytes', [string]$StressBytes) }
+    return ,$arguments
+}

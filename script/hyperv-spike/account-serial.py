@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare completed host/guest serial I/O; counts do not locate a physical loss hop."""
+"""Compare completed host/guest transport I/O (COM or Hyper-V socket); counts do not locate a physical loss hop."""
 import argparse
 import json
 from pathlib import Path
@@ -124,7 +124,7 @@ def account(host, guest):
         "final_guest_input_queue": None if last_status is None else last_status[1],
         "missing_bytes": locate(shortfall, pending_request, last_status, last_rx_event),
         "classification": "receive-stream shortfall" if shortfall else "completed counts match; content and later stages still need validation",
-        "scope": "accepted named-pipe writes versus completed guest reads; no exact internal loss hop inferred",
+        "scope": "accepted host writes versus completed guest reads; no exact internal loss hop inferred",
     }
 
 

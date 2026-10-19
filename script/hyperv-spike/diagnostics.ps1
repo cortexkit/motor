@@ -90,3 +90,33 @@ function Save-SpikeGuestEvidence([string]$Disk, [string]$Directory) {
     } -ReadOnly
     Write-Host "EVIDENCE stopped-guest-diagnostics $Directory (no job password or disk retained)"
 }
+
+# Copy only the agent's diagnostic log from a stopped overlay. Used on every
+# hvsock run so both sides' byte counters are available, without the slower
+# event-log export the failure harvest does.
+function Save-SpikeAgentLog([string]$Disk, [string]$Directory) {
+    New-Item $Directory -ItemType Directory -Force | Out-Null
+    Use-SpikeWindowsDisk $Disk {
+        param($volume)
+        $log = Get-SpikePlainGuestItem $volume 'ProgramData\Motor\hyperv-agent.log'
+        if ($log) { Copy-Item -LiteralPath $log.FullName -Destination (Join-Path $Directory 'hyperv-agent.log') }
+        else { Write-Host 'EVIDENCE agent-log absent or reparse path' }
+    } -ReadOnly
+}
+
+# Compare the host client's trace with the guest agent's counters. Prints the
+# accounting JSON and returns its exit code; never throws, because it runs while
+# a VM is being cleaned up. -1 means the guest log was not available.
+function Invoke-SpikeByteAccounting([string]$Python, [string]$Batch, [int]$Run, [string]$HostTrace, [string]$GuestLog) {
+    if (-not $Python -or -not (Test-Path -LiteralPath $HostTrace) -or -not (Test-Path -LiteralPath $GuestLog)) {
+        Write-Host "FAIL byte-accounting-inputs run=$Run host=$HostTrace guest=$GuestLog"
+        return -1
+    }
+    try {
+        $result = Invoke-SpikeNative $Python @((Join-Path $PSScriptRoot 'account-serial.py'), '--host-trace', $HostTrace, '--guest-log', $GuestLog) $Batch "accounting-run-$Run"
+        return $result.exitCode
+    } catch {
+        Write-Host "FAIL byte-accounting run=$Run $_"
+        return -1
+    }
+}

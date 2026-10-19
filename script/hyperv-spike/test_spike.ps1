@@ -15,7 +15,7 @@ function Assert-Refused([scriptblock]$Check, [string]$Reason) {
 }
 Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion) zone=$([TimeZoneInfo]::Local.Id)"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
-foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/process.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/build-probe.ps1','script/hyperv-spike/diagnostics.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
+foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/process.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/build-probe.ps1','script/hyperv-spike/diagnostics.ps1','script/hyperv-spike/hvsock-service.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
     Test-SpikeLogic "parse-$relative" {
         $tokens = $null; $errors = $null
         [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $repo $relative), [ref]$tokens, [ref]$errors)
@@ -268,6 +268,39 @@ Test-SpikeLogic 'iso-stream-writer-compiles' {
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'common.ps1'), [ref]$tokens, [ref]$errors)
     $source = $ast.Find({ param($node) $node -is [Management.Automation.Language.StringConstantExpressionAst] -and $node.Value -like '*public static class MotorSpikeIso*' }, $true)
     Add-Type -TypeDefinition $source.Value
+}
+Test-SpikeLogic 'hvsock-service-id-matches-agent-constant' {
+    $source = Get-Content (Join-Path $repo 'crates/motor-winagent/src/transport.rs') -Raw
+    Assert-Logic ($source -match 'pub const HVSOCK_SERVICE_ID: &str = "([0-9a-f-]{36})";')
+    Assert-Logic ($Matches[1] -ceq $SpikeHvsockServiceId)
+    Assert-Logic ((Get-SpikeServiceKeyPath) -like '*\Virtualization\GuestCommunicationServices\92c268b0-cddd-40a4-a664-f32e50ad35ea')
+}
+Test-SpikeLogic 'hvsock-service-key-is-idempotent-and-only-touches-its-own-key' {
+    Assert-Logic ((Get-SpikeServiceKeyAction 'install' $false '') -eq 'create')
+    Assert-Logic ((Get-SpikeServiceKeyAction 'install' $true $SpikeHvsockOwner) -eq 'present')
+    Assert-Logic ((Get-SpikeServiceKeyAction 'uninstall' $true $SpikeHvsockOwner) -eq 'remove')
+    Assert-Logic ((Get-SpikeServiceKeyAction 'uninstall' $false '') -eq 'absent')
+    Assert-Refused { Get-SpikeServiceKeyAction 'install' $true '' } 'hvsock-service-key-not-owned'
+    Assert-Refused { Get-SpikeServiceKeyAction 'uninstall' $true 'someone-else' } 'hvsock-service-key-not-owned'
+}
+Test-SpikeLogic 'transport-options-refuse-mismatched-combinations' {
+    Assert-SpikeTransportOptions 'com' '' $false 2097152
+    Assert-SpikeTransportOptions 'hvsock' 'C:\agent.exe' $false 2097152
+    Assert-Refused { Assert-SpikeTransportOptions 'hvsock' '' $false 2097152 } 'hvsock-requires-agent-override'
+    Assert-Refused { Assert-SpikeTransportOptions 'hvsock' 'C:\agent.exe' $true 2097152 } 'hvsock-refuses-serial-options'
+    Assert-Refused { Assert-SpikeTransportOptions 'hvsock' 'C:\agent.exe' $false 0 } 'hvsock-refuses-serial-options'
+    Assert-Refused { Assert-SpikeTransportOptions 'tcp' 'C:\agent.exe' $false 2097152 } 'unknown-transport'
+}
+Test-SpikeLogic 'client-arguments-name-exactly-one-channel' {
+    $com = Get-SpikeClientArgs 'com' 'motor-hv-abc' '4ae3c7f2-1d39-4c6b-9e58-0123456789ab' 'n0' 'C:\canary.txt' 'ALLY' 'C:\r.json' 0
+    Assert-Logic (($com -join '|') -ceq '--pipe|motor-hv-abc|--nonce|n0|--canary|C:\canary.txt|--host|ALLY|--result|C:\r.json')
+    $socket = Get-SpikeClientArgs 'hvsock' 'motor-hv-abc' '4ae3c7f2-1d39-4c6b-9e58-0123456789ab' 'n0' 'C:\canary.txt' 'ALLY' 'C:\r.json' 65536
+    Assert-Logic (($socket -join '|') -ceq '--vm-id|4ae3c7f2-1d39-4c6b-9e58-0123456789ab|--nonce|n0|--canary|C:\canary.txt|--host|ALLY|--result|C:\r.json|--stress-bytes|65536')
+    Assert-Logic ($socket -is [array] -and $socket.Count -eq 12)
+}
+Test-SpikeLogic 'byte-accounting-never-throws-on-missing-inputs' {
+    # The function's own FAIL line is expected here; keep it out of the test log.
+    Assert-Logic ((Invoke-SpikeByteAccounting '' ([IO.Path]::GetTempPath()) 1 'missing-host.log' 'missing-guest.log' 6>$null) -eq -1)
 }
 Write-Host "Checks: $passed passed, $failed failed, 0 skipped"
 if ($failed -ne 0) { exit 1 }

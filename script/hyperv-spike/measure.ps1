@@ -3,6 +3,7 @@
 Measure five fresh offline jobs, or one diagnostic run that reports no median.
 .EXAMPLE
 .\measure.ps1 -Root C:\motor-spike\hyperv
+.\measure.ps1 -Transport hvsock -GuestAgentPath C:\motor-spike\hyperv\motor-winagent-hyperv.exe
 .NOTES
 Run elevated after provision.ps1 succeeds. Parent hashing is outside the phase
 timings and may dominate wall time; each client has a 300 s cap. Uses at most one
@@ -11,7 +12,8 @@ timings and may dominate wall time; each client has a 300 s cap. Uses at most on
 param([string]$Root = 'C:\motor-spike\hyperv', [string]$ClientPath = '', [switch]$DiagnosticOnly,
     [string]$GuestAgentPath = '', [ValidateSet(0,2097152)][int]$SerialQueueBytes = 2097152,
     [ValidateSet(0,65536)][int]$StressBytes = 0, [ValidateRange(1,300)][int]$ProbeTimeoutSeconds = 300,
-    [switch]$CompareSerialQueues)
+    [switch]$CompareSerialQueues, [ValidateSet('com','hvsock')][string]$Transport = 'com',
+    [ValidateSet('wildcard','parent')][string]$ListenAddress = 'wildcard')
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\diagnostics.ps1"
 $Root = [IO.Path]::GetFullPath($Root)
@@ -26,6 +28,8 @@ try {
     $lock = Enter-Spike $Root
     if (-not $DiagnosticOnly -and ($StressBytes -ne 0 -or $SerialQueueBytes -eq 0 -or $ProbeTimeoutSeconds -ne 300)) { throw 'Serial control/stress/short-timeout options require DiagnosticOnly' }
     if ($SerialQueueBytes -eq 0 -and -not $GuestAgentPath) { throw 'Serial queue control requires a diagnostic agent override' }
+    Assert-SpikeTransportOptions $Transport $GuestAgentPath $CompareSerialQueues.IsPresent $SerialQueueBytes
+    if ($Transport -eq 'com' -and $ListenAddress -ne 'wildcard') { throw 'ListenAddress applies only to -Transport hvsock' }
     if ($CompareSerialQueues -and (-not $DiagnosticOnly -or -not $GuestAgentPath -or $StressBytes -ne 65536 -or $SerialQueueBytes -ne 2097152)) { throw 'Queue comparison requires DiagnosticOnly, GuestAgentPath, StressBytes 65536 and the 2097152-byte fix' }
     $agentHash = if ($GuestAgentPath) { $GuestAgentPath = (Resolve-Path -LiteralPath $GuestAgentPath).Path; (Get-FileHash -LiteralPath $GuestAgentPath).Hash } else { '' }
     $batch = Join-Path $Root ('measure-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
@@ -39,12 +43,21 @@ try {
     Assert-Spike (@(Get-ChildItem $Root -Filter 'job-*.vhdx').Count -eq 0) 'no-orphan-job-disk' $Root
     $version = Invoke-SpikeNative $client @('--version') $batch 'client-version'
     Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=3') 'probe-version' ((Get-FileHash $client).Hash)
+    $python = $null
+    if ($Transport -eq 'hvsock') {
+        Assert-Spike ($version.stdout -match 'transports=pipe,hvsock') 'probe-supports-hvsock' $version.stdout.Trim()
+        $serviceKey = Get-SpikeServiceKeyState
+        Assert-Spike ($serviceKey.exists -and $serviceKey.owner -eq $SpikeHvsockOwner) 'hvsock-service-registered' "$(Get-SpikeServiceKeyPath) $($serviceKey | ConvertTo-Json -Compress) (run hvsock-service.ps1 -Install first)"
+        $python = (Get-Command python -ErrorAction Stop).Source
+        $pythonVersion = Invoke-SpikeNative $python @('--version') $batch 'python-version'
+        Assert-Spike ($pythonVersion.exitCode -eq 0) 'python-for-byte-accounting' "$python $($pythonVersion.stdout.Trim())"
+    }
     $canary = Join-Path $Root ('host-only-' + [Guid]::NewGuid().ToString('N') + '.txt')
     Set-Content $canary ([Guid]::NewGuid().ToString('N')) -Encoding ascii
     Assert-Spike (Test-Path $canary) 'real-host-canary-exists' "path=$canary SHA256=$((Get-FileHash $canary).Hash) (contents never staged)"
     $runCount = if ($CompareSerialQueues) { 2 } elseif ($DiagnosticOnly) { 1 } else { 5 }
     $queueEvidence = if ($GuestAgentPath) { [string]$SerialQueueBytes } else { 'baseline-not-overridden' }
-    Write-Host "EVIDENCE measurement-mode diagnosticOnly=$DiagnosticOnly runs=$runCount client=$client agent=$agentHash serialQueue=$queueEvidence compare=$CompareSerialQueues stressBytes=$StressBytes capSeconds=$ProbeTimeoutSeconds"
+    Write-Host "EVIDENCE measurement-mode transport=$Transport listen=$ListenAddress diagnosticOnly=$DiagnosticOnly runs=$runCount client=$client agent=$agentHash serialQueue=$queueEvidence compare=$CompareSerialQueues stressBytes=$StressBytes capSeconds=$ProbeTimeoutSeconds"
     for ($run = 1; $run -le $runCount; $run++) {
         $activeQueueBytes = if ($CompareSerialQueues -and $run -eq 1) { 0 } else { $SerialQueueBytes }
         $controlFailure = $null
@@ -68,6 +81,8 @@ try {
         $createMs = $null
         $helloMs = $null
         $cleanupOkay = $false
+        $harvestMs = 0
+        $accountingExit = $null
         try {
             Assert-Spike (Test-SpikePipeAbsent $pipe) 'pipe-absent-before' $pipe
             New-VHD -Path $child -Differencing -ParentPath $parent | Out-Null
@@ -85,19 +100,30 @@ try {
                     [IO.File]::WriteAllBytes($agent.FullName, [IO.File]::ReadAllBytes($GuestAgentPath))
                     Assert-Spike ((Get-FileHash -LiteralPath $agent.FullName).Hash -eq $agentHash) 'overlay-agent-hash' $agentHash
                     Assert-Spike ((Get-Acl -LiteralPath $agent.FullName).Sddl -eq $beforeAcl) 'overlay-agent-acl-preserved' $beforeAcl
-                    [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
-                    [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash queue=$activeQueueBytes nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
-                    Write-Host "EVIDENCE overlay-serial-queue run=$run bytes=$activeQueueBytes"
+                    if ($Transport -eq 'hvsock') {
+                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-listen.txt'), $ListenAddress, [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash transport=hvsock listen=$ListenAddress nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
+                        Write-Host "EVIDENCE overlay-hvsock-listen run=$run address=$ListenAddress"
+                    } else {
+                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash queue=$activeQueueBytes nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
+                        Write-Host "EVIDENCE overlay-serial-queue run=$run bytes=$activeQueueBytes"
+                    }
                 }
             }
             $timeline['define_vm_begin_unix_ms'] = Get-SpikeUnixMs
-            New-SpikeVM $name $child $vmDirectory $pipe
+            New-SpikeVM $name $child $vmDirectory $(if ($Transport -eq 'com') { $pipe } else { '' })
             $timeline['define_vm_done_unix_ms'] = Get-SpikeUnixMs
             Assert-Spike (@(Get-VMNetworkAdapter -VMName $name).Count -eq 0) 'no-job-network-adapter' $name
             Assert-Spike (@(Get-VMDvdDrive -VMName $name).Count -eq 0) 'no-job-media' $name
             Assert-Spike (@(Get-VMHardDiskDrive -VMName $name).Count -eq 1) 'only-os-overlay-attached' $child
             Assert-Spike (@(Get-VMIntegrationService -VMName $name | Where-Object Enabled).Count -eq 0) 'no-optional-integration-services' $name
-            Assert-Spike ((Get-VMComPort -VMName $name -Number 1).Path -eq "\\.\pipe\$pipe") 'com1-pipe-mapping' $pipe
+            if ($Transport -eq 'com') {
+                Assert-Spike ((Get-VMComPort -VMName $name -Number 1).Path -eq "\\.\pipe\$pipe") 'com1-pipe-mapping' $pipe
+            } else {
+                Assert-Spike (-not (Get-VMComPort -VMName $name -Number 1).Path) 'no-com-port-mapping' $name
+            }
+            $vmId = (Get-VM -Name $name).Id.ToString()
             $createMs = $create.Elapsed.TotalMilliseconds
             $createDone = Get-SpikeUnixMs
             $timeline['create_done_unix_ms'] = $createDone
@@ -109,8 +135,8 @@ try {
             $startReturned = Get-SpikeUnixMs
             $timeline['start_vm_return_unix_ms'] = $startReturned
             Write-Host "EVIDENCE start-vm-return unix_ms=$startReturned"
-            $clientArgs = @('--pipe', $pipe, '--nonce', $id, '--canary', $canary, '--host', $env:COMPUTERNAME, '--result', $result)
-            if ($StressBytes) { $clientArgs += @('--stress-bytes',[string]$StressBytes) }
+            $clientArgs = Get-SpikeClientArgs $Transport $pipe $vmId $id $canary $env:COMPUTERNAME $result $StressBytes
+            Write-Host "EVIDENCE probe-channel transport=$Transport $(if ($Transport -eq 'hvsock') { "vm_id=$vmId service_id=$SpikeHvsockServiceId" } else { "pipe=$pipe" })"
             $running = Start-SpikeNativeProcess $client $clientArgs
             $timeline['client_start_unix_ms'] = $running.started_unix_ms
             Write-Host "EVIDENCE probe-start pid=$($running.process.Id) unix_ms=$($running.started_unix_ms)"
@@ -165,9 +191,19 @@ try {
                 } finally {
                     try { Close-SpikeNativeProcess $running } finally {
                         Remove-SpikeVM $name
+                        $harvest = [Diagnostics.Stopwatch]::StartNew()
                         if ((-not $probe -or $DiagnosticOnly) -and (Test-Path -LiteralPath $child)) {
                             try { Save-SpikeGuestEvidence $child (Join-Path $batch "run-$run-guest") }
                             catch { Write-Host "FAIL diagnostic-harvest $_ (cleanup still required)" }
+                        } elseif ($Transport -eq 'hvsock' -and (Test-Path -LiteralPath $child)) {
+                            # Byte accounting needs the guest's counters on every run.
+                            try { Save-SpikeAgentLog $child (Join-Path $batch "run-$run-guest") }
+                            catch { Write-Host "FAIL agent-log-harvest $_ (cleanup still required)" }
+                        }
+                        # Evidence collection is not part of the teardown a job pays.
+                        $harvestMs = $harvest.Elapsed.TotalMilliseconds
+                        if ($Transport -eq 'hvsock') {
+                            $accountingExit = Invoke-SpikeByteAccounting $python $batch $run $stderr (Join-Path $batch "run-$run-guest\hyperv-agent.log")
                         }
                         if (Test-Path $child) { Remove-Item $child -Force }
                         if (Test-Path $vmDirectory) { Remove-Item $vmDirectory -Recurse -Force }
@@ -177,7 +213,8 @@ try {
                     }
                 }
             } finally {
-                $teardownMs = $teardown.Elapsed.TotalMilliseconds
+                $teardownMs = $teardown.Elapsed.TotalMilliseconds - $harvestMs
+                $timeline['evidence_harvest_ms'] = $harvestMs
                 $timeline['teardown_done_unix_ms'] = Get-SpikeUnixMs
                 $timeline | ConvertTo-Json | Set-Content (Join-Path $batch "run-$run-timeline.json") -Encoding UTF8
                 Write-Host "EVIDENCE full-timeline $($timeline | ConvertTo-Json -Compress)"
@@ -192,6 +229,7 @@ try {
             continue
         }
         Assert-Spike ($cleanupOkay -and $null -ne $probe) 'complete-sample' $run
+        if ($Transport -eq 'hvsock') { Assert-Spike ($accountingExit -eq 0) 'byte-accounting-both-directions' "run=$run exit=$accountingExit" }
         $row = [ordered]@{ create_ms=$createMs; boot_hello_ms=$helloMs; command_ms=[double]$probe.command_ms; teardown_ms=$teardownMs; start_vm_call_ms=$startCallMs; start_to_first_byte_ms=$startToFirstMs; first_byte_to_hello_ms=$firstToHelloMs }
         Write-Host "PASS phases run=$run $($row | ConvertTo-Json -Compress)"
         $rows += $row
