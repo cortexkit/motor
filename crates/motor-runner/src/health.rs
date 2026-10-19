@@ -1,5 +1,8 @@
 use crate::storage::Job;
-use motor_protocol::{HealthCounts, HealthRepositoryUsage, Outcome, RefusalReason};
+use motor_protocol::{
+    HealthCounts, HealthQueueWait, HealthRepositoryUsage, HealthUnderusedReservation, Outcome,
+    RefusalReason, RunningJob,
+};
 use std::{collections::BTreeMap, path::Path};
 use uuid::Uuid;
 
@@ -10,6 +13,7 @@ pub(super) const REPOSITORY_WINDOW_MS: u64 = 24 * 60 * MINUTE_MS;
 pub(super) struct Health {
     pub since_ms: u64,
     buckets: BTreeMap<u64, HealthCounts>,
+    queue_waits: BTreeMap<u64, BTreeMap<u64, u64>>,
 }
 
 impl Health {
@@ -17,6 +21,7 @@ impl Health {
         Self {
             since_ms,
             buckets: BTreeMap::new(),
+            queue_waits: BTreeMap::new(),
         }
     }
 
@@ -24,6 +29,50 @@ impl Health {
         let minute = now / MINUTE_MS;
         self.buckets
             .retain(|bucket, _| minute.saturating_sub(*bucket) < u64::from(WINDOW_MINUTES));
+        self.queue_waits
+            .retain(|bucket, _| minute.saturating_sub(*bucket) < u64::from(WINDOW_MINUTES));
+    }
+
+    pub fn record_queue_wait(&mut self, now: u64, wait_ms: u64) {
+        self.prune(now);
+        *self
+            .queue_waits
+            .entry(now / MINUTE_MS)
+            .or_default()
+            .entry(wait_ms)
+            .or_default() += 1;
+    }
+
+    pub fn queue_wait(&mut self, now: u64) -> HealthQueueWait {
+        self.prune(now);
+        let mut histogram = BTreeMap::<u64, u64>::new();
+        for bucket in self.queue_waits.values() {
+            for (&wait, &count) in bucket {
+                *histogram.entry(wait).or_default() += count;
+            }
+        }
+        let total: u64 = histogram.values().sum();
+        let percentile = |percent: u64| {
+            let rank = (total * percent).div_ceil(100);
+            let mut seen = 0;
+            histogram
+                .iter()
+                .find_map(|(&wait, &count)| {
+                    seen += count;
+                    (seen >= rank).then_some(wait)
+                })
+                .unwrap_or(0)
+        };
+        HealthQueueWait {
+            p50_ms: percentile(50),
+            p90_ms: percentile(90),
+            refusals: self
+                .counts(now)
+                .refusals
+                .get("queue_wait_exceeded")
+                .copied()
+                .unwrap_or(0),
+        }
     }
 
     pub fn record(&mut self, now: u64, update: impl FnOnce(&mut HealthCounts)) {
@@ -72,6 +121,8 @@ struct FinishedJob {
 #[derive(Default)]
 pub(super) struct RepositoryUsage {
     jobs: BTreeMap<Uuid, FinishedJob>,
+    pub active: BTreeMap<Uuid, (RunningJob, bool)>,
+    pub underused: BTreeMap<Uuid, HealthUnderusedReservation>,
 }
 
 impl RepositoryUsage {
@@ -84,8 +135,35 @@ impl RepositoryUsage {
     }
 
     /// Called on every job record save, often under the state lock, so it does
-    /// only a map lookup; expired entries are dropped when a snapshot is taken.
+    /// only map lookups; expired entries are dropped when a snapshot is taken.
     pub fn record_job(&mut self, job: &Job, now: u64) {
+        self.active.remove(&job.id);
+        if job.pending() || job.state == crate::storage::JobState::Running {
+            self.active.insert(
+                job.id,
+                (
+                    RunningJob::new(job.id, job.key(), job.weight),
+                    job.pending(),
+                ),
+            );
+        }
+        self.underused.remove(&job.id);
+        if let Some(usage) = &job.reservation_use {
+            if job.terminal.is_some()
+                && usage.wall_ms > 10 * MINUTE_MS
+                && usage.average_use_ppm < 250_000
+            {
+                self.underused.insert(
+                    job.id,
+                    HealthUnderusedReservation {
+                        job_id: job.id,
+                        workspace_key: job.key().to_owned(),
+                        vcpus: job.weight,
+                        usage: usage.clone(),
+                    },
+                );
+            }
+        }
         self.jobs.remove(&job.id);
         let Some(finished_ms) = job.finished_ms else {
             return;
@@ -120,6 +198,12 @@ impl RepositoryUsage {
                 queue_wait_refusal,
             },
         );
+    }
+
+    pub fn remove(&mut self, id: Uuid) {
+        self.active.remove(&id);
+        self.underused.remove(&id);
+        self.jobs.remove(&id);
     }
 
     pub fn snapshot(&mut self, now: u64) -> BTreeMap<String, HealthRepositoryUsage> {
@@ -160,4 +244,35 @@ impl RepositoryUsage {
             now >= job.finished_ms && now - job.finished_ms < REPOSITORY_WINDOW_MS
         });
     }
+}
+
+pub(super) fn host_sample(
+    loadavg: &str,
+    cpuinfo: &str,
+    meminfo: &str,
+) -> (Option<serde_json::Number>, Option<u64>, Option<u64>) {
+    let mut fields = loadavg.split_whitespace();
+    let load = fields
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .and_then(serde_json::Number::from_f64);
+    // Count logical CPU threads in /proc/cpuinfo so load can be read against host capacity.
+    let threads = cpuinfo
+        .lines()
+        .filter(|line| {
+            line.split_once(':').is_some_and(|(key, value)| {
+                key.trim() == "processor" && value.trim().parse::<u64>().is_ok()
+            })
+        })
+        .count() as u64;
+    let threads = (threads > 0).then_some(threads);
+    let available = meminfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "MemAvailable:").then_some(())?;
+        let kib = fields.next()?.parse::<u64>().ok()?;
+        (fields.next()? == "kB").then_some(())?;
+        kib.checked_mul(1024)
+    });
+    (load, threads, available)
 }

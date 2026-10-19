@@ -193,6 +193,28 @@ pub struct RunnerHealth {
     /// Finished job records in the rolling 24-hour window, grouped by repository basename.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_usage: BTreeMap<String, HealthRepositoryUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_1m: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    /// Includes permits reserved for jobs whose workspace setup is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permits_held: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permits_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_1h: Option<HealthQueueWait>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthQueueWait {
+    /// Nearest-rank percentiles of the capacity wait reported in Started.
+    /// Zero means no jobs started in the reporting window.
+    pub p50_ms: u64,
+    pub p90_ms: u64,
+    pub refusals: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

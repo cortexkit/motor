@@ -220,7 +220,37 @@ impl Runner {
     }
 
     pub fn runner_status(&self) -> RunnerStatusReply {
-        let status = self.status();
+        let now = self.now();
+        // Keep retained job history out of the state-lock path of each probe.
+        let (status, permits_held) = {
+            let inner = self.core.inner.lock().unwrap();
+            let usage = self.core.repository_usage.lock().unwrap();
+            let active = &usage.active;
+            let queue_depth = active.values().filter(|(_, pending)| *pending).count() as u32;
+            let running = active
+                .values()
+                .filter(|(_, pending)| !pending)
+                .map(|(job, _)| job.clone())
+                .collect();
+            let permits = active
+                .iter()
+                .filter(|(id, (_, pending))| !pending || inner.starting.contains(id))
+                .map(|(_, (job, _))| job.weight)
+                .sum();
+            (self.status_with_jobs(&inner, queue_depth, running), permits)
+        };
+        let (repository_usage, underused_reservations) = {
+            let mut usage = self.core.repository_usage.lock().unwrap();
+            (
+                usage.snapshot(now),
+                usage.underused.values().cloned().collect(),
+            )
+        };
+        let (load_1m, threads, mem_available_bytes) = health::host_sample(
+            &fs::read_to_string("/proc/loadavg").unwrap_or_default(),
+            &fs::read_to_string("/proc/cpuinfo").unwrap_or_default(),
+            &fs::read_to_string("/proc/meminfo").unwrap_or_default(),
+        );
         let free_bytes = match (self.core.config.free_space_probe)(&self.core.trees.state) {
             Ok(bytes) => Some(bytes),
             Err(error) => {
@@ -250,28 +280,6 @@ impl Runner {
                 weight: job.weight,
             })
             .collect();
-        let underused_reservations = self
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .jobs
-            .values()
-            .filter_map(|job| {
-                let usage = job.reservation_use.as_ref()?;
-                (job.terminal.is_some()
-                    && usage.wall_ms > 10 * 60_000
-                    && usage.average_use_ppm < 250_000)
-                    .then(|| HealthUnderusedReservation {
-                        job_id: job.id,
-                        workspace_key: job.key().to_owned(),
-                        vcpus: job.weight,
-                        usage: usage.clone(),
-                    })
-            })
-            .collect();
-        let now = self.now();
-        let repository_usage = self.core.repository_usage.lock().unwrap().snapshot(now);
         let health = {
             let mut counters = self.core.health.lock().unwrap();
             RunnerHealth {
@@ -285,6 +293,12 @@ impl Runner {
                 counts: counters.counts(now),
                 underused_reservations,
                 repository_usage,
+                load_1m,
+                threads,
+                mem_available_bytes,
+                permits_held: Some(permits_held),
+                permits_cap: Some(self.core.config.max_weight),
+                queue_wait_1h: Some(counters.queue_wait(now)),
             }
         };
         RunnerStatusReply {

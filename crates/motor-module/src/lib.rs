@@ -8,6 +8,7 @@ mod config;
 mod default_tip;
 mod diagnostics;
 mod engram_catalog;
+mod health_cache;
 mod hosted;
 pub mod logging;
 pub mod module;

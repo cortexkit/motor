@@ -69,6 +69,7 @@ fn disk_eviction_skips_reserved_and_running_workspaces() {
             r.cwd = text(path).into();
             let mut job = Job::new(r.job_id, Some(r.clone()), now, 1, 99);
             job.state = state;
+            runner.save(&job).unwrap();
             inner.jobs.insert(job.id, job);
         }
     }

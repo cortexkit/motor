@@ -516,7 +516,23 @@ fn windows_health_and_status_use_the_instance_units_and_baseline_toolchain() {
     let status = runner.runner_status();
     assert_eq!(status.status.rustc_version, "1.99.0");
     assert_eq!(status.health.as_ref().unwrap().failed_job_units, Some(1));
-    let shape = serde_json::to_value(status.health.unwrap()).unwrap();
+    let mut shape = serde_json::to_value(status.health.unwrap()).unwrap();
+    assert_eq!(shape["permits_held"], 0);
+    assert_eq!(shape["permits_cap"], runner.config().max_weight);
+    assert_eq!(
+        shape["queue_wait_1h"],
+        serde_json::json!({"p50_ms": 0, "p90_ms": 0, "refusals": 0})
+    );
+    for key in [
+        "load_1m",
+        "threads",
+        "mem_available_bytes",
+        "permits_held",
+        "permits_cap",
+        "queue_wait_1h",
+    ] {
+        shape.as_object_mut().unwrap().remove(key);
+    }
     assert_eq!(shape.as_object().unwrap().len(), 8);
     assert!(shape.get("rustc_version").is_none());
     let mut linux = f.config();
