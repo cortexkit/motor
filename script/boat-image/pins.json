@@ -20,7 +20,7 @@
     "ca-certificates", "unzip", "xz-utils", "patch", "ufw"
   ],
   "runner_inputs_sha256": {
-    "script/runner/tools.txt": "0adb18c8d25056c7dff10b6f97d5e41444daa412c36bfe87c2b211728b044244",
+    "script/runner/tools.txt": "a24145ef770f822c73ac43ee4beb0e63f98bfa627bf7e32e5c6877824924e7ee",
     "script/runner/install-tools.sh": "4e7cc41499433a0a90ce448a558d05a8dab1c9d51a96f809dbdb87c230933a37",
     "script/runner/build-sccache.sh": "35e89b323cd3914279fa772052ed6992fb271231c5cece7a6fe683fa38229541",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870"
