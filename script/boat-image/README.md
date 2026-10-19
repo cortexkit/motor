@@ -155,8 +155,11 @@ disposable clone. Never expose it as a production endpoint.
 ## Disk budget
 
 Recursive mode repair is implemented by the runner's native `physical-chmod`
-operation, not by a version-dependent coreutils `chmod -P`. It pins every root
-and ancestor with `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)`, opens children with
+operation, not by a version-dependent coreutils `chmod -P`. It pins every
+ancestor with `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)` and each root with
+`O_PATH|O_NOFOLLOW`. A root may be a directory (walked recursively) or a regular
+file (only that inode); a symlink or special-inode root is refused before any
+mode changes. It opens children with
 `O_NOFOLLOW`, skips symlink inodes by `fstat`, and changes modes through pinned
 descriptors. The kernel-owned `/proc/self/fd` link is used for `fchmodat` so FIFO,
 socket and device inodes need not be opened for I/O; it never resolves a

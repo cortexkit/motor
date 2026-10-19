@@ -120,34 +120,46 @@ fn open_at(parent: RawFd, name: &std::ffi::OsStr, directory: bool) -> io::Result
     }
 }
 
+/// Pin a repair root without following any symlink. Every ancestor must be a
+/// physical directory. The root itself may be a directory (repaired recursively)
+/// or a regular file (only that inode is repaired), as `chmod -R` accepted both.
+/// A symlink or special-inode root is refused before any mode changes.
 fn physical_root(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() || path.parent().is_none() {
         return Err(io::Error::other(
             "permission tree must be absolute and not filesystem root",
         ));
     }
-    let mut fd = open_at(libc::AT_FDCWD, std::ffi::OsStr::new("/"), true)?;
-    let mut descended = false;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                fd = open_at(fd.as_raw_fd(), name, true)?;
-                descended = true;
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "permission tree contains a nonphysical component",
-                ))
-            }
-        }
-    }
-    if !descended {
+    let names = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name)),
+            _ => Some(Err(io::Error::other(
+                "permission tree contains a nonphysical component",
+            ))),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let Some((last, ancestors)) = names.split_last() else {
         return Err(io::Error::other(
             "refusing permission repair of filesystem root",
         ));
+    };
+    let mut fd = open_at(libc::AT_FDCWD, std::ffi::OsStr::new("/"), true)?;
+    for name in ancestors {
+        fd = open_at(fd.as_raw_fd(), name, true)?;
     }
-    Ok(fd)
+    // Without O_DIRECTORY, O_PATH|O_NOFOLLOW pins a symlink itself rather than
+    // failing, so the root's type is checked on the pinned inode.
+    let root = open_at(fd.as_raw_fd(), last, false)?;
+    let kind = fs::File::from(root.try_clone()?).metadata()?.file_type();
+    if !kind.is_dir() && !kind.is_file() {
+        return Err(io::Error::other(format!(
+            "permission root must be a physical directory or regular file, not a symlink or special inode: {}",
+            path.display()
+        )));
+    }
+    Ok(root)
 }
 
 struct Frame {

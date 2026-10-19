@@ -1,7 +1,7 @@
 use super::*;
 use cortexkit_test_support::ScratchDir;
 use std::os::unix::{
-    fs::{symlink, PermissionsExt},
+    fs::{symlink, FileTypeExt, PermissionsExt},
     net::UnixListener,
 };
 
@@ -78,6 +78,49 @@ fn physical_permission_walk_pins_inodes_across_a_symlink_replacement() {
 }
 
 #[test]
+fn physical_permission_walk_repairs_a_regular_file_root_and_refuses_a_symlink_root() {
+    let scratch = ScratchDir::new("motor-physical-permission-file-root");
+    let output = scratch.join("output");
+    fs::create_dir(&output).unwrap();
+    let stdout = output.join("stdout");
+    let exit = output.join("exit");
+    fs::write(&stdout, b"job output").unwrap();
+    fs::write(&exit, b"0").unwrap();
+    fs::set_permissions(&stdout, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&exit, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+    apply(Policy::OwnerWrite, &[&stdout]).unwrap();
+    assert_eq!(mode(&stdout), 0o644);
+    apply(Policy::Private, &[&stdout, &exit]).unwrap();
+    assert_eq!(mode(&stdout), 0o600);
+    assert_eq!(mode(&exit), 0o700);
+    // Only the named file's inode changes, never its parent directory.
+    assert_eq!(mode(&output), 0o755);
+
+    let outside = scratch.join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o440)).unwrap();
+    let link = output.join("stderr");
+    symlink(&outside, &link).unwrap();
+    let dangling = output.join("dangling");
+    symlink(scratch.join("missing"), &dangling).unwrap();
+    let fifo = output.join("fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o666) }, 0);
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
+    fs::set_permissions(&stdout, fs::Permissions::from_mode(0o444)).unwrap();
+    for refused in [&link, &dangling, &fifo] {
+        // Roots are validated before any mode changes, so the good file is untouched.
+        assert!(apply(Policy::Private, &[&stdout, refused]).is_err());
+        assert_eq!(mode(&stdout), 0o444);
+    }
+    assert_eq!(mode(&outside), 0o440);
+    assert_eq!(mode(&fifo), 0o666);
+    // A regular file is not a directory ancestor.
+    assert!(apply(Policy::Private, &[&stdout.join("child")]).is_err());
+}
+
+#[test]
 fn physical_permission_modes_preserve_conditional_execute_and_support_special_inodes() {
     let scratch = ScratchDir::new("motor-physical-permission-modes");
     let tree = scratch.join("tree");
@@ -92,7 +135,15 @@ fn physical_permission_modes_preserve_conditional_execute_and_support_special_in
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o666) }, 0);
     let socket = tree.join("socket");
-    let _listener = UnixListener::bind(&socket).unwrap();
+    // Gate scratch paths can exceed the 108-byte sun_path limit, so bind through
+    // a short /proc/self/fd path naming the open tree directory instead.
+    let directory = fs::File::open(&tree).unwrap();
+    let short = format!("/proc/self/fd/{}/socket", directory.as_raw_fd());
+    let _listener = UnixListener::bind(&short).unwrap();
+    assert!(fs::symlink_metadata(&socket)
+        .unwrap()
+        .file_type()
+        .is_socket());
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o666)).unwrap();
     assert_eq!(mode(&socket), 0o666);
     apply(Policy::OwnerWrite, &[&tree]).unwrap();

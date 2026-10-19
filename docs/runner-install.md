@@ -43,6 +43,10 @@ The trusted operator uses exactly these argv forms (paths are data, not shell):
 /usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- /absolute/tree ...
 ```
 
+Each path is a physical directory, repaired recursively, or a regular file,
+repaired alone. Symlink and special-inode roots, and symlinked ancestors, are
+refused before any mode changes.
+
 Before deploying a candidate that uses native mode repair, an **administrator**
 installs a matching copy and the operator-only sudo fragment:
 
