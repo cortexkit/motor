@@ -71,6 +71,105 @@ pub(crate) fn systemctl(args: &[&str], privileged: bool) -> io::Result<Output> {
     output(command.args(args))
 }
 
+pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::Result<bool> {
+    let major = version
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("cannot determine systemd manager version"))?;
+    if major < 257 && !boat_profile {
+        return Err(io::Error::other("systemd >=257 is required for PrivatePIDs; only an explicitly configured single-tenant --boat-profile may run without it"));
+    }
+    Ok(major >= 257)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
+    let output = systemctl(&["show", "--property=Version", "--value"], false)?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "cannot query systemd manager capabilities",
+        ));
+    }
+    let enabled = private_pids_capability(&String::from_utf8_lossy(&output.stdout), boat_profile)?;
+    if !enabled {
+        tracing::warn!("Boat single-tenant profile: systemd lacks PrivatePIDs; jobs share the host PID namespace");
+    }
+    Ok(enabled)
+}
+
+pub(crate) fn provider_names(
+    manager: &str,
+    inherited: impl Iterator<Item = String>,
+) -> io::Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::from([
+        "ASCII_TOKEN".to_owned(),
+        "BOAT_ID".to_owned(),
+        "BOAT_CURRENT_ID_FILE".to_owned(),
+    ]);
+    for name in manager
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .chain(inherited)
+    {
+        if name == "ASCII_TOKEN" || name.starts_with("BOAT_") {
+            if !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(io::Error::other(
+                    "invalid provider environment variable name",
+                ));
+            }
+            names.insert(name);
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn provider_environment_names() -> io::Result<Vec<String>> {
+    let result = systemctl(&["show-environment"], false)?;
+    if !result.status.success() {
+        return Err(io::Error::other(
+            "cannot inspect system manager environment names",
+        ));
+    }
+    provider_names(
+        &String::from_utf8_lossy(&result.stdout),
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    )
+}
+
+#[test]
+fn boat_provider_environment_names_include_unknown_prefixes_without_values() {
+    let names = provider_names(
+        "BOAT_FUTURE=never-echo\nOTHER=ignored\nASCII_TOKEN=never-echo",
+        ["BOAT_SHELL".to_owned()].into_iter(),
+    )
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "ASCII_TOKEN",
+            "BOAT_CURRENT_ID_FILE",
+            "BOAT_FUTURE",
+            "BOAT_ID",
+            "BOAT_SHELL"
+        ]
+    );
+}
+
+#[test]
+fn boat_pid_compatibility_is_explicit_and_version_checked() {
+    assert!(private_pids_capability("255.4-1ubuntu8.16", false).is_err());
+    assert!(!private_pids_capability("255.4-1ubuntu8.16", true).unwrap());
+    assert!(private_pids_capability("257.9", true).unwrap());
+    assert!(private_pids_capability("259.5", false).unwrap());
+    assert!(private_pids_capability("unknown", true).is_err());
+}
+
 pub(crate) struct PollBackoff {
     delay: Duration,
     maximum: Duration,

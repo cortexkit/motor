@@ -44,6 +44,16 @@ pub struct Config {
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
+    /// Explicit single-tenant Boat compatibility: systemd before 257 cannot
+    /// create private PID namespaces. All other job isolation remains enabled.
+    pub boat_profile: bool,
+    /// One-job Boat budget measured at boot, after idle overhead and headroom.
+    /// Never used for the fleet profile's per-vCPU memory rule.
+    pub boat_memory_max_bytes: Option<u64>,
+    #[cfg(target_os = "linux")]
+    pub(crate) private_pids: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) boat_unset_environment: Vec<String>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.
     pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
@@ -51,6 +61,8 @@ pub struct Config {
     pub build_slot_root: PathBuf,
     pub max_queue_depth: usize,
     pub max_weight: u32,
+    /// Keep the fleet's daemon-only core unless the operator explicitly opts out.
+    pub reserve_daemon_core: bool,
     pub rustc_slots: u32,
     /// Maximum size of the per-instance compiler cache, in GiB.
     pub sccache_size_gib: u64,
@@ -81,6 +93,8 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) windows_phase: Option<Arc<dyn Fn(motor_winagent::Phase) + Send + Sync>>,
     pub free_space_floor_bytes: u64,
+    /// Optional soft reclaim goal; absent preserves twice the admission floor.
+    pub free_space_eviction_bytes: Option<u64>,
     /// Only catalogued workspaces beneath these roots may be pressure-evicted.
     pub workspace_roots: Vec<PathBuf>,
     /// Authorized destinations for caller workspaces, heads and siblings.
@@ -205,12 +219,19 @@ impl Config {
         let state_root = state_root.into();
         Self {
             tenant_vm: false,
+            boat_profile: false,
+            boat_memory_max_bytes: None,
+            #[cfg(target_os = "linux")]
+            private_pids: true,
+            #[cfg(target_os = "linux")]
+            boat_unset_environment: Vec::new(),
             tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,
             max_queue_depth: 64,
             max_weight: 28,
+            reserve_daemon_core: true,
             rustc_slots: 24,
             sccache_size_gib: 200,
             #[cfg(target_os = "linux")]
@@ -234,6 +255,7 @@ impl Config {
             #[cfg(test)]
             windows_prep_executable: None,
             free_space_floor_bytes: DEFAULT_FREE_SPACE_FLOOR_BYTES,
+            free_space_eviction_bytes: None,
             workspace_roots: vec![PathBuf::from("/Users")],
             owned_workspace_roots: vec![PathBuf::from("/Users")],
             drop_timeout: Duration::from_secs(60),
@@ -348,6 +370,9 @@ impl Config {
 }
 
 pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
+    if let Some(bytes) = _config.boat_memory_max_bytes {
+        return format!("the Boat job's measured memory budget of {} bytes was reached; the kernel killed a process and the job was stopped. More vCPUs do not increase this sandbox's usable memory.", bytes);
+    }
     #[cfg(test)]
     let floor_gib = _config.memory_floor_gib;
     #[cfg(test)]
@@ -373,6 +398,31 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
     format!(
         "the job's memory limit of {limit} GiB was reached; the kernel killed a process and the job was stopped.{advice}"
     )
+}
+
+#[test]
+fn boat_memory_override_requires_explicit_profile_and_budget() {
+    for (boat, bytes) in [
+        (false, Some(2 << 30)),
+        (true, None),
+        (true, Some(512 << 20)),
+    ] {
+        let mut config = Config::new("/unused", "boat");
+        config.boat_profile = boat;
+        config.boat_memory_max_bytes = bytes;
+        let error = Runner::open(config)
+            .err()
+            .expect("invalid Boat memory configuration must fail");
+        assert!(error
+            .to_string()
+            .contains("--boat-profile requires an explicit measured"));
+    }
+    let mut config = Config::new("/unused", "boat");
+    config.boat_profile = true;
+    config.boat_memory_max_bytes = Some(14 << 30);
+    let detail = oom_memory_limit_detail(&config, 8, 8);
+    assert!(detail.contains("15032385536 bytes"));
+    assert!(!detail.contains("28 GiB"));
 }
 
 #[derive(Clone)]
@@ -685,7 +735,22 @@ impl Runner {
         {
             return Err(invalid("invalid runner configuration"));
         }
+        if config.boat_profile != config.boat_memory_max_bytes.is_some()
+            || config
+                .boat_memory_max_bytes
+                .is_some_and(|bytes| bytes < (1 << 30))
+        {
+            return Err(invalid("--boat-profile requires an explicit measured --boat-memory-max-bytes budget of at least 1 GiB; other profiles must not override memory"));
+        }
         backend.validate(&config)?;
+        if config
+            .free_space_eviction_bytes
+            .is_some_and(|soft| soft <= config.free_space_floor_bytes)
+        {
+            return Err(invalid(
+                "disk eviction threshold must be above the refusal floor",
+            ));
+        }
         #[cfg(test)]
         let cpus = config
             .cpu_topology
@@ -694,6 +759,11 @@ impl Runner {
             .unwrap_or_else(CpuTopology::read)?;
         #[cfg(not(test))]
         let cpus = CpuTopology::read()?;
+        let cpus = if config.reserve_daemon_core {
+            cpus
+        } else {
+            cpus.without_daemon_reservation()
+        };
         let cpus = if let Some(vm) = &config.windows {
             CpuTopology::fixed(vm.cpu_set.clone())?
         } else {
@@ -712,6 +782,10 @@ impl Runner {
         };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
+            config.private_pids = crate::systemd::job_private_pids(config.boat_profile)?;
+            if config.boat_profile {
+                config.boat_unset_environment = crate::systemd::provider_environment_names()?;
+            }
             crate::isolation::validate_account()?;
             #[cfg(test)]
             if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
@@ -1729,8 +1803,8 @@ impl Runner {
     fn cpu_refusal(&self, claim: u32) -> Option<(RefusalReason, String)> {
         if claim == 0 || claim > self.core.cpus.capacity() {
             Some((RefusalReason::RunnerFull, format!(
-                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; one physical core is reserved for daemon setup)",
-                self.core.cpus.capacity()
+                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; daemon core reservation {})",
+                self.core.cpus.capacity(), if self.core.config.reserve_daemon_core { "enabled" } else { "explicitly disabled" }
             )))
         } else {
             None
@@ -4479,6 +4553,12 @@ impl Runner {
                 crate::backend::memory_limit_gib(job.weight, self.core.config.memory_floor_gib);
             #[cfg(not(test))]
             let limit = crate::backend::memory_limit_gib(job.weight);
+            let limit = self
+                .core
+                .config
+                .boat_memory_max_bytes
+                .map(|bytes| format!("{:.3}", bytes as f64 / (1_u64 << 30) as f64))
+                .unwrap_or(limit);
             tracing::warn!(
                 job_id = %id,
                 memory_limit_gib = %limit,

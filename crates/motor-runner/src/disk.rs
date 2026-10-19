@@ -599,7 +599,11 @@ impl Runner {
         }
         // Reclaim cache before admission becomes unsafe. Missing the soft goal
         // must never refuse a job while the hard reserve is still available.
-        let soft = floor.saturating_mul(2);
+        let soft = self
+            .core
+            .config
+            .free_space_eviction_bytes
+            .unwrap_or_else(|| floor.saturating_mul(2));
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         let mut free = probe()?;
         if !self.core.quarantined.is_empty() {

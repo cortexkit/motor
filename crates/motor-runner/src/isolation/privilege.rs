@@ -197,8 +197,14 @@ fn writer_tree_operations_batch_all_paths_without_following_links() {
         Box::new(move |command| {
             assert_eq!(command.get_program(), "/usr/bin/sudo");
             let args: Vec<_> = command.get_args().collect();
-            assert!(args.contains(&std::ffi::OsStr::new("-R")));
-            assert!(args.contains(&std::ffi::OsStr::new("-P")));
+            let native = args.get(2) == Some(&std::ffi::OsStr::new("physical-chmod"));
+            if native {
+                assert_eq!(args[1], crate::permissions::HELPER);
+                assert_eq!(args[3], "private-rwX");
+            } else {
+                assert!(args.contains(&std::ffi::OsStr::new("-R")));
+                assert!(args.contains(&std::ffi::OsStr::new("-P")));
+            }
             let separator = args.iter().position(|arg| *arg == "--").unwrap();
             assert_eq!(
                 &args[separator + 1..],
@@ -207,9 +213,11 @@ fn writer_tree_operations_batch_all_paths_without_following_links() {
                     .map(|path| path.as_os_str())
                     .collect::<Vec<_>>()
             );
-            recorded
-                .borrow_mut()
-                .push(args[1].to_string_lossy().into_owned());
+            recorded.borrow_mut().push(if native {
+                "physical-chmod".to_owned()
+            } else {
+                args[1].to_string_lossy().into_owned()
+            });
             Ok(success(""))
         }),
         || {
@@ -222,6 +230,6 @@ fn writer_tree_operations_batch_all_paths_without_following_links() {
     );
     assert_eq!(
         &*operations.borrow(),
-        &["/usr/bin/chown", "/usr/bin/setfacl", "/usr/bin/chmod"]
+        &["/usr/bin/chown", "/usr/bin/setfacl", "physical-chmod"]
     );
 }

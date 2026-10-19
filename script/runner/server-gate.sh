@@ -59,6 +59,8 @@ step clippy cargo clippy --workspace --all-targets --locked -- -D warnings
 for run in $(seq 1 "$runs"); do
   step "workspace-$run" cargo nextest run --workspace --locked --no-fail-fast
 done
+step permission-helper cargo build -p motor-runner --bin motor-runner --locked
+step permission-helper-policy "$CARGO_TARGET_DIR/debug/motor-runner" check-permissions-helper
 for run in $(seq 1 "$runs"); do
   step "operator-lib-$run" cargo nextest run -p motor-runner --lib --locked --run-ignored only \
     -E 'test(/::isolated_/) | test(=engine::tests::cancellation_deadline_and_drop_kill_even_term_ignoring_groups)' \

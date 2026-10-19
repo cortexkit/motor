@@ -575,6 +575,12 @@ impl Backend for HostBackend {
                     sandbox
                         .retaining_failed_units()
                         .in_tenant_vm(config.tenant_vm)
+                        .with_boat_profile(
+                            config.boat_profile,
+                            config.private_pids,
+                            config.boat_memory_max_bytes,
+                        )
+                        .without_provider_environment(&config.boat_unset_environment)
                 })
                 .and_then(|sandbox| {
                     #[cfg(test)]

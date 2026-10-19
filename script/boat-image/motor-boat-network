@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Validate, then reapply only motor's egress table on each Boat start."""
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+
+IP = '/usr/sbin/ip'
+NFT = '/usr/sbin/nft'
+SYSCTL = '/usr/sbin/sysctl'
+UFW = '/usr/sbin/ufw'
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='validate without changing firewall or sysctls')
+    parser.add_argument('--template', type=Path, default=Path('/usr/local/libexec/motor-boat-net.nft'))
+    args = parser.parse_args()
+    for binary in (IP, NFT, SYSCTL, UFW):
+        if not Path(binary).is_file():
+            raise SystemExit('required administrator executable is missing: ' + binary)
+    routes = json.loads(run(IP, '-j', '-4', 'route', 'show', 'default', capture_output=True).stdout)
+    if not routes or not re.fullmatch(r'[a-zA-Z0-9_.-]+', routes[0]['dev']):
+        raise SystemExit('no verified IPv4 egress interface; refusing outbound job networking')
+    interface = routes[0]['dev']
+    rules = args.template.read_text()
+    if rules.count('enp6s0') != 3:
+        raise SystemExit('unexpected motor network template')
+    exists = subprocess.run([NFT, 'list', 'table', 'inet', 'motor_net'], capture_output=True).returncode == 0
+    transaction = ('delete table inet motor_net\n' if exists else '') + rules.replace('enp6s0', interface)
+    run(NFT, '--check', '-f', '-', input=transaction)
+    route = ['route', 'allow', 'in', 'on', 'mnet-+', 'out', 'on', interface, 'from', '10.88.0.0/16']
+    if args.check:
+        run(SYSCTL, '-n', 'net.ipv4.ip_forward')
+        run(UFW, '--dry-run', *route)
+        print('Boat network preflight: 4 absolute executables, IPv4 route, nft transaction and UFW syntax verified')
+        return
+    run(NFT, '-f', '-', input=transaction)
+    run(SYSCTL, '-w', 'net.ipv4.ip_forward=1')
+    run(UFW, *route)
+    meminfo = Path('/proc/meminfo').read_text()
+    available = next(int(line.split()[1]) * 1024 for line in meminfo.splitlines() if line.startswith('MemAvailable:'))
+    Path('/run/motor-boat-memory.json').write_text(json.dumps({'meminfo_before_runner': meminfo,
+        'mem_available_bytes': available, 'nproc': run('/usr/bin/nproc', capture_output=True).stdout.strip()}) + '\n')
+
+
+if __name__ == '__main__':
+    main()

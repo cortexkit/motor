@@ -1240,11 +1240,10 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
             ])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
-            .arg(path),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::OwnerWrite,
+        &[path],
+    )?)?;
     fs::create_dir_all(marker.parent().unwrap())?;
     fs::write(marker, identity)?;
     Ok(())
@@ -1384,11 +1383,10 @@ fn prepare_job_home(path: &Path) -> io::Result<()> {
             ])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .arg(path),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::Private,
+        &[path],
+    )?)?;
     checked(
         Command::new("/usr/bin/sudo")
             .args(["-n", "/usr/bin/chmod", "0700", "--"])
@@ -1455,11 +1453,10 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
             .args(["-n", "/usr/bin/chown", "-R", "-P", &owner, "--"])
             .arg(path),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX", "--"])
-            .arg(path),
-    )
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::OwnerWrite,
+        &[path],
+    )?)
 }
 
 pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
@@ -1512,11 +1509,10 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
             .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
             .args(paths),
     )?;
-    checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .args(paths),
-    )?;
+    checked(&mut crate::permissions::command(
+        crate::permissions::Policy::Private,
+        paths,
+    )?)?;
     Ok(())
 }
 
@@ -1554,6 +1550,10 @@ pub(crate) struct Sandbox {
     writer: bool,
     network: bool,
     tenant_vm: bool,
+    private_pids: bool,
+    boat_profile: bool,
+    boat_memory_max: Option<u64>,
+    provider_unset_env: Vec<String>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2138,6 +2138,10 @@ impl Sandbox {
             writer,
             network: false,
             tenant_vm: false,
+            private_pids: true,
+            boat_profile: false,
+            boat_memory_max: None,
+            provider_unset_env: Vec::new(),
         })
     }
 
@@ -2148,6 +2152,21 @@ impl Sandbox {
     }
     pub(crate) fn in_tenant_vm(mut self, enabled: bool) -> Self {
         self.tenant_vm = enabled;
+        self
+    }
+    pub(crate) fn with_boat_profile(
+        mut self,
+        enabled: bool,
+        private_pids: bool,
+        memory_max: Option<u64>,
+    ) -> Self {
+        self.boat_profile = enabled;
+        self.private_pids = private_pids;
+        self.boat_memory_max = if enabled { memory_max } else { None };
+        self
+    }
+    pub(crate) fn without_provider_environment(mut self, names: &[String]) -> Self {
+        self.provider_unset_env = names.to_vec();
         self
     }
 
@@ -2209,6 +2228,26 @@ impl Sandbox {
         if self.tenant_vm {
             cmd.args(tenant_unit_properties());
         }
+        if self.boat_profile {
+            cmd.arg("--property=ProcSubset=pid");
+            let names = crate::systemd::provider_names(
+                "",
+                self.provider_unset_env
+                    .iter()
+                    .cloned()
+                    .chain(env.iter().map(|(key, _)| key.clone())),
+            )?;
+            cmd.arg(format!("--property=UnsetEnvironment={}", names.join(" ")));
+            cmd.arg("--property=TasksMax=4096");
+            cmd.arg("--property=CPUQuotaPeriodSec=100ms");
+            cmd.arg(format!(
+                "--property=CPUQuota={}%",
+                u64::from(requested_vcpus) * 100
+            ));
+        }
+        if self.private_pids {
+            cmd.arg("--property=PrivatePIDs=yes");
+        }
         if durable {
             // Inheriting --pipe stderr would let a job forge launcher accounting
             // through its parent's descriptors. Only stdin crosses the boundary.
@@ -2249,6 +2288,7 @@ impl Sandbox {
         let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
         let memory_max = crate::backend::memory_max(requested_vcpus);
+        let memory_max = self.boat_memory_max.unwrap_or(memory_max);
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.
@@ -2264,7 +2304,6 @@ impl Sandbox {
             "ProtectHome=tmpfs",
             "PrivateTmp=yes",
             "PrivateDevices=yes",
-            "PrivatePIDs=yes",
             "PrivateNetwork=yes",
             "ProtectProc=invisible",
             "IgnoreSIGPIPE=no",

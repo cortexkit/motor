@@ -12,6 +12,19 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|arg| arg == "physical-chmod") {
+        return motor_runner::physical_chmod(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args == ["permission-helper-digest"] {
+        println!("{}", motor_runner::permission_helper_digest());
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args == ["check-permissions-helper"] {
+        return motor_runner::check_permissions_helper();
+    }
+    #[cfg(target_os = "linux")]
     if args.first().is_some_and(|arg| arg == "tenant-agent") {
         if args.len() != 1 {
             return Err(io::Error::other("tenant-agent takes no arguments"));
@@ -210,6 +223,10 @@ fn configure_options(
             config.tenant_vm = true;
             continue;
         }
+        if arg == "--boat-profile" {
+            config.boat_profile = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| io::Error::other("missing option value"))?;
@@ -219,6 +236,12 @@ fn configure_options(
             "--tenant-socket-dir" => config.tenant_socket_dir = Some(value.into()),
             "--build-slot-root" => config.build_slot_root = value.into(),
             "--max-weight" => config.max_weight = value.parse().map_err(io::Error::other)?,
+            "--reserve-daemon-core" => {
+                config.reserve_daemon_core = value.parse().map_err(io::Error::other)?
+            }
+            "--boat-memory-max-bytes" => {
+                config.boat_memory_max_bytes = Some(value.parse().map_err(io::Error::other)?)
+            }
             "--max-queue-depth" => {
                 config.max_queue_depth = value.parse().map_err(io::Error::other)?
             }
@@ -228,6 +251,9 @@ fn configure_options(
             }
             "--free-space-floor-bytes" => {
                 config.free_space_floor_bytes = value.parse().map_err(io::Error::other)?
+            }
+            "--free-space-eviction-bytes" => {
+                config.free_space_eviction_bytes = Some(value.parse().map_err(io::Error::other)?)
             }
             "--workspace-root" => config.workspace_roots.push(value.into()),
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
@@ -252,6 +278,15 @@ fn configure_options(
     {
         return Err(io::Error::other(
             "--tenant-vm requires the Linux host backend",
+        ));
+    }
+    if config.boat_profile
+        && (!cfg!(target_os = "linux")
+            || config.backend != motor_runner::BackendKind::Host
+            || (config.tenant_vm && config.tenant_socket_dir.is_none()))
+    {
+        return Err(io::Error::other(
+            "--boat-profile requires the Linux host backend; tenant mode must use root-private local sockets",
         ));
     }
     Ok((job, drain_timeout_s, exit_after))
@@ -282,6 +317,44 @@ mod tenant_options {
         )
         .is_err());
     }
+}
+
+#[test]
+fn boat_profile_is_an_explicit_linux_host_option() {
+    let mut config = Config::new("/unused", "boat");
+    let result = configure_options(&mut config, ["--boat-profile".into()].into_iter());
+    assert_eq!(result.is_ok(), cfg!(target_os = "linux"));
+    assert!(config.boat_profile);
+    let mut config = Config::new("/unused", "boat");
+    assert!(configure_options(
+        &mut config,
+        ["--boat-profile".into(), "--backend".into(), "vm".into()].into_iter()
+    )
+    .is_err());
+    let mut config = Config::new("/unused", "boat");
+    let local = configure_options(
+        &mut config,
+        [
+            "--boat-profile".into(),
+            "--tenant-vm".into(),
+            "--tenant-socket-dir".into(),
+            "/run/motor-tenant".into(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(local.is_ok(), cfg!(target_os = "linux"));
+}
+
+#[test]
+fn daemon_core_reservation_is_disabled_only_by_an_explicit_flag() {
+    let mut config = Config::new("/unused", "boat");
+    assert!(config.reserve_daemon_core);
+    configure_options(
+        &mut config,
+        ["--reserve-daemon-core".into(), "false".into()].into_iter(),
+    )
+    .unwrap();
+    assert!(!config.reserve_daemon_core);
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

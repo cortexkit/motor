@@ -6,14 +6,19 @@ Or set BOAT_API_KEY in the parent environment; never pass the key as an argument
 DIR must be new. JSON evidence is checkpointed there and printed after cleanup.
 Recover an interrupted run: same credentials, --cleanup DIR/results.json.
 Render evidence without credentials: --render DIR/results.json --findings FILE.
+Exit status: 0 when the verdict passed (cleanup complete, or Boat accepted every deletion and
+only its final purge is pending), 1 when the verdict failed, 3 when resources may still exist
+and need --cleanup. JSON `verdict` and `cleanup_state` report the two separately.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 from datetime import datetime, timezone
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import signal
@@ -150,6 +155,7 @@ class Probe:
     def __init__(self, client, data, checkpoint, port=9443, minutes=30):
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
         self.deadline = time.monotonic() + minutes * 60
+        self.minutes = minutes
         self.base = ".boat-probe-" + data["run_id"]
         self.source = Path(__file__).with_name("guest.py").read_bytes()
 
@@ -344,6 +350,8 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                 if attempt + 1 < attempts:
                     pause(2)
     for resource in reversed(data["resources"]):
+        if retained_image(resource):
+            continue
         if resource.get("deleted"):
             continue
         sid = resource["id"]
@@ -412,10 +420,79 @@ def cleanup(client, data, checkpoint, attempts=3, pause=time.sleep):
                 resource["fallback_stop"] = client.request("POST", path + "/stop", {})
             except Exception as error:
                 resource["fallback_stop_error"] = str(error)
-    data["cleanup_complete"] = not data["pending_creates"] and all(r.get("deleted") for r in data["resources"])
+    retained = [r for r in data['resources'] if retained_image(r) and not r.get('deleted')]
+    data['operator_retained_resources'] = retained
+    data["cleanup_complete"] = not data["pending_creates"] and all(r.get("deleted") or retained_image(r) for r in data["resources"])
+    data["cleanup_state"] = cleanup_state(data)
+    prepared = data.get('runner_host', {}).get('prepared_image')
+    if prepared:
+        for resource in data['resources']:
+            if resource['kind'] == 'named-snapshot' and resource['id'] == prepared['name']:
+                prepared.update(deleted=bool(resource.get('deleted')), operator_retained=retained_image(resource) and not resource.get('deleted'))
     data["cleanup_summary"] = ("All created sandboxes and named snapshots deleted." if data["cleanup_complete"] else
-                               "CLEANUP INCOMPLETE: inspect API errors/deletion operations; an accepted deletion may await upload URL expiry.")
+                                PURGE_PENDING_SUMMARY if data["cleanup_state"] == "purge_pending" else
+                                "CLEANUP INCOMPLETE: inspect API errors/deletion operations and retry --cleanup.")
+    if retained:
+        if data['cleanup_complete']:
+            data['cleanup_summary'] = 'All non-retained execution resources deleted.'
+        data['cleanup_summary'] += f" {len(retained)} prepared image(s) explicitly retained by the operator; not deleted."
     checkpoint()
+
+
+PURGE_PENDING_SUMMARY = ("Deletion accepted for every remaining sandbox; Boat's final data purge awaits upload URL "
+                         "expiry (expectedBy). No action is required; --cleanup after expectedBy confirms the purge.")
+
+
+def retained_image(resource):
+    return resource["kind"] == "named-snapshot" and resource.get("operator_retained") is True
+
+
+def cleanup_state(data):
+    """Classify cleanup separately from the measurement verdict.
+
+    complete: every resource is deleted or an operator-retained image.
+    purge_pending: the rest are sandboxes whose deletion Boat accepted and which only wait
+    for upload URL expiry; nothing is left running and retrying cannot speed this up.
+    incomplete: a create may be unrecorded or a resource may still exist; retry --cleanup.
+    """
+    if data.get("pending_creates"):
+        return "incomplete"
+    pending = False
+    for resource in data.get("resources", []):
+        if resource.get("deleted") or retained_image(resource):
+            continue
+        stage = (resource.get("deletion_state") or {}).get("stage")
+        if resource["kind"] == "sandbox" and resource.get("deletion_operation") and stage == "waiting_for_uploads":
+            pending = True
+            continue
+        return "incomplete"
+    return "purge_pending" if pending else "complete"
+
+
+def verdict(data):
+    """The measurement verdict: did the requested probe finish and did every check pass."""
+    reasons = []
+    if not data.get("measurements_complete"):
+        reasons.append("measurements incomplete")
+    if data.get("error"):
+        reasons.append("error recorded")
+    for mode in ("ssh_reach", "runner_host"):
+        if mode in data and data[mode].get("all_passed") is not True:
+            reasons.append(mode + " checks did not all pass")
+    return {"passed": not reasons, "reasons": reasons}
+
+
+# Exit statuses. Cleanup that Boat accepted but has not purged yet does not fail a run.
+EXIT_PASSED, EXIT_FAILED, EXIT_CLEANUP_INCOMPLETE = 0, 1, 3
+
+
+def exit_status(data, cleanup_only=False):
+    """3 whenever resources may still exist (they cost money and need --cleanup), else the verdict."""
+    if cleanup_state(data) == "incomplete":
+        return EXIT_CLEANUP_INCOMPLETE
+    if cleanup_only:
+        return EXIT_PASSED
+    return EXIT_PASSED if verdict(data)["passed"] else EXIT_FAILED
 
 
 TEMPLATE = """# Boat runner measurement findings
@@ -474,10 +551,39 @@ This is an environment probe, not a motor-runner token-enforcement test.
 """
 
 
-def render(data, path):
-    def display(value):
-        return json.dumps(value, ensure_ascii=True).replace("|", "\\|").replace("\n", " ")
+def display(value):
+    return json.dumps(value, ensure_ascii=True).replace("|", "\\|").replace("\n", " ")
 
+
+def cleanup_section(data):
+    """The provider cleanup table and its summary line, shared by every report kind."""
+    rows = ["| Resource | Fully purged | Deletion status / stage / expectedBy | Boat usage (seconds / dollars) |",
+            "| --- | --- | --- | --- |"]
+    purge_pending = False
+    for r in data.get("resources", []):
+        usage = r.get("usage", {})
+        operation = r.get("deletion_state", {})
+        if not operation:
+            operation = next((event["operation"] for event in reversed(data.get("cleanup", []))
+                              if event.get("id") == r["id"] and "operation" in event), {})
+        purge_pending |= operation.get("stage") == "waiting_for_uploads" and not r.get("deleted", False)
+        purged = "retained by operator" if retained_image(r) and not r.get("deleted") else display(r.get("deleted", False))
+        rows.append(f"| {r['kind']} {r['id']} | {purged} | "
+                    f"{display([operation.get('status'), operation.get('stage'), operation.get('expectedBy')])} | "
+                    f"{display([usage.get('seconds'), usage.get('dollars')])} |")
+    summary = display(data.get("cleanup_summary", "unmeasured"))
+    if purge_pending:
+        summary = "Deletion accepted; final data purge awaits upload URL expiry (see expectedBy above)."
+    return "\n".join(rows), summary
+
+
+def render(data, path):
+    text = render_runner_host(data) if "runner_host" in data else render_environment(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def render_environment(data):
     cycles = data.get("cycles", [])
     timing = [("Fresh create to Boat-ready", data.get("create", {}).get("seconds_to_ready"))]
     timing.extend((f"Cycle {n + 1}: stop / resume / guest", [c.get("stop_seconds"), c.get("resume_seconds"),
@@ -490,24 +596,11 @@ def render(data, path):
                                                 for c in data.get("toolchain_cycles", [])])]
     rows = ["| Measurement | Seconds |", "| --- | --- |"]
     rows.extend(f"| {name} | {display(value)} |" for name, value in timing)
-    cleanup_rows = ["| Resource | Fully purged | Deletion status / stage / expectedBy | Boat usage (seconds / dollars) |",
-                    "| --- | --- | --- | --- |"]
-    purge_pending = False
-    for r in data.get("resources", []):
-        usage = r.get("usage", {})
-        operation = r.get("deletion_state", {})
-        if not operation:
-            operation = next((event["operation"] for event in reversed(data.get("cleanup", []))
-                              if event.get("id") == r["id"] and "operation" in event), {})
-        purge_pending |= operation.get("stage") == "waiting_for_uploads" and not r.get("deleted", False)
-        cleanup_rows.append(f"| {r['kind']} {r['id']} | {display(r.get('deleted', False))} | "
-                            f"{display([operation.get('status'), operation.get('stage'), operation.get('expectedBy')])} | "
-                            f"{display([usage.get('seconds'), usage.get('dollars')])} |")
+    cleanup_table, cleanup_summary = cleanup_section(data)
     fields = {name: display(data.get(name, "unmeasured")) for name in
-              ("run_id", "started_at", "finished_at", "measurements_complete", "error", "cleanup_summary")}
+              ("run_id", "started_at", "finished_at", "measurements_complete", "error")}
     fields["error"] = display(data["error"]) if data.get("error") is not None else "none recorded"
-    if purge_pending:
-        fields["cleanup_summary"] = "Deletion accepted; final data purge awaits upload URL expiry (see expectedBy above)."
+    fields["cleanup_summary"] = cleanup_summary
     ssh = data.get("ssh_reach")
     fields["ssh_table"] = "Not requested."
     if ssh:
@@ -517,7 +610,7 @@ def render(data, path):
             elapsed = evidence.get("seconds_to_echo", evidence.get("seconds"))
             ssh_rows.append(f"| {check['name']} | {check['status']} | {display(elapsed)} |")
         fields["ssh_table"] = "\n".join(ssh_rows) + "\n\nFull evidence: `ssh_reach.checks` and `ssh_reach.phases`."
-    fields.update(timing_table="\n".join(rows), cleanup_table="\n".join(cleanup_rows),
+    fields.update(timing_table="\n".join(rows), cleanup_table=cleanup_table,
                   toolchain_bytes=display(data.get("toolchain", {}).get("installed_bytes", "unmeasured")),
                   few_gb=display(data.get("toolchain", {}).get("few_gb_installed", "unmeasured")),
                   ip_pairs=display([[c.get("ip_before"), c.get("ip_after")] for c in cycles]),
@@ -527,8 +620,112 @@ def render(data, path):
     text = TEMPLATE
     for name, value in fields.items():
         text = text.replace("{{" + name + "}}", value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    return text
+
+
+def job_evidence(phase):
+    """Exit code, wall seconds and parsed isolation payload for one runner-host phase, tolerating gaps."""
+    def code(name):
+        return (phase.get(name, {}).get("result") or {}).get("code", "unmeasured")
+    try:
+        isolation = json.loads(phase["isolation"]["result"]["stdout"])
+    except (KeyError, TypeError, ValueError):
+        isolation = {}
+    seconds = {name: phase.get(name, {}).get("seconds", "unmeasured") for name in ("exit", "rust", "isolation")}
+    return code, isolation, seconds
+
+
+def rounded(value, digits):
+    if value is None:
+        return "unmeasured"
+    return round(value, digits) if isinstance(value, float) else value
+
+
+def mib(value):
+    return f"{value / (1 << 20):.0f}" if isinstance(value, (int, float)) else "unmeasured"
+
+
+def render_runner_host(data):
+    """Findings for --runner-host: the verdict, per-phase jobs, timings and job memory budget."""
+    runner = data["runner_host"]
+    checks = runner.get("checks", [])
+    failing = [c["name"] for c in checks if c.get("status") != "PASS"]
+    outcome = data.get("verdict") or verdict(data)
+    error = display(data["error"]) if data.get("error") is not None else "none recorded"
+    status = data.get("exit_status")
+    status_text = (f"Exit status: {status}" if status is not None else
+                   f"Exit status under the current rules: {exit_status(data)} (the run did not record one)")
+    lines = ["# Boat runner-host findings", "",
+             f"Run: {display(data.get('run_id'))}; started: {display(data.get('started_at'))}; "
+             f"finished: {display(data.get('finished_at'))}.",
+             f"Source revision: {display(runner.get('source_revision', 'unmeasured'))}.",
+             "Evidence: the accompanying `results.json` (API responses, guest output, raw job terminals).", "",
+             "## Verdict", "",
+             f"Runner-host verdict: **{'PASSED' if outcome['passed'] else 'FAILED'}**. "
+             f"Checks: {len(checks) - len(failing)} of {len(checks)} passed.",
+             f"Failing checks: {display(failing) if failing else 'none'}.",
+             f"Reasons: {display(outcome['reasons']) if outcome['reasons'] else 'none'}.",
+             f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
+             f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "
+             f"{status_text} (0 passed, 1 failed, 3 resources need --cleanup).", "",
+             "## Phases", "",
+             "Every phase runs real jobs through the motor client over the pinned SSH forward.", "",
+             "| Phase | Checks passed | Exit job code | Rust job code | Job seconds (exit / rust / isolation) | "
+             "Job user | Job interfaces | memory.max | cpu.max | pids.max | nproc | PID namespace shared with host |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for phase in runner.get("phases", []):
+        name = phase.get("name", "unnamed")
+        own = [c for c in checks if c["name"].startswith(name + ".")]
+        code, job, seconds = job_evidence(phase)
+        limits = job.get("limits", {})
+        host_pid = (phase.get("host") or {}).get("namespaces", {}).get("pid")
+        shared = display(job["namespaces"]["pid"] == host_pid) if job.get("namespaces") and host_pid else "unmeasured"
+        lines.append(f"| {name} | {sum(c['status'] == 'PASS' for c in own)} of {len(own)} | {display(code('exit'))} | "
+                     f"{display(code('rust'))} | {display([rounded(seconds[k], 2) for k in ('exit', 'rust', 'isolation')])} | "
+                     f"{display(job.get('user', 'unmeasured'))} | {display(job.get('interfaces', 'unmeasured'))} | "
+                     f"{display(limits.get('memory.max', 'unmeasured'))} | {display(limits.get('cpu.max', 'unmeasured'))} | "
+                     f"{display(limits.get('pids.max', 'unmeasured'))} | {display(job.get('nproc', 'unmeasured'))} | {shared} |")
+    other = [c for c in checks if not any(c["name"].startswith(p.get("name", "") + ".") for p in runner.get("phases", []))]
+    lines += ["", "Checks outside a phase: " + (", ".join(f"{c['name']} {c['status']}" for c in other) or "none") + ".",
+              "The limit values are read by the job from its own cgroup files; no load is generated.", "",
+              "## Timing (seconds, measured from the operator's Mac)", "",
+              "| Measurement | Seconds |", "| --- | --- |"]
+    prepared, snapshot = runner.get("prepared_image") or {}, runner.get("snapshot") or {}
+    for label, value in (("Create to Boat-ready (first sandbox)", runner.get("create", {}).get("seconds_to_ready")),
+                         ("Source upload and recipe install", runner.get("install_seconds")),
+                         ("Prepared image save", prepared.get("seconds")),
+                         ("Measurement snapshot save", snapshot.get("seconds")),
+                         ("Create from measurement snapshot to Boat-ready", runner.get("create_from_snapshot", {}).get("seconds_to_ready")),
+                         ("Create from measurement snapshot to first finished job", runner.get("snapshot_create_to_first_job_seconds"))):
+        lines.append(f"| {label} | {display(rounded(value, 1))} |")
+    lines += ["", "First-job time includes waiting for Boat to report full hydration, SSH, service restart and "
+              "memory budgeting. Prepared-image save is absent when an existing image was reused.", "",
+              "## Job memory budget", "",
+              "memory.max = MemAvailable before runner start - runner idle - margin, rounded down to whole MiB.", "",
+              "| Phase | MemAvailable bytes | Runner idle bytes | Margin bytes | Budget memory.max bytes | Budget MiB | Job memory.max bytes |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
+    budgets = []
+    for phase in runner.get("phases", []):
+        budget = (phase.get("host") or {}).get("memory_budget", {})
+        _, job, _ = job_evidence(phase)
+        if isinstance(budget.get("memory_max_bytes"), int):
+            budgets.append(budget["memory_max_bytes"])
+        lines.append(f"| {phase.get('name')} | " + " | ".join(display(budget.get(k, "unmeasured")) for k in
+                     ("mem_available_bytes", "runner_idle_bytes", "margin_bytes", "memory_max_bytes")) +
+                     f" | {mib(budget.get('memory_max_bytes'))} | {display(job.get('limits', {}).get('memory.max', 'unmeasured'))} |")
+    lines += ["", f"Smallest job memory budget across phases: {mib(min(budgets)) if budgets else 'unmeasured'} MiB.", "",
+              "## Snapshots", "",
+              "| Role | Name | Snapshot id | Size bytes | Retained | Real jobs qualified |", "| --- | --- | --- | --- | --- | --- |"]
+    for role, item in (("prepared source (borrowed, not deleted)", runner.get("prepared_source")),
+                       ("prepared image", runner.get("prepared_image")), ("measurement snapshot", runner.get("snapshot"))):
+        if item:
+            lines.append(f"| {role} | {display(item.get('name'))} | {display(item.get('id'))} | {display(item.get('size_bytes'))} | "
+                         f"{display(bool(item.get('operator_retained')))} | {display(item.get('real_jobs_qualified', 'n/a'))} |")
+    if prepared.get("delete_command"):
+        lines += ["", f"Delete the prepared image (pipe the Boat key reader into stdin): `{prepared['delete_command']}`"]
+    cleanup_table, cleanup_summary = cleanup_section(data)
+    lines += ["", "## Cleanup and provider usage", "", cleanup_table, "", cleanup_summary, ""]
+    return "\n".join(lines)
 
 
 def read_key(args):
@@ -543,7 +740,7 @@ def interrupt(signum, frame):
     raise KeyboardInterrupt("received signal " + str(signum))
 
 
-def main():
+def main(report_stream=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--key-stdin", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -552,8 +749,20 @@ def main():
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
-    parser.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
+    mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh large; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
+    mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
+    parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
+    parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
+    parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
     args = parser.parse_args()
+    if (args.prepared_image or args.from_prepared_image) and not args.runner_host:
+        parser.error('prepared image options require --runner-host')
+    if args.from_prepared_image and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.from_prepared_image):
+        parser.error('invalid prepared named-snapshot handle')
+    if args.delete_retained_images and not args.cleanup:
+        parser.error('--delete-retained-images requires --cleanup')
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
         args.write_template.write_text(TEMPLATE)
@@ -568,6 +777,9 @@ def main():
     if args.cleanup:
         path = args.cleanup
         data = json.loads(path.read_text())
+        if args.delete_retained_images:
+            for resource in data['resources']:
+                resource.pop('operator_retained', None)
     else:
         args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
         path = args.output / "results.json"
@@ -579,7 +791,16 @@ def main():
     try:
         if not args.cleanup:
             runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
-            if args.ssh_reach:
+            runner.results_path = path.resolve()
+            runner.retain_prepared_image = args.prepared_image
+            runner.from_prepared_image = args.from_prepared_image
+            if args.runner_host:
+                from runner_host import RunnerHost
+                RunnerHost(runner).run()
+            elif args.runner_prerequisites:
+                from runner_prerequisites import run
+                run(runner)
+            elif args.ssh_reach:
                 from ssh_reach import SSHReach
                 SSHReach(runner).run()
             else:
@@ -593,18 +814,32 @@ def main():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         cleanup(client, data, checkpoint)
         data["finished_at"] = datetime.now(timezone.utc).isoformat()
+        if not args.cleanup:
+            data["verdict"] = verdict(data)
+        data["exit_status"] = exit_status(data, cleanup_only=bool(args.cleanup))
         checkpoint()
     render(scrub(data, key), args.findings or path.with_suffix(".md"))
-    print(json.dumps(scrub(data, key), indent=2))
-    if args.cleanup:
-        return 0 if data.get("cleanup_complete") else 1
-    return 0 if (data.get("measurements_complete") and data.get("cleanup_complete") and not data.get("error") and
-                 data.get("ssh_reach", {}).get("all_passed", True)) else 1
+    print(json.dumps(scrub(data, key), indent=2, allow_nan=False), file=report_stream or sys.stdout)
+    return data["exit_status"]
+
+
+def entrypoint():
+    output = sys.stdout
+    offline = any(arg in sys.argv for arg in ('--help', '-h', '--render', '--write-template'))
+    redirect = contextlib.nullcontext() if offline else contextlib.redirect_stdout(sys.stderr)
+    try:
+        with redirect:
+            return main(report_stream=output)
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
+        failure = {'schema':1, 'error':'invalid probe arguments', 'measurements_complete':False, 'cleanup_complete':False}
+    except (Exception, KeyboardInterrupt) as error:
+        failure = {'schema':1, 'error':'probe failed before producing its report', 'error_type':type(error).__name__,
+                   'measurements_complete':False, 'cleanup_complete':False}
+    print(json.dumps(failure, allow_nan=False), file=output)
+    return 1
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (ProbeError, OSError, ValueError) as error:
-        print("boat-probe: " + str(error), file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(entrypoint())

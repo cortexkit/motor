@@ -370,9 +370,7 @@ fn private_writer_tree(path: &Path, account: WriterAccount) {
     )
     .unwrap();
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "-R", "-P", "u+rwX,go-rwx", "--"])
-            .arg(path),
+        &mut crate::permissions::command(crate::permissions::Policy::Private, &[path]).unwrap(),
     )
     .unwrap();
 }
@@ -407,6 +405,10 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         retain_failed: false,
         network: false,
         tenant_vm: false,
+        private_pids: true,
+        boat_profile: false,
+        boat_memory_max: None,
+        provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: WRITER_USER,

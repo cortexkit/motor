@@ -631,6 +631,40 @@ fn default_disk_budget_admits_at_223_gb_with_no_evictable_workspaces() {
 }
 
 #[test]
+fn explicit_sandbox_disk_budget_admits_with_sixty_three_gib_free() {
+    let f = Fixture::new();
+    let defaults = Config::new("unused", "default");
+    assert_eq!(defaults.free_space_floor_bytes, 128 * (1 << 30));
+    assert!(defaults.free_space_eviction_bytes.is_none());
+    let mut c = f.config();
+    c.free_space_floor_bytes = 24 * (1 << 30);
+    c.free_space_eviction_bytes = Some(32 * (1 << 30));
+    c.free_space_probe = Arc::new(|_| Ok(63 * (1 << 30)));
+    let runner = Runner::open(c).unwrap();
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Accepted(0)
+    ));
+}
+
+#[test]
+fn explicit_eviction_goal_does_not_silently_use_twice_the_floor() {
+    let f = Fixture::new();
+    let mut c = f.config();
+    c.free_space_floor_bytes = 24 * (1 << 30);
+    c.free_space_eviction_bytes = Some(32 * (1 << 30));
+    c.free_space_probe = Arc::new(|_| Ok(40 * (1 << 30)));
+    c.clock = Arc::new(|| 4_000_000);
+    let runner = Runner::open(c).unwrap();
+    let idle = f.scratch.join("remote/worktrees/old-idle");
+    workspace(&runner, &idle, 0);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(idle.exists());
+    assert!(runner.runner_status().disk.unwrap().last_eviction.is_none());
+}
+
+#[test]
 fn disk_admission_refuses_typed_when_reflinks_reclaim_too_little() {
     let f = Fixture::new();
     let runner = Runner::open(config(&f, |_| Ok(7))).unwrap();

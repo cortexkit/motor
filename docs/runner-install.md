@@ -28,10 +28,90 @@ are fixed in the scripts and the unit files, and must match your host.
   POSIX ACL tools (`setfacl`), and Linux namespaces and mounts.
 - An operator account with `sudo`. The runner calls `sudo -n` for the
   operations that need root (starting job services, ACL repair, network
-  attachment). The repository does not ship a sudoers file: grant only the
-  command forms the runner uses. `script/runner/network-sudo-probes.json` lists
+  attachment). The repository ships the narrow native-permissions fragment
+  `script/runner/permissions-helper.sudoers`, not a complete host policy. Grant
+  only the remaining command forms the runner uses. `script/runner/network-sudo-probes.json` lists
   the network forms; the rest are the `sudo` calls in
   `crates/motor-runner/src/isolation.rs`, `systemd.rs` and `network_linux.rs`.
+
+## Native permission helper prerequisite
+
+The trusted operator uses exactly these argv forms (paths are data, not shell):
+
+```text
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- /absolute/tree ...
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- /absolute/tree ...
+```
+
+Each path is a physical directory, repaired recursively, or a regular file,
+repaired alone. Symlink and special-inode roots, and symlinked ancestors, are
+refused before any mode changes.
+
+Before deploying a candidate that uses native mode repair, an **administrator**
+installs a matching copy and the operator-only sudo fragment:
+
+```sh
+sudo bash script/runner/install-permissions-helper.sh "$PWD/target/release/motor-runner" ubuntu
+target/release/motor-runner check-permissions-helper
+```
+
+Use the actual non-root service owner instead of `ubuntu` if different. For
+clarity, the privileged install operations performed by that administrator
+script are equivalent to the following (prefer the script: it also validates
+physical ownership, uses unique staging names and creates timestamped backups):
+
+```sh
+candidate="$PWD/target/release/motor-runner"
+operator=ubuntu
+policy=$(mktemp)
+python3 script/runner/permissions_policy.py script/runner/permissions-helper.sudoers "$operator" "$policy"
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
+sudo install -o root -g root -m 0755 "$candidate" /usr/local/libexec/.motor-runner-permissions.new
+sudo install -o root -g root -m 0440 "$policy" /etc/sudoers.d/.motor-runner-permissions.new
+sudo visudo -c -f /etc/sudoers.d/.motor-runner-permissions.new
+sudo mv -f /usr/local/libexec/.motor-runner-permissions.new /usr/local/libexec/motor-runner-permissions
+sudo mv -f /etc/sudoers.d/.motor-runner-permissions.new /etc/sudoers.d/motor-runner-permissions
+sudo visudo -c
+rm -f "$policy"
+"$candidate" check-permissions-helper
+```
+
+The installer rejects `motor-job`, `motor-cache`, UID aliases of those accounts, root,
+and unsafe account/template syntax. It validates physical root-owned ancestors,
+installs an atomic root0755 binary at the fixed path and root0440 sudoers file,
+and validates the fragment with visudo. The job account cannot write the binary
+or its ancestors and receives no sudo rule. Only `physical-chmod`, the fixed
+`owner-rwX` or `private-rwX` policy, and `--` are delegated; the native parser rejects relative/root
+or symlink trees and never invokes a shell. No arbitrary mode/operation/binary
+argument is accepted. This administrator bootstrap script itself is **not** a
+delegated command.
+
+`deploy.sh` checks the fixed helper's ownership, code digest and both
+`sudo -n -l` forms before staging/draining a new daemon, so a missing grant cannot
+silently break every job after the swap. Legacy candidates that do not use the
+helper retain their previous deploy path. Administrator helper/policy updates
+have timestamped backups but are not automatically reverted by daemon rollback;
+restore matching helper/policy backups as administrator when reverting a
+post-helper candidate. Ordinary daemon rollback/drain semantics are unchanged.
+For example, after closing admission/draining all instances that use the helper,
+an administrator can restore the installer's matching timestamped backups:
+
+```sh
+stamp=YYYYMMDDTHHMMSSZ
+sudo install -o root -g root -m 0755 "/usr/local/libexec/motor-runner-permissions.rollback-$stamp" /usr/local/libexec/.motor-runner-permissions.restore
+sudo install -o root -g root -m 0440 "/etc/sudoers.d/motor-runner-permissions.rollback-$stamp" /etc/sudoers.d/.motor-runner-permissions.restore
+sudo visudo -c -f /etc/sudoers.d/.motor-runner-permissions.restore
+sudo mv -f /usr/local/libexec/.motor-runner-permissions.restore /usr/local/libexec/motor-runner-permissions
+sudo mv -f /etc/sudoers.d/.motor-runner-permissions.restore /etc/sudoers.d/motor-runner-permissions
+sudo visudo -c
+/path/to/matching-old-candidate check-permissions-helper
+```
+
+Restore/start the matching daemon using the drain-and-rollback procedure before
+reopening admission; do not restore job state or rerun accepted commands. For a
+first-install rollback with no backups, return every daemon to a pre-helper
+version before removing the helper and `/etc/sudoers.d/motor-runner-permissions`.
+Do not remove or downgrade a helper still needed by another running instance.
 
 ## 1. Bootstrap the server
 
@@ -153,6 +233,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--rustc-slots N` | 24 | Machine-wide limit on concurrent compiler processes, enforced by the build-slot supervisor (`crates/prefrontal-build-slot`). |
 | `--sccache-size-gib N` | 200 | Compile cache cap. |
 | `--free-space-floor-bytes N` | 137438953472 (128 GiB) | Disk admission floor; 0 disables. |
+| `--free-space-eviction-bytes N` | twice the floor | Optional soft reclaim goal, strictly above the hard floor. Does not change admission while the hard reserve is available. |
 | `--workspace-root PATH` | `/Users` | Adds a root under which idle workspaces may be evicted. |
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
 | `--backend host\|windows-vm` | `host` | Job backend. A third value, `vm`, is parsed but refused at startup in this build. |
@@ -160,6 +241,8 @@ stay up (`loginctl enable-linger <operator>`).
 | `--windows-cpus LIST` | absent | Linux placement avoidance: Windows VM host CPUs in CPU-list syntax; their online SMT siblings are included. Requires `--windows-slot-lock`. |
 | `--windows-slot-lock PATH` | absent | Absolute path to the shared Windows QEMU slot lock; requires `--windows-cpus`. Read-only observation, never acquires the lock. |
 | `--job-network veth` | absent | Allow outbound networking for jobs that request it. |
+| `--reserve-daemon-core false` | true | Explicitly let a dedicated single-job sandbox use all online CPUs. The fleet default keeps its existing daemon-core reservation policy. |
+| `--boat-profile` | absent | Explicit single-tenant Boat compatibility for systemd 255: omit unsupported PrivatePIDs, retain other isolation and add CPU/PID ceilings. Do not enable it to bypass missing PID isolation on an ordinary build server; the default profile refuses unsupported systemd. See `script/boat-image/README.md`. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
 
 `motor-runner --version` prints the version. Other subcommands are `connect`

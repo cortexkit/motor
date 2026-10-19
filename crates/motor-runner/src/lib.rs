@@ -9,6 +9,8 @@ mod engine;
 #[cfg(target_os = "linux")]
 mod isolation;
 pub mod network;
+#[cfg(target_os = "linux")]
+mod permissions;
 mod platform;
 mod return_paths;
 mod server;
@@ -39,6 +41,21 @@ pub use backend::BackendKind;
 pub use engine::{Config, Runner, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 pub use server::serve;
 pub use storage::{JobState, REPLAY_BYTES, RETENTION_MS};
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn physical_chmod(args: &[String]) -> std::io::Result<()> {
+    permissions::run(args)
+}
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn permission_helper_digest() -> String {
+    permissions::digest()
+}
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn check_permissions_helper() -> std::io::Result<()> {
+    permissions::check_install()
+}
 #[cfg(target_os = "linux")]
 pub use tenant::serve_tenant;
 #[cfg(target_os = "linux")]

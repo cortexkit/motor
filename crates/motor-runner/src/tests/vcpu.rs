@@ -99,6 +99,21 @@ fn oversized_and_zero_claims_are_refused_before_start_with_limit_detail() {
     assert!(!Path::new(&f.key).join("must-not-start").exists());
 }
 
+#[test]
+fn explicit_sandbox_reservation_admits_one_through_eight_vcpus() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    assert!(config.reserve_daemon_core);
+    config.reserve_daemon_core = false;
+    config.cpu_topology = Some(CpuTopology::new((0..8).map(|cpu| vec![cpu]).collect()).unwrap());
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 8);
+    for claim in 1..=8 {
+        assert!(runner.cpu_refusal(claim).is_none());
+    }
+    assert!(runner.cpu_refusal(9).unwrap().1.contains("1..=8"));
+}
+
 #[tokio::test]
 async fn internal_warm_build_shrinks_to_a_small_host() {
     let f = Fixture::new();

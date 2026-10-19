@@ -1,0 +1,3 @@
+# Only the trusted runner operator receives these two fixed native operations.
+# Path arguments are data: the helper rejects non-absolute/root/symlink trees.
+@OPERATOR@ ALL=(root) NOPASSWD: /usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *, /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *
