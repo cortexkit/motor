@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Portable plumbing tests; these do not assert anything about a real Boat VM."""
+import contextlib
+from datetime import datetime, timedelta, timezone
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import sys
+import unittest
+from unittest.mock import MagicMock, patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("boat_probe", HERE / "probe.py")
+if spec is None or spec.loader is None:
+    raise ImportError("cannot load the Boat probe beside its tests")
+probe = importlib.util.module_from_spec(spec)
+sys.path.insert(0, str(HERE))
+try:
+    spec.loader.exec_module(probe)
+    import ssh_reach
+finally:
+    sys.path.pop(0)
+reach = sys.modules["reach"]
+
+
+def evidence(resources=()):
+    return {"schema": 1, "run_id": "unit-test", "api": [], "cycles": [], "cleanup": [],
+            "started_at": datetime.now(timezone.utc).isoformat(), "pending_creates": [],
+            "resources": [dict(r) for r in resources]}
+
+
+class FakeClient:
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def request(self, method, path, body=None, **kwargs):
+        self.calls.append((method, path, body, kwargs))
+        route = self.routes[(method, path)]
+        result = route.pop(0) if isinstance(route, list) else route
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def deleting(status="completed"):
+    return {"ok": True, "type": "deletion.operation", "operation": {"id": "bdop_test", "status": status}}
+
+
+class ParsingTests(unittest.TestCase):
+    def test_envelopes_and_sandbox_id(self):
+        body = probe.parse_response('{"ok":true,"type":"sandbox.info","sandbox":{"id":"bx_23456789"}}')
+        self.assertEqual(probe.sandbox(body)["id"], "bx_23456789")
+        for raw in ("[]", "null", "not json", '{"ok":false}', '{"ok":1}'):
+            with self.subTest(raw=raw), self.assertRaises(probe.ProbeError):
+                probe.parse_response(raw)
+        with self.assertRaises(probe.ProbeError):
+            probe.sandbox({"id": "bx_23456789"})
+
+    def test_command_output_requires_success_and_complete_json(self):
+        good = {"exitCode": 0, "stdout": '{"uid":1000}\n'}
+        self.assertEqual(probe.command_output(good), {"uid": 1000})
+        for change in ({"exitCode": 1}, {"timedOut": True}, {"stdoutTruncated": True}, {"stderrTruncated": True},
+                       {"stdout": "[]"}, {"stdout": "log before JSON\n{}"}):
+            with self.subTest(change=change), self.assertRaises(probe.ProbeError):
+                probe.command_output(dict(good, **change))
+
+    def test_retry_only_documented_startup_refusals(self):
+        for status, body, expected in (
+            (409, {"code": "sandbox_starting"}, True),
+            (409, {"code": "machine_not_running"}, False),
+            (502, {"message": "sandbox_restoring", "error": {"details": {"retryable": True}}}, True),
+            (502, {"message": "something_else", "error": {"details": {"retryable": True}}}, False),
+            (403, {"code": "sandbox_starting"}, False),
+        ):
+            with self.subTest(status=status, body=body):
+                self.assertEqual(probe.retryable_start(probe.ApiError(status, json.dumps(body))), expected)
+
+    def test_hydration_wait_polls_past_ready_until_hydrated(self):
+        client = FakeClient({("GET", "/sandboxes/bx_23456789"):
+                             [{"sandbox": {"id": "bx_23456789", "state": "ready", "hydrated": False}},
+                              {"sandbox": {"id": "bx_23456789", "state": "ready", "hydrated": True}}]})
+        with patch.object(probe.time, "sleep"):
+            item = probe.Probe(client, evidence(), lambda: None).wait_hydrated("bx_23456789")
+        self.assertTrue(item["hydrated"])
+        self.assertEqual(len(client.calls), 2)
+
+    def test_async_poll_uses_numeric_process_id_not_command_id(self):
+        client = FakeClient({("POST", "/sandboxes/bx_23456789/commands"):
+                             {"processId": 42, "commandId": "cmd-not-poll-key"},
+                             ("GET", "/sandboxes/bx_23456789/commands/42?tailBytes=8388608"):
+                             {"status": "exited", "exitCode": 0, "stdout": "{}"}})
+        runner = probe.Probe(client, evidence(), lambda: None)
+        self.assertEqual(runner.execute("bx_23456789", "true")["status"], "exited")
+        self.assertEqual(client.calls[0][2]["detached"], True)
+
+    def test_lost_command_is_not_success(self):
+        client = FakeClient({("POST", "/sandboxes/bx_23456789/commands"): {"processId": 2},
+                             ("GET", "/sandboxes/bx_23456789/commands/2?tailBytes=8388608"): {"status": "lost"}})
+        with self.assertRaisesRegex(probe.ProbeError, "lost"):
+            probe.Probe(client, evidence(), lambda: None).execute("bx_23456789", "true")
+
+    def test_create_uses_large_no_account_environment_and_journals_before_polling(self):
+        item = {"id": "bx_23456789", "state": "ready"}
+        client = FakeClient({("POST", "/sandboxes"): {"sandbox": item},
+                             ("GET", "/sandboxes/bx_23456789"): {"sandbox": item}})
+        data = evidence()
+        checkpoints = []
+        probe.Probe(client, data, lambda: checkpoints.append(json.loads(json.dumps(data)))).create()
+        self.assertEqual(client.calls[0][2], {"type": "large", "ttlSeconds": 1800, "noEnv": True})
+        self.assertTrue(checkpoints[0]["pending_creates"])
+        self.assertEqual(checkpoints[1]["resources"][0]["id"], "bx_23456789")
+        self.assertFalse(data["pending_creates"])
+
+    def test_secret_is_redacted_from_nested_evidence_and_files(self):
+        key = "boat_TEST_SECRET_NOT_REAL"
+        data = {"api": [{"response": {"stdout": "echo " + key, "desktopUrl": "https://secret"}}], key: key}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.json"
+            probe.save(path, data, key)
+            text = path.read_text()
+            self.assertNotIn(key, text)
+            self.assertNotIn("https://secret", text)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_key_read_never_uses_arguments_and_removes_env(self):
+        with patch.dict(os.environ, {"BOAT_API_KEY": "env-secret"}), patch("sys.stdin", io.StringIO("stdin-secret\n")):
+            args = type("Args", (), {"key_stdin": True})()
+            self.assertEqual(probe.read_key(args), "stdin-secret")
+            self.assertNotIn("BOAT_API_KEY", os.environ)
+
+    def test_no_redirect_can_forward_the_bearer(self):
+        with self.assertRaisesRegex(probe.ProbeError, "redirect"):
+            probe.NoRedirect().redirect_request(None, None, 302, "", {}, "https://elsewhere.invalid")
+
+    def test_render_is_offline_and_missing_values_stay_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.md"
+            probe.render(evidence(), path)
+            text = path.read_text()
+            self.assertIn("unmeasured", text)
+            self.assertIn("**Unassessed.**", text)
+            self.assertNotIn("{{", text)
+            self.assertIn("Error: none recorded", text)
+
+
+    def test_render_explains_pending_purge_from_an_older_checkpoint(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789", "deletion_operation": "bdop_test"}])
+        data["cleanup"] = [{"id": "bx_23456789", "operation":
+                            {"status": "blocked", "stage": "waiting_for_uploads", "expectedBy": "2026-10-19T19:00:00Z"}}]
+        data["cleanup_summary"] = "retry --cleanup with delete scope"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.md"
+            probe.render(data, path)
+            text = path.read_text()
+        self.assertIn("Deletion accepted; final data purge awaits upload URL expiry", text)
+        self.assertIn("2026-10-19T19:00:00Z", text)
+        self.assertNotIn("with delete scope", text)
+
+
+    def test_standalone_reach_verifies_exact_echo_over_tls(self):
+        context, raw, stream = MagicMock(), MagicMock(), MagicMock()
+        raw.__enter__.return_value = raw
+        context.wrap_socket.return_value.__enter__.return_value = stream
+        stream.recv.side_effect = [b"boat-probe:", b"challenge\n"]
+        stream.version.return_value = "TLSv1.3"
+        with patch.object(reach.ssl, "create_default_context", return_value=context), \
+             patch.object(reach.socket, "create_connection", return_value=raw) as connect, \
+             patch.object(reach.uuid, "uuid4", return_value=type("Uuid", (), {"hex": "challenge"})()):
+            result = reach.tcp_probe("2001:db8::2", 9443, "PUBLIC CERT")
+        self.assertTrue(result["verified_echo"])
+        self.assertEqual(result["tls_version"], "TLSv1.3")
+        connect.assert_called_once_with(("2001:db8::2", 9443), timeout=4)
+        stream.sendall.assert_called_once_with(b"challenge\n")
+
+    def test_standalone_reach_rejects_wrong_echo(self):
+        context, raw, stream = MagicMock(), MagicMock(), MagicMock()
+        raw.__enter__.return_value = raw
+        context.wrap_socket.return_value.__enter__.return_value = stream
+        stream.recv.side_effect = [b"wrong\n", b""]
+        with patch.object(reach.ssl, "create_default_context", return_value=context), \
+             patch.object(reach.socket, "create_connection", return_value=raw):
+            result = reach.tcp_probe("2001:db8::2", 9443, "PUBLIC CERT")
+        self.assertFalse(result["verified_echo"])
+
+
+
+class CleanupTests(unittest.TestCase):
+    def test_all_resources_deleted_in_reverse_order_and_operation_polled(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789"},
+                         {"kind": "named-snapshot", "id": "motor-probe-test"}])
+        client = FakeClient({("DELETE", "/named-snapshots/motor-probe-test"): {"status": "deleted"},
+                             ("GET", "/sandboxes/bx_23456789/usage"): {"seconds": 60, "dollars": .0012},
+                             ("DELETE", "/sandboxes/bx_23456789"): deleting("pending"),
+                             ("GET", "/deletion-operations/bdop_test"): [deleting("processing"), deleting()]})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertTrue(data["cleanup_complete"])
+        self.assertTrue(all(r["deleted"] for r in data["resources"]))
+        self.assertEqual(client.calls[0][:2], ("DELETE", "/named-snapshots/motor-probe-test"))
+        delete = next(c for c in client.calls if c[:2] == ("DELETE", "/sandboxes/bx_23456789"))
+        self.assertEqual(delete[3], {"confirm": "bx_23456789"})
+        self.assertEqual(data["resources"][0]["usage"]["seconds"], 60)
+
+    def test_forbidden_delete_stops_but_does_not_claim_cleanup_and_continues(self):
+        data = evidence([{"kind": "named-snapshot", "id": "image"}, {"kind": "sandbox", "id": "bx_23456789"}])
+        client = FakeClient({("GET", "/sandboxes/bx_23456789/usage"): probe.ApiError(403, "denied"),
+                             ("DELETE", "/sandboxes/bx_23456789"): probe.ApiError(403, "delete scope missing"),
+                             ("POST", "/sandboxes/bx_23456789/stop"): {"status": "archiving"},
+                             ("DELETE", "/named-snapshots/image"): {"status": "deleted"}})
+        probe.cleanup(client, data, lambda: None, attempts=2, pause=lambda _: None)
+        self.assertFalse(data["cleanup_complete"])
+        self.assertFalse(data["resources"][1].get("deleted", False))
+        self.assertTrue(data["resources"][0]["deleted"])
+        self.assertIn("fallback_stop", data["resources"][1])
+
+    def test_accepted_deletion_is_not_completed_deletion(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789"}])
+        client = FakeClient({("GET", "/sandboxes/bx_23456789/usage"): {},
+                             ("DELETE", "/sandboxes/bx_23456789"): deleting("pending"),
+                             ("GET", "/deletion-operations/bdop_test"): deleting("blocked"),
+                             ("POST", "/sandboxes/bx_23456789/stop"): {}})
+        probe.cleanup(client, data, lambda: None, attempts=1, pause=lambda _: None)
+        self.assertFalse(data["cleanup_complete"])
+        self.assertEqual(data["resources"][0]["deletion_operation"], "bdop_test")
+
+    def test_recovery_polls_existing_operation_instead_of_trusting_hidden_404(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789", "deletion_operation": "bdop_test", "usage": {}}])
+        client = FakeClient({("GET", "/deletion-operations/bdop_test"): probe.ApiError(404, "not found"),
+                             ("POST", "/sandboxes/bx_23456789/stop"): probe.ApiError(404, "not found")})
+        probe.cleanup(client, data, lambda: None, attempts=1, pause=lambda _: None)
+        self.assertFalse(data["cleanup_complete"])
+        self.assertFalse(any(call[0] == "DELETE" for call in client.calls))
+
+    def test_waiting_for_uploads_is_pending_purge_not_missing_delete_scope(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789", "usage": {}}])
+        operation = deleting("processing")
+        operation["operation"].update(stage="waiting_for_uploads", expectedBy="2026-10-19T19:00:00Z")
+        client = FakeClient({("DELETE", "/sandboxes/bx_23456789"): operation,
+                             ("GET", "/deletion-operations/bdop_test"): operation})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertFalse(data["cleanup_complete"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(data["resources"][0]["deletion_state"]["stage"], "waiting_for_uploads")
+        self.assertNotIn("fallback_stop", data["resources"][0])
+        self.assertIn("upload URL expiry", data["cleanup_summary"])
+        self.assertNotIn("with delete scope", data["cleanup_summary"])
+
+    def test_lost_create_response_recovers_same_idempotency_key_and_body(self):
+        data = evidence()
+        pending = {"body": {"type": "large", "noEnv": True}, "idempotency": "stable-uuid"}
+        data["pending_creates"] = [pending]
+        client = FakeClient({("POST", "/sandboxes"): {"sandbox": {"id": "bx_23456789"}},
+                             ("GET", "/sandboxes/bx_23456789/usage"): {},
+                             ("DELETE", "/sandboxes/bx_23456789"): deleting(),
+                             ("GET", "/deletion-operations/bdop_test"): deleting()})
+        checkpoints = []
+        probe.cleanup(client, data, lambda: checkpoints.append(json.dumps(data)), pause=lambda _: None)
+        self.assertEqual(client.calls[0], ("POST", "/sandboxes", pending["body"], {"idempotency": "stable-uuid"}))
+        self.assertEqual(data["pending_creates"], [])
+        self.assertTrue(data["cleanup_complete"])
+        self.assertTrue(any('"bx_23456789"' in item for item in checkpoints))
+
+    def test_expired_create_idempotency_is_not_replayed(self):
+        data = evidence()
+        data["started_at"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        data["pending_creates"] = [{"body": {}, "idempotency": "old"}]
+        client = FakeClient({})
+        probe.cleanup(client, data, lambda: None, attempts=1, pause=lambda _: None)
+        self.assertEqual(client.calls, [])
+        self.assertFalse(data["cleanup_complete"])
+
+    def test_cleanup_is_idempotent_and_missing_resources_are_absent(self):
+        data = evidence([{"kind": "sandbox", "id": "bx_23456789"}])
+        client = FakeClient({("GET", "/sandboxes/bx_23456789/usage"): probe.ApiError(404, "missing"),
+                             ("DELETE", "/sandboxes/bx_23456789"): probe.ApiError(404, "missing")})
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        calls = list(client.calls)
+        probe.cleanup(client, data, lambda: None, pause=lambda _: None)
+        self.assertEqual(client.calls, calls)
+        self.assertTrue(data["cleanup_complete"])
+
+    def test_snapshot_saving_conflict_is_waited_out_before_retry(self):
+        data = evidence([{"kind": "named-snapshot", "id": "image"}])
+        client = FakeClient({("DELETE", "/named-snapshots/image"):
+                             [probe.ApiError(409, "save_in_progress"), {"status": "deleted"}],
+                             ("GET", "/named-snapshots/image"): {"snapshot": {"status": "ready"}}})
+        probe.cleanup(client, data, lambda: None, attempts=2, pause=lambda _: None)
+        self.assertTrue(data["cleanup_complete"])
+        self.assertEqual([c[0] for c in client.calls], ["DELETE", "GET", "DELETE"])
+
+    def test_main_failure_still_cleans_up_and_prints_only_redacted_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "run"
+            def fail(runner):
+                runner.data["resources"].append({"kind": "named-snapshot", "id": "image"})
+                raise RuntimeError("remote text: boat_NOT_REAL")
+            client = FakeClient({("DELETE", "/named-snapshots/image"): {"status": "deleted"}})
+            output = io.StringIO()
+            with patch("sys.argv", ["probe.py", "--output", str(destination)]), \
+                 patch.dict(os.environ, {"BOAT_API_KEY": "boat_NOT_REAL"}), \
+                 patch.object(probe, "Client", return_value=client), \
+                 patch.object(probe.Probe, "run", fail), patch.object(probe.signal, "signal"), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(probe.main(), 1)
+            self.assertNotIn("boat_NOT_REAL", output.getvalue())
+            self.assertTrue(json.loads(output.getvalue())["cleanup_complete"])
+            self.assertNotIn("boat_NOT_REAL", (destination / "results.md").read_text())
+
+
+class SSHTests(unittest.TestCase):
+    def test_ipv4_ssh_endpoint_wins_over_ipv6_machine_ip(self):
+        route = ssh_reach.endpoint({"sshEndpoint": "192.0.2.3:22001", "machineIp": "2001:db8::2"})
+        self.assertEqual((route["host"], route["port"], route["family"]), ("192.0.2.3", 22001, 4))
+        self.assertEqual(ssh_reach.endpoint({"machineIp": "192.0.2.4"})["port"], 22)
+
+    def test_api_host_key_is_only_trust_anchor_and_ssh_never_uses_tofu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "known_hosts"
+            ssh_reach.pin_host(path, "bx_23456789", {"hostKey": "ssh-ed25519 dGVzdC1rZXk="})
+            self.assertEqual(path.read_text(), "bx_23456789 ssh-ed25519 dGVzdC1rZXk=\n")
+            argv = ssh_reach.ssh_argv({"host": "192.0.2.3", "port": 22001}, Path(tmp) / "key", path, "bx_23456789")
+        for option in ("StrictHostKeyChecking=yes", "GlobalKnownHostsFile=/dev/null", "UpdateHostKeys=no",
+                       "IdentityAgent=none", "IdentitiesOnly=yes", "ControlPath=none"):
+            self.assertIn(option, argv)
+        self.assertIn("UserKnownHostsFile=" + str(path), argv)
+        self.assertIn("HostKeyAlias=bx_23456789", argv)
+        self.assertIn("-4", argv)
+        self.assertNotIn("accept-new", " ".join(argv))
+
+    def test_missing_or_multiline_host_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for key in ("", "ssh-ed25519 dGVzdA==\nother injected", "unknown dGVzdA=="):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    ssh_reach.pin_host(Path(tmp) / "known_hosts", "bx_23456789", {"hostKey": key})
+
+    def test_refusal_requires_authenticated_connection_and_no_command_marker(self):
+        auth = 'Authenticated to host using "publickey".\n'
+        self.assertTrue(ssh_reach.refused({"exit_code": 1, "stderr": auth, "stdout": ""}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": "Permission denied (publickey)."}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": auth + "Connection reset"}, "marker"))
+        self.assertFalse(ssh_reach.refused({"exit_code": 0, "stderr": auth, "stdout": "marker"}, "marker"))
+
+    def test_allowed_command_is_reported_fail_for_forward_only_requirement(self):
+        runner = type("Runner", (), {"data": {"run_id": "unit"}, "checkpoint": lambda self: None})()
+        measurement = ssh_reach.SSHReach(runner)
+        result = {"exit_code": 0, "stdout": "boat-ssh-unit\n", "stderr": 'Authenticated to host using "publickey".'}
+        with patch.object(ssh_reach, "process", return_value=result):
+            measurement.connection(["ssh", "user@192.0.2.3"], "restricted.command_refused", refuse=True)
+        self.assertEqual(measurement.data["checks"][0]["status"], "FAIL")
+
+    def test_restrict_rewrites_only_tested_key_and_removes_its_unrestricted_duplicates(self):
+        public = "ssh-ed25519 dGVzdC1rZXk= tested"
+        unrelated = "ssh-ed25519 b3RoZXIta2V5 unrelated"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".ssh/authorized_keys"
+            path.parent.mkdir()
+            path.write_text(public + "\n" + unrelated + "\n" + public + "\n")
+            environment = dict(os.environ, HOME=tmp)
+            result = ssh_reach.subprocess.run([sys.executable, "-c", ssh_reach.AUTHORIZED_KEYS, public, "restrict",
+                                              'restrict,port-forwarding,permitopen="127.0.0.1:9443"'],
+                                             capture_output=True, text=True, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            expected = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+            self.assertEqual(observed["after"], [expected])
+            self.assertEqual(path.read_text().splitlines(), [unrelated, expected])
+
+    def test_tunnel_uses_no_session_channel_and_reaps_local_ssh(self):
+        child = MagicMock()
+        child.poll.return_value = None
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(ssh_reach.subprocess, "Popen", return_value=child) as launch, \
+             patch.object(ssh_reach, "tcp_probe", return_value={"verified_echo": True}):
+            result = ssh_reach.forward(["ssh", "-4", "user@192.0.2.3"], "PUBLIC CERT", Path(tmp))
+        argv = launch.call_args.args[0]
+        self.assertIn("-N", argv)
+        self.assertIn("-L", argv)
+        self.assertTrue(any(part.endswith(":127.0.0.1:9443") for part in argv))
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once()
+        self.assertTrue(result["verified_echo"])
+        self.assertTrue(result["tunnel_process_reaped"])
+
+    def test_private_api_credential_not_in_local_ssh_environment(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+        with patch.dict(os.environ, {"BOAT_API_KEY": "not-for-ssh"}), \
+             patch.object(ssh_reach.subprocess, "run", return_value=completed) as run:
+            ssh_reach.process(["ssh", "-V"])
+        self.assertNotIn("BOAT_API_KEY", run.call_args.kwargs["env"])
+
+    def test_resume_refresh_does_not_reauthorize_tested_key_before_persistence_checks(self):
+        runner = MagicMock()
+        runner.data = {"run_id": "unit"}
+        runner.create.return_value = ({"id": "bx_23456789", "vcpu": 8, "memoryGB": 16}, {})
+        measurement = ssh_reach.SSHReach(runner)
+        public = "ssh-ed25519 dGVzdA== tested"
+        witness_public = "ssh-ed25519 d2l0bmVzcw== witness"
+        restricted = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+        def generated(argv, **kwargs):
+            if argv[0] == "ssh-keygen":
+                path = Path(argv[-1])
+                path.write_text("not-a-real-private-key")
+                path.with_suffix(".pub").write_text(public if path.name.startswith("probe") else witness_public)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+        response = {"hostKey": "ssh-ed25519 dGVzdA==", "sshEndpoint": "192.0.2.3:22001", "machineIp": "2001:db8::2"}
+        with patch.object(ssh_reach, "process", side_effect=generated), \
+             patch.object(measurement, "authorize", return_value=response) as authorize, \
+             patch.object(measurement, "phase") as phase, patch.object(measurement, "resume"), \
+             patch.object(measurement, "key_lines", side_effect=[{"matching_keys": 1, "after": [public]},
+                                                               {"after": [restricted]}, {"after": [restricted]}]):
+            measurement.run()
+        self.assertEqual([call.args[1] for call in authorize.call_args_list],
+                         [public, witness_public, public, witness_public])
+        self.assertEqual([call.args[1] for call in phase.call_args_list],
+                         ["initial", "old_key_before_reauthorize", "reauthorized", "restricted", "restricted_after_resume"])
+        self.assertTrue(measurement.data["local_private_keys_removed"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
