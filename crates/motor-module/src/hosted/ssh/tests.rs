@@ -165,3 +165,28 @@ async fn pinned_forward_echo_and_identity_cleanup_after_run_and_key_mismatch() {
     );
     assert!(!root.exists());
 }
+
+#[test]
+fn cloud_boat_requester_openssh_public_key_matches_client_identity() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let seed = vector["requester"]["test_only_seed_hex"]
+        .as_str()
+        .unwrap()
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let runtime = Runtime::new(&SigningKey::from_bytes(&seed)).unwrap();
+    let identity = ssh_key::PrivateKey::read_openssh_file(&runtime.root.join("identity")).unwrap();
+    assert_eq!(
+        identity.public_key().to_openssh().unwrap(),
+        vector["requester"]["openssh"].as_str().unwrap()
+    );
+}

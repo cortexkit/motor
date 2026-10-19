@@ -63,6 +63,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
     for path in [
         "cloud/runners-contract.md",
+        "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/host-signature.json",
         "cloud/lease.json",
