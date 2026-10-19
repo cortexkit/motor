@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Portable plumbing tests; these do not assert anything about a real Boat VM."""
+import base64
 import contextlib
 from datetime import datetime, timedelta, timezone
 import importlib.util
@@ -95,6 +96,15 @@ class ParsingTests(unittest.TestCase):
         runner = probe.Probe(client, evidence(), lambda: None)
         self.assertEqual(runner.execute("bx_23456789", "true")["status"], "exited")
         self.assertEqual(client.calls[0][2]["detached"], True)
+
+    def test_guest_listener_command_accepts_an_alternate_loopback_port(self):
+        runner = object.__new__(probe.Probe)
+        runner.source, runner.base, runner.port = b"guest script", ".boat-probe-unit", 9443
+        runner.execute = MagicMock(return_value={"exitCode": 0, "stdout": "{}"})
+        with patch.object(probe, "command_output", return_value={"ready": True}):
+            self.assertEqual(probe.Probe.guest(runner, "bx_23456789", "listener-loopback", port=9444),
+                             {"ready": True})
+        self.assertIn("--port 9444", runner.execute.call_args.args[1])
 
     def test_lost_command_is_not_success(self):
         client = FakeClient({("POST", "/sandboxes/bx_23456789/commands"): {"processId": 2},
@@ -342,29 +352,97 @@ class SSHTests(unittest.TestCase):
         self.assertFalse(ssh_reach.refused({"exit_code": 255, "stderr": auth + "Connection reset"}, "marker"))
         self.assertFalse(ssh_reach.refused({"exit_code": 0, "stderr": auth, "stdout": "marker"}, "marker"))
 
+    def test_remote_forward_row_requires_authenticated_open_failure(self):
+        auth = 'Authenticated to host using "publickey".\n'
+        refusal = "remote port forwarding failed for listen port 0"
+        self.assertTrue(ssh_reach.remote_forward_refused({"exit_code": 255, "stderr": auth + refusal}))
+        self.assertFalse(ssh_reach.remote_forward_refused({"exit_code": 255, "stderr": refusal}))
+        self.assertFalse(ssh_reach.remote_forward_refused({"exit_code": 1, "stderr": auth + "Connection reset"}))
+        self.assertFalse(ssh_reach.remote_forward_refused({"exit_code": None, "stderr": auth + refusal}))
+
     def test_allowed_command_is_reported_fail_for_forward_only_requirement(self):
         runner = type("Runner", (), {"data": {"run_id": "unit"}, "checkpoint": lambda self: None})()
         measurement = ssh_reach.SSHReach(runner)
         result = {"exit_code": 0, "stdout": "boat-ssh-unit\n", "stderr": 'Authenticated to host using "publickey".'}
         with patch.object(ssh_reach, "process", return_value=result):
-            measurement.connection(["ssh", "user@192.0.2.3"], "restricted.command_refused", refuse=True)
+            measurement.connection(["ssh", "user@192.0.2.3"], "restricted.exec_refused", refuse=True)
         self.assertEqual(measurement.data["checks"][0]["status"], "FAIL")
 
-    def test_restrict_rewrites_only_tested_key_and_removes_its_unrestricted_duplicates(self):
+    def test_shell_refusal_checks_plain_and_forced_pty_without_marker_echo(self):
+        runner = type("Runner", (), {"data": {"run_id": "unit"}, "checkpoint": lambda self: None})()
+        measurement = ssh_reach.SSHReach(runner)
+        auth = 'Authenticated to host using "publickey".\n'
+        with patch.object(ssh_reach, "process", return_value={"exit_code": 1, "stdout": "", "stderr": auth}) as run:
+            measurement.connection(["ssh", "-T", "user@192.0.2.3"], "restricted.shell_without_pty_refused",
+                                   refuse=True, shell=True)
+            measurement.connection(["ssh", "-T", "user@192.0.2.3"], "restricted.shell_with_pty_refused",
+                                   refuse=True, shell=True, pty=True)
+        plain, terminal = run.call_args_list
+        self.assertNotIn("-tt", plain.args[0])
+        self.assertIn("-tt", terminal.args[0])
+        for call in (plain, terminal):
+            self.assertNotIn(measurement.marker, call.kwargs["input_text"])
+        self.assertEqual([row["status"] for row in measurement.data["checks"]], ["PASS", "PASS"])
+
+    def test_restricted_phase_emits_independent_json_rows_for_all_capabilities(self):
+        auth = 'Authenticated to host using "publickey".\n'
+        runner = MagicMock()
+        runner.data = {"run_id": "unit"}
+        runner.guest.side_effect = [
+            {"ready": True, "listening_addresses": ["127.0.0.1:9443"], "certificate_pem": "CERT"},
+            {"ready": True, "listening_addresses": ["127.0.0.1:9444"], "certificate_pem": "CERT"},
+        ]
+        measurement = ssh_reach.SSHReach(runner)
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(ssh_reach, "process", return_value={"exit_code": 1, "stdout": "", "stderr": auth}), \
+             patch.object(ssh_reach, "forward", return_value={"verified_echo": True, "tunnel_process_reaped": True}), \
+             patch.object(ssh_reach, "blocked_forward", return_value={"server_refused": True,
+                                                                        "verified_echo": False,
+                                                                        "tunnel_process_reaped": True}), \
+             patch.object(ssh_reach, "remote_forward", return_value={"refused": True,
+                                                                       "tunnel_process_reaped": True}):
+            measurement.phase("bx_23456789", "restricted", {
+                "hostKey": "ssh-ed25519 dGVzdA==", "sshEndpoint": "192.0.2.3:22001"},
+                Path(tmp) / "key", Path(tmp), restricted=True)
+        checks = json.loads(json.dumps(measurement.data["checks"]))
+        rows = {row["name"]: row["status"] for row in checks}
+        expected = {
+            "restricted.exec_refused",
+            "restricted.shell_without_pty_refused",
+            "restricted.shell_with_pty_refused",
+            "restricted.tls_over_permitted_forward",
+            "restricted.other_destination_forward_refused",
+            "restricted.remote_forward_refused",
+        }
+        self.assertTrue(expected.issubset(rows))
+        self.assertTrue(all(rows[name] == "PASS" for name in expected))
+        runner.guest.assert_called_with("bx_23456789", "listener-loopback", port=ssh_reach.OTHER_PORT)
+
+    def test_restrict_writes_forced_command_byte_for_byte_and_preserves_other_keys(self):
         public = "ssh-ed25519 dGVzdC1rZXk= tested"
         unrelated = "ssh-ed25519 b3RoZXIta2V5 unrelated"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".ssh/authorized_keys"
             path.parent.mkdir()
             path.write_text(public + "\n" + unrelated + "\n" + public + "\n")
-            environment = dict(os.environ, HOME=tmp)
-            result = ssh_reach.subprocess.run([sys.executable, "-c", ssh_reach.AUTHORIZED_KEYS, public, "restrict",
-                                              'restrict,port-forwarding,permitopen="127.0.0.1:9443"'],
-                                             capture_output=True, text=True, env=environment)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            observed = json.loads(result.stdout)
-            expected = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+
+            class LocalRunner:
+                data = {"run_id": "unit"}
+
+                def execute(self, sid, text):
+                    completed = ssh_reach.subprocess.run(["/bin/sh", "-c", text], capture_output=True, text=True,
+                                                         env=dict(os.environ, HOME=tmp))
+                    return {"exitCode": completed.returncode, "stdout": completed.stdout,
+                            "stderr": completed.stderr}
+
+                def checkpoint(self):
+                    pass
+
+            observed = ssh_reach.SSHReach(LocalRunner()).key_lines("bx_23456789", public, "restrict")
+            forced = 'restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false"'
+            expected = forced + " " + public
             self.assertEqual(observed["after"], [expected])
+            self.assertEqual(observed["raw_after"], [base64.b64encode((expected + "\n").encode()).decode("ascii")])
             self.assertEqual(path.read_text().splitlines(), [unrelated, expected])
 
     def test_tunnel_uses_no_session_channel_and_reaps_local_ssh(self):
@@ -397,7 +475,8 @@ class SSHTests(unittest.TestCase):
         measurement = ssh_reach.SSHReach(runner)
         public = "ssh-ed25519 dGVzdA== tested"
         witness_public = "ssh-ed25519 d2l0bmVzcw== witness"
-        restricted = 'restrict,port-forwarding,permitopen="127.0.0.1:9443" ' + public
+        restricted = 'restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false" ' + public
+        raw_restricted = base64.b64encode((restricted + "\n").encode()).decode("ascii")
         def generated(argv, **kwargs):
             if argv[0] == "ssh-keygen":
                 path = Path(argv[-1])
@@ -409,7 +488,8 @@ class SSHTests(unittest.TestCase):
              patch.object(measurement, "authorize", return_value=response) as authorize, \
              patch.object(measurement, "phase") as phase, patch.object(measurement, "resume"), \
              patch.object(measurement, "key_lines", side_effect=[{"matching_keys": 1, "after": [public]},
-                                                               {"after": [restricted]}, {"after": [restricted]}]):
+                                                                {"after": [restricted], "raw_after": [raw_restricted]},
+                                                                {"after": [restricted], "raw_after": [raw_restricted]}]):
             measurement.run()
         self.assertEqual([call.args[1] for call in authorize.call_args_list],
                          [public, witness_public, public, witness_public])

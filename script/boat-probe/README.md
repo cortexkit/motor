@@ -44,14 +44,18 @@ service reached through `ssh -N -L` to `127.0.0.1:9443`. It does not open 9443 i
 UFW or expose the TLS service publicly. It stops/resumes twice, records host-key
 and endpoint changes, tests the old private key before reauthorizing that tested
 key, then writes exactly
-`restrict,port-forwarding,permitopen="127.0.0.1:9443"` on its authorized_keys line.
-It tests command refusal, shell refusal and allowed forwarding independently,
-then resumes and tests the same restriction again.
+`restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false"`
+on its authorized_keys line. The restricted phase separately checks refused exec,
+shells with and without a PTY, permitted TLS forwarding, a forward to a second
+loopback listener, and remote forwarding. It then stops/resumes, re-reads the
+tested line byte for byte without reauthorizing that key, and repeats those checks.
 
-The shell test requests a shell without a PTY: refusal to allocate a PTY alone
-does not establish shell refusal. Restriction persistence compares the exact
-tested line and reports normalization/whitespace changes as FAIL with the raw
-before/after lines for inspection.
+Both shell tests require an authenticated connection and no marker output; the
+PTY-requesting test separates a refused shell from merely disabled PTY allocation.
+Restriction persistence compares the exact tested line, including its newline,
+and reports normalization/whitespace changes as FAIL with the raw before/after
+lines for inspection. The separate-port and remote-forward checks require an SSH
+server refusal, not just a failed TLS attempt or an unreachable endpoint.
 
 A different throwaway witness public key obtains the refreshed host key after
 resume. Reinstalling the tested key before checking persistence could normalize
@@ -62,10 +66,10 @@ logged and are removed locally; each local SSH tunnel is terminated and reaped.
 
 Every check has PASS/FAIL plus raw evidence under `ssh_reach`. An authentication
 or route failure does not count as successful shell refusal. OpenSSH's `restrict`
-option does not itself forbid command execution; the mode measures the requested
-combination rather than assuming it creates a forwarding-only login or silently
-adding a forced command. Negative capability findings are FAIL, not a rewritten
-expectation. Overall exit also remains nonzero while final data purge is pending.
+option does not itself forbid command execution, so this mode tests the requested
+forced-command line instead of assuming it creates a forwarding-only login.
+Negative capability findings are FAIL, not a rewritten expectation. Overall exit
+also remains nonzero while final data purge is pending.
 Allow roughly **3–8 large-sandbox minutes**, plus asynchronous purge latency; this
 is an estimate, not a measured SSH result. No toolchain or named snapshot is
 created in this mode. Boat SSH reference: <https://docs.boat.dev/ssh-access>.
