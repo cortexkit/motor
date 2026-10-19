@@ -139,3 +139,5 @@ Test-SpikeLogic 'iso-stream-writer-compiles' {
 }
 Write-Host "Checks: $passed passed, $failed failed, 0 skipped"
 if ($failed -ne 0) { exit 1 }
+& "$PSScriptRoot/test_servicing.ps1"
+if (-not $?) { exit 1 }

@@ -94,15 +94,16 @@ try {
     Use-SpikeWindowsDisk $disk {
         param($volume)
         $provision = Join-Path $volume 'build\provision'
-        foreach ($file in @('bootstrap.log','finalize.log','FAILED.txt','provisioned','finalized','winagent.sha256','pwsh-probe.json','pwsh-probe.stdout.log','pwsh-probe.stderr.log','pwsh-host-trace.log','pwsh-startup-diagnostics.log')) {
+        foreach ($file in @('bootstrap.log','os-update-first.log','os-updated','finalize.log','FAILED.txt','provisioned','finalized','winagent.sha256','pwsh-probe.json','pwsh-probe.stdout.log','pwsh-probe.stderr.log','pwsh-host-trace.log','pwsh-startup-diagnostics.log')) {
             if (Test-Path (Join-Path $provision $file)) { Copy-Item (Join-Path $provision $file) $logs }
         }
-        foreach ($file in @('bootstrap.log','finalize.log')) {
+        Get-ChildItem $provision -Filter '*-updates-*.json' -File | Copy-Item -Destination $logs
+        foreach ($file in @('os-update-first.log','bootstrap.log','finalize.log')) {
             if (Test-Path (Join-Path $logs $file)) { Get-Content (Join-Path $logs $file) | Out-Host }
         }
         if (Test-Path (Join-Path $logs 'FAILED.txt')) { Get-Content (Join-Path $logs 'FAILED.txt') | Out-Host }
         Assert-Spike (-not (Test-Path (Join-Path $provision 'FAILED.txt'))) 'no-failure-marker' $provision
-        foreach ($file in @('provisioned','finalized')) { Assert-Spike (Test-Path (Join-Path $provision $file)) $file (Get-Content (Join-Path $provision $file)) }
+        foreach ($file in @('os-updated','provisioned','finalized')) { Assert-Spike (Test-Path (Join-Path $provision $file)) $file (Get-Content (Join-Path $provision $file)) }
         $bootstrap = Get-Content (Join-Path $provision 'bootstrap.log') -Raw
         foreach ($right in @('SeBatchLogonRight','SeCreateSymbolicLinkPrivilege')) {
             Assert-Spike ($bootstrap -match "Verified $right for motor-job SID S-1-") 'verified-effective-job-right' $right
