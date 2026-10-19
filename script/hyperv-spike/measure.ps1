@@ -162,7 +162,7 @@ try {
                 } finally {
                     try { Close-SpikeNativeProcess $running } finally {
                         Remove-SpikeVM $name
-                        if (-not $probe -and (Test-Path -LiteralPath $child)) {
+                        if ((-not $probe -or $DiagnosticOnly) -and (Test-Path -LiteralPath $child)) {
                             try { Save-SpikeGuestEvidence $child (Join-Path $batch "run-$run-guest") }
                             catch { Write-Host "FAIL diagnostic-harvest $_ (cleanup still required)" }
                         }

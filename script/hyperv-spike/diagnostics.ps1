@@ -1,4 +1,4 @@
-# Failure-only evidence from a stopped disposable overlay, never from host secrets.
+# Selected evidence from a stopped disposable overlay, never from host secrets.
 function Get-SpikeClientProgress([string]$Text) {
     $progress = [ordered]@{}
     foreach ($line in ($Text -split '\r?\n')) {
