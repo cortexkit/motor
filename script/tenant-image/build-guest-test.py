@@ -105,7 +105,7 @@ class Builder:
         for path in (self.source, self.image):
             if self.output.is_relative_to(path) or path.is_relative_to(self.output):
                 raise ValueError("output must be separate from the source checkout and immutable image")
-        if shutil.disk_usage("/srv/build").free < REQUIRED_FREE:
+        if shutil.disk_usage("/var/lib/motor-vm").free < REQUIRED_FREE:
             raise RuntimeError("need 232 GiB free: 170 GiB floor + 54 GiB qualification + 8 GiB build allowance")
         if not (self.cache / "registry").is_dir():
             raise ValueError("--cargo-cache must contain the populated host Cargo registry")

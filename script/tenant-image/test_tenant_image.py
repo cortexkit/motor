@@ -35,6 +35,11 @@ def resolved_config():
 
 
 class ImageTests(unittest.TestCase):
+    def test_default_build_output_uses_root_trusted_vm_bind_view(self):
+        with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner"]), mock.patch.object(image, "build") as build:
+            image.main()
+        self.assertEqual(build.call_args.args[1], Path("/var/lib/motor-vm/tenant-images").resolve())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

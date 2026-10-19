@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::{os::fd::OwnedFd, path::PathBuf};
 
 pub const REGISTRY: &str = "/etc/motor-vm-helper/tenants";
-pub const TENANTS: &str = "/srv/build/vm/tenants";
-pub const IMAGES: &str = "/srv/build/vm/tenant-images";
+pub const TENANTS: &str = "/var/lib/motor-vm/tenants";
+pub const IMAGES: &str = "/var/lib/motor-vm/tenant-images";
 
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()

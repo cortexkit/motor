@@ -1,7 +1,9 @@
 # Tenant provisioning
 
 `python3 script/tenant-provision/provision.py --config /absolute/operator-config.json`
-runs once as root on the dedicated Linux VM host. Requires Python 3.9+, XFS
+runs once as root on the dedicated Linux VM host. Install and activate the
+[VM storage bind mount](../../docs/linux-microvm.md#install) first; all root-run
+paths use `/var/lib/motor-vm`, not the `/srv/build/vm` source spelling. Requires Python 3.9+, XFS
 with reflink, `fallocate`, `mkfs.xfs`, `ip`, `mount`, `umount`, cgroup v2 with
 CPU/cpuset/memory/pids/I/O controllers, and Firecracker **and jailer 1.17.0** in
 `/usr/local/lib/firecracker/1.17.0/`. Deploy `script/tenant-vm-spike/api_schema.py`
@@ -12,7 +14,7 @@ The JSON configuration has these required fields:
 
 - `tenant`, `vm`: single path components; `sub`: the lease broker's account
   (`acct:<ULID>`) or organization (`org:<ULID>`) identity;
-- `image_version`: an existing immutable directory in `/srv/build/vm/tenant-images`;
+- `image_version`: an existing immutable directory in `/var/lib/motor-vm/tenant-images`;
 - `vcpu_ceiling`, `guest_ram_mib`, `disk_quota_bytes`, `cpuset`, `tap_index` (1–254);
 - `resolvers`: public IPv4 resolver addresses, also configured in the host agent.
 

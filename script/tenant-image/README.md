@@ -55,7 +55,10 @@ for a full build. No credentials or adjacent checkout are inputs.
 ## Operator build
 
 Full image builds require root on a **dedicated Linux x86_64 operator host**;
-do not run them through the unprivileged remote-job lane. The host needs
+do not run them through the unprivileged remote-job lane. First install and
+activate the [root-trusted VM storage mount](../../docs/linux-microvm.md#install).
+The default output root is `/var/lib/motor-vm/tenant-images`; do not use the
+`/srv/build/vm` source spelling for root-run operations. The host needs
 debootstrap with trixie support and current Debian archive signing keys,
 e2fsprogs, util-linux, Python 3, curl, xz, make, GCC 13.4.0 (`gcc-13`), flex,
 bison, bc, libssl-dev and libelf-dev. Allow at least 200 GiB of scratch space
@@ -67,7 +70,7 @@ environment variables are explicitly cleared, including in the chroot.
 sudo python3 script/tenant-image/build.py build EXAMPLE_VERSION \
   --runner /absolute/path/to/motor-runner --jobs 4
 python3 script/tenant-image/build.py inventory \
-  /srv/build/vm/tenant-images/EXAMPLE_VERSION
+  /var/lib/motor-vm/tenant-images/EXAMPLE_VERSION
 ```
 
 The version directory is reserved with an exclusive `mkdir` **before** checking
@@ -81,7 +84,7 @@ unmount first, remove scratch, then write `manifest.json` as their completion
 record. Existing completed versions must never be removed to rebuild in place.
 
 The build creates the following artifacts under the operator-host output root,
-`/srv/build/vm/tenant-images/<version>/`, where `<version>` is the chosen release name:
+`/var/lib/motor-vm/tenant-images/<version>/`, where `<version>` is the chosen release name:
 
 - `vmlinux`, `rootfs`: read-only files; rootfs is an ext4 **lower**, not the
   tenant's XFS data filesystem;
@@ -200,15 +203,15 @@ mkdir -p "$BUILD"
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
   cargo build --locked -j4 -p motor-host -p motor-vm-helper -p motor-lease --bins
-IMAGE=/srv/build/vm/tenant-images/IMAGE_VERSION
-PREP=/srv/build/qualification-prep/UNUSED_PREP_NAME
+IMAGE=/var/lib/motor-vm/tenant-images/IMAGE_VERSION
+PREP=/var/lib/motor-vm/qualification-prep/UNUSED_PREP_NAME
 sudo python3 script/tenant-image/build-guest-test.py --image "$IMAGE" \
   --source "$PWD" --cargo-cache "${CARGO_HOME:-$HOME/.cargo}" --output "$PREP" --jobs 4
 # Select two host CPUs excluding any CPUs reserved for Windows jobs.
 sudo python3 script/tenant-image/qualify.py \
   --image "$IMAGE" \
   --bin-dir "$BUILD/debug" --runner-test-binary "$PREP/runner-tests" \
-  --cpuset 0-1 --results /srv/build/qualification/UNUSED_RUN_NAME
+  --cpuset 0-1 --results /var/lib/motor-vm/qualification/UNUSED_RUN_NAME
 ```
 
 Prerequisites are Python 3.9+, systemd 257+ (including `systemd-debug-generator`
@@ -225,7 +228,7 @@ chroot preparation requires 232 GiB free (170 GiB floor + 54 GiB qualification
 reserve + an 8 GiB build allowance), without copying the 32 GiB rootfs. Its target
 files, `runner-tests`, `cargo-artifacts.jsonl` and `provenance.json` remain under
 `--output`; remove them only after confirming preparation's cleanup succeeded.
-The qualification requires **224 GiB free on `/srv/build` after builds**: a 170 GiB floor
+The qualification requires **224 GiB free on `/var/lib/motor-vm` after builds**: a 170 GiB floor
 plus a 54 GiB allocation allowance. It rechecks the floor plus snapshot bytes
 before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a fully allocated 20 GiB XFS
 disk, a 16 GiB size base and one 16 GiB suspend image. Snapshot `memory.high` is

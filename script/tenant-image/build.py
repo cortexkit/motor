@@ -180,7 +180,7 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     create = subs.add_parser("build")
     create.add_argument("version")
-    create.add_argument("--output-root", type=Path, default=Path("/srv/build/vm/tenant-images"))
+    create.add_argument("--output-root", type=Path, default=Path("/var/lib/motor-vm/tenant-images"))
     create.add_argument("--runner", type=Path, required=True)
     create.add_argument("--jobs", type=int, default=4)
     for sub in (create, subs.add_parser("inventory")):

@@ -20,7 +20,8 @@ Configuration is a closed JSON object with these required fields:
 - `registry_dir` (normally `/etc/motor-vm-helper/tenants`), readable root-managed
   helper registry files supplying ceilings, sizes, tap indices and idle policy;
 - `resolvers`, an array of public IPv4 strings matching provisioning;
-- `storage`, the filesystem path whose available bytes cover suspend snapshots;
+- `storage`, the filesystem path whose available bytes cover suspend snapshots
+  (use the root-trusted `/var/lib/motor-vm` bind view, not `/srv/build/vm`);
 - `admin_socket`, in a private directory writable by the host user.
 
 The agent derives the guest address and gateway from the registered tap index.

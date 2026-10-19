@@ -25,16 +25,16 @@
   "firecracker": "/usr/local/libexec/firecracker",
   "loader": "/usr/local/libexec/motor-vm-loader",
   "job_snapshot": {
-    "vmstate": "/srv/build/vm/images/job.vmstate",
-    "rootfs": "/srv/build/vm/images/rootfs",
-    "memory": "/srv/build/vm/images/job.memory",
-    "record": "/srv/build/vm/images/job.record.json"
+    "vmstate": "/var/lib/motor-vm/images/job.vmstate",
+    "rootfs": "/var/lib/motor-vm/images/rootfs",
+    "memory": "/var/lib/motor-vm/images/job.memory",
+    "record": "/var/lib/motor-vm/images/job.record.json"
   },
   "scan_snapshot": {
-    "vmstate": "/srv/build/vm/images/scan.vmstate",
-    "rootfs": "/srv/build/vm/images/rootfs",
-    "memory": "/srv/build/vm/images/scan.memory",
-    "record": "/srv/build/vm/images/scan.record.json"
+    "vmstate": "/var/lib/motor-vm/images/scan.vmstate",
+    "rootfs": "/var/lib/motor-vm/images/rootfs",
+    "memory": "/var/lib/motor-vm/images/scan.memory",
+    "record": "/var/lib/motor-vm/images/scan.record.json"
   },
   "hugepages_per_slot": 8192,
   "agent_port": 52001,

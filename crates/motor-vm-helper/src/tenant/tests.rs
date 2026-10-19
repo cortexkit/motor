@@ -21,6 +21,24 @@ pub(crate) fn registry(name: &str) -> Registry {
         io_weight: 100,
     }
 }
+
+#[test]
+fn tenant_paths_use_trusted_bind_view_and_refuse_old_source_spelling() {
+    let mut r = registry("a");
+    assert_eq!(
+        r.disk,
+        PathBuf::from("/var/lib/motor-vm/tenants/a/disk.img")
+    );
+    assert_eq!(
+        r.image(),
+        PathBuf::from("/var/lib/motor-vm/tenant-images/v1")
+    );
+    r.validate("a").unwrap();
+    r.disk = PathBuf::from("/srv/build/vm/tenants/a/disk.img");
+    r.generation = PathBuf::from("/srv/build/vm/tenants/a/generation");
+    r.suspend = PathBuf::from("/srv/build/vm/tenants/a/suspend");
+    assert!(r.validate("a").is_err());
+}
 struct Fake {
     calls: Vec<String>,
     running: bool,

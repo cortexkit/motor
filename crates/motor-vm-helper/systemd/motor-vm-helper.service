@@ -1,7 +1,7 @@
 [Unit]
 Description=Motor microVM privilege and slot-lease helper
 After=local-fs.target
-RequiresMountsFor=/srv/build/vm
+RequiresMountsFor=/var/lib/motor-vm
 
 [Service]
 Type=simple

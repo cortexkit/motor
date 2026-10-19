@@ -7,6 +7,13 @@ instance runs jobs.
 
 [docs/linux-microvm.md](../../docs/linux-microvm.md#motor-vm-helper) describes
 its host prerequisites, installation, protocol, restart behavior and tests.
+The helper's fixed storage root is `/var/lib/motor-vm`, the root-trusted bind
+view of `/srv/build/vm`. Install and enable the versioned
+`systemd/var-lib-motor\x2dvm.mount` unit before starting the helper; the service's
+`RequiresMountsFor=` keeps that dependency explicit. The install sequence is in
+the host prerequisites linked above. Root-owned data below an unprivileged-owned
+parent is not sufficient: all VM reads use the protected mounted path.
+
 # Persistent tenant operations
 
 The existing connection-owned job slots are unchanged. Tenant operations are

@@ -25,7 +25,7 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-ROOT = Path("/srv/build/vm")
+ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
 HELPER_SOCKET = Path("/run/motor-vm-helper.sock")
@@ -246,7 +246,7 @@ class Harness:
     def preflight(self):
         if sys.platform != "linux" or os.geteuid() != 0 or self.uid == 0:
             raise RuntimeError("requires Linux root and a non-root --host-user")
-        guard(shutil.disk_usage("/srv/build").free, 54 * GIB)
+        guard(shutil.disk_usage(ROOT).free, 54 * GIB)
         if HELPER_SOCKET.exists() or HELPER_SOCKET.is_symlink() or any(REGISTRY.glob("*.json")):
             raise RuntimeError("refusing an existing helper socket or registered tenants; never interrupt a live helper")
         if (ROOT / "jail/tenants").exists() and any((ROOT / "jail/tenants").iterdir()):
@@ -268,7 +268,7 @@ class Harness:
             raise RuntimeError("supplied binary does not contain the required ignored test; not skipped")
         source = self.args.image.resolve()
         if source.parent != ROOT / "tenant-images":
-            raise RuntimeError("image must be under /srv/build/vm/tenant-images")
+            raise RuntimeError("image must be under /var/lib/motor-vm/tenant-images")
         self.run("python3", HERE / "build.py", "inventory", source)
         self.provisioner = module("tenant_provision", HERE.parent / "tenant-provision/provision.py")
         self.provisioner.trusted(source / "manifest.json")
@@ -284,7 +284,7 @@ class Harness:
         self.bindings_before = BINDINGS.read_bytes() if BINDINGS.exists() else None
         if self.bindings_before is not None and json.loads(self.bindings_before):
             raise RuntimeError("refusing existing host tenant bindings")
-        return dict(free_bytes=shutil.disk_usage("/srv/build").free, baseline=baseline,
+        return dict(free_bytes=shutil.disk_usage(ROOT).free, baseline=baseline,
                     test_binary=str(self.args.runner_test_binary.resolve()))
 
     def host_state(self) -> dict[str, Any]:
@@ -599,7 +599,7 @@ class Harness:
             # Quiescing, freeze/thaw, memory.high and durable snapshots are owned
             # by the real helper. Never replace them with direct Firecracker APIs.
             def suspend():
-                guard(shutil.disk_usage("/srv/build").free, 16 * GIB)
+                guard(shutil.disk_usage(ROOT).free, 16 * GIB)
                 reply = self.helper("suspend")
                 if reply["running"] is not False:
                     raise RuntimeError(f"suspend did not stop the VM: {reply}")

@@ -1,0 +1,11 @@
+[Unit]
+Description=Root-trusted bind view of Motor VM storage
+
+[Mount]
+What=/srv/build/vm
+Where=/var/lib/motor-vm
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target

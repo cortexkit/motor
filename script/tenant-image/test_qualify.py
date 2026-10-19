@@ -27,6 +27,11 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_qualification_and_provisioning_use_the_same_trusted_bind_root(self):
+        provision = q.module("qualification_layout_provision", q.HERE.parent / "tenant-provision/provision.py")
+        self.assertEqual(q.ROOT, Path("/var/lib/motor-vm"))
+        self.assertEqual(provision.ROOT, q.ROOT)
+
     def test_boot_args_preserve_manifest_and_deliver_opt_in_unit(self):
         original = "console=ttyS0 root=/dev/vda ro init=/sbin/motor-init net.ifnames=0"
         args = q.qualification_args(original)

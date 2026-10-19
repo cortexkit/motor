@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-ROOT = Path("/srv/build/vm")
+ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
 BIN = Path("/usr/local/lib/firecracker/1.17.0")

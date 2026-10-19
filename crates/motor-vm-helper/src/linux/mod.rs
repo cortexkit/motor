@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const BUILD_ROOT: &str = "/srv/build/vm";
+pub const BUILD_ROOT: &str = "/var/lib/motor-vm";
 pub const SOCKET: &str = "/run/motor-vm-helper.sock";
 struct Running {
     loader: Child,
