@@ -51,6 +51,27 @@ pub(crate) struct Job {
     pub retain_until_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_key: Option<String>,
+    /// Set when a job spilled to a hosted runner, its hosted route failed
+    /// before any Run frame reached a hosted runner, and ck-motor resubmitted
+    /// it to the build server. The build server
+    /// keeps the withdrawn first submission as a tombstone under the caller's
+    /// job ID and never admits that ID again, so the resubmission runs there
+    /// under this ID. The caller keeps using its original job ID throughout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_server_job_id: Option<Uuid>,
+}
+impl Job {
+    /// The hosted route that governs this job, if any. A resubmitted spill
+    /// keeps its route record, but the job now runs on the build server, so it
+    /// is no longer routed hosted. The record stays because an older ck-motor
+    /// reading this store would otherwise attach to the withdrawn tombstone and
+    /// report "refused, never ran" for a job that may be running; with the
+    /// record it reports the hosted outcome as unknown instead.
+    pub(crate) fn hosted_route(&self) -> Option<crate::hosted::HostedJobState> {
+        self.hosted
+            .clone()
+            .filter(|_| self.build_server_job_id.is_none())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -474,6 +495,23 @@ impl Storage {
                         .unwrap_or_default()
                         .max(now_ms().saturating_add(RETENTION_MS)),
                 );
+            }
+        })
+    }
+    /// Durably record the build-server ID of a resubmitted spill before its
+    /// Run frame is sent, so a restart attaches to that submission instead of
+    /// submitting again or reporting the withdrawn first submission.
+    pub(crate) fn resubmitted(
+        &self,
+        id: Uuid,
+        build_server_job_id: Uuid,
+        hosted_code: &str,
+    ) -> io::Result<()> {
+        self.update(|s| {
+            let job = s.jobs.entry(id).or_default();
+            job.build_server_job_id = Some(build_server_job_id);
+            if let Some(route) = job.hosted.as_mut() {
+                route.hosted_code = Some(hosted_code.into());
             }
         })
     }

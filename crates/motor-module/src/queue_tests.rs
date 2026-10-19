@@ -516,10 +516,180 @@ async fn boat_finish_is_first_for_terminal_refusal_and_unknown_and_never_release
     assert_eq!(bodies[2].1["outcome"], "lost");
 }
 
-#[tokio::test]
-async fn exhausted_spill_provisioning_returns_retryable_refusal_without_local_run() {
-    let boat = crate::hosted::boat_tests::Boat::new(usize::MAX, false).await;
-    let scratch = ScratchDir::new("motor-spill-provisioning-budget");
+/// What a fake build server saw, in order.
+#[derive(Default)]
+pub(crate) struct BuildServerLog {
+    /// Run frames as (job ID, queue_wait_limit_s).
+    pub runs: Vec<(Uuid, u64)>,
+    pub attaches: Vec<Uuid>,
+    pub withdraws: Vec<Uuid>,
+    /// Jobs that ran to completion, which Attach replays.
+    pub completed: std::collections::HashSet<Uuid>,
+}
+
+/// A build server that is full for a job's first submission and runs its
+/// resubmission. A Run with a zero queue-wait limit is the spill-watched first
+/// submission: it waits for a capacity permit until ck-motor withdraws it. Any
+/// other Run starts after a short queue wait and exits 7. Attach serves a
+/// completed job and, like the real runner, answers an ID it never admitted
+/// with a transfer_interrupted tombstone.
+pub(crate) struct ResubmitPeer {
+    pub log: Arc<std::sync::Mutex<BuildServerLog>>,
+}
+impl ResubmitPeer {
+    pub(crate) fn new() -> Self {
+        Self {
+            log: Arc::default(),
+        }
+    }
+}
+async fn resubmitted_result<W: tokio::io::AsyncWrite + Unpin>(peer: &mut W, id: Uuid, from: u64) {
+    if from == 0 {
+        let started = Frame::Started {
+            job_id: id,
+            seq: 0,
+            queue_wait_ms: 300,
+            started_at_ms: 1_730_000_000_300,
+            path_mapping: None,
+        };
+        write_frame_async(peer, &started).await.unwrap();
+    }
+    if from <= 1 {
+        let output = Output::new(
+            1,
+            OutputStream::Stdout,
+            BytePayload(b"build server output\n".to_vec()),
+        );
+        write_frame_async(peer, &Frame::Output(output))
+            .await
+            .unwrap();
+    }
+    let terminal =
+        TerminalRecord::new(id, Outcome::Exit { code: 7 }, 2, 300, 0).with_ran(Ran::Remote);
+    write_frame_async(peer, &Frame::Terminal(terminal))
+        .await
+        .unwrap();
+}
+impl Connector for ResubmitPeer {
+    fn connect(
+        &self,
+        _: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        let log = self.log.clone();
+        Box::pin(async move {
+            let (client, mut peer) = tokio::io::duplex(65536);
+            tokio::spawn(async move {
+                let Ok(Some(Frame::Hello { .. })) = read_frame_async(&mut peer).await else {
+                    return;
+                };
+                let hello = Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    started: true,
+                    gate_jobs: true,
+                    platforms: vec!["linux".into()],
+                    default_branch_tip: false,
+                    return_paths: false,
+                };
+                write_frame_async(&mut peer, &hello).await.unwrap();
+                while let Ok(Some(frame)) = read_frame_async(&mut peer).await {
+                    match frame {
+                        Frame::Have { repositories, .. } => {
+                            let reply = Frame::HaveReply {
+                                repositories,
+                                git_dependencies: Some(Vec::new()),
+                            };
+                            write_frame_async(&mut peer, &reply).await.unwrap();
+                        }
+                        Frame::Run(run) => {
+                            let id = run.job_id;
+                            log.lock().unwrap().runs.push((id, run.queue_wait_limit_s));
+                            let accepted = Frame::Accepted(Accepted::new(id, 0));
+                            write_frame_async(&mut peer, &accepted).await.unwrap();
+                            let waiting = Frame::Heartbeat {
+                                queue_wait_ms: Some(0),
+                            };
+                            write_frame_async(&mut peer, &waiting).await.unwrap();
+                            if run.queue_wait_limit_s == 0 {
+                                continue;
+                            }
+                            // Queue briefly: a job still spill-watched would be
+                            // withdrawn here.
+                            let until = tokio::time::Instant::now() + Duration::from_millis(300);
+                            loop {
+                                match tokio::time::timeout_at(until, read_frame_async(&mut peer))
+                                    .await
+                                {
+                                    Err(_) => break,
+                                    Ok(Ok(Some(Frame::Withdraw { job_id, .. }))) => {
+                                        log.lock().unwrap().withdraws.push(job_id)
+                                    }
+                                    Ok(Ok(Some(_))) => {}
+                                    Ok(_) => return,
+                                }
+                            }
+                            resubmitted_result(&mut peer, id, 0).await;
+                            log.lock().unwrap().completed.insert(id);
+                            return;
+                        }
+                        Frame::Withdraw { job_id, .. } => {
+                            log.lock().unwrap().withdraws.push(job_id);
+                            let reply = Frame::WithdrawReply {
+                                outcome: WithdrawOutcome::Withdrawn,
+                            };
+                            write_frame_async(&mut peer, &reply).await.unwrap();
+                            let terminal = TerminalRecord::new(
+                                job_id,
+                                Outcome::RefusedBeforeStart {
+                                    reason: RefusalReason::QueueWaitExceeded,
+                                },
+                                0,
+                                0,
+                                0,
+                            )
+                            .with_ran(Ran::None);
+                            write_frame_async(&mut peer, &Frame::Terminal(terminal))
+                                .await
+                                .unwrap();
+                            return;
+                        }
+                        Frame::Attach(request) => {
+                            let id = request.job_id;
+                            let completed = {
+                                let mut log = log.lock().unwrap();
+                                log.attaches.push(id);
+                                log.completed.contains(&id)
+                            };
+                            if completed {
+                                resubmitted_result(&mut peer, id, request.from_seq).await;
+                            } else {
+                                let tombstone = TerminalRecord::new(
+                                    id,
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::TransferInterrupted,
+                                    },
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .with_ran(Ran::None);
+                                write_frame_async(&mut peer, &Frame::Terminal(tombstone))
+                                    .await
+                                    .unwrap();
+                            }
+                            return;
+                        }
+                        Frame::Heartbeat { .. } => {}
+                        other => panic!("unexpected build-server frame {other:?}"),
+                    }
+                }
+            });
+            Ok(Box::new(client) as Box<dyn Duplex>)
+        })
+    }
+}
+
+/// A committed repository under the scratch directory.
+pub(crate) fn fixture_repo(scratch: &Path) -> PathBuf {
     let repo = scratch.join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
@@ -542,20 +712,21 @@ async fn exhausted_spill_provisioning_returns_retryable_refusal_without_local_ru
             .unwrap()
             .success());
     }
-    let withdrawn = Arc::new(AtomicBool::new(false));
-    let motor = Motor::with_connector(
-        boat.config.clone(),
-        &scratch.join("state"),
-        Arc::new(SpillPeer {
-            withdrawn: withdrawn.clone(),
-            direct: false,
-        }),
-    )
-    .unwrap();
-    let id = Uuid::now_v7();
+    repo
+}
+
+/// Runs a spill-eligible job with the given queue-wait limit in seconds and
+/// returns every record the caller received, up to and including its terminal.
+pub(crate) async fn run_spilled(
+    motor: &Motor,
+    id: Uuid,
+    repo: &Path,
+    wait: u64,
+    limit: Duration,
+) -> Vec<StreamRecord> {
     motor
         .storage
-        .create(id, 1, None, Some("test".into()), false)
+        .create(id, wait, None, Some("test".into()), false)
         .unwrap();
     let path = repo.to_str().unwrap();
     let request = RunRequest::new(path, path, path, "true").with_timeout(30);
@@ -567,47 +738,277 @@ async fn exhausted_spill_provisioning_returns_retryable_refusal_without_local_ru
             id,
             (request, crate::ReturnOptions::default()),
             Vec::new(),
-            (1, true),
+            (wait, true),
             &tx,
             wake,
         )
         .await
     });
-    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+    let records = tokio::time::timeout(limit, async {
+        let mut records = Vec::new();
         loop {
             let record = rx.recv().await.unwrap().unwrap();
-            if let StreamRecord::Terminal(terminal) = record {
-                break terminal;
+            let terminal = matches!(record, StreamRecord::Terminal(_));
+            records.push(record);
+            if terminal {
+                break records;
             }
         }
     })
     .await
     .unwrap();
     task.await.unwrap().unwrap();
-    assert!(withdrawn.load(Ordering::SeqCst));
-    assert_eq!(
-        terminal.outcome,
-        Outcome::RefusedBeforeStart {
-            reason: RefusalReason::Unreachable
+    records
+}
+
+/// The caller saw one job: a single acceptance, output in increasing
+/// sequence, and one terminal under its own job ID with the build server's
+/// exit code.
+pub(crate) fn assert_one_build_server_job(id: Uuid, records: &[StreamRecord]) {
+    let accepted: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            StreamRecord::Accepted(a) => Some(a.job_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(accepted, vec![id], "{records:?}");
+    let seqs: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            StreamRecord::Started(s) => Some(s.seq),
+            StreamRecord::Output(o) => Some(o.seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs, vec![0, 1], "{records:?}");
+    let terminals: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            StreamRecord::Terminal(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].job_id, id);
+    assert_eq!(terminals[0].outcome, Outcome::Exit { code: 7 });
+    assert_eq!(terminals[0].ran, Some(Ran::Remote));
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(_))),
+        "{records:?}"
+    );
+}
+
+/// The build server saw the withdrawn first submission and exactly one
+/// resubmission under a new ID with the job's full queue-wait limit, and the
+/// resubmission was never withdrawn again.
+pub(crate) fn assert_resubmitted_once(id: Uuid, log: &BuildServerLog, wait: u64) -> Uuid {
+    assert_eq!(log.runs.len(), 2, "{:?}", log.runs);
+    assert_eq!(log.runs[0], (id, 0));
+    let (resubmitted, limit) = log.runs[1];
+    assert_ne!(resubmitted, id);
+    assert_eq!(limit, wait, "queue-wait budget restarts at resubmission");
+    assert_eq!(log.withdraws, vec![id], "a resubmission never spills again");
+    resubmitted
+}
+
+fn spill_config(broker_url: &str) -> Config {
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    Config {
+        runner_instance: "test".into(),
+        broker_token_source: crate::BrokerTokenSource::Fake,
+        broker_url: Some(broker_url.into()),
+        spill_to_hosted: true,
+        spill_after_s: 0,
+        ..Config::default()
+    }
+}
+
+fn lease_requests(requests: &crate::hosted::test_http::Requests) -> usize {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/v1/leases")
+        .count()
+}
+
+#[tokio::test]
+async fn spilled_no_capacity_resubmits_to_build_server_as_one_stream() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        // CLOUD answers 503 no_capacity when the tenant's Boat pool or its
+        // hourly start cap is exhausted.
+        if path == "/v1/leases" {
+            (503, serde_json::json!({"error": "no_capacity"}))
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
         }
-    );
-    assert_eq!(terminal.ran, Some(Ran::None));
-    assert_eq!(terminal.retry_after_ms, Some(1_000));
-    assert!(terminal
-        .refusal_detail
-        .as_deref()
-        .is_some_and(|detail| detail.starts_with("hosted_provisioning")));
-    let state = motor.hosted_state(id).unwrap();
-    assert!(state.hosted_no_fallback);
-    assert_eq!(state.hosted_code.as_deref(), Some("hosted_provisioning"));
-    assert_eq!(boat.runs.load(Ordering::SeqCst), 0);
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-no-capacity");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    // One lease request: no_capacity is not retried for a spill, and the
+    // resubmitted job never asks the broker again.
+    assert_eq!(lease_requests(&broker.requests), 1);
+    assert!(!broker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(path, _)| path.ends_with("/reattach") || path.ends_with("/finish")));
+    assert!(motor.hosted_state(id).is_none());
+}
+
+// A provisioning budget that runs out used to refuse the caller; the job had
+// already given up its build-server place, so it now goes back there.
+#[tokio::test]
+async fn spilled_provisioning_budget_resubmits_to_build_server() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (
+                202,
+                serde_json::json!({"status": "provisioning", "retry_after_ms": 5000}),
+            )
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-provisioning-budget");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    // A one-second queue-wait limit leaves the lease one second to provision.
+    let records = run_spilled(&motor, id, &repo, 1, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 1);
+    assert!(lease_requests(&broker.requests) >= 1);
+    assert!(motor.hosted_state(id).is_none());
+}
+
+fn boat_paths(boat: &crate::hosted::boat_tests::Boat) -> Vec<String> {
+    boat.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// The production sequence of the first spills: CLOUD booked a Boat sandbox,
+/// ck-motor rejected the lease's token before connecting, released it (CLOUD
+/// answers job_admitted for a booked Boat job), reattached to a sandbox that
+/// never received the job and reported outcome unknown. A token stating
+/// 512 MiB, below any real Boat size, still fails the client's checks; the job
+/// must now settle the booking as never run and finish on the build server.
+#[tokio::test]
+async fn boat_lease_failing_client_checks_resubmits_instead_of_reattaching() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    boat.mem_mib.store(512, Ordering::SeqCst);
+    boat.strict_attach.store(true, Ordering::SeqCst);
+    let scratch = ScratchDir::new("motor-boat-claims-resubmit");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor =
+        Motor::with_connector(boat.config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
+    let id = Uuid::now_v7();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
+    assert_one_build_server_job(id, &records);
+    let resubmitted = assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    // The hosted path explains itself in the log, and never logs a token
+    // (compact JWTs start with eyJ) or a key.
+    let text = captured.text();
+    eprintln!("{text}");
+    for line in [
+        "hosted lease requested",
+        "hosted lease granted",
+        "provider=boat",
+        "hosted lease claims mismatch",
+        "field=mem_mib",
+        "actual=512",
+        "Boat finish replied",
+        "http_status=200",
+        "spill not placed; resubmitted to build server",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+    assert!(text.contains(&format!("build_server_job_id={resubmitted}")));
+    assert!(!text.contains("eyJ") && !text.contains("ssh-ed25519"));
+    assert_eq!(boat.runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(boat.attaches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let paths = boat_paths(&boat);
     assert_eq!(
-        boat.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(path, _)| path == "/v1/leases")
-            .count(),
-        1
+        paths.iter().filter(|p| p.as_str() == "/v1/leases").count(),
+        1,
+        "{paths:?}"
     );
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.ends_with("/reattach") || p.ends_with("/release")),
+        "{paths:?}"
+    );
+    let finishes: Vec<_> = boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.ends_with("/finish"))
+        .map(|(_, body)| body.clone())
+        .collect();
+    assert_eq!(
+        finishes,
+        vec![serde_json::json!({"outcome": "lost", "run_ms": 0})]
+    );
+}
+
+/// The same Boat lease with the sandbox's measured memory (13444 MiB, the
+/// production large size) is accepted and the job runs on Boat. The caller
+/// sees one acceptance, not a second one from the Boat runner.
+#[tokio::test]
+async fn boat_lease_stating_sandbox_memory_runs_on_boat() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    boat.mem_mib.store(13444, Ordering::SeqCst);
+    boat.strict_attach.store(true, Ordering::SeqCst);
+    let scratch = ScratchDir::new("motor-boat-sandbox-memory");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor =
+        Motor::with_connector(boat.config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
+    let accepted = records
+        .iter()
+        .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+        .count();
+    assert_eq!(accepted, 1, "{records:?}");
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.job_id == id && t.outcome == Outcome::Exit { code: 23 }),
+        "{records:?}"
+    );
+    assert_eq!(log.lock().unwrap().runs, vec![(id, 0)]);
+    assert_eq!(boat.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

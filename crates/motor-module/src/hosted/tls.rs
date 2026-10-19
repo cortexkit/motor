@@ -74,19 +74,30 @@ pub(super) fn claims(
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).map_err(|_| Error::Auth)?)
             .map_err(|_| Error::Auth)?;
     let jwk = motor_lease::RequesterJwk::from_key(&key.verifying_key());
-    if lease.job_id != id.to_string()
-        || claims.jti != lease.job_id
-        || claims.placement != lease.placement
-        || claims.purpose != purpose
-        || claims.max_s != lease.max_s
-        || claims.iss != motor_lease::ISSUER
-        || claims.aud != lease.placement.host
-        || claims.iat > now_s().saturating_add(60)
-        || claims.exp <= now_s()
-        || lease.token_expires_at_ms != claims.exp.saturating_mul(1000)
-        || lease.token_expires_at_ms <= now_s().saturating_mul(1000)
-        || motor_lease::bind_requester(&claims, &jwk).is_err()
-    {
+    let now = now_s();
+    // Name the first failed binding so a refused lease is diagnosable from the
+    // log. Every value logged here is public lease metadata, never the token.
+    let failed = [
+        ("job_id", lease.job_id != id.to_string()),
+        ("jti", claims.jti != lease.job_id),
+        ("placement", claims.placement != lease.placement),
+        ("purpose", claims.purpose != purpose),
+        ("max_s", claims.max_s != lease.max_s),
+        ("iss", claims.iss != motor_lease::ISSUER),
+        ("aud", claims.aud != lease.placement.host),
+        ("iat", claims.iat > now.saturating_add(60)),
+        ("exp", claims.exp <= now),
+        (
+            "token_expires_at_ms",
+            lease.token_expires_at_ms != claims.exp.saturating_mul(1000)
+                || lease.token_expires_at_ms <= now.saturating_mul(1000),
+        ),
+        ("cnf", motor_lease::bind_requester(&claims, &jwk).is_err()),
+    ]
+    .into_iter()
+    .find_map(|(field, failed)| failed.then_some(field));
+    if let Some(field) = failed {
+        tracing::info!(job_id = %id, field, "hosted lease claims mismatch");
         return Err(Error::Auth);
     }
     Ok(claims)

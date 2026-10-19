@@ -23,10 +23,11 @@ impl Client {
             return Ok(false);
         };
         if state.finish_done
-            || state
-                .placement
-                .as_ref()
-                .is_none_or(|p| !p.host.starts_with("boat:"))
+            || state.pending_finish.is_none()
+                && state
+                    .placement
+                    .as_ref()
+                    .is_none_or(|p| !p.host.starts_with("boat:"))
                 && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
         {
             return Ok(state.hosted_code.as_deref() == Some("hosted_sandbox_lost"));
@@ -82,6 +83,25 @@ impl Client {
         tracing::warn!(job_id = %id, "Boat finish remains pending");
         Ok(false)
     }
+    /// Settle a booked job that never received a Run frame, so the broker
+    /// stops holding its sandbox. CLOUD's finish contract has no outcome that
+    /// says "never ran"; `lost` with zero run time is the closest it accepts.
+    /// The body is stored first, so a restart retries it like any pending finish.
+    pub(crate) async fn finish_never_ran(
+        &self,
+        id: Uuid,
+        storage: &Storage,
+    ) -> std::io::Result<()> {
+        storage.hosted_update(id, |state| {
+            if !state.finish_done && state.pending_finish.is_none() {
+                state.pending_finish = Some(Finish {
+                    outcome: "lost".into(),
+                    run_ms: 0,
+                });
+            }
+        })?;
+        self.finish(id, None, storage).await.map(|_| ())
+    }
     async fn finish_once(&self, id: Uuid, body: &Finish) -> Result<Reply, Error> {
         let reply = self
             .http
@@ -95,6 +115,8 @@ impl Client {
             .await
             .map_err(|_| Error::Broker)?;
         let status = reply.status().as_u16();
+        tracing::info!(job_id = %id, outcome = %body.outcome, run_ms = body.run_ms,
+            http_status = status, "Boat finish replied");
         if matches!(status, 400 | 404 | 409) {
             tracing::warn!(job_id = %id, http_status = status, "Boat finish refused without retry");
             if status == 409

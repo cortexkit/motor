@@ -142,7 +142,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 }
 
 mod account;
-mod harness;
+pub(crate) mod harness;
 use harness::*;
 use motor_protocol::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
