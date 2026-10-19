@@ -41,6 +41,14 @@ A tenant runner is root inside its VM, so it runs its privileged helpers
 (setfacl, chown, chmod, systemctl, systemd-run and the network tools) directly
 with sudo's reset environment instead of through `sudo -n`, and skips the sudo
 grant inventory. `serve` refuses `--tenant-vm` when not running as root.
+At startup the runner grants the job and cache accounts read access to the
+shared Cargo registry/git, rustup and Cargo tool trees, but first walks each
+tree without writing. A tree whose every entry is already readable (no
+extended ACL with group and other read, or a named-user ACL entry for the
+account; plus, for registry/git, a matching default ACL on every directory)
+is left untouched. The tenant image ships its toolchain root-owned and
+world-readable for this reason: rewriting its ACLs on the RAM overlay copies
+the whole toolchain into memory and does not finish within the attach budget.
 
 `motor-runner tenant-agent` runs as root and serves port 54, also restricted
 to the host CID. It handles `attach_tenant`, `post_restore`, `cancel`, `drain`,

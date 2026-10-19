@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -18,6 +19,12 @@ NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files
 UNREACHABLE_RESOLVER = "1.1.1.1"
 FAST_S = 3.0
 READY_S = 10.0
+# Longer than the host's own attach deadline, so a slow attach is reported
+# with the measured readiness time rather than a missing marker.
+ATTACH_WAIT_S = 90.0
+TOOL_ROOTS = (Path("/usr/local/lib/motor/rustup"), Path("/usr/local/lib/motor/cargo"))
+TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
+SAMPLE_BYTES = 32 * 1024 * 1024
 
 
 def nameservers(text):
@@ -68,12 +75,82 @@ def name_service_probe():
     start = int(subprocess.run(["systemctl", "show", "-P", "ExecMainStartTimestampMonotonic",
                                 "motor-tenant-runner.service"], stdout=subprocess.PIPE, text=True,
                                check=True).stdout.strip() or 0)
-    ready = runner_ready_seconds(start, Path("/run/motor-tenant-generation").stat().st_mtime,
+    marker = Path("/run/motor-tenant-generation")
+    deadline = time.monotonic() + ATTACH_WAIT_S
+    while not marker.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"attach did not complete within {ATTACH_WAIT_S:.0f} s of this probe")
+        time.sleep(.1)
+    ready = runner_ready_seconds(start, marker.stat().st_mtime,
                                  time.clock_gettime(time.CLOCK_REALTIME), time.monotonic())
     print(f"tenant runner start to attach completion: {ready:.3f} s", flush=True)
     if not 0 <= ready < READY_S:
         raise RuntimeError(f"tenant runner took {ready:.3f} s to become ready")
     print(NAME_SERVICE, flush=True)
+
+
+def tree_inventory(root):
+    """Entries, regular-file bytes and entries not plainly world-readable."""
+    entries, size, closed = 0, 0, []
+    for path in [root, *(Path(d, n) for d, ds, fs in os.walk(root) for n in ds + fs)]:
+        metadata = path.lstat()
+        entries += 1
+        if stat.S_ISLNK(metadata.st_mode):
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            size += metadata.st_size
+        needed = 0o055 if stat.S_ISDIR(metadata.st_mode) else 0o044
+        has_acl = "system.posix_acl_access" in os.listxattr(path, follow_symlinks=False)
+        if metadata.st_uid or metadata.st_gid or metadata.st_mode & needed != needed or has_acl:
+            closed.append(str(path))
+    return entries, size, closed
+
+
+def upper_bytes():
+    usage = os.statvfs("/overlay")
+    return (usage.f_blocks - usage.f_bfree) * usage.f_frsize
+
+
+def tool_tree_probe():
+    # Runner startup must not have written to the image toolchain: any such
+    # write appears as a copied-up path in the RAM overlay's upper directory.
+    copied = [str(path) for path in (Path("/overlay/upper") / root.relative_to("/") for root in TOOL_ROOTS)
+              if path.exists()]
+    measurement = dict(copied_up_at_start=copied, overlay_upper_bytes=upper_bytes())
+    metacopy = Path("/sys/module/overlay/parameters/metacopy")
+    measurement["overlay_metacopy"] = metacopy.read_text().strip() if metacopy.exists() else None
+    closed = []
+    for root in TOOL_ROOTS:
+        start = time.monotonic()
+        entries, size, unreadable = tree_inventory(root)
+        measurement[str(root)] = dict(entries=entries, file_bytes=size, not_world_readable=len(unreadable),
+                                      stat_walk_s=round(time.monotonic() - start, 3))
+        closed += unreadable[:5]
+    # Time an ACL grant over a bounded sample of the toolchain's files, the
+    # same operation the runner used to apply to the whole tree on each start.
+    sample, sample_bytes = [], 0
+    for directory, _, files in os.walk(TOOL_ROOTS[0]):
+        for name in files:
+            path = Path(directory, name)
+            if path.is_symlink() or sample_bytes >= SAMPLE_BYTES:
+                continue
+            sample.append(str(path))
+            sample_bytes += path.lstat().st_size
+    before = upper_bytes()
+    start = time.monotonic()
+    subprocess.run(["setfacl", "-P", "-m", "u:motor-job:rX", "--", *sample], check=True)
+    elapsed = time.monotonic() - start
+    total = measurement[str(TOOL_ROOTS[0])]
+    measurement["sample_setfacl"] = dict(
+        files=len(sample), file_bytes=sample_bytes, elapsed_s=round(elapsed, 3),
+        overlay_upper_growth_bytes=upper_bytes() - before,
+        whole_tree_estimate_s=round(elapsed * total["file_bytes"] / max(sample_bytes, 1), 1))
+    print("GUEST_TOOL_TREE_MEASUREMENT " + json.dumps(measurement, sort_keys=True), flush=True)
+    if copied:
+        raise RuntimeError(f"runner startup copied image tool trees into the overlay: {copied}")
+    if closed:
+        raise RuntimeError(f"image tool entries are not plainly world-readable: {closed}")
+    print(TOOL_TREES, flush=True)
 
 
 def runner_diagnostics():
@@ -196,6 +273,7 @@ def main():
         time.sleep(.1)
     run("/usr/local/libexec/hosted_image_check.py", "--tenant")
     name_service_probe()
+    tool_tree_probe()
     root = Path("/tenant/qualification")
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)

@@ -2,6 +2,7 @@
 """Runs inside the disposable chroot, using only its staged inputs and public downloads."""
 
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,11 @@ GUEST_SERVICES = ("motor-tenant-agent.service", "motor-net-rules.service", "moto
 MODULE_LOAD_DIRS = ("etc/modules-load.d", "run/modules-load.d", "usr/local/lib/modules-load.d",
                     "usr/lib/modules-load.d", "lib/modules-load.d")
 AGENT_VALIDATED_PATHS = (Path("/tenant"), Path("/Users"), Path("/home"), PREFIX / "cargo/bin")
+# Image tools shared by every tenant's jobs. They never change per tenant, so
+# they ship root-owned and readable by every account. The tenant runner then
+# finds them readable and skips its startup ACL grant, which on the VM's RAM
+# overlay would copy the whole toolchain up into memory on every boot.
+TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo")
 
 
 def run(*args, capture=False) -> str:
@@ -165,6 +171,57 @@ def verify_agent_paths(root, owner=0):
     return [str(path) for path in AGENT_VALIDATED_PATHS]
 
 
+def tool_tree_entries(root):
+    """Every path under root, including root, without following symlinks."""
+    yield root
+    for directory, directories, files in os.walk(root):
+        for name in directories + files:
+            yield Path(directory, name)
+
+
+def publish_tool_trees(roots=TOOL_TREES, own=os.lchown):
+    for root in roots:
+        for path in tool_tree_entries(root):
+            metadata = path.lstat()
+            own(path, 0, 0)
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            mode = stat.S_IMODE(metadata.st_mode) & ~0o022
+            searchable = stat.S_ISDIR(metadata.st_mode) or mode & 0o111
+            path.chmod(mode | (0o555 if searchable else 0o444))
+
+
+def has_access_acl(path):
+    try:
+        os.getxattr(path, "system.posix_acl_access", follow_symlinks=False)
+    except OSError as error:
+        if error.errno in (errno.ENODATA, errno.EOPNOTSUPP):
+            return False
+        raise
+    return True
+
+
+def verify_tool_trees(roots=TOOL_TREES, acl=has_access_acl, owner=0, group=0):
+    # Mirrors the runner's startup check: root owner and group, no extended
+    # ACL, group and other may read every file and search every directory.
+    counts = {}
+    for root in roots:
+        count = 0
+        for path in tool_tree_entries(root):
+            metadata = path.lstat()
+            if metadata.st_uid != owner or metadata.st_gid != group:
+                raise ValueError(f"image tool path is not root-owned: {path}: {metadata.st_uid}:{metadata.st_gid}")
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            mode = stat.S_IMODE(metadata.st_mode)
+            needed = 0o055 if stat.S_ISDIR(metadata.st_mode) else 0o044
+            if mode & needed != needed or mode & 0o022 or acl(path):
+                raise ValueError(f"image tool path is not plainly world-readable: {path}: mode {mode:04o}")
+            count += 1
+        counts[str(root)] = count
+    return counts
+
+
 def configure(pins):
     for account in ("motor-job", "motor-cache"):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
@@ -172,6 +229,7 @@ def configure(pins):
     for directory in ("tenant", "Users", "home", "overlay", ".lower", "usr/local/libexec", "etc/nftables.d"):
         Path("/", directory).mkdir(parents=True, exist_ok=True)
     normalize_agent_paths(Path("/"))
+    publish_tool_trees()
     shutil.copy2(BUILD / "motor-runner", "/usr/local/bin/motor-runner")
     Path("/usr/local/bin/motor-runner").chmod(0o755)
     shutil.copy2(BUILD / "guest/motor-init", "/sbin/motor-init")
@@ -239,6 +297,8 @@ def verify(pins):
     inventory["nextest"] = run("cargo", "nextest", "--version", capture=True)
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-tenant-agent.service",
         "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service")
+    # Last, after every tool above has run and could have added files.
+    inventory["world_readable_tool_trees"] = verify_tool_trees()
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
     print(f"guest inventory: {len(pins['packages'])} packages; {len(pins['rust_toolchains'])} Rust toolchains; "

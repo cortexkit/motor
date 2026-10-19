@@ -42,10 +42,11 @@ LIVE = ("hosted image live inventory: 10 checks passed (overlay, read-only lower
 TENANT = "hosted image tenant inventory: 3 checks passed (XFS, FICLONE to /Users and /home)"
 NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files, "
                 "sudo and lookup fast with an unreachable resolver, runner ready within 10 s")
+TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-         "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+         "tool trees", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
          "guest units", "teardown")
 
 
@@ -767,6 +768,7 @@ class Harness:
             self.step("live inventory", lambda: self.expect_console(LIVE))
             self.step("tenant inventory", lambda: self.expect_console(TENANT))
             self.step("name service", lambda: self.expect_console(NAME_SERVICE))
+            self.step("tool trees", lambda: self.expect_console(TOOL_TREES))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,

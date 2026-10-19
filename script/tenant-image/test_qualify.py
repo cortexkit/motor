@@ -202,9 +202,37 @@ class QualificationTests(unittest.TestCase):
     def test_guest_name_service_line_matches_the_host_expectation(self):
         guest = q.module("guest_name_service", q.HERE / "guest/hosted_qualify.py")
         self.assertEqual(guest.NAME_SERVICE, q.NAME_SERVICE)
+        self.assertEqual(guest.TOOL_TREES, q.TOOL_TREES)
+        self.assertLess(q.STEPS.index("name service"), q.STEPS.index("tool trees"))
+        self.assertLess(q.STEPS.index("tool trees"), q.STEPS.index("vsock isolation"))
         self.assertIn("name service", q.STEPS)
         self.assertLess(q.STEPS.index("tenant inventory"), q.STEPS.index("name service"))
         self.assertLess(q.STEPS.index("name service"), q.STEPS.index("vsock isolation"))
+
+    def test_guest_tool_tree_probe_fails_on_copy_up_before_its_own_sample(self):
+        guest = q.module("guest_tool_trees", q.HERE / "guest/hosted_qualify.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "rustup"
+            (root / "lib").mkdir(parents=True)
+            (root / "lib/librustc.so").write_text("library\n")
+            upper = Path(directory) / "upper" / root.relative_to("/")
+            upper.mkdir(parents=True)
+            real_path = guest.Path
+            def path(*parts):
+                if parts == ("/overlay/upper",):
+                    return real_path(directory, "upper")
+                return real_path(*parts)
+            commands = []
+            with mock.patch.object(guest, "TOOL_ROOTS", (root,)), mock.patch.object(guest, "Path", side_effect=path), \
+                    mock.patch.object(guest, "upper_bytes", return_value=0), \
+                    mock.patch.object(guest, "tree_inventory", return_value=(3, 8, [])), \
+                    mock.patch.object(guest.subprocess, "run", side_effect=lambda args, **_: commands.append(args)), \
+                    mock.patch("builtins.print") as printed:
+                with self.assertRaisesRegex(RuntimeError, "copied image tool trees"):
+                    guest.tool_tree_probe()
+            evidence = json.loads(printed.call_args_list[0].args[0].split(" ", 1)[1])
+            self.assertEqual(evidence["copied_up_at_start"], [str(upper)])
+            self.assertEqual(commands[0][:5], ["setfacl", "-P", "-m", "u:motor-job:rX", "--"])
 
     def test_guest_nameserver_parsing_ignores_comments_and_options(self):
         guest = q.module("guest_nameservers", q.HERE / "guest/hosted_qualify.py")

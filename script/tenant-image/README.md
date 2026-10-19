@@ -330,6 +330,16 @@ temporarily in place, `getent ahosts <hostname>` and `sudo -n true` must each
 finish within 3 s. The runner unit's start to the attach completion marker must
 take under 10 s. The step passes only on the exact `NAME_SERVICE` line.
 
+The tool-tree probe then checks that runner startup copied nothing from
+`/usr/local/lib/motor/rustup` or `/usr/local/lib/motor/cargo` into the overlay
+upper directory, and that every entry there is root-owned, world-readable and
+without an extended ACL (the image build verifies the same, recorded as
+`world_readable_tool_trees` in `tools.json`). It prints
+`GUEST_TOOL_TREE_MEASUREMENT` evidence: entry and byte counts, stat-walk time,
+overlay metacopy setting, and a timed `setfacl` over a 32 MiB sample of the
+toolchain, extrapolated by bytes to the whole tree. The step passes only on the
+exact `TOOL_TREES` line.
+
 The harness copies `motor-vm-helper`, `motor-host` and `motor-fake-broker` into
 a fresh root-owned mode-0755 bin directory before invoking them. Its helper config is root-owned mode 0600.
 The legacy job-slot configuration still requires a loader even though this lane

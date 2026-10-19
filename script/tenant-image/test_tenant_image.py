@@ -313,6 +313,36 @@ class ImageTests(unittest.TestCase):
             self.assertIn("StandardOutput=journal+console", unit)
             self.assertIn("StandardError=journal+console", unit)
 
+    def test_tool_trees_are_published_world_readable_and_verified_without_following_links(self):
+        toolchain = self.root / "rustup"
+        (toolchain / "lib").mkdir(parents=True)
+        (toolchain / "lib/librustc.so").write_text("library\n")
+        (toolchain / "rustc").write_text("rustc\n")
+        (toolchain / "rustc").chmod(0o750)
+        (toolchain / "lib/librustc.so").chmod(0o640)
+        (toolchain / "lib").chmod(0o770)
+        outside = self.root / "private"
+        outside.write_text("secret\n")
+        outside.chmod(0o600)
+        (toolchain / "link").symlink_to(outside)
+        # BSD-style systems give new files their directory's group.
+        owner, group = os.getuid(), toolchain.lstat().st_gid
+        with self.assertRaisesRegex(ValueError, "not plainly world-readable"):
+            guest.verify_tool_trees([toolchain], acl=lambda _: False, owner=owner, group=group)
+        own = mock.Mock()
+        guest.publish_tool_trees([toolchain], own=own)
+        self.assertIn(mock.call(toolchain / "link", 0, 0), own.call_args_list)
+        self.assertEqual((toolchain / "rustc").stat().st_mode & 0o7777, 0o755)
+        self.assertEqual((toolchain / "lib/librustc.so").stat().st_mode & 0o7777, 0o644)
+        self.assertEqual((toolchain / "lib").stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(outside.stat().st_mode & 0o7777, 0o600)
+        self.assertEqual(guest.verify_tool_trees([toolchain], acl=lambda _: False, owner=owner, group=group),
+                         {str(toolchain): 4})
+        with self.assertRaisesRegex(ValueError, "not plainly world-readable"):
+            guest.verify_tool_trees([toolchain], acl=lambda path: path.name == "rustc", owner=owner, group=group)
+        with self.assertRaisesRegex(ValueError, "not root-owned"):
+            guest.verify_tool_trees([toolchain], acl=lambda _: False, owner=owner + 1, group=group)
+
     def test_agent_directory_normalization_and_verification_share_all_components(self):
         relatives = ("tenant", "Users", "home", "usr/local/lib/motor/cargo/bin")
         for relative in relatives:

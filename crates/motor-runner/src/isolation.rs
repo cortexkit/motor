@@ -19,6 +19,7 @@ use std::{
 use uuid::Uuid;
 
 mod hosts;
+mod readable;
 
 const USER: &str = "motor-job";
 pub(crate) const WRITER_USER: &str = "motor-cache";
@@ -282,6 +283,15 @@ fn grant_read_only_tree_as(path: &Path, inherit: bool, user: &str) -> io::Result
         )));
     }
     let acl = format!("u:{user}:rX");
+    // Rewriting every ACL is the slow part of runner startup on a large tree,
+    // and on a tenant VM's overlay it copies the whole toolchain into memory.
+    // Skip it when the tree already gives this account read access.
+    if let Some(uid) = account_uid(user)? {
+        if readable::already_readable(path, uid, inherit) {
+            tracing::info!(path = %path.display(), user, inherit, "shared tree already readable; ACL grant skipped");
+            return Ok(());
+        }
+    }
     checked(
         crate::privilege::command("/usr/bin/setfacl")
             .args(["-R", "-P", "-m", &acl, "--"])
