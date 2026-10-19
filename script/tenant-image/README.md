@@ -178,9 +178,21 @@ be stopped, but schedule the snapshot window off peak.
 Build the current checkout's real host/helper/fake-broker binaries and a Linux
 runner **library test executable** first. The test executable is delivered to
 the guest; neither Cargo sources nor a new runner binary are installed over the
-image's runner. Use a target compatible with the image's libc (or a static musl
-build). An incompatible or absent test executable is a **FAIL**, never a skip.
-For a native Linux toolchain compatible with the image:
+image's runner. Build the test executable in the image's own Debian/GNU-libc
+userland with `build-guest-test.py`, rather than assuming the host's glibc is old
+enough. The locked `cortexkit-cow` dependency does not currently compile for
+musl, so a musl test build is not a preparation path. An incompatible or absent
+test executable is a **FAIL**, never a skip.
+
+The preparation tool mounts the original rootfs read-only under a disposable
+host overlay, binds this source checkout and the populated host Cargo registry
+read-only, and compiles offline with the image's Rust/C toolchains. Compiler
+wrappers and inherited environment are cleared. It lists the required test in
+that same chroot to verify the loader/library combination, saves the executable
+and provenance, and unmounts everything before removing the overlay. This is a
+trusted root build environment, not a sandbox for untrusted source. It does not
+run the isolation test there; the exact ignored test still runs inside the real
+VM during qualification. No dependency pin or lockfile change is needed.
 
 ```sh
 BUILD="$PWD/target/tenant-qualification"
@@ -188,15 +200,14 @@ mkdir -p "$BUILD"
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
   cargo build --locked -j4 -p motor-host -p motor-vm-helper -p motor-lease --bins
-env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
-  RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
-  cargo test --locked -j4 -p motor-runner --lib --no-run --message-format=json \
-  > "$BUILD/runner-tests.jsonl"
-TEST_BINARY=$(python3 -c 'import json,sys; a=[v["executable"] for l in open(sys.argv[1]) if (v:=json.loads(l)).get("reason")=="compiler-artifact" and v.get("target",{}).get("name")=="motor_runner" and v.get("executable")]; assert len(a)==1,a; print(a[0])' "$BUILD/runner-tests.jsonl")
+IMAGE=/srv/build/vm/tenant-images/IMAGE_VERSION
+PREP=/srv/build/qualification-prep/UNUSED_PREP_NAME
+sudo python3 script/tenant-image/build-guest-test.py --image "$IMAGE" \
+  --source "$PWD" --cargo-cache "${CARGO_HOME:-$HOME/.cargo}" --output "$PREP" --jobs 4
 # Select two host CPUs excluding any CPUs reserved for Windows jobs.
 sudo python3 script/tenant-image/qualify.py \
-  --image /srv/build/vm/tenant-images/IMAGE_VERSION \
-  --bin-dir "$BUILD/debug" --runner-test-binary "$TEST_BINARY" \
+  --image "$IMAGE" \
+  --bin-dir "$BUILD/debug" --runner-test-binary "$PREP/runner-tests" \
   --cpuset 0-1 --results /srv/build/qualification/UNUSED_RUN_NAME
 ```
 
@@ -210,7 +221,11 @@ different existing unprivileged account with `--host-user` if necessary.
 Budget, **not measured results**: allow 5–15 minutes after builds, approximately
 53 GiB peak incremental disk plus the delivered executable/logs, and about
 17 GiB host RAM. Builds can add 5–20 minutes and their own Cargo scratch. The
-harness requires **224 GiB free on `/srv/build` after builds**: a 170 GiB floor
+chroot preparation requires 232 GiB free (170 GiB floor + 54 GiB qualification
+reserve + an 8 GiB build allowance), without copying the 32 GiB rootfs. Its target
+files, `runner-tests`, `cargo-artifacts.jsonl` and `provenance.json` remain under
+`--output`; remove them only after confirming preparation's cleanup succeeded.
+The qualification requires **224 GiB free on `/srv/build` after builds**: a 170 GiB floor
 plus a 54 GiB allocation allowance. It rechecks the floor plus snapshot bytes
 before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a fully allocated 20 GiB XFS
 disk, a 16 GiB size base and one 16 GiB suspend image. Snapshot `memory.high` is
@@ -260,5 +275,6 @@ Portable harness tests:
 
 ```sh
 python3 -W error script/tenant-image/test_qualify.py
+python3 -W error script/tenant-image/test_build_guest_test.py
 python3 -W error script/tenant-provision/test_provision.py
 ```
