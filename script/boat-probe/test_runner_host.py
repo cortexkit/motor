@@ -30,7 +30,14 @@ class RunnerHostTests(unittest.TestCase):
                 "namespaces": {"net": "net:[2]", "pid": "pid:[1]", "mnt": "mnt:[2]"},
                 "private_shm": True, "shm_writable": True, "nproc": "8",
                 "limits": {"memory.max": "15569256448", "cpu.max": "800000 100000", "pids.max": "4096"},
-                "provider_environment": {"ASCII_TOKEN": False, "BOAT_ID": False, "BOAT_CLI_TOKEN": False}}
+                "provider_environment": {"ASCII_TOKEN": False, "BOAT_ID": False, "BOAT_CLI_TOKEN": False},
+                "status_security": {'NoNewPrivs':'1','CapEff':'0000000000000000','CapBnd':'0000000000000000'},
+                "proc_mountinfo": ['proc /proc rw - proc proc rw,hidepid=invisible,subset=pid'],
+                "process_visibility": {'self_pid':10,'protected_pids':[1,2], 'proc':[{'pid':10,'uid':997,'same_cgroup':True}],
+                    'ps':{'exit_code':0,'rows':[{'pid':10,'uid':997,'comm':'python3'}]},
+                    'runner_signal_probe':{'pid':1,'allowed':False,'errno':1}},
+                "provider_access": {'inherited_names': [], 'files': {'/home/user/.config/ascii/boat/config.json': {'readable':False}},
+                                    'processes': {'1': {'readable':False}}}}
 
     def test_real_job_limit_and_namespace_parser(self):
         job = self.fixture()
@@ -61,6 +68,28 @@ class RunnerHostTests(unittest.TestCase):
         compile(host.HOST, "host", "exec")
         self.assertIn("memory.max", host.JOB)
         self.assertNotEqual(host.PORT, 9443)
+
+    def test_isolation_refusal_is_failure_not_an_empty_stdout_json_parse(self):
+        self.assertEqual(host.isolation_result_checks({'code':200, 'stdout':''}, {}), {'isolation_job_completed':False})
+        with self.assertRaisesRegex(ValueError, 'did not emit JSON evidence'):
+            host.isolation_result_checks({'code':0, 'stdout':''}, {})
+
+    def test_provider_access_requires_actual_checks_and_denies_token_exposure(self):
+        access = self.fixture()['provider_access']
+        self.assertTrue(host.provider_access_denied(access))
+        access['processes']['1']['ascii_token_present'] = True
+        self.assertFalse(host.provider_access_denied(access))
+        self.assertFalse(host.provider_access_denied({'files':{}, 'processes':{}, 'inherited_names':[]}))
+
+    def test_process_visibility_requires_own_cgroup_and_signal_permission_denial(self):
+        job = self.fixture()
+        self.assertTrue(all(host.process_visibility_checks(job).values()))
+        job['process_visibility']['proc'].append({'pid':2,'uid':0,'same_cgroup':False})
+        self.assertFalse(host.process_visibility_checks(job)['proc_only_job_processes'])
+        job['process_visibility']['ps']['rows'].append({'pid':2,'uid':0,'comm':'motor-runner'})
+        self.assertFalse(host.process_visibility_checks(job)['ps_only_job_processes'])
+        job['process_visibility']['runner_signal_probe']['errno'] = 3
+        self.assertFalse(host.process_visibility_checks(job)['cannot_signal_runner'])
 
     def test_failure_diagnostics_capture_each_unit_even_when_status_is_nonzero(self):
         output = io.StringIO()

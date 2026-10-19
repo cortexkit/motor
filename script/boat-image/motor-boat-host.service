@@ -8,8 +8,8 @@ ConditionPathExists=/etc/motor/tenant/id
 User=root
 Group=root
 Environment=HOME=/var/lib/motor-boat/home
-UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN
-ExecStart=/usr/local/bin/motor-host --sandbox /etc/motor/sandbox.json
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --host-exec --sandbox /etc/motor/sandbox.json
 ExecStartPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --wait-host-ready
 Restart=on-failure
 RestartSec=2

@@ -235,12 +235,16 @@ def service_preflight():
         subprocess.run(['/usr/bin/systemctl', 'stop', 'motor-boat.service'], check=False)
 
 
-def configure(pins):
-    target_directories()
+def accounts():
     for account in ("motor-job", "motor-cache"):
         if subprocess.run(["id", "-u", account], capture_output=True).returncode:
             run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
                 "--shell", "/usr/sbin/nologin", account)
+
+
+def configure(pins):
+    target_directories()
+    accounts()
     state(pins)
     config = Path("/etc/ssh/sshd_config").read_text()
     if not re.search(r"(?im)^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf\s*$", config):
@@ -249,7 +253,7 @@ def configure(pins):
         "AllowTcpForwarding local\nPermitTTY no\nAllowAgentForwarding no\nX11Forwarding no\nPermitTunnel no\n")
     run("/usr/sbin/sshd", "-t")
     run("systemctl", "reload", "ssh")
-    for name in ("motor-boat-network", "motor-boat-bridge.py", "motor-boat-start.py"):
+    for name in ("motor-boat-network", "motor-boat-bridge.py", "motor-boat-start.py", "motor-boat-credentials.py"):
         run("install", "-m", "0755", str(HERE / name), "/usr/local/libexec/" + name)
     run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
         "/usr/local/libexec/motor-boat-net.nft")
@@ -313,6 +317,8 @@ def main():
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *pins["packages"])
     target_directories()
+    accounts()
+    run('/usr/bin/python3', str(HERE / 'motor-boat-credentials.py'), '--output', '/srv/build/boat-provider-audit.json')
     # Check the administrative path and firewall transaction before long tool builds.
     run('/usr/bin/python3', str(HERE / 'motor-boat-network'), '--check', '--template', str(ROOT / 'script/runner/motor-net.nft'))
     tools(pins)
@@ -331,7 +337,8 @@ def main():
         "sccache": ["sccache", "--version"], "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
-                     packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases)
+                     packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
+                     provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))
     for key, expected in {"node": "v" + pins["node"], "bun": pins["bun"], "pnpm": pins["pnpm"],
                           "nats": "nats-server: v" + pins["nats"], "sccache": "sccache 0.18.0"}.items():
         if inventory[key] != expected:

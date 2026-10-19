@@ -8,6 +8,6 @@ User=root
 Group=root
 ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-bridge.py
 Restart=on-failure
-UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
 
 # Deliberately not enabled: only the operator probe starts this unauthenticated bridge.

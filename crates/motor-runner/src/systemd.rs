@@ -99,6 +99,68 @@ pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
     Ok(enabled)
 }
 
+pub(crate) fn provider_names(
+    manager: &str,
+    inherited: impl Iterator<Item = String>,
+) -> io::Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::from([
+        "ASCII_TOKEN".to_owned(),
+        "BOAT_ID".to_owned(),
+        "BOAT_CURRENT_ID_FILE".to_owned(),
+    ]);
+    for name in manager
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .chain(inherited)
+    {
+        if name == "ASCII_TOKEN" || name.starts_with("BOAT_") {
+            if !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(io::Error::other(
+                    "invalid provider environment variable name",
+                ));
+            }
+            names.insert(name);
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn provider_environment_names() -> io::Result<Vec<String>> {
+    let result = systemctl(&["show-environment"], false)?;
+    if !result.status.success() {
+        return Err(io::Error::other(
+            "cannot inspect system manager environment names",
+        ));
+    }
+    provider_names(
+        &String::from_utf8_lossy(&result.stdout),
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    )
+}
+
+#[test]
+fn boat_provider_environment_names_include_unknown_prefixes_without_values() {
+    let names = provider_names(
+        "BOAT_FUTURE=never-echo\nOTHER=ignored\nASCII_TOKEN=never-echo",
+        ["BOAT_SHELL".to_owned()].into_iter(),
+    )
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "ASCII_TOKEN",
+            "BOAT_CURRENT_ID_FILE",
+            "BOAT_FUTURE",
+            "BOAT_ID",
+            "BOAT_SHELL"
+        ]
+    );
+}
+
 #[test]
 fn boat_pid_compatibility_is_explicit_and_version_checked() {
     assert!(private_pids_capability("255.4-1ubuntu8.16", false).is_err());

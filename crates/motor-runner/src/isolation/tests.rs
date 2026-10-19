@@ -120,6 +120,7 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
         let command = f
             .command_sandbox()
             .with_boat_profile(boat, private_pids, Some(14 * (1 << 30)))
+            .without_provider_environment(&["BOAT_FUTURE".to_owned()])
             .command("true", &f.workspace, &[], true, &[1, 2], 2)
             .unwrap();
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
@@ -145,6 +146,13 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             .any(|a| a.starts_with("--property=TemporaryFileSystem=/dev/shm:")));
         assert_eq!(args.contains(&"--property=CPUQuota=200%"), boat);
         assert_eq!(args.contains(&"--property=TasksMax=4096"), boat);
+        assert_eq!(args.contains(&"--property=ProcSubset=pid"), boat);
+        assert_eq!(
+            args.contains(
+                &"--property=UnsetEnvironment=ASCII_TOKEN BOAT_CURRENT_ID_FILE BOAT_FUTURE BOAT_ID"
+            ),
+            boat
+        );
     }
 }
 
@@ -299,6 +307,7 @@ impl Fixture {
             private_pids: true,
             boat_profile: false,
             boat_memory_max: None,
+            provider_unset_env: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
             user: USER,
@@ -425,6 +434,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -913,6 +923,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                provider_unset_env: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -964,6 +975,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                provider_unset_env: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1346,6 +1358,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,

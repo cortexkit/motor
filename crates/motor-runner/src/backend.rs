@@ -580,6 +580,7 @@ impl Backend for HostBackend {
                             config.private_pids,
                             config.boat_memory_max_bytes,
                         )
+                        .without_provider_environment(&config.boat_unset_environment)
                 })
                 .and_then(|sandbox| {
                     #[cfg(test)]

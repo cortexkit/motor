@@ -500,5 +500,25 @@ class SSHTests(unittest.TestCase):
         self.assertTrue(measurement.data["local_private_keys_removed"])
 
 
+class JsonStdoutTests(unittest.TestCase):
+    def test_live_failure_keeps_stdout_json_and_never_echoes_exception_values(self):
+        output, errors = io.StringIO(), io.StringIO()
+        def fail(report_stream=None):
+            print('incidental progress')
+            raise ValueError('canary-credential-never-echo')
+        with patch('sys.argv', ['probe.py','--runner-host']), patch.object(probe, 'main', side_effect=fail), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            self.assertEqual(probe.entrypoint(), 1)
+        self.assertEqual(json.loads(output.getvalue())['error_type'], 'ValueError')
+        self.assertIn('incidental progress', errors.getvalue())
+        self.assertNotIn('canary-credential-never-echo', output.getvalue() + errors.getvalue())
+
+    def test_argument_failure_also_has_one_json_report(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch('sys.argv', ['probe.py','--not-a-probe-option']), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            self.assertEqual(probe.entrypoint(), 1)
+        self.assertEqual(json.loads(output.getvalue())['error'], 'invalid probe arguments')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

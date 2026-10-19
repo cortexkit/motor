@@ -145,6 +145,11 @@ pub(crate) fn format_list(cpus: &[u32]) -> String {
 }
 
 impl CpuTopology {
+    pub(crate) fn without_daemon_reservation(mut self) -> Self {
+        self.reserved = 0;
+        self
+    }
+
     /// A VM uses its dedicated CPU set; none of that set is daemon-only.
     pub(crate) fn fixed(cpus: Vec<u32>) -> io::Result<Self> {
         let mut topology = Self::new(vec![cpus])?;

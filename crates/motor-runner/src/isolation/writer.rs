@@ -410,6 +410,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: WRITER_USER,

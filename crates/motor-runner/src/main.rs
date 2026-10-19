@@ -223,6 +223,9 @@ fn configure_options(
             "--tenant-socket-dir" => config.tenant_socket_dir = Some(value.into()),
             "--build-slot-root" => config.build_slot_root = value.into(),
             "--max-weight" => config.max_weight = value.parse().map_err(io::Error::other)?,
+            "--reserve-daemon-core" => {
+                config.reserve_daemon_core = value.parse().map_err(io::Error::other)?
+            }
             "--boat-memory-max-bytes" => {
                 config.boat_memory_max_bytes = Some(value.parse().map_err(io::Error::other)?)
             }
@@ -324,6 +327,18 @@ fn boat_profile_is_an_explicit_linux_host_option() {
         .into_iter(),
     );
     assert_eq!(local.is_ok(), cfg!(target_os = "linux"));
+}
+
+#[test]
+fn daemon_core_reservation_is_disabled_only_by_an_explicit_flag() {
+    let mut config = Config::new("/unused", "boat");
+    assert!(config.reserve_daemon_core);
+    configure_options(
+        &mut config,
+        ["--reserve-daemon-core".into(), "false".into()].into_iter(),
+    )
+    .unwrap();
+    assert!(!config.reserve_daemon_core);
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

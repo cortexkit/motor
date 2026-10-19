@@ -88,6 +88,26 @@ fn small_hosts_keep_every_cpu_allocatable() {
     assert!(!build_server.place(30, std::iter::empty()).contains(&0));
 }
 
+#[test]
+fn explicit_single_job_sandbox_uses_all_eight_vcpus() {
+    for cores in [
+        (0..8).map(|cpu| vec![cpu]).collect(),
+        (0..4).map(|cpu| vec![cpu, cpu + 4]).collect(),
+    ] {
+        let default = CpuTopology::new(cores).unwrap();
+        assert!(default.capacity() < 8);
+        let sandbox = default.without_daemon_reservation();
+        assert_eq!(sandbox.capacity(), 8);
+        for request in 1..=8 {
+            assert_eq!(
+                sandbox.place(request, std::iter::empty()).len(),
+                request as usize
+            );
+        }
+    }
+    assert!(crate::Config::new("/unused", "main").reserve_daemon_core);
+}
+
 fn windows_topology(probe: ActivityProbe) -> CpuTopology {
     let mut topology = CpuTopology::new((0..16).map(|cpu| vec![cpu, cpu + 16]).collect())
         .unwrap()

@@ -52,6 +52,8 @@ pub struct Config {
     pub boat_memory_max_bytes: Option<u64>,
     #[cfg(target_os = "linux")]
     pub(crate) private_pids: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) boat_unset_environment: Vec<String>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.
     pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
@@ -59,6 +61,8 @@ pub struct Config {
     pub build_slot_root: PathBuf,
     pub max_queue_depth: usize,
     pub max_weight: u32,
+    /// Keep the fleet's daemon-only core unless the operator explicitly opts out.
+    pub reserve_daemon_core: bool,
     pub rustc_slots: u32,
     /// Maximum size of the per-instance compiler cache, in GiB.
     pub sccache_size_gib: u64,
@@ -217,12 +221,15 @@ impl Config {
             boat_memory_max_bytes: None,
             #[cfg(target_os = "linux")]
             private_pids: true,
+            #[cfg(target_os = "linux")]
+            boat_unset_environment: Vec::new(),
             tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,
             max_queue_depth: 64,
             max_weight: 28,
+            reserve_daemon_core: true,
             rustc_slots: 24,
             sccache_size_gib: 200,
             #[cfg(target_os = "linux")]
@@ -741,6 +748,11 @@ impl Runner {
             .unwrap_or_else(CpuTopology::read)?;
         #[cfg(not(test))]
         let cpus = CpuTopology::read()?;
+        let cpus = if config.reserve_daemon_core {
+            cpus
+        } else {
+            cpus.without_daemon_reservation()
+        };
         let cpus = if let Some(vm) = &config.windows {
             CpuTopology::fixed(vm.cpu_set.clone())?
         } else {
@@ -760,6 +772,9 @@ impl Runner {
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
             config.private_pids = crate::systemd::job_private_pids(config.boat_profile)?;
+            if config.boat_profile {
+                config.boat_unset_environment = crate::systemd::provider_environment_names()?;
+            }
             crate::isolation::validate_account()?;
             #[cfg(test)]
             if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
@@ -1777,8 +1792,8 @@ impl Runner {
     fn cpu_refusal(&self, claim: u32) -> Option<(RefusalReason, String)> {
         if claim == 0 || claim > self.core.cpus.capacity() {
             Some((RefusalReason::RunnerFull, format!(
-                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; one physical core is reserved for daemon setup)",
-                self.core.cpus.capacity()
+                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; daemon core reservation {})",
+                self.core.cpus.capacity(), if self.core.config.reserve_daemon_core { "enabled" } else { "explicitly disabled" }
             )))
         } else {
             None

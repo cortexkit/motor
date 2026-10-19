@@ -1557,6 +1557,7 @@ pub(crate) struct Sandbox {
     private_pids: bool,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
+    provider_unset_env: Vec<String>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2144,6 +2145,7 @@ impl Sandbox {
             private_pids: true,
             boat_profile: false,
             boat_memory_max: None,
+            provider_unset_env: Vec::new(),
         })
     }
 
@@ -2165,6 +2167,10 @@ impl Sandbox {
         self.boat_profile = enabled;
         self.private_pids = private_pids;
         self.boat_memory_max = if enabled { memory_max } else { None };
+        self
+    }
+    pub(crate) fn without_provider_environment(mut self, names: &[String]) -> Self {
+        self.provider_unset_env = names.to_vec();
         self
     }
 
@@ -2227,6 +2233,15 @@ impl Sandbox {
             cmd.args(tenant_unit_properties());
         }
         if self.boat_profile {
+            cmd.arg("--property=ProcSubset=pid");
+            let names = crate::systemd::provider_names(
+                "",
+                self.provider_unset_env
+                    .iter()
+                    .cloned()
+                    .chain(env.iter().map(|(key, _)| key.clone())),
+            )?;
+            cmd.arg(format!("--property=UnsetEnvironment={}", names.join(" ")));
             cmd.arg("--property=TasksMax=4096");
             cmd.arg("--property=CPUQuotaPeriodSec=100ms");
             cmd.arg(format!(

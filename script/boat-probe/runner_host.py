@@ -1,11 +1,14 @@
 """Real motor jobs in a disposable Boat host; no broker or token endpoint."""
 import contextlib
+import errno
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -13,8 +16,13 @@ from credential_audit import SOURCE
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
+provider_spec = importlib.util.spec_from_file_location('boat_provider_access', ROOT / 'script/boat-image/motor-boat-credentials.py')
+if provider_spec is None or provider_spec.loader is None:
+    raise ImportError('cannot load provider access probe')
+provider = importlib.util.module_from_spec(provider_spec)
+provider_spec.loader.exec_module(provider)
 PORT = 19443
-ENV_NAMES = "import os,json; print(json.dumps({k: k in os.environ for k in ('ASCII_TOKEN','BOAT_ID','BOAT_CLI_TOKEN')}))"
+ENV_NAMES = "import os,json; print(json.dumps({k: True for k in os.environ if k == 'ASCII_TOKEN' or k.startswith('BOAT_')}))"
 POLICY = {"allowtcpforwarding": "local", "permittty": "no", "allowagentforwarding": "no",
           "x11forwarding": "no", "permittunnel": "no"}
 DIAGNOSTICS = r'''
@@ -32,20 +40,45 @@ for unit in ('motor-boat.service','motor-boat-host.service','motor-boat-host.pat
 print(json.dumps(out))
 '''
 
-JOB = r'''
-import json, os, pathlib, pwd, subprocess
+JOB = provider.ACCESS_SOURCE + r'''
+import errno, json, os, pathlib, pwd, subprocess
 cg = pathlib.Path('/sys/fs/cgroup') / pathlib.Path('/proc/self/cgroup').read_text().strip().split('0::',1)[1].lstrip('/')
 shm = pathlib.Path('/dev/shm/boat-host-canary')
 private = not shm.exists()
 probe = pathlib.Path('/dev/shm/job-canary')
 probe.write_text('private')
+membership = pathlib.Path('/proc/self/cgroup').read_text()
+visible = []
+for directory in pathlib.Path('/proc').iterdir():
+    if directory.name.isdecimal():
+        try:
+            status = (directory/'status').read_text()
+            uid = int(next(line.split()[1] for line in status.splitlines() if line.startswith('Uid:')))
+            visible.append({'pid':int(directory.name), 'uid':uid, 'same_cgroup':(directory/'cgroup').read_text() == membership})
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            visible.append({'pid':int(directory.name), 'inspection_error':type(error).__name__})
+ps = subprocess.run(['ps','-eo','pid=,uid=,comm='], capture_output=True, text=True, timeout=10)
+ps_rows = [{'pid':int(parts[0]),'uid':int(parts[1]),'comm':parts[2]} for line in ps.stdout.splitlines() if len(parts := line.split(None,2)) == 3]
+try:
+    os.kill(RUNNER_PID, 0)
+    signal_probe = {'pid':RUNNER_PID, 'allowed':True}
+except OSError as error:
+    signal_probe = {'pid':RUNNER_PID, 'allowed':False, 'errno':error.errno}
 data = {'user': pwd.getpwuid(os.getuid()).pw_name, 'uid': os.getuid(),
         'interfaces': sorted(p.name for p in pathlib.Path('/sys/class/net').iterdir()),
         'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('net','pid','mnt')},
         'private_shm': private, 'shm_writable': probe.read_text() == 'private',
         'nproc': subprocess.check_output(['nproc'], text=True).strip(),
         'cgroup': str(cg), 'limits': {n: (cg/n).read_text().strip() for n in ('memory.max','cpu.max','pids.max')},
-        'provider_environment': {k: k in os.environ for k in ('ASCII_TOKEN','BOAT_ID','BOAT_CLI_TOKEN')}}
+        'provider_environment': {k: True for k in os.environ if k == 'ASCII_TOKEN' or k.startswith('BOAT_')},
+        'provider_access': provider_access(PROVIDER_PATHS, PROVIDER_PIDS)}
+data['process_visibility'] = {'proc':visible, 'ps':{'exit_code':ps.returncode,'rows':ps_rows,'stderr':ps.stderr},
+    'protected_pids':PROTECTED_PIDS, 'runner_signal_probe':signal_probe, 'self_pid':os.getpid()}
+status = pathlib.Path('/proc/self/status').read_text()
+data['status_security'] = {key:next(line.split()[1] for line in status.splitlines() if line.startswith(key+':')) for key in ('NoNewPrivs','CapEff','CapBnd')}
+data['proc_mountinfo'] = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == '/proc']
 print(json.dumps(data))
 '''
 HOST = SOURCE + r'''
@@ -62,6 +95,18 @@ for unit in ('motor-boat', 'motor-boat-bridge', 'motor-boat-host'):
     group = subprocess.check_output(['systemctl','show',unit,'--property=ControlGroup','--value'], text=True).strip()
     path = pathlib.Path('/sys/fs/cgroup') / group.lstrip('/')
     idle[unit] = {'cgroup': group, 'memory.current': (path/'memory.current').read_text().strip()}
+    main_pid = subprocess.check_output(['systemctl','show',unit,'--property=MainPID','--value'], text=True).strip()
+    idle[unit]['main_pid'] = int(main_pid)
+    unit_names = {v.split(b'=',1)[0].decode() for v in pathlib.Path('/proc/'+main_pid+'/environ').read_bytes().split(b'\0') if b'=' in v}
+    idle[unit]['provider_environment_names'] = sorted(k for k in unit_names if k == 'ASCII_TOKEN' or k.startswith('BOAT_'))
+sshd_pids = []
+for path in pathlib.Path('/proc').iterdir():
+    if path.name.isdecimal():
+        try:
+            if (path/'comm').read_text().strip().startswith('sshd'):
+                sshd_pids.append(int(path.name))
+        except OSError:
+            pass
 def endpoint_refusal():
     try:
         hello = json.dumps({'type':'lease_hello','v':1,'token':'not-a-valid-token',
@@ -91,10 +136,13 @@ print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('n
     'sshd': capture(['/usr/sbin/sshd','-T']),
     'systemd_env': capture(['systemd-run','--wait','--pipe','--collect','python3','-c',ENV_NAMES]),
     'runner_unit': capture(['systemctl','show','motor-boat','--property=MainPID','--property=Environment']),
-    'runner_environment': {k: k in names for k in ('ASCII_TOKEN','BOAT_ID','BOAT_CLI_TOKEN')},
+    'runner_environment': {k: True for k in names if k == 'ASCII_TOKEN' or k.startswith('BOAT_')},
     'memory_budget': json.loads(pathlib.Path('/var/lib/motor-boat/budget.json').read_text()),
     'idle_services_memory': idle, 'meminfo_at_idle': pathlib.Path('/proc/meminfo').read_text(),
     'endpoint_refusal': endpoint_refusal(), 'tenant_sockets': tenant_sockets,
+    'runner_pid':int(pid),
+    'sshd_pids':sshd_pids,
+    'provider_sanitization': json.loads(pathlib.Path('/run/motor-boat-credentials.json').read_text()),
     'listeners': capture(['ss','-ltnp']),
     'inventory': json.loads(pathlib.Path('/var/lib/motor-boat/inventory.json').read_text())}))
 '''.replace('ENV_NAMES', repr(ENV_NAMES))
@@ -105,6 +153,16 @@ def job_result(text):
     if type(result.get("code")) is not int or not isinstance(result.get("terminal"), dict):
         raise ValueError("client did not produce a terminal")
     return result
+
+
+def isolation_result_checks(result, host):
+    if result['code'] != 0:
+        return {'isolation_job_completed': False}
+    try:
+        payload = json.loads(result['stdout'])
+    except ValueError as error:
+        raise ValueError('isolation job exited zero but did not emit JSON evidence') from error
+    return isolation_checks(payload, host)
 
 
 def isolation_checks(job, host):
@@ -120,9 +178,35 @@ def isolation_checks(job, host):
         "cpu_limit": len(cpu) == 2 and cpu == ["800000", "100000"] and job['nproc'] == '8',
         "pid_limit": job["limits"]["pids.max"] == "4096",
         "no_provider_job_environment": not any(job["provider_environment"].values()),
+        "no_provider_job_access": provider_access_denied(job['provider_access']),
+        "no_privilege_gain": job['status_security']['NoNewPrivs'] == '1' and int(job['status_security']['CapEff'],16) == 0 and int(job['status_security']['CapBnd'],16) == 0,
+        **process_visibility_checks(job),
         # This explicit Boat profile does not promise a private PID namespace on systemd 255.
         "boat_pid_profile": job["namespaces"]["pid"] == host["namespaces"]["pid"],
     }
+
+
+def process_visibility_checks(job):
+    visibility = job['process_visibility']
+    proc = visibility['proc']
+    ps = visibility['ps']
+    protected = set(visibility['protected_pids'])
+    signal = visibility['runner_signal_probe']
+    return {
+        'proc_only_job_processes': bool(proc) and any(row['pid'] == visibility['self_pid'] for row in proc) and
+            all(row.get('uid') == job['uid'] and row.get('same_cgroup') and row['pid'] not in protected for row in proc),
+        'ps_only_job_processes': ps['exit_code'] == 0 and bool(ps['rows']) and
+            any(row['pid'] == visibility['self_pid'] for row in ps['rows']) and
+            all(row['uid'] == job['uid'] and row['pid'] not in protected for row in ps['rows']),
+        'cannot_signal_runner': signal['pid'] in protected and signal.get('allowed') is False and signal.get('errno') == errno.EPERM,
+        'pid_only_proc_mount': any('subset=pid' in line and ('hidepid=invisible' in line or 'hidepid=2' in line) for line in job['proc_mountinfo']),
+    }
+
+
+def provider_access_denied(access):
+    return bool(access['files']) and bool(access['processes']) and not access['inherited_names'] and all(not row.get('ascii_token_assignment') and
+        (not path.endswith('/.config/ascii/boat/config.json') or not row['readable'])
+        for path,row in access['files'].items()) and all(not row.get('ascii_token_present') for row in access['processes'].values())
 
 
 def policy_checks(host):
@@ -211,9 +295,9 @@ class RunnerHost:
     def phase(self, sid, label, directory, public, repository, client, first_started=None):
         record = {"name": label}
         self.data["phases"].append(record)
+        argv = self.route(sid, directory, public)
         identity = "import os; from pathlib import Path; p=Path('/etc/motor/tenant/id'); p.write_text(" + repr(sid) + "); os.chown(p,0,0); p.chmod(0o444)"
         self.execute(sid, "sudo -n python3 -c " + shlex.quote(identity) + " && sudo -n systemctl restart motor-boat motor-boat-host motor-boat-bridge && sudo -n systemctl start motor-boat-host.path")
-        argv = self.route(sid, directory, public)
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
         listeners = host["listeners"]["stdout"]
@@ -231,27 +315,34 @@ class RunnerHost:
         self.check(label + ".no_account_credentials", host["credential_audit"]["clean"], host["credential_audit"])
         self.check(label + ".systemd_environment_measured", host["systemd_env"]["exit_code"] == 0, host["systemd_env"])
         self.check(label + ".no_provider_runner_environment", not any(host["runner_environment"].values()), host["runner_environment"])
+        self.check(label + '.no_provider_host_environment', not host['idle_services_memory']['motor-boat-host']['provider_environment_names'], host['idle_services_memory']['motor-boat-host'])
+        self.check(label + '.outside_job_cannot_read_provider_tokens', provider_access_denied(host['provider_sanitization']['outside_job_after']), host['provider_sanitization'])
+        self.check(label + '.protected_services_running', bool(host['sshd_pids']) and host['runner_pid'] > 0 and host['idle_services_memory']['motor-boat-host']['main_pid'] > 0, {'runner':host['runner_pid'],'host':host['idle_services_memory']['motor-boat-host']['main_pid'],'sshd':host['sshd_pids']})
+        protected = [host['runner_pid'], host['idle_services_memory']['motor-boat-host']['main_pid'], *host['sshd_pids'], *[p['pid'] for p in host['provider_sanitization']['processes']]]
+        job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
                 for name, command in [("exit", "printf 'boat-round-trip\\n'; exit 23"),
                                       ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
-                                      ("isolation", "python3 -c " + shlex.quote(JOB))]:
+                                      ("isolation", "python3 -c " + shlex.quote(job_script))]:
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
                         raise ValueError("motor client failed: " + json.dumps(result))
                     parsed = job_result(result["stdout"])
                     record[name]["result"] = parsed
-                    if first_started is not None and name == "exit":
+                    if first_started is not None and name == "exit" and parsed['code'] == 23 and 'boat-round-trip' in parsed['stdout']:
                         self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
                     if name == "isolation":
-                        for key, passed in isolation_checks(json.loads(parsed["stdout"]), host).items():
+                        for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
                     else:
                         expected = 23 if name == "exit" else 0
                         marker = "boat-round-trip" if name == "exit" else "boat-hello"
                         self.check(label + "." + name, parsed["code"] == expected and marker in parsed["stdout"], parsed)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
+        if any(check['status'] != 'PASS' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+            raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')
         return record
 
     def run(self):
@@ -265,7 +356,7 @@ class RunnerHost:
     def _run(self):
         from probe import READY, cleanup
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], cwd=ROOT, check=True)
+        subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT, check=True, stdout=sys.stderr)
         build = process(["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_KEY_0", "-u", "GIT_CONFIG_VALUE_0",
                          "cargo", "build", "--locked", "-p", "motor-module", "--example", "boat_probe"], timeout=600)
         self.data["client_build"] = build
@@ -288,7 +379,7 @@ class RunnerHost:
                 raise ValueError("unexpected large sandbox sizing")
             argv = self.route(sid, directory, public)
             bundle = directory / "motor.bundle"
-            subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], cwd=ROOT, check=True)
+            subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], cwd=ROOT, check=True, stdout=sys.stderr)
             sha = hashlib.sha256(bundle.read_bytes()).hexdigest()
             with bundle.open("rb") as stream:
                 sent = subprocess.run(argv + ["cat > /home/user/motor.bundle"], stdin=stream, capture_output=True, timeout=120)
@@ -310,7 +401,7 @@ class RunnerHost:
                 (repository / "Cargo.lock").write_text('version = 4\n[[package]]\nname = "boat-hello"\nversion = "0.1.0"\n')
                 (repository / "src/main.rs").write_text('fn main() { println!("boat-hello"); }\n')
                 for command in (["git", "init", "-q"], ["git", "add", "."], ["git", "-c", "user.name=Boat probe", "-c", "user.email=probe@invalid", "commit", "-qm", "probe input"]):
-                    subprocess.run(command, cwd=repository, check=True)
+                    subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)
                 self.phase(sid, "initial", directory, public, repository, client)
                 audit = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(SOURCE + "\nimport json; print(json.dumps(credential_audit()))"))["stdout"])
                 self.check("snapshot.no_account_credentials", audit["clean"], audit)

@@ -26,6 +26,11 @@ if network_spec is None or network_spec.loader is None:
     raise ImportError('cannot load Boat network preflight')
 network = importlib.util.module_from_spec(network_spec)
 network_spec.loader.exec_module(network)
+credentials_spec = importlib.util.spec_from_file_location('boat_credentials', HERE / 'motor-boat-credentials.py')
+if credentials_spec is None or credentials_spec.loader is None:
+    raise ImportError('cannot load Boat credential hygiene')
+credentials = importlib.util.module_from_spec(credentials_spec)
+credentials_spec.loader.exec_module(credentials)
 
 
 class RecipeTests(unittest.TestCase):
@@ -75,6 +80,7 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("--job-network veth", unit)
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
+        self.assertIn('--reserve-daemon-core false', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
@@ -89,8 +95,37 @@ class RecipeTests(unittest.TestCase):
         unit = (HERE / 'motor-boat-host.service').read_text()
         path = (HERE / 'motor-boat-host.path').read_text()
         self.assertIn('ConditionPathExists=/etc/motor/tenant/id', unit)
-        self.assertIn('motor-host --sandbox /etc/motor/sandbox.json', unit)
+        self.assertIn('motor-boat-start.py --host-exec --sandbox /etc/motor/sandbox.json', unit)
         self.assertIn('PathExists=/etc/motor/tenant/id', path)
+
+    def test_provider_config_and_profiles_are_redacted_then_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / '.config/ascii/boat/config.json'
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({'apiKey':'canary-never-print', 'url':'metadata', 'nested':{'token':None}}))
+            profile = home / '.bashrc'
+            profile.write_text('export ASCII_TOKEN="canary-never-print"\nexport BOAT_CURRENT_ID_FILE=/neutral/path\nexport BOAT_FUTURE="canary-never-print"\nexport PATH=/kept\n')
+            result = credentials.sanitize([str(home)], [profile])
+            self.assertEqual(result['config_before'][0]['key_names'], ['apiKey','nested','nested.token','url'])
+            self.assertEqual(result['config_before'][0]['nonempty_credential_field_names'], ['apiKey'])
+            self.assertNotIn('canary-never-print', json.dumps(result))
+            self.assertFalse(config.exists())
+            self.assertEqual(profile.read_text(), ':\n:\n:\nexport PATH=/kept\n')
+            self.assertEqual(credentials.clean_environment({'ASCII_TOKEN':'secret','BOAT_UNKNOWN':'secret','PATH':'kept'}), {'PATH':'kept'})
+
+    def test_bootstrap_and_host_exec_clear_every_provider_prefix(self):
+        class ExecObserved(Exception):
+            pass
+        def execv(program, args):
+            self.assertEqual(program, '/usr/local/bin/motor-host')
+            self.assertEqual(args, [program, '--sandbox', '/etc/motor/sandbox.json'])
+            self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
+            raise ExecObserved()
+        with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
+             patch.object(sys, 'argv', ['start','--host-exec','--sandbox','/etc/motor/sandbox.json']), patch.object(start.os, 'execv', execv):
+            with self.assertRaises(ExecObserved):
+                start.main()
 
     def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
         calls = []

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 from datetime import datetime, timezone
 import json
 import os
@@ -544,7 +545,7 @@ def interrupt(signum, frame):
     raise KeyboardInterrupt("received signal " + str(signum))
 
 
-def main():
+def main(report_stream=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--key-stdin", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -605,7 +606,7 @@ def main():
         data["finished_at"] = datetime.now(timezone.utc).isoformat()
         checkpoint()
     render(scrub(data, key), args.findings or path.with_suffix(".md"))
-    print(json.dumps(scrub(data, key), indent=2))
+    print(json.dumps(scrub(data, key), indent=2, allow_nan=False), file=report_stream or sys.stdout)
     if args.cleanup:
         return 0 if data.get("cleanup_complete") else 1
     return 0 if (data.get("measurements_complete") and data.get("cleanup_complete") and not data.get("error") and
@@ -613,9 +614,23 @@ def main():
                  data.get("runner_host", {}).get("all_passed", True)) else 1
 
 
-if __name__ == "__main__":
+def entrypoint():
+    output = sys.stdout
+    offline = any(arg in sys.argv for arg in ('--help', '-h', '--render', '--write-template'))
+    redirect = contextlib.nullcontext() if offline else contextlib.redirect_stdout(sys.stderr)
     try:
-        raise SystemExit(main())
-    except (ProbeError, OSError, ValueError) as error:
-        print("boat-probe: " + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        with redirect:
+            return main(report_stream=output)
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
+        failure = {'schema':1, 'error':'invalid probe arguments', 'measurements_complete':False, 'cleanup_complete':False}
+    except (Exception, KeyboardInterrupt) as error:
+        failure = {'schema':1, 'error':'probe failed before producing its report', 'error_type':type(error).__name__,
+                   'measurements_complete':False, 'cleanup_complete':False}
+    print(json.dumps(failure, allow_nan=False), file=output)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())

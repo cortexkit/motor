@@ -65,7 +65,18 @@ visibility boundary is lost: jobs using the same `motor-job` UID can see and
 signal each other's processes. The daemon also inhabits that namespace, but
 **ProtectProc=invisible and its different UID remain in force**; shared namespace
 does not grant permission to signal the daemon or override that `/proc` filter.
-Do not use this profile to mix tenants. Nested Firecracker using the existing
+The Boat job unit sets `ProtectProc=invisible`, `ProcSubset=pid`,
+`User=motor-job`, `Group=motor-job`, `NoNewPrivileges=yes`, an empty
+`CapabilityBoundingSet`, `RestrictNamespaces=yes` and `MountAPIVFS=yes`.
+`ProtectProc` hides other users' process directories; `ProcSubset` hides non-PID
+procfs entries; the UID/capability rules deny signals to root and provider-user
+processes. These are not a replacement PID namespace against another process
+with the same UID. The live job must record only its own UID/cgroup in `/proc`,
+only its own UID in `ps`, the actual proc mount options and zero capabilities,
+and get **EPERM**, not ESRCH, for `kill -0` on the known live runner PID.
+The host records runner, endpoint, sshd and provider-process PIDs as visibility
+negative controls. **Exactly one job may be admitted per sandbox**: these
+controls do not restore a same-UID PID-namespace boundary. Do not mix tenants. Nested Firecracker using the existing
 pinned tenant image is the follow-up for identical server isolation; the
 prerequisite evidence shows KVM API 12 and AMD nested=1/SVM, not a boot or speed
 qualification.
@@ -97,7 +108,10 @@ separately built authenticated endpoint, not a measured claim that their future 
 the **final daemon PID** to own the listening socket before dependents start.
 
 One job may use all measured usable vCPUs; this recipe targets `large` only and
-uses its measured `nproc=8` for weight/slots. The fresh-resource operator pass
+uses its measured `nproc=8` for weight/slots. The unit explicitly sets
+`--reserve-daemon-core false`, so the sandbox's single job may use all eight
+vCPUs; this is not inferred from machine size and the fleet default still reserves
+a daemon core where its existing topology policy applies. The fresh-resource operator pass
 measured MemAvailable **15,492,481,024 B** on large (labels are not a capacity
 promise). Creating xlarge returned HTTP 403 `machine_class_plan_required`,
 requiring Boat's $100/month plan, so no xlarge capacity or behavior was measured. The memory
@@ -183,13 +197,40 @@ capped at 30 minutes; deletion/purge latency is separate.
 
 The audit explicitly checks every passwd account home for Boat's in-sandbox API
 key, classifies `.npmrc` by **key names only**, and records sensitive environment
-names without values. It retains SDK source-file lookalikes separately rather
+names without values. Before tools are built and on every runner start, a root
+hygiene step records only the CLI config's JSON key names and nonempty
+credential-like field names, deletes that config for every account, and replaces
+provider exports in shell profiles with no-op statements (preserving shell
+conditional syntax). No provider CLI config values or provider environment values
+are emitted. The initial
+and per-start redacted reports retain PID/UID/comm/cgroup and provider-variable
+names for PID 1 and processes carrying ASCII_TOKEN, plus actual `motor-job`
+file/proc readability checks outside the job sandbox. The real isolation job
+repeats those access checks inside its sandbox. Empty/missing evidence is not a
+passing access test.
+
+Runner and endpoint exec wrappers clear `ASCII_TOKEN` and every `BOAT_*` key;
+transient job units also unset the provider names discovered from the system
+manager/caller environment before admission. Unknown future `BOAT_*` names are
+covered. Credential absence is checked again after clone and resume.
+[Boat's security documentation](https://docs.boat.dev/security) scopes ASCII_TOKEN only to hosting ports of its own
+sandbox, not to the account or other sandboxes; the process/readability probes
+measure exposure, not independent authorization scope. Config existence alone
+is not proof of a populated API key: the redacted field evidence must establish
+that distinction. The noEnv in-sandbox CLI key is removed regardless.
+
+The audit retains SDK source-file lookalikes separately rather
 than claiming their filenames contain credentials. Documented provider-only
 `ASCII_TOKEN`/`BOAT_ID` are recorded separately; neither may enter a motor job.
 Audit errors/unknown npmrc syntax prevent snapshotting. It is a bounded scan, not
 proof against deliberately hidden arbitrary secrets. SSH and systemd token
 inheritance are measured independently. Cleanup/recovery and accepted-versus-final
 purge reporting are the existing `script/boat-probe/README.md` contract.
+
+Live-mode stdout is one JSON report even on fatal setup/argument failures;
+incidental local command progress goes to stderr. A refused isolation job is a
+failed check with its terminal/refusal reason, not an attempt to parse its empty
+guest stdout, and a refused job is never counted as snapshot-to-first-job timing.
 
 Portable tests run via `python3 scripts/run-script-tests.py`. They validate pins,
 checksum rejection and evidence parsing, **not** live installation or isolation.

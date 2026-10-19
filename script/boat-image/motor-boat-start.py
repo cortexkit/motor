@@ -20,6 +20,12 @@ def budget(available, overhead, margin=MARGIN):
     return result
 
 
+def clear_provider_environment():
+    for name in list(os.environ):
+        if name == 'ASCII_TOKEN' or name.startswith('BOAT_'):
+            del os.environ[name]
+
+
 def owns_listener(pid, path=SOCKET):
     inodes = set()
     for line in Path('/proc/net/unix').read_text().splitlines()[1:]:
@@ -48,6 +54,9 @@ def owns_endpoint(pid):
 
 
 def main():
+    clear_provider_environment()
+    if sys.argv[1:2] == ['--host-exec']:
+        os.execv('/usr/local/bin/motor-host', ['/usr/local/bin/motor-host', *sys.argv[2:]])
     if sys.argv[1:] in (['--wait-ready'], ['--wait-host-ready']):
         host = sys.argv[1] == '--wait-host-ready'
         until = time.monotonic() + 45
