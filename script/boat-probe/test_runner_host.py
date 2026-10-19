@@ -1,5 +1,8 @@
 import json
 import importlib.util
+import contextlib
+import io
+from unittest.mock import patch, Mock
 from pathlib import Path
 import sys
 import unittest
@@ -58,6 +61,19 @@ class RunnerHostTests(unittest.TestCase):
         compile(host.HOST, "host", "exec")
         self.assertIn("memory.max", host.JOB)
         self.assertNotEqual(host.PORT, 9443)
+
+    def test_failure_diagnostics_capture_each_unit_even_when_status_is_nonzero(self):
+        output = io.StringIO()
+        def command(argv, **kwargs):
+            return Mock(returncode=3 if 'status' in argv else 0, stdout='captured '+argv[-1], stderr='')
+        with patch.object(host.subprocess, 'run', command), contextlib.redirect_stdout(output):
+            exec(host.DIAGNOSTICS, {})
+        data = json.loads(output.getvalue())
+        self.assertEqual(set(data), {'motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'})
+        for unit, record in data.items():
+            self.assertEqual(record['status']['exit_code'], 3)
+            self.assertEqual(record['status']['argv'], ['/usr/bin/systemctl','status','--no-pager','-l',unit])
+            self.assertEqual(record['journal']['argv'], ['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])
 
     def test_admission_parser_requires_real_auth_refusal_and_all_private_sockets(self):
         sample = {'endpoint_refusal': {'connected': True, 'frame': {'type':'lease_refused','reason':'auth'}},

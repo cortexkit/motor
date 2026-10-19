@@ -2,7 +2,9 @@
 """Portable recipe integrity tests, not proof of a functioning Boat host."""
 import copy
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -19,6 +21,11 @@ if start_spec is None or start_spec.loader is None:
     raise ImportError("cannot load Boat startup budget helper")
 start = importlib.util.module_from_spec(start_spec)
 start_spec.loader.exec_module(start)
+network_spec = importlib.util.spec_from_loader('boat_network', SourceFileLoader('boat_network', str(HERE / 'motor-boat-network')))
+if network_spec is None or network_spec.loader is None:
+    raise ImportError('cannot load Boat network preflight')
+network = importlib.util.module_from_spec(network_spec)
+network_spec.loader.exec_module(network)
 
 
 class RecipeTests(unittest.TestCase):
@@ -84,6 +91,33 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('ConditionPathExists=/etc/motor/tenant/id', unit)
         self.assertIn('motor-host --sandbox /etc/motor/sandbox.json', unit)
         self.assertIn('PathExists=/etc/motor/tenant/id', path)
+
+    def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
+        calls = []
+        def run(*args, **kwargs):
+            calls.append(args)
+            return Mock(stdout='[{"dev":"eth0"}]' if args[0] == network.IP else '')
+        template = install.ROOT / 'script/runner/motor-net.nft'
+        with patch.object(network, 'run', run), patch.object(network.subprocess, 'run', return_value=Mock(returncode=1)), \
+             patch.object(network.Path, 'is_file', return_value=True), \
+             patch.object(sys, 'argv', ['network','--check','--template',str(template)]):
+            network.main()
+        self.assertTrue(all(call[0].startswith('/usr/sbin/') for call in calls))
+        self.assertIn((network.NFT, '--check', '-f', '-'), calls)
+        self.assertTrue(any(call[:2] == (network.UFW, '--dry-run') for call in calls))
+        self.assertFalse(any('-w' in call for call in calls))
+        self.assertFalse(any(call[:2] == (network.NFT, '-f') for call in calls))
+
+    def test_unit_preflight_collects_all_statuses_and_journals_before_stopping(self):
+        failure = install.subprocess.CalledProcessError(1, 'systemctl start')
+        with patch.object(install, 'run', side_effect=failure), patch.object(install.subprocess, 'run') as collect:
+            with self.assertRaises(install.subprocess.CalledProcessError):
+                install.service_preflight()
+        calls = [call.args[0] for call in collect.call_args_list]
+        for unit in ('motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'):
+            self.assertIn(['/usr/bin/systemctl','status','--no-pager','-l',unit], calls)
+            self.assertIn(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'], calls)
+        self.assertEqual(calls[-1], ['/usr/bin/systemctl','stop','motor-boat.service'])
 
     def test_memory_budget_subtracts_measured_idle_and_margin(self):
         self.assertEqual(start.budget(16*(1<<30), 1<<30), 15569256448)

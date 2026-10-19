@@ -17,6 +17,20 @@ PORT = 19443
 ENV_NAMES = "import os,json; print(json.dumps({k: k in os.environ for k in ('ASCII_TOKEN','BOAT_ID','BOAT_CLI_TOKEN')}))"
 POLICY = {"allowtcpforwarding": "local", "permittty": "no", "allowagentforwarding": "no",
           "x11forwarding": "no", "permittunnel": "no"}
+DIAGNOSTICS = r'''
+import json, subprocess
+out = {}
+def command(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        return {'argv':argv, 'exit_code':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {'argv':argv, 'error':str(error)}
+for unit in ('motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'):
+    out[unit] = {'status':command(['/usr/bin/systemctl','status','--no-pager','-l',unit]),
+                 'journal':command(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])}
+print(json.dumps(out))
+'''
 
 JOB = r'''
 import json, os, pathlib, pwd, subprocess
@@ -175,13 +189,17 @@ class RunnerHost:
     def execute(self, sid, command, timeout=120):
         result = self.probe.execute(sid, command, poll_seconds=timeout)
         if result.get("exitCode") != 0 or result.get("stdoutTruncated") or result.get("stderrTruncated"):
+            failure = {'command': command, 'result': result}
+            self.data.setdefault('guest_failures', []).append(failure)
             try:
-                self.data.setdefault('guest_failures', []).append({'command': command, 'result': result,
-                    'journal': self.probe.execute(sid, 'sudo -n journalctl -b --no-pager -n 100 -u motor-boat -u motor-boat-host -u motor-boat-bridge', poll_seconds=30)})
-            except Exception:
-                pass
+                diagnostics = self.probe.execute(sid, 'sudo -n python3 -c ' + shlex.quote(DIAGNOSTICS), poll_seconds=100)
+                failure['diagnostic_command'] = diagnostics
+                if diagnostics.get('exitCode') == 0 and not diagnostics.get('stdoutTruncated'):
+                    failure['unit_diagnostics'] = json.loads(diagnostics['stdout'])
+            except Exception as error:
+                failure['diagnostics_error'] = str(error)
             self.probe.checkpoint()
-            raise ValueError("guest command failed or truncated: " + json.dumps(result))
+            raise ValueError("guest command failed or truncated; see runner_host.guest_failures unit_diagnostics: " + json.dumps(result))
         return result
 
     def route(self, sid, directory, public):

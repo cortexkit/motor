@@ -222,6 +222,19 @@ def target_directories():
         '/etc/ssh/sshd_config.d', '/etc/motor', '/etc/motor/tenant')
 
 
+def service_preflight():
+    try:
+        run('/usr/bin/systemctl', 'start', 'motor-boat.service')
+        run('/usr/bin/systemctl', 'is-active', '--quiet', 'motor-boat.service')
+    except subprocess.CalledProcessError:
+        for unit in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-host.path', 'motor-boat-bridge.service'):
+            subprocess.run(['/usr/bin/systemctl', 'status', '--no-pager', '-l', unit], check=False)
+            subprocess.run(['/usr/bin/journalctl', '-u', unit, '-b', '--no-pager', '-n', '200'], check=False)
+        raise
+    finally:
+        subprocess.run(['/usr/bin/systemctl', 'stop', 'motor-boat.service'], check=False)
+
+
 def configure(pins):
     target_directories()
     for account in ("motor-job", "motor-cache"):
@@ -300,12 +313,16 @@ def main():
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *pins["packages"])
     target_directories()
+    # Check the administrative path and firewall transaction before long tool builds.
+    run('/usr/bin/python3', str(HERE / 'motor-boat-network'), '--check', '--template', str(ROOT / 'script/runner/motor-net.nft'))
     tools(pins)
     os.chdir(ROOT)
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
     for binary in ('motor-runner', 'motor-host'):
         run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)
     configure(pins)
+    # Starting motor-boat.service checks its configured flags and socket readiness without a job.
+    service_preflight()
     inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],
         "node": ["node", "--version"], "bun": ["bun", "--version"],

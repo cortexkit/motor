@@ -11,7 +11,7 @@ RuntimeDirectoryMode=0700
 Environment=HOME=/var/lib/motor-boat/home
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup
-Environment=PATH=/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=TMPDIR=/var/lib/motor-boat/tmp
 UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN
 ExecStartPre=+/usr/local/libexec/motor-boat-network

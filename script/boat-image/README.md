@@ -136,6 +136,23 @@ ordinary runner Unix socket. Its unit is installed but never enabled; only the
 probe starts it, stops it before snapshot, and restarts it explicitly on the
 disposable clone. Never expose it as a production endpoint.
 
+## Fast startup checks and failure evidence
+
+Before long tool builds, the installer dry-runs the network helper: it requires
+absolute `/usr/sbin/ip`, `nft`, `sysctl` and `ufw` paths, validates the nft transaction
+and checks UFW route syntax without applying rules or sysctl writes. The root
+service PATH also includes administrative directories. After installation,
+`systemd-analyze verify` checks the units and an actual start/stop of the runner
+unit exercises its exact flags, mounted state, root account validation, memory
+budget and all required socket listeners without exposing a job connection.
+The endpoint still waits for the probe/broker identity file.
+
+Any failed guest command records `systemctl status --no-pager -l` and 200 boot
+journal lines separately for every runner, host, host-path and bridge unit under
+`runner_host.guest_failures[].unit_diagnostics`; collection errors and raw command
+results are retained rather than silently discarded. The recipe's startup
+preflight prints the same per-unit evidence before stopping a failed service.
+
 ## Operator probe
 
 From the operator's Mac, use the same stdin credential reader as `boat-probe`:
