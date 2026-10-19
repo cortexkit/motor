@@ -15,7 +15,7 @@ function Assert-Refused([scriptblock]$Check, [string]$Reason) {
 }
 Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion)"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
-foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1')) {
+foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1')) {
     Test-SpikeLogic "parse-$relative" {
         $tokens = $null; $errors = $null
         [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $repo $relative), [ref]$tokens, [ref]$errors)
@@ -57,6 +57,30 @@ Test-SpikeLogic 'host-files-denies-local-unc-and-agent-secret' {
     }
 }
 . "$PSScriptRoot/common.ps1"
+. "$PSScriptRoot/boot-files.ps1"
+Test-SpikeLogic 'bcdboot-arguments-bind-source-and-explicit-esp-with-verbose-output' {
+    $arguments = @(Get-SpikeBcdBootArguments 'F:\Windows' 'E')
+    Assert-Logic (($arguments -join '|') -eq 'F:\Windows|/s|E:|/f|UEFI|/v')
+    $arguments = @(Get-SpikeBcdBootArguments 'F:\Windows' 'G' -Offline)
+    Assert-Logic (($arguments -join '|') -eq 'F:\Windows|/s|G:|/f|UEFI|/v|/offline')
+}
+function New-EspPartition { return @{ DiskNumber=2; PartitionNumber=1; GptType='{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'; DriveLetter='E' } }
+function New-EspVolume { return @{ FileSystem='FAT32'; DriveLetter='E' } }
+Test-SpikeLogic 'esp-requires-fat32-not-an-assumed-format-request' {
+    Assert-SpikeEspState (New-EspPartition) (New-EspVolume) 2
+    $v = New-EspVolume; $v.FileSystem = 'NTFS'
+    Assert-Refused { Assert-SpikeEspState (New-EspPartition) $v 2 } 'esp-fat32'
+}
+Test-SpikeLogic 'esp-requires-matching-live-letter-and-disk-identity' {
+    $p = New-EspPartition; $p.DriveLetter = ''
+    Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-mounted-letter'
+    $p = New-EspPartition; $p.DriveLetter = 'F'
+    Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-mounted-letter'
+    $p = New-EspPartition; $p.DiskNumber = 0
+    Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-partition-identity'
+    $p = New-EspPartition; $p.GptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+    Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-partition-identity'
+}
 Test-SpikeLogic 'pass-fail-helper-never-passes-false' { Assert-Refused { Assert-Spike $false 'sentinel' 'fixture' } 'FAIL sentinel' }
 Test-SpikeLogic 'unix-time-is-milliseconds' {
     $now = Get-SpikeUnixMs

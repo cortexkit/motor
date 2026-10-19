@@ -16,6 +16,7 @@ param(
     [int]$TimeoutMinutes = 180
 )
 . "$PSScriptRoot\common.ps1"
+. "$PSScriptRoot\boot-files.ps1"
 $Root = [IO.Path]::GetFullPath($Root)
 $ServerIso = (Resolve-Path -LiteralPath $ServerIso).Path
 $name = 'motor-hv-provision'
@@ -74,8 +75,7 @@ try {
     $os = "$($windows.DriveLetter):\"
     New-Item (Join-Path $os 'Windows\Panther') -ItemType Directory -Force | Out-Null
     Copy-Item (Join-Path $seed 'autounattend.xml') (Join-Path $os 'Windows\Panther\unattend.xml')
-    & bcdboot.exe (Join-Path $os 'Windows') /s "$($efi.DriveLetter):" /f UEFI | Out-Host
-    Assert-Spike ($LASTEXITCODE -eq 0) 'uefi-boot-files' "$($efi.DriveLetter):"
+    Install-SpikeBootFiles $virtualDisk.Number $efi.PartitionNumber (Join-Path $os 'Windows') $Root
     Dismount-VHD -Path $disk
     $diskMounted = $false
     if ($mountedIso) { Dismount-DiskImage -ImagePath $ServerIso; $mountedIso = $false }
