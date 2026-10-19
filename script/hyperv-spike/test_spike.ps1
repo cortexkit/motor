@@ -15,7 +15,7 @@ function Assert-Refused([scriptblock]$Check, [string]$Reason) {
 }
 Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion)"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
-foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1')) {
+foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
     Test-SpikeLogic "parse-$relative" {
         $tokens = $null; $errors = $null
         [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $repo $relative), [ref]$tokens, [ref]$errors)
@@ -80,6 +80,52 @@ Test-SpikeLogic 'esp-requires-matching-live-letter-and-disk-identity' {
     Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-partition-identity'
     $p = New-EspPartition; $p.GptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
     Assert-Refused { Assert-SpikeEspState $p (New-EspVolume) 2 } 'esp-partition-identity'
+}
+$ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'script/windows-vm/install-powershell.ps1'), [ref]$tokens, [ref]$errors)
+foreach ($name in @('Get-MotorNativeExitHex','Invoke-MotorPowerShellProbe','Assert-MotorPowerShellProbe')) {
+    $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+Test-SpikeLogic 'native-exit-hex-preserves-coreclr-and-loader-status' {
+    Assert-Logic ((Get-MotorNativeExitHex -2146233082) -ceq '0x80131506')
+    Assert-Logic ((Get-MotorNativeExitHex -1073741515) -ceq '0xC0000135')
+    Assert-Logic ((Get-MotorNativeExitHex -1) -ceq '0xFFFFFFFF')
+    Assert-Logic ((Get-MotorNativeExitHex 0) -ceq '0x00000000')
+}
+Test-SpikeLogic 'powershell-version-requires-success-exact-output-and-no-timeout' {
+    $p = @{ timedOut=$false; exitCode=0; exitHex='0x00000000'; stdout="7.6.7`r`n"; stderr='' }
+    Assert-MotorPowerShellProbe $p '7.6.7'
+    $p.stdout = ''
+    Assert-Refused { Assert-MotorPowerShellProbe $p '7.6.7' } 'Unexpected PowerShell version'
+    $p.stdout = '7.6.6'
+    Assert-Refused { Assert-MotorPowerShellProbe $p '7.6.7' } 'Unexpected PowerShell version'
+    $p.stdout = '7.6.7'; $p.exitCode = -2146233082; $p.exitHex = '0x80131506'
+    Assert-Refused { Assert-MotorPowerShellProbe $p '7.6.7' } '0x80131506'
+    $p.timedOut = $true
+    Assert-Refused { Assert-MotorPowerShellProbe $p '7.6.7' } 'timed out'
+}
+Test-SpikeLogic 'powershell-probe-captures-native-stdout-stderr-and-nonzero-exit' {
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('motor-pwsh-test-' + [Guid]::NewGuid().ToString('N'))
+    New-Item $scratch -ItemType Directory | Out-Null
+    try {
+        $executable = (Get-Process -Id $PID).Path
+        $p = Invoke-MotorPowerShellProbe $executable '$PSVersionTable.PSVersion.ToString()' $scratch
+        Assert-MotorPowerShellProbe $p $PSVersionTable.PSVersion.ToString()
+        $p = Invoke-MotorPowerShellProbe $executable '[Console]::Out.Write("fixture output"); [Console]::Error.Write("fixture error"); exit 23' $scratch
+        Assert-Logic ($p.exitCode -eq 23 -and $p.exitHex -ceq '0x00000017')
+        Assert-Logic ($p.stdout -ceq 'fixture output' -and $p.stderr -ceq 'fixture error')
+        Assert-Logic ((Get-Content (Join-Path $scratch 'pwsh-probe.stderr.log') -Raw) -ceq 'fixture error')
+        Assert-Logic ((Get-Content (Join-Path $scratch 'pwsh-probe.json') -Raw | ConvertFrom-Json).exitCode -eq 23)
+    } finally { Remove-Item $scratch -Recurse -Force }
+}
+Test-SpikeLogic 'powershell-probe-timeout-kills-and-records-child' {
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('motor-pwsh-timeout-' + [Guid]::NewGuid().ToString('N'))
+    New-Item $scratch -ItemType Directory | Out-Null
+    try {
+        $p = Invoke-MotorPowerShellProbe (Get-Process -Id $PID).Path 'Start-Sleep -Seconds 10' $scratch 100
+        Assert-Logic $p.timedOut
+        Assert-Refused { Assert-MotorPowerShellProbe $p '7.6.7' } 'timed out'
+    } finally { Remove-Item $scratch -Recurse -Force }
 }
 Test-SpikeLogic 'pass-fail-helper-never-passes-false' { Assert-Refused { Assert-Spike $false 'sentinel' 'fixture' } 'FAIL sentinel' }
 Test-SpikeLogic 'unix-time-is-milliseconds' {

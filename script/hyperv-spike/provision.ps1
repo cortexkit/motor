@@ -94,7 +94,7 @@ try {
     Use-SpikeWindowsDisk $disk {
         param($volume)
         $provision = Join-Path $volume 'build\provision'
-        foreach ($file in @('bootstrap.log','finalize.log','FAILED.txt','provisioned','finalized','winagent.sha256')) {
+        foreach ($file in @('bootstrap.log','finalize.log','FAILED.txt','provisioned','finalized','winagent.sha256','pwsh-probe.json','pwsh-probe.stdout.log','pwsh-probe.stderr.log','pwsh-host-trace.log','pwsh-startup-diagnostics.log')) {
             if (Test-Path (Join-Path $provision $file)) { Copy-Item (Join-Path $provision $file) $logs }
         }
         foreach ($file in @('bootstrap.log','finalize.log')) {

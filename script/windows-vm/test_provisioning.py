@@ -201,7 +201,8 @@ class BaselineInputsTests(unittest.TestCase):
                          "C:\\Program Files\\PowerShell\\7", "Get-FileHash", "Expand-Archive",
                          "/inheritance:r", "*S-1-5-32-545:(OI)(CI)RX", "/reset /T /C /L /Q",
                          "GetAccessRules", "PowerShell ACL inheritance reset failed",
-                         "-NoProfile -Command '$PSVersionTable.PSVersion.ToString()'"):
+                         "'$PSVersionTable.PSVersion.ToString()'", "Assert-MotorPowerShellProbe $probe '7.6.7'",
+                         "RedirectStandardError = $true", "-NonInteractive -EncodedCommand"):
             self.assertIn(expected, source)
         self.assertIn('& "$PSScriptRoot\\install-powershell.ps1"', (HERE / "setup-job-baseline.ps1").read_text())
         self.assertIn('PowerShell-7.6.7-win-x64.zip', (HERE / "bootstrap.ps1").read_text())
