@@ -14,17 +14,20 @@ import time
 
 from reach import tcp_probe
 
-RESTRICTION = 'restrict,port-forwarding,permitopen="127.0.0.1:9443"'
+RESTRICTION = 'restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false"'
+OTHER_PORT = 9444
 
 AUTHORIZED_KEYS = r'''
-import json, os, pathlib, shlex, sys
+import base64, json, os, pathlib, shlex, sys
 public, mode, restriction = sys.argv[1:]
 kind, blob = public.split()[:2]
 path = pathlib.Path.home() / '.ssh/authorized_keys'
-lines = path.read_text().splitlines()
+lines = path.read_bytes().splitlines(keepends=True)
+def body(line):
+    return line.removesuffix(b'\n').removesuffix(b'\r').decode()
 def ours(line):
     try:
-        fields = shlex.split(line)
+        fields = shlex.split(body(line))
         index = fields.index(kind)
         return fields[index + 1] == blob
     except (ValueError, IndexError):
@@ -33,18 +36,23 @@ before = [line for line in lines if ours(line)]
 if mode == 'restrict':
     if not before:
         raise RuntimeError('tested public key is absent from authorized_keys')
-    replacement = restriction + ' ' + public
-    lines = [line for line in lines if not ours(line)] + [replacement]
+    replacement = (restriction + ' ' + public + '\n').encode()
+    lines = [line for line in lines if not ours(line)]
+    if lines and not lines[-1].endswith((b'\n', b'\r')):
+        lines[-1] += b'\n'
+    lines.append(replacement)
     temporary = path.with_name('authorized_keys.boat-probe')
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as stream:
-        stream.write('\n'.join(lines) + '\n')
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(b''.join(lines))
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
     path.chmod(0o600)
 after = [line for line in lines if ours(line)]
-print(json.dumps({'before': before, 'after': after, 'matching_keys': len(after)}))
+print(json.dumps({'before': [body(line) for line in before], 'after': [body(line) for line in after],
+                  'raw_after': [base64.b64encode(line).decode('ascii') for line in after],
+                  'matching_keys': len(after)}))
 '''
 
 
@@ -110,18 +118,24 @@ def authenticated(result):
 def refused(result, marker):
     code = result.get("exit_code")
     channel_refused = any(text in result.get("stderr", "") for text in
-                          ("exec request failed", "shell request failed", "administratively prohibited"))
+                          ("exec request failed", "shell request failed", "PTY allocation request failed",
+                           "administratively prohibited"))
     return (authenticated(result) and code not in {None, 0} and (code != 255 or channel_refused) and
             marker not in result.get("stdout", ""))
 
 
-def forward(argv, certificate, directory):
+def remote_forward_refused(result):
+    return (authenticated(result) and result.get("exit_code") not in {None, 0} and
+            "remote port forwarding failed" in result.get("stderr", ""))
+
+
+def forward(argv, certificate, directory, remote_port=9443):
     """Forward without a session; the base argv ends with the SSH destination."""
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
     command = argv[:-1] + ["-o", "ExitOnForwardFailure=yes", "-N", "-L",
-                            f"127.0.0.1:{port}:127.0.0.1:9443", argv[-1]]
+                            f"127.0.0.1:{port}:127.0.0.1:{remote_port}", argv[-1]]
     start = time.monotonic()
     result = {"argv": command, "local_port": port, "attempts": []}
     child = None
@@ -162,6 +176,97 @@ def forward(argv, certificate, directory):
     return result
 
 
+def blocked_forward(argv, certificate, directory, remote_port):
+    """Ask for a disallowed direct-tcpip destination and require sshd's refusal."""
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    command = argv[:-1] + ["-o", "ExitOnForwardFailure=yes", "-N", "-L",
+                           f"127.0.0.1:{port}:127.0.0.1:{remote_port}", argv[-1]]
+    start = time.monotonic()
+    result = {"argv": command, "local_port": port, "remote_port": remote_port, "attempts": []}
+    child = None
+    log = directory / "blocked-forward.stderr"
+    environment = {k: v for k, v in os.environ.items() if k != "BOAT_API_KEY"}
+    try:
+        with log.open("w") as stream:
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=stream, env=environment)
+            until = time.monotonic() + 8
+            while time.monotonic() < until and child.poll() is None:
+                attempt = tcp_probe("127.0.0.1", port, certificate, timeout=2)
+                result["attempts"].append(attempt)
+                if attempt.get("verified_echo"):
+                    result["verified_echo"] = True
+                    break
+                log_text = log.read_text()
+                if "administratively prohibited" in log_text:
+                    result["server_refused"] = True
+                    break
+                time.sleep(0.2)
+    except OSError as error:
+        result["error"] = str(error)
+    finally:
+        if child:
+            child.terminate()
+            reaped = False
+            try:
+                child.wait(timeout=5)
+                reaped = True
+            except subprocess.TimeoutExpired:
+                child.kill()
+                try:
+                    child.wait(timeout=5)
+                    reaped = True
+                except subprocess.TimeoutExpired:
+                    result["reap_error"] = "SSH did not exit after SIGKILL"
+            result["tunnel_process_reaped"] = reaped
+        result["stderr"] = log.read_text() if log.exists() else ""
+        result["authenticated_publickey"] = authenticated(result)
+        result["server_refused"] = (result.get("server_refused") is True or
+                                    "administratively prohibited" in result["stderr"])
+        result["seconds"] = time.monotonic() - start
+    return result
+
+
+def remote_forward(argv, directory):
+    """Request a remote listener; a refused request exits, an accepted one stays alive."""
+    command = argv[:-1] + ["-o", "ExitOnForwardFailure=yes", "-N", "-R",
+                           "127.0.0.1:0:127.0.0.1:9443", argv[-1]]
+    start = time.monotonic()
+    result = {"argv": command}
+    log = directory / "remote-forward.stderr"
+    environment = {k: v for k, v in os.environ.items() if k != "BOAT_API_KEY"}
+    child = None
+    try:
+        with log.open("w") as stream:
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=stream, env=environment)
+            until = time.monotonic() + 8
+            while time.monotonic() < until and child.poll() is None:
+                time.sleep(0.1)
+            if child.poll() is None:
+                result["no_refusal_before_timeout"] = True
+                child.terminate()
+            child.wait(timeout=5)
+            result["exit_code"] = child.returncode
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result["error"] = str(error)
+        if child and child.poll() is None:
+            child.kill()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                result["reap_error"] = "SSH did not exit after SIGKILL"
+    finally:
+        result["stderr"] = log.read_text() if log.exists() else ""
+        result["authenticated_publickey"] = authenticated(result)
+        result["refused"] = remote_forward_refused(result)
+        result["tunnel_process_reaped"] = child is None or child.poll() is not None
+        result["seconds"] = time.monotonic() - start
+    return result
+
+
 class SSHReach:
     def __init__(self, runner):
         self.runner = runner
@@ -192,9 +297,13 @@ class SSHReach:
             raise RuntimeError("authorized_keys command failed: " + json.dumps(result))
         return json.loads(result["stdout"])
 
-    def connection(self, argv, name, refuse=False, shell=False):
+    def connection(self, argv, name, refuse=False, shell=False, pty=False):
         command = "printf '%s\\n' " + shlex.quote(self.marker)
-        result = process(argv if shell else argv + [command], input_text=command + "\nexit\n" if shell else None)
+        shell_argv = argv[:-1] + (["-tt"] if pty else []) + [argv[-1]] if shell else argv + [command]
+        if shell:
+            midpoint = len(self.marker) // 2
+            command = "printf '%s%s\\n' " + shlex.quote(self.marker[:midpoint]) + " " + shlex.quote(self.marker[midpoint:])
+        result = process(shell_argv, input_text=command + "\nexit\n" if shell else None)
         result["authenticated_publickey"] = authenticated(result)
         passed = refused(result, self.marker) if refuse else result.get("exit_code") == 0 and self.marker in result.get("stdout", "")
         self.check(name, passed, result)
@@ -213,21 +322,53 @@ class SSHReach:
         self.data["phases"].append(phase)
         self.check(label + ".ipv4_endpoint", route["family"] == 4, route)
         argv = ssh_argv(route, private, known, sid)
-        phase["command"] = self.connection(argv, label + (".command_refused" if restricted else ".command"), refuse=restricted)
+        phase["command"] = self.connection(argv, label + (".exec_refused" if restricted else ".command"), refuse=restricted)
         if restricted:
-            phase["shell"] = self.connection(argv, label + ".shell_refused", refuse=True, shell=True)
+            phase["shell_without_pty"] = self.connection(argv, label + ".shell_without_pty_refused", refuse=True, shell=True)
+            phase["shell_with_pty"] = self.connection(argv, label + ".shell_with_pty_refused", refuse=True,
+                                                       shell=True, pty=True)
         listener = self.runner.guest(sid, "listener-loopback")
         phase["listener"] = listener
         self.check(label + ".loopback_listener", listener.get("ready") is True and
                    listener.get("listening_addresses") == ["127.0.0.1:9443"], listener)
         if listener.get("ready"):
             phase["forward"] = forward(argv, listener["certificate_pem"], directory)
-            self.check(label + ".tls_over_direct_tcpip", phase["forward"].get("verified_echo") is True, phase["forward"])
+            self.check(label + ".tls_over_permitted_forward", phase["forward"].get("verified_echo") is True, phase["forward"])
             self.check(label + ".tunnel_reaped", phase["forward"].get("tunnel_process_reaped") is True,
                        {"tunnel_process_reaped": phase["forward"].get("tunnel_process_reaped"),
                         "reap_error": phase["forward"].get("reap_error")})
+            if restricted:
+                other = self.runner.guest(sid, "listener-loopback", port=OTHER_PORT)
+                phase["other_destination_listener"] = other
+                self.check(label + ".other_destination_listener",
+                           other.get("ready") is True and other.get("listening_addresses") == [f"127.0.0.1:{OTHER_PORT}"],
+                           other)
+                if other.get("ready"):
+                    phase["other_destination_forward"] = blocked_forward(
+                        argv, other["certificate_pem"], directory, OTHER_PORT)
+                    self.check(label + ".other_destination_forward_refused",
+                               phase["other_destination_forward"].get("server_refused") is True and
+                               phase["other_destination_forward"].get("verified_echo") is not True,
+                               phase["other_destination_forward"])
+                    self.check(label + ".other_destination_tunnel_reaped",
+                               phase["other_destination_forward"].get("tunnel_process_reaped") is True,
+                               phase["other_destination_forward"])
+                else:
+                    self.check(label + ".other_destination_forward_refused", False,
+                               {"error": "other-destination listener is not ready"})
+                phase["remote_forward"] = remote_forward(argv, directory)
+                self.check(label + ".remote_forward_refused",
+                           phase["remote_forward"].get("refused") is True, phase["remote_forward"])
+                self.check(label + ".remote_forward_tunnel_reaped",
+                           phase["remote_forward"].get("tunnel_process_reaped") is True,
+                           phase["remote_forward"])
         else:
-            self.check(label + ".tls_over_direct_tcpip", False, {"error": "loopback listener not ready"})
+            self.check(label + ".tls_over_permitted_forward", False, {"error": "loopback listener not ready"})
+            if restricted:
+                self.check(label + ".other_destination_forward_refused", False,
+                           {"error": "permitted loopback listener not ready"})
+                self.check(label + ".remote_forward_refused", False,
+                           {"error": "permitted loopback listener not ready"})
         return phase
 
     def resume(self, sid, label):
@@ -280,13 +421,16 @@ class SSHReach:
                         "machine_ip_changed": initial.get("machineIp") != refreshed.get("machineIp")})
             restricted = self.key_lines(sid, public, "restrict")
             expected_line = RESTRICTION + " " + public
+            expected_raw_line = base64.b64encode((expected_line + "\n").encode()).decode("ascii")
             self.check("restriction_written", restricted.get("after") == [expected_line], restricted)
+            self.check("restriction_written_byte_exact", restricted.get("raw_after") == [expected_raw_line], restricted)
             self.phase(sid, "restricted", reauthorized, private, directory, restricted=True)
             self.resume(sid, "restricted_resume")
             # Reauthorizing the tested key here could remove its options and invalidate the survival test.
             after = self.authorize(sid, witness_public)
             lines = self.key_lines(sid, public)
             self.check("restriction_survived_resume", lines.get("after") == [expected_line], lines)
+            self.check("restriction_survived_resume_byte_exact", lines.get("raw_after") == [expected_raw_line], lines)
             self.check("restricted_resume_metadata_compared", True,
                        {"host_key_changed": reauthorized["hostKey"] != after["hostKey"],
                         "ssh_endpoint_changed": reauthorized.get("sshEndpoint") != after.get("sshEndpoint"),
