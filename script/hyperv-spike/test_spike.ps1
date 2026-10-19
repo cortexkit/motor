@@ -57,6 +57,14 @@ Test-SpikeLogic 'host-files-denies-local-unc-and-agent-secret' {
     }
 }
 . "$PSScriptRoot/common.ps1"
+Test-SpikeLogic 'smart-app-control-enforcement-refuses-unsigned-spike-before-build' {
+    Assert-Refused { Assert-SpikeSmartAppControl { 1 } } 'Smart App Control is enforcing; unsigned spike binaries will be blocked'
+    Assert-SpikeSmartAppControl { 0 }
+    Assert-SpikeSmartAppControl { 2 }
+    Assert-SpikeSmartAppControl { $null }
+    Assert-Refused { Assert-SpikeSmartAppControl { 99 } } 'Unknown Smart App Control state'
+    Assert-Refused { Assert-SpikeSmartAppControl { throw 'registry unreadable' } } 'could not read policy'
+}
 . "$PSScriptRoot/boot-files.ps1"
 . "$PSScriptRoot/diagnostics.ps1"
 Test-SpikeLogic 'native-argument-quoting-keeps-quotes-spaces-and-trailing-slashes' {

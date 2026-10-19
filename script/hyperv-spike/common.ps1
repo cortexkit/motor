@@ -8,11 +8,35 @@ function Assert-Spike($Condition, [string]$Name, $Evidence) {
     Write-Host "PASS $Name $Evidence"
 }
 
+function Assert-SpikeSmartAppControl([scriptblock]$ReadState = {
+    $path = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $policy = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+    $value = $policy.PSObject.Properties['VerifiedAndReputablePolicyState']
+    if ($null -eq $value) { return $null }
+    return [int]$value.Value
+}) {
+    try { $state = & $ReadState }
+    catch { throw "FAIL Smart App Control preflight could not read policy: $_" }
+    if ($null -eq $state) {
+        Write-Host 'EVIDENCE Smart App Control state not present; other application-control policies are not assessed'
+        return
+    }
+    if ($state -eq 1) {
+        throw 'FAIL Smart App Control is enforcing; unsigned spike binaries will be blocked. Host policy is an operator decision; no setting was changed.'
+    }
+    if ($state -notin @(0,2)) { throw "FAIL Unknown Smart App Control state: $state" }
+    # Evaluation can become enforcement later. This is a read-only check, not
+    # permission to bypass Smart App Control or any other application policy.
+    Assert-Spike $true 'smart-app-control-not-enforcing' "VerifiedAndReputablePolicyState=$state (0=off, 2=evaluation)"
+}
+
 function Enter-Spike([string]$Root) {
     Assert-Spike ([Environment]::OSVersion.Platform -eq 'Win32NT') 'windows-host' $PSVersionTable.PSVersion
     Assert-Spike ($Root -match '^C:\\motor-spike\\hyperv(?:-[A-Za-z0-9-]+)?$') 'dedicated-spike-root' $Root
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Assert-Spike $admin 'elevated-host' ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    Assert-SpikeSmartAppControl
     Import-Module Hyper-V
     Assert-Spike ((Get-Service vmms).Status -eq 'Running') 'hyperv-service' (Get-Service vmms).Status
     Assert-Spike ((Get-CimInstance Win32_ComputerSystem).HypervisorPresent) 'hypervisor-present' (Get-CimInstance Win32_OperatingSystem).Caption
