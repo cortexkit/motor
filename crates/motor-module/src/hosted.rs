@@ -131,6 +131,17 @@ pub(crate) enum Error {
     AccountPermanent,
     AccountInvalid,
 }
+const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
+const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
+fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
+    ms.clamp(MIN_PROVISIONING_RETRY_MS, MAX_PROVISIONING_RETRY_MS)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningReply {
+    status: String,
+    retry_after_ms: u64,
+}
 impl Error {
     pub(crate) fn code(self) -> &'static str {
         match self {
@@ -256,6 +267,17 @@ fn keyed_hash_input(salt: &[u8; 32], input: &str) -> String {
     motor_lease::base64url(&mac.finalize().into_bytes())
 }
 
+fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
+    // Local permit waiting has already spent part of the job's queue-wait allowance.
+    let waited_ms = job
+        .hosted
+        .as_ref()
+        .and_then(|state| state.spill_wait_ms)
+        .unwrap_or(0);
+    job.queue_wait_limit_s
+        .saturating_mul(1000)
+        .saturating_sub(waited_ms)
+}
 fn lease_body(
     id: Uuid,
     request: &RunRequest,
@@ -347,6 +369,14 @@ impl Client {
         if matches!(reply.status().as_u16(), 401 | 403) {
             return Err(Error::Auth);
         }
+        if reply.status().as_u16() == 202 && path == "/v1/leases" {
+            let provisioning: ProvisioningReply = reply.json().await.map_err(|_| Error::Broker)?;
+            return if provisioning.status == "provisioning" {
+                Err(Error::Provisioning(provisioning.retry_after_ms))
+            } else {
+                Err(Error::Broker)
+            };
+        }
         if !reply.status().is_success() {
             let status = reply.status().as_u16();
             let code = reply.json::<serde_json::Value>().await.ok();
@@ -364,12 +394,6 @@ impl Client {
                     Some("budget_exhausted") => Error::Budget,
                     Some("platform_unsupported") => Error::Platform,
                     Some("sandbox_lost") if status == 409 => Error::SandboxLost,
-                    Some("provisioning") => Error::Provisioning(
-                        code.as_ref()
-                            .and_then(|v| v.get("retry_after_ms"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1000),
-                    ),
                     Some("job_conflict" | "bad_request") => Error::Rejected,
                     other if status == 409 => {
                         let broker_code = other
@@ -436,12 +460,11 @@ impl Client {
         request: &RunRequest,
         storage: &Arc<Storage>,
     ) -> Result<(Channel, Lease), Error> {
+        let job = storage.job(id).ok_or(Error::Broker)?;
+        let provisioning_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(spill_wait_budget_ms(&job));
         let salt = storage.hosted_salt().map_err(|_| Error::Auth)?;
-        let mut body = match storage
-            .job(id)
-            .and_then(|j| j.hosted)
-            .and_then(|s| s.lease_request)
-        {
+        let mut body = match job.hosted.and_then(|state| state.lease_request) {
             Some(request) => request,
             None => lease_body(
                 id,
@@ -468,14 +491,22 @@ impl Client {
                 return Err(Error::Connect);
             }
             if let Some(iat) = state.retry_iat {
-                wait_after_iat(iat).await;
+                if tokio::time::timeout_at(provisioning_deadline, wait_after_iat(iat))
+                    .await
+                    .is_err()
+                {
+                    return Err(Error::Provisioning(MIN_PROVISIONING_RETRY_MS));
+                }
             }
             let attempt = state.placement_attempts;
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
             // means no HTTP request was sent to create a reservation for it.
-            let bearer = self.bearer().await?;
+            let bearer = match tokio::time::timeout_at(provisioning_deadline, self.bearer()).await {
+                Ok(result) => result?,
+                Err(_) => return Err(Error::Provisioning(MIN_PROVISIONING_RETRY_MS)),
+            };
             // Even if the lease response is lost, the broker may have issued a
             // token. Wait past its possible issue second before requesting another:
             // the host accepts a replacement run token only with a greater iat.
@@ -487,7 +518,7 @@ impl Client {
                 })
                 .map_err(|_| Error::Broker)?;
             let lease: Lease = match self
-                .post_ready_authorized("/v1/leases", &body, bearer)
+                .post_ready_authorized("/v1/leases", &body, bearer, provisioning_deadline)
                 .await
             {
                 Ok(l) => l,
@@ -529,32 +560,35 @@ impl Client {
         path: &str,
         body: &T,
     ) -> Result<R, Error> {
-        self.post_ready_authorized(path, body, self.bearer().await?)
-            .await
+        self.post(path, body).await
     }
     async fn post_ready_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &T,
         mut bearer: String,
+        deadline: tokio::time::Instant,
     ) -> Result<R, Error> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        let mut retry_after_ms = MIN_PROVISIONING_RETRY_MS;
         loop {
-            match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer))
-                .await
-                .unwrap_or(Err(Error::Provisioning(1000)))
+            match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await
             {
-                Err(Error::Provisioning(ms)) => {
-                    let delay = Duration::from_millis(ms.clamp(100, 20_000));
-                    if tokio::time::Instant::now() + delay >= deadline {
-                        return Err(Error::Provisioning(ms));
+                Err(_) => return Err(Error::Provisioning(retry_after_ms)),
+                Ok(Err(Error::Provisioning(ms))) => {
+                    retry_after_ms = bounded_provisioning_retry_ms(ms);
+                    let retry_at =
+                        tokio::time::Instant::now() + Duration::from_millis(retry_after_ms);
+                    if retry_at >= deadline {
+                        tokio::time::sleep_until(deadline).await;
+                        return Err(Error::Provisioning(retry_after_ms));
                     }
-                    tokio::time::sleep(delay).await;
-                    bearer = tokio::time::timeout_at(deadline, self.bearer())
-                        .await
-                        .unwrap_or(Err(Error::Provisioning(ms)))?;
+                    tokio::time::sleep_until(retry_at).await;
+                    bearer = match tokio::time::timeout_at(deadline, self.bearer()).await {
+                        Ok(result) => result?,
+                        Err(_) => return Err(Error::Provisioning(retry_after_ms)),
+                    };
                 }
-                result => return result,
+                Ok(result) => return result,
             }
         }
     }
