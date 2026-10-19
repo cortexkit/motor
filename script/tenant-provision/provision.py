@@ -15,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import traceback
 import uuid
 
 ROOT = Path("/var/lib/motor-vm")
@@ -120,8 +121,8 @@ def trusted(path):
 
 
 class HTTP(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=300)
+    def __init__(self, path, timeout=300):
+        super().__init__("localhost", timeout=timeout)
         self.path = str(path)
 
     def connect(self):
@@ -130,29 +131,47 @@ class HTTP(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
-def api(root, method, path, body=None):
+def api(root, method, path, body=None, record=None, timeout=300):
     SCHEMA.validate(method, path, body)
-    conn = HTTP(root / "api.sock")
+    if record is not None:
+        record("api_request", method=method, path=path, body=body)
+    conn = HTTP(root / "api.sock", timeout=timeout)
     try:
         conn.request(method, path, None if body is None else json.dumps(body), {"Content-Type": "application/json"})
         response = conn.getresponse()
         data = response.read()
+        if record is not None:
+            record("api_response", method=method, path=path, status=response.status, body=data.decode(errors="replace"))
         if response.status not in (200, 204):
             raise RuntimeError(f"Firecracker {path}: {response.status} {data!r}")
+        return json.loads(data) if data else None
     finally:
         conn.close()
 
 
+class AgentNotReady(ConnectionError):
+    """Transport failed before any guest control request was submitted."""
+
+
 def agent(root, request):
     with socket.socket(socket.AF_UNIX) as sock:
-        sock.settimeout(30)
-        sock.connect(str(root / "vsock.sock"))
-        sock.sendall(b"CONNECT 54\n")
-        answer = b""
-        while len(answer) < 128 and not answer.endswith(b"\n"):
-            answer += sock.recv(1) or (_ for _ in ()).throw(EOFError())
+        sock.settimeout(1)
+        try:
+            sock.connect(str(root / "vsock.sock"))
+            sock.sendall(b"CONNECT 54\n")
+            answer = b""
+            while len(answer) < 128 and not answer.endswith(b"\n"):
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise AgentNotReady(f"vsock CONNECT 54 closed before handshake completed: {answer!r}")
+                answer += chunk
+        except AgentNotReady:
+            raise
+        except OSError as error:
+            raise AgentNotReady(f"vsock CONNECT 54: {type(error).__name__}: {error}") from error
         if not answer.startswith(b"OK ") or not answer.endswith(b"\n"):
-            raise RuntimeError("vsock handshake refused")
+            raise RuntimeError(f"vsock handshake refused: {answer!r}")
+        sock.settimeout(30)
         body = json.dumps(request).encode()
         sock.sendall(struct.pack(">I", len(body)) + body)
         def exact(n):
@@ -160,7 +179,7 @@ def agent(root, request):
             while len(data) < n:
                 chunk = sock.recv(n - len(data))
                 if not chunk:
-                    raise EOFError()
+                    raise EOFError(f"guest control reply closed after request submission ({len(data)}/{n} bytes)")
                 data += chunk
             return data
         size, = struct.unpack(">I", exact(4))
@@ -171,6 +190,29 @@ def agent(root, request):
             raise RuntimeError(f"guest refused base preparation: {reply}")
 
 
+def wait_for_base_agent(root, proc, record, timeout=60, probe=agent, clock=time.monotonic, pause=time.sleep):
+    deadline = clock() + timeout
+    attempt = 0
+    while True:
+        status = proc.poll()
+        if status is not None:
+            raise RuntimeError(f"base VMM exited before guest readiness: returncode={status}")
+        attempt += 1
+        try:
+            probe(root, {"op": "prepare_snapshot", "kind": "base"})
+        except AgentNotReady as error:
+            record("agent_not_ready", attempt=attempt, exception_type=type(error).__name__, error=str(error))
+            status = proc.poll()
+            if status is not None:
+                raise RuntimeError(f"base VMM exited during guest readiness: returncode={status}; {error}") from error
+            if clock() >= deadline:
+                raise TimeoutError(f"base agent readiness exceeded {timeout}s while VMM was running; last transport error: {error}") from error
+            pause(.02)
+        else:
+            record("agent_ready", attempt=attempt)
+            return
+
+
 def boot_args(image):
     args = json.loads((image / "manifest.json").read_text())["boot_args"]
     if not isinstance(args, str) or not args.strip() or any(ch in args for ch in "\r\n\0"):
@@ -178,7 +220,76 @@ def boot_args(image):
     return args
 
 
-def build_base(c, image, base, console=None):
+class BootEvidence:
+    """Optional operator artifacts that survive removal of a failed base jail."""
+    def __init__(self, directory):
+        self.directory = directory
+        self.config = {}
+        if directory is not None:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+
+    def record(self, kind, **fields):
+        if self.directory is None:
+            return
+        event = dict(kind=kind, monotonic_s=time.monotonic(), **fields)
+        with (self.directory / "events.jsonl").open("a") as output:
+            output.write(json.dumps(event) + "\n")
+        if kind == "api_request" and fields["method"] == "PUT":
+            self.config[fields["path"]] = fields["body"]
+            (self.directory / "submitted-config.json").write_text(json.dumps(self.config, indent=2) + "\n")
+
+    def cgroup(self, group):
+        if self.directory is None:
+            return
+        values = {}
+        for name in ("memory.events", "memory.current", "memory.peak", "pids.current", "cgroup.events", "cpu.stat", "io.stat"):
+            path = group / name
+            if path.exists():
+                values[name] = path.read_text()
+        self.record("cgroup_before_stop", path=str(group), values=values)
+
+    def preserve(self, state):
+        if self.directory is not None:
+            for name in ("firecracker.log", "metrics.jsonl"):
+                source = state / name
+                if source.exists():
+                    shutil.copyfile(source, self.directory / name)
+
+    def stop(self, proc, group, state, vmm_api, failure):
+        if proc is not None:
+            before = proc.poll()
+            self.record("vmm_before_cleanup", pid=proc.pid, returncode=before,
+                        reason=type(failure).__name__ if failure is not None else "base_snapshot_complete")
+            self.cgroup(group)
+            if self.directory is not None and before is None:
+                for method, path, body in [("GET", "/vm/config", None), ("PUT", "/actions", {"action_type": "FlushMetrics"})]:
+                    try:
+                        reply = vmm_api(method, path, body, timeout=1)
+                        if path == "/vm/config":
+                            (self.directory / "observed-config.json").write_text(json.dumps(reply, indent=2) + "\n")
+                    except Exception as error:
+                        self.record("diagnostic_error", path=path, exception_type=type(error).__name__, error=str(error) or repr(error))
+            current = proc.poll()
+            self.record("vmm_after_diagnostics", pid=proc.pid, returncode=current)
+            if current is None:
+                self.record("host_kill", pid=proc.pid, signal="SIGKILL", reason="base_boot_cleanup")
+                proc.kill()
+            after = proc.wait(timeout=10)
+            self.record("vmm_after_cleanup", pid=proc.pid, returncode=after)
+        self.preserve(state)
+
+
+def base_requests(c, args):
+    return [("/machine-config", {"vcpu_count": c["vcpu_ceiling"], "mem_size_mib": c["guest_ram_mib"], "smt": False}),
+            ("/boot-source", {"kernel_image_path": "/kernel", "boot_args": args}),
+            ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": True, "is_read_only": True}),
+            ("/drives/tenant", {"drive_id": "tenant", "path_on_host": "/tenant.img", "is_root_device": False, "is_read_only": False}),
+            ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "base0", "guest_mac": "06:00:ac:10:00:02"}),
+            ("/vsock", {"guest_cid": 3, "uds_path": "/vsock.sock"}),
+            ("/actions", {"action_type": "InstanceStart"})]
+
+
+def build_base(c, image, base, console=None, diagnostics=None):
     """Kernel boot happens only here, with an unmounted placeholder /dev/vdb."""
     args_from_manifest = boot_args(image)
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -194,6 +305,11 @@ def build_base(c, image, base, console=None):
     parent_group = Path("/sys/fs/cgroup/motor-tenant-provision")
     group = parent_group / identifier
     namespace_created = False
+    evidence = BootEvidence(diagnostics)
+    stderr = None
+    failure = None
+    def vmm_api(method, path, body=None, timeout=300):
+        return api(root, method, path, body, record=evidence.record, timeout=timeout)
     try:
         os.chown(root, uid, uid)
         parent_group.mkdir(exist_ok=True)
@@ -209,6 +325,12 @@ def build_base(c, image, base, console=None):
         run("fallocate", "-l", 512 * 1048576, placeholder)
         os.chown(placeholder, uid, uid)
         os.chown(state, uid, uid)
+        if diagnostics is not None:
+            for name in ("firecracker.log", "metrics.jsonl"):
+                path = state / name
+                path.touch(mode=0o600)
+                os.chown(path, uid, uid)
+            stderr = (diagnostics / "vmm-stderr.log").open("ab", buffering=0)
         for source, name, readonly, directory in [(image / "vmlinux", "kernel", True, False), (image / "rootfs", "rootfs.ext4", True, False),
                                                    (placeholder, "tenant.img", False, False), (state, "state", False, True)]:
             target = root / name
@@ -223,41 +345,32 @@ def build_base(c, image, base, console=None):
                 "--cgroup", f"memory.max={(c['guest_ram_mib'] + c['memory_headroom_mib']) * 1048576}",
                 "--cgroup", f"pids.max={c['vcpu_ceiling'] + 64}", "--cgroup", f"io.weight=default {c['io_weight']}",
                 "--", "--api-sock", "/api.sock"]
+        evidence.record("jailer_launch", argv=[str(a) for a in args])
         proc = subprocess.Popen([str(a) for a in args], stdin=subprocess.DEVNULL,
                                 stdout=console if console is not None else subprocess.DEVNULL,
-                                stderr=console if console is not None else None)
+                                stderr=stderr if stderr is not None else (console if console is not None else None))
         deadline = time.monotonic() + 10
         while True:
             try:
-                api(root, "GET", "/version")
+                vmm_api("GET", "/version", timeout=1)
                 break
-            except OSError:
+            except OSError as error:
+                evidence.record("api_not_ready", exception_type=type(error).__name__, error=str(error) or repr(error))
                 if proc.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("base Firecracker did not become ready")
+                    raise RuntimeError(f"base Firecracker API not ready: returncode={proc.poll()}; {type(error).__name__}: {error}") from error
                 time.sleep(.02)
-        for path, body in [("/machine-config", {"vcpu_count": c["vcpu_ceiling"], "mem_size_mib": c["guest_ram_mib"], "smt": False}),
-                           ("/boot-source", {"kernel_image_path": "/kernel", "boot_args": args_from_manifest}),
-                           ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": True, "is_read_only": True}),
-                           ("/drives/tenant", {"drive_id": "tenant", "path_on_host": "/tenant.img", "is_root_device": False, "is_read_only": False}),
-                           ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "base0", "guest_mac": "06:00:ac:10:00:02"}),
-                           ("/vsock", {"guest_cid": 3, "uds_path": "/vsock.sock"}),
-                           ("/actions", {"action_type": "InstanceStart"})]:
-            api(root, "PUT", path, body)
-        deadline = time.monotonic() + 60
-        while True:
-            try:
-                agent(root, {"op": "prepare_snapshot", "kind": "base"})
-                break
-            except OSError:
-                if proc.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("base guest agent did not become ready")
-                time.sleep(.02)
-        api(root, "PATCH", "/vm", {"state": "Paused"})
+        if diagnostics is not None:
+            vmm_api("PUT", "/logger", {"log_path": "/state/firecracker.log", "level": "Debug", "show_level": True, "show_log_origin": True})
+            vmm_api("PUT", "/metrics", {"metrics_path": "/state/metrics.jsonl"})
+        for path, body in base_requests(c, args_from_manifest):
+            vmm_api("PUT", path, body)
+        wait_for_base_agent(root, proc, evidence.record)
+        vmm_api("PATCH", "/vm", {"state": "Paused"})
         high = group / "memory.high"
         old = high.read_text()
         high.write_text(str(min(c["snapshot_memory_high_mib"], c["guest_ram_mib"]) * 1048576))
         try:
-            api(root, "PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.memory", "sync_snapshot_files": False})
+            vmm_api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": "/state/base.vmstate", "mem_file_path": "/state/base.memory", "sync_snapshot_files": False})
         finally:
             high.write_text(old)
         for name in ("base.vmstate", "base.memory"):
@@ -266,17 +379,39 @@ def build_base(c, image, base, console=None):
             os.chown(state / name, 0, 0)
             (state / name).chmod(0o444)
         sync_dir(state)
+    except BaseException as error:
+        failure = error
+        evidence.record("base_boot_failure", exception_type=type(error).__name__, error=str(error) or repr(error), traceback=traceback.format_exc())
+        raise
     finally:
-        if proc is not None:
-            proc.kill()
-            proc.wait(timeout=10)
+        cleanup_errors = []
+        def cleanup(label, action):
+            try:
+                action()
+                return True
+            except Exception as error:
+                cleanup_errors.append(f"{label}: {type(error).__name__}: {str(error) or repr(error)}")
+                return False
+        cleanup("diagnostics and VMM stop", lambda: evidence.stop(proc, group, state, vmm_api, failure))
+        # A diagnostic write failure must not leave the VMM alive or prevent
+        # independent unmount and namespace cleanup attempts.
+        if proc is not None and proc.poll() is None:
+            cleanup("fallback VMM kill", proc.kill)
+            cleanup("fallback VMM wait", lambda: proc.wait(timeout=10))
+        if stderr is not None:
+            cleanup("stderr close", stderr.close)
+        unmounted = True
         for target in reversed(mounts):
-            run("umount", target)
+            unmounted = cleanup(f"unmount {target}", lambda target=target: run("umount", target)) and unmounted
         if group.exists():
-            group.rmdir()
+            cleanup("cgroup removal", group.rmdir)
         if namespace_created:
-            run("ip", "netns", "del", netns)
-        shutil.rmtree(boundary)
+            cleanup("namespace removal", lambda: run("ip", "netns", "del", netns))
+        if unmounted:
+            cleanup("jail removal", lambda: shutil.rmtree(boundary))
+        if cleanup_errors:
+            original = f"{type(failure).__name__}: {str(failure) or repr(failure)}; " if failure is not None else ""
+            raise RuntimeError(original + "base cleanup failed: " + "; ".join(cleanup_errors)) from failure
     placeholder.unlink()
     os.chown(state, 0, 0)
     state.chmod(0o755)

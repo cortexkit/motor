@@ -4,7 +4,10 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import socket
+import struct
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -173,6 +176,161 @@ class ProvisionTests(unittest.TestCase):
         self.assertLess(events.index("mount"), events.index("stage"))
         self.assertLess(events.index("stage"), events.index("umount"))
         self.assertEqual((p.REGISTRY / "a.json").stat().st_mode & 0o777, 0o644)
+
+    def agent_server(self, handler):
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(self.root / "vsock.sock"))
+        listener.listen()
+        listener.settimeout(3)
+        errors = []
+        def serve():
+            try:
+                with listener:
+                    handler(listener)
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=serve)
+        thread.start()
+        self.addCleanup(lambda: thread.join(timeout=4))
+        return thread, errors
+
+    def receive_hello(self, conn):
+        conn.settimeout(3)
+        line = b""
+        while not line.endswith(b"\n"):
+            chunk = conn.recv(1)
+            if not chunk:
+                raise EOFError("fixture handshake closed")
+            line += chunk
+        self.assertEqual(line, b"CONNECT 54\n")
+
+    def receive_control(self, conn):
+        self.receive_hello(conn)
+        conn.sendall(b"OK 54\n")
+        def exact(size):
+            result = b""
+            while len(result) < size:
+                chunk = conn.recv(size - len(result))
+                if not chunk:
+                    raise EOFError("fixture control frame closed")
+                result += chunk
+            return result
+        size, = struct.unpack(">I", exact(4))
+        return json.loads(exact(size))
+
+    def test_initial_vsock_eof_retries_until_agent_is_really_listening(self):
+        requests = []
+        def serve(listener):
+            conn, _ = listener.accept()
+            with conn:
+                self.receive_hello(conn)
+            conn, _ = listener.accept()
+            with conn:
+                requests.append(self.receive_control(conn))
+                reply = b'{"ok":true}'
+                conn.sendall(struct.pack(">I", len(reply)) + reply)
+        thread, errors = self.agent_server(serve)
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        record = mock.Mock()
+        p.wait_for_base_agent(self.root, proc, record, timeout=3)
+        thread.join(timeout=4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(requests, [{"op": "prepare_snapshot", "kind": "base"}])
+        self.assertEqual([call.args[0] for call in record.call_args_list], ["agent_not_ready", "agent_ready"])
+        proc.kill.assert_not_called()
+
+    def test_eof_after_control_submission_is_fatal_and_never_retried(self):
+        requests = []
+        def serve(listener):
+            conn, _ = listener.accept()
+            with conn:
+                requests.append(self.receive_control(conn))
+        thread, errors = self.agent_server(serve)
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        probe = mock.Mock(wraps=p.agent)
+        with self.assertRaisesRegex(EOFError, "after request submission"):
+            p.wait_for_base_agent(self.root, proc, mock.Mock(), probe=probe)
+        thread.join(timeout=4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_readiness_timeout_and_early_vmm_exit_name_the_cause(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        probe = mock.Mock(side_effect=p.AgentNotReady("listener absent"))
+        with self.assertRaisesRegex(TimeoutError, "60s while VMM was running.*listener absent"):
+            p.wait_for_base_agent(self.root, proc, mock.Mock(), probe=probe, clock=mock.Mock(side_effect=[0, 60]))
+        proc.poll.return_value = -9
+        probe.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "returncode=-9"):
+            p.wait_for_base_agent(self.root, proc, mock.Mock(), probe=probe)
+        probe.assert_not_called()
+
+    def test_real_guest_refusal_is_not_a_readiness_retry(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        probe = mock.Mock(side_effect=RuntimeError("guest refused base preparation: busy"))
+        with self.assertRaisesRegex(RuntimeError, "guest refused"):
+            p.wait_for_base_agent(self.root, proc, mock.Mock(), probe=probe)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_boot_and_diagnostic_requests_match_published_firecracker_schema(self):
+        args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init"
+        requests = p.base_requests(config(), args)
+        actual = dict(requests)
+        self.assertEqual(actual["/boot-source"]["boot_args"], args)
+        self.assertEqual(actual["/drives/rootfs"], dict(drive_id="rootfs", path_on_host="/rootfs.ext4", is_root_device=True, is_read_only=True))
+        self.assertFalse(actual["/drives/tenant"]["is_root_device"])
+        for path, body in requests + [("/logger", dict(log_path="/state/firecracker.log", level="Debug", show_level=True, show_log_origin=True)),
+                                      ("/metrics", dict(metrics_path="/state/metrics.jsonl")),
+                                      ("/actions", dict(action_type="FlushMetrics"))]:
+            p.SCHEMA.validate("PUT", path, body)
+        p.SCHEMA.validate("GET", "/vm/config", None)
+
+    def test_boot_evidence_preserves_config_metrics_exit_and_host_kill_reason(self):
+        evidence = p.BootEvidence(self.root / "diagnostics")
+        state, group = self.root / "state", self.root / "group"
+        state.mkdir()
+        group.mkdir()
+        (state / "firecracker.log").write_text("raw Firecracker failure\n")
+        (state / "metrics.jsonl").write_text('{"vmm":{}}\n')
+        (group / "memory.events").write_text("oom 0\noom_kill 0\n")
+        evidence.record("api_request", method="PUT", path="/boot-source", body=dict(boot_args="manifest args"))
+        proc = mock.Mock(pid=123)
+        proc.poll.return_value = None
+        proc.wait.return_value = -9
+        api = mock.Mock(return_value=dict(boot_source=dict(boot_args="observed args")))
+        evidence.stop(proc, group, state, api, EOFError("before handshake"))
+        events = [json.loads(line) for line in (evidence.directory / "events.jsonl").read_text().splitlines()]
+        before = next(row for row in events if row["kind"] == "vmm_before_cleanup")
+        self.assertIsNone(before["returncode"])
+        self.assertEqual(before["reason"], "EOFError")
+        self.assertEqual(next(row for row in events if row["kind"] == "host_kill")["reason"], "base_boot_cleanup")
+        self.assertEqual(events[-1]["returncode"], -9)
+        self.assertEqual((evidence.directory / "firecracker.log").read_text(), "raw Firecracker failure\n")
+        self.assertEqual((evidence.directory / "metrics.jsonl").read_text(), '{"vmm":{}}\n')
+        self.assertEqual(json.loads((evidence.directory / "submitted-config.json").read_text())["/boot-source"]["boot_args"], "manifest args")
+        self.assertTrue((evidence.directory / "observed-config.json").exists())
+        api.assert_any_call("PUT", "/actions", {"action_type": "FlushMetrics"}, timeout=1)
+        proc.kill.assert_called_once()
+
+    def test_already_exited_vmm_records_status_without_claiming_a_host_kill(self):
+        evidence = p.BootEvidence(self.root / "diagnostics")
+        proc = mock.Mock(pid=123)
+        proc.poll.return_value = 137
+        proc.wait.return_value = 137
+        api = mock.Mock()
+        evidence.stop(proc, self.root / "absent-group", self.root, api, RuntimeError("exit"))
+        events = [json.loads(line) for line in (evidence.directory / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(events[0]["returncode"], 137)
+        self.assertNotIn("host_kill", [row["kind"] for row in events])
+        proc.kill.assert_not_called()
+        api.assert_not_called()
 
 
 if __name__ == "__main__":

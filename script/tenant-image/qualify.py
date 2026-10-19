@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 import uuid
 from typing import Any
@@ -50,6 +51,21 @@ def module(name, path):
 
 def b64(data):
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def describe_error(error):
+    return f"{type(error).__name__}: {str(error) or repr(error)}"
+
+
+def error_evidence(error):
+    details: dict[str, Any] = dict(exception_type=type(error).__name__, exception_repr=repr(error), traceback=traceback.format_exc())
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        details["command"] = [str(arg) for arg in error.cmd] if isinstance(error.cmd, (list, tuple)) else str(error.cmd)
+        details["returncode"] = getattr(error, "returncode", None)
+        for name in ("stdout", "stderr"):
+            value = getattr(error, name, None)
+            details[name] = value.decode(errors="replace") if isinstance(value, bytes) else value
+    return details
 
 
 def qualification_args(original):
@@ -172,13 +188,26 @@ class Harness:
         start = time.monotonic()
         try:
             evidence = action()
-        except Exception as error:
+        except BaseException as error:
             self.verdicts[name] = False
-            self.record("FAIL", step=name, error=str(error), elapsed_s=time.monotonic() - start)
+            self.record("FAIL", step=name, error=describe_error(error), **error_evidence(error), elapsed_s=time.monotonic() - start)
+            self.failure_logs()
             raise
         self.verdicts[name] = True
         self.record("PASS", step=name, evidence=evidence, elapsed_s=time.monotonic() - start)
         return evidence
+
+    def failure_logs(self):
+        paths = list(self.results.glob("*.log"))
+        boot = self.results / "base-boot"
+        if boot.exists():
+            paths.extend(path for path in boot.iterdir() if path.is_file())
+        for path in sorted(paths):
+            try:
+                data = path.read_bytes()
+                self.record("failure_artifact", path=str(path), bytes=len(data), tail=data[-65536:].decode(errors="replace"))
+            except OSError as error:
+                self.record("failure_artifact_error", path=str(path), error=describe_error(error))
 
     def wait(self, predicate, description, timeout=180):
         deadline = time.monotonic() + timeout
@@ -333,7 +362,7 @@ class Harness:
 
         with (self.results / "base-console.log").open("ab", buffering=0) as console:
             def base(c, image, path):
-                self.provisioner.build_base(c, image, path, console=console)
+                self.provisioner.build_base(c, image, path, console=console, diagnostics=self.results / "base-boot")
             self.provisioner.provision(self.config, make_base=base, stage=stage)
         # The helper has one inert job slot because its existing configuration
         # requires one. Only persistent-tenant operations are sent by this lane.
@@ -504,12 +533,14 @@ class Harness:
             try:
                 action()
             except Exception as error:
-                errors.append(str(error))
+                errors.append(describe_error(error))
 
         attempt(self.stop_processes)
         if self.started_helper and self.registry.exists():
             attempt(lambda: self.helper("stop_tenant"))
         for unit in reversed(self.units):
+            attempt(lambda unit=unit: self.run("systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState",
+                                               "-p", "Result", "-p", "ExecMainCode", "-p", "ExecMainStatus", "-p", "ControlGroup"))
             attempt(lambda unit=unit: self.run("journalctl", "-u", unit, "--no-pager", "--output=short-monotonic"))
             attempt(lambda unit=unit: self.run("systemctl", "stop", unit))
             # Reset only this invocation's failed unit, never unrelated failures.
@@ -619,12 +650,12 @@ class Harness:
             self.step("post-restore job", restored_job)
             self.step("guest units", lambda: self.expect_console("PASS guest failed units: none"))
         except BaseException as caught:
-            error = str(caught)
+            error = describe_error(caught)
         finally:
             try:
                 self.step("teardown", self.teardown)
             except BaseException as caught:
-                error = f"{error or ''}; teardown: {caught}"
+                error = f"{error or ''}; teardown: {describe_error(caught)}"
             for name in STEPS:
                 if name not in self.verdicts:
                     self.verdicts[name] = False

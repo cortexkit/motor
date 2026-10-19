@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -144,6 +145,33 @@ class QualificationTests(unittest.TestCase):
         harness.console = lambda: q.TENANT + "\nFAIL guest qualification: isolation failed\n"
         with self.assertRaisesRegex(RuntimeError, "isolation failed"):
             harness.expect_console(q.TENANT)
+
+    def test_empty_exception_still_names_the_type_and_preserves_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = object.__new__(q.Harness)
+            harness.results = Path(tmp)
+            harness.verdicts = {}
+            harness.name = "portable-fixture"
+            harness.log = (Path(tmp) / "raw.jsonl").open("w")
+            harness.preflight = mock.Mock(side_effect=EOFError())
+            harness.teardown = mock.Mock(return_value="clean")
+            with mock.patch("builtins.print"):
+                self.assertEqual(harness.execute(), 1)
+            summary = json.loads((Path(tmp) / "summary.json").read_text())
+            self.assertEqual(summary["error"], "EOFError: EOFError()")
+            events = [json.loads(line) for line in (Path(tmp) / "raw.jsonl").read_text().splitlines()]
+            failed = next(row for row in events if row.get("step") == "preflight")
+            self.assertEqual(failed["exception_type"], "EOFError")
+            self.assertIn("EOFError", failed["traceback"])
+            self.assertNotEqual(failed["error"], "")
+
+    def test_subprocess_failure_keeps_real_exit_status_stdout_and_stderr(self):
+        error = subprocess.CalledProcessError(137, ["jailer", "--id", "base"], output=b"raw stdout\n", stderr=b"raw stderr\n")
+        evidence = q.error_evidence(error)
+        self.assertEqual(evidence["returncode"], 137)
+        self.assertEqual(evidence["stdout"], "raw stdout\n")
+        self.assertEqual(evidence["stderr"], "raw stderr\n")
+        self.assertEqual(evidence["command"], ["jailer", "--id", "base"])
 
 
 if __name__ == "__main__":

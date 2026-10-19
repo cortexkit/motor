@@ -270,9 +270,24 @@ baseline, not cleared. Cleanup errors fail qualification and identify retained
 paths; never recursively delete them while mounts or VMMs remain. SIGINT and
 SIGTERM trigger teardown; SIGKILL or host loss cannot do so.
 
-Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, and the
-host/fake-broker logs. **No live qualification result is claimed by the portable
-tests or by merely building this harness.**
+Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, the
+host/fake-broker logs and the complete `base-boot/` directory. Base-boot evidence
+includes exact submitted API bodies and responses, the observed Firecracker VM
+configuration, separate VMM stderr, a Debug-level Firecracker log, flushed metrics,
+cgroup memory/CPU/I/O counters, and process status before and after cleanup. A
+host-issued SIGKILL is recorded separately from a VMM that already exited. Failure
+rows always include an exception type, nonempty message and traceback; captured
+subprocess failures retain their real exit status/stdout/stderr. The terminal
+prints bounded log tails while full artifacts remain on disk.
+
+Base boot retries only transport failures before the initial `CONNECT 54`
+handshake completes, for at most 60 seconds. Firecracker can close such an early
+connection while the guest vsock device exists but its agent has not started.
+Once a guest control request is submitted, EOF or a refusal is fatal, not retried;
+a repeated prepare request could hide an unknown operation outcome. A readiness
+timeout names the last transport failure and whether the VMM was still running.
+**No live qualification result is claimed by the portable tests or by merely
+building this harness.**
 
 Portable harness tests:
 
