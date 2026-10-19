@@ -8,7 +8,9 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "hyperv-spike")]
     if std::env::args().skip(1).eq(["--build-info"]) {
-        println!("motor-winagent hyperv-spike agent_diag=2 queue_config=0,2097152 protocol=4");
+        println!(
+            "motor-winagent hyperv-spike agent_diag=3 partial_read=4096,250ms queue_config=0,2097152 protocol=4"
+        );
         return Ok(());
     }
     guest::run()
@@ -167,6 +169,10 @@ mod guest {
     struct Port {
         handle: Arc<Handle>,
         stop: Arc<Handle>,
+        #[cfg(feature = "hyperv-spike")]
+        read_total: Arc<std::sync::atomic::AtomicU64>,
+        #[cfg(feature = "hyperv-spike")]
+        write_total: Arc<std::sync::atomic::AtomicU64>,
     }
     impl Port {
         fn open(stop: Arc<Handle>) -> io::Result<Self> {
@@ -230,7 +236,14 @@ mod guest {
                                 }
                             });
                         }
-                        return Ok(Self { handle, stop });
+                        return Ok(Self {
+                            handle,
+                            stop,
+                            #[cfg(feature = "hyperv-spike")]
+                            read_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                            #[cfg(feature = "hyperv-spike")]
+                            write_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        });
                     }
                     Err(error) if stop.signalled() || Instant::now() >= deadline => {
                         return Err(error);
@@ -238,6 +251,21 @@ mod guest {
                     Err(_) => thread::sleep(Duration::from_millis(200)),
                 }
             }
+        }
+
+        #[cfg(feature = "hyperv-spike")]
+        fn record_transfer(&self, count: u32, write: bool) {
+            let counter = if write {
+                &self.write_total
+            } else {
+                &self.read_total
+            };
+            let total = counter.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed)
+                + count as u64;
+            diagnostic!(
+                "io {} done bytes={count} total={total}",
+                if write { "write" } else { "read" }
+            );
         }
 
         fn transfer(&self, bytes: *mut u8, length: usize, write: bool) -> io::Result<usize> {
@@ -284,12 +312,49 @@ mod guest {
                 );
                 if result == 0 && last_error != ERROR_IO_PENDING {
                     let error = io::Error::from_raw_os_error(last_error as i32);
-                    if !write && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    if !cfg!(feature = "hyperv-spike")
+                        && !write
+                        && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
+                    {
                         return Ok(0);
                     }
                     return Err(error);
                 }
+                #[cfg(feature = "hyperv-spike")]
+                if result != 0 {
+                    win32(GetOverlappedResult(
+                        self.handle.0,
+                        &operation,
+                        &mut transferred,
+                        0,
+                    ))?;
+                    self.record_transfer(transferred, write);
+                    return Ok(transferred as usize);
+                }
                 let handles = [self.stop.0, event.0];
+                #[cfg(feature = "hyperv-spike")]
+                let ready = loop {
+                    let ready = WaitForMultipleObjects(2, handles.as_ptr(), 0, 250);
+                    if ready == WAIT_TIMEOUT {
+                        // Poll completion after a bounded event wait. This also
+                        // distinguishes a pending IRP from a completed operation.
+                        if GetOverlappedResult(self.handle.0, &operation, &mut transferred, 0) != 0
+                        {
+                            diagnostic!("io completion observed by poll");
+                            self.record_transfer(transferred, write);
+                            return Ok(transferred as usize);
+                        }
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE as i32) {
+                            continue;
+                        }
+                        CancelIoEx(self.handle.0, &operation);
+                        GetOverlappedResult(self.handle.0, &operation, &mut transferred, 1);
+                        return Err(error);
+                    }
+                    break ready;
+                };
+                #[cfg(not(feature = "hyperv-spike"))]
                 let ready = WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE);
                 if ready != WAIT_OBJECT_0 + 1 {
                     CancelIoEx(self.handle.0, &operation);
@@ -305,10 +370,8 @@ mod guest {
                     &mut transferred,
                     1,
                 ))?;
-                diagnostic!(
-                    "io {} done bytes={transferred}",
-                    if write { "write" } else { "read" }
-                );
+                #[cfg(feature = "hyperv-spike")]
+                self.record_transfer(transferred, write);
                 Ok(transferred as usize)
             }
         }
@@ -318,7 +381,16 @@ mod guest {
             if bytes.is_empty() {
                 Ok(0)
             } else {
-                self.transfer(bytes.as_mut_ptr(), bytes.len(), false)
+                #[cfg(feature = "hyperv-spike")]
+                {
+                    motor_winagent::transport::read_serial(bytes, |chunk| {
+                        self.transfer(chunk.as_mut_ptr(), chunk.len(), false)
+                    })
+                }
+                #[cfg(not(feature = "hyperv-spike"))]
+                {
+                    self.transfer(bytes.as_mut_ptr(), bytes.len(), false)
+                }
             }
         }
     }
@@ -923,7 +995,18 @@ mod guest {
             loop {
                 match read_frame(&mut port) {
                     Ok(Some(frame)) => {
-                        diagnostic!("reader complete frame");
+                        #[cfg(feature = "hyperv-spike")]
+                        match &frame {
+                            Frame::ReceiveTree { bytes } => {
+                                diagnostic!("reader frame ReceiveTree bytes={}", bytes.len())
+                            }
+                            Frame::TreeEnd { .. } => diagnostic!("reader frame TreeEnd"),
+                            Frame::Start {} => diagnostic!("reader frame Start"),
+                            Frame::Collect {} => diagnostic!("reader frame Collect"),
+                            Frame::Dismount {} => diagnostic!("reader frame Dismount"),
+                            Frame::Cancel {} => diagnostic!("reader frame Cancel"),
+                            _ => diagnostic!("reader unexpected host frame"),
+                        }
                         post(&tx, &reader_stop, Event::Host(frame));
                     }
                     Ok(None) => {

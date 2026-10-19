@@ -22,7 +22,7 @@ pub fn init() -> io::Result<()> {
     let hash = sha2::Sha256::digest(std::fs::read(&executable)?);
     writeln!(
         file,
-        "agent_diag=2 feature=hyperv-spike exe={} sha256={hash:x}",
+        "agent_diag=3 feature=hyperv-spike exe={} sha256={hash:x}",
         executable.display()
     )?;
     // Flush file creation and startup identity before any serial operation.

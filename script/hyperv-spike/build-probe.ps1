@@ -22,7 +22,7 @@ try {
             $agent = Join-Path $Root 'motor-winagent-hyperv.exe'
             Copy-Item (Join-Path $Root 'probe-build\x86_64-pc-windows-msvc\release\motor-winagent.exe') $agent -Force
             $identity = Invoke-SpikeNative $agent @('--build-info') $Root 'agent-build-info'
-            Assert-Spike ($identity.exitCode -eq 0 -and $identity.stdout -match 'hyperv-spike agent_diag=2') 'guest-agent-diagnostic-feature' $identity.stdout.Trim()
+            Assert-Spike ($identity.exitCode -eq 0 -and $identity.stdout -match 'hyperv-spike agent_diag=3') 'guest-agent-diagnostic-feature' $identity.stdout.Trim()
             Write-Host "EVIDENCE guest-agent-override path=$agent SHA256=$((Get-FileHash $agent).Hash) (not installed in parent)"
         }
     } finally {

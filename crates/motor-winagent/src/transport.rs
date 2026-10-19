@@ -5,6 +5,24 @@ pub const HYPERV_NONCE_FILE: &str = r"C:\ProgramData\Motor\hyperv-nonce.txt";
 pub const HYPERV_QUEUE_FILE: &str = r"C:\ProgramData\Motor\hyperv-serial-queue.txt";
 pub const HYPERV_QUEUE_BYTES: u32 = 2 * crate::MAX_FRAME_BYTES as u32;
 
+pub fn read_serial(
+    bytes: &mut [u8],
+    mut operation: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> io::Result<usize> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let length = bytes.len().min(4096);
+    loop {
+        // Serial timeouts return zero without closing the stream. The callback
+        // must continue to honor service cancellation and propagate I/O errors.
+        let count = operation(&mut bytes[..length])?;
+        if count != 0 {
+            return Ok(count);
+        }
+    }
+}
+
 pub fn hyperv_queue_bytes(text: Option<&str>) -> io::Result<u32> {
     match text.map(str::trim) {
         None => Ok(HYPERV_QUEUE_BYTES),
@@ -65,9 +83,16 @@ pub fn configure_com(handle: std::os::windows::io::BorrowedHandle<'_>) -> io::Re
         if BuildCommDCBW(mode.as_ptr(), &mut dcb) == 0 || SetCommState(handle, &dcb) == 0 {
             return Err(io::Error::last_os_error());
         }
-        // All-zero timeouts block until the requested bytes arrive. The existing
-        // overlapped stop event still cancels reads when the service is stopped.
-        let timeouts: COMMTIMEOUTS = std::mem::zeroed();
+        // Return partial serial input so a missing tail cannot hide all received
+        // bytes inside one indefinitely pending ReadFile. A zero-byte timeout
+        // is retried by Port::read, not exposed to framing as an EOF.
+        let timeouts = COMMTIMEOUTS {
+            ReadIntervalTimeout: 50,
+            ReadTotalTimeoutMultiplier: 0,
+            ReadTotalTimeoutConstant: 250,
+            WriteTotalTimeoutMultiplier: 0,
+            WriteTotalTimeoutConstant: 0,
+        };
         if SetCommTimeouts(handle, &timeouts) == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -102,6 +127,44 @@ pub fn serial_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_read_retries_timeouts_and_bounds_each_operation() {
+        let mut bytes = vec![0; 10000];
+        let mut calls = 0;
+        let count = read_serial(&mut bytes, |buffer| {
+            assert_eq!(buffer.len(), 4096);
+            calls += 1;
+            if calls < 3 {
+                return Ok(0);
+            }
+            buffer[..4].copy_from_slice(&[1, 2, 3, 4]);
+            Ok(4)
+        })
+        .unwrap();
+        assert_eq!((count, calls), (4, 3));
+        assert_eq!(&bytes[..4], &[1, 2, 3, 4]);
+        assert_eq!(
+            read_serial(&mut [], |_| panic!("empty read called transport")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn serial_read_cancellation_is_not_hidden_by_timeout_retry() {
+        let mut calls = 0;
+        let error = read_serial(&mut [0; 4], |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(0)
+            } else {
+                Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stopped"))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(calls, 2);
+    }
 
     #[test]
     fn serial_queue_config_is_bounded_and_default_is_larger_than_one_frame() {
