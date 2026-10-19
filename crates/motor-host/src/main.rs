@@ -39,6 +39,16 @@ struct Binding {
 #[tokio::main]
 async fn main() -> Result<()> {
     motor_protocol::logging::init("[motor-host]")?;
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--sandbox")
+    {
+        let path = std::env::args_os()
+            .nth(2)
+            .context("usage: motor-host --sandbox <config.json>")?;
+        let config = serde_json::from_reader(File::open(path)?)?;
+        return motor_host::sandbox::run(config).await;
+    }
     let path = std::env::args_os()
         .nth(1)
         .context("usage: motor-host <config.json>")?;

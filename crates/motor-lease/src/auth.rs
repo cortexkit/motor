@@ -261,7 +261,7 @@ pub fn verify_token(
             .as_deref()
             .is_some_and(|vm| !valid_name(vm))
         || !valid_job_id(&claims.jti)
-        || !valid_name(&claims.aud)
+        || !valid_audience(&claims.aud)
         || expected_job.is_some_and(|job| job != claims.jti)
         || claims.purpose != required_purpose
         || !valid_subject(&claims.sub)
@@ -285,6 +285,12 @@ pub fn verify_token(
         return Err(AuthError::Expired);
     }
     Ok(claims)
+}
+
+fn valid_audience(value: &str) -> bool {
+    // Provider-scoped Boat identities are not host registry names. Only this
+    // namespace is allowed; an arbitrary URI must not become a valid audience.
+    valid_name(value.strip_prefix("boat:").unwrap_or(value))
 }
 
 pub(crate) fn valid_subject(subject: &str) -> bool {

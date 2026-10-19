@@ -19,6 +19,8 @@ mod systemd;
 mod tenant;
 #[cfg(target_os = "linux")]
 mod tenant_agent;
+#[cfg(any(target_os = "linux", test))]
+mod tenant_local;
 #[cfg(test)]
 mod test_cleanup;
 #[cfg(test)]
@@ -41,6 +43,8 @@ pub use storage::{JobState, REPLAY_BYTES, RETENTION_MS};
 pub use tenant::serve_tenant;
 #[cfg(target_os = "linux")]
 pub use tenant_agent::serve_agent;
+#[cfg(target_os = "linux")]
+pub use tenant_local::serve_tenant_local;
 
 #[doc(hidden)]
 pub fn windows_prepare(path: &std::path::Path) -> std::io::Result<()> {
