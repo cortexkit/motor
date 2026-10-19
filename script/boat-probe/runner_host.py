@@ -35,7 +35,7 @@ data = {'user': pwd.getpwuid(os.getuid()).pw_name, 'uid': os.getuid(),
 print(json.dumps(data))
 '''
 HOST = SOURCE + r'''
-import json, os, pathlib, subprocess
+import json, os, pathlib, socket, stat, struct, subprocess
 pathlib.Path('/dev/shm/boat-host-canary').write_text('not for jobs')
 def capture(argv):
     p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
@@ -44,10 +44,34 @@ configs = {str(p): p.read_text() for p in pathlib.Path('/etc/ssh/sshd_config.d')
 pid = subprocess.check_output(['systemctl','show','motor-boat','--property=MainPID','--value'], text=True).strip()
 names = {v.split(b'=',1)[0].decode() for v in pathlib.Path('/proc/'+pid+'/environ').read_bytes().split(b'\0') if b'=' in v}
 idle = {}
-for unit in ('motor-boat', 'motor-boat-bridge'):
+for unit in ('motor-boat', 'motor-boat-bridge', 'motor-boat-host'):
     group = subprocess.check_output(['systemctl','show',unit,'--property=ControlGroup','--value'], text=True).strip()
     path = pathlib.Path('/sys/fs/cgroup') / group.lstrip('/')
     idle[unit] = {'cgroup': group, 'memory.current': (path/'memory.current').read_text().strip()}
+def endpoint_refusal():
+    try:
+        hello = json.dumps({'type':'lease_hello','v':1,'token':'not-a-valid-token',
+            'requester_jwk':{'kty':'OKP','crv':'Ed25519','x':'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'}}).encode()
+        with socket.create_connection(('127.0.0.1',9443), timeout=15) as client:
+            client.sendall(struct.pack('>I',len(hello))+hello)
+            def exact(n):
+                out = b''
+                while len(out) < n:
+                    chunk = client.recv(n-len(out))
+                    if not chunk:
+                        raise ValueError('endpoint closed without a refusal frame')
+                    out += chunk
+                return out
+            length = struct.unpack('>I',exact(4))[0]
+            if length > 1048576:
+                raise ValueError('unexpected endpoint frame length')
+            return {'connected':True, 'frame':json.loads(exact(length))}
+    except (OSError, ValueError) as error:
+        return {'error':str(error)}
+tenant_sockets = {}
+for path in [pathlib.Path('/run/motor-tenant'), *[pathlib.Path('/run/motor-tenant')/name for name in ('jobs.sock','events.sock','admin.sock')]]:
+    meta = path.lstat()
+    tenant_sockets[str(path)] = {'uid':meta.st_uid, 'mode':oct(stat.S_IMODE(meta.st_mode)), 'socket':stat.S_ISSOCK(meta.st_mode)}
 print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('net','pid','mnt')},
     'credential_audit': credential_audit(), 'ssh_config': configs,
     'sshd': capture(['/usr/sbin/sshd','-T']),
@@ -56,6 +80,7 @@ print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('n
     'runner_environment': {k: k in names for k in ('ASCII_TOKEN','BOAT_ID','BOAT_CLI_TOKEN')},
     'memory_budget': json.loads(pathlib.Path('/var/lib/motor-boat/budget.json').read_text()),
     'idle_services_memory': idle, 'meminfo_at_idle': pathlib.Path('/proc/meminfo').read_text(),
+    'endpoint_refusal': endpoint_refusal(), 'tenant_sockets': tenant_sockets,
     'listeners': capture(['ss','-ltnp']),
     'inventory': json.loads(pathlib.Path('/var/lib/motor-boat/inventory.json').read_text())}))
 '''.replace('ENV_NAMES', repr(ENV_NAMES))
@@ -89,6 +114,18 @@ def isolation_checks(job, host):
 def policy_checks(host):
     actual = dict(line.split(None, 1) for line in host["sshd"]["stdout"].splitlines() if " " in line)
     return {key: host["sshd"].get("exit_code") == 0 and actual.get(key) == value for key, value in POLICY.items()}
+
+
+def admission_checks(host):
+    refusal = host['endpoint_refusal']
+    sockets = host['tenant_sockets']
+    expected = {'/run/motor-tenant', *('/run/motor-tenant/' + name for name in ('jobs.sock','events.sock','admin.sock'))}
+    return {
+        'endpoint_rejects_invalid_token': refusal.get('connected') is True and refusal.get('frame') == {'type':'lease_refused','reason':'auth'},
+        'root_private_tenant_sockets': set(sockets) == expected and all(meta['uid'] == 0 and
+            meta['mode'] == ('0o700' if path == '/run/motor-tenant' else '0o600') and
+            (path == '/run/motor-tenant' or meta['socket']) for path,meta in sockets.items()),
+    }
 
 
 @contextlib.contextmanager
@@ -138,6 +175,12 @@ class RunnerHost:
     def execute(self, sid, command, timeout=120):
         result = self.probe.execute(sid, command, poll_seconds=timeout)
         if result.get("exitCode") != 0 or result.get("stdoutTruncated") or result.get("stderrTruncated"):
+            try:
+                self.data.setdefault('guest_failures', []).append({'command': command, 'result': result,
+                    'journal': self.probe.execute(sid, 'sudo -n journalctl -b --no-pager -n 100 -u motor-boat -u motor-boat-host -u motor-boat-bridge', poll_seconds=30)})
+            except Exception:
+                pass
+            self.probe.checkpoint()
             raise ValueError("guest command failed or truncated: " + json.dumps(result))
         return result
 
@@ -150,13 +193,18 @@ class RunnerHost:
     def phase(self, sid, label, directory, public, repository, client, first_started=None):
         record = {"name": label}
         self.data["phases"].append(record)
-        self.execute(sid, "sudo -n systemctl restart motor-boat motor-boat-bridge")
+        identity = "import os; from pathlib import Path; p=Path('/etc/motor/tenant/id'); p.write_text(" + repr(sid) + "); os.chown(p,0,0); p.chmod(0o444)"
+        self.execute(sid, "sudo -n python3 -c " + shlex.quote(identity) + " && sudo -n systemctl restart motor-boat motor-boat-host motor-boat-bridge && sudo -n systemctl start motor-boat-host.path")
         argv = self.route(sid, directory, public)
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
         listeners = host["listeners"]["stdout"]
         self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
                    not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
+        self.check(label + '.endpoint_loopback_only', '127.0.0.1:9443' in listeners and
+                   not any(s in listeners for s in ('0.0.0.0:9443','[::]:9443','*:9443')), host['listeners'])
+        for key, passed in admission_checks(host).items():
+            self.check(label + '.' + key, passed, {'refusal': host['endpoint_refusal'], 'sockets': host['tenant_sockets']})
         ssh = process(argv + ["python3 -c " + shlex.quote(ENV_NAMES)])
         record["ssh_environment"] = ssh
         self.check(label + ".ssh_environment_measured", ssh.get("exit_code") == 0, ssh)
@@ -250,7 +298,7 @@ class RunnerHost:
                 self.check("snapshot.no_account_credentials", audit["clean"], audit)
                 if not audit["clean"]:
                     raise ValueError("refusing to snapshot account credentials or incomplete audit")
-                self.execute(sid, "sudo -n systemctl stop motor-boat-bridge motor-boat && sudo -n rm -f /etc/motor/tenant/id && test ! -e /etc/motor/tenant/id && sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync")
+                self.execute(sid, "sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat && sudo -n rm -f /etc/motor/tenant/id && test ! -e /etc/motor/tenant/id && sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync")
                 name = "motor-runner-" + self.probe.data["run_id"]
                 self.probe.data["resources"].append({"kind": "named-snapshot", "id": name})
                 self.probe.checkpoint()

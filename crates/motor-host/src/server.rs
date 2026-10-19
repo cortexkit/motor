@@ -49,9 +49,18 @@ pub struct Runtime {
     event_workers: Mutex<BTreeSet<String>>,
     terminal_workers: Mutex<BTreeSet<String>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
+    pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
     pub fn new(host_id: String, host: Host, control: Arc<dyn Control>) -> Arc<Self> {
+        Self::with_identity(host_id, host, control, None)
+    }
+    pub(crate) fn with_identity(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        sandbox_identity: Option<crate::sandbox::IdentityFile>,
+    ) -> Arc<Self> {
         let tenant_operations = host
             .tenants
             .values()
@@ -67,6 +76,7 @@ impl Runtime {
             tenant_operations,
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
+            sandbox_identity,
         })
     }
     pub fn refresh_keys(&self, minimum_interval_s: u64) {
@@ -87,7 +97,7 @@ impl Runtime {
             Ok(reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()?
-                .get("https://runners.cortexkit.io/.well-known/jwks.json")
+                .get(motor_lease::JWKS_URL)
                 .send()?
                 .error_for_status()?
                 .json()?)
@@ -99,10 +109,12 @@ impl Runtime {
             .refresh(fetched.map_err(|_| AuthError::Auth));
     }
     pub fn recover(self: &Arc<Self>) -> Result<()> {
-        self.host
-            .lock()
-            .expect("host lock")
-            .start_billing(unix_ms())?;
+        if self.sandbox_identity.is_none() {
+            self.host
+                .lock()
+                .expect("host lock")
+                .start_billing(unix_ms())?;
+        }
         let tenants: Vec<_> = self
             .host
             .lock()
@@ -131,13 +143,23 @@ impl Runtime {
         jwk: &motor_lease::RequesterJwk,
         now_s: u64,
     ) -> Result<Claims, Error> {
+        let identity = self
+            .sandbox_identity
+            .as_ref()
+            .map(|file| file.read())
+            .transpose()
+            .map_err(|_| Error::Refused(Refusal::Auth))?;
+        let audience = identity
+            .as_deref()
+            .map(crate::sandbox::audience)
+            .unwrap_or_else(|| self.host_id.clone());
         let keys = self.keys.read().expect("keys lock");
-        let claims = verify_token(token, &keys, &self.host_id, None, Purpose::Run, now_s)
+        let claims = verify_token(token, &keys, &audience, None, Purpose::Run, now_s)
             .or_else(|e| {
                 if e == AuthError::Expired {
                     Err(e)
                 } else {
-                    verify_token(token, &keys, &self.host_id, None, Purpose::Attach, now_s)
+                    verify_token(token, &keys, &audience, None, Purpose::Attach, now_s)
                 }
             })
             .map_err(|e| {
@@ -149,6 +171,12 @@ impl Runtime {
             })?;
         uuid::Uuid::parse_str(&claims.jti).map_err(|_| Error::Refused(Refusal::Auth))?;
         if claims.platform != "linux-x64" {
+            return Err(Error::Refused(Refusal::Auth));
+        }
+        if identity
+            .as_ref()
+            .is_some_and(|id| claims.placement.vm.as_ref() != Some(id))
+        {
             return Err(Error::Refused(Refusal::Auth));
         }
         bind_requester(&claims, jwk).map_err(|_| Error::Refused(Refusal::Auth))?;
@@ -314,7 +342,9 @@ impl Runtime {
         });
     }
     pub fn tick(self: &Arc<Self>, now_ms: u64) -> Result<()> {
-        self.fetch_detached_terminals();
+        if self.sandbox_identity.is_none() {
+            self.fetch_detached_terminals();
+        }
         let (cancels, quotas, candidates) = {
             let mut host = self.host.lock().expect("host lock");
             host.billing_tick(now_ms)?;
@@ -325,7 +355,7 @@ impl Runtime {
                 if let Some(update) = host.quota_update(tenant, now_ms)? {
                     quotas.push(update);
                 }
-                if host.suspend_candidate(tenant, now_ms) {
+                if self.sandbox_identity.is_none() && host.suspend_candidate(tenant, now_ms) {
                     candidates.push(tenant.clone());
                 }
             }
@@ -678,7 +708,7 @@ where
         .collect();
     let challenge = Challenge {
         nonce,
-        host_id: runtime.host_id.clone(),
+        host_id: claims.aud.clone(),
         ts: unix_ms() / 1000,
     };
     write_frame(&mut client, &json!({"type":"challenge", "nonce":challenge.nonce, "host_id":challenge.host_id, "ts":challenge.ts})).await?;
@@ -816,6 +846,10 @@ where
                     cursor = cursor.max(seq);
                 }
                 if frame["type"] == "terminal" {
+                    if runtime.sandbox_identity.is_some() {
+                        write_frame(&mut cw, &frame).await?;
+                        return Ok::<(),anyhow::Error>(());
+                    }
                     let control = runtime.control.clone();
                     let tenant = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].tenant.clone();
                     let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await?;

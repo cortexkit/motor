@@ -142,6 +142,45 @@ request combines `tenant` with one guest control operation: `drain` with
 those typed requests are forwarded on port 54; none is accepted on the TLS job
 path by the host admin service.
 
+## Sandbox admission mode
+
+`motor-host --sandbox <config.json>` reuses the host admission state machine,
+requester challenge, durable journal and ordered `verified_lease` relay without a
+VM helper. Its listener is plain length-prefixed JSON on IPv4 loopback only;
+the caller must supply a host-key-pinned SSH forward. It does not accept TLS.
+
+The closed configuration object requires `journal_dir`, `job_socket`,
+`event_socket`, `admin_socket` and a positive `vcpu_ceiling`. Optional `id_file`
+and `port` use defaults centralized in `src/sandbox.rs` for Boat (boat.dev), the
+sandbox provider. These values are interim until the broker's provider lease
+contract is final. There are no TLS, host-signing-key, broker-sender or heartbeat
+settings in this mode.
+
+The broker installs the sandbox identity as a root-owned mode-0444 regular file.
+Each connection reads it afresh, fails closed if it cannot be read safely, and
+requires the signed token's audience and placement to name that sandbox. The
+same broker key cache, platform checks, run/attach purpose binding and typed
+refusals apply as on tenant VM hosts. A changed identity applies to subsequent
+connections, not to a connection already authenticated.
+
+The runner starts with `--tenant-vm --tenant-socket-dir <directory>` and exposes
+`jobs.sock`, `events.sock` and `admin.sock` in a pre-created root-owned mode-0700
+directory. Those are the three configured endpoint socket paths. The directory's
+ancestors must be root-owned and not group/other-writable. Socket nodes are mode
+0600; only an owned dead socket is replaced. Without the explicit directory
+option, tenant VMs keep their existing vsock listeners.
+
+The watchdog sends per-job cancellation through the runner's admin socket at
+`max_s`, including after a client disconnect. There is no outside CPU-cutoff
+authority inside a provider sandbox. No usage or heartbeat is posted, no local
+billing settlement is synthesized, and runner terminals are relayed without
+`hosted_terminal`: only the broker's provider adapter can measure billable usage.
+
+Portable `sandbox::tests` cover fake-broker admission, audience and identity
+changes, requester proofs, reattach, exact refusal types, non-TLS framing and
+disconnected cancellation. `tenant_local::tests` in `motor-runner` cover the
+private socket bindings, stale-node policy and tenant-only handlers.
+
 ## Verification
 
 `cargo test -p motor-host` runs the portable admission, durable-journal, TLS,

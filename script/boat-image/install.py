@@ -150,8 +150,8 @@ def state(pins):
         raise ValueError("runner disk is not XFS")
     for directory in ("state", "state/workspaces", "home", "tmp"):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
-        run("chown", "motor-boat:motor-boat", str(STATE / directory))
-    run("chown", "motor-boat:motor-boat", str(STATE))
+        run("chown", "root:root", str(STATE / directory))
+    run("chown", "root:root", str(STATE))
     Path("/Users").mkdir(exist_ok=True)
     Path("/etc/systemd/system/Users.mount").write_text(
         "[Unit]\nRequires=var-lib-motor\\x2dboat.mount\nAfter=var-lib-motor\\x2dboat.mount\n"
@@ -216,15 +216,18 @@ def tools(pins):
         marker.write_text(inputs)
 
 
+def target_directories():
+    run('install', '-d', '-o', 'root', '-g', 'root', '-m', '0755',
+        '/usr/local/bin', '/usr/local/libexec', '/etc/systemd/system',
+        '/etc/ssh/sshd_config.d', '/etc/motor', '/etc/motor/tenant')
+
+
 def configure(pins):
-    for account in ("motor-boat", "motor-job", "motor-cache"):
+    target_directories()
+    for account in ("motor-job", "motor-cache"):
         if subprocess.run(["id", "-u", account], capture_output=True).returncode:
             run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
                 "--shell", "/usr/sbin/nologin", account)
-    sudoers = Path("/etc/sudoers.d/motor-boat")
-    sudoers.write_text("motor-boat ALL=(root) NOPASSWD: ALL\n")
-    sudoers.chmod(0o440)
-    run("visudo", "-cf", str(sudoers))
     state(pins)
     config = Path("/etc/ssh/sshd_config").read_text()
     if not re.search(r"(?im)^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf\s*$", config):
@@ -238,14 +241,23 @@ def configure(pins):
     run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
         "/usr/local/libexec/motor-boat-net.nft")
     cpus = int(run("nproc", capture=True))
-    for name in ("motor-boat.service", "motor-boat-bridge.service"):
+    for name in ("motor-boat.service", "motor-boat-bridge.service", "motor-boat-host.service", "motor-boat-host.path"):
         Path("/etc/systemd/system", name).write_text((HERE / name).read_text().replace("@VCPUS@", str(cpus)))
+    (STATE / 'host-journal').mkdir(mode=0o700, exist_ok=True)
+    Path('/etc/motor/sandbox.json').write_text(json.dumps({
+        'journal_dir': str(STATE / 'host-journal'),
+        'job_socket': '/run/motor-tenant/jobs.sock',
+        'event_socket': '/run/motor-tenant/events.sock',
+        'admin_socket': '/run/motor-tenant/admin.sock',
+        'vcpu_ceiling': cpus,
+    }, indent=2) + '\n')
     Path("/etc/motor/tenant").mkdir(parents=True, exist_ok=True)
     Path("/etc/motor/tenant/id").unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-boat.service",
-        "/etc/systemd/system/motor-boat-bridge.service")
-    run("systemctl", "enable", "motor-boat.service")
+        "/etc/systemd/system/motor-boat-bridge.service", "/etc/systemd/system/motor-boat-host.service",
+        "/etc/systemd/system/motor-boat-host.path")
+    run("systemctl", "enable", "motor-boat.service", "motor-boat-host.path")
 
 
 def main():
@@ -287,10 +299,12 @@ def main():
     # Keep provider-managed init and SSH binaries; only our SSH drop-in is installed.
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *pins["packages"])
+    target_directories()
     tools(pins)
     os.chdir(ROOT)
-    run("cargo", "build", "--release", "--locked", "-p", "motor-runner")
-    run("install", "-m", "0755", "/srv/build/target/release/motor-runner", "/usr/local/bin/motor-runner")
+    run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
+    for binary in ('motor-runner', 'motor-host'):
+        run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)
     configure(pins)
     inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],

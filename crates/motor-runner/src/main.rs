@@ -176,8 +176,13 @@ async fn main() -> io::Result<()> {
             );
             #[cfg(target_os = "linux")]
             if runner.config().tenant_vm {
-                let tenant = motor_runner::serve_tenant(runner.clone());
-                tokio::select! { result = serve(runner, listener) => result?, result = tenant => result? }
+                if let Some(directory) = &runner.config().tenant_socket_dir {
+                    let tenant = motor_runner::serve_tenant_local(runner.clone(), directory);
+                    tokio::select! { result = serve(runner.clone(), listener) => result?, result = tenant => result? }
+                } else {
+                    let tenant = motor_runner::serve_tenant(runner.clone());
+                    tokio::select! { result = serve(runner, listener) => result?, result = tenant => result? }
+                }
             } else {
                 serve(runner, listener).await?;
             }
@@ -215,6 +220,7 @@ fn configure_options(
         match arg.as_str() {
             "--instance" => config.instance = value,
             "--state-root" => config.state_root = value.into(),
+            "--tenant-socket-dir" => config.tenant_socket_dir = Some(value.into()),
             "--build-slot-root" => config.build_slot_root = value.into(),
             "--max-weight" => config.max_weight = value.parse().map_err(io::Error::other)?,
             "--boat-memory-max-bytes" => {
@@ -245,6 +251,9 @@ fn configure_options(
             _ => return Err(io::Error::other(format!("unknown option {arg}"))),
         }
     }
+    if config.tenant_socket_dir.is_some() && !config.tenant_vm {
+        return Err(io::Error::other("--tenant-socket-dir requires --tenant-vm"));
+    }
     if config.tenant_vm
         && (!cfg!(target_os = "linux") || config.backend != motor_runner::BackendKind::Host)
     {
@@ -255,10 +264,10 @@ fn configure_options(
     if config.boat_profile
         && (!cfg!(target_os = "linux")
             || config.backend != motor_runner::BackendKind::Host
-            || config.tenant_vm)
+            || (config.tenant_vm && config.tenant_socket_dir.is_none()))
     {
         return Err(io::Error::other(
-            "--boat-profile requires the Linux host backend without --tenant-vm",
+            "--boat-profile requires the Linux host backend; tenant mode must use root-private local sockets",
         ));
     }
     Ok((job, drain_timeout_s, exit_after))
@@ -303,6 +312,18 @@ fn boat_profile_is_an_explicit_linux_host_option() {
         ["--boat-profile".into(), "--backend".into(), "vm".into()].into_iter()
     )
     .is_err());
+    let mut config = Config::new("/unused", "boat");
+    let local = configure_options(
+        &mut config,
+        [
+            "--boat-profile".into(),
+            "--tenant-vm".into(),
+            "--tenant-socket-dir".into(),
+            "/run/motor-tenant".into(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(local.is_ok(), cfg!(target_os = "linux"));
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

@@ -20,11 +20,11 @@ def budget(available, overhead, margin=MARGIN):
     return result
 
 
-def owns_listener(pid):
+def owns_listener(pid, path=SOCKET):
     inodes = set()
     for line in Path('/proc/net/unix').read_text().splitlines()[1:]:
         fields = line.split(maxsplit=7)
-        if len(fields) == 8 and fields[7] == SOCKET and int(fields[3], 16) & 0x10000:
+        if len(fields) == 8 and fields[7] == path and int(fields[3], 16) & 0x10000:
             inodes.add('socket:[' + fields[6] + ']')
     for fd in Path(f'/proc/{pid}/fd').iterdir():
         try:
@@ -35,18 +35,35 @@ def owns_listener(pid):
     return False
 
 
+def owns_endpoint(pid):
+    inodes = set()
+    for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+        for line in Path(path).read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[1].split(':')[1] == '24E3' and fields[3] == '0A':
+                if fields[1] != '0100007F:24E3':
+                    raise RuntimeError('endpoint is not exclusively IPv4 loopback')
+                inodes.add('socket:[' + fields[9] + ']')
+    return any(os.readlink(fd) in inodes for fd in Path(f'/proc/{pid}/fd').iterdir())
+
+
 def main():
-    if sys.argv[1:] == ['--wait-ready']:
+    if sys.argv[1:] in (['--wait-ready'], ['--wait-host-ready']):
+        host = sys.argv[1] == '--wait-host-ready'
         until = time.monotonic() + 45
         while time.monotonic() < until:
-            pid = int(subprocess.check_output(['systemctl', 'show', 'motor-boat', '--property=MainPID', '--value'], text=True))
+            unit = 'motor-boat-host' if host else 'motor-boat'
+            pid = int(subprocess.check_output(['systemctl', 'show', unit, '--property=MainPID', '--value'], text=True))
             try:
-                if Path(f'/proc/{pid}/exe').resolve().name == 'motor-runner' and owns_listener(pid):
+                ready = (Path(f'/proc/{pid}/exe').resolve().name == 'motor-host' and owns_endpoint(pid)) if host else (
+                    Path(f'/proc/{pid}/exe').resolve().name == 'motor-runner' and
+                    all(owns_listener(pid, path) for path in (SOCKET, '/run/motor-tenant/jobs.sock', '/run/motor-tenant/events.sock', '/run/motor-tenant/admin.sock')))
+                if ready:
                     return
             except (OSError, ValueError):
                 pass
             time.sleep(.1)
-        raise RuntimeError('final runner never owned its listening socket')
+        raise RuntimeError('service never owned its required listening sockets')
     baseline = json.loads(Path('/run/motor-boat-memory.json').read_text())
     available = baseline['mem_available_bytes']
     command = ['/usr/local/bin/motor-runner', *sys.argv[1:]]

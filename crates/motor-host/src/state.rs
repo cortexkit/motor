@@ -161,6 +161,7 @@ pub struct Host {
     observed_at_ms: u64,
     pub(crate) restart_ms: u64,
     pub(crate) prior_alive_ms: u64,
+    pub(crate) provider_managed: bool,
 }
 impl Host {
     pub fn new(
@@ -178,10 +179,32 @@ impl Host {
             observed_at_ms: 0,
             restart_ms: 0,
             prior_alive_ms: 0,
+            provider_managed: false,
         }
     }
+    pub(crate) fn sandbox(ceiling: u32, snapshot: Snapshot, journal: Box<dyn Journal>) -> Self {
+        let mut host = Self::new(
+            BTreeMap::from([(
+                "sandbox".into(),
+                Tenant {
+                    tenant: "sandbox".into(),
+                    sub: String::new(),
+                    vcpu_ceiling: ceiling,
+                    guest_ram_mib: 0,
+                    idle_suspend_s: u64::MAX,
+                    host_floor_bytes: 0,
+                },
+            )]),
+            snapshot,
+            journal,
+        );
+        host.provider_managed = true;
+        host
+    }
     pub(crate) fn save(&mut self, mut next: Snapshot) -> Result<(), Error> {
-        crate::billing::mark_overlap(&mut next);
+        if !self.provider_managed {
+            crate::billing::mark_overlap(&mut next);
+        }
         self.journal.store(&next)?;
         self.snapshot = next;
         self.publish_connections();
@@ -237,8 +260,14 @@ impl Host {
             .vm
             .as_deref()
             .ok_or(Error::Refused(Refusal::Auth))?;
-        let entry = self.tenants.get(vm).ok_or(Error::Refused(Refusal::Auth))?;
-        if entry.sub != claims.sub {
+        // Sandbox placement is authenticated against its freshly read identity
+        // before this shared reservation state is reached. The broker, not a
+        // second local tenant registry, binds the subject to that sandbox.
+        let entry = self
+            .tenants
+            .get(if self.provider_managed { "sandbox" } else { vm })
+            .ok_or(Error::Refused(Refusal::Auth))?;
+        if !self.provider_managed && entry.sub != claims.sub {
             return refuse(Refusal::Auth);
         }
         if let Some(lease) = self.snapshot.leases.get(&claims.jti) {
@@ -577,7 +606,9 @@ impl Host {
                         lease.state = LeaseState::Started;
                         lease.started_at_ms =
                             Some(if live_event { now_ms } else { self.restart_ms });
-                        next.billing.entry(job.clone()).or_default().started_live = live_event;
+                        if !self.provider_managed {
+                            next.billing.entry(job.clone()).or_default().started_live = live_event;
+                        }
                     }
                     TenantEventKind::Terminal
                         if matches!(lease.state, LeaseState::Admitted | LeaseState::Started) =>
@@ -596,9 +627,11 @@ impl Host {
                                 self.prior_alive_ms
                             });
                         }
-                        let billing = next.billing.entry(job.clone()).or_default();
-                        billing.terminal_live = live_event;
-                        billing.ended_observed_ms = Some(now_ms);
+                        if !self.provider_managed {
+                            let billing = next.billing.entry(job.clone()).or_default();
+                            billing.terminal_live = live_event;
+                            billing.ended_observed_ms = Some(now_ms);
+                        }
                     }
                     TenantEventKind::Refused
                         if lease.state == LeaseState::Reserved && lease.delivered =>

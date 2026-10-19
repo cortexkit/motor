@@ -52,6 +52,8 @@ pub struct Config {
     pub boat_memory_max_bytes: Option<u64>,
     #[cfg(target_os = "linux")]
     pub(crate) private_pids: bool,
+    /// Root-private tenant channels instead of vsock, only when explicitly set.
+    pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
@@ -215,6 +217,7 @@ impl Config {
             boat_memory_max_bytes: None,
             #[cfg(target_os = "linux")]
             private_pids: true,
+            tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,

@@ -8,7 +8,7 @@ exact revision being installed:
 
 ```sh
 sudo python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)"
-sudo systemctl start motor-boat
+sudo systemctl start motor-boat motor-boat-host.path
 ```
 
 `pins.json` fixes the official signed Ubuntu source URLs, Rust/rustup, Node,
@@ -57,8 +57,8 @@ The operator's prerequisite pass measured systemd **255.4**, which rejects
 compatibility choice approved for this provider. The runner queries the actual
 system manager's version. Without the flag, systemd <257 refuses startup; the
 build server never silently loses PID isolation. On newer systemd even the Boat
-profile retains PrivatePIDs. The flag is refused for non-Linux, VM and tenant-VM
-CLI configurations.
+profile retains PrivatePIDs. The flag requires the Linux host backend; tenant
+mode additionally requires root-private local sockets rather than vsock.
 
 On systemd 255, jobs share the sandbox's PID namespace. The per-job PID
 visibility boundary is lost: jobs using the same `motor-job` UID can see and
@@ -92,9 +92,8 @@ service (including the small wrapper and charged startup cache) is counted,
 conservatively. `/var/lib/motor-boat/budget.json` retains the raw baseline meminfo,
 idle samples, margin and cap. The start wrapper refuses to launch if that computed job budget is below 1 GiB.
 The reserved 512 MiB is headroom for the disposable loopback bridge and the
-separately built authenticated endpoint, not a measured claim that their future
-peak usage will fit. The full probe records the final idle `motor-boat.service`
-and `motor-boat-bridge.service` cgroups independently. ExecStartPost requires
+separately built authenticated endpoint, not a measured claim that their future peak usage will fit. The full probe records the final idle `motor-boat.service`,
+`motor-boat-host.service` and `motor-boat-bridge.service` cgroups independently. ExecStartPost requires
 the **final daemon PID** to own the listening socket before dependents start.
 
 One job may use all measured usable vCPUs; this recipe targets `large` only and
@@ -118,8 +117,19 @@ options. Production's independent token endpoint supplies admission control.
 
 `/etc/motor/tenant/id` is absent in the base recipe and is removed/rechecked
 immediately before snapshot capture. The broker writes the actual root-owned
-0444 tenant identity on every create. Port **9443 stays free** for the separately
-built endpoint; that endpoint is deliberately not started here.
+0444 tenant identity on every create. The runner and admission endpoint run as root because the trusted tenant channels
+must be root-owned in `/run/motor-tenant` (0700); jobs still run as `motor-job`.
+The runner uses `--tenant-vm --tenant-socket-dir /run/motor-tenant`, never vsock in
+the Boat profile. Readiness requires the daemon PID to own its ordinary socket
+and all three root-0600 `jobs.sock`, `events.sock` and `admin.sock` listeners.
+`motor-host --sandbox /etc/motor/sandbox.json` reads those channels and listens on
+**127.0.0.1:9443**. Its root-owned config records the journal path and measured
+vCPU ceiling. A systemd path unit starts admission only after the broker writes
+the identity file; endpoint readiness checks the endpoint PID's loopback listener.
+The probe installs a temporary root-0444 test identity, verifies an actual
+`lease_refused/auth` frame for an invalid token, stops admission and removes the
+identity before snapshot capture. This is a negative admission check, not a
+successful broker-token job test.
 
 The unauthenticated bridge is **probe-only**, loopback **127.0.0.1:19443** to the
 ordinary runner Unix socket. Its unit is installed but never enabled; only the

@@ -207,12 +207,13 @@ class Probe:
             time.sleep(2)
         raise ProbeError("timed out polling command " + str(process))
 
-    def guest(self, sid, phase, timeout=90, version="1.85.1"):
+    def guest(self, sid, phase, timeout=90, version="1.85.1", port=None):
         encoded = base64.b64encode(self.source).decode()
         script = self.base + "/guest.py"
+        port = self.port if port is None else port
         text = ("cd \"$HOME\" && mkdir -p " + shlex.quote(self.base) + " && printf %s " + shlex.quote(encoded) +
                 " | base64 -d > " + shlex.quote(script) + "; python3 " + shlex.quote(script) + " " +
-                shlex.quote(phase) + " " + shlex.quote(self.base) + " --port " + str(self.port) +
+                shlex.quote(phase) + " " + shlex.quote(self.base) + " --port " + str(port) +
                 " --toolchain-version " + shlex.quote(version))
         return command_output(self.execute(sid, text, timeout))
 

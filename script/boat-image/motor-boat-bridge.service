@@ -4,8 +4,8 @@ Requires=motor-boat.service
 After=motor-boat.service
 
 [Service]
-User=motor-boat
-Group=motor-boat
+User=root
+Group=root
 ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-bridge.py
 Restart=on-failure
 UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN

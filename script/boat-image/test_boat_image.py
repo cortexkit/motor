@@ -66,9 +66,24 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("--boat-profile", unit)
         self.assertIn("--max-weight @VCPUS@", unit)
         self.assertIn("--job-network veth", unit)
-        self.assertIn("User=motor-boat", unit)
+        self.assertIn("User=root", unit)
+        self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
+        self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
+
+    def test_target_directories_exist_before_installing_binaries_or_units(self):
+        with patch.object(install, 'run') as run:
+            install.target_directories()
+        self.assertEqual(run.call_args.args[:8], ('install','-d','-o','root','-g','root','-m','0755'))
+        self.assertTrue({'/usr/local/bin','/usr/local/libexec','/etc/systemd/system','/etc/ssh/sshd_config.d','/etc/motor','/etc/motor/tenant'} <= set(run.call_args.args[8:]))
+
+    def test_admission_endpoint_waits_for_identity_without_baking_it_into_image(self):
+        unit = (HERE / 'motor-boat-host.service').read_text()
+        path = (HERE / 'motor-boat-host.path').read_text()
+        self.assertIn('ConditionPathExists=/etc/motor/tenant/id', unit)
+        self.assertIn('motor-host --sandbox /etc/motor/sandbox.json', unit)
+        self.assertIn('PathExists=/etc/motor/tenant/id', path)
 
     def test_memory_budget_subtracts_measured_idle_and_margin(self):
         self.assertEqual(start.budget(16*(1<<30), 1<<30), 15569256448)

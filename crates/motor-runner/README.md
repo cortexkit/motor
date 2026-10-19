@@ -20,6 +20,16 @@ tests; it is not an isolation boundary.
 
 ## Tenant VM mode
 
+For an in-sandbox admission endpoint instead of a VM host, add
+`--tenant-socket-dir <directory>` to `--tenant-vm`. This replaces the vsock
+tenant listeners with `jobs.sock`, `events.sock` and `admin.sock`, each mode
+0600, in a pre-created root-owned mode-0700 directory with root-owned,
+non-writable-by-jobs ancestors. The job and event sockets serve the same tenant
+handlers, not the ordinary unleased protocol; admin permits only cancel, drain,
+resume and status. Existing live sockets, foreign nodes and symlinks are never
+unlinked. The default remains vsock. See `motor-host`'s sandbox mode for the
+matching admission configuration.
+
 On Linux, `serve --backend host --tenant-vm` adds host-CID-only vsock
 listeners on ports 52 (job connections) and 53 (durable lifecycle events).
 On port 52 the host, after authenticating the client's job token, must write

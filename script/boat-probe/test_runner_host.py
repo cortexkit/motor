@@ -59,6 +59,16 @@ class RunnerHostTests(unittest.TestCase):
         self.assertIn("memory.max", host.JOB)
         self.assertNotEqual(host.PORT, 9443)
 
+    def test_admission_parser_requires_real_auth_refusal_and_all_private_sockets(self):
+        sample = {'endpoint_refusal': {'connected': True, 'frame': {'type':'lease_refused','reason':'auth'}},
+                  'tenant_sockets': {path: {'uid':0, 'mode': '0o700' if path == '/run/motor-tenant' else '0o600', 'socket':path != '/run/motor-tenant'}
+                     for path in ('/run/motor-tenant','/run/motor-tenant/jobs.sock','/run/motor-tenant/events.sock','/run/motor-tenant/admin.sock')}}
+        self.assertTrue(all(host.admission_checks(sample).values()))
+        sample['endpoint_refusal'] = {'error':'connection refused'}
+        self.assertFalse(host.admission_checks(sample)['endpoint_rejects_invalid_token'])
+        sample['tenant_sockets'] = {}
+        self.assertFalse(host.admission_checks(sample)['root_private_tenant_sockets'])
+
 
 if __name__ == "__main__":
     unittest.main()

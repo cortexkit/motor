@@ -127,6 +127,33 @@ fn every_mirrored_token_vector() {
 }
 
 #[test]
+fn boat_audience_accepts_only_its_namespace_and_valid_sandbox_names() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    for (audience, accepted) in [
+        ("test-host".to_owned(), true),
+        ("boat:bx_test-1.2".to_owned(), true),
+        (format!("boat:{}", "a".repeat(64)), true),
+        (format!("boat:{}", "a".repeat(65)), false),
+        ("boat:".to_owned(), false),
+        ("boat:bad/id".to_owned(), false),
+        ("boat:bad id".to_owned(), false),
+        ("boat:boat:bx_test".to_owned(), false),
+        ("other:bx_test".to_owned(), false),
+        ("Boat:bx_test".to_owned(), false),
+    ] {
+        let mut c = claims();
+        c.aud = audience.clone();
+        c.placement.host = audience.clone();
+        let token = sign_token(&c, "current", &key).unwrap();
+        assert_eq!(
+            verify_token(&token, &keys(), &audience, None, Purpose::Run, c.iat).is_ok(),
+            accepted,
+            "{audience}"
+        );
+    }
+}
+
+#[test]
 fn key_rotation_cache_keeps_last_good_and_removes_retired_keys() {
     let fixture = vectors();
     let token = fixture["token_cases"][0]["token"].as_str().unwrap();
