@@ -7,11 +7,15 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn trace(event: &str, detail: serde_json::Value) {
-    let unix_ms = std::time::SystemTime::now()
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
+        .as_millis()
+}
+
+fn trace(event: &str, detail: serde_json::Value) {
+    let unix_ms = unix_ms();
     eprintln!(
         "EVIDENCE transport {}",
         serde_json::json!({"event": event, "unix_ms": unix_ms, "detail": detail})
@@ -22,6 +26,7 @@ struct TracedIo<T> {
     inner: T,
     read: usize,
     written: usize,
+    first_com_byte_unix_ms: Option<u128>,
 }
 impl<T: io::Read> io::Read for TracedIo<T> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -33,6 +38,14 @@ impl<T: io::Read> io::Read for TracedIo<T> {
         let result = self.inner.read(bytes);
         match &result {
             Ok(count) => {
+                if *count > 0 && self.first_com_byte_unix_ms.is_none() {
+                    let first = unix_ms();
+                    self.first_com_byte_unix_ms = Some(first);
+                    trace(
+                        "first-com-byte",
+                        serde_json::json!({"first_com_byte_unix_ms":first}),
+                    );
+                }
                 self.read += count;
                 trace(
                     "read-done",
@@ -163,6 +176,9 @@ struct Row {
     boot_hello_ms: f64,
     command_ms: f64,
     teardown_ms: f64,
+    start_vm_call_ms: f64,
+    start_to_first_byte_ms: f64,
+    first_byte_to_hello_ms: f64,
 }
 
 fn summary(rows: &[Row]) -> io::Result<serde_json::Value> {
@@ -183,6 +199,18 @@ fn summary(rows: &[Row]) -> io::Result<serde_json::Value> {
         ),
         ("command_ms", rows.iter().map(|r| r.command_ms).collect()),
         ("teardown_ms", rows.iter().map(|r| r.teardown_ms).collect()),
+        (
+            "start_vm_call_ms",
+            rows.iter().map(|r| r.start_vm_call_ms).collect(),
+        ),
+        (
+            "start_to_first_byte_ms",
+            rows.iter().map(|r| r.start_to_first_byte_ms).collect(),
+        ),
+        (
+            "first_byte_to_hello_ms",
+            rows.iter().map(|r| r.first_byte_to_hello_ms).collect(),
+        ),
     ] {
         if values.iter().any(|v| !v.is_finite() || *v < 0.0) {
             return Err(invalid("invalid duration"));
@@ -200,7 +228,11 @@ fn summary(rows: &[Row]) -> io::Result<serde_json::Value> {
 #[derive(Serialize)]
 struct Probe {
     hello_unix_ms: u128,
+    first_com_byte_unix_ms: u128,
     command_ms: f64,
+    command_start_unix_ms: u128,
+    command_exit_unix_ms: u128,
+    protocol_complete_unix_ms: u128,
 }
 
 fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Probe> {
@@ -208,6 +240,7 @@ fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Pro
         inner: pipe,
         read: 0,
         written: 0,
+        first_com_byte_unix_ms: None,
     };
     let mut session = Session::new(Peer::Host, &args.nonce)?;
     let receive = |session: &mut Session, pipe: &mut _| -> io::Result<Frame> {
@@ -282,6 +315,7 @@ fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Pro
         return Err(invalid("expected tree_received"));
     }
     let command = Instant::now();
+    let command_start_unix_ms = unix_ms();
     trace("command-start", serde_json::json!({}));
     session.send(&mut pipe, &Frame::Start {})?;
     if receive(&mut session, &mut pipe)? != (Frame::Started {}) {
@@ -304,6 +338,7 @@ fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Pro
         }
     }
     let command_ms = command.elapsed().as_secs_f64() * 1000.0;
+    let command_exit_unix_ms = unix_ms();
     trace("command-exit", serde_json::json!({"command_ms":command_ms}));
     let stdout = String::from_utf8(stdout).map_err(io::Error::other)?;
     for required in [
@@ -329,9 +364,16 @@ fn conversation<T: io::Read + io::Write>(pipe: T, args: &Args) -> io::Result<Pro
         return Err(invalid("unclean dismount"));
     }
     println!("PASS protocol-complete");
+    let protocol_complete_unix_ms = unix_ms();
     Ok(Probe {
         hello_unix_ms,
+        first_com_byte_unix_ms: pipe
+            .first_com_byte_unix_ms
+            .ok_or_else(|| invalid("Hello without a first byte"))?,
         command_ms,
+        command_start_unix_ms,
+        command_exit_unix_ms,
+        protocol_complete_unix_ms,
     })
 }
 
@@ -376,7 +418,7 @@ fn run() -> io::Result<()> {
     let values: Vec<_> = std::env::args().skip(1).collect();
     if values == ["--version"] {
         println!(
-            "motor Hyper-V spike protocol {} trace=1",
+            "motor Hyper-V spike protocol {} trace=2",
             motor_winagent::PROTOCOL_VERSION
         );
         return Ok(());
@@ -419,13 +461,18 @@ mod tests {
             inner: io::Cursor::new(vec![1, 2, 3]),
             read: 0,
             written: 0,
+            first_com_byte_unix_ms: None,
         };
+        assert_eq!(io::Read::read(&mut stream, &mut []).unwrap(), 0);
+        assert!(stream.first_com_byte_unix_ms.is_none());
         let mut bytes = [0; 2];
         io::Read::read_exact(&mut stream, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2]);
         io::Write::write_all(&mut stream, &[9, 8, 7]).unwrap();
         io::Write::flush(&mut stream).unwrap();
         assert_eq!((stream.read, stream.written), (2, 3));
+        assert!(stream.first_com_byte_unix_ms.is_some());
+        let first = stream.first_com_byte_unix_ms;
         assert_eq!(stream.inner.get_ref(), &[1, 2, 9, 8, 7]);
         assert_eq!(
             io::Read::read_exact(&mut stream, &mut bytes)
@@ -433,6 +480,7 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+        assert_eq!(stream.first_com_byte_unix_ms, first);
     }
 
     struct ScriptedPipe {
@@ -546,6 +594,9 @@ mod tests {
                 boot_hello_ms: v * 2.,
                 command_ms: v * 3.,
                 teardown_ms: v * 4.,
+                start_vm_call_ms: v / 4.,
+                start_to_first_byte_ms: v / 2.,
+                first_byte_to_hello_ms: v * 1.5,
             })
             .collect();
         let result = summary(&rows).unwrap();
@@ -553,6 +604,9 @@ mod tests {
         assert_eq!(result["boot_hello_ms"]["median"], 6.);
         assert_eq!(result["command_ms"]["median"], 9.);
         assert_eq!(result["teardown_ms"]["median"], 12.);
+        assert_eq!(result["start_vm_call_ms"]["median"], 0.75);
+        assert_eq!(result["start_to_first_byte_ms"]["median"], 1.5);
+        assert_eq!(result["first_byte_to_hello_ms"]["median"], 4.5);
         assert_eq!(
             result["create_ms"]["raw"],
             serde_json::json!([1000., 3., 1., 5., 2.])

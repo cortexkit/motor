@@ -13,9 +13,9 @@ function Assert-Refused([scriptblock]$Check, [string]$Reason) {
     try { & $Check | Out-Null } catch { $message = $_.Exception.Message }
     if ($message -notlike "*$Reason*") { throw "expected refusal '$Reason', got '$message'" }
 }
-Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion)"
+Write-Host "PowerShell $($PSVersionTable.PSVersion) $([Environment]::OSVersion) zone=$([TimeZoneInfo]::Local.Id)"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
-foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/build-probe.ps1','script/hyperv-spike/diagnostics.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
+foreach ($relative in @('script/hyperv-spike/common.ps1','script/hyperv-spike/process.ps1','script/hyperv-spike/boot-files.ps1','script/hyperv-spike/build-probe.ps1','script/hyperv-spike/diagnostics.ps1','script/hyperv-spike/provision.ps1','script/hyperv-spike/measure.ps1','crates/motor-winagent/examples/isolation.ps1','script/windows-vm/bootstrap.ps1','script/windows-vm/setup-job-baseline.ps1','script/windows-vm/install-powershell.ps1')) {
     Test-SpikeLogic "parse-$relative" {
         $tokens = $null; $errors = $null
         [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $repo $relative), [ref]$tokens, [ref]$errors)
@@ -59,6 +59,69 @@ Test-SpikeLogic 'host-files-denies-local-unc-and-agent-secret' {
 . "$PSScriptRoot/common.ps1"
 . "$PSScriptRoot/boot-files.ps1"
 . "$PSScriptRoot/diagnostics.ps1"
+Test-SpikeLogic 'native-argument-quoting-keeps-quotes-spaces-and-trailing-slashes' {
+    Assert-Logic ((Convert-SpikeNativeArgument '') -ceq '""')
+    Assert-Logic ((Convert-SpikeNativeArgument 'a b') -ceq '"a b"')
+    Assert-Logic ((Convert-SpikeNativeArgument 'a"b') -ceq '"a\"b"')
+    Assert-Logic ((Convert-SpikeNativeArgument 'C:\tail\') -ceq '"C:\tail\\"')
+    Assert-Refused { Convert-SpikeNativeArgument ('a' + [char]0) } 'NUL'
+}
+Test-SpikeLogic 'managed-native-exit-zero-nonzero-and-stderr-under-stop' {
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('motor-native-' + [Guid]::NewGuid().ToString('N'))
+    New-Item $scratch -ItemType Directory | Out-Null
+    try {
+        foreach ($code in @(0,23)) {
+            $command = '[Console]::Out.Write("fixture output"); [Console]::Error.Write("Updating crates.io index"); exit ' + $code
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+            $result = Invoke-SpikeNative (Get-Process -Id $PID).Path @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) $scratch "fixture-$code"
+            Assert-Logic ($result.exitCode -eq $code -and $result.stdout -ceq 'fixture output' -and $result.stderr -ceq 'Updating crates.io index')
+        }
+    } finally { Remove-Item $scratch -Recurse -Force }
+}
+Test-SpikeLogic 'managed-native-argument-roundtrip-with-spaces-quotes-and-empty-value' {
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('motor-native-argv-' + [Guid]::NewGuid().ToString('N'))
+    New-Item $scratch -ItemType Directory | Out-Null
+    try {
+        $file = Join-Path $scratch 'arguments.ps1'
+        # Inspect CLR argv, before Windows PowerShell 5.1 reinterprets file args.
+        Set-Content $file '[Console]::Out.Write((ConvertTo-Json -InputObject @([Environment]::GetCommandLineArgs()) -Compress))' -Encoding UTF8
+        $expected = @('space value','quote"value','C:\trail\','')
+        $running = Start-SpikeNativeProcess (Get-Process -Id $PID).Path (@('-NoProfile','-NonInteractive','-File',$file) + $expected)
+        try {
+            Assert-Logic ($running.process.WaitForExit(10000))
+            $result = Complete-SpikeNativeProcess $running '' ''
+            $allArguments = ConvertFrom-Json -InputObject $result.stdout
+            $actual = $allArguments[($allArguments.Count - 4)..($allArguments.Count - 1)]
+            if ($result.exitCode -ne 0 -or $actual.Count -ne 4 -or ($actual -join '|') -cne ($expected -join '|')) { throw "Native argv mismatch: actualCount=$($actual.Count) expected=$($expected -join '|') actual=$($actual -join '|') json=$($result.stdout) stderr=$($result.stderr)" }
+        } finally { Close-SpikeNativeProcess $running }
+    } finally { Remove-Item $scratch -Recurse -Force }
+}
+Test-SpikeLogic 'managed-native-capture-drains-both-large-streams' {
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('[Console]::Out.Write(("O"*200000)); [Console]::Error.Write(("E"*200000))'))
+    $running = Start-SpikeNativeProcess (Get-Process -Id $PID).Path @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
+    try {
+        Assert-Logic ($running.process.WaitForExit(10000))
+        $result = Complete-SpikeNativeProcess $running '' ''
+        Assert-Logic ($result.exitCode -eq 0 -and $result.stdout.Length -eq 200000 -and $result.stderr.Length -eq 200000)
+    } finally { Close-SpikeNativeProcess $running }
+}
+Test-SpikeLogic 'managed-native-timeout-kills-before-capturing-status' {
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Start-Sleep -Seconds 10'))
+    $running = Start-SpikeNativeProcess (Get-Process -Id $PID).Path @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
+    try {
+        Assert-Logic (-not $running.process.WaitForExit(100))
+        $running.process.Kill(); $running.process.WaitForExit()
+        $result = Complete-SpikeNativeProcess $running '' ''
+        Assert-Logic ($result.exitCode -ne 0)
+    } finally { Close-SpikeNativeProcess $running }
+}
+Test-SpikeLogic 'missing-native-exit-status-never-becomes-zero' {
+    $process = [pscustomobject]@{ HasExited=$true; ExitCode=$null }
+    $process | Add-Member ScriptMethod WaitForExit {}
+    $stdout = [Threading.Tasks.TaskCompletionSource[string]]::new(); $stdout.SetResult('')
+    $stderr = [Threading.Tasks.TaskCompletionSource[string]]::new(); $stderr.SetResult('')
+    Assert-Refused { Complete-SpikeNativeProcess ([pscustomobject]@{process=$process; stdout=$stdout.Task; stderr=$stderr.Task}) '' '' } 'exit status is missing'
+}
 Test-SpikeLogic 'guest-evidence-never-descends-through-reparse-ancestors' {
     $visited = [Collections.Generic.List[string]]::new()
     $read = {
@@ -146,6 +209,12 @@ Test-SpikeLogic 'pass-fail-helper-never-passes-false' { Assert-Refused { Assert-
 Test-SpikeLogic 'unix-time-is-milliseconds' {
     $now = Get-SpikeUnixMs
     Assert-Logic ($now -gt 1700000000000 -and $now -lt 2100000000000)
+}
+Test-SpikeLogic 'unix-time-uses-utc-epoch-independent-of-local-zone' {
+    Assert-Logic ((Get-SpikeUnixMs ([DateTimeOffset]'1970-01-01T01:00:00+01:00')) -eq 0)
+    Assert-Logic ((Get-SpikeUnixMs ([DateTimeOffset]'1970-01-01T01:00:01.234+01:00')) -eq 1234)
+    $expected = [long](([DateTime]::UtcNow.Ticks - 621355968000000000L) / 10000)
+    Assert-Logic ([Math]::Abs((Get-SpikeUnixMs) - $expected) -lt 1000)
 }
 Test-SpikeLogic 'iso-stream-writer-compiles' {
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'common.ps1'), [ref]$tokens, [ref]$errors)

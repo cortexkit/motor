@@ -1,6 +1,7 @@
 # Shared operator helpers. Dot-source from Windows PowerShell 5.1, elevated.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. "$PSScriptRoot\process.ps1"
 
 function Assert-Spike($Condition, [string]$Name, $Evidence) {
     if (-not $Condition) { throw "FAIL $Name $Evidence" }
@@ -116,7 +117,7 @@ public static class MotorSpikeIso {
     Assert-Spike ((Get-Item $Path).Length -gt 0) 'seed-iso' ((Get-FileHash $Path).Hash)
 }
 
-function Get-SpikeUnixMs { return [long]([DateTime]::UtcNow - [DateTime]'1970-01-01Z').TotalMilliseconds }
+function Get-SpikeUnixMs([DateTimeOffset]$Instant = [DateTimeOffset]::UtcNow) { return $Instant.ToUnixTimeMilliseconds() }
 
 function Test-SpikePipeAbsent([string]$Pipe) {
     $path = "\\.\pipe\$Pipe"
