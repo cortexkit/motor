@@ -98,10 +98,11 @@ struct Args {
     canary: String,
     host: String,
     result: String,
+    stress_bytes: usize,
 }
 
 fn arguments(values: &[String]) -> io::Result<Args> {
-    if values.len() != 10 {
+    if values.len() != 10 && values.len() != 12 {
         return Err(invalid(
             "expected --pipe NAME --nonce UUID --canary PATH --host NAME --result PATH",
         ));
@@ -112,6 +113,11 @@ fn arguments(values: &[String]) -> io::Result<Args> {
             return Err(invalid("duplicate option"));
         }
     }
+    let stress_bytes = match pairs.remove("--stress-bytes").as_deref() {
+        None | Some("0") => 0,
+        Some("65536") => 65536,
+        _ => return Err(invalid("stress bytes must be 0 or 65536")),
+    };
     let mut take = |key| {
         pairs
             .remove(key)
@@ -123,7 +129,11 @@ fn arguments(values: &[String]) -> io::Result<Args> {
         canary: take("--canary")?,
         host: take("--host")?,
         result: take("--result")?,
+        stress_bytes,
     };
+    if !pairs.is_empty() {
+        return Err(invalid("unknown option"));
+    }
     motor_winagent::transport::hyperv_nonce(&args.nonce)?;
     if !args.pipe.starts_with("motor-hv-")
         || !args
@@ -166,6 +176,14 @@ fn tree(args: &Args) -> io::Result<Vec<u8>> {
     header.set_mode(0o644);
     header.set_cksum();
     tar.append_data(&mut header, "m/spike/check.ps1", script.as_bytes())?;
+    if args.stress_bytes != 0 {
+        let padding = vec![0u8; args.stress_bytes];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(padding.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "m/spike/serial-stress.bin", padding.as_slice())?;
+    }
     tar.into_inner()
 }
 
@@ -418,7 +436,7 @@ fn run() -> io::Result<()> {
     let values: Vec<_> = std::env::args().skip(1).collect();
     if values == ["--version"] {
         println!(
-            "motor Hyper-V spike protocol {} trace=2",
+            "motor Hyper-V spike protocol {} trace=3",
             motor_winagent::PROTOCOL_VERSION
         );
         return Ok(());
@@ -452,6 +470,7 @@ mod tests {
             canary: "C:\\motor spike\\it's private.txt".into(),
             host: "HOST-1".into(),
             result: "C:\\result.json".into(),
+            stress_bytes: 0,
         }
     }
 
@@ -562,6 +581,13 @@ mod tests {
         ]
         .map(str::to_owned);
         assert_eq!(arguments(&values).unwrap(), a);
+        let mut stress = values.to_vec();
+        stress.extend(["--stress-bytes".to_owned(), "65536".to_owned()]);
+        assert_eq!(arguments(&stress).unwrap().stress_bytes, 65536);
+        stress[11] = "1".into();
+        assert!(arguments(&stress).is_err());
+        stress[10] = "--unknown".into();
+        assert!(arguments(&stress).is_err());
         for (index, value) in [
             (0, "--other"),
             (2, "--pipe"),
@@ -584,6 +610,21 @@ mod tests {
         assert!(script.contains("'C:\\motor spike\\it''s private.txt'"));
         assert!(script.contains("'\\\\HOST-1\\C$\\motor spike\\it''s private.txt'"));
         assert!(script.contains("$Evidence.groups -contains 'S-1-5-32-544'"));
+    }
+    #[test]
+    fn serial_stress_tree_is_bounded_and_has_no_extra_command() {
+        let mut a = args();
+        a.stress_bytes = 65536;
+        let bytes = tree(&a).unwrap();
+        assert!(bytes.len() < motor_winagent::CHUNK_BYTES);
+        motor_winagent::validate_tree(&mut io::Cursor::new(&bytes)).unwrap();
+        let entries: Vec<_> = tar::Archive::new(bytes.as_slice())
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, ["m/spike/check.ps1", "m/spike/serial-stress.bin"]);
+        assert_eq!(isolation_script(&a), isolation_script(&args()));
     }
     #[test]
     fn medians_use_all_five_samples_not_average_and_reject_skips() {

@@ -9,11 +9,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     guest::run()
 }
 
+#[cfg(all(windows, feature = "hyperv-spike"))]
+mod hyperv_diag;
 #[cfg(windows)]
 mod storage;
 
 #[cfg(windows)]
 mod guest {
+    macro_rules! diagnostic {
+        ($($arg:tt)*) => {{ #[cfg(feature = "hyperv-spike")] crate::hyperv_diag::event(&format!($($arg)*)); }};
+    }
     use motor_winagent::{
         CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CACHE_MOUNT, CHUNK_BYTES, CacheAce, CacheTimings,
         Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
@@ -177,13 +182,49 @@ mod guest {
                 match Handle::new(handle) {
                     Ok(handle) => {
                         #[cfg(feature = "hyperv-spike")]
-                        motor_winagent::transport::configure_com(unsafe {
-                            std::os::windows::io::BorrowedHandle::borrow_raw(handle.0)
-                        })?;
-                        return Ok(Self {
-                            handle: Arc::new(handle),
-                            stop,
-                        });
+                        {
+                            let setup = motor_winagent::transport::configure_com(unsafe {
+                                std::os::windows::io::BorrowedHandle::borrow_raw(handle.0)
+                            })?;
+                            diagnostic!("COM configured {setup}");
+                        }
+                        let handle = Arc::new(handle);
+                        #[cfg(feature = "hyperv-spike")]
+                        {
+                            let monitor = handle.clone();
+                            let monitor_stop = stop.clone();
+                            thread::spawn(move || {
+                                let mut previous = None;
+                                let mut tick = 0u64;
+                                while !monitor_stop.signalled() {
+                                    let status = motor_winagent::transport::serial_status(unsafe {
+                                        std::os::windows::io::BorrowedHandle::borrow_raw(monitor.0)
+                                    });
+                                    match status {
+                                        Ok(value) => {
+                                            if value.0 != 0
+                                                || previous != Some(value)
+                                                || tick.is_multiple_of(10)
+                                            {
+                                                diagnostic!(
+                                                    "COM status errors=0x{:x} rxover={} overrun={} queued_in={} queued_out={}",
+                                                    value.0,
+                                                    value.0 & 1 != 0,
+                                                    value.0 & 2 != 0,
+                                                    value.1,
+                                                    value.2
+                                                );
+                                            }
+                                            previous = Some(value);
+                                        }
+                                        Err(error) => diagnostic!("COM status error: {error}"),
+                                    }
+                                    tick += 1;
+                                    thread::sleep(Duration::from_millis(500));
+                                }
+                            });
+                        }
+                        return Ok(Self { handle, stop });
                     }
                     Err(error) if stop.signalled() || Instant::now() >= deadline => {
                         return Err(error);
@@ -194,6 +235,10 @@ mod guest {
         }
 
         fn transfer(&self, bytes: *mut u8, length: usize, write: bool) -> io::Result<usize> {
+            diagnostic!(
+                "io {} start requested={length}",
+                if write { "write" } else { "read" }
+            );
             if self.stop.signalled() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -225,8 +270,14 @@ mod guest {
                         &mut operation,
                     )
                 };
-                if result == 0 && GetLastError() != ERROR_IO_PENDING {
-                    let error = io::Error::last_os_error();
+                let last_error = if result == 0 { GetLastError() } else { 0 };
+                diagnostic!(
+                    "io submitted success={} transferred={} last_error={last_error}",
+                    result != 0,
+                    transferred
+                );
+                if result == 0 && last_error != ERROR_IO_PENDING {
+                    let error = io::Error::from_raw_os_error(last_error as i32);
                     if !write && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
                         return Ok(0);
                     }
@@ -248,6 +299,10 @@ mod guest {
                     &mut transferred,
                     1,
                 ))?;
+                diagnostic!(
+                    "io {} done bytes={transferred}",
+                    if write { "write" } else { "read" }
+                );
                 Ok(transferred as usize)
             }
         }
@@ -289,6 +344,8 @@ mod guest {
         let _ = service();
     }
     fn service() -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "hyperv-spike")]
+        crate::hyperv_diag::init();
         let stop = Arc::new(Handle::event()?);
         let handler_stop = stop.clone();
         let status =
@@ -317,6 +374,7 @@ mod guest {
         };
         report(ServiceState::Running, 0)?;
         let result = serve(stop.clone());
+        diagnostic!("service result: {result:?}");
         stop.signal();
         report(ServiceState::Stopped, if result.is_ok() { 0 } else { 1 })?;
         result.map_err(Into::into)
@@ -850,7 +908,10 @@ mod guest {
             let mut port = port;
             loop {
                 match read_frame(&mut port) {
-                    Ok(Some(frame)) => post(&tx, &reader_stop, Event::Host(frame)),
+                    Ok(Some(frame)) => {
+                        diagnostic!("reader complete frame");
+                        post(&tx, &reader_stop, Event::Host(frame));
+                    }
                     Ok(None) => {
                         post(
                             &tx,
@@ -863,6 +924,7 @@ mod guest {
                         break;
                     }
                     Err(error) => {
+                        diagnostic!("reader error: {error}");
                         post(&tx, &reader_stop, Event::Lost(error));
                         break;
                     }
@@ -1231,9 +1293,13 @@ mod guest {
             .write(true)
             .create_new(true)
             .open(temp.join("motor-tree.tar"))?;
+        diagnostic!("staging archive opened");
         let command = loop {
             match receive(protocol, rx, &port.stop)? {
-                Frame::ReceiveTree { bytes } => archive.write_all(&bytes)?,
+                Frame::ReceiveTree { bytes } => {
+                    diagnostic!("staging ReceiveTree bytes={}", bytes.len());
+                    archive.write_all(&bytes)?;
+                }
                 Frame::TreeEnd { command } => break command,
                 _ => return Err(invalid("expected tree transfer")),
             }
@@ -1257,6 +1323,7 @@ mod guest {
         drop(archive);
         std::fs::remove_file(temp.join("motor-tree.tar"))?;
         send(protocol, port, &Frame::TreeReceived {})?;
+        diagnostic!("staging TreeReceived sent");
         Ok((command, before))
     }
 
@@ -1417,6 +1484,7 @@ mod guest {
             enable_privilege(privilege)?;
         }
         let nonce = boot_nonce()?;
+        diagnostic!("boot nonce={nonce}");
         let mut protocol = Protocol::new(&nonce)?;
         let mut port = Port::open(stop)?;
         let (tx, rx) = mpsc::sync_channel(16);

@@ -67,6 +67,19 @@ Test-SpikeLogic 'smart-app-control-enforcement-refuses-unsigned-spike-before-bui
 }
 . "$PSScriptRoot/boot-files.ps1"
 . "$PSScriptRoot/diagnostics.ps1"
+Test-SpikeLogic 'partial-client-progress-preserves-hello-before-a-later-timeout' {
+    $text = @'
+EVIDENCE transport {"event":"first-com-byte","unix_ms":100,"detail":{"first_com_byte_unix_ms":100}}
+EVIDENCE transport {"event":"hello-validated","unix_ms":101,"detail":{"hello_unix_ms":101}}
+EVIDENCE transport {"event":"send-tree-end-done","unix_ms":102,"detail":{}}
+EVIDENCE transport {"event":"await-frame","unix_ms":103,"detail":{"state":"AwaitTreeReceived"}}
+EVIDENCE transport {"event":"read-start","unix_ms":104,"detail":{"requested":1,"total":415}}
+'@
+    $progress = Get-SpikeClientProgress $text
+    Assert-Logic ($progress.first_com_byte_unix_ms -eq 100 -and $progress.hello_unix_ms -eq 101)
+    Assert-Logic ($progress.last_protocol_wait -ceq 'AwaitTreeReceived' -and $progress.last_transport_event -ceq 'read-start')
+    Assert-Logic ($progress.tree_end_send_done_unix_ms -eq 102)
+}
 Test-SpikeLogic 'native-argument-quoting-keeps-quotes-spaces-and-trailing-slashes' {
     Assert-Logic ((Convert-SpikeNativeArgument '') -ceq '""')
     Assert-Logic ((Convert-SpikeNativeArgument 'a b') -ceq '"a b"')

@@ -8,7 +8,10 @@ Run elevated after provision.ps1 succeeds. Parent hashing is outside the phase
 timings and may dominate wall time; each client has a 300 s cap. Uses at most one
 8 GiB / 4 vCPU VM and one disposable differencing VHDX. Keeps raw logs and JSON.
 #>
-param([string]$Root = 'C:\motor-spike\hyperv', [string]$ClientPath = '', [switch]$DiagnosticOnly)
+param([string]$Root = 'C:\motor-spike\hyperv', [string]$ClientPath = '', [switch]$DiagnosticOnly,
+    [string]$GuestAgentPath = '', [ValidateSet(0,2097152)][int]$SerialQueueBytes = 2097152,
+    [ValidateSet(0,65536)][int]$StressBytes = 0, [ValidateRange(1,300)][int]$ProbeTimeoutSeconds = 300,
+    [switch]$CompareSerialQueues)
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\diagnostics.ps1"
 $Root = [IO.Path]::GetFullPath($Root)
@@ -17,9 +20,14 @@ $client = if ($ClientPath) { (Resolve-Path -LiteralPath $ClientPath).Path } else
 $lock = $null
 $transcript = $false
 $rows = @()
+$comparison = @()
 $canary = $null
 try {
     $lock = Enter-Spike $Root
+    if (-not $DiagnosticOnly -and ($StressBytes -ne 0 -or $SerialQueueBytes -eq 0 -or $ProbeTimeoutSeconds -ne 300)) { throw 'Serial control/stress/short-timeout options require DiagnosticOnly' }
+    if ($SerialQueueBytes -eq 0 -and -not $GuestAgentPath) { throw 'Serial queue control requires a diagnostic agent override' }
+    if ($CompareSerialQueues -and (-not $DiagnosticOnly -or -not $GuestAgentPath -or $StressBytes -ne 65536 -or $SerialQueueBytes -ne 2097152)) { throw 'Queue comparison requires DiagnosticOnly, GuestAgentPath, StressBytes 65536 and the 2097152-byte fix' }
+    $agentHash = if ($GuestAgentPath) { $GuestAgentPath = (Resolve-Path -LiteralPath $GuestAgentPath).Path; (Get-FileHash -LiteralPath $GuestAgentPath).Hash } else { '' }
     $batch = Join-Path $Root ('measure-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item $batch -ItemType Directory | Out-Null
     Start-Transcript -Path (Join-Path $batch 'host.log') | Out-Host
@@ -30,13 +38,16 @@ try {
     Assert-Spike ((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory -ge 10GB/1KB) 'free-memory-at-least-10GiB' (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
     Assert-Spike (@(Get-ChildItem $Root -Filter 'job-*.vhdx').Count -eq 0) 'no-orphan-job-disk' $Root
     $version = Invoke-SpikeNative $client @('--version') $batch 'client-version'
-    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=2') 'probe-version' ((Get-FileHash $client).Hash)
+    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=3') 'probe-version' ((Get-FileHash $client).Hash)
     $canary = Join-Path $Root ('host-only-' + [Guid]::NewGuid().ToString('N') + '.txt')
     Set-Content $canary ([Guid]::NewGuid().ToString('N')) -Encoding ascii
     Assert-Spike (Test-Path $canary) 'real-host-canary-exists' "path=$canary SHA256=$((Get-FileHash $canary).Hash) (contents never staged)"
-    $runCount = if ($DiagnosticOnly) { 1 } else { 5 }
-    Write-Host "EVIDENCE measurement-mode diagnosticOnly=$DiagnosticOnly runs=$runCount client=$client"
+    $runCount = if ($CompareSerialQueues) { 2 } elseif ($DiagnosticOnly) { 1 } else { 5 }
+    $queueEvidence = if ($GuestAgentPath) { [string]$SerialQueueBytes } else { 'baseline-not-overridden' }
+    Write-Host "EVIDENCE measurement-mode diagnosticOnly=$DiagnosticOnly runs=$runCount client=$client agent=$agentHash serialQueue=$queueEvidence compare=$CompareSerialQueues stressBytes=$StressBytes capSeconds=$ProbeTimeoutSeconds"
     for ($run = 1; $run -le $runCount; $run++) {
+        $activeQueueBytes = if ($CompareSerialQueues -and $run -eq 1) { 0 } else { $SerialQueueBytes }
+        $controlFailure = $null
         $id = [Guid]::NewGuid().ToString('N')
         $name = "motor-hv-$id"
         $pipe = $name
@@ -66,6 +77,16 @@ try {
                 $nonce = Join-Path $volume 'ProgramData\Motor\hyperv-nonce.txt'
                 [IO.File]::WriteAllText($nonce, $id, [Text.UTF8Encoding]::new($false))
                 Assert-Spike ((Get-Acl $nonce).AreAccessRulesProtected -eq $false) 'nonce-inherits-protected-motor-acl' ((Get-Acl $nonce).Sddl)
+                if ($GuestAgentPath) {
+                    $agent = Get-SpikePlainGuestItem $volume 'ProgramData\Motor\motor-winagent.exe'
+                    if (-not $agent) { throw 'Baseline agent path is missing or reparse' }
+                    $beforeAcl = (Get-Acl -LiteralPath $agent.FullName).Sddl
+                    [IO.File]::WriteAllBytes($agent.FullName, [IO.File]::ReadAllBytes($GuestAgentPath))
+                    Assert-Spike ((Get-FileHash -LiteralPath $agent.FullName).Hash -eq $agentHash) 'overlay-agent-hash' $agentHash
+                    Assert-Spike ((Get-Acl -LiteralPath $agent.FullName).Sddl -eq $beforeAcl) 'overlay-agent-acl-preserved' $beforeAcl
+                    [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
+                    Write-Host "EVIDENCE overlay-serial-queue run=$run bytes=$activeQueueBytes"
+                }
             }
             $timeline['define_vm_begin_unix_ms'] = Get-SpikeUnixMs
             New-SpikeVM $name $child $vmDirectory $pipe
@@ -87,10 +108,11 @@ try {
             $timeline['start_vm_return_unix_ms'] = $startReturned
             Write-Host "EVIDENCE start-vm-return unix_ms=$startReturned"
             $clientArgs = @('--pipe', $pipe, '--nonce', $id, '--canary', $canary, '--host', $env:COMPUTERNAME, '--result', $result)
+            if ($StressBytes) { $clientArgs += @('--stress-bytes',[string]$StressBytes) }
             $running = Start-SpikeNativeProcess $client $clientArgs
             $timeline['client_start_unix_ms'] = $running.started_unix_ms
             Write-Host "EVIDENCE probe-start pid=$($running.process.Id) unix_ms=$($running.started_unix_ms)"
-            $finished = $running.process.WaitForExit(300000)
+            $finished = $running.process.WaitForExit($ProbeTimeoutSeconds * 1000)
             if (-not $finished) {
                 Get-VM -Name $name | Select-Object Name,State,Status,Uptime,CPUUsage,MemoryAssigned | Format-List | Out-Host
                 Write-Host "EVIDENCE probe-timeout unix_ms=$(Get-SpikeUnixMs) pid=$($running.process.Id)"
@@ -99,8 +121,10 @@ try {
             $output = Complete-SpikeNativeProcess $running $stdout $stderr
             $timeline['client_exit_unix_ms'] = Get-SpikeUnixMs
             $timeline['client_exit_code'] = $output.exitCode
+            $progress = Get-SpikeClientProgress $output.stderr
+            foreach ($key in $progress.Keys) { $timeline[$key] = $progress[$key] }
             if (-not $finished) {
-                throw 'FAIL probe-timeout (300s total, includes boot/Hello/command/protocol completion)'
+                throw "FAIL probe-timeout (${ProbeTimeoutSeconds}s total, includes boot/Hello/command/protocol completion)"
             }
             Get-Content $stdout,$stderr | Out-Host
             $logsDisplayed = $true
@@ -119,6 +143,11 @@ try {
             $timeline['protocol_complete_unix_ms'] = $probe.protocol_complete_unix_ms
             Write-Host "EVIDENCE boot-timeline $($timeline | ConvertTo-Json -Compress)"
             Assert-Spike ($helloMs -ge 0 -and $helloMs -le 120000) 'boot-to-validated-Hello' "run=$run ms=$helloMs"
+        } catch {
+            if ($CompareSerialQueues -and $run -eq 1 -and $_.Exception.Message -match 'FAIL probe-(timeout|exit)') {
+                $controlFailure = $_.Exception.Message
+                Write-Host "DIAGNOSTIC default-queue control failed: $controlFailure (not an accepted sample)"
+            } else { throw }
         } finally {
             $teardown = [Diagnostics.Stopwatch]::StartNew()
             $timeline['teardown_begin_unix_ms'] = Get-SpikeUnixMs
@@ -151,6 +180,14 @@ try {
                 Write-Host "EVIDENCE full-timeline $($timeline | ConvertTo-Json -Compress)"
             }
         }
+        if ($CompareSerialQueues) {
+            $comparison += [ordered]@{ run=$run; queue_bytes=$activeQueueBytes; completed=($null -eq $controlFailure -and $null -ne $probe); control_failure=$controlFailure; cleanup=$cleanupOkay }
+            ConvertTo-Json -InputObject $comparison -Depth 5 | Set-Content (Join-Path $batch 'serial-comparison.json') -Encoding UTF8
+        }
+        if ($controlFailure) {
+            Assert-Spike $cleanupOkay 'failed-control-cleanup-complete' $run
+            continue
+        }
         Assert-Spike ($cleanupOkay -and $null -ne $probe) 'complete-sample' $run
         $row = [ordered]@{ create_ms=$createMs; boot_hello_ms=$helloMs; command_ms=[double]$probe.command_ms; teardown_ms=$teardownMs; start_vm_call_ms=$startCallMs; start_to_first_byte_ms=$startToFirstMs; first_byte_to_hello_ms=$firstToHelloMs }
         Write-Host "PASS phases run=$run $($row | ConvertTo-Json -Compress)"
@@ -178,7 +215,7 @@ try {
     }
 }
 if ($DiagnosticOnly) {
-    Write-Host 'DIAGNOSTIC single run completed; five-run measurement not performed and no median reported'
+    Write-Host 'DIAGNOSTIC run(s) completed; five-run measurement not performed and no median reported'
     return
 }
 $summary = Invoke-SpikeNative $client @('--summary', (Join-Path $batch 'samples.json')) $batch 'summary'

@@ -1,6 +1,6 @@
-<# Build only the trusted host probe with an already installed Rust/MSVC toolchain.
-No guest image, guest agent, toolchain installation or Windows policy is changed. #>
-param([string]$Root = 'C:\motor-spike\hyperv', [string]$Cargo = 'cargo')
+<# Build trusted spike executables with an already installed Rust/MSVC toolchain.
+The optional agent is an overlay override; no sealed image or Windows policy is changed. #>
+param([string]$Root = 'C:\motor-spike\hyperv', [string]$Cargo = 'cargo', [switch]$WithAgent)
 . "$PSScriptRoot\common.ps1"
 $Root = [IO.Path]::GetFullPath($Root)
 $lock = $null
@@ -16,12 +16,19 @@ try {
         $env:RUSTC_WRAPPER = ''; $env:CARGO_BUILD_RUSTC_WRAPPER = ''
         $built = Invoke-SpikeNative $Cargo @('build','--release','--locked','--manifest-path',$manifest,'--target','x86_64-pc-windows-msvc','--example','hyperv-spike','--target-dir',(Join-Path $Root 'probe-build'),'-j','2') $Root 'cargo-build'
         Assert-Spike ($built.exitCode -eq 0) 'host-probe-built' $manifest
+        if ($WithAgent) {
+            $agentBuild = Invoke-SpikeNative $Cargo @('build','--release','--locked','--manifest-path',$manifest,'--target','x86_64-pc-windows-msvc','--features','hyperv-spike','--bin','motor-winagent','--target-dir',(Join-Path $Root 'probe-build'),'-j','2') $Root 'agent-build'
+            Assert-Spike ($agentBuild.exitCode -eq 0) 'guest-agent-override-built' $manifest
+            $agent = Join-Path $Root 'motor-winagent-hyperv.exe'
+            Copy-Item (Join-Path $Root 'probe-build\x86_64-pc-windows-msvc\release\motor-winagent.exe') $agent -Force
+            Write-Host "EVIDENCE guest-agent-override path=$agent SHA256=$((Get-FileHash $agent).Hash) (not installed in parent)"
+        }
     } finally {
         $env:RUSTC_WRAPPER = $oldWrapper; $env:CARGO_BUILD_RUSTC_WRAPPER = $oldBuildWrapper
     }
     $destination = Join-Path $Root 'hyperv-spike-trace.exe'
     Copy-Item (Join-Path $Root 'probe-build\x86_64-pc-windows-msvc\release\examples\hyperv-spike.exe') $destination -Force
     $version = Invoke-SpikeNative $destination @('--version') $Root 'probe-version'
-    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=2') 'traced-host-probe' "$($version.stdout.Trim()) SHA256=$((Get-FileHash $destination).Hash)"
+    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=3') 'traced-host-probe' "$($version.stdout.Trim()) SHA256=$((Get-FileHash $destination).Hash)"
     Write-Host "PASS measurement-only-client path=$destination (parent and guest agent untouched)"
 } finally { if ($lock) { $lock.Dispose() } }
