@@ -22,6 +22,11 @@ by this probe; the operator supplies their existing authorized reader.
 
 ### Runner host prerequisites (no installs)
 
+For the full toolchain recipe, real motor-client jobs and named-snapshot timing,
+see [`script/boat-image/README.md`](../boat-image/README.md) and use `--runner-host`.
+That mode uses probe-only loopback port 19443, leaving 9443 for the separately
+built authenticated endpoint.
+
 ```sh
 <key reader> | python3 script/boat-probe/probe.py --key-stdin --runner-prerequisites \
   --output .cortexkit/internal-docs/research/boat-runner-prerequisites --max-minutes 5

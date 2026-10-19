@@ -44,6 +44,14 @@ pub struct Config {
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
+    /// Explicit single-tenant Boat compatibility: systemd before 257 cannot
+    /// create private PID namespaces. All other job isolation remains enabled.
+    pub boat_profile: bool,
+    /// One-job Boat budget measured at boot, after idle overhead and headroom.
+    /// Never used for the fleet profile's per-vCPU memory rule.
+    pub boat_memory_max_bytes: Option<u64>,
+    #[cfg(target_os = "linux")]
+    pub(crate) private_pids: bool,
     pub instance: String,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
@@ -203,6 +211,10 @@ impl Config {
         let state_root = state_root.into();
         Self {
             tenant_vm: false,
+            boat_profile: false,
+            boat_memory_max_bytes: None,
+            #[cfg(target_os = "linux")]
+            private_pids: true,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,
@@ -345,6 +357,9 @@ impl Config {
 }
 
 pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
+    if let Some(bytes) = _config.boat_memory_max_bytes {
+        return format!("the Boat job's measured memory budget of {} bytes was reached; the kernel killed a process and the job was stopped. More vCPUs do not increase this sandbox's usable memory.", bytes);
+    }
     #[cfg(test)]
     let floor_gib = _config.memory_floor_gib;
     #[cfg(test)]
@@ -370,6 +385,31 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
     format!(
         "the job's memory limit of {limit} GiB was reached; the kernel killed a process and the job was stopped.{advice}"
     )
+}
+
+#[test]
+fn boat_memory_override_requires_explicit_profile_and_budget() {
+    for (boat, bytes) in [
+        (false, Some(2 << 30)),
+        (true, None),
+        (true, Some(512 << 20)),
+    ] {
+        let mut config = Config::new("/unused", "boat");
+        config.boat_profile = boat;
+        config.boat_memory_max_bytes = bytes;
+        let error = Runner::open(config)
+            .err()
+            .expect("invalid Boat memory configuration must fail");
+        assert!(error
+            .to_string()
+            .contains("--boat-profile requires an explicit measured"));
+    }
+    let mut config = Config::new("/unused", "boat");
+    config.boat_profile = true;
+    config.boat_memory_max_bytes = Some(14 << 30);
+    let detail = oom_memory_limit_detail(&config, 8, 8);
+    assert!(detail.contains("15032385536 bytes"));
+    assert!(!detail.contains("28 GiB"));
 }
 
 #[derive(Clone)]
@@ -682,6 +722,13 @@ impl Runner {
         {
             return Err(invalid("invalid runner configuration"));
         }
+        if config.boat_profile != config.boat_memory_max_bytes.is_some()
+            || config
+                .boat_memory_max_bytes
+                .is_some_and(|bytes| bytes < (1 << 30))
+        {
+            return Err(invalid("--boat-profile requires an explicit measured --boat-memory-max-bytes budget of at least 1 GiB; other profiles must not override memory"));
+        }
         backend.validate(&config)?;
         #[cfg(test)]
         let cpus = config
@@ -709,6 +756,7 @@ impl Runner {
         };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
+            config.private_pids = crate::systemd::job_private_pids(config.boat_profile)?;
             crate::isolation::validate_account()?;
             #[cfg(test)]
             if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
@@ -4476,6 +4524,12 @@ impl Runner {
                 crate::backend::memory_limit_gib(job.weight, self.core.config.memory_floor_gib);
             #[cfg(not(test))]
             let limit = crate::backend::memory_limit_gib(job.weight);
+            let limit = self
+                .core
+                .config
+                .boat_memory_max_bytes
+                .map(|bytes| format!("{:.3}", bytes as f64 / (1_u64 << 30) as f64))
+                .unwrap_or(limit);
             tracing::warn!(
                 job_id = %id,
                 memory_limit_gib = %limit,

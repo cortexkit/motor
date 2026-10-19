@@ -114,6 +114,41 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
 }
 
 #[test]
+fn boat_command_preserves_isolation_and_limits_without_private_pids() {
+    let f = Fixture::new();
+    for (boat, private_pids) in [(false, true), (true, false), (true, true)] {
+        let command = f
+            .command_sandbox()
+            .with_boat_profile(boat, private_pids, Some(14 * (1 << 30)))
+            .command("true", &f.workspace, &[], true, &[1, 2], 2)
+            .unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args.contains(&"--property=PrivatePIDs=yes"), private_pids);
+        let expected_memory = if boat {
+            14 * (1_u64 << 30)
+        } else {
+            16 * (1_u64 << 30)
+        };
+        assert!(args.contains(&format!("--property=MemoryMax={expected_memory}").as_str()));
+        for property in [
+            "PrivateNetwork=yes",
+            "PrivateDevices=yes",
+            "ProtectProc=invisible",
+            "NoNewPrivileges=yes",
+            "KillMode=control-group",
+            "User=motor-job",
+        ] {
+            assert!(args.contains(&format!("--property={property}").as_str()));
+        }
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--property=TemporaryFileSystem=/dev/shm:")));
+        assert_eq!(args.contains(&"--property=CPUQuota=200%"), boat);
+        assert_eq!(args.contains(&"--property=TasksMax=4096"), boat);
+    }
+}
+
+#[test]
 fn tenant_job_units_limit_tasks_and_deny_vsock_only_in_tenant_mode() {
     let f = Fixture::new();
     for enabled in [false, true] {
@@ -261,6 +296,9 @@ impl Fixture {
             retain_failed: false,
             network: false,
             tenant_vm: false,
+            private_pids: true,
+            boat_profile: false,
+            boat_memory_max: None,
             parent_umask: 0o022,
             memory_floor_gib: None,
             user: USER,
@@ -384,6 +422,9 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         retain_failed: false,
         network: false,
         tenant_vm: false,
+        private_pids: true,
+        boat_profile: false,
+        boat_memory_max: None,
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -869,6 +910,9 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 retain_failed: false,
                 network: false,
                 tenant_vm: false,
+                private_pids: true,
+                boat_profile: false,
+                boat_memory_max: None,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -917,6 +961,9 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 retain_failed: false,
                 network: false,
                 tenant_vm: false,
+                private_pids: true,
+                boat_profile: false,
+                boat_memory_max: None,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1296,6 +1343,9 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         retain_failed: false,
         network: false,
         tenant_vm: false,
+        private_pids: true,
+        boat_profile: false,
+        boat_memory_max: None,
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,

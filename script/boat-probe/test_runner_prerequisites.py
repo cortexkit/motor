@@ -70,6 +70,26 @@ class PrerequisitesTests(unittest.TestCase):
             token.unlink()
             self.assertTrue(namespace["credential_audit"]([root], {})["clean"])
 
+    def test_provider_environment_is_scoped_and_npmrc_keys_are_classified(self):
+        namespace = {}
+        exec(prerequisites.SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, ".npmrc")
+            path.write_text("prefix=/irrelevant\n")
+            data = namespace["credential_audit"]([root], {"ASCII_TOKEN": "not-logged", "BOAT_ID": "not-logged"})
+            self.assertTrue(data["clean"])
+            self.assertEqual(data["provider_environment_names"], ["ASCII_TOKEN", "BOAT_ID"])
+            self.assertEqual(data["npmrc_keys"][str(path)], ["prefix"])
+            path.write_text("//registry.example/:_authToken=never-log-this\n")
+            data = namespace["credential_audit"]([root], {})
+            self.assertFalse(data["clean"])
+            self.assertNotIn("never-log-this", json.dumps(data))
+            path.unlink()
+            key = Path(root, ".config/ascii/boat/config.json")
+            key.parent.mkdir(parents=True)
+            key.write_text("never-log-this")
+            self.assertFalse(namespace["credential_audit"]([root], {})["clean"])
+
     def test_schema_parser_reports_fields_without_inventing_base_choice(self):
         data = prerequisites.create_schema(self.SCHEMA)
         self.assertEqual(data["fields"], ["type", "from", "noEnv", "environment"])

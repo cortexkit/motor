@@ -150,6 +150,7 @@ class Probe:
     def __init__(self, client, data, checkpoint, port=9443, minutes=30):
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
         self.deadline = time.monotonic() + minutes * 60
+        self.minutes = minutes
         self.base = ".boat-probe-" + data["run_id"]
         self.source = Path(__file__).with_name("guest.py").read_bytes()
 
@@ -554,6 +555,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
     mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh large; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
+    mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
     args = parser.parse_args()
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
@@ -580,7 +582,10 @@ def main():
     try:
         if not args.cleanup:
             runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
-            if args.runner_prerequisites:
+            if args.runner_host:
+                from runner_host import RunnerHost
+                RunnerHost(runner).run()
+            elif args.runner_prerequisites:
                 from runner_prerequisites import run
                 run(runner)
             elif args.ssh_reach:
@@ -603,7 +608,8 @@ def main():
     if args.cleanup:
         return 0 if data.get("cleanup_complete") else 1
     return 0 if (data.get("measurements_complete") and data.get("cleanup_complete") and not data.get("error") and
-                 data.get("ssh_reach", {}).get("all_passed", True)) else 1
+                 data.get("ssh_reach", {}).get("all_passed", True) and
+                 data.get("runner_host", {}).get("all_passed", True)) else 1
 
 
 if __name__ == "__main__":

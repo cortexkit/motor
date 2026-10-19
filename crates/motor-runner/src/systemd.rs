@@ -71,6 +71,43 @@ pub(crate) fn systemctl(args: &[&str], privileged: bool) -> io::Result<Output> {
     output(command.args(args))
 }
 
+pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::Result<bool> {
+    let major = version
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("cannot determine systemd manager version"))?;
+    if major < 257 && !boat_profile {
+        return Err(io::Error::other("systemd >=257 is required for PrivatePIDs; only an explicitly configured single-tenant --boat-profile may run without it"));
+    }
+    Ok(major >= 257)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
+    let output = systemctl(&["show", "--property=Version", "--value"], false)?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "cannot query systemd manager capabilities",
+        ));
+    }
+    let enabled = private_pids_capability(&String::from_utf8_lossy(&output.stdout), boat_profile)?;
+    if !enabled {
+        tracing::warn!("Boat single-tenant profile: systemd lacks PrivatePIDs; jobs share the host PID namespace");
+    }
+    Ok(enabled)
+}
+
+#[test]
+fn boat_pid_compatibility_is_explicit_and_version_checked() {
+    assert!(private_pids_capability("255.4-1ubuntu8.16", false).is_err());
+    assert!(!private_pids_capability("255.4-1ubuntu8.16", true).unwrap());
+    assert!(private_pids_capability("257.9", true).unwrap());
+    assert!(private_pids_capability("259.5", false).unwrap());
+    assert!(private_pids_capability("unknown", true).is_err());
+}
+
 pub(crate) struct PollBackoff {
     delay: Duration,
     maximum: Duration,

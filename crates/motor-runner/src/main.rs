@@ -205,6 +205,10 @@ fn configure_options(
             config.tenant_vm = true;
             continue;
         }
+        if arg == "--boat-profile" {
+            config.boat_profile = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| io::Error::other("missing option value"))?;
@@ -213,6 +217,9 @@ fn configure_options(
             "--state-root" => config.state_root = value.into(),
             "--build-slot-root" => config.build_slot_root = value.into(),
             "--max-weight" => config.max_weight = value.parse().map_err(io::Error::other)?,
+            "--boat-memory-max-bytes" => {
+                config.boat_memory_max_bytes = Some(value.parse().map_err(io::Error::other)?)
+            }
             "--max-queue-depth" => {
                 config.max_queue_depth = value.parse().map_err(io::Error::other)?
             }
@@ -245,6 +252,15 @@ fn configure_options(
             "--tenant-vm requires the Linux host backend",
         ));
     }
+    if config.boat_profile
+        && (!cfg!(target_os = "linux")
+            || config.backend != motor_runner::BackendKind::Host
+            || config.tenant_vm)
+    {
+        return Err(io::Error::other(
+            "--boat-profile requires the Linux host backend without --tenant-vm",
+        ));
+    }
     Ok((job, drain_timeout_s, exit_after))
 }
 
@@ -273,6 +289,20 @@ mod tenant_options {
         )
         .is_err());
     }
+}
+
+#[test]
+fn boat_profile_is_an_explicit_linux_host_option() {
+    let mut config = Config::new("/unused", "boat");
+    let result = configure_options(&mut config, ["--boat-profile".into()].into_iter());
+    assert_eq!(result.is_ok(), cfg!(target_os = "linux"));
+    assert!(config.boat_profile);
+    let mut config = Config::new("/unused", "boat");
+    assert!(configure_options(
+        &mut config,
+        ["--boat-profile".into(), "--backend".into(), "vm".into()].into_iter()
+    )
+    .is_err());
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

@@ -1,0 +1,13 @@
+[Unit]
+Description=Disposable Boat probe loopback bridge (no admission authentication)
+Requires=motor-boat.service
+After=motor-boat.service
+
+[Service]
+User=motor-boat
+Group=motor-boat
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-bridge.py
+Restart=on-failure
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN
+
+# Deliberately not enabled: only the operator probe starts this unauthenticated bridge.

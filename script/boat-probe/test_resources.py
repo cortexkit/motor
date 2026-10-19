@@ -9,6 +9,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 try:
     spec = importlib.util.spec_from_file_location('boat_resources', HERE / 'resources.py')
+    if spec is None or spec.loader is None:
+        raise ImportError('cannot load Boat resource probe')
     resources = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(resources)
 finally:
