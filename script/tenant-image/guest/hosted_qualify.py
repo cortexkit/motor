@@ -24,6 +24,9 @@ def runner_diagnostics():
             state[name] = dict(code=result.returncode, stdout=result.stdout, stderr=result.stderr)
         except Exception as error:
             state[name] = dict(error=f"{type(error).__name__}: {error}")
+    # The guest keeps no journal, so a runner that never binds its socket leaves
+    # no log. Record what its threads and children are blocked in instead.
+    state["processes"] = process_snapshot(state)
     path = Path("/tenant/state/main/runner.sock")
     try:
         info = path.lstat()
@@ -37,6 +40,46 @@ def runner_diagnostics():
     except Exception as error:
         state["socket_error"] = f"{type(error).__name__}: {error}"
     print("GUEST_RUNNER_DIAGNOSTIC " + json.dumps(state), flush=True)
+
+
+def process_snapshot(state):
+    """Each thread's wait channel for the runner and its descendants."""
+    try:
+        main = int(state["unit"]["stdout"].split("MainPID=", 1)[1].split()[0])
+    except Exception as error:
+        return dict(error=f"no MainPID: {type(error).__name__}: {error}")
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as error:
+        return dict(error=f"no /proc: {type(error).__name__}: {error}")
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            parent = int((entry / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(parent, []).append(int(entry.name))
+    found, pending = [], [main]
+    while pending and len(found) < 64:
+        pid = pending.pop()
+        found.append(pid)
+        pending.extend(children.get(pid, []))
+    snapshot = []
+    for pid in found:
+        proc = Path(f"/proc/{pid}")
+        try:
+            cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[:300]
+            threads = []
+            for task in sorted((proc / "task").iterdir(), key=lambda p: int(p.name))[:32]:
+                stat = (task / "stat").read_text().rsplit(")", 1)[1].split()
+                threads.append(dict(tid=int(task.name), comm=(task / "comm").read_text().strip(),
+                                    state=stat[0], wchan=(task / "wchan").read_text().strip()))
+            snapshot.append(dict(pid=pid, cmdline=cmdline, threads=threads))
+        except OSError as error:
+            snapshot.append(dict(pid=pid, error=f"{type(error).__name__}: {error}"))
+    return snapshot
 
 
 def diagnostic_window(stop):
