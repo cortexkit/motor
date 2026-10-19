@@ -9,7 +9,7 @@ use std::{
 #[derive(Serialize)]
 struct Catalog {
     schema_version: u8,
-    module_id: &'static str,
+    module_id: String,
     entries: Vec<Entry>,
 }
 
@@ -27,27 +27,31 @@ const CONFIG_REASON: &str = "Operator routing settings can be reused on another 
 const STORAGE_REASON: &str = "Not backed up on purpose: jobs from the last 24 hours, their runner bindings and pending cancels, plus per-start runtime sockets and the lease; a restored copy would be stale and could replay a cancel.";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn write_best_effort(data_dir: io::Result<PathBuf>, storage_root: &Path) {
-    let result = data_dir.and_then(|data_dir| write_catalog(&data_dir, storage_root));
+pub(crate) fn write_best_effort(
+    module_id: &str,
+    data_dir: io::Result<PathBuf>,
+    storage_root: &Path,
+) {
+    let result = data_dir.and_then(|data_dir| write_catalog(module_id, &data_dir, storage_root));
     if let Err(error) = result {
         tracing::warn!(%error, "could not write Engram backup catalog");
     }
 }
 
-fn write_catalog(data_dir: &Path, storage_root: &Path) -> io::Result<()> {
+fn write_catalog(module_id: &str, data_dir: &Path, storage_root: &Path) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
-    let bytes = catalog_bytes(data_dir, storage_root)?;
+    let bytes = catalog_bytes(module_id, data_dir, storage_root)?;
     atomic_write(&data_dir.join("engram-catalog.json"), &bytes)
 }
 
-fn catalog_bytes(data_dir: &Path, storage_root: &Path) -> io::Result<Vec<u8>> {
+fn catalog_bytes(module_id: &str, data_dir: &Path, storage_root: &Path) -> io::Result<Vec<u8>> {
     let data_root = fs::canonicalize(data_dir)?;
     let mut entries = Vec::new();
 
     let config = data_dir.join("config.jsonc");
     match fs::symlink_metadata(&config) {
         Ok(metadata) if metadata.file_type().is_file() => entries.push(Entry {
-            entry_id: "ck-motor/config".into(),
+            entry_id: format!("{module_id}/config"),
             class: "portable",
             reason: CONFIG_REASON,
             mechanism: FILETREE,
@@ -60,14 +64,16 @@ fn catalog_bytes(data_dir: &Path, storage_root: &Path) -> io::Result<Vec<u8>> {
 
     let storage = match fs::canonicalize(storage_root) {
         Ok(path) if path.is_dir() => path,
-        Ok(_) => return catalog_json(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return catalog_json(entries),
+        Ok(_) => return catalog_json(module_id, entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return catalog_json(module_id, entries)
+        }
         Err(error) => return Err(error),
     };
     if let Ok(relative) = storage.strip_prefix(&data_root) {
         if let Some(path) = canonical_relative_path(relative) {
             entries.push(Entry {
-                entry_id: "ck-motor/storage".into(),
+                entry_id: format!("{module_id}/storage"),
                 class: "device-local",
                 reason: STORAGE_REASON,
                 mechanism: FILETREE,
@@ -76,14 +82,14 @@ fn catalog_bytes(data_dir: &Path, storage_root: &Path) -> io::Result<Vec<u8>> {
         }
     }
 
-    catalog_json(entries)
+    catalog_json(module_id, entries)
 }
 
-fn catalog_json(mut entries: Vec<Entry>) -> io::Result<Vec<u8>> {
+fn catalog_json(module_id: &str, mut entries: Vec<Entry>) -> io::Result<Vec<u8>> {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     serde_json::to_vec(&Catalog {
         schema_version: 1,
-        module_id: "ck-motor",
+        module_id: module_id.to_owned(),
         entries,
     })
     .map_err(io::Error::other)
@@ -197,9 +203,9 @@ mod tests {
         }
     }
 
-    fn fixture() -> (cortexkit_test_support::ScratchDir, PathBuf, PathBuf) {
+    fn fixture(module_id: &str) -> (cortexkit_test_support::ScratchDir, PathBuf, PathBuf) {
         let scratch = cortexkit_test_support::ScratchDir::new("engram-catalog");
-        let data_dir = scratch.join("cortexkit/ck-motor");
+        let data_dir = scratch.join(format!("cortexkit/{module_id}"));
         let storage_root = data_dir.join("store.db.ck-motor");
         fs::create_dir_all(&storage_root).unwrap();
         fs::write(data_dir.join("config.jsonc"), "{}\n").unwrap();
@@ -208,33 +214,36 @@ mod tests {
 
     #[test]
     fn catalog_has_deterministic_exact_engram_v1_bytes() {
-        let (_scratch, data_dir, storage_root) = fixture();
-        let bytes = catalog_bytes(&data_dir, &storage_root).unwrap();
-        assert_eq!(
-            bytes,
-            br#"{"schema_version":1,"module_id":"ck-motor","entries":[{"entry_id":"ck-motor/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"},{"entry_id":"ck-motor/storage","class":"device-local","reason":"Not backed up on purpose: jobs from the last 24 hours, their runner bindings and pending cancels, plus per-start runtime sockets and the lease; a restored copy would be stale and could replay a cancel.","mechanism":"filetree","path":"store.db.ck-motor"}]}"#
-        );
+        for module_id in ["ck-motor", "motor"] {
+            let (_scratch, data_dir, storage_root) = fixture(module_id);
+            let bytes = catalog_bytes(module_id, &data_dir, &storage_root).unwrap();
+            let expected = format!(
+                r#"{{"schema_version":1,"module_id":"{module_id}","entries":[{{"entry_id":"{module_id}/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"}},{{"entry_id":"{module_id}/storage","class":"device-local","reason":"Not backed up on purpose: jobs from the last 24 hours, their runner bindings and pending cancels, plus per-start runtime sockets and the lease; a restored copy would be stale and could replay a cancel.","mechanism":"filetree","path":"store.db.ck-motor"}}]}}"#
+            );
+            assert_eq!(bytes, expected.as_bytes(), "module id: {module_id}");
+        }
     }
 
     #[test]
     fn storage_outside_module_data_directory_is_not_listed() {
         let scratch = cortexkit_test_support::ScratchDir::new("engram-catalog-outside");
-        let data_dir = scratch.join("data");
+        let data_dir = scratch.join("cortexkit/motor");
         let storage_root = scratch.join("elsewhere/store.db.ck-motor");
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&storage_root).unwrap();
         fs::write(data_dir.join("config.jsonc"), "{}\n").unwrap();
-        let json = String::from_utf8(catalog_bytes(&data_dir, &storage_root).unwrap()).unwrap();
+        let json =
+            String::from_utf8(catalog_bytes("motor", &data_dir, &storage_root).unwrap()).unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":1,"module_id":"ck-motor","entries":[{"entry_id":"ck-motor/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"}]}"#
+            r#"{"schema_version":1,"module_id":"motor","entries":[{"entry_id":"motor/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"}]}"#
         );
     }
 
     #[test]
     fn identical_catalog_keeps_its_modification_time() {
-        let (_scratch, data_dir, storage_root) = fixture();
-        write_catalog(&data_dir, &storage_root).unwrap();
+        let (_scratch, data_dir, storage_root) = fixture("ck-motor");
+        write_catalog("ck-motor", &data_dir, &storage_root).unwrap();
         let path = data_dir.join("engram-catalog.json");
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         #[cfg(unix)]
@@ -243,7 +252,7 @@ mod tests {
             fs::metadata(&path).unwrap().ino()
         };
         std::thread::sleep(Duration::from_millis(20));
-        write_catalog(&data_dir, &storage_root).unwrap();
+        write_catalog("ck-motor", &data_dir, &storage_root).unwrap();
         let after_metadata = fs::metadata(&path).unwrap();
         assert_eq!(after_metadata.modified().unwrap(), before);
         #[cfg(unix)]
@@ -286,7 +295,11 @@ mod tests {
         fs::write(&not_a_directory, "not a directory").unwrap();
         let captured = Captured::default();
         let _guard = crate::logging::scoped(captured.clone());
-        write_best_effort(Ok(not_a_directory), &scratch.join("unused-root"));
+        write_best_effort(
+            "ck-motor",
+            Ok(not_a_directory),
+            &scratch.join("unused-root"),
+        );
         let lines: Vec<_> = captured.text().lines().map(str::to_owned).collect();
         assert_eq!(lines.len(), 1, "unexpected log output: {lines:?}");
         assert!(lines[0].contains("WARN"), "{lines:?}");

@@ -53,6 +53,10 @@ impl Drop for Daemon {
 
 impl Daemon {
     async fn start(f: &Fixture, config: Config) -> Arc<Self> {
+        Self::start_with_module_id(f, config, "ck-motor").await
+    }
+
+    async fn start_with_module_id(f: &Fixture, config: Config, module_id: &str) -> Arc<Self> {
         let path = f
             .scratch
             .join(format!("connection-{}.json", Uuid::now_v7().simple()));
@@ -86,9 +90,12 @@ impl Daemon {
             )
         })
         .await;
-        let handler = Handler::new(config).with_motor(motor);
+        let handler = Handler::new(config)
+            .with_module_id(module_id)
+            .with_motor(motor);
+        let module_id = module_id.to_owned();
         let boot = tokio::spawn(async move {
-            subc_client_rs::serve_with_handle(&path, module::manifest("ck-motor"), handler).await
+            subc_client_rs::serve_with_handle(&path, module::manifest(&module_id), handler).await
         });
         let (mut stream, _) = listener.accept().await.unwrap();
         authenticate_server(
@@ -798,10 +805,10 @@ async fn direct_bind_is_refused_as_before_while_the_switch_is_off() {
         !Config::default().admit_direct_exec,
         "the switch is off by default"
     );
-    let daemon = Daemon::start(&f, f.config.clone()).await;
+    let daemon = Daemon::start_with_module_id(&f, f.config.clone(), "motor").await;
     let refused = error(&daemon.bind(DIRECT_CHANNEL, direct()).await);
     assert_eq!(refused["code"], "motor_direct_refused");
-    assert_eq!(refused["message"], "ck-motor refuses direct binds");
+    assert_eq!(refused["message"], "motor refuses direct binds");
     assert_eq!(
         daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
         FrameType::Response
@@ -811,7 +818,7 @@ async fn direct_bind_is_refused_as_before_while_the_switch_is_off() {
 #[tokio::test]
 async fn switched_on_direct_routes_reach_only_the_four_exec_operations() {
     let f = Fixture::new(Cut::None, 28).await;
-    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    let daemon = Daemon::start_with_module_id(&f, direct_config(&f), "motor").await;
     assert_eq!(
         daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
         FrameType::Response
@@ -833,7 +840,7 @@ async fn switched_on_direct_routes_reach_only_the_four_exec_operations() {
         );
         assert_eq!(
             refused["message"],
-            format!("ck-motor refuses {op} for direct"),
+            format!("motor refuses {op} for direct"),
             "{op}"
         );
     }
@@ -844,6 +851,10 @@ async fn switched_on_direct_routes_reach_only_the_four_exec_operations() {
             .await,
     );
     assert_eq!(aggregate["code"], "motor_op_not_permitted_for_principal");
+    assert_eq!(
+        aggregate["message"],
+        "motor refuses exec.status without a job_id for direct; a direct caller may check only its own jobs"
+    );
     // The other three pass the operation gate and reach the ownership check.
     let stranger = Uuid::now_v7();
     for (op, params) in [
@@ -853,6 +864,10 @@ async fn switched_on_direct_routes_reach_only_the_four_exec_operations() {
     ] {
         let reply = error(&daemon.request(DIRECT_CHANNEL, op, params).await);
         assert_eq!(reply["code"], "motor_job_not_found", "{op}");
+        assert_eq!(
+            reply["message"], "motor has no such job for this caller",
+            "{op}"
+        );
     }
     assert!(
         f.proxy.frames.lock().unwrap().is_empty(),

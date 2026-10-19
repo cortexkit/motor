@@ -1,5 +1,5 @@
 use motor_module::{
-    module::{manifest_with_config, Handler},
+    module::{manifest_with_config, Handler, DEFAULT_MODULE_ID},
     Config,
 };
 use std::{io, path::PathBuf, sync::Arc};
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(io::Error::other(format!("unknown option {arg}")).into()),
         }
     }
-    let id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| "ck-motor".into());
+    let id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| DEFAULT_MODULE_ID.into());
     let config = match config {
         Some(path) => Config::load(&path)?,
         None => Config::default(),
@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     let handler = Handler::new(config)
+        .with_module_id(id.clone())
         .with_credentials(resolver)
         .with_account_tokens(Arc::new(motor_module::AccountTokens::new(
             connection.clone(),
@@ -122,7 +123,7 @@ fn print_manifest(
     if args != ["--manifest"] {
         return Ok(false);
     }
-    let module_id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| "ck-motor".into());
+    let module_id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| DEFAULT_MODULE_ID.into());
     let manifest = motor_module::module::manifest(&module_id);
     serde_json::to_writer(&mut *output, &manifest)?;
     writeln!(output)?;

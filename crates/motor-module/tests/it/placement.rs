@@ -232,6 +232,10 @@ impl Rig {
         Self::with_resolver(Arc::new(CredentialFailure(class))).await
     }
     async fn with_resolver(resolver: Arc<dyn CredentialResolver>) -> Self {
+        Self::with_module_id(resolver, "ck-motor").await
+    }
+
+    async fn with_module_id(resolver: Arc<dyn CredentialResolver>, module_id: &str) -> Self {
         let scratch = SocketScratch::new("mp");
         let path = scratch.join("connection.json");
         let root = scratch.join("s.ck-motor");
@@ -259,10 +263,19 @@ impl Rig {
             .open(&path)
             .and_then(|mut file| file.write_all(&bytes))
             .unwrap();
-        let handler = Handler::new(Config::default()).with_credentials(resolver);
+        let handler = Handler::new(Config::default())
+            .with_module_id(module_id)
+            .with_credentials(resolver);
         let h = handler.clone();
+        let module_id = module_id.to_owned();
+        let manifest_module_id = module_id.clone();
         let boot = tokio::spawn(async move {
-            subc_client_rs::serve_with_handle(&path, crate::module::manifest("ck-motor"), h).await
+            subc_client_rs::serve_with_handle(
+                &path,
+                crate::module::manifest(&manifest_module_id),
+                h,
+            )
+            .await
         });
         let (mut daemon, _) = listener.accept().await.unwrap();
         authenticate_server(
@@ -277,8 +290,8 @@ impl Rig {
         let hello = read_frame(&mut daemon).await.unwrap().unwrap();
         assert_eq!(hello.header.ty, FrameType::Hello);
         let descriptor = cortexkit_store_types::StorageDescriptor {
-            module_id: "ck-motor".into(),
-            storage_namespace: "ck-motor".into(),
+            module_id: module_id.clone(),
+            storage_namespace: module_id,
             isolation: cortexkit_store_types::Isolation::Module,
             backend: cortexkit_store_types::StorageBackend::Sqlite {
                 path: scratch.join("s").to_string_lossy().into_owned(),
@@ -469,7 +482,11 @@ async fn core_bind_and_workspace_prepare_are_admitted() {
 }
 #[tokio::test]
 async fn core_is_refused_exec_run() {
-    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    let mut rig = Rig::with_module_id(
+        Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
+        "motor",
+    )
+    .await;
     assert_eq!(
         rig.bind(core(), Value::Null).await.header.ty,
         FrameType::Response
@@ -483,7 +500,7 @@ async fn core_is_refused_exec_run() {
     let reply = rig
         .request("exec.run", serde_json::to_value(request).unwrap())
         .await;
-    assert_op_refused(&reply, "prefrontal-core", "exec.run");
+    assert_op_refused(&reply, "motor", "prefrontal-core", "exec.run");
     assert!(
         !rig.root.join("state.json").exists(),
         "authorization must precede job creation"
@@ -492,13 +509,17 @@ async fn core_is_refused_exec_run() {
 }
 #[tokio::test]
 async fn aft_is_refused_workspace_prepare() {
-    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    let mut rig = Rig::with_module_id(
+        Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
+        "motor",
+    )
+    .await;
     assert_eq!(
         rig.bind(aft(), Value::Null).await.header.ty,
         FrameType::Response
     );
     let reply = rig.request("workspace.prepare", json!({"workspace_key":"/not-a-worktree", "repository_root":"/not-a-repository", "base_commit":"base", "siblings":[]})).await;
-    assert_op_refused(&reply, "aft", "workspace.prepare");
+    assert_op_refused(&reply, "motor", "aft", "workspace.prepare");
     rig.stop().await;
 }
 
@@ -519,11 +540,12 @@ async fn exec_status_empty_params_preserves_aggregate_reply_bytes() {
     assert_eq!(disk.body, reply.body);
     rig.stop().await;
 }
-fn assert_op_refused(reply: &Frame, principal: &str, op: &str) {
+fn assert_op_refused(reply: &Frame, self_module_id: &str, principal: &str, op: &str) {
     assert_eq!(reply.header.ty, FrameType::Error);
     let error: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(error["code"], "motor_op_not_permitted_for_principal");
     let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("{self_module_id} refuses {op}")));
     assert!(message.contains(&format!("reserved:{principal}")));
     assert!(message.contains(op));
 }
@@ -558,7 +580,11 @@ async fn remaining_cross_principal_and_unknown_operations_are_refused_before_par
             ],
         ),
     ] {
-        let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+        let mut rig = Rig::with_module_id(
+            Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
+            "motor",
+        )
+        .await;
         assert_eq!(
             rig.bind(json!({"kind":"reserved", "module_id":principal}), scope)
                 .await
@@ -568,7 +594,7 @@ async fn remaining_cross_principal_and_unknown_operations_are_refused_before_par
         );
         for op in ops {
             let reply = rig.request(op, Value::Null).await;
-            assert_op_refused(&reply, principal, op);
+            assert_op_refused(&reply, "motor", principal, op);
         }
         rig.stop().await;
     }
@@ -604,17 +630,29 @@ async fn basal_routes_other_than_the_health_flow_are_refused_at_bind() {
         flow_scope("motor-build-server-health", "prefrontal-core", false),
         flow_scope("motor-build-server-health", "basal", true),
     ] {
-        let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+        let mut rig = Rig::with_module_id(
+            Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
+            "motor",
+        )
+        .await;
         let reply = rig.bind(basal(), scope.clone()).await;
         assert_eq!(reply.header.ty, FrameType::Error, "{scope}");
         let error: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(error["code"], "motor_principal_refused", "{scope}");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("motor refuses reserved:basal"));
         rig.stop().await;
     }
 }
 #[tokio::test]
 async fn other_reserved_principals_are_refused_at_bind() {
-    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    let mut rig = Rig::with_module_id(
+        Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
+        "motor",
+    )
+    .await;
     let reply = rig
         .bind(
             json!({"kind":"reserved", "module_id":"claustrum"}),
@@ -624,6 +662,10 @@ async fn other_reserved_principals_are_refused_at_bind() {
     assert_eq!(reply.header.ty, FrameType::Error);
     let error: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(error["code"], "motor_principal_refused");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("motor refuses reserved:claustrum"));
     assert!(error["message"]
         .as_str()
         .unwrap()
