@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+ROOT_MOUNTINFO = "1 0 8:1 / / rw - xfs /dev/root rw\n"
 
 
 def module(name, path):
@@ -36,7 +37,7 @@ def resolved_config():
 
 class ImageTests(unittest.TestCase):
     def test_default_build_output_uses_root_trusted_vm_bind_view(self):
-        with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner"]), mock.patch.object(image, "build") as build:
+        with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
             image.main()
         self.assertEqual(build.call_args.args[1], Path("/var/lib/motor-vm/tenant-images").resolve())
 
@@ -61,7 +62,8 @@ class ImageTests(unittest.TestCase):
         (stage / "tools.json").write_text('{"fixture": true}\n')
 
     def build(self, version="test-1"):
-        return image.build(version, self.root / "images", self.versions, self.runner, builder=self.builder)
+        return image.build(version, self.root / "images", self.versions, self.runner, builder=self.builder,
+                           build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
 
     def change_pin(self, key, value):
         pins = json.loads(self.versions.read_text())
@@ -117,6 +119,7 @@ class ImageTests(unittest.TestCase):
         before = {path.name: path.read_bytes() for path in target.iterdir()}
         result = subprocess.run([sys.executable, str(HERE / "build.py"), "build", "test-1",
                                  "--output-root", str(target.parent), "--runner", "/not/a/runner",
+                                 "--build-budget-gib", "1",
                                  "--versions", "/not/a/versions"], text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("FileExistsError", result.stderr)
@@ -154,12 +157,88 @@ class ImageTests(unittest.TestCase):
             raise RuntimeError("stopped before unmount")
 
         with self.assertRaises(RuntimeError):
-            image.build("failed", self.root / "images", self.versions, self.runner, builder=fail)
+            image.build("failed", self.root / "images", self.versions, self.runner, builder=fail,
+                        build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
         target = self.root / "images/failed"
         with self.assertRaisesRegex(ValueError, "incomplete"):
             image.inventory(target, self.versions)
         with self.assertRaises(FileExistsError):
             self.build("failed")
+
+    def test_mounted_stage_is_retained_without_recursive_delete_or_manifest(self):
+        ready = False
+        def builder(stage, pins, runner, jobs):
+            nonlocal ready
+            self.builder(stage, pins, runner, jobs)
+            (stage / "root/dev").mkdir(parents=True)
+            ready = True
+        stage = self.root / "images/blocked/.work"
+        def mountinfo():
+            return ROOT_MOUNTINFO + (f"2 1 0:2 / {stage / 'root/dev'} rw - tmpfs tmpfs rw\n" if ready else "")
+        caught = None
+        with mock.patch.object(image.shutil, "rmtree") as remove:
+            try:
+                image.build("blocked", self.root / "images", self.versions, self.runner, builder=builder,
+                            build_budget=1024**3, free_floor=0, mountinfo_reader=mountinfo)
+            except Exception as error:
+                caught = error
+            remove.assert_not_called()
+        self.assertIsInstance(caught, RuntimeError)
+        self.assertRegex(str(caught), "mounted paths:.*root/dev")
+        self.assertTrue((stage / "rootfs").is_file())
+        self.assertFalse((stage.parent / "manifest.json").exists())
+        usage = json.loads((stage.parent / "disk-usage.json").read_text())
+        self.assertEqual(usage["outcome"], "failed")
+
+    def test_real_rootfs_builder_uses_a_private_mount_namespace(self):
+        stage = self.root / "private-stage"
+        stage.mkdir()
+        execute = mock.Mock()
+        with mock.patch.object(image.platform, "system", return_value="Linux"), mock.patch.object(image.platform, "machine", return_value="x86_64"), mock.patch.object(image.os, "geteuid", return_value=0):
+            image.build_artifacts(stage, image.load_versions(self.versions), self.runner, 4, run=execute)
+        self.assertEqual(execute.call_args_list[1].args[0][:6], ["unshare", "--mount", "--propagation", "private", "--", "bash"])
+
+    def test_storage_preflight_refuses_before_builder(self):
+        builder = mock.Mock()
+        with mock.patch.object(image.shutil, "disk_usage", return_value=type("Usage", (), dict(free=3 * 1024**3 - 1))):
+            with self.assertRaisesRegex(ValueError, "floor.*budget"):
+                image.build("space", self.root / "images", self.versions, self.runner, builder=builder,
+                            build_budget=1024**3, free_floor=2 * 1024**3, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+        builder.assert_not_called()
+        self.assertFalse((self.root / "images/space/manifest.json").exists())
+
+    def test_cleanup_command_refuses_a_nonstage_root_even_for_root(self):
+        with mock.patch.object(sys, "argv", ["build.py", "cleanup-mounts", "/"]), mock.patch.object(sys, "stderr"), mock.patch.object(image.os, "geteuid", return_value=0), mock.patch.object(image, "unmount_tree") as unmount:
+            with self.assertRaises(SystemExit) as error:
+                image.main()
+        self.assertEqual(error.exception.code, 2)
+        unmount.assert_not_called()
+
+    def test_internal_subcommands_do_not_require_a_build_budget(self):
+        config = self.root / "kernel.config"
+        config.write_text(resolved_config())
+        with mock.patch.object(sys, "argv", ["build.py", "check-kernel", str(config)]):
+            image.main()
+        root = self.root / ".work/root"
+        with mock.patch.object(sys, "argv", ["build.py", "cleanup-mounts", str(root)]), mock.patch.object(image.os, "geteuid", return_value=0), mock.patch.object(image, "unmount_tree") as unmount:
+            image.main()
+        unmount.assert_called_once_with(root.resolve())
+        with mock.patch.object(sys, "argv", ["build.py", "check-mounts", str(root)]), mock.patch.object(image, "assert_unmounted") as fence:
+            image.main()
+        fence.assert_called_once_with(root.resolve())
+
+    def test_measured_profile_admits_same_recipe_and_refuses_changed_pins(self):
+        with mock.patch.object(image.shutil, "disk_usage", return_value=type("Usage", (), dict(free=1024**4))):
+            first = self.build("first")
+            profile = first / "disk-usage.json"
+            second = image.build("second", first.parent, self.versions, self.runner, builder=self.builder,
+                                 peak_profile=profile, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+            self.assertEqual(json.loads((second / "disk-usage.json").read_text())["recipe_digest"], json.loads(profile.read_text())["recipe_digest"])
+            self.change_pin("node", "24.20.0")
+            with self.assertRaisesRegex(ValueError, "profile.*match"):
+                image.build("different", first.parent, self.versions, self.runner, builder=self.builder,
+                            peak_profile=profile, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+        self.assertEqual(len(self.calls), 2)
 
     def test_version_cannot_escape_output_root(self):
         for name in ("", ".", "..", "a/b", "/absolute", "bad\nname"):
@@ -286,7 +365,7 @@ class ImageTests(unittest.TestCase):
         self.assertIn("ro", table["/.lower"][1])
 
     def rootfs_shell(self, fail_chroot=False):
-        stage, bins = self.root / "stage", self.root / "bin"
+        stage, bins = self.root / ".work", self.root / "bin"
         stage.mkdir()
         bins.mkdir()
         (stage / "versions.json").write_bytes(self.versions.read_bytes())
@@ -294,14 +373,36 @@ class ImageTests(unittest.TestCase):
         (stage / "guest").mkdir()
         (stage / "motor-runner").write_bytes(b"test runner")
         log = self.root / "commands.jsonl"
+        mounts = self.root / "mounts.json"
+        mounts.write_text("[]")
         stub = '''import json, os, pathlib, sys
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 log = pathlib.Path(os.environ["STUB_LOG"])
+mounts = pathlib.Path(os.environ["STUB_MOUNTS"])
 with log.open("a") as stream:
     stream.write(json.dumps([name, *args]) + "\\n")
 if name == "id": print("0")
 elif name == "uname": print("Linux" if args == ["-s"] else "x86_64")
-elif name == "mountpoint": sys.exit(0)
+elif name == "mount" and not any(a.startswith("--make-") for a in args):
+    paths = json.loads(mounts.read_text()) + [args[-1]]
+    if "--rbind" in args:
+        paths += [args[-1] + "/pts", args[-1] + "/shm", args[-1] + "/shm/deep"]
+    mounts.write_text(json.dumps(paths))
+elif name == "umount":
+    paths = json.loads(mounts.read_text())
+    paths.remove(args[-1])
+    mounts.write_text(json.dumps(paths))
+elif name == "python3":
+    if len(args) >= 3 and args[1] == "cleanup-mounts":
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("storage", pathlib.Path(args[0]).with_name("build_storage.py"))
+        storage = importlib.util.module_from_spec(spec); spec.loader.exec_module(storage)
+        def mountinfo():
+            return "1 0 8:1 / / rw - xfs /dev/root rw\\n" + "".join(
+                f"{i+2} 1 0:2 / {p} rw - tmpfs stub rw\\n" for i,p in enumerate(json.loads(mounts.read_text())))
+        storage.unmount_tree(pathlib.Path(args[2]), reader=mountinfo)
+    else:
+        os.execv(sys.executable, [sys.executable, *args])
 elif name == "chroot":
     if os.environ.get("FAIL_CHROOT"): sys.exit(7)
     root = pathlib.Path(args[0])
@@ -310,11 +411,11 @@ elif name == "chroot":
 elif name in ("truncate", "mkfs.ext4"):
     pathlib.Path(args[-1]).write_bytes(b"test rootfs")
 '''
-        for name in ("id", "uname", "debootstrap", "mountpoint", "mount", "umount", "chroot", "truncate", "mkfs.ext4"):
+        for name in ("id", "uname", "debootstrap", "mount", "umount", "chroot", "truncate", "mkfs.ext4", "python3"):
             path = bins / name
             path.write_text(f"#!{sys.executable}\n" + stub)
             path.chmod(0o755)
-        env = dict(os.environ, PATH=f"{bins}:/usr/bin:/bin", STUB_LOG=str(log), JOBS="2")
+        env = dict(os.environ, PATH=f"{bins}:/usr/bin:/bin", STUB_LOG=str(log), STUB_MOUNTS=str(mounts), JOBS="2")
         if fail_chroot:
             env["FAIL_CHROOT"] = "1"
         result = subprocess.run(["bash", str(HERE / "build-rootfs.sh"), str(stage)],
@@ -330,14 +431,17 @@ elif name in ("truncate", "mkfs.ext4"):
         self.assertIn("CARGO_BUILD_RUSTC_WRAPPER=", chroot)
         unmounts = [i for i, call in enumerate(calls) if call[0] == "umount"]
         packing = next(i for i, call in enumerate(calls) if call[0] == "mkfs.ext4")
-        self.assertEqual(len(unmounts), 4)
+        self.assertEqual(len(unmounts), 7)
+        paths = [call[-1] for call in calls if call[0] == "umount"]
+        self.assertLess(paths.index(str(stage / "root/dev/shm/deep")), paths.index(str(stage / "root/dev/shm")))
+        self.assertLess(paths.index(str(stage / "root/dev/shm")), paths.index(str(stage / "root/dev")))
         self.assertLess(max(unmounts), packing)
         self.assertEqual((stage / "rootfs").read_bytes(), b"test rootfs")
 
     def test_rootfs_shell_failure_unmounts_but_does_not_publish_image(self):
         result, calls, stage = self.rootfs_shell(fail_chroot=True)
         self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertEqual(len([call for call in calls if call[0] == "umount"]), 4)
+        self.assertEqual(len([call for call in calls if call[0] == "umount"]), 7)
         self.assertFalse(any(call[0] == "mkfs.ext4" for call in calls))
         self.assertFalse((stage / "rootfs").exists())
 

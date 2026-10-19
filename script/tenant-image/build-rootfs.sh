@@ -15,14 +15,7 @@ packages=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1
 root="$out/root"
 mkdir "$root" "$out/scratch"
 cleanup() {
-    local failed=0
-    # Do not erase a chroot if a bind mount is still exposing the host's files.
-    for path in dev sys proc srv/build; do
-        if mountpoint -q "$root/$path"; then
-            umount --recursive "$root/$path" || failed=1
-        fi
-    done
-    return "$failed"
+    python3 "$here/build.py" cleanup-mounts "$root"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -34,7 +27,7 @@ mount --bind "$out/scratch" "$root/srv/build"
 mount -t proc proc "$root/proc"
 mount -t sysfs -o ro sysfs "$root/sys"
 mount --rbind /dev "$root/dev"
-mount --make-rslave "$root/dev"
+mount --make-rprivate "$root/dev"
 cp -a "$out/script" "$out/guest" "$out/versions.json" "$out/motor-runner" "$root/srv/build/"
 cp "$here/install-guest.py" "$root/srv/build/install-guest.py"
 chroot "$root" /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C.UTF-8 \

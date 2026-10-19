@@ -66,17 +66,37 @@ The default output root is `/var/lib/motor-vm/tenant-images`; do not use the
 `/srv/build/vm` source spelling for root-run operations. The host needs
 debootstrap with trixie support and current Debian archive signing keys,
 e2fsprogs, util-linux, Python 3, curl, xz, make, GCC 13.4.0 (`gcc-13`), flex,
-bison, bc, libssl-dev and libelf-dev. Allow at least 200 GiB of scratch space
-for the tool builds plus the 32 GiB rootfs. Cargo invocations within this build
+bison, bc, libssl-dev and libelf-dev. The build requires either an explicit
+first-build allocated-byte cap (`--build-budget-gib`) or a matching successful
+`disk-usage.json` (`--peak-profile`); there is no implicit scratch estimate.
+The free-space floor is 170 GiB. A first 64 GiB cap therefore needs 234 GiB free,
+not because the build is known to need 64 GiB, but because that is the operator's
+admitted limit until a peak is measured. Cargo invocations within this build
 are serial; `--jobs` caps each build's parallelism. Both Rust compiler-wrapper
 environment variables are explicitly cleared, including in the chroot.
 
 ```sh
 sudo python3 script/tenant-image/build.py build EXAMPLE_VERSION \
-  --runner /absolute/path/to/motor-runner --jobs 4
+  --runner /absolute/path/to/motor-runner --jobs 4 --build-budget-gib 64
 python3 script/tenant-image/build.py inventory \
   /var/lib/motor-vm/tenant-images/EXAMPLE_VERSION
 ```
+
+The build logs checkpoints and writes `disk-usage.json` beside its artifacts on
+both success and ordinary failure, with periodic sampled peaks of allocated
+file blocks owned by this version (nominal one-second interval plus phase
+checkpoints). Sparse holes are not counted as 32 GiB of
+real use, hardlinks are deduplicated, symlinks/mounts are not traversed, and
+reflink sharing can conservatively overcount blocks. The minimum global free
+space is reported separately: activity by other jobs cannot masquerade as the
+build's allocated-byte peak. An in-progress profile is refreshed during the build
+but cannot admit another build. A complete successful matching profile admits
+its peak plus 25%, rounded up to GiB, plus 4 GiB; recipe, runner, input pins and
+job count must match. For example, a repeat build can replace the explicit cap
+with `--peak-profile /var/lib/motor-vm/tenant-images/PRIOR_VERSION/disk-usage.json`.
+The monitor stops only its active build process group on cap/floor/measurement
+failure and retains the failed version; SIGKILL or host loss can leave only the
+last in-progress sample, never a reusable successful profile.
 
 The version directory is reserved with an exclusive `mkdir` **before** checking
 the binary, downloading or building anything. Even a concurrent invocation
@@ -84,9 +104,16 @@ cannot overwrite a version. A failed build deliberately leaves its reserved
 directory and `.work` for diagnosis; `build.py inventory` rejects any directory
 that still contains `.work`. Before manually
 removing a failed version to retry, check that no mounts remain under `.work`.
-Never recursively delete a chroot with live bind mounts. Successful builders
-unmount first, remove scratch, then write `manifest.json` as their completion
-record. Existing completed versions must never be removed to rebuild in place.
+Never recursively delete a chroot with live bind mounts. The rootfs subprocess
+runs in a private mount namespace, with its /dev subtree private too. Cleanup
+parses that namespace's mountinfo and performs blocking, non-lazy unmounts deepest
+first, including nested or stacked mounts. It refuses busy/unchanged mounts by
+name. The parent checks its own mountinfo before artifact promotion and again
+immediately before stage removal; a failed fence retains staging and publishes
+no manifest. Successful builders remove scratch, then write `manifest.json` as
+their completion record. `python3 build.py check-mounts RETAINED_VERSION` is the
+read-only mount fence to run before any manual disposal of an incomplete
+version. Existing completed versions must never be removed to rebuild in place.
 
 The build creates the following artifacts under the operator-host output root,
 `/var/lib/motor-vm/tenant-images/<version>/`, where `<version>` is the chosen release name:
@@ -151,6 +178,7 @@ Portable checks (no root, no VM, no network):
 
 ```sh
 python3 -W error script/tenant-image/test_tenant_image.py
+python3 -W error script/tenant-image/test_build_storage.py
 bash -n script/tenant-image/build-kernel.sh script/tenant-image/build-rootfs.sh
 sh -n script/tenant-image/guest/motor-init
 ```
@@ -188,8 +216,11 @@ not replace only the kernel or edit an existing completed rootfs in place: that
 would retain old guest-unit/module configuration and break the manifest's artifact
 hashes. Reuse the original verified runner binary when no runner code change is
 intended; the builder executes it inside the newly built userland as before.
-Allow the full tool-image build's scratch budget and network access, then run
-artifact inventory and the complete operator qualification on the new version.
+Set an explicit allocated-build-byte cap for the first rebuild, or supply a
+successful peak profile matching the recipe, runner, input pins and job count.
+After the build completes, `build.py inventory NEW_IMAGE` must verify artifact
+hashes and kernel requirements; `qualify.py --image NEW_IMAGE ...` must then run
+the real boot, guest checks, leased jobs, suspend/restore and teardown gates.
 `build.py check-kernel` rejects configurations with `NFT_REJECT` or its family
 companions set to `m`: those modules cannot be loaded in a guest that has no
 module store and locks module loading.
