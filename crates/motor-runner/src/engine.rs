@@ -44,6 +44,8 @@ pub struct Config {
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
+    /// Root-private tenant channels instead of vsock, only when explicitly set.
+    pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
@@ -203,6 +205,7 @@ impl Config {
         let state_root = state_root.into();
         Self {
             tenant_vm: false,
+            tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
             state_root,

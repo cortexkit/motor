@@ -195,6 +195,9 @@ impl Host {
         now_ms: u64,
         live: bool,
     ) -> Result<(), Error> {
+        if self.provider_managed {
+            return Ok(());
+        }
         let mut next = self.snapshot.clone();
         let b = next.billing.entry(job.to_owned()).or_default();
         if b.host_settled || b.terminal.is_some() {
@@ -207,6 +210,25 @@ impl Host {
         self.save(next)
     }
     pub fn billing_tick(&mut self, now_ms: u64) -> Result<(), Error> {
+        if self.provider_managed {
+            // Provider usage is measured outside this sandbox. Only cancellation
+            // is local: a disconnected requester must not disable the run cap.
+            let mut next = self.snapshot.clone();
+            for (job, lease) in &next.leases {
+                if lease.state == LeaseState::Started
+                    && lease.started_at_ms.is_some_and(|started| {
+                        now_ms >= started.saturating_add(lease.claims.max_s.saturating_mul(1000))
+                    })
+                {
+                    next.pending_cancels
+                        .insert(job.clone(), lease.tenant.clone());
+                }
+            }
+            if next.pending_cancels != self.snapshot.pending_cancels {
+                self.save(next)?;
+            }
+            return Ok(());
+        }
         let mut next = self.snapshot.clone();
         for (job, lease) in &mut next.leases {
             let b = next.billing.entry(job.clone()).or_default();
@@ -292,6 +314,9 @@ impl Host {
         Ok(())
     }
     pub fn terminal_delivered(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
+        if self.provider_managed {
+            return Ok(());
+        }
         let mut next = self.snapshot.clone();
         next.billing.entry(job.to_owned()).or_default().delivered = true;
         enqueue_usage(&mut next, now_ms);
