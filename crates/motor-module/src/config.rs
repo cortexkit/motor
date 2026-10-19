@@ -9,6 +9,15 @@ use std::{
 pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_runners: bool,
+    /// Move only proven capacity-permit waits to hosted runners. Defaults are
+    /// omitted so older clients with a closed Config schema can still load it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub spill_to_hosted: bool,
+    /// Capacity-permit wait before attempting spill, in seconds (default 45).
+    #[serde(skip_serializing_if = "is_default_spill_after")]
+    pub spill_after_s: u64,
+    #[serde(skip_serializing_if = "is_default_spill_max_vcpus")]
+    pub spill_max_vcpus: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_url: Option<String>,
     #[serde(skip_serializing_if = "BrokerTokenSource::is_default")]
@@ -63,6 +72,13 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_default_spill_after(value: &u64) -> bool {
+    *value == 45
+}
+fn is_default_spill_max_vcpus(value: &u32) -> bool {
+    *value == 8
+}
+
 fn is_default_direct_timeout(value: &u64) -> bool {
     *value == DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS
 }
@@ -80,6 +96,9 @@ impl Default for Config {
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
             hosted_runners: false,
+            spill_to_hosted: false,
+            spill_after_s: 45,
+            spill_max_vcpus: 8,
             broker_url: None,
             broker_token_source: BrokerTokenSource::CkAccount,
             runner_instance: "main".into(),

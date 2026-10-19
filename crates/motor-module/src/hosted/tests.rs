@@ -4,7 +4,14 @@ use super::*;
 fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
     let config = Config::default();
     let json = serde_json::to_value(&config).unwrap();
-    for key in ["hosted_runners", "broker_url", "broker_token_source"] {
+    for key in [
+        "hosted_runners",
+        "broker_url",
+        "broker_token_source",
+        "spill_to_hosted",
+        "spill_after_s",
+        "spill_max_vcpus",
+    ] {
         assert!(json.get(key).is_none(), "{key}");
     }
     let mut config = config;

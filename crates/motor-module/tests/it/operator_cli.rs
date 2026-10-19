@@ -57,6 +57,14 @@ impl Daemon {
     }
 
     async fn start_with_module_id(f: &Fixture, config: Config, module_id: &str) -> Arc<Self> {
+        Self::start_with_tokens(f, config, module_id, None).await
+    }
+    async fn start_with_tokens(
+        f: &Fixture,
+        config: Config,
+        module_id: &str,
+        tokens: Option<Arc<crate::AccountTokens>>,
+    ) -> Arc<Self> {
         let path = f
             .scratch
             .join(format!("connection-{}.json", Uuid::now_v7().simple()));
@@ -93,6 +101,11 @@ impl Daemon {
         let handler = Handler::new(config)
             .with_module_id(module_id)
             .with_motor(motor);
+        let handler = if let Some(tokens) = tokens {
+            handler.with_account_tokens(tokens)
+        } else {
+            handler
+        };
         let module_id = module_id.to_owned();
         let boot = tokio::spawn(async move {
             subc_client_rs::serve_with_handle(&path, module::manifest(&module_id), handler).await
@@ -813,6 +826,76 @@ async fn direct_bind_is_refused_as_before_while_the_switch_is_off() {
         daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
         FrameType::Response
     );
+}
+
+#[tokio::test]
+async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_off() {
+    use crate::hosted::account::tests::{refusal, token, FakeVault};
+    let f = Fixture::new(Cut::None, 28).await;
+    let config = direct_config(&f);
+    assert!(!config.hosted_runners);
+    let payload = motor_lease::base64url(
+        &serde_json::to_vec(
+            &json!({"aud":"cortexkit-runners", "sub":"acct:operator", "iat":1,"exp":u64::MAX}),
+        )
+        .unwrap(),
+    );
+    let jwt = format!("operator-secret-header.{payload}.operator-secret-signature");
+    let vault = FakeVault::new(vec![
+        Ok(token(&jwt)),
+        Ok(refusal("auth_required")),
+        Ok(refusal("not_found")),
+        Ok(refusal("transient")),
+        Ok(refusal("permanent")),
+        Ok(json!({})),
+    ]);
+    let daemon = Daemon::start_with_tokens(&f, config, "motor", Some(vault.client())).await;
+    assert_eq!(
+        daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+        FrameType::Response
+    );
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    let denied = error(&daemon.request(AFT_CHANNEL, "hosted.check", json!({})).await);
+    assert_eq!(denied["code"], "motor_op_not_permitted_for_principal");
+    let logs = crate::logging::Captured::default();
+    let _guard = crate::logging::scoped(logs.clone());
+    tracing::warn!("hosted operator capture active");
+    for status in [
+        "ok",
+        "auth_required",
+        "not_found",
+        "transient",
+        "permanent",
+        "invalid",
+    ] {
+        let reply = daemon
+            .request(DIRECT_CHANNEL, "hosted.check", json!({}))
+            .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let output = body(&reply);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["status"], status);
+        if status == "ok" {
+            assert_eq!(value["claims"]["sub"], "acct:operator");
+        }
+        if status == "transient" {
+            assert_eq!(value["retry_after_ms"], 4321);
+        }
+        for secret in [
+            &jwt,
+            "operator-secret-header",
+            "operator-secret-signature",
+            "private-vault-code",
+        ] {
+            assert!(!output.contains(secret));
+            assert!(!logs.text().contains(secret));
+        }
+    }
+    assert_eq!(vault.requests.lock().unwrap().len(), 6);
+    assert!(logs.text().contains("hosted operator capture active"));
 }
 
 #[tokio::test]
