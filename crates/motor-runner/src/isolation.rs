@@ -1624,9 +1624,27 @@ fn prefetch_cargo_dependencies(
             )?
             .env("CARGO_NET_OFFLINE", "false"),
         )
-        .map_err(|error| io::Error::other(format!("{stage}: {error}")))?;
+        .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
     }
     Ok(())
+}
+
+/// A stale lockfile is the caller's to fix, and it can't be fixed remotely:
+/// a job's changes to tracked files never come back to the caller's checkout.
+/// Say so, rather than leaving only Cargo's `--locked` message.
+fn fetch_failure(stage: &str, error: &str) -> String {
+    // Cargo has worded this both "needs to be updated but --locked was passed to
+    // prevent this" and "cannot update the lock file ... because --locked was
+    // passed to prevent this"; the shared tail matches both.
+    if error.contains("--locked was passed to prevent this") {
+        format!(
+            "{stage}: {error}; Cargo.lock doesn't match Cargo.toml: update it in your \
+             own checkout (cargo update runs there, not in a remote job, whose file \
+             changes don't come back), then retry"
+        )
+    } else {
+        format!("{stage}: {error}")
+    }
 }
 
 impl Sandbox {

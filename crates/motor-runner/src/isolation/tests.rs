@@ -8,6 +8,23 @@ mod writer;
 mod privilege;
 
 #[test]
+fn stale_lockfile_refusal_says_to_update_it_locally() {
+    // Both wordings Cargo has used for a manifest edited past its lockfile.
+    for cargo in [
+        "error: the lock file /w/Cargo.lock needs to be updated but --locked was \
+         passed to prevent this",
+        "error: cannot update the lock file /w/Cargo.lock because --locked was \
+         passed to prevent this",
+    ] {
+        let detail = fetch_failure("fetch job dependencies", cargo);
+        assert!(detail.starts_with("fetch job dependencies: error: "));
+        assert!(detail.contains("update it in your own checkout"));
+    }
+    let other = fetch_failure("fetch job dependencies", "failed to download serde");
+    assert_eq!(other, "fetch job dependencies: failed to download serde");
+}
+
+#[test]
 fn memory_max_scales_per_vcpu_with_a_sixteen_gib_floor() {
     for vcpus in 1..=4 {
         assert_eq!(crate::backend::memory_max(vcpus, None), 17_179_869_184);
