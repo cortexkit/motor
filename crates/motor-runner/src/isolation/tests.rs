@@ -1201,6 +1201,45 @@ fn isolated_job_cannot_see_another_accounts_process() {
     );
 }
 
+// PrivateDevices=yes gives a job a private /dev, and systemd fills its /dev/pts
+// by bind-mounting whatever the host has at /dev/pts. If the host has lost its
+// devpts mount, for example because an unmount propagated from a shared bind of
+// /dev, jobs get a bare devtmpfs directory there. Then /dev/ptmx fails with
+// ENODEV and every pseudo-terminal test inside a job fails.
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_job_can_open_a_pty() {
+    let f = Fixture::new();
+    let sandbox = f.sandbox();
+    // A later mount at the same mount point hides earlier ones, so the job's
+    // visible /dev/pts is the one no other /dev/pts entry is stacked on.
+    let script = r#"
+import os
+mounts = []
+with open("/proc/self/mountinfo") as table:
+    for line in table:
+        fields, _, tail = line.partition(" - ")
+        fields = fields.split()
+        if fields[4] == "/dev/pts":
+            mounts.append((fields[0], fields[1], tail.split()[0]))
+assert mounts, "no /dev/pts mount"
+stacked = {parent for (_, parent, _) in mounts}
+visible = [fstype for (mount, _, fstype) in mounts if mount not in stacked]
+print("fstype", " ".join(visible))
+leader, follower = os.openpty()
+print("terminal", os.ttyname(follower))
+"#;
+    let (status, stdout, stderr) = output(
+        &sandbox,
+        &format!("exec python3 -c '{script}'"),
+        &f.workspace,
+    );
+    assert!(status.success(), "{stdout}\n{stderr}");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines[0], "fstype devpts", "{stdout}");
+    assert!(lines[1].starts_with("terminal /dev/pts/"), "{stdout}");
+}
+
 #[test]
 #[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
 fn isolated_job_starts_with_no_ignored_or_blocked_signals() {
