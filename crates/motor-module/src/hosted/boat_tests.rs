@@ -141,7 +141,9 @@ impl Boat {
         let http=Http::new(move |path,body| {
             if path.ends_with("/reattach") && lost_reply.load(Ordering::SeqCst) != 0 { return (409, serde_json::json!({"error":"sandbox_lost"})); }
             if path.ends_with("/finish") {return (200,serde_json::json!({"job_id":path.split('/').nth(3).unwrap(),"settled_vcpu_ms":250,"released_vcpu_ms":59750}));}
-            if requests_seen.fetch_add(1,Ordering::SeqCst)<provisioning {return (503,serde_json::json!({"error":"provisioning","retry_after_ms":10}));}
+            if requests_seen.fetch_add(1, Ordering::SeqCst) < provisioning {
+                return (202, serde_json::json!({"status":"provisioning","retry_after_ms":10}));
+            }
             let (id,jwk,purpose,sshd)=if path=="/v1/leases" {
                 let request: motor_lease::LeaseRequest=serde_json::from_value(body.clone()).unwrap();
                 let mut saved=job.lock().unwrap();
@@ -211,6 +213,7 @@ async fn boat_provisioning_retry_and_reattach_refresh_endpoint_and_pin() {
     let scratch = cortexkit_test_support::ScratchDir::new("boat-client");
     let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
     let id = Uuid::now_v7();
+    storage.create(id, 300, None, None, false).unwrap();
     let route = HostedJobState::new(&boat.config);
     storage.hosted_route(id, route.clone()).unwrap();
     let path = scratch.to_str().unwrap();
@@ -253,6 +256,7 @@ async fn boat_loss_409_stops_reattach_and_never_resubmits_or_releases() {
     let scratch = cortexkit_test_support::ScratchDir::new("boat-loss");
     let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
     let id = Uuid::now_v7();
+    storage.create(id, 300, None, None, false).unwrap();
     let route = HostedJobState::new(&boat.config);
     storage.hosted_route(id, route.clone()).unwrap();
     let path = scratch.to_str().unwrap();
@@ -295,4 +299,372 @@ async fn boat_loss_409_stops_reattach_and_never_resubmits_or_releases() {
         serde_json::json!({"outcome":"lost","run_ms":0})
     );
     assert_eq!(boat.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let decode_hex = |text: &str| -> [u8; 32] {
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    };
+    let key = SigningKey::from_bytes(&decode_hex(
+        vector["requester"]["test_only_seed_hex"].as_str().unwrap(),
+    ));
+    let booked_request = &vector["booked"]["request"]["body"];
+    let id = Uuid::parse_str(booked_request["job_id"].as_str().unwrap()).unwrap();
+    let request = RunRequest::new(
+        "/home/test/workspace",
+        "/home/test/workspace/repo",
+        "/home/test/workspace",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_weight_hint(booked_request["vcpus"].as_u64().unwrap() as u32)
+    .with_timeout(booked_request["timeout_s"].as_u64().unwrap());
+    let lease_request = lease_body(
+        id,
+        &request,
+        (
+            booked_request["workspace_key_hash"]
+                .as_str()
+                .unwrap()
+                .into(),
+            booked_request["repo_hash"].as_str().unwrap().into(),
+        ),
+        serde_json::from_value(booked_request["placement_hint"].clone()).unwrap(),
+        RequesterJwk::from_key(&key.verifying_key()),
+    )
+    .unwrap();
+    let built = serde_json::to_value(&lease_request).unwrap();
+    for (scenario, expected) in [
+        ("provisioning", &vector["provisioning"]["request"]["body"]),
+        ("booked", booked_request),
+    ] {
+        for field in [
+            "job_id",
+            "vcpus",
+            "platform",
+            "workspace_key_hash",
+            "repo_hash",
+            "placement_hint",
+            "timeout_s",
+        ] {
+            assert_eq!(
+                built[field], expected[field],
+                "{scenario} LeaseRequest.{field}"
+            );
+        }
+        // CLOUD's net=true example is illustrative; Motor spills only network-free jobs.
+        assert_eq!(built["net"], false, "{scenario} LeaseRequest.net");
+        assert_eq!(
+            built["requester_jwk"]["kty"],
+            expected["requester_jwk"]["kty"]
+        );
+        assert_eq!(
+            built["requester_jwk"]["crv"],
+            expected["requester_jwk"]["crv"]
+        );
+        assert_eq!(
+            built["requester_jwk"]["x"], expected["requester_jwk"]["x"],
+            "{scenario} LeaseRequest.requester_jwk.x"
+        );
+    }
+    assert_eq!(
+        built["requester_jwk"]["x"], vector["requester"]["x"],
+        "LeaseRequest.requester_jwk.x"
+    );
+
+    let booked_reply = &vector["booked"]["reply"];
+    assert_eq!(booked_reply["status"], 201);
+    let lease: placement::Lease = serde_json::from_value(booked_reply["body"].clone()).unwrap();
+    assert_eq!(booked_reply["body"]["provider"], "boat");
+    assert_eq!(
+        lease.lease_id,
+        booked_reply["body"]["lease_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        lease.job_id,
+        booked_reply["body"]["job_id"].as_str().unwrap()
+    );
+    assert_eq!(lease.placement.host, "boat:bx_22222222");
+    assert_eq!(lease.placement.vm.as_deref(), Some("bx_22222222"));
+    let ssh = lease.ssh.as_ref().unwrap();
+    assert_eq!(ssh.endpoint, "198.51.100.1:22000");
+    assert_eq!(
+        ssh.host_key,
+        booked_reply["body"]["ssh"]["host_key"].as_str().unwrap()
+    );
+    assert_eq!(ssh.user, "user");
+    assert_eq!(lease.runner_port, Some(9443));
+    assert_eq!(lease.job_token, booked_reply["body"]["job_token"]);
+    assert_eq!(
+        lease.token_expires_at_ms,
+        booked_reply["body"]["token_expires_at_ms"]
+            .as_u64()
+            .unwrap()
+    );
+    assert_eq!(lease.max_s, booked_reply["body"]["max_s"].as_u64().unwrap());
+    assert_eq!(
+        lease.reserved_vcpu_ms,
+        booked_reply["body"]["reserved_vcpu_ms"].as_u64().unwrap()
+    );
+
+    let reattach_body = serde_json::to_value(reattach_body(&key)).unwrap();
+    let reattach_request = &vector["sandbox_lost"]["reattach"]["request"];
+    assert_eq!(reattach_body["requester_jwk"]["kty"], "OKP");
+    assert_eq!(reattach_body["requester_jwk"]["crv"], "Ed25519");
+    assert_eq!(
+        reattach_body["requester_jwk"]["x"],
+        reattach_request["body"]["requester_jwk"]["x"]
+    );
+
+    let finish = &vector["finish"];
+    let finish_id = Uuid::parse_str(
+        finish["request"]["pathname"]
+            .as_str()
+            .unwrap()
+            .split('/')
+            .nth(3)
+            .unwrap(),
+    )
+    .unwrap();
+    let mut terminal = TerminalRecord::new(finish_id, Outcome::Exit { code: 23 }, 0, 0, 0);
+    terminal.wall_ms = finish["request"]["body"]["run_ms"].as_u64().unwrap();
+    let finish_body = placement::Finish::from_terminal(&terminal, 100);
+    let finish_value = serde_json::to_value(&finish_body).unwrap();
+    assert_eq!(
+        finish_value["outcome"],
+        finish["request"]["body"]["outcome"]
+    );
+    assert_eq!(finish_value["run_ms"], finish["request"]["body"]["run_ms"]);
+    assert_eq!(finish["request"]["method"], "POST");
+    assert_eq!(finish["reply"]["status"], 200);
+    let finish_reply: placement::FinishReply =
+        serde_json::from_value(finish["reply"]["body"].clone()).unwrap();
+    assert_eq!(finish_reply.job_id, finish["reply"]["body"]["job_id"]);
+    assert_eq!(
+        finish_reply.settled_vcpu_ms,
+        finish["reply"]["body"]["settled_vcpu_ms"]
+    );
+    assert_eq!(
+        finish_reply.released_vcpu_ms,
+        finish["reply"]["body"]["released_vcpu_ms"]
+    );
+
+    let finish_reply_body = finish["reply"]["body"].clone();
+    let finish_http = Http::new(move |_path, _body| (200, finish_reply_body.clone())).await;
+    let config = Config {
+        runner_instance: "boat-vector-test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(finish_http.url.clone()),
+        spill_to_hosted: true,
+        ..Config::default()
+    };
+    let scratch = cortexkit_test_support::ScratchDir::new("boat-vector-finish");
+    let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
+    storage
+        .hosted_route(finish_id, HostedJobState::new(&config))
+        .unwrap();
+    storage
+        .hosted_update(finish_id, |state| state.lease(&lease))
+        .unwrap();
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    assert!(!Client::new(HostedJobState::new(&config))
+        .finish(finish_id, Some(&terminal), &storage)
+        .await
+        .unwrap());
+    let sent = finish_http.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, finish["request"]["pathname"].as_str().unwrap());
+    assert_eq!(sent[0].1["outcome"], finish["request"]["body"]["outcome"]);
+    assert_eq!(sent[0].1["run_ms"], finish["request"]["body"]["run_ms"]);
+    let settled = storage.job(finish_id).unwrap().hosted.unwrap();
+    assert!(settled.finish_done);
+    assert_eq!(settled.billed_vcpu_ms, Some(180000));
+}
+
+#[tokio::test]
+async fn cloud_boat_sandbox_lost_vector_maps_to_client_error() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let decode_hex = |text: &str| -> [u8; 32] {
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    };
+    let key = SigningKey::from_bytes(&decode_hex(
+        vector["requester"]["test_only_seed_hex"].as_str().unwrap(),
+    ));
+    let request = &vector["sandbox_lost"]["reattach"]["request"];
+    let reply_body = vector["sandbox_lost"]["reattach"]["reply"]["body"].clone();
+    let http = Http::new(move |_path, _body| (409, reply_body.clone())).await;
+    let config = Config {
+        runner_instance: "boat-vector-loss-test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(http.url.clone()),
+        spill_to_hosted: true,
+        ..Config::default()
+    };
+    let result = Client::new(HostedJobState::new(&config))
+        .post_authorized::<_, serde_json::Value>(
+            request["pathname"].as_str().unwrap(),
+            &reattach_body(&key),
+            "hosted-test-bearer".into(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::SandboxLost)));
+    let sent = http.requests.lock().unwrap();
+    let (path, body) = sent.last().unwrap();
+    assert_eq!(path, request["pathname"].as_str().unwrap());
+    assert_eq!(
+        body["requester_jwk"]["x"],
+        request["body"]["requester_jwk"]["x"]
+    );
+    let lost_reply = &vector["sandbox_lost"]["reattach"]["reply"];
+    assert_eq!(lost_reply["status"], 409);
+    assert_eq!(lost_reply["body"]["error"], "sandbox_lost");
+}
+
+#[tokio::test]
+async fn cloud_boat_provisioning_response_retries_then_parses_booked_lease() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let provisioning = &vector["provisioning"]["reply"];
+    let booked = &vector["booked"]["reply"];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reply_calls = calls.clone();
+    let provisioning_status = provisioning["status"].as_u64().unwrap() as u16;
+    let provisioning_body = provisioning["body"].clone();
+    let booked_status = booked["status"].as_u64().unwrap() as u16;
+    let booked_body = booked["body"].clone();
+    let http = Http::new(move |_path, _body| {
+        if reply_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            (provisioning_status, provisioning_body.clone())
+        } else {
+            (booked_status, booked_body.clone())
+        }
+    })
+    .await;
+    let config = Config {
+        runner_instance: "boat-vector-provisioning-test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(http.url.clone()),
+        spill_to_hosted: true,
+        ..Config::default()
+    };
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    let lease: placement::Lease = Client::new(HostedJobState::new(&config))
+        .post_ready_authorized(
+            vector["booked"]["request"]["pathname"].as_str().unwrap(),
+            &vector["booked"]["request"]["body"],
+            "hosted-test-bearer".into(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.job_id, booked["body"]["job_id"].as_str().unwrap());
+    assert_eq!(lease.placement.host, "boat:bx_22222222");
+    assert_eq!(lease.runner_port, Some(9443));
+    let sent = http.requests.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(sent[0].0, "/v1/leases");
+    assert_eq!(sent[1].0, "/v1/leases");
+    assert_eq!(sent[0].1, vector["booked"]["request"]["body"]);
+    assert_eq!(sent[1].1, vector["booked"]["request"]["body"]);
+    assert_eq!(sent[0].1["job_id"], sent[1].1["job_id"]);
+}
+
+#[tokio::test]
+async fn cloud_boat_unknown_success_shape_is_a_typed_broker_error() {
+    let http = Http::new(|_path, _body| (200, serde_json::json!({"status":"unexpected"}))).await;
+    let config = Config {
+        runner_instance: "boat-invalid-success-test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(http.url.clone()),
+        spill_to_hosted: true,
+        ..Config::default()
+    };
+    let result = Client::new(HostedJobState::new(&config))
+        .post_authorized::<_, placement::Lease>(
+            "/v1/leases",
+            &serde_json::json!({}),
+            "token".into(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Broker)));
+}
+
+#[tokio::test]
+async fn cloud_boat_provisioning_budget_exhaustion_is_retryable_and_bounded() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let reply = vector["provisioning"]["reply"]["body"].clone();
+    let http = Http::new(move |_path, _body| (202, reply.clone())).await;
+    let config = Config {
+        runner_instance: "boat-vector-budget-test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(http.url.clone()),
+        spill_to_hosted: true,
+        ..Config::default()
+    };
+    let route = HostedJobState {
+        spill_wait_ms: Some(9_500),
+        ..HostedJobState::default()
+    };
+    let job = crate::storage::Job {
+        queue_wait_limit_s: 10,
+        hosted: Some(route),
+        ..crate::storage::Job::default()
+    };
+    let budget_ms = spill_wait_budget_ms(&job);
+    assert_eq!(budget_ms, 500);
+    let started = tokio::time::Instant::now();
+    let result = Client::new(HostedJobState::new(&config))
+        .post_ready_authorized::<_, placement::Lease>(
+            "/v1/leases",
+            &vector["provisioning"]["request"]["body"],
+            "hosted-test-bearer".into(),
+            started + Duration::from_millis(budget_ms),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("provisioning unexpectedly produced a lease"),
+    };
+    assert!(matches!(error, Error::Provisioning(5_000)));
+    assert_eq!(error.code(), "hosted_provisioning");
+    assert_eq!(error.reason(), RefusalReason::Unreachable);
+    assert_eq!(error.retry_after_ms(), Some(5_000));
+    assert!(elapsed >= Duration::from_millis(budget_ms));
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cloud_boat_provisioning_retry_delay_is_clamped() {
+    assert_eq!(bounded_provisioning_retry_ms(0), 1_000);
+    assert_eq!(bounded_provisioning_retry_ms(5_000), 5_000);
+    assert_eq!(bounded_provisioning_retry_ms(u64::MAX), 30_000);
 }

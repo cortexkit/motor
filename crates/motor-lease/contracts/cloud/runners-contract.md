@@ -115,12 +115,13 @@ Every error body is exactly `{"error":"<code>"}`, with no other member.
 | 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
 | 402 | `budget_exhausted` |
 | 404 | `not_found`, `job_unknown` |
-| 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict` |
+| 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 500 | `internal` |
-| 503 | `no_capacity`, `unavailable`; both include `Retry-After: 5` |
+| 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal names a longer wait |
 
 Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
-retryable transport failures. Host retries after a consumed counter must use a new counter.
+retryable transport failures. `sandbox_lost` is final for that job: its Boat sandbox stopped or
+failed under the lease, and ck-motor must start a new `job_id`. Host retries after a consumed counter must use a new counter.
 
 ## Client endpoints
 
@@ -156,7 +157,9 @@ After authentication and schema validation, checks proceed in this order:
 3. Ask for placement. If no active host has the requested platform, return 400
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
    `no_capacity`. Before returning a refusal, repeat the existing-job check so a concurrent
-   successful lease wins over that refusal.
+   successful lease wins over that refusal. When Boat spill is enabled and the platform equals
+   `BOAT_PLATFORM`, either refusal is replaced by the spill path in
+   [Boat placements](#boat-placements).
 4. Compute the budget candidate from current totals. For finite allowances,
    `remaining = max(0, allowance − settled_total − reserved_total)` and
    `max_s = min(timeout_s, floor(remaining / (vcpus × 1000)))`; unlimited uses `timeout_s`.
@@ -237,6 +240,25 @@ that host reporting `admitted` or `started` before `release_at_ms`. If those hea
 arrive in time, for example because the host can't reach the broker, the alarm settles the job at
 zero and its later usage report gets `job_settled`. Hosts narrow the window by refusing to admit a
 job whose run token has expired, which leaves at least 60 seconds for the heartbeat.
+
+### POST /v1/leases/{job_id}/finish
+
+Boat placements only (nothing inside a Boat sandbox signs to the broker, so ck-motor reports the
+end). Authentication and release's D1 claim check run first: an unknown, claim-only or other
+tenant's job is 404 `job_unknown`. The body is exactly `{outcome, run_ms}` with JSON Content-Type;
+`outcome` is `exit`, `signal`, `timeout`, `cancelled` or `lost`, and `run_ms` a non-negative safe
+integer of at most `max_s × 1000`. Anything else is 400 `bad_request`. Then, in order:
+
+1. A job not placed on a Boat sandbox: 404 `job_unknown`.
+2. A job settled as `lost`: 409 `sandbox_lost`.
+3. A job settled by an earlier finish: the identical canonical body (`{outcome, run_ms}` in that
+   order) returns the original 200 reply; any other body gives 409 `usage_conflict`. Settled any
+   other way: 409 `job_settled`.
+4. Otherwise settle on the broker clock (see [Boat placements](#boat-placements)) with reason
+   `finished`, record `outcome` and `run_ms` as untrusted facts, and rewrite the key file empty.
+
+Success is **200** with exactly `{job_id, settled_vcpu_ms, released_vcpu_ms}`. `run_ms` never
+affects the amount.
 
 ### GET /v1/tenant
 
@@ -387,6 +409,91 @@ count again. These hourly facts go to account's `RunnersUsageIngest`; the accoun
 the broker's reservation authority. Allowances are lifetime vCPU-ms; a missing row means 0, and
 `unlimited` removes the budget gate. Prices and invoices are outside this contract.
 
+## Boat placements
+
+When no registered host fits a lease, the broker can spill it to a Boat (boat.dev) sandbox that it
+drives through Boat's API. Spill is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
+is configured. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
+serves at most one live lease**. Placement hints never select a sandbox.
+
+**Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), and `BOAT_SIZES`
+(the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
+`vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
+fitting size is 503 `no_capacity`.
+
+**Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
+lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
+(after a Boat 429 or 503), the lease is 503 `no_capacity` at once with that wait as Retry-After.
+Then a provisioning record keyed by `job_id` claims a pool slot: a free ready sandbox, else an
+archived one to resume, else one being stopped (waited for, then resumed), else a new sandbox
+under the cap and a limit of 6 creates per tenant per hour. No slot is 503 `no_capacity`.
+
+**Provisioning reply.** While the claimed sandbox starts, the answer is **202** with exactly
+`{"status":"provisioning","retry_after_ms":5000}`. No budget is held. A re-request with the same
+`job_id` and lease hash joins the record and answers from broker state; a different body is 409
+`job_conflict`. A record lives 120 seconds; after that, or after Boat refuses to start the
+sandbox (answered once as 503 `no_capacity` with Boat's wait), the next re-request starts over.
+
+**Booking.** The reservation is booked in the request that returns the lease, in one transaction
+that re-checks the budget, and only if Boat's auto-stop for the sandbox falls after the lease's
+deadline. A booked Boat job is **admitted at booking**: release answers 409 `job_admitted`. The
+key file is then written and read back; if that fails the job stays booked and re-requests
+answer 202 while the broker retries, and after 3 failures the job settles as `lost`.
+
+**Reply.** **201** with exactly these fields, in this order (reattach uses the same shape with
+200 and an `attach` token):
+
+```text
+{provider:"boat", lease_id, job_id, placement:{host:"boat:<sandbox_id>", vm:"<sandbox_id>"},
+ ssh:{endpoint, host_key, user}, runner_port, job_token, token_expires_at_ms, max_s, reserved_vcpu_ms}
+```
+
+Host replies are unchanged and carry no `provider`. The job token's `aud` and `placement.host`
+are `boat:<sandbox_id>`, with Boat's sandbox id verbatim (grammar
+`^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$` from Boat's OpenAPI file); the colon can never
+match a registered host id. The token's `mem_mib` is the chosen size's usable `mem_mib`, the
+sandbox's whole usable memory, not the fleet formula. `runner_port` is 9443.
+
+**SSH transport.** ck-motor connects to `ssh.endpoint` (`host:port`, an IPv4 or bracketed IPv6
+host) as `ssh.user`, pins `ssh.host_key` (exactly `ssh-ed25519 <base64>`, no options or comment),
+and opens one local forward to `127.0.0.1:<runner_port>` with `-N`, then runs the normal token and
+admission challenge over it. The endpoint and host key come from Boat's `POST /sshkey` reply,
+fetched once per sandbox incarnation (they change on every resume), and every re-request and
+reattach returns the sandbox's current pair. The sandbox's `~/.ssh/authorized_keys` holds exactly
+one line, for the lease's requester Ed25519 key (the one `cnf.jkt` names):
+
+```text
+restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false" ssh-ed25519 <base64(string "ssh-ed25519" || string pk)>
+```
+
+SSH strings are a big-endian uint32 length followed by the bytes. A re-request or reattach with a
+different requester key rewrites the line to that key before any token is returned. Finish,
+settlement and a deadline rewrite the file empty. The file is hygiene, not revocation: the tenant
+has root in its own sandbox, and established sessions survive a rewrite.
+
+**Settlement (broker clock only).** A finished or lost Boat job settles
+`min(max(vcpus × (settled_at_ms − booked_at_ms), vcpus × 60000), reserved_vcpu_ms)`, where
+`settled_at_ms` is when the broker received the finish or observed the loss. At the host-lost
+deadline an unfinished Boat job settles its full reservation with reason `deadline`. If its
+sandbox stops or fails under the lease (Boat's auto-stop, a Boat fault, a guest crash) or the key
+file cannot be written, the job settles with reason `lost`, and lease re-request, reattach and
+finish answer 409 `sandbox_lost`. Boat settlements update the tenant's budget totals but are
+**never counted** in the `runners` / `vcpu_ms` usage aggregate; their facts (and Boat's own
+machine-time meter per run window) are recorded in D1 only, until a billing rule exists.
+
+**Image obligations** (the tenant sandbox image):
+
+- Tenant sandboxes are created confined (`noEnv`), so the snapshot must not depend on any account
+  secret, and is built from a `noEnv` sandbox through the clean image pipeline.
+- The broker writes `/etc/motor/tenant/id` once per sandbox, root-owned `0444`, holding the
+  sandbox id as ASCII with no newline; a resume keeps it. The runner reads it, refuses all
+  connections while it is missing, and checks the token's `aud` equals `boat:<id>`.
+- The runner listens only on `127.0.0.1:9443`.
+- sshd sets `AllowTcpForwarding local`, `PermitTTY no`, `AllowAgentForwarding no`,
+  `X11Forwarding no` and `PermitTunnel no`, and the boot unit empties `authorized_keys` on every
+  resume.
+- Nothing in the sandbox signs to the broker: no report key, heartbeat or usage report.
+
 ## Pinned conformance evidence
 
 `test-vectors/runners/job-tokens.json` pins both token purposes and their header/claim bytes,
@@ -394,9 +501,13 @@ the fixed signing seed and its derived public key. `test-vectors/runners/lease.j
 lease request and exact reply, including the lease id and SPKI hash.
 `test-vectors/runners/host-signature.json` pins the exact host signature input and signature.
 `test-vectors/runners/usage-settlement.json` pins the report and settlement reply.
+`test-vectors/runners/boat-lease.json` pins, with a recorded test size and the recorded test
+requester key, the Boat 202 provisioning reply, the booked Boat lease reply, a finish call and
+reply, `sandbox_lost` on reattach and finish, and the requester key's OpenSSH encoding and
+authorized_keys line.
 
-`workers/runners/test/vectors.test.ts` compares real implementation output to those committed
-bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,
+`workers/runners/test/vectors.test.ts` and `workers/runners/test/boat-vectors.test.ts` compare real
+implementation output to those committed bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,
 `workers/runners/test/host-auth.test.ts`, `workers/runners/test/usage.test.ts`,
 `workers/runners/test/rerequest.test.ts` and `workers/runners/test/lease-concurrency.test.ts`
 exercise the corresponding credentials, state transitions and accounting invariants. See

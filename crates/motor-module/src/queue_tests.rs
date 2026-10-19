@@ -515,3 +515,99 @@ async fn boat_finish_is_first_for_terminal_refusal_and_unknown_and_never_release
     assert_eq!(bodies[1].1["outcome"], "lost");
     assert_eq!(bodies[2].1["outcome"], "lost");
 }
+
+#[tokio::test]
+async fn exhausted_spill_provisioning_returns_retryable_refusal_without_local_run() {
+    let boat = crate::hosted::boat_tests::Boat::new(usize::MAX, false).await;
+    let scratch = ScratchDir::new("motor-spill-provisioning-budget");
+    let repo = scratch.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let withdrawn = Arc::new(AtomicBool::new(false));
+    let motor = Motor::with_connector(
+        boat.config.clone(),
+        &scratch.join("state"),
+        Arc::new(SpillPeer {
+            withdrawn: withdrawn.clone(),
+            direct: false,
+        }),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor
+        .storage
+        .create(id, 1, None, Some("test".into()), false)
+        .unwrap();
+    let path = repo.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+    let (tx, mut rx) = mpsc::channel(32);
+    let (_wake, wake) = watch::channel(false);
+    let job = motor.clone();
+    let task = tokio::spawn(async move {
+        job.run_job(
+            id,
+            (request, crate::ReturnOptions::default()),
+            Vec::new(),
+            (1, true),
+            &tx,
+            wake,
+        )
+        .await
+    });
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = rx.recv().await.unwrap().unwrap();
+            if let StreamRecord::Terminal(terminal) = record {
+                break terminal;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.await.unwrap().unwrap();
+    assert!(withdrawn.load(Ordering::SeqCst));
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unreachable
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms, Some(1_000));
+    assert!(terminal
+        .refusal_detail
+        .as_deref()
+        .is_some_and(|detail| detail.starts_with("hosted_provisioning")));
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_no_fallback);
+    assert_eq!(state.hosted_code.as_deref(), Some("hosted_provisioning"));
+    assert_eq!(boat.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        boat.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/v1/leases")
+            .count(),
+        1
+    );
+}
