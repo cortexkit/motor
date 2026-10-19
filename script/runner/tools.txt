@@ -35,6 +35,9 @@
 #   the operator's tenant-VM guest kernel (script/tenant-vm-spike/build-kernel.sh).
 #   The host's default GCC 15 defaults to C23 and can't build the pinned Linux
 #   6.1.128, so that kernel builds with gcc-13.
+# - debian-archive-keyring (Ubuntu's package): lets debootstrap verify the
+#   Debian trixie snapshot that the tenant image rootfs is built from
+#   (script/tenant-image/build-rootfs.sh).
 # - Node, pnpm and Bun: preinstall the versions required by repository manifests.
 #   The runner also uses Bun for pre-job bun.lock installs. Verify official
 #   release archives against published SHA-256 sums. Install tools under /usr
