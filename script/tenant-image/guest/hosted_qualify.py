@@ -42,6 +42,18 @@ def runner_diagnostics():
     print("GUEST_RUNNER_DIAGNOSTIC " + json.dumps(state), flush=True)
 
 
+def socket_peer(inode):
+    """The /proc/net rows that name a socket inode, so its protocol and address show."""
+    rows = []
+    for table in ("unix", "udp", "udp6", "tcp", "tcp6", "netlink", "raw", "raw6"):
+        try:
+            lines = Path(f"/proc/net/{table}").read_text().splitlines()
+        except OSError:
+            continue
+        rows += [f"{table}: {line.strip()}" for line in lines[1:] if inode in line.split()]
+    return rows or ["inode not found in /proc/net"]
+
+
 def process_snapshot(state):
     """Each thread's wait channel for the runner and its descendants."""
     try:
@@ -82,11 +94,16 @@ def process_snapshot(state):
                     fds[fd.name] = os.readlink(fd)
                 except OSError as error:
                     fds[fd.name] = f"{type(error).__name__}"
+            sockets = {}
+            for name, target in fds.items():
+                if target.startswith("socket:["):
+                    sockets[name] = socket_peer(target[8:-1])
             try:
                 stack = (proc / "stack").read_text()[-1200:]
             except OSError as error:
                 stack = f"{type(error).__name__}: {error}"
-            snapshot.append(dict(pid=pid, cmdline=cmdline, threads=threads, fds=fds, stack=stack))
+            snapshot.append(dict(pid=pid, cmdline=cmdline, threads=threads, fds=fds,
+                                 sockets=sockets, stack=stack))
         except OSError as error:
             snapshot.append(dict(pid=pid, error=f"{type(error).__name__}: {error}"))
     return snapshot
