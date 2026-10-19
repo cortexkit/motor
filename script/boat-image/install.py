@@ -217,9 +217,21 @@ def tools(pins):
 
 
 def target_directories():
+    # /usr/local can be staff-writable; the helper's trust check includes every parent.
+    parents = ('/', '/usr', '/usr/local', '/usr/local/libexec')
+    for name in parents:
+        path = Path(name)
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise ValueError('permissions helper ancestor is not a physical directory: ' + name)
     run('install', '-d', '-o', 'root', '-g', 'root', '-m', '0755',
-        '/usr/local/bin', '/usr/local/libexec', '/etc/systemd/system',
+        *parents, '/usr/local/bin', '/etc/systemd/system',
         '/etc/ssh/sshd_config.d', '/etc/motor', '/etc/motor/tenant')
+
+
+def install_permission_helper(binary):
+    target_directories()
+    run('install', '-o', 'root', '-g', 'root', '-m', '0755', str(binary),
+        '/usr/local/libexec/motor-runner-permissions')
 
 
 def service_preflight():
@@ -326,8 +338,7 @@ def main():
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
     for binary in ('motor-runner', 'motor-host'):
         run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)
-    run('install', '-o', 'root', '-g', 'root', '-m', '0755', '/srv/build/target/release/motor-runner',
-        '/usr/local/libexec/motor-runner-permissions')
+    install_permission_helper('/srv/build/target/release/motor-runner')
     run('/usr/local/bin/motor-runner', 'check-permissions-helper')
     configure(pins)
     # Starting motor-boat.service checks its configured flags and socket readiness without a job.

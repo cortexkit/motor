@@ -29,14 +29,22 @@ pub(crate) fn digest() -> String {
 pub(crate) fn check_install() -> io::Result<()> {
     let helper = Path::new(HELPER);
     for path in helper.ancestors() {
-        let metadata = fs::symlink_metadata(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot inspect permissions helper path {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
         let valid_type = if path == helper {
             metadata.is_file() && metadata.mode() & 0o7777 == 0o755
         } else {
             metadata.is_dir()
         };
         if !valid_type || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(io::Error::other("permissions helper and ancestors must be physical, root-owned and not job-writable"));
+            return Err(io::Error::other(format!("unsafe permissions helper path {}: uid={} gid={} mode={:04o} type={:?}; expected physical root-owned non-job-writable ancestry and root0755 helper", path.display(), metadata.uid(), metadata.gid(), metadata.mode() & 0o7777, metadata.file_type())));
         }
     }
     let output = Command::new(HELPER)

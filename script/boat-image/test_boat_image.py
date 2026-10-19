@@ -93,6 +93,15 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:8], ('install','-d','-o','root','-g','root','-m','0755'))
         self.assertTrue({'/usr/local/bin','/usr/local/libexec','/etc/systemd/system','/etc/ssh/sshd_config.d','/etc/motor','/etc/motor/tenant'} <= set(run.call_args.args[8:]))
 
+    def test_rendered_helper_install_normalizes_every_parent_and_fixed_binary(self):
+        calls = []
+        with patch.object(install, 'run', side_effect=lambda *args, **kwargs: calls.append(args)):
+            install.install_permission_helper('/srv/build/candidate')
+        directory = calls[0]
+        self.assertEqual(directory[:8], ('install','-d','-o','root','-g','root','-m','0755'))
+        self.assertTrue({'/','/usr','/usr/local','/usr/local/libexec'} <= set(directory[8:]))
+        self.assertEqual(calls[-1], ('install','-o','root','-g','root','-m','0755','/srv/build/candidate','/usr/local/libexec/motor-runner-permissions'))
+
     def test_admission_endpoint_waits_for_identity_without_baking_it_into_image(self):
         unit = (HERE / 'motor-boat-host.service').read_text()
         path = (HERE / 'motor-boat-host.path').read_text()
