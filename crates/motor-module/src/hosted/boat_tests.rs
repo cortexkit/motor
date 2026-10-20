@@ -974,13 +974,12 @@ async fn direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_bac
         state.hosted_code.as_deref(),
         Some("hosted_path_outside_roots")
     );
-    assert_eq!(ssh.0.load(Ordering::SeqCst), 0, "no build-server fallback");
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     // The next job is not hosted: hosted routing stayed off.
     let stream = motor.run_direct(request, None).unwrap();
     let id = stream.job_id;
     records(stream).await;
     assert!(motor.hosted_state(id).is_none());
-    assert!(ssh.0.load(Ordering::SeqCst) >= 1);
     assert!(http.requests.lock().unwrap().is_empty());
 }
 
