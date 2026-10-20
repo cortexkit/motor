@@ -71,7 +71,9 @@ python3 script/windows-runner/bundle.py
 ```
 
 `script/runner/toolchain.json` pins cargo-xwin, VS channel build and package
-manifest content, exact CRT/SDK components and the private SDK cache tree hash.
+manifest content, exact CRT/SDK components and the private Microsoft payload
+subtree hash (`cache/xwin`, retaining `xwin/` in relative names). Generated
+`clang-cl`/CMake host wrappers outside that subtree are not SDK payload.
 The cross tool/cache install stays under the source checkout's
 `target/windows-cross`, with no host-global installation. xwin downloads Microsoft's MSVC CRT
 and Windows SDK headers/import libraries under Microsoft's Build Tools/SDK

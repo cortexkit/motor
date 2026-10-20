@@ -6,9 +6,16 @@ from pathlib import Path
 import sys
 
 
-def manifest(root):
+def manifest(root, subdirectory=None):
+    scan = root
+    if subdirectory is not None:
+        if len(Path(subdirectory).parts) != 1 or subdirectory in (".", ".."):
+            raise ValueError("SDK subtree must name one child directory")
+        scan = root / subdirectory
+        if scan.is_symlink() or not scan.is_dir():
+            raise ValueError("SDK subtree must be a real directory")
     files = []
-    for path in sorted(root.rglob("*")):
+    for path in sorted(scan.rglob("*")):
         if path.is_symlink():
             files.append({"path": path.relative_to(root).as_posix(), "symlink": str(path.readlink())})
         elif path.is_file():
@@ -22,10 +29,10 @@ def manifest(root):
 
 
 if __name__ == "__main__":
-    data = manifest(Path(sys.argv[1]))
-    if len(sys.argv) > 3:
-        pins = json.loads(Path(sys.argv[3]).read_text())["windows_cross"]
-        root = Path(sys.argv[1])
+    root = Path(sys.argv[1])
+    pins = json.loads(Path(sys.argv[3]).read_text())["windows_cross"] if len(sys.argv) > 3 else None
+    data = manifest(root, pins.get("sdk_subdir") if pins else None)
+    if pins:
         matching = [root.parent / "provenance/manifest.vsman"]
         if not matching[0].is_file() or hashlib.sha256(matching[0].read_bytes()).hexdigest() != pins["package_manifest_sha256"]:
             raise SystemExit("FAIL Microsoft package manifest content changed; explicit pin review required")

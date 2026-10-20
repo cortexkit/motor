@@ -16,6 +16,8 @@
       "Win11SDK_10.0.26100": "10.0.26100.15"
     },
     "cache_tree_sha256": "3c8ae4a1113c0d056b443311753a5d4fcaab0baf4d208bc9885ef5cd324d406f",
+    "sdk_subdir": "xwin",
+    "cache_scope_note": "The unchanged tree hash covers Microsoft's xwin/ payload subtree, with xwin/ in each relative path. cargo-xwin creates a host clang-cl symlink and cmake/ wrappers outside it while building; those are generated tool configuration, not SDK/CRT inputs.",
     "prep_toolchain": {
       "version": "1.99.0",
       "target": "x86_64-pc-windows-msvc",
