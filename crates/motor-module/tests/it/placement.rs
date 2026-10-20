@@ -236,6 +236,21 @@ impl Rig {
     }
 
     async fn with_module_id(resolver: Arc<dyn CredentialResolver>, module_id: &str) -> Self {
+        let handler = Handler::new(Config::default())
+            .with_module_id(module_id)
+            .with_credentials(resolver);
+        let rig = Self::start(handler, module_id).await;
+        // Tests built on this rig read storage-backed health straight away,
+        // so wait until the background storage open has finished.
+        tokio::time::timeout(Duration::from_secs(5), rig.handler.storage_opened())
+            .await
+            .expect("module storage opens")
+            .unwrap();
+        rig
+    }
+    /// Serves `handler` against a fake daemon and sends it HELLO_ACK, without
+    /// waiting for anything the handler does after that.
+    async fn start(handler: Handler, module_id: &str) -> Self {
         let scratch = SocketScratch::new("mp");
         let path = scratch.join("connection.json");
         let root = scratch.join("s.ck-motor");
@@ -263,19 +278,20 @@ impl Rig {
             .open(&path)
             .and_then(|mut file| file.write_all(&bytes))
             .unwrap();
-        let handler = Handler::new(Config::default())
-            .with_module_id(module_id)
-            .with_credentials(resolver);
         let h = handler.clone();
         let module_id = module_id.to_owned();
         let manifest_module_id = module_id.clone();
-        let boot = tokio::spawn(async move {
-            subc_client_rs::serve_with_handle(
+        // The SDK starts reading frames only once the boot half, which runs
+        // `on_hello_ack`, has returned. Running both halves in one task lets a
+        // test send frames before that and see whether they are answered.
+        let serving = tokio::spawn(async move {
+            let (_, serving) = subc_client_rs::serve_with_handle(
                 &path,
                 crate::module::manifest(&manifest_module_id),
                 h,
             )
-            .await
+            .await?;
+            serving.await
         });
         let (mut daemon, _) = listener.accept().await.unwrap();
         authenticate_server(
@@ -312,11 +328,10 @@ impl Rig {
             serde_json::to_value(ack).unwrap(),
         )
         .await;
-        let (_, serving) = boot.await.unwrap().unwrap();
         Self {
             handler,
             daemon,
-            serving: tokio::spawn(serving),
+            serving,
             scratch,
             root,
         }
@@ -618,6 +633,85 @@ async fn health_flow_reaches_only_the_read_only_health_report() {
     assert_eq!(reply.header.ty, FrameType::Error);
     let error: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(error["code"], "runner_health_unavailable");
+    rig.stop().await;
+}
+fn absent_credentials() -> Arc<dyn CredentialResolver> {
+    Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent))
+}
+/// After a restart many callers reattach at once. The SDK reads no frame, route
+/// binds included, until `on_hello_ack` returns, so that hook must not wait for
+/// the storage open: binds are answered while storage is still opening, and a
+/// request that needs storage waits for it.
+#[tokio::test]
+async fn binds_are_answered_while_storage_opens_and_requests_wait_for_it() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = Handler::new(Config::default())
+        .with_credentials(absent_credentials())
+        .with_storage_gate(Arc::clone(&gate));
+    let mut rig = Rig::start(handler, "ck-motor").await;
+    assert_eq!(
+        rig.bind(aft(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    assert!(
+        rig.handler.initialized().is_err(),
+        "the bind must be answered before storage has opened"
+    );
+    send(
+        &mut rig.daemon,
+        FrameType::Request,
+        7,
+        3,
+        json!({"op":"exec.status", "params":{}}),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), read_frame(&mut rig.daemon))
+            .await
+            .is_err(),
+        "a request that needs storage must wait while it opens"
+    );
+    gate.add_permits(1);
+    let reply = receive(&mut rig.daemon).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    assert_eq!(reply.body, br#"{"queue_depth":0,"running_jobs":[],"server_reachable":false,"repositories":[],"rustc_version":""}"#);
+    rig.stop().await;
+}
+/// A request is refused with the typed, retryable `motor_unavailable` once it
+/// has waited the storage deadline, and this holds for the Basal health flow's
+/// `runner.health` too.
+#[tokio::test]
+async fn a_request_is_refused_as_unavailable_when_storage_misses_the_deadline() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let deadline = Duration::from_millis(200);
+    let handler = Handler::new(Config::default())
+        .with_credentials(absent_credentials())
+        .with_storage_gate(Arc::clone(&gate))
+        .with_storage_ready_deadline(deadline);
+    let mut rig = Rig::start(handler, "ck-motor").await;
+    assert_eq!(
+        rig.bind(
+            basal(),
+            flow_scope("motor-build-server-health", "prefrontal-core", true)
+        )
+        .await
+        .header
+        .ty,
+        FrameType::Response
+    );
+    let started = std::time::Instant::now();
+    let reply = rig.request("runner.health", json!({})).await;
+    assert!(started.elapsed() >= deadline, "refused before the deadline");
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let error: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "motor_unavailable");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("ck-motor unavailable: storage still opening after 200 ms"),
+        "{error}"
+    );
     rig.stop().await;
 }
 #[tokio::test]

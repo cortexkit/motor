@@ -32,6 +32,31 @@ pub const SDK_HANDLER_CAPACITY: usize = 64;
 // the provider. These control operations must remain usable under saturation.
 pub const CONTROL_HEADROOM: usize = 8;
 pub const RUN_ADMISSION_LIMIT: usize = SDK_HANDLER_CAPACITY - CONTROL_HEADROOM;
+/// How long a request that needs module storage waits for startup to open it
+/// before it is refused as `motor_unavailable`.
+///
+/// The SDK reads no frames until `on_hello_ack` returns, so the handler opens
+/// storage in the background and requests wait for it instead. The bound is
+/// under the SDK consumer's default call timeout (30 s), so a caller on default
+/// options receives this typed, retryable refusal rather than its own timeout.
+/// It still covers the first eight attempts of the storage lease retry (backoff
+/// 0.1 s doubling to a 5 s cap, about 16 s of sleeps), long enough for an old
+/// process that is still shutting down during a restart to release the lease.
+pub const STORAGE_READY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Where startup is in opening module storage. Requests wait while it is
+/// `Opening`; any other state answers them at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageState {
+    /// No HELLO_ACK has started a storage open on this connection.
+    NotStarted,
+    /// The startup task is opening storage, or retrying a lease another
+    /// process holds.
+    Opening,
+    Ready,
+    /// Startup gave up; `startup_error` says why.
+    Failed,
+}
 struct RunPermit(Arc<std::sync::atomic::AtomicUsize>);
 impl RunPermit {
     fn acquire(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
@@ -243,6 +268,12 @@ pub struct Handler {
     run_count: Arc<std::sync::atomic::AtomicUsize>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
+    storage_state: Arc<tokio::sync::watch::Sender<StorageState>>,
+    storage_ready_deadline: std::time::Duration,
+    /// Holds the startup task before its first storage open until a test adds
+    /// a permit, so tests can observe requests that arrive during the open.
+    #[cfg(test)]
+    storage_gate: Option<Arc<tokio::sync::Semaphore>>,
     health_cache: Arc<Mutex<crate::health_cache::HealthCache>>,
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
@@ -283,6 +314,10 @@ impl Handler {
             run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
+            storage_state: Arc::new(tokio::sync::watch::Sender::new(StorageState::NotStarted)),
+            storage_ready_deadline: STORAGE_READY_DEADLINE,
+            #[cfg(test)]
+            storage_gate: None,
             health_cache: Arc::new(Mutex::new(crate::health_cache::HealthCache::default())),
             health_sampler: Arc::new(Mutex::new(crate::health_cache::Sampler::default())),
             write_engram_catalog: false,
@@ -302,6 +337,17 @@ impl Handler {
     #[cfg(test)]
     pub(crate) fn with_motor(self, motor: Motor) -> Self {
         let _ = self.motor.set(motor);
+        self.storage_state.send_replace(StorageState::Ready);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_storage_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.storage_gate = Some(gate);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_storage_ready_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.storage_ready_deadline = deadline;
         self
     }
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
@@ -317,6 +363,15 @@ impl Handler {
         if let Some(startup) = startup {
             startup.abort();
             let _ = startup.await;
+            // An aborted open will never finish, so release any waiting
+            // request now instead of at its deadline.
+            self.storage_state.send_if_modified(|state| {
+                let aborted = *state == StorageState::Opening;
+                if aborted {
+                    *state = StorageState::NotStarted;
+                }
+                aborted
+            });
         }
         let sampler = self.health_sampler.lock().unwrap().0.take();
         if let Some(sampler) = sampler {
@@ -358,13 +413,11 @@ impl Handler {
         tracing::warn!(%detail, "ck-motor storage unavailable");
         *self.startup_error.lock().unwrap() = Some(detail);
     }
-    async fn initialize_storage(
-        &self,
-        root: PathBuf,
-        catalog_data_dir: io::Result<PathBuf>,
-        first_attempt: tokio::sync::oneshot::Sender<()>,
-    ) {
-        let mut first_attempt = Some(first_attempt);
+    async fn initialize_storage(&self, root: PathBuf, catalog_data_dir: io::Result<PathBuf>) {
+        #[cfg(test)]
+        if let Some(gate) = &self.storage_gate {
+            let _ = gate.acquire().await;
+        }
         let mut backoff = std::time::Duration::from_millis(100);
         loop {
             let config = self.config.clone();
@@ -403,9 +456,7 @@ impl Handler {
                     self.motor.set(motor).ok();
                     self.start_health_sampler();
                     *self.startup_error.lock().unwrap() = None;
-                    if let Some(ready) = first_attempt.take() {
-                        let _ = ready.send(());
-                    }
+                    self.storage_state.send_replace(StorageState::Ready);
                     return;
                 }
                 Err(error) => {
@@ -415,10 +466,10 @@ impl Handler {
                     } else {
                         format!("storage_open_failed: {error}")
                     });
-                    if let Some(ready) = first_attempt.take() {
-                        let _ = ready.send(());
-                    }
+                    // A busy lease stays `Opening`: the retry below may still
+                    // succeed, so waiting requests keep waiting for it.
                     if !contended {
+                        self.storage_state.send_replace(StorageState::Failed);
                         return;
                     }
                 }
@@ -515,6 +566,11 @@ impl Handler {
                 code: "motor_op_not_permitted_for_principal".into(),
                 message: format!("{} refuses {op} for direct", self.module_id),
             });
+        }
+        if op != "hosted.check" {
+            // Every other direct op reads the store; wait for startup to open
+            // it so the `initialized` calls below find it.
+            self.ready().await?;
         }
         let owned = |id: Uuid| self.direct_jobs.lock().unwrap().get(&id) == Some(&route);
         fn parse<T: serde::de::DeserializeOwned>(params: Value) -> io::Result<T> {
@@ -630,7 +686,7 @@ impl Handler {
             }
         }
     }
-    fn initialized(&self) -> io::Result<&Motor> {
+    pub(crate) fn initialized(&self) -> io::Result<&Motor> {
         self.motor.get().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -645,6 +701,49 @@ impl Handler {
                 ),
             )
         })
+    }
+    /// The open store, waiting up to the storage deadline while startup is
+    /// still opening it. A failed startup, or one still opening at the
+    /// deadline, is a `NotConnected` error, which `handle` reports as
+    /// `motor_unavailable`.
+    pub(crate) async fn ready(&self) -> io::Result<&Motor> {
+        let mut state = self.storage_state.subscribe();
+        let settled = tokio::time::timeout(
+            self.storage_ready_deadline,
+            state.wait_for(|state| *state != StorageState::Opening),
+        )
+        .await;
+        if settled.is_err() {
+            // Storage may have opened just as the deadline passed.
+            if let Ok(motor) = self.initialized() {
+                return Ok(motor);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "{} unavailable: storage still opening after {} ms; retry later ({})",
+                    self.module_id,
+                    self.storage_ready_deadline.as_millis(),
+                    self.startup_error
+                        .lock()
+                        .unwrap()
+                        .as_deref()
+                        .unwrap_or("first storage open has not finished")
+                ),
+            ));
+        }
+        self.initialized()
+    }
+    /// Waits for HELLO_ACK to start opening storage, then calls `ready`. Tests
+    /// that send HELLO_ACK use it because they cannot tell when the serve task
+    /// has handled it.
+    #[cfg(test)]
+    pub(crate) async fn storage_opened(&self) -> io::Result<&Motor> {
+        let mut state = self.storage_state.subscribe();
+        let _ = state
+            .wait_for(|state| *state != StorageState::NotStarted)
+            .await;
+        self.ready().await
     }
 }
 
@@ -672,25 +771,24 @@ impl ModuleHandler for Handler {
             Ok(root) => root,
             Err(error) => {
                 self.startup_failed(format!("invalid_storage_descriptor: {error}"));
+                self.storage_state.send_replace(StorageState::Failed);
                 return;
             }
         };
-        let (ready, first_attempt) = tokio::sync::oneshot::channel();
-        {
-            let mut task = self.startup_task.lock().unwrap();
-            if self.motor.get().is_some() || task.as_ref().is_some_and(|task| !task.is_finished()) {
-                return;
-            }
-            let handler = self.clone();
-            *task = Some(tokio::spawn(async move {
-                handler
-                    .initialize_storage(root, module_data_dir(&handler.module_id), ready)
-                    .await
-            }));
+        let mut task = self.startup_task.lock().unwrap();
+        if self.motor.get().is_some() || task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
         }
-        // Keep the ordinary startup ready before serving requests. Contention
-        // returns after one attempt, while the retry task runs independently.
-        let _ = first_attempt.await;
+        // The SDK reads no frames, route binds included, until this returns, so
+        // storage opens in the background. Requests that need it wait in
+        // `ready`; binds are answered at once.
+        self.storage_state.send_replace(StorageState::Opening);
+        let handler = self.clone();
+        *task = Some(tokio::spawn(async move {
+            handler
+                .initialize_storage(root, module_data_dir(&handler.module_id))
+                .await
+        }));
     }
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
         match request.principal.as_ref() {
@@ -821,7 +919,7 @@ impl ModuleHandler for Handler {
                     message: format!("{} refuses {} for reserved:{module_id}", self.module_id, envelope.op),
                 });
             }
-            let motor = self.initialized()?;
+            let motor = self.ready().await?;
             let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
             match envelope.op.as_str() {
                 "exec.run" => {
@@ -1241,32 +1339,38 @@ mod startup_tests {
             storage: Some(serde_json::to_value(descriptor).unwrap()),
             machine_id: None,
         };
-        let startup = tokio::spawn({
-            let handler = handler.clone();
-            async move { handler.on_hello_ack(&ack).await }
-        });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        handler.on_hello_ack(&ack).await;
+        // A busy lease is retried in the background, so the error becomes
+        // visible only after the first attempt has run.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handler
+                .health()
+                .await
+                .detail
+                .is_some_and(|detail| detail.contains("storage_lease_busy"))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first attempt reports the busy lease");
         assert!(handler.initialized().is_err());
         assert!(matches!(
             handler.health().await.status,
             HealthStatus::Failing
         ));
-        assert!(handler
-            .health()
-            .await
-            .detail
-            .unwrap()
-            .contains("storage_lease_busy"));
+        // A request arriving now waits for the retry instead of failing.
+        let waiting = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.ready().await.map(|_| ()).map_err(|e| e.to_string()) }
+        });
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
-        startup.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while handler.initialized().is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("startup recovers without another hello acknowledgement");
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiting request is answered once the lease is free")
+            .unwrap()
+            .expect("startup recovers without another hello acknowledgement");
         handler.shutdown().await;
     }
 
@@ -1292,5 +1396,14 @@ mod startup_tests {
             HealthStatus::Failing
         ));
         assert!(handler.startup_task.lock().unwrap().is_none());
+        // Startup has failed for good, so a request is refused at once rather
+        // than after the storage deadline.
+        let refusal = tokio::time::timeout(Duration::from_secs(1), handler.ready())
+            .await
+            .expect("a failed startup refuses without waiting")
+            .err()
+            .unwrap();
+        assert_eq!(refusal.kind(), io::ErrorKind::NotConnected);
+        assert!(refusal.to_string().contains("invalid_storage_descriptor"));
     }
 }
