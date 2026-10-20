@@ -141,7 +141,11 @@ def state(pins):
             stream.truncate(pins["state_gib"] * 1024**3)
         run("mkfs.xfs", "-q", "-m", "reflink=1", str(image))
     mount = Path("/etc/systemd/system/var-lib-motor\\x2dboat.mount")
-    mount.write_text("[Unit]\nDescription=Boat reflink runner disk\n[Mount]\n"
+    # Boat's agent starts this enabled mount while its file restore still
+    # serves /var/lib/motor-boat from a temporary view, and moves that view
+    # aside when it finishes, taking a mount stacked on it along.
+    mount.write_text("[Unit]\nDescription=Boat reflink runner disk\n"
+                     "Requires=motor-boat-restored.service\nAfter=motor-boat-restored.service\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"
                      "Type=xfs\nOptions=loop,noatime\n[Install]\nWantedBy=multi-user.target\n")
     run("systemctl", "daemon-reload")
@@ -239,12 +243,34 @@ def service_preflight():
         run('/usr/bin/systemctl', 'start', 'motor-boat.service')
         run('/usr/bin/systemctl', 'is-active', '--quiet', 'motor-boat.service')
     except subprocess.CalledProcessError:
-        for unit in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-host.path', 'motor-boat-bridge.service'):
+        for unit in ('motor-boat-restored.service', 'motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service', 'motor-boat-bridge.service'):
             subprocess.run(['/usr/bin/systemctl', 'status', '--no-pager', '-l', unit], check=False)
             subprocess.run(['/usr/bin/journalctl', '-u', unit, '-b', '--no-pager', '-n', '200'], check=False)
         raise
     finally:
         subprocess.run(['/usr/bin/systemctl', 'stop', 'motor-boat.service'], check=False)
+
+
+UNITS = ("motor-boat-restored.service", "motor-boat.service", "motor-boat-bridge.service",
+         "motor-boat-host.service", "motor-boat-identity.service")
+# Units earlier recipes installed; a recipe reapplied on such an image removes them.
+RETIRED_UNITS = ("motor-boat-host.path",)
+
+
+def install_units(cpus, systemd=Path("/etc/systemd/system")):
+    """Write the unit files and their helper scripts. Runs only while the image
+    is built; nothing rewrites units at runtime, so the snapshot holds exactly
+    what systemd verified here. The caller reloads systemd afterwards."""
+    for name in ("motor-boat-network", "motor-boat-bridge.py", "motor-boat-start.py", "motor-boat-credentials.py"):
+        run("install", "-m", "0755", str(HERE / name), "/usr/local/libexec/" + name)
+    run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
+        "/usr/local/libexec/motor-boat-net.nft")
+    for name in RETIRED_UNITS:
+        if (systemd / name).exists() or (systemd / name).is_symlink():
+            subprocess.run(["systemctl", "disable", "--now", name], check=False)
+            (systemd / name).unlink(missing_ok=True)
+    for name in UNITS:
+        (systemd / name).write_text((HERE / name).read_text().replace("@VCPUS@", str(cpus)))
 
 
 def accounts():
@@ -254,9 +280,12 @@ def accounts():
                 "--shell", "/usr/sbin/nologin", account)
 
 
-def configure(pins):
+def configure(pins, revision):
     target_directories()
     accounts()
+    cpus = int(run("nproc", capture=True))
+    # The runner-disk mount written by state() requires motor-boat-restored.service.
+    install_units(cpus)
     state(pins)
     config = Path("/etc/ssh/sshd_config").read_text()
     if not re.search(r"(?im)^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf\s*$", config):
@@ -265,13 +294,6 @@ def configure(pins):
         "AllowTcpForwarding local\nPermitTTY no\nAllowAgentForwarding no\nX11Forwarding no\nPermitTunnel no\n")
     run("/usr/sbin/sshd", "-t")
     run("systemctl", "reload", "ssh")
-    for name in ("motor-boat-network", "motor-boat-bridge.py", "motor-boat-start.py", "motor-boat-credentials.py"):
-        run("install", "-m", "0755", str(HERE / name), "/usr/local/libexec/" + name)
-    run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
-        "/usr/local/libexec/motor-boat-net.nft")
-    cpus = int(run("nproc", capture=True))
-    for name in ("motor-boat.service", "motor-boat-bridge.service", "motor-boat-host.service", "motor-boat-host.path"):
-        Path("/etc/systemd/system", name).write_text((HERE / name).read_text().replace("@VCPUS@", str(cpus)))
     (STATE / 'host-journal').mkdir(mode=0o700, exist_ok=True)
     Path('/etc/motor/sandbox.json').write_text(json.dumps({
         'journal_dir': str(STATE / 'host-journal'),
@@ -279,14 +301,14 @@ def configure(pins):
         'event_socket': '/run/motor-tenant/events.sock',
         'admin_socket': '/run/motor-tenant/admin.sock',
         'vcpu_ceiling': cpus,
+        'ready_marker': '/run/motor/endpoint-ready',
     }, indent=2) + '\n')
+    Path('/etc/motor/image-revision').write_text(revision + '\n')
     Path("/etc/motor/tenant").mkdir(parents=True, exist_ok=True)
     Path("/etc/motor/tenant/id").unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    run("systemd-analyze", "verify", "/etc/systemd/system/motor-boat.service",
-        "/etc/systemd/system/motor-boat-bridge.service", "/etc/systemd/system/motor-boat-host.service",
-        "/etc/systemd/system/motor-boat-host.path")
-    run("systemctl", "enable", "motor-boat.service", "motor-boat-host.path")
+    run("systemd-analyze", "verify", *("/etc/systemd/system/" + name for name in UNITS))
+    run("systemctl", "enable", "motor-boat.service", "motor-boat-identity.service")
 
 
 def main():
@@ -340,7 +362,7 @@ def main():
         run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)
     install_permission_helper('/srv/build/target/release/motor-runner')
     run('/usr/local/bin/motor-runner', 'check-permissions-helper')
-    configure(pins)
+    configure(pins, args.revision)
     # Starting motor-boat.service checks its configured flags and socket readiness without a job.
     service_preflight()
     inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {

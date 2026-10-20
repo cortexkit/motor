@@ -1,0 +1,14 @@
+[Unit]
+Description=Start Boat admission once the broker installs the sandbox identity
+Requires=motor-boat-restored.service
+After=motor-boat-restored.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --watch-identity
+
+[Install]
+WantedBy=multi-user.target

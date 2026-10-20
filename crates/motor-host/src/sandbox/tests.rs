@@ -531,8 +531,9 @@ async fn sandbox_refusals_name_the_failing_check() {
 /// The readiness marker the broker polls holds exactly the sandbox id, only
 /// while broker keys are loaded and the identity file is valid, and follows a
 /// rewritten identity file instead of keeping a stale id.
-#[test]
-fn sandbox_ready_marker_tracks_keys_and_identity() {
+// The fixture binds a tokio Unix listener, so it needs a runtime.
+#[tokio::test]
+async fn sandbox_ready_marker_tracks_keys_and_identity() {
     let f = Fixture::new();
     let marker = f.dir.path().join("endpoint-ready");
     let id = f.dir.path().join("id");

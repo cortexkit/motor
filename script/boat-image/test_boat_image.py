@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Portable recipe integrity tests, not proof of a functioning Boat host."""
+import contextlib
 import copy
 import importlib.util
+import io
 from importlib.machinery import SourceFileLoader
 import json
 import sys
@@ -104,10 +106,100 @@ class RecipeTests(unittest.TestCase):
 
     def test_admission_endpoint_waits_for_identity_without_baking_it_into_image(self):
         unit = (HERE / 'motor-boat-host.service').read_text()
-        path = (HERE / 'motor-boat-host.path').read_text()
+        watcher = (HERE / 'motor-boat-identity.service').read_text()
         self.assertIn('ConditionPathExists=/etc/motor/tenant/id', unit)
         self.assertIn('motor-boat-start.py --host-exec --sandbox /etc/motor/sandbox.json', unit)
-        self.assertIn('PathExists=/etc/motor/tenant/id', path)
+        self.assertIn('motor-boat-start.py --watch-identity', watcher)
+        self.assertIn('WantedBy=multi-user.target', watcher)
+        # The inotify path unit stayed armed on Boat's retired FUSE /etc.
+        self.assertFalse((HERE / 'motor-boat-host.path').exists())
+        self.assertIn('motor-boat-host.path', install.RETIRED_UNITS)
+        self.assertNotIn('motor-boat-host.path', install.UNITS)
+
+    def test_runner_mount_and_identity_watcher_wait_for_boat_restore(self):
+        for name in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service'):
+            text = (HERE / name).read_text()
+            with self.subTest(unit=name):
+                self.assertRegex(text, r'(?m)^Requires=.*\bmotor-boat-restored\.service\b')
+                self.assertRegex(text, r'(?m)^After=.*\bmotor-boat-restored\.service\b')
+        gate = (HERE / 'motor-boat-restored.service').read_text()
+        self.assertIn('DefaultDependencies=no', gate)
+        self.assertIn('RemainAfterExit=yes', gate)
+        self.assertIn('motor-boat-start.py --wait-restored', gate)
+        self.assertNotIn('[Install]', gate)
+        writes = {}
+        with patch.object(install, 'run'), patch.object(install.Path, 'mkdir'), \
+             patch.object(install.Path, 'exists', return_value=True), \
+             patch.object(install.Path, 'write_text', lambda path, text: writes.__setitem__(str(path), text)), \
+             patch.object(install, 'tempfile'), patch.object(install, 'fcntl'), \
+             patch.object(install.Path, 'read_bytes', return_value=b''):
+            install.run.return_value = 'xfs'
+            install.state(self.pins)
+        mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
+        self.assertIn('Requires=motor-boat-restored.service', mount)
+        self.assertIn('After=motor-boat-restored.service', mount)
+
+    def test_endpoint_unit_publishes_marker_directory_and_keeps_restarting(self):
+        unit = (HERE / 'motor-boat-host.service').read_text()
+        self.assertIn('RuntimeDirectory=motor', unit)
+        self.assertIn('RuntimeDirectoryMode=0755', unit)
+        self.assertIn('StartLimitIntervalSec=0', unit)
+        self.assertIn('/run/motor/endpoint-revision', unit)
+
+    def test_restore_gate_waits_for_boat_marker_and_fuse_system_paths(self):
+        live = ('442 32 253:1 /etc /var/lib/ascii-lazy/sysbind/etc rw - ext4 /dev/vda1 rw\n'
+                '32 2 253:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw\n'
+                '1897 32 0:52 / /etc rw,relatime shared:1791 - fuse ascii-lazyfs-sys rw,user_id=0\n')
+        reason = start.restore_pending(live, False)
+        self.assertIn('/etc is still served by ascii-lazyfs-sys (fuse)', reason)
+        # After the restore Boat mounts the real directory on top and retires
+        # the FUSE view elsewhere; the later entry on /etc wins.
+        done = live.replace(' /etc rw,relatime shared:1791', ' /var/lib/ascii-lazy/retired/etc rw,relatime shared:1791') + \
+            '1224 32 253:1 /etc /etc rw,relatime - ext4 /dev/vda1 rw\n'
+        self.assertIsNone(start.restore_pending(done, False))
+        self.assertIn('restore marker', start.restore_pending(done, True))
+        stacked = done + '1999 1224 0:90 / /etc rw - fuse ascii-lazyfs-sys rw\n'
+        self.assertIsNotNone(start.restore_pending(stacked, False))
+        escaped = start.mount_table('5 1 0:1 / /var/lib/motor\\040boat rw - ext4 /dev/vda1 rw\n')
+        self.assertEqual(escaped[0][0], '/var/lib/motor boat')
+        self.assertIsNone(start.serving_mount('/etcetera', start.mount_table('1224 32 253:1 /etc /etc rw - fuse x rw\n')))
+
+    def test_restore_gate_reports_then_gives_up_after_its_deadline(self):
+        now = [0.0]
+        def pause(seconds):
+            now[0] += seconds
+        output = io.StringIO()
+        with patch.object(start.Path, 'read_text', return_value='1 0 0:52 / /usr rw - fuse lazy rw\n'), \
+             patch.object(start, 'RESTORE_ACTIVE', Mock(exists=Mock(return_value=False))), \
+             contextlib.redirect_stdout(output), self.assertRaisesRegex(RuntimeError, 'did not finish'):
+            start.wait_restored(clock=lambda: now[0], pause=pause)
+        self.assertEqual(output.getvalue().count('waiting for Boat'), 1)
+        self.assertGreaterEqual(now[0], start.RESTORE_DEADLINE_S)
+
+    def test_identity_watcher_starts_endpoint_once_for_either_write_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = Path(tmp, 'id')
+            starts = []
+            # Already present when the watcher starts: no wait at all.
+            identity.write_text('bx_23456789')
+            start.watch_identity(lambda: starts.append('start'), lambda: start.identity_present(identity),
+                                 pause=lambda _: self.fail('waited for an existing file'))
+            self.assertEqual(starts, ['start'])
+            identity.unlink()
+            # Appears later, by rename into the directory: polled until present.
+            polls = []
+            def pause(_):
+                polls.append(1)
+                if len(polls) == 3:
+                    staged = Path(tmp, '.staged')
+                    staged.write_text('bx_23456789')
+                    staged.rename(identity)
+            start.watch_identity(lambda: starts.append('start'), lambda: start.identity_present(identity), pause=pause)
+            self.assertEqual((starts, len(polls)), (['start', 'start'], 3))
+            # A directory or dangling link at the path is not an identity file.
+            identity.unlink()
+            identity.symlink_to(Path(tmp, 'missing'))
+            self.assertFalse(start.identity_present(identity))
 
     def test_provider_config_and_profiles_are_redacted_then_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,7 +252,7 @@ class RecipeTests(unittest.TestCase):
             with self.assertRaises(install.subprocess.CalledProcessError):
                 install.service_preflight()
         calls = [call.args[0] for call in collect.call_args_list]
-        for unit in ('motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'):
+        for unit in ('motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
             self.assertIn(['/usr/bin/systemctl','status','--no-pager','-l',unit], calls)
             self.assertIn(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'], calls)
         self.assertEqual(calls[-1], ['/usr/bin/systemctl','stop','motor-boat.service'])

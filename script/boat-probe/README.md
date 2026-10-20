@@ -25,8 +25,9 @@ by this probe; the operator supplies their existing authorized reader.
 For the full toolchain recipe, real motor-client jobs and named-snapshot timing,
 see [`script/boat-image/README.md`](../boat-image/README.md) and use `--runner-host`.
 That mode keeps direct real-job checks on probe-only loopback port 19443, and
-also starts the authenticated endpoint on 127.0.0.1:9443 to verify invalid-token
-refusal and root-private tenant sockets.
+also replays the broker's identity install and readiness-marker read to start
+the authenticated endpoint on 127.0.0.1:9443 in each order the broker can
+produce, then verifies invalid-token refusal and root-private tenant sockets.
 
 ```sh
 <key reader> | python3 script/boat-probe/probe.py --key-stdin --runner-prerequisites \

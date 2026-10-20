@@ -1,4 +1,5 @@
-"""Real motor jobs in a disposable Boat host; no broker or token endpoint."""
+"""Real motor jobs in a disposable Boat host, and the endpoint start-up path
+replayed in the broker's order; no broker-signed token reaches the endpoint."""
 import contextlib
 import errno
 import hashlib
@@ -34,7 +35,7 @@ def command(argv):
         return {'argv':argv, 'exit_code':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
     except (OSError, subprocess.TimeoutExpired) as error:
         return {'argv':argv, 'error':str(error)}
-for unit in ('motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'):
+for unit in ('motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
     out[unit] = {'status':command(['/usr/bin/systemctl','status','--no-pager','-l',unit]),
                  'journal':command(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])}
 print(json.dumps(out))
@@ -146,6 +147,66 @@ print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('n
     'listeners': capture(['ss','-ltnp']),
     'inventory': json.loads(pathlib.Path('/var/lib/motor-boat/inventory.json').read_text())}))
 '''.replace('ENV_NAMES', repr(ENV_NAMES))
+
+# The broker's identity install, byte for byte (CLOUD boat-pool.ts): Boat's
+# file API writes the id as the sandbox user under /tmp, then one exec call
+# installs it root-owned 0444. The broker accepts only exit 0 with stdout
+# equal to the id.
+IDENTITY_STAGING = '/tmp/ck-motor-tenant-id'
+IDENTITY_INSTALL = ('sudo install -D -m 0444 -o root -g root /tmp/ck-motor-tenant-id /etc/motor/tenant/id'
+                    ' && rm -f /tmp/ck-motor-tenant-id && cat /etc/motor/tenant/id')
+# The broker reads this through the exec API as the sandbox user, not root,
+# and counts the sandbox ready only for exit 0 and stdout equal to the id.
+READY_MARKER = '/run/motor/endpoint-ready'
+MARKER_READ = 'cat ' + READY_MARKER
+# Upper bound, from the identity install (or from hydration when the id
+# predates it), for the endpoint to listen with its marker. The measured
+# value is recorded beside each check; the broker itself waits 10 minutes.
+ENDPOINT_BOUND_S = 120
+ENDPOINT_STATE = r'''
+import json, os, pathlib, stat, subprocess
+def unit(name):
+    out = subprocess.run(['systemctl','show',name,'--property=ActiveState','--property=SubState',
+        '--property=MainPID','--property=NRestarts','--property=Result'], capture_output=True, text=True).stdout
+    return dict(line.split('=',1) for line in out.splitlines() if '=' in line)
+def meta(path):
+    try:
+        m = os.lstat(path)
+    except FileNotFoundError:
+        return {'present':False}
+    return {'present':True, 'uid':m.st_uid, 'mode':oct(stat.S_IMODE(m.st_mode)), 'regular':stat.S_ISREG(m.st_mode)}
+rows = [line.split() for line in pathlib.Path('/proc/net/tcp').read_text().splitlines()[1:]]
+etc = subprocess.run(['findmnt','-n','-o','SOURCE,FSTYPE','-T','/etc'], capture_output=True, text=True).stdout.strip()
+print(json.dumps({'units':{name:unit(name) for name in ('motor-boat-restored.service','motor-boat-identity.service',
+        'motor-boat.service','motor-boat-host.service')},
+    'id_file':meta('/etc/motor/tenant/id'), 'marker':meta('/run/motor/endpoint-ready'),
+    'listening_9443':any(r[1] == '0100007F:24E3' and r[3] == '0A' for r in rows),
+    'boat_restore_active':os.path.exists('/var/lib/ascii-lazy/active'), 'etc_mount':etc}))
+'''
+
+
+def marker_matches(read, sid):
+    return read.get('exit_code') == 0 and read.get('stdout') in (sid, sid + '\n')
+
+
+def readiness_checks(wait, sid, bound=ENDPOINT_BOUND_S):
+    state = wait.get('state') or {}
+    marker, identity = state.get('marker', {}), state.get('id_file', {})
+    return {
+        'endpoint_ready_within_bound': wait.get('ready') is True and wait.get('seconds', bound + 1) <= bound,
+        'ready_marker_is_exact_id': marker_matches(wait.get('marker', {}), sid),
+        'ready_marker_root_0644': marker.get('uid') == 0 and marker.get('mode') == '0o644' and marker.get('regular') is True,
+        'endpoint_listening': state.get('listening_9443') is True,
+        'identity_root_0444': identity.get('uid') == 0 and identity.get('mode') == '0o444' and identity.get('regular') is True,
+    }
+
+
+def armed_checks(state):
+    """The watcher is polling, and nothing of the endpoint remains: no id,
+    no marker (removed on stop), nothing listening on 9443."""
+    return (state['units']['motor-boat-identity.service'].get('ActiveState') == 'active' and
+            state['units']['motor-boat-restored.service'].get('ActiveState') == 'active' and
+            not state['id_file']['present'] and not state['marker']['present'] and not state['listening_9443'])
 
 
 def job_result(text):
@@ -338,7 +399,7 @@ class RunnerHost:
         self.check(label + '.no_account_credentials', audit['clean'], audit)
         if not audit['clean']:
             raise ValueError('refusing to snapshot credentials or incomplete evidence')
-        self.execute(sid, 'sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat')
+        self.execute(sid, 'sudo -n systemctl stop motor-boat-identity motor-boat-host motor-boat-bridge motor-boat')
         hygiene = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
         self.check(label + '.identity_and_probe_keys_absent', all(hygiene[k] is True for k in ('identity_absent','boat_cli_configs_absent','probe_authorizations_absent')), hygiene)
         self.execute(sid, 'sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync')
@@ -387,12 +448,103 @@ class RunnerHost:
         self.data['prepared_image'] = metadata
         self.probe.checkpoint()
 
-    def phase(self, sid, label, directory, public, repository, client, first_started=None):
+    def install_identity(self, sid):
+        """Replay the broker's identity install exactly; never raises, so a
+        refused install is recorded evidence rather than an aborted phase."""
+        record = {'started_monotonic': time.monotonic()}
+        try:
+            self.probe.request('PUT', f'/sandboxes/{sid}/files', {'path': IDENTITY_STAGING, 'content': sid})
+            result = self.probe.execute(sid, IDENTITY_INSTALL)
+            record.update(exit_code=result.get('exitCode'), stdout=result.get('stdout'), stderr=result.get('stderr'))
+        except Exception as error:
+            record['error'] = str(error)
+        record['accepted'] = record.get('exit_code') == 0 and record.get('stdout') == sid
+        record['seconds'] = time.monotonic() - record['started_monotonic']
+        self.probe.checkpoint()
+        return record
+
+    def endpoint_state(self, sid):
+        return json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(ENDPOINT_STATE))['stdout'])
+
+    def read_marker(self, sid):
+        result = self.probe.execute(sid, MARKER_READ)
+        return {'exit_code': result.get('exitCode'), 'stdout': result.get('stdout'), 'stderr': result.get('stderr')}
+
+    def wait_endpoint(self, sid, since, bound=ENDPOINT_BOUND_S):
+        """Poll the marker the way the broker does until it holds the id or
+        `bound` seconds have passed since `since` (a monotonic time)."""
+        polls = 0
+        while True:
+            polls += 1
+            read = self.read_marker(sid)
+            ready = marker_matches(read, sid)
+            if ready or time.monotonic() - since >= bound:
+                return {'ready': ready, 'seconds': time.monotonic() - since, 'polls': polls, 'at_monotonic': time.monotonic(),
+                        'marker': read, 'state': self.endpoint_state(sid)}
+            time.sleep(2)
+
+    def readiness(self, label, wait, sid):
+        for key, passed in readiness_checks(wait, sid).items():
+            self.check(label + '.' + key, passed, wait)
+
+    def arm_then_install(self, sid, label, record):
+        """Order 1: the identity watcher is already polling when the broker's
+        install creates the file."""
+        self.execute(sid, 'sudo -n systemctl stop motor-boat-host && sudo -n rm -f /etc/motor/tenant/id && '
+                          'sudo -n systemctl restart motor-boat-identity && sudo -n systemctl start motor-boat')
+        before = self.endpoint_state(sid)
+        self.check(label + '.armed_before_identity', armed_checks(before), before)
+        install = self.install_identity(sid)
+        self.check(label + '.identity_install_accepted', install['accepted'], install)
+        wait = self.wait_endpoint(sid, install['started_monotonic'])
+        record['armed_then_install'] = {'before': before, 'install': install, 'wait': wait}
+        self.readiness(label + '.armed', wait, sid)
+
+    def broker_order(self, sid, label, record, pre_swap_install, hydrated_at, created_at):
+        """Boat's order on a fresh clone: the broker's install may land before
+        Boat's file restore finishes, and it installs again when the marker
+        does not appear. Either way the endpoint must become ready."""
+        first = self.wait_endpoint(sid, hydrated_at)
+        flow = {'pre_swap_install': pre_swap_install, 'after_hydration': first,
+                'pre_swap_install_survived': first['ready']}
+        if not first['ready']:
+            flow['reinstall'] = self.install_identity(sid)
+            self.check(label + '.identity_reinstall_accepted', flow['reinstall']['accepted'], flow['reinstall'])
+            first = flow['after_reinstall'] = self.wait_endpoint(sid, flow['reinstall']['started_monotonic'])
+        record['broker_order'] = flow
+        if first['ready'] and created_at is not None:
+            self.data['snapshot_create_to_endpoint_ready_seconds'] = first['at_monotonic'] - created_at
+        self.readiness(label + '.broker_order', first, sid)
+
+    def existing_then_reinstall(self, sid, label, record, hydrated_at):
+        """Order 2: after a resume the identity file is already on disk when
+        the watcher starts. The broker then installs it again; that must keep
+        the same endpoint process and marker."""
+        first = self.wait_endpoint(sid, hydrated_at)
+        self.readiness(label + '.existing_identity', first, sid)
+        install = self.install_identity(sid)
+        self.check(label + '.identity_reinstall_accepted', install['accepted'], install)
+        after = self.wait_endpoint(sid, install['started_monotonic'])
+        host_before = first['state']['units']['motor-boat-host.service']
+        host_after = after['state']['units']['motor-boat-host.service']
+        self.check(label + '.reinstall_keeps_one_endpoint', marker_matches(after['marker'], sid) and
+                   host_before.get('MainPID') == host_after.get('MainPID') != '0' and
+                   host_before.get('NRestarts') == host_after.get('NRestarts'), {'before': first, 'after': after})
+        record['existing_then_reinstall'] = {'first': first, 'install': install, 'after': after}
+
+    def phase(self, sid, label, directory, public, repository, client, first_started=None,
+              pre_swap_install=None, hydrated_at=None):
         record = {"name": label}
         self.data["phases"].append(record)
         argv = self.route(sid, directory, public)
-        identity = "import os; from pathlib import Path; p=Path('/etc/motor/tenant/id'); p.write_text(" + repr(sid) + "); os.chown(p,0,0); p.chmod(0o444)"
-        self.execute(sid, "sudo -n python3 -c " + shlex.quote(identity) + " && sudo -n systemctl restart motor-boat motor-boat-host motor-boat-bridge && sudo -n systemctl start motor-boat-host.path")
+        if label == 'snapshot_clone':
+            self.broker_order(sid, label, record, pre_swap_install, hydrated_at, first_started)
+            self.arm_then_install(sid, label, record)
+        elif label == 'resumed':
+            self.existing_then_reinstall(sid, label, record, hydrated_at)
+        else:
+            self.arm_then_install(sid, label, record)
+        self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
         listeners = host["listeners"]["stdout"]
@@ -478,7 +630,9 @@ class RunnerHost:
                 raise ValueError("unexpected large sandbox sizing")
             if source_image:
                 self.probe.wait_hydrated(sid)
-                self.execute(sid, 'sudo -n systemctl stop motor-boat-host.path motor-boat-host motor-boat-bridge motor-boat')
+                # A prepared image from an older recipe still has the path unit.
+                self.execute(sid, 'sudo -n systemctl stop motor-boat-host motor-boat-bridge motor-boat && '
+                                  '{ sudo -n systemctl stop motor-boat-host.path motor-boat-identity 2>/dev/null || true; }')
             argv = self.route(sid, directory, public)
             bundle = directory / "motor.bundle"
             subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], cwd=ROOT, check=True, stdout=sys.stderr)
@@ -522,14 +676,20 @@ class RunnerHost:
                 start = time.monotonic()
                 clone, self.data["create_from_snapshot"] = self.probe.create(name)
                 sid = clone["id"]
+                # Install while Boat may still be restoring files, as a broker
+                # racing the restore would; broker_order re-installs if lost.
+                pre_swap = self.install_identity(sid)
                 self.probe.wait_hydrated(sid)
-                self.phase(sid, "snapshot_clone", directory, public, repository, client, first_started=start)
+                hydrated_at = time.monotonic()
+                self.data['create_from_snapshot']['seconds_to_hydrated'] = hydrated_at - start
+                self.phase(sid, "snapshot_clone", directory, public, repository, client, first_started=start,
+                           pre_swap_install=pre_swap, hydrated_at=hydrated_at)
                 self.probe.request("POST", f"/sandboxes/{sid}/stop", {})
                 self.probe.wait_sandbox(sid, {"archived"})
                 self.probe.request("POST", f"/sandboxes/{sid}/resume", {})
                 self.probe.wait_sandbox(sid, READY)
                 self.probe.wait_hydrated(sid)
-                self.phase(sid, "resumed", directory, public, repository, client)
+                self.phase(sid, "resumed", directory, public, repository, client, hydrated_at=time.monotonic())
                 before = self.data["phases"][1]["host"]["ssh_config"]
                 after = self.data["phases"][2]["host"]["ssh_config"]
                 self.check("sshd.dropin_survives_resume", before.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") == after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") and bool(after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf")), {"before": before, "after": after})

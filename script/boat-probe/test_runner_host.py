@@ -132,7 +132,7 @@ class RunnerHostTests(unittest.TestCase):
         with patch.object(host.subprocess, 'run', command), contextlib.redirect_stdout(output):
             exec(host.DIAGNOSTICS, {})
         data = json.loads(output.getvalue())
-        self.assertEqual(set(data), {'motor-boat.service','motor-boat-host.service','motor-boat-host.path','motor-boat-bridge.service'})
+        self.assertEqual(set(data), {'motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'})
         for unit, record in data.items():
             self.assertEqual(record['status']['exit_code'], 3)
             self.assertEqual(record['status']['argv'], ['/usr/bin/systemctl','status','--no-pager','-l',unit])
@@ -147,6 +147,64 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.admission_checks(sample)['endpoint_rejects_invalid_token'])
         sample['tenant_sockets'] = {}
         self.assertFalse(host.admission_checks(sample)['root_private_tenant_sockets'])
+
+    def endpoint_state(self, **overrides):
+        state = {'units': {'motor-boat-identity.service': {'ActiveState': 'active'},
+                           'motor-boat-restored.service': {'ActiveState': 'active'},
+                           'motor-boat-host.service': {'ActiveState': 'active', 'MainPID': '42', 'NRestarts': '0'}},
+                 'id_file': {'present': True, 'uid': 0, 'mode': '0o444', 'regular': True},
+                 'marker': {'present': True, 'uid': 0, 'mode': '0o644', 'regular': True},
+                 'listening_9443': True}
+        state.update(overrides)
+        return state
+
+    def test_identity_install_replays_the_broker_byte_for_byte(self):
+        self.assertEqual(host.IDENTITY_INSTALL, 'sudo install -D -m 0444 -o root -g root /tmp/ck-motor-tenant-id '
+                         '/etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id && cat /etc/motor/tenant/id')
+        self.assertEqual(host.MARKER_READ, 'cat /run/motor/endpoint-ready')
+        probe = Mock()
+        probe.execute.return_value = {'exitCode': 0, 'stdout': 'bx_23456789', 'stderr': ''}
+        record = host.RunnerHost.__new__(host.RunnerHost)
+        record.probe = probe
+        result = record.install_identity('bx_23456789')
+        probe.request.assert_called_once_with('PUT', '/sandboxes/bx_23456789/files',
+                                              {'path': '/tmp/ck-motor-tenant-id', 'content': 'bx_23456789'})
+        probe.execute.assert_called_once_with('bx_23456789', host.IDENTITY_INSTALL)
+        self.assertTrue(result['accepted'])
+        # The broker rejects a trailing newline or any non-zero exit.
+        for reply in ({'exitCode': 0, 'stdout': 'bx_23456789\n'}, {'exitCode': 1, 'stdout': 'bx_23456789'}):
+            probe.execute.return_value = reply
+            self.assertFalse(record.install_identity('bx_23456789')['accepted'])
+        probe.request.side_effect = RuntimeError('file API refused')
+        self.assertEqual(record.install_identity('bx_23456789')['error'], 'file API refused')
+
+    def test_marker_must_be_the_exact_id_with_at_most_a_newline(self):
+        for stdout, code, expected in (('bx_23456789', 0, True), ('bx_23456789\n', 0, True),
+                                       ('bx_23456789\n\n', 0, False), ('bx_other', 0, False), ('bx_23456789', 1, False)):
+            with self.subTest(stdout=stdout, code=code):
+                self.assertEqual(host.marker_matches({'exit_code': code, 'stdout': stdout}, 'bx_23456789'), expected)
+
+    def test_readiness_needs_bound_marker_listener_and_root_files(self):
+        wait = {'ready': True, 'seconds': 12.0, 'marker': {'exit_code': 0, 'stdout': 'bx_23456789'},
+                'state': self.endpoint_state()}
+        self.assertTrue(all(host.readiness_checks(wait, 'bx_23456789').values()))
+        slow = dict(wait, seconds=host.ENDPOINT_BOUND_S + 1)
+        self.assertFalse(host.readiness_checks(slow, 'bx_23456789')['endpoint_ready_within_bound'])
+        loose = dict(wait, state=self.endpoint_state(marker={'present': True, 'uid': 0, 'mode': '0o666', 'regular': True}))
+        self.assertFalse(host.readiness_checks(loose, 'bx_23456789')['ready_marker_root_0644'])
+        silent = dict(wait, state=self.endpoint_state(listening_9443=False))
+        self.assertFalse(host.readiness_checks(silent, 'bx_23456789')['endpoint_listening'])
+        self.assertFalse(any(host.readiness_checks({'ready': False}, 'bx_23456789').values()))
+
+    def test_armed_state_requires_polling_watcher_and_no_endpoint_leftovers(self):
+        absent = {'present': False}
+        armed = self.endpoint_state(id_file=absent, marker=absent, listening_9443=False)
+        self.assertTrue(host.armed_checks(armed))
+        self.assertFalse(host.armed_checks(dict(armed, marker={'present': True})))
+        self.assertFalse(host.armed_checks(dict(armed, listening_9443=True)))
+        dead = json.loads(json.dumps(armed))
+        dead['units']['motor-boat-identity.service']['ActiveState'] = 'inactive'
+        self.assertFalse(host.armed_checks(dead))
 
 
 if __name__ == "__main__":
