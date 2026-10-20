@@ -222,6 +222,9 @@ class RunnerHostTests(unittest.TestCase):
             self.assertFalse(host.storage_checks(dict(data, **{key:False}))['reflink_disk_and_workspace_bind'])
         wrong = dict(data, findmnt={path:text.replace('xfs', 'ext4') for path, text in data['findmnt'].items()})
         self.assertFalse(host.storage_checks(wrong)['reflink_disk_and_workspace_bind'])
+        stacked = dict(data, findmnt={path:json.dumps({'filesystems':[
+            {'target':path,'fstype':'ext4'}, {'target':path,'fstype':'xfs'}]}) for path in data['findmnt']})
+        self.assertFalse(host.storage_checks(stacked)['reflink_disk_and_workspace_bind'])
         self.assertFalse(host.storage_checks(dict(data, prepared={}))['storage_verified_before_services'])
         late = dict(data, prepared=dict(data['prepared'], verified_monotonic_ns=3000))
         self.assertFalse(host.storage_checks(late)['storage_verified_before_services'])

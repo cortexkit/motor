@@ -268,9 +268,47 @@ impl Launch {
 #[cfg(target_os = "linux")]
 pub(crate) fn clone_target(source: &Path, target: &Path) -> io::Result<()> {
     use cortexkit_cow::{backend, BackendKind};
+    check_clone_device(source, target)?;
     backend(BackendKind::LinuxReflink)
         .start(source, target)
         .map_err(io::Error::other)
+}
+
+#[cfg(target_os = "linux")]
+fn check_clone_device(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Mount tables may contain hidden mounts at the same path. stat follows
+    // the effective namespace instead; the ioctl remains the final authority.
+    let source_device = std::fs::metadata(source)?.dev();
+    let mut parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    loop {
+        match std::fs::metadata(parent) {
+            Ok(metadata) => {
+                let target_device = metadata.dev();
+                if source_device != target_device {
+                    return Err(io::Error::other(format!(
+                        "reflink paths are on different filesystems: {} (device {source_device}) -> {} (existing parent {} device {target_device})",
+                        source.display(), target.display(), parent.display()
+                    )));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if parent == Path::new(".") || parent == Path::new("/") {
+                    return Err(error);
+                }
+                parent = parent
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 static NEXT_CONTROL_FILE_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -391,6 +429,37 @@ pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<File>
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clone_target_checks_effective_devices_before_creating_destination() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-clone-devices");
+        assert_ne!(
+            std::fs::metadata(&scratch).unwrap().dev(),
+            std::fs::metadata("/proc").unwrap().dev()
+        );
+        let target = Path::new("/proc/motor-reflink-device-test/missing/clone");
+        let error = clone_target(&scratch, target).unwrap_err().to_string();
+        assert!(error.contains("different filesystems"), "{error}");
+        assert!(error.contains("existing parent /proc device"), "{error}");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clone_target_follows_same_device_alias_and_missing_parent() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-clone-device-alias");
+        let source = scratch.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("bytes"), "clone bytes").unwrap();
+        let alias = scratch.join("alias");
+        std::os::unix::fs::symlink(&scratch, &alias).unwrap();
+        let target = alias.join("missing/clone");
+        clone_target(&source, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("bytes")).unwrap(), b"clone bytes");
+    }
 
     struct ParentMask(libc::mode_t);
     impl Drop for ParentMask {

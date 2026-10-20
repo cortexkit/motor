@@ -45,9 +45,11 @@ or ioctl failure aborts installation rather than changing copy semantics.
 Both mount points must be empty on the root disk in the image. After hydration,
 `motor-boat-storage.service` checks the current views before mounting anything;
 non-empty directories cause a logged refusal, never automatic deletion or a
-mount hiding existing data. It mounts XFS over Boat's **empty** root-disk bind
-and binds the workspace directory onto `/Users`, without unmounting Boat's own
-sysbinds. Each runner and endpoint start independently checks the exact XFS
+mount hiding existing data. After hydration it unmounts only the **empty public**
+root-disk binds at our two paths, leaving Boat's references under
+`/var/lib/ascii-lazy/sysbind` untouched. It checks the exposed bare directories
+again, mounts XFS, then binds the workspace directory onto `/Users`. Each runner
+and endpoint start independently rejects duplicate mount targets and checks the exact XFS
 mount, its loop device's backing file `/var/lib/motor-boat.xfs`, the `/Users`
 bind identity, `reflink=1`, and a real cross-path FICLONE. An active mount unit
 alone is not evidence of usable storage.
@@ -316,7 +318,14 @@ is needed. The first and second Node jobs read `node_modules/boat-dep/index.js`;
 publishing and reusing the install cache must exercise the runner's reflink
 path, rather than cloning an empty directory or symlinks only. Mount evidence
 includes current findmnt output and loop backing identity, plus the per-boot
-storage verification timestamp preceding both runner and endpoint start times.
+   storage verification timestamp preceding both runner and endpoint start times.
+
+Qualification also rejects stacked entries at either target; it does not assume
+the first `findmnt` row is the effective mount. The runner's Linux clone path
+checks the source and nearest existing destination parent's actual `st_dev`
+before creating a target, so hidden mount-table entries cannot substitute for
+the kernel's path resolution. FICLONE itself is still authoritative and there
+is no copy fallback.
 
 Expect about **10 minutes** of sandbox time when starting from a prepared image
 (the measured run below took 9 minutes plus asynchronous purge), and longer for a

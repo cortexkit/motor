@@ -214,8 +214,8 @@ print(json.dumps(data))
 
 
 def storage_checks(data):
-    filesystems = {point:json.loads(text)['filesystems'][0] for point, text in data['findmnt'].items()}
-    actual = all(filesystems[point]['target'] == point and filesystems[point]['fstype'] == 'xfs'
+    filesystems = {point:json.loads(text)['filesystems'] for point, text in data['findmnt'].items()}
+    actual = all(len(filesystems[point]) == 1 and filesystems[point][0]['target'] == point and filesystems[point][0]['fstype'] == 'xfs'
                  for point in ('/var/lib/motor-boat', '/Users'))
     prepared = data.get('prepared', {})
     verified = prepared.get('verified_monotonic_ns', 0)
@@ -726,6 +726,7 @@ class RunnerHost:
         # The 30-minute provider budget starts after the local client is available.
         self.probe.deadline = time.monotonic() + min(1800, self.probe.minutes * 60)
         self.data["source_revision"] = revision
+        (ROOT / '.cortexkit').mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="motor-boat-ssh-") as temporary:
             directory = Path(temporary)
             self.directory = directory

@@ -139,6 +139,7 @@ def state_mount(rows):
     row = serving_mount(str(STATE), rows)
     if row is None or row[:2] != (str(STATE), 'xfs'):
         raise RuntimeError(f'{STATE} must be an XFS mount of {IMAGE}, found {row}')
+    unique_mount(STATE, rows)
     device = STATE.stat().st_dev
     backing = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/loop/backing_file')
     if not backing.is_file() or not Path(backing.read_text().strip()).samefile(IMAGE):
@@ -150,7 +151,14 @@ def users_mount(rows):
     row = serving_mount(str(USERS), rows)
     if row is None or row[:2] != (str(USERS), 'xfs') or not USERS.samefile(STATE / 'state/workspaces'):
         raise RuntimeError(f'{USERS} must bind {STATE}/state/workspaces, found {row}')
+    unique_mount(USERS, rows)
     return row
+
+
+def unique_mount(path, rows):
+    count = sum(row[0] == str(path) for row in rows)
+    if count != 1:
+        raise RuntimeError(f'{path} must have exactly one mount, found {count}; stacked mount targets are unsafe')
 
 
 def empty_mountpoint(path):
@@ -158,6 +166,20 @@ def empty_mountpoint(path):
         raise RuntimeError(f'mount point is not a physical directory: {path}')
     if next(path.iterdir(), None) is not None:
         raise RuntimeError(f'refusing to mount over non-empty directory {path}; stop services and inspect the root-disk data')
+
+
+def unmount_root_view(path):
+    empty_mountpoint(path)
+    rows = mounts()
+    exact = [row for row in rows if row[0] == str(path)]
+    if not exact:
+        return
+    if len(exact) != 1 or exact[0][1] != 'ext4' or path.stat().st_dev != Path('/').stat().st_dev:
+        raise RuntimeError(f'refusing to unmount an unexpected storage view at {path}: {exact}')
+    # Only the public, empty root-disk bind is retired. Boat's references under
+    # /var/lib/ascii-lazy/sysbind remain mounted and owned by its restore agent.
+    subprocess.run(['/usr/bin/umount', '--', str(path)], check=True)
+    empty_mountpoint(path)
 
 
 def check_storage():
@@ -180,7 +202,8 @@ def check_storage():
 def prepare_storage():
     """Replace Boat's empty root-disk sysbind views only after file restoration.
     A .mount unit can be active for that foreign bind, so systemctl start alone
-    cannot establish the disk identity. Never unmount Boat's own mounts."""
+    cannot establish the disk identity. Retire only the empty public root-disk
+    binds, so neither path has duplicate mount targets after preparation."""
     reason = restore_pending(Path('/proc/self/mountinfo').read_text(), RESTORE_ACTIVE.exists())
     if reason:
         raise RuntimeError('cannot prepare storage before Boat restore: ' + reason)
@@ -196,6 +219,9 @@ def prepare_storage():
             ready.append(False)
     # Check both views before mounting either: a dirty root-disk workspace must
     # not be hidden even when the state mount point is empty.
+    for path, mounted in ((USERS, ready[1]), (STATE, ready[0])):
+        if not mounted:
+            unmount_root_view(path)
     if not ready[0]:
         subprocess.run(['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(IMAGE), str(STATE)], check=True)
     state_mount(mounts())

@@ -176,6 +176,37 @@ class RecipeTests(unittest.TestCase):
         with patch.object(start.Path, 'samefile', return_value=False), self.assertRaisesRegex(RuntimeError, 'must bind'):
             start.users_mount(rows)
 
+    def test_storage_rejects_stacked_targets_even_when_top_mount_is_correct(self):
+        rows = start.mount_table('1 0 253:1 /var/lib/motor-boat /var/lib/motor-boat rw - ext4 /dev/vda1 rw\n'
+                                 '2 1 7:0 / /var/lib/motor-boat rw - xfs /dev/loop0 rw\n')
+        with self.assertRaisesRegex(RuntimeError, 'stacked mount targets'):
+            start.state_mount(rows)
+        users = start.mount_table('3 0 253:1 /Users /Users rw - ext4 /dev/vda1 rw\n'
+                                  '4 3 7:0 /state/workspaces /Users rw - xfs /dev/loop0 rw\n')
+        with patch.object(start.Path, 'samefile', return_value=True), self.assertRaisesRegex(RuntimeError, 'stacked mount targets'):
+            start.users_mount(users)
+
+    def test_only_empty_public_root_disk_binds_are_unmounted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            point = Path(tmp)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
+                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), patch.object(start.subprocess, 'run') as run:
+                start.unmount_root_view(point)
+                run.assert_called_once_with(['/usr/bin/umount', '--', str(point)], check=True)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'xfs', '/dev/loop9')]), \
+                 patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'unexpected storage view'):
+                start.unmount_root_view(point)
+            run.assert_not_called()
+
+    def test_unmount_refuses_underlying_nonempty_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            point = Path(tmp)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
+                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), \
+                 patch.object(start.subprocess, 'run', side_effect=lambda *args, **kwargs: (point / 'hidden-data').touch()), \
+                 self.assertRaisesRegex(RuntimeError, 'non-empty directory'):
+                start.unmount_root_view(point)
+
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
              patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
@@ -213,8 +244,10 @@ class RecipeTests(unittest.TestCase):
                  patch.object(start, 'mounts', return_value=[]), \
                  patch.object(start, 'state_mount', side_effect=[RuntimeError('ext4'), ('state', 'xfs', 'loop')]), \
                  patch.object(start, 'users_mount', side_effect=RuntimeError('ext4')), \
+                 patch.object(start, 'unmount_root_view') as retire, \
                  patch.object(start, 'check_storage', return_value={'reflink': True}), patch.object(start.subprocess, 'run') as run:
                 start.prepare_storage()
+                self.assertEqual([call.args[0] for call in retire.call_args_list], [users, state])
             self.assertEqual([call.args[0] for call in run.call_args_list], [
                 ['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(start.IMAGE), str(state)],
                 ['/usr/bin/mount', '--bind', str(state / 'state/workspaces'), str(users)]])
