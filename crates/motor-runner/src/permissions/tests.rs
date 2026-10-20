@@ -10,6 +10,56 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[test]
+fn physical_permission_repair_accepts_canonical_runner_state_for_all_profiles() {
+    use crate::{Config, Runner};
+
+    let scratch = ScratchDir::new("motor-symlink-state");
+    let real = scratch.join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = scratch.join("state");
+    symlink(&real, &alias).unwrap();
+    for profile in ["main", "boat", "tenant"] {
+        let mut config = Config::new(&alias, profile);
+        config.free_space_floor_bytes = 0;
+        config.reserve_daemon_core = false;
+        config.tenant_vm = profile != "main";
+        if profile == "boat" {
+            config.boat_profile = true;
+            config.boat_memory_max_bytes = Some(14 * (1 << 30));
+        }
+        let runner = Runner::open(config).unwrap();
+        let home = runner.config().state_dir().join("sandboxes/job/home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        // The same walk is used by the installed helper and direct-root runners.
+        if unsafe { libc::geteuid() } == 0 {
+            repair_tree(Policy::Private, &[&home]).unwrap();
+        } else {
+            apply(Policy::Private, &[&home]).unwrap();
+        }
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(runner.config().state_root, real.canonicalize().unwrap());
+
+        let outside = scratch.join(format!("outside-{profile}"));
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
+        let planted = runner.config().state_dir().join("sandboxes/planted");
+        symlink(&outside, &planted).unwrap();
+        assert!(apply(Policy::Private, &[&planted]).is_err());
+        assert!(apply(Policy::Private, &[&planted.join("child")]).is_err());
+        assert_eq!(mode(&outside), 0o750);
+    }
+    let outside = scratch.join("outside-instance");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, real.join("planted-instance")).unwrap();
+    assert!(Runner::open(Config::new(&alias, "planted-instance"))
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("not a symlink"));
+}
+
+#[test]
 fn physical_permission_walk_never_follows_planted_descendant_symlinks() {
     let scratch = ScratchDir::new("motor-physical-permissions");
     let tree = scratch.join("tree");

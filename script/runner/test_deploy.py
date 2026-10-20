@@ -4,6 +4,11 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import sys
+import socket
+import threading
+import base64
+import hashlib
 import tempfile
 import unittest
 
@@ -13,6 +18,11 @@ if policy_spec is None or policy_spec.loader is None:
     raise ImportError('cannot load permissions sudo policy renderer')
 policy = importlib.util.module_from_spec(policy_spec)
 policy_spec.loader.exec_module(policy)
+canary_spec = importlib.util.spec_from_file_location('deploy_canary', DEPLOY.with_name('deploy_canary.py'))
+if canary_spec is None or canary_spec.loader is None:
+    raise ImportError('cannot load deployment canary')
+canary = importlib.util.module_from_spec(canary_spec)
+canary_spec.loader.exec_module(canary)
 
 
 class PermissionsPolicyTests(unittest.TestCase):
@@ -35,7 +45,8 @@ class PermissionsPolicyTests(unittest.TestCase):
 
 class DeployTests(unittest.TestCase):
     def run_deploy(self, job, *, resume=True, drain="timeout", fail_start=False,
-                    instance="main", default_state_root=False, decoys=False, drain_timeout=None, helper_valid=True):
+                    instance="main", default_state_root=False, decoys=False, drain_timeout=None,
+                    helper_valid=True, canary='pass'):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
@@ -79,8 +90,19 @@ esac
 '''
             candidate, live = root / "candidate", root / "live"
             for path in (candidate, live):
-                path.write_text(admin)
+                path.write_text(admin + f'\n# {path.name}\n')
                 path.chmod(0o755)
+            original_live = live.read_bytes()
+            python = bin_dir / 'python3'
+            python.write_text(f'''#!/usr/bin/env bash
+if [[ "$1" = */deploy_canary.py ]]; then
+  echo "canary $*" >> "$LOG"
+  [ "$CANARY" = pass ] || {{ echo "canary $CANARY" >&2; exit 1; }}
+else
+  exec {sys.executable!r} "$@"
+fi
+''')
+            python.chmod(0o755)
             systemctl = bin_dir / "systemctl"
             systemctl.write_text('''#!/usr/bin/env bash
 echo "systemctl $*" >> "$LOG"
@@ -98,6 +120,8 @@ fi
                        RESUME=str(resume).lower(), DRAIN=drain,
                        FAIL_START=str(fail_start).lower(), START_FAILED=str(root / "failed"))
             env['HELPER_VALID'] = str(helper_valid).lower()
+            env['CANARY'] = canary
+            env.pop('RUNNER_CANARY_TIMEOUT_S', None)
             if default_state_root:
                 env.pop("RUNNER_STATE_ROOT")
             env.pop("RUNNER_DRAIN_TIMEOUT_S", None)
@@ -108,7 +132,9 @@ fi
                 command.append(instance)
             result = subprocess.run(command, env=env,
                                     capture_output=True, text=True, timeout=10)
-            return result, (root / "log").read_text(), (root / "admission").read_text().strip()
+            log = (root / 'log').read_text()
+            log += f'live restored: {live.read_bytes() == original_live}\n'
+            return result, log, (root / "admission").read_text().strip()
 
     def job(self, **extra):
         return dict(dict(id="survivor-job", state="Running", terminal=None, started_ms=1), **extra)
@@ -216,7 +242,127 @@ fi
         self.assertIn("resume --instance main", log)
         self.assertEqual(admission, "open")
 
+    def test_post_swap_canary_runs_on_main_and_e2e_before_success(self):
+        for instance in ('main', 'e2e'):
+            with self.subTest(instance=instance):
+                result, log, admission = self.run_deploy(
+                    self.job(), drain='complete', instance=instance)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'--instance {instance} --timeout-s 20', log)
+                self.assertLess(log.index('systemctl --user is-active'), log.index('canary '))
+                self.assertIn('live restored: False', log)
+                self.assertEqual(admission, 'open')
+
+    def test_post_swap_canary_failure_stops_candidate_and_restores_old_executable(self):
+        for canary in ('refused-before-start', 'exit-1', 'deadline-exceeded'):
+            with self.subTest(canary=canary):
+                result, log, admission = self.run_deploy(
+                    self.job(), drain='complete', canary=canary)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Post-swap isolated canary failed; rolling back', result.stderr)
+                self.assertIn('restored rollback executable', result.stderr)
+                self.assertNotIn('deployed motor-runner', result.stdout)
+                self.assertEqual(log.count('systemctl --user stop'), 2)
+                self.assertEqual(log.count('systemctl --user start'), 2)
+                self.assertIn('live restored: True', log)
+                self.assertEqual(admission, 'open')
+
+    def test_windows_explicitly_skips_the_linux_isolated_canary(self):
+        result, log, _ = self.run_deploy(self.job(), drain='complete', instance='windows')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('canary ', log)
+        self.assertIn('explicitly skipped for windows', result.stderr)
+
     def test_proven_not_started_is_restart_recoverable(self):
         result, _, admission = self.run_deploy(dict(id="queued", state="Queued", terminal=None, started_ms=None, process=None))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(admission, "open")
+
+
+class CanaryTests(unittest.TestCase):
+    def exercise(self, outcome='pass', instance='main'):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / instance
+            state.mkdir()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(state / 'runner.sock'))
+            listener.listen()
+            errors = []
+            requests = []
+
+            def server():
+                try:
+                    with listener, listener.accept()[0] as peer:
+                        hello = canary.receive(peer)
+                        self.assertTrue(hello['started'])
+                        canary.send(peer, dict(type='hello', protocol_version=1))
+                        request = canary.receive(peer)
+                        requests.append(request)
+                        self.assertEqual(request['weight_hint'], 1)
+                        self.assertEqual(request['timeout'], 5)
+                        self.assertEqual(request['queue_wait_limit_s'], 5)
+                        self.assertEqual(request['command'], 'test "$(id -un)" = motor-job')
+                        self.assertEqual(request['env'], {})
+                        self.assertNotEqual(request.get('workspace_kind'), 'head')
+                        if outcome == 'refused':
+                            canary.send(peer, dict(type='refusal', reason='workspace_setup_failed'))
+                            return
+                        if outcome == 'timeout':
+                            # Wait for the bounded client to close; no synthetic
+                            # success frame can accidentally satisfy the canary.
+                            while peer.recv(4096):
+                                pass
+                            return
+                        job = request['job_id']
+                        canary.send(peer, dict(type='accepted', job_id=job))
+                        chunk = canary.receive(peer)
+                        bundle = base64.b64decode(chunk['data'])
+                        self.assertEqual(chunk['type'], 'bundle_chunk')
+                        self.assertEqual(len(bundle), request['bundles'][0]['length'])
+                        self.assertEqual(hashlib.sha256(bundle).hexdigest(), request['bundles'][0]['sha256'])
+                        bundle_path = root / 'received.bundle'
+                        bundle_path.write_bytes(bundle)
+                        refs = subprocess.check_output(['git', 'bundle', 'list-heads', str(bundle_path)], text=True)
+                        self.assertIn(request['snapshot_commit'], refs)
+                        self.assertEqual(request['integration_tip'], request['snapshot_commit'])
+                        if outcome != 'no-start':
+                            canary.send(peer, dict(type='started', job_id=job))
+                        terminal = (dict(type='exit', code=1) if outcome == 'exit-1' else
+                                    dict(type='refused', reason='workspace_setup_failed') if outcome == 'setup-failed' else
+                                    dict(type='exit', code=0))
+                        canary.send(peer, dict(type='terminal', job_id=job, outcome=terminal))
+                except Exception as error:
+                    errors.append(error)
+            thread = threading.Thread(target=server, daemon=True)
+            thread.start()
+            result = subprocess.run(
+                [sys.executable, str(DEPLOY.with_name('deploy_canary.py')),
+                 '--state-root', str(root), '--instance', instance,
+                 '--timeout-s', '1' if outcome == 'timeout' else '5'],
+                capture_output=True, text=True, timeout=10)
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            if errors:
+                raise errors[0]
+            return result, requests
+
+    def test_canary_transfers_a_real_bundle_and_requires_isolated_start_and_zero_exit(self):
+        for instance in ('main', 'e2e'):
+            with self.subTest(instance=instance):
+                result, requests = self.exercise(instance=instance)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('started and exited 0', result.stdout)
+                self.assertIn(f'/{instance}/', requests[0]['workspace_key'])
+
+    def test_canary_rejects_admission_refusal_setup_failure_nonzero_and_missing_start(self):
+        for outcome in ('refused', 'setup-failed', 'exit-1', 'no-start'):
+            with self.subTest(outcome=outcome):
+                result, _ = self.exercise(outcome)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('canary', result.stderr)
+
+    def test_canary_deadline_bounds_a_daemon_that_never_accepts(self):
+        result, _ = self.exercise('timeout')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('deployment canary deadline exceeded', result.stderr)

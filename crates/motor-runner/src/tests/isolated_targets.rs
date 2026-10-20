@@ -1,6 +1,78 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+async fn deployment_canary(f: &Fixture, runner: &Runner) -> std::process::Output {
+    let (socket, server) = listener(f, runner);
+    let state = f.scratch.join("canary-client/e2e");
+    fs::create_dir_all(&state).unwrap();
+    std::os::unix::fs::symlink(&socket.0, state.join("runner.sock")).unwrap();
+    let result = tokio::process::Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../script/runner/deploy_canary.py"))
+        // Relative socket names fit sun_path even with a long fixture scratch root.
+        .args(["--state-root", "canary-client", "--instance", "e2e"])
+        .arg("--workspace-root")
+        .arg(f.scratch.join("remote/worktrees"))
+        .args(["--timeout-s", "20"])
+        .current_dir(f.scratch.join("."))
+        .output()
+        .await
+        .unwrap();
+    server.abort();
+    result
+}
+
+#[tokio::test]
+async fn deployment_canary_reaches_a_real_runner_job_start() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let result = deployment_canary(&f, &runner).await;
+    let jobs = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .values()
+        .filter(|job| !job.base)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(jobs.len(), 1, "{}", String::from_utf8_lossy(&result.stderr));
+    let job = &jobs[0];
+    assert!(
+        job.started_ms.is_some(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let outcome = &job.terminal.as_ref().unwrap().outcome;
+    assert!(matches!(outcome, Outcome::Exit { code: 0 | 1 }));
+    // A portable fixture runs as the test account; only an isolated fixture is
+    // guaranteed to satisfy the canary's motor-job identity assertion.
+    assert_eq!(
+        result.status.success(),
+        *outcome == Outcome::Exit { code: 0 }
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+async fn isolated_symlinked_state_root_runs_job_through_permissions_helper() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    fs::create_dir_all(&config.state_root).unwrap();
+    let alias = f.scratch.join("operator-state-link");
+    std::os::unix::fs::symlink(&config.state_root, &alias).unwrap();
+    config.state_root = alias;
+    config.isolate_jobs = true;
+    let runner = Runner::open(config).unwrap();
+    let result = deployment_canary(&f, &runner).await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    crate::isolation::restore_runner_access(&f.scratch).unwrap();
+}
+
 #[test]
 #[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
 fn isolated_startup_reclaims_job_owned_trash_entries() {

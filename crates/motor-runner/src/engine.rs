@@ -805,6 +805,17 @@ impl Runner {
             #[cfg(not(test))]
             crate::isolation::prepare_shared_read_access()?;
         }
+        // The operator's state root may be reached through symlinks (for example
+        // when storage lives on another volume). Resolve only that trusted root
+        // once; job-controlled descendants must still pass the no-follow walk.
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&config.state_root)?;
+        }
+        config.state_root = fs::canonicalize(&config.state_root)?;
         let state = config.state_dir();
         {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
