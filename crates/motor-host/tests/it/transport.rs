@@ -708,6 +708,8 @@ impl Control for SlowSuspend {
         Ok(())
     }
 }
+// Heartbeats read host memory from /proc/meminfo, which only Linux hosts have.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_publication_does_not_queue_helper_probes_behind_suspend() {
     let mut host = host();
