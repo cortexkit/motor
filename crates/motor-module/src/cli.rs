@@ -20,13 +20,17 @@ use std::{
     io::{BufRead, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use subc_client_rs::{
     async_trait, CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer,
     SubscribeOptions,
 };
 use subc_protocol::{BindIdentity, RouteTarget};
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::Instant,
+};
 
 /// Nothing ran: the request was refused before the command started (by
 /// ck-motor, the runner or the daemon), or it could not be submitted.
@@ -102,8 +106,9 @@ Exit status: the command's own exit code; 128+N when a signal N killed it;
 (the job ID is printed); 202 timeout; 203 cancelled; 204 bad arguments.
 
 Ctrl-C or SIGTERM cancels the job and waits for its outcome; a second one stops
-waiting. If the connection drops, the job keeps running until it ends or its
-timeout stops it. Save the one-time job ID and secret printed on stderr, or use
+waiting. If the route closes, run tries to reattach for up to 60 seconds without
+resubmitting the job. The job keeps running until it ends or its timeout stops it.
+Save the one-time job ID and secret printed on stderr, or use
 --secret-file. Reconnect with `ck motor attach JOB_ID`, reading the secret from
 stdin, or `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job, and run
 parallel jobs from separate checkouts: the runner runs one job per workspace at
@@ -238,6 +243,7 @@ Reads the job's secret from one line of stdin, or from --secret-file PATH.
 Secrets are never accepted as arguments or from environment variables.
 Replays output from the start, then streams until the job ends. --status prints
 the current state and outcome as JSON without streaming (exit 0 while running).
+Both wait up to 60 seconds for ck-motor if its capability is temporarily absent.
 The terminal exit statuses and interrupt behavior are the same as `ck motor run`.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -410,8 +416,62 @@ pub struct StreamFailure {
 pub enum SubmitError {
     /// Nothing reached ck-motor, or ck-motor refused it before creating a job.
     NotSent(String),
+    /// No module currently claims exec-remote/v1; a placement may be restarting.
+    CapabilityUnavailable(String),
     /// The request may have reached ck-motor; its fate is unknown.
     Unknown(String),
+}
+
+const CAPABILITY_WAIT: Duration = Duration::from_secs(60);
+
+async fn wait_for_motor<T, F, Fut>(mut call: F, err: &mut dyn Write) -> Result<T, SubmitError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SubmitError>>,
+{
+    let deadline = Instant::now() + CAPABILITY_WAIT;
+    let mut announced = false;
+    wait_for_motor_until(&mut call, err, deadline, &mut announced).await
+}
+
+async fn wait_for_motor_until<T, F, Fut>(
+    mut call: F,
+    err: &mut dyn Write,
+    deadline: Instant,
+    announced: &mut bool,
+) -> Result<T, SubmitError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SubmitError>>,
+{
+    let mut delay = Duration::from_millis(100);
+    let mut unavailable = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(unavailable
+                .unwrap_or_else(|| SubmitError::Unknown("timed out waiting for ck-motor".into())));
+        }
+        match tokio::time::timeout_at(deadline, call()).await {
+            Ok(Err(SubmitError::CapabilityUnavailable(message))) => {
+                if !*announced {
+                    let _ = writeln!(err, "ck motor: waiting for ck-motor (up to 60 s)");
+                    *announced = true;
+                }
+                unavailable = Some(SubmitError::CapabilityUnavailable(message));
+            }
+            Ok(result) => return result,
+            Err(_) => {
+                return Err(unavailable.unwrap_or_else(|| {
+                    SubmitError::Unknown("timed out waiting for ck-motor".into())
+                }));
+            }
+        }
+        tokio::time::sleep_until(deadline.min(Instant::now() + delay)).await;
+        if Instant::now() >= deadline {
+            return Err(unavailable.expect("capability refusal before backoff"));
+        }
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
 }
 
 /// The calls `ck motor run` makes on its ck-motor route. The production one
@@ -471,9 +531,9 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
-    let mut stream = match client.run(request).await {
+    let stream = match client.run(request).await {
         Ok(stream) => stream,
-        Err(SubmitError::NotSent(message)) => {
+        Err(SubmitError::NotSent(message) | SubmitError::CapabilityUnavailable(message)) => {
             let _ = writeln!(err, "ck motor run: refused before start: {message}");
             return EXIT_REFUSED;
         }
@@ -487,7 +547,7 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     };
     consume(
         client,
-        stream.as_mut(),
+        stream,
         Session {
             job_id: None,
             secret: None,
@@ -515,7 +575,7 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
     if args.status {
-        return match client.status(args.job_id, secret).await {
+        return match wait_for_motor(|| client.status(args.job_id, secret), err).await {
             Ok(status) => {
                 let _ = writeln!(
                     out,
@@ -527,13 +587,13 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
             Err(failure) => attach_failure(failure, err),
         };
     }
-    let mut stream = match client.attach(args.job_id, secret).await {
+    let stream = match wait_for_motor(|| client.attach(args.job_id, secret), err).await {
         Ok(stream) => stream,
         Err(failure) => return attach_failure(failure, err),
     };
     consume(
         client,
-        stream.as_mut(),
+        stream,
         Session {
             job_id: Some(args.job_id),
             secret: Some(secret.into()),
@@ -548,7 +608,9 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
 
 fn attach_failure(failure: SubmitError, err: &mut dyn Write) -> u8 {
     let (message, code) = match failure {
-        SubmitError::NotSent(message) => (message, EXIT_REFUSED),
+        SubmitError::NotSent(message) | SubmitError::CapabilityUnavailable(message) => {
+            (message, EXIT_REFUSED)
+        }
         SubmitError::Unknown(message) => (message, EXIT_UNKNOWN),
     };
     let _ = writeln!(err, "ck motor attach: {message}");
@@ -557,7 +619,7 @@ fn attach_failure(failure: SubmitError, err: &mut dyn Write) -> u8 {
 
 async fn consume<C: ExecClient + ?Sized>(
     client: &C,
-    stream: &mut dyn RecordStream,
+    mut stream: Box<dyn RecordStream>,
     mut session: Session,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -570,6 +632,9 @@ async fn consume<C: ExecClient + ?Sized>(
     };
     let mut job_id = session.job_id;
     let mut received = false;
+    let mut last_output_seq = None;
+    let mut recovery_deadline: Option<Instant> = None;
+    let mut recovery_announced = false;
     let mut cancel_wanted = false;
     let mut cancel_sent = false;
     loop {
@@ -597,9 +662,22 @@ async fn consume<C: ExecClient + ?Sized>(
                     "ck motor {name}: outcome unknown: the stream ended without an outcome. {}",
                     job_hint(job_id)
                 );
+                if name == "run" {
+                    reattach_hint(job_id, session.secret_file.as_ref(), err);
+                }
                 return EXIT_UNKNOWN;
             }
             Err(failure) => {
+                if recovery_deadline.is_some()
+                    && !matches!(
+                        failure.code.as_deref(),
+                        Some("outcome_unknown" | "route_closed")
+                    )
+                {
+                    attach_failure(SubmitError::NotSent(failure.message), err);
+                    reattach_hint(job_id, session.secret_file.as_ref(), err);
+                    return EXIT_UNKNOWN;
+                }
                 if !received && failure.code.as_deref() == Some("motor_job_not_found") {
                     return attach_failure(SubmitError::NotSent(failure.message), err);
                 }
@@ -626,12 +704,51 @@ async fn consume<C: ExecClient + ?Sized>(
                     );
                     return EXIT_USAGE;
                 }
+                if name == "run"
+                    && matches!(
+                        failure.code.as_deref(),
+                        Some("outcome_unknown" | "route_closed")
+                    )
+                {
+                    if let (Some(id), Some(secret)) = (job_id, session.secret.as_deref()) {
+                        if let Some(deadline) = recovery_deadline {
+                            tokio::time::sleep_until(
+                                deadline.min(Instant::now() + Duration::from_secs(1)),
+                            )
+                            .await;
+                        }
+                        let deadline =
+                            *recovery_deadline.get_or_insert(Instant::now() + CAPABILITY_WAIT);
+                        match wait_for_motor_until(
+                            || client.attach(id, secret),
+                            err,
+                            deadline,
+                            &mut recovery_announced,
+                        )
+                        .await
+                        {
+                            Ok(replacement) => {
+                                stream = replacement;
+                                received = false;
+                                continue;
+                            }
+                            Err(failure) => {
+                                attach_failure(failure, err);
+                                reattach_hint(job_id, session.secret_file.as_ref(), err);
+                                return EXIT_UNKNOWN;
+                            }
+                        }
+                    }
+                }
                 let _ = writeln!(
                     err,
                     "ck motor {name}: outcome unknown: {}. {}",
                     failure.message,
                     job_hint(job_id)
                 );
+                if name == "run" {
+                    reattach_hint(job_id, session.secret_file.as_ref(), err);
+                }
                 return EXIT_UNKNOWN;
             }
         };
@@ -722,6 +839,16 @@ async fn consume<C: ExecClient + ?Sized>(
                 }
             }
             StreamRecord::Output(output) => {
+                // Attach replays from the beginning; a sequence is shared by
+                // stdout and stderr, so one high-water mark covers both.
+                if last_output_seq.is_some_and(|seq| output.seq <= seq) {
+                    continue;
+                }
+                last_output_seq = Some(output.seq);
+                // Only new output ends a recovery window: replayed acceptance
+                // alone must not let a repeatedly closing route wait forever.
+                recovery_deadline = None;
+                recovery_announced = false;
                 let bytes = &output.bytes.0;
                 let _ = match output.stream {
                     OutputStream::Stderr => err.write_all(bytes).and_then(|()| err.flush()),
@@ -741,6 +868,20 @@ async fn consume<C: ExecClient + ?Sized>(
             }
             _ => {}
         }
+    }
+}
+
+fn reattach_hint(job_id: Option<Uuid>, secret_file: Option<&SecretFile>, err: &mut dyn Write) {
+    if let Some(id) = job_id {
+        let file = secret_file
+            .map(|file| {
+                format!(
+                    " {}",
+                    command_line(&["--secret-file".into(), file.path.display().to_string()])
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(err, "ck motor run: outcome unknown; reattach with `ck motor attach {id}{file}` (otherwise read the saved secret from stdin)");
     }
 }
 
@@ -833,11 +974,16 @@ pub fn exit_code(terminal: &TerminalRecord) -> u8 {
 /// attests it as `Principal::Direct`.
 pub struct SubcClient {
     consumer: SubcConsumer,
-    route: RouteHandle,
-    module_id: String,
+    route: Mutex<Option<ClientRoute>>,
+    workspace: PathBuf,
     returns: crate::ReturnOptions,
     allow_spill: bool,
     hosted: bool,
+}
+
+struct ClientRoute {
+    handle: RouteHandle,
+    module_id: String,
 }
 
 impl SubcClient {
@@ -845,24 +991,45 @@ impl SubcClient {
         Self::connect_classified(workspace)
             .await
             .map_err(|failure| match failure {
-                SubmitError::NotSent(message) | SubmitError::Unknown(message) => message,
+                SubmitError::NotSent(message)
+                | SubmitError::CapabilityUnavailable(message)
+                | SubmitError::Unknown(message) => message,
             })
     }
 
     async fn connect_classified(workspace: &Path) -> Result<Self, SubmitError> {
+        let client = Self::connect_for_attach(workspace).await?;
+        client.refresh_route().await?;
+        Ok(client)
+    }
+
+    async fn connect_for_attach(workspace: &Path) -> Result<Self, SubmitError> {
         let consumer = SubcConsumer::connect_default(ConsumerOptions::default())
             .await
             .map_err(|e| SubmitError::Unknown(format!("connect to the subc daemon: {e}")))?;
-        let module_id = consumer
+        Ok(Self {
+            consumer,
+            route: Mutex::new(None),
+            workspace: workspace.to_owned(),
+            returns: crate::ReturnOptions::default(),
+            allow_spill: false,
+            hosted: false,
+        })
+    }
+
+    async fn refresh_route(&self) -> Result<(), SubmitError> {
+        let module_id = self
+            .consumer
             .resolve_provider(crate::module::CAPABILITY)
             .await
             .map_err(connection_error)?;
         let identity = BindIdentity::new(
-            workspace,
+            &self.workspace,
             "ck-motor-run",
             format!("ck-motor-run-{}", Uuid::now_v7()),
         );
-        let route = consumer
+        let handle = self
+            .consumer
             .open_route(
                 RouteTarget::ManagementSurface {
                     module_id: module_id.clone(),
@@ -872,14 +1039,9 @@ impl SubcClient {
             )
             .await
             .map_err(connection_error)?;
-        Ok(Self {
-            consumer,
-            route,
-            module_id,
-            returns: crate::ReturnOptions::default(),
-            allow_spill: false,
-            hosted: false,
-        })
+        // A route belongs to one module placement; never reuse it for reattach.
+        *self.route.lock().await = Some(ClientRoute { handle, module_id });
+        Ok(())
     }
 
     async fn subscribe(
@@ -888,15 +1050,17 @@ impl SubcClient {
         params: impl serde::Serialize,
         secret: Option<&str>,
     ) -> Result<Box<dyn RecordStream>, SubmitError> {
+        let route = self.route.lock().await;
+        let route = route.as_ref().expect("route opened before subscribing");
         let mut subscription = self
             .consumer
             .subscribe_route(
-                &self.route,
+                &route.handle,
                 direct_envelope(op, params, secret),
                 SubscribeOptions::default(),
             )
             .await
-            .map_err(|error| submit_error(error, &self.module_id))?;
+            .map_err(|error| submit_error(error, &route.module_id))?;
         // Drain the SDK's bounded channel even when the terminal's stdout is slow.
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -906,13 +1070,24 @@ impl SubcClient {
                 }
             }
             if let Err(error) = subscription.closed().await {
-                let _ = tx.send(Err(StreamFailure {
-                    code: error.code().map(str::to_owned),
-                    message: error.to_string(),
-                }));
+                let _ = tx.send(Err(stream_failure(error)));
             }
         });
         Ok(Box::new(QueuedStream(rx)))
+    }
+}
+
+fn stream_failure(error: CallError) -> StreamFailure {
+    let code = if matches!(error, CallError::OutcomeUnknown(_)) {
+        Some("outcome_unknown")
+    } else if error.close_reason().is_some() {
+        Some("route_closed")
+    } else {
+        error.code()
+    };
+    StreamFailure {
+        code: code.map(str::to_owned),
+        message: error.to_string(),
     }
 }
 
@@ -937,7 +1112,9 @@ fn submit_error(error: CallError, module_id: &str) -> SubmitError {
 }
 
 fn connection_error(error: CallError) -> SubmitError {
-    if error.code().is_some() {
+    if error.code() == Some("capability_unprovided") {
+        SubmitError::CapabilityUnavailable(error.to_string())
+    } else if error.code().is_some() {
         SubmitError::NotSent(error.to_string())
     } else {
         SubmitError::Unknown(error.to_string())
@@ -962,28 +1139,34 @@ impl ExecClient for SubcClient {
         job_id: Uuid,
         secret: &str,
     ) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.refresh_route().await?;
         self.subscribe("exec.attach", AttachRequest::new(job_id, 0), Some(secret))
             .await
     }
 
     async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError> {
+        self.refresh_route().await?;
+        let route = self.route.lock().await;
+        let route = route.as_ref().expect("route opened before status");
         let bytes = self
             .consumer
             .request(
-                &self.route,
+                &route.handle,
                 direct_envelope("exec.status", json!({"job_id":job_id}), Some(secret)),
                 CallOptions::default(),
             )
             .await
-            .map_err(|error| submit_error(error, &self.module_id))?;
+            .map_err(|error| submit_error(error, &route.module_id))?;
         serde_json::from_slice(&bytes)
             .map_err(|_| SubmitError::Unknown("unreadable job status".into()))
     }
 
     async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String> {
+        let route = self.route.lock().await;
+        let route = route.as_ref().ok_or("no route for cancellation")?;
         self.consumer
             .request(
-                &self.route,
+                &route.handle,
                 direct_envelope("exec.cancel", CancelRequest::new(job_id), secret),
                 CallOptions::default(),
             )
@@ -1104,7 +1287,13 @@ pub async fn hosted_check_main(args: &[String]) -> u8 {
     let result = client
         .consumer
         .request(
-            &client.route,
+            &client
+                .route
+                .lock()
+                .await
+                .as_ref()
+                .expect("connected route")
+                .handle,
             direct_envelope("hosted.check", json!({}), None),
             CallOptions::default(),
         )
@@ -1162,7 +1351,7 @@ pub async fn attach_main(args: &[String]) -> u8 {
             return EXIT_UNKNOWN;
         }
     };
-    let client = match SubcClient::connect_classified(&workspace).await {
+    let client = match SubcClient::connect_for_attach(&workspace).await {
         Ok(client) => client,
         Err(failure) => return attach_failure(failure, &mut std::io::stderr()),
     };
@@ -1201,6 +1390,58 @@ fn interrupt_signals() -> std::io::Result<mpsc::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_errors_preserve_only_missing_claimants_as_retryable() {
+        use super::*;
+        let missing = CallError::CapabilityUnprovided {
+            capability: crate::module::CAPABILITY.into(),
+        };
+        assert!(matches!(
+            connection_error(missing),
+            SubmitError::CapabilityUnavailable(_)
+        ));
+        let missing: subc_protocol::ErrorBody = serde_json::from_value(
+            json!({"code":"capability_unprovided", "message":"no claimant"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            connection_error(CallError::Module(missing)),
+            SubmitError::CapabilityUnavailable(_)
+        ));
+        let error =
+            CallError::OutcomeUnknown(Box::new(std::io::Error::other("route closed by subc")));
+        assert_eq!(
+            stream_failure(error).code.as_deref(),
+            Some("outcome_unknown")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_wait_does_not_retry_other_refusals_or_unknown_outcomes() {
+        use super::*;
+        for unknown in [false, true] {
+            let mut attempts = 0;
+            let mut err = Vec::new();
+            let start = Instant::now();
+            let result = wait_for_motor(
+                || {
+                    attempts += 1;
+                    std::future::ready(Err::<(), _>(if unknown {
+                        SubmitError::Unknown("transport failure".into())
+                    } else {
+                        SubmitError::NotSent("capability_ambiguous".into())
+                    }))
+                },
+                &mut err,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert!(err.is_empty());
+        }
+    }
+
     #[test]
     fn secret_file_is_private_new_and_never_overwrites() {
         use std::os::unix::fs::PermissionsExt;
@@ -1621,13 +1862,13 @@ mod hosted_cli_tests {
                 ..crate::HostedJobState::default()
             })
             .unwrap();
-            let mut records = Records(VecDeque::from([serde_json::to_vec(&record).unwrap()]));
+            let records = Records(VecDeque::from([serde_json::to_vec(&record).unwrap()]));
             let (_, mut interrupts) = mpsc::channel(1);
             let mut out = Vec::new();
             let mut err = Vec::new();
             let code = consume(
                 &UnusedClient,
-                &mut records,
+                Box::new(records),
                 Session {
                     job_id: Some(id),
                     secret: None,
@@ -1687,7 +1928,13 @@ pub async fn shadow_report_main(args: &[String]) -> u8 {
         let bytes = client
             .consumer
             .request(
-                &client.route,
+                &client
+                    .route
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("connected route")
+                    .handle,
                 direct_envelope("shadow.report", json!({"since": since}), None),
                 CallOptions::default(),
             )

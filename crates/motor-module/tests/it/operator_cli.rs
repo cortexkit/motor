@@ -318,6 +318,135 @@ impl ExecClient for WireClient {
     }
 }
 
+/// A daemon placement gap followed by a fresh direct route to the real handler.
+struct PlacementClient {
+    wire: WireClient,
+    missing: AtomicU64,
+    runs: AtomicU64,
+    attaches: AtomicU64,
+    statuses: AtomicU64,
+    secrets: Mutex<Vec<String>>,
+    wrong_secret: bool,
+    unknown_job: bool,
+    pause_on_close: bool,
+}
+
+impl PlacementClient {
+    fn new(daemon: Arc<Daemon>, missing: u64) -> Self {
+        Self {
+            wire: WireClient {
+                daemon,
+                channel: OTHER_DIRECT_CHANNEL,
+                hosted: false,
+            },
+            missing: AtomicU64::new(missing),
+            runs: AtomicU64::new(0),
+            attaches: AtomicU64::new(0),
+            statuses: AtomicU64::new(0),
+            secrets: Mutex::new(Vec::new()),
+            wrong_secret: false,
+            unknown_job: false,
+            pause_on_close: false,
+        }
+    }
+
+    fn resolve(&self) -> Result<(), SubmitError> {
+        if self
+            .missing
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            Err(SubmitError::CapabilityUnavailable(
+                "capability_unprovided: no catalog claimant for exec-remote/v1".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct CloseAfterOutput {
+    stream: Box<dyn RecordStream>,
+    close: bool,
+    pause_on_close: bool,
+}
+
+#[subc_client_rs::async_trait]
+impl RecordStream for CloseAfterOutput {
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, StreamFailure> {
+        if self.close {
+            if self.pause_on_close {
+                tokio::time::pause();
+                self.pause_on_close = false;
+            }
+            return Err(StreamFailure {
+                code: Some("outcome_unknown".into()),
+                message: "request outcome unknown: route closed by subc".into(),
+            });
+        }
+        let bytes = self.stream.next().await?;
+        if let Some(bytes) = &bytes {
+            self.close = matches!(
+                serde_json::from_slice::<StreamRecord>(bytes),
+                Ok(StreamRecord::Output(_))
+            );
+        }
+        Ok(bytes)
+    }
+}
+
+#[subc_client_rs::async_trait]
+impl ExecClient for PlacementClient {
+    async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let original = WireClient {
+            daemon: self.wire.daemon.clone(),
+            channel: DIRECT_CHANNEL,
+            hosted: false,
+        };
+        Ok(Box::new(CloseAfterOutput {
+            stream: original.run(request).await?,
+            close: false,
+            pause_on_close: self.pause_on_close,
+        }))
+    }
+
+    async fn attach(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.attaches.fetch_add(1, Ordering::SeqCst);
+        self.secrets.lock().unwrap().push(secret.into());
+        self.resolve()?;
+        let job_id = if self.unknown_job {
+            Uuid::now_v7()
+        } else {
+            job_id
+        };
+        let secret = if self.wrong_secret {
+            "wrong-secret"
+        } else {
+            secret
+        };
+        self.wire.attach(job_id, secret).await
+    }
+
+    async fn status(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<motor_protocol::JobStatusReply, SubmitError> {
+        self.statuses.fetch_add(1, Ordering::SeqCst);
+        self.resolve()?;
+        self.wire.status(job_id, secret).await
+    }
+
+    async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String> {
+        self.wire.cancel(job_id, secret).await
+    }
+}
+
 /// Collects what `drive` writes, in arrival order, and wakes a waiter when a
 /// marker line appears on stdout.
 /// Each write, tagged "out" or "err".
@@ -822,6 +951,206 @@ async fn cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret
         }
         assert!(errors.windows(2).all(|pair| pair[0] == pair[1]));
     }
+}
+
+#[tokio::test]
+async fn cli_attach_and_status_wait_for_a_capability_claimant() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (job_id, secret, mut frames) =
+        direct_submission(&daemon, timed(&f, "printf 'replayed\\n'; exit 23", 60)).await;
+    collect_frames(&mut frames).await;
+    for status in [false, true] {
+        let client = PlacementClient::new(daemon.clone(), 2);
+        let terminal = Terminal::default();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let code = cli::drive_attach(
+            &client,
+            &cli::AttachArgs {
+                job_id,
+                secret_file: None,
+                status,
+            },
+            &secret,
+            &mut Side("out", terminal.clone()),
+            &mut Side("err", terminal.clone()),
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 23);
+        assert_eq!(
+            terminal.text("err").matches("waiting for ck-motor").count(),
+            1
+        );
+        if status {
+            assert_eq!(client.statuses.load(Ordering::SeqCst), 3);
+            let reply: motor_protocol::JobStatusReply =
+                serde_json::from_str(&terminal.text("out")).unwrap();
+            assert_eq!(cli::exit_code(reply.terminal.as_ref().unwrap()), 23);
+        } else {
+            assert_eq!(client.attaches.load(Ordering::SeqCst), 3);
+            assert_eq!(terminal.text("out"), "replayed\n");
+        }
+        assert_eq!(client.runs.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn cli_capability_gap_is_bounded_and_keeps_the_refused_exit_code() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    tokio::time::pause();
+    for status in [false, true] {
+        let client = PlacementClient::new(daemon.clone(), u64::MAX);
+        let terminal = Terminal::default();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let start = tokio::time::Instant::now();
+        let code = cli::drive_attach(
+            &client,
+            &cli::AttachArgs {
+                job_id: Uuid::now_v7(),
+                secret_file: None,
+                status,
+            },
+            "not-disclosed",
+            &mut Side("out", terminal.clone()),
+            &mut Side("err", terminal.clone()),
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, cli::EXIT_REFUSED);
+        assert!((Duration::from_secs(60)..Duration::from_millis(60_010)).contains(&start.elapsed()));
+        let attempts =
+            client.attaches.load(Ordering::SeqCst) + client.statuses.load(Ordering::SeqCst);
+        assert!(attempts > 2 && attempts < 40, "{attempts} attempts");
+        assert_eq!(
+            terminal.text("err").matches("waiting for ck-motor").count(),
+            1
+        );
+        assert!(terminal.text("err").contains("capability_unprovided"));
+        assert!(!terminal.text("err").contains("not-disclosed"));
+        assert_eq!(terminal.text("out"), "");
+    }
+}
+
+#[tokio::test]
+async fn cli_run_reattaches_without_resubmitting_or_reprinting_output() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let client = PlacementClient::new(daemon, 2);
+    let terminal = Terminal::default();
+    let secret_path = f.scratch.join("reattach.key");
+    let (_tx, mut interrupts) = mpsc::channel(1);
+    let code = cli::drive_run(
+        &client,
+        &timed(
+            &f,
+            "printf 'first\\n'; printf 'error\\n' >&2; printf 'last\\n'; exit 17",
+            60,
+        ),
+        Some(cli::SecretFile::create(&secret_path).unwrap()),
+        &mut Side("out", terminal.clone()),
+        &mut Side("err", terminal.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, 17);
+    assert_eq!(client.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(client.attaches.load(Ordering::SeqCst), 3);
+    assert_eq!(terminal.text("out"), "first\nlast\n");
+    assert_eq!(
+        terminal
+            .text("err")
+            .lines()
+            .filter(|line| *line == "error")
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminal.text("err").matches("waiting for ck-motor").count(),
+        1
+    );
+    let secret = fs::read_to_string(secret_path).unwrap();
+    assert!(client
+        .secrets
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|seen| seen == secret.trim()));
+    assert!(!terminal.text("err").contains(secret.trim()));
+}
+
+#[tokio::test]
+async fn cli_run_reattach_gap_times_out_with_the_saved_attach_command() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    let mut client = PlacementClient::new(daemon, u64::MAX);
+    client.pause_on_close = true;
+    let terminal = Terminal::default();
+    let path = f.scratch.join("secret with spaces.key");
+    let (_tx, mut interrupts) = mpsc::channel(1);
+    let code = cli::drive_run(
+        &client,
+        &timed(&f, "printf 'first\\n'; exit 0", 60),
+        Some(cli::SecretFile::create(&path).unwrap()),
+        &mut Side("out", terminal.clone()),
+        &mut Side("err", terminal.clone()),
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, cli::EXIT_UNKNOWN);
+    assert_eq!(client.runs.load(Ordering::SeqCst), 1);
+    assert!(client.attaches.load(Ordering::SeqCst) > 2);
+    let errors = terminal.text("err");
+    assert!(errors.contains("reattach with `ck motor attach "));
+    assert!(errors.contains(&format!("--secret-file '{}'", path.display())));
+    assert_eq!(errors.matches("waiting for ck-motor").count(), 1);
+    assert!(!errors.contains(fs::read_to_string(path).unwrap().trim()));
+}
+
+#[tokio::test]
+async fn cli_run_reattach_wrong_secret_is_indistinguishable_from_an_unknown_job() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let mut refusals = Vec::new();
+    for wrong_secret in [true, false] {
+        let mut client = PlacementClient::new(daemon.clone(), 0);
+        client.wrong_secret = wrong_secret;
+        client.unknown_job = !wrong_secret;
+        let terminal = Terminal::default();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let code = cli::drive(
+            &client,
+            &timed(&f, "printf 'first\\n'; exit 0", 60),
+            &mut Side("out", terminal.clone()),
+            &mut Side("err", terminal.clone()),
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, cli::EXIT_UNKNOWN);
+        assert_eq!(client.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(client.attaches.load(Ordering::SeqCst), 1);
+        let errors = terminal.text("err");
+        assert!(!errors.contains("waiting for ck-motor"));
+        assert!(!errors.contains("wrong-secret"));
+        assert!(errors.contains("reattach with `ck motor attach "));
+        refusals.push(
+            errors
+                .lines()
+                .find(|line| line.starts_with("ck motor attach:"))
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(refusals[0], refusals[1]);
+    assert!(refusals[0].contains("no such job"));
 }
 
 #[tokio::test]
