@@ -36,7 +36,8 @@ impl Motor {
             let mut run_sent = false;
             // The deadline bounds lease acquisition, upload and the command, not
             // just execution. Shadows never reattach or resubmit after a loss.
-            let deadline = Duration::from_secs(request.timeout.unwrap_or(0).saturating_add(120));
+            let deadline = Duration::from_secs(request.timeout.unwrap_or(0).saturating_add(120))
+                + crate::hosted::SHADOW_PROVISIONING_BUDGET;
             let execution = motor.execute_shadow(
                 shadow_id,
                 &request,
@@ -139,11 +140,10 @@ impl Motor {
                 .shadow_run(id, request, &salt, booked)
                 .await
                 .map_err(|e| {
-                    io::Error::other(format!(
-                        "{}: {}",
-                        e.code(),
-                        client.broker_code().unwrap_or_default()
-                    ))
+                    io::Error::other(match client.broker_code() {
+                        Some(code) => format!("{}: {code}", e.code()),
+                        None => e.code().to_owned(),
+                    })
                 })?,
         );
         let c = channel.as_mut().unwrap();

@@ -167,6 +167,11 @@ pub(crate) enum Error {
     AccountPermanent,
     AccountInvalid,
 }
+/// How long a shadow waits for the broker to provision its sandbox. Resuming a
+/// stopped Boat sandbox takes about 100 s and a cold start from the prepared
+/// image up to about 3 minutes, so a shorter wait abandons most shadows that
+/// don't land on a warm sandbox.
+pub(crate) const SHADOW_PROVISIONING_BUDGET: Duration = Duration::from_secs(300);
 const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
 const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
 fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
@@ -760,7 +765,7 @@ impl Client {
             request: &body,
             shadow: true,
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + SHADOW_PROVISIONING_BUDGET;
         let lease: Lease = self
             .post_ready_authorized("/v1/leases", &wire, self.bearer().await?, deadline)
             .await?;
