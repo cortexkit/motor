@@ -32,6 +32,12 @@ class CaptureTests(unittest.TestCase):
                                  {"version": None, "error": "not-probed: sccache"})
             run.assert_not_called()
 
+    def test_gnu_test_inventory_never_passes_a_version_flag(self):
+        with patch.object(parity.subprocess, 'run') as run:
+            self.assertEqual(parity.binary_version('/usr/bin/gnutest', {}),
+                             {'version': None, 'error': 'not-probed: test has no version flag'})
+            run.assert_not_called()
+
     def test_coreutils_prefixed_true_uses_canonical_argv0(self):
         with patch.object(parity.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'true (GNU coreutils) 9.7', '')) as run:
             parity.binary_version('/usr/bin/gnutrue', {})
@@ -104,6 +110,10 @@ class ParityTests(unittest.TestCase):
                  for name, spec in manifest['tools'].items()}
         tools.update({name: {'path': path, 'version': name[3:] + ' (GNU coreutils) 9.7', 'exit_code': 0}
                       for name, path in manifest['gnu_coreutils'].items()})
+        for name, row in tools.items():
+            if name in manifest['gnu_coreutils']:
+                row['package'] = 'gnu-coreutils: ' + row['path']
+        tools['gnutest'].update(version=None, sha256='package-qualified-test')
         return {**{key: copy.deepcopy(manifest[key]) for key in ('rust_default', 'rust_profile', 'rust_toolchains', 'cargo_home', 'rustup_home')},
                 'rustup_version': 'rustup ' + manifest['rustup'], 'cargo_binaries': bins, 'tools': tools,
                 'rust_target_payloads': {name: {target: True for target in spec['targets']} for name, spec in manifest['rust_toolchains'].items()},
@@ -114,11 +124,28 @@ class ParityTests(unittest.TestCase):
 
     def report(self, actual, job=False):
         with patch.object(parity, 'capture', return_value=actual):
-            return parity.check(self.manifest, job=job)
+            return parity.check(self.manifest, job=job, gnu_test_sha256='package-qualified-test')
 
     def test_measured_contract_passes(self):
         self.assertTrue(self.report(self.observed())['passed'])
         self.assertTrue(self.report(self.observed(), job=True)['passed'])
+
+    def test_gnu_dd_and_test_exact_server_outputs_are_accepted(self):
+        actual = self.observed()
+        actual['tools']['gnudd'].update(version='dd (coreutils) 9.7', exit_code=0, package='gnu-coreutils: /usr/bin/gnudd')
+        actual['tools']['gnutest'].update(version='', exit_code=0, package='gnu-coreutils: /usr/bin/gnutest')
+        self.assertTrue(self.report(actual)['passed'])
+        actual['tools']['gnudd']['package'] = ''
+        self.assertTrue(self.report(actual)['passed'])
+        actual['tools']['gnutest']['package'] = 'coreutils-from-uutils: /usr/bin/gnutest'
+        self.assertFalse(self.report(actual)['passed'])
+
+    def test_job_versionless_gnu_test_requires_fresh_host_hash(self):
+        actual = self.observed()
+        actual['tools']['gnutest']['package'] = ''
+        self.assertTrue(self.report(actual, job=True)['passed'])
+        actual['tools']['gnutest']['sha256'] = 'different-file'
+        self.assertFalse(self.report(actual, job=True)['passed'])
 
     def test_missing_image_wasm_target_fails_check(self):
         actual = self.observed()

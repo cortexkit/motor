@@ -37,7 +37,7 @@ class RunnerHostTests(unittest.TestCase):
             target = Path(tmp, 'wasm32-unknown-unknown')
             target.mkdir()
             checker = Path(tmp, 'checker.py')
-            checker.write_text('from pathlib import Path\ndef check(manifest, role, job):\n'
+            checker.write_text('from pathlib import Path\ndef check(manifest, role, job, gnu_test_sha256=None):\n'
                                f'    return {{"passed": Path({str(target)!r}).is_dir(), "job": job}}\n')
             with patch.object(host, 'PARITY_SCRIPT', checker):
                 source = host.parity_source(job=True)

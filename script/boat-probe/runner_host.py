@@ -434,13 +434,13 @@ def prepared_image_digest(revision, inventory):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',',':')).encode()).hexdigest()
 
 
-def parity_source(job=False):
+def parity_source(job=False, gnu_test_sha256=None):
     # Run the operator checkout's checker, not an image's possibly stale checker
     # or its build-time inventory. Every phase measures the current filesystem.
     return ("import json\n"
             "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py'}\n"
             f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
-            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r})\n"
+            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r})\n"
             "print(json.dumps(result))\n")
 
 
@@ -758,10 +758,12 @@ class RunnerHost:
         job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
+                gnu_test_hash = (record['toolchain_parity']['observed']['tools'].get('gnutest') or {}).get('sha256')
                 jobs = [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
                                        ("exit", "printf 'boat-round-trip\\n'; exit 23"),
                                         ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
-                                        ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(job=True))),
+                                        ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
+                                            job=True, gnu_test_sha256=gnu_test_hash))),
                                        ("isolation", "python3 -c " + shlex.quote(job_script))]
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))

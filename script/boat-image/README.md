@@ -75,6 +75,12 @@ mount's read-only flag. Missing targets, components, Cargo binaries or required
 packages prevent a PASS verdict, including in `--verify-prepared-image` mode.
 The checker reads rustup's installed lists and verifies each target's `libstd`
 payload exists; a stale installation receipt alone cannot qualify a target.
+GNU aliases are identified by the owning `coreutils`/`gnu-coreutils` package.
+When no package owner is reported, the checker accepts version output containing
+either `(coreutils)` or `(GNU coreutils)`.
+`gnutest` has no version flag: its host package ownership is checked without
+executing it. The probe compares the job's `gnutest` file hash with a fresh hash
+of the host's `gnutest` file because job filesystems omit dpkg's database.
 The report carries the manifest digest and observed versions.
 `test_recipe_preinstalls_wasm32_unknown_unknown`,
 `test_missing_image_wasm_target_fails_check`, and the probe's parity tests defend

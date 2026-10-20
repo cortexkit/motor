@@ -25,9 +25,11 @@ def binary_version(path, env):
     # Inventory must never start or depend on a cache server.
     if Path(path).name.startswith("sccache"):
         return {"version": None, "error": "not-probed: sccache"}
+    if Path(path).name == "gnutest":
+        return {"version": None, "error": "not-probed: test has no version flag"}
     try:
         name = Path(path).name
-        # true, false and test recognize --version only under their own names.
+        # true and false recognize --version only under their own names.
         argv0 = name[3:] if name.startswith("gnu") else str(path)
         result = subprocess.run([argv0, "--version"], executable=str(path), env=env,
                                 text=True, capture_output=True, timeout=30)
@@ -90,6 +92,8 @@ def capture(manifest=None, job=False):
                 capture_output=True, timeout=30).stdout.strip()
             tools[name] = {"path": path, "realpath": str(Path(path).resolve()),
                            **binary_version(path, env), "package": owner}
+            if name == 'gnutest':
+                tools[name]['sha256'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         else:
             tools[name] = None
     packages = {}
@@ -165,7 +169,7 @@ def readonly_mount(path, mountinfo):
     return bool(matches) and "ro" in max(matches, key=lambda row: len(row[4]))[5].split(",")
 
 
-def differences(manifest, actual, role="build-server", job=False):
+def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None):
     errors = []
 
     def equal(name, expected, observed):
@@ -218,7 +222,19 @@ def differences(manifest, actual, role="build-server", job=False):
     for name in manifest["gnu_coreutils"]:
         observed = tools.get(name) or {}
         equal(name + " path", manifest["gnu_coreutils"][name], observed.get("path"))
-        if not observed.get("path") or "GNU coreutils" not in (observed.get("version") or ""):
+        packages = {owner.split(':', 1)[0] for line in observed.get('package', '').splitlines()
+                    for owner in line.partition(': ')[0].split(', ') if owner}
+        owned = bool(packages & {'coreutils', 'gnu-coreutils'})
+        family = bool(re.fullmatch(r'.*\((?:GNU )?coreutils\) [0-9]+(?:\.[0-9]+)+.*',
+                                  first_line(observed.get('version'))))
+        if name == 'gnutest' and job:
+            # Job filesystems omit dpkg's database. Compare gnutest's hash with
+            # the fresh host hash after checking that host file's package owner.
+            # test has no --version option.
+            identified = bool(gnu_test_sha256) and observed.get('sha256') == gnu_test_sha256
+        else:
+            identified = owned or (name != 'gnutest' and not packages and family)
+        if not observed.get("path") or not identified:
             errors.append(name + ": missing GNU coreutils alias")
     if job:
         for name, expected in manifest["job_environment"].items():
@@ -239,7 +255,7 @@ def differences(manifest, actual, role="build-server", job=False):
     return errors
 
 
-def check(manifest, role="build-server", job=False):
+def check(manifest, role="build-server", job=False, gnu_test_sha256=None):
     validate(manifest)
     actual = capture(manifest, job=job)
     if role == "boat" and not job:
@@ -247,7 +263,7 @@ def check(manifest, role="build-server", job=False):
         actual["sccache_inputs_sha256"] = marker.read_text() if marker.is_file() else None
         artifacts = Path('/srv/build/sccache-artifacts.json')
         actual['sccache_artifacts'] = json.loads(artifacts.read_text()) if artifacts.is_file() else None
-    errors = differences(manifest, actual, role, job)
+    errors = differences(manifest, actual, role, job, gnu_test_sha256)
     # Keep qualification output bounded without discarding the measured versions.
     actual.pop("cargo_metadata", None)
     for row in [*actual["cargo_binaries"].values(), *actual["tools"].values()]:
@@ -318,12 +334,14 @@ def main():
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--role", choices=("build-server", "boat"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
+    parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
     args = parser.parse_args()
     if args.capture:
         result = capture()
     else:
         manifest = json.loads(args.manifest.read_text())
-        result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(manifest, args.role, args.job)
+        result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(
+            manifest, args.role, args.job, args.gnu_test_sha256)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if args.check and not result["passed"] else 0
 
