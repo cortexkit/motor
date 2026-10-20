@@ -36,7 +36,7 @@ impl Helper {
         let deadline = helper_reply_deadline(&request);
         tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
         let result = UnixStream::connect(&self.socket)
-            .map_err(anyhow::Error::from)
+            .with_context(|| format!("connect helper socket {}", self.socket.display()))
             .and_then(|stream| exchange_helper(stream, &request))
             .with_context(|| {
                 format!(
@@ -82,8 +82,12 @@ fn exchange_helper_with_deadline(
     request: &Value,
     deadline: Duration,
 ) -> Result<(Value, Vec<OwnedFd>)> {
-    stream.set_read_timeout(Some(deadline))?;
-    stream.set_write_timeout(Some(ORDINARY_HELPER_TIMEOUT))?;
+    stream
+        .set_read_timeout(Some(deadline))
+        .context("set helper read timeout")?;
+    stream
+        .set_write_timeout(Some(ORDINARY_HELPER_TIMEOUT))
+        .context("set helper write timeout")?;
     let bytes = serde_json::to_vec(request)?;
     ensure!(bytes.len() < 4096, "helper request too large");
     stream.write_all(&bytes).context("write helper request")?;

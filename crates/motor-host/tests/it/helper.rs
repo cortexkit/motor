@@ -241,7 +241,7 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
             guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
         };
         let response = helper.wake("tenant", None);
-        assert_eq!(response.is_ok(), result == "pass");
+        assert_eq!(response.is_ok(), result == "pass", "{result}: {response:?}");
         if result != "pass" {
             assert!(matches!(
                 response
