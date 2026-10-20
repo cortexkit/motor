@@ -2,12 +2,21 @@ use super::*;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     time::UNIX_EPOCH,
 };
+
+fn extension() -> &'static str {
+    if cfg!(windows) {
+        "vhdx"
+    } else {
+        "qcow2"
+    }
+}
 
 pub(crate) struct CacheDisks {
     root: PathBuf,
@@ -43,7 +52,8 @@ impl CacheDisks {
         )
     }
     pub(crate) fn disk(&self, workspace: &str) -> PathBuf {
-        self.root.join(format!("{}.qcow2", self.key(workspace)))
+        self.root
+            .join(format!("{}.{}", self.key(workspace), extension()))
     }
     pub(crate) fn marker(&self, disk: &Path) -> PathBuf {
         disk.with_extension("attached")
@@ -53,7 +63,7 @@ impl CacheDisks {
     }
     fn valid_disk(&self, path: &Path) -> bool {
         path.parent() == Some(self.root.as_path())
-            && path.extension().is_some_and(|s| s == "qcow2")
+            && path.extension().is_some_and(|s| s == extension())
             && path.file_stem().is_some_and(|s| {
                 s.len() == 64 && s.to_string_lossy().bytes().all(|b| b.is_ascii_hexdigit())
             })
@@ -85,16 +95,16 @@ impl CacheDisks {
         {
             return Err(invalid("Windows cache lock root is a symlink"));
         }
+        #[cfg(unix)]
         fs::set_permissions(&self.locks, fs::Permissions::from_mode(0o700)).map_err(|error| {
             super::vm::path_error("chmod cache lock directory", &self.locks, error)
         })?;
         let path = self.locks.join(disk.file_stem().unwrap());
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let lock = options
             .open(&path)
             .map_err(|error| super::vm::path_error("open cache lock", &path, error))?;
         lock.lock_exclusive()
@@ -143,14 +153,13 @@ impl CacheDisks {
             super::vm::path_error("write cache usage", &self.usage(&disk), error)
         })?;
         let marker_path = self.marker(&disk);
-        let marker = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&marker_path)
-            .map_err(|error| {
-                super::vm::path_error("create cache attachment", &marker_path, error)
-            })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let marker = options.open(&marker_path).map_err(|error| {
+            super::vm::path_error("create cache attachment", &marker_path, error)
+        })?;
         marker
             .sync_all()
             .map_err(|error| super::vm::path_error("sync cache attachment", &marker_path, error))?;
@@ -202,16 +211,28 @@ impl CacheDisks {
         self.sync_root()
     }
     fn sync_root(&self) -> io::Result<()> {
-        File::open(&self.root)
-            .and_then(|root| root.sync_all())
+        crate::filesystem::sync_directory(&self.root)
             .map_err(|error| super::vm::path_error("sync cache directory", &self.root, error))
     }
     pub(crate) fn reconcile(&self) -> io::Result<()> {
         self.real_root()?;
+        #[cfg(windows)]
+        {
+            // A power loss can reorder NTFS directory metadata. Native startup
+            // stops all owned VMs first, then discards every previous cache,
+            // including a disk whose attachment marker was never persisted.
+            let disks = fs::read_dir(&self.root)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?;
+            for disk in disks.into_iter().filter(|path| self.valid_disk(path)) {
+                let _lock = self.lock(&disk)?;
+                self.remove(&disk)?;
+            }
+        }
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.extension().is_some_and(|s| s == "attached") {
-                let disk = path.with_extension("qcow2");
+                let disk = path.with_extension(extension());
                 let _lock = self.lock(&disk)?;
                 self.remove(&disk)?;
             }
@@ -224,7 +245,7 @@ impl CacheDisks {
         device: u64,
     ) -> io::Result<Vec<CacheCandidate>> {
         self.real_root()?;
-        if fs::symlink_metadata(&self.root)?.dev() != device {
+        if crate::filesystem::device(&self.root)? != device {
             return Err(invalid("Windows cache cleanup cannot cross a mount"));
         }
         let mut candidates = Vec::new();
@@ -233,7 +254,7 @@ impl CacheDisks {
             let metadata = fs::symlink_metadata(&path)?;
             if self.valid_disk(&path)
                 && metadata.is_file()
-                && metadata.dev() == device
+                && crate::filesystem::device(&path)? == device
                 && !protected.contains(&path)
                 && !self.attached(&path)?
             {

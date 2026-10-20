@@ -336,6 +336,10 @@ impl Config {
         self.state_dir().join("writer-scratch")
     }
     pub(crate) fn writer_enabled(&self) -> bool {
+        #[cfg(windows)]
+        if self.windows_instance() {
+            return false;
+        }
         // These runners spend leased CPU time. Even an idle-started fill can
         // consume the next job's quota or hold a setup lock after it arrives.
         if self.tenant_vm || self.boat_profile {
@@ -365,19 +369,39 @@ impl Config {
         self.backend == BackendKind::WindowsVm
     }
     fn configure_backend(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        if !self.windows_instance() || self.tenant_vm || self.boat_profile {
+            return Err(invalid(
+                "native Windows hosts require the Hyper-V windows-vm backend",
+            ));
+        }
         if self.windows_instance() {
             let path = self
                 .vm_config
                 .as_ref()
                 .ok_or_else(|| invalid("--backend windows-vm requires --vm-config <file>"))?;
             self.windows = Some(Arc::new(crate::windows::VmConfig::load(path)?));
-            self.max_weight = 4;
+            #[cfg(unix)]
+            {
+                self.max_weight = 4;
+            }
+            #[cfg(windows)]
+            {
+                self.max_weight = self.windows.as_ref().unwrap().concurrent_jobs * 4;
+            }
             self.workspace_roots.clear();
         }
         Ok(())
     }
     pub fn socket_path(&self) -> PathBuf {
-        self.state_dir().join("runner.sock")
+        #[cfg(unix)]
+        {
+            self.state_dir().join("runner.sock")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\motor-runner-{}", self.instance))
+        }
     }
 }
 
@@ -679,6 +703,7 @@ pub(crate) enum Admission {
     DiskFull(RunnerDiskFull),
 }
 
+#[cfg(unix)]
 fn private_state_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
@@ -716,6 +741,14 @@ fn private_state_directory(path: &Path) -> io::Result<()> {
         }
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn private_state_directory(path: &Path) -> io::Result<()> {
+    // script/windows-runner/install.ps1 protects C:\ProgramData\MotorRunner.
+    // State directories inherit that root DACL; readonly attributes do not
+    // express private access on Windows.
+    crate::filesystem::device(path).map(|_| ())
 }
 
 impl Runner {
@@ -777,7 +810,14 @@ impl Runner {
             cpus.without_daemon_reservation()
         };
         let cpus = if let Some(vm) = &config.windows {
-            CpuTopology::fixed(vm.cpu_set.clone())?
+            #[cfg(unix)]
+            {
+                CpuTopology::fixed(vm.cpu_set.clone())?
+            }
+            #[cfg(windows)]
+            {
+                CpuTopology::fixed((0..vm.concurrent_jobs * 4).collect())?
+            }
         } else {
             cpus
         };
@@ -815,6 +855,7 @@ impl Runner {
         // The operator's state root may be reached through symlinks (for example
         // when storage lives on another volume). Resolve only that trusted root
         // once; job-controlled descendants must still pass the no-follow walk.
+        #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             fs::DirBuilder::new()
@@ -822,8 +863,14 @@ impl Runner {
                 .mode(0o700)
                 .create(&config.state_root)?;
         }
-        config.state_root = fs::canonicalize(&config.state_root)?;
+        #[cfg(windows)]
+        fs::create_dir_all(&config.state_root)?;
+        #[cfg(unix)]
+        {
+            config.state_root = fs::canonicalize(&config.state_root)?;
+        }
         let state = config.state_dir();
+        #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
             // Bind may initially inherit a loose umask. A private, owned parent
@@ -838,6 +885,11 @@ impl Runner {
                     "runner state directory must be owned by the daemon and not a symlink",
                 ));
             }
+            private_state_directory(&state)?;
+        }
+        #[cfg(windows)]
+        {
+            fs::create_dir_all(&state)?;
             private_state_directory(&state)?;
         }
         #[cfg(target_os = "linux")]
@@ -870,6 +922,7 @@ impl Runner {
                     }
                 };
         }
+        #[cfg(unix)]
         if config.windows_instance() {
             use std::os::unix::fs::PermissionsExt;
             lock.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -1537,7 +1590,7 @@ impl Runner {
             let path = self.record_path(id);
             let directory = path.parent().unwrap();
             std::fs::remove_dir_all(directory)?;
-            File::open(directory.parent().unwrap())?.sync_all()?;
+            crate::filesystem::sync_directory(directory.parent().unwrap())?;
             inner.jobs.remove(&id);
             self.core.repository_usage.lock().unwrap().remove(id);
         }
@@ -4305,7 +4358,6 @@ impl Runner {
     }
     fn follow_unit(&self, id: Uuid) -> io::Result<()> {
         use std::io::{Seek, SeekFrom};
-        use std::os::unix::fs::OpenOptionsExt;
         let (process, durable) = {
             let inner = self.core.inner.lock().unwrap();
             let job = &inner.jobs[&id];
@@ -4360,10 +4412,7 @@ impl Runner {
                         }
                     };
                     let read = || -> io::Result<Vec<u8>> {
-                        let mut file = OpenOptions::new()
-                            .read(true)
-                            .custom_flags(libc::O_NOFOLLOW)
-                            .open(directory.join(name))?;
+                        let mut file = crate::filesystem::read_nofollow(&directory.join(name))?;
                         file.seek(SeekFrom::Start(offset))?;
                         let mut bytes = Vec::new();
                         file.take(16384).read_to_end(&mut bytes)?;
@@ -4415,19 +4464,26 @@ impl Runner {
         process: Option<platform::ProcessIdentity>,
         path: &Path,
     ) -> io::Result<std::process::ExitStatus> {
-        use std::os::unix::{fs::OpenOptionsExt, process::ExitStatusExt};
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
         let durable = (|| {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)?;
+            let mut file = crate::filesystem::read_nofollow(path)?;
             let mut code = String::new();
             Read::by_ref(&mut file).take(32).read_to_string(&mut code)?;
             let code = code.trim().parse::<i32>().map_err(io::Error::other)?;
             if !(0..=255).contains(&code) {
                 return Err(io::Error::other("invalid durable exit code"));
             }
-            Ok(std::process::ExitStatus::from_raw(code << 8))
+            #[cfg(unix)]
+            {
+                Ok(std::process::ExitStatus::from_raw(code << 8))
+            }
+            #[cfg(windows)]
+            {
+                Ok(std::process::ExitStatus::from_raw(code as u32))
+            }
         })();
         durable.or_else(|error| {
             // The wrapper writes a fixed writable inode in a read-only output

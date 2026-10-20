@@ -75,30 +75,38 @@ pub(super) fn prepare(
             destination: sibling.canonical_path.clone(),
         });
     }
+    #[cfg(unix)]
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| invalid("HOME is unset"))?;
+    #[cfg(unix)]
     let cargo = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".cargo"));
     // The dedicated preparation account cannot traverse the runner's home.
     // Resolve the installed toolchain and give the unit read-only access to it.
+    #[cfg(unix)]
     let rustup = cargo.join("bin/rustup");
+    #[cfg(unix)]
     let toolchain = command(
         config,
         &rustup.to_string_lossy(),
         &["which".into(), "cargo".into()],
     )
     .map_err(|error| super::vm::path_error("locate preparation toolchain with", &rustup, error))?;
+    #[cfg(unix)]
     if !toolchain.status.success() {
         return Err(invalid("cannot locate trusted preparation toolchain"));
     }
+    #[cfg(unix)]
     let cargo_executable =
         PathBuf::from(String::from_utf8(toolchain.stdout).map_err(invalid)?.trim());
+    #[cfg(unix)]
     let toolchain_bin = cargo_executable
         .parent()
         .ok_or_else(|| invalid("invalid cargo toolchain path"))?
         .to_path_buf();
+    #[cfg(unix)]
     let plan = Plan {
         staging: staging.into(),
         snapshots,
@@ -110,27 +118,57 @@ pub(super) fn prepare(
         toolchain_source: toolchain_bin.parent().unwrap().to_path_buf(),
         toolchain_bin: "/opt/motor-prep-toolchain/bin".into(),
     };
+    #[cfg(windows)]
+    let plan = {
+        let toolchain = config
+            .windows
+            .as_ref()
+            .unwrap()
+            .layout_root
+            .join("prep-toolchain");
+        let routes = super::trusted_prep::copy_routes(staging, &routes)?;
+        Plan {
+            staging: staging.into(),
+            snapshots,
+            routes,
+            workspace: request.workspace_key.clone(),
+            tree_hash: request.tree_hash.clone(),
+            cargo: toolchain.join("bin/cargo.exe"),
+            rustup: toolchain.clone(),
+            toolchain_bin: toolchain.join("bin"),
+            toolchain_source: toolchain,
+        }
+    };
     let plan_path = staging.join("prepare.json");
     atomic_json(&plan_path, &plan)
         .map_err(|error| super::vm::path_error("write preparation plan", &plan_path, error))?;
+    #[cfg(unix)]
     super::vm::acl(config, "u:motor-prep:r", &plan_path)?;
-    #[cfg(test)]
-    let executable = match &config.windows_prep_executable {
-        Some(path) => path.clone(),
-        None => std::env::current_exe()?,
-    };
-    #[cfg(not(test))]
-    let executable = std::env::current_exe()?;
-    let args = prep_args(config, setup.id, &plan, &plan_path, &executable);
-    let output = run_preparation(config, setup.id, &args)
-        .map_err(|error| super::vm::path_error("run trusted preparation for", staging, error))?;
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "Windows trusted preparation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        let executable = match &config.windows_prep_executable {
+            Some(path) => path.clone(),
+            None => std::env::current_exe()?,
+        };
+        #[cfg(not(test))]
+        let executable = std::env::current_exe()?;
+        let args = prep_args(config, setup.id, &plan, &plan_path, &executable);
+        let output = run_preparation(config, setup.id, &args).map_err(|error| {
+            super::vm::path_error("run trusted preparation for", staging, error)
+        })?;
+        if !output.status.success() {
+            return Err(invalid(format!(
+                "Windows trusted preparation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        super::vm::restore_staging_access(config, staging)?;
     }
-    super::vm::restore_staging_access(config, staging)?;
+    #[cfg(windows)]
+    execute_with_fetch(&plan_path, |cmd| {
+        super::trusted_prep::prepare_fetch(config, staging, cmd)
+    })?;
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
@@ -139,6 +177,7 @@ pub(super) fn prepare(
     Ok(tar)
 }
 
+#[cfg(unix)]
 fn prep_args(
     config: &Config,
     id: Uuid,
@@ -178,6 +217,7 @@ fn prep_args(
     ]
 }
 
+#[cfg(unix)]
 fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Output> {
     #[cfg(test)]
     if config.windows_command.is_some() {
@@ -268,17 +308,34 @@ fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<(
 }
 
 fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
-    let output = Command::new("/usr/bin/git")
+    let mut command = Command::new(if cfg!(windows) {
+        r"C:\Program Files\Git\cmd\git.exe"
+    } else {
+        "/usr/bin/git"
+    });
+    command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "PATH",
+            if cfg!(windows) {
+                r"C:\Windows\System32;C:\Program Files\Git\cmd"
+            } else {
+                "/usr/bin:/bin"
+            },
+        )
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .arg("-c")
         .arg(format!("safe.directory={}", snapshot.mirror.display()))
         .arg("--git-dir")
         .arg(&snapshot.mirror)
-        .args(args)
-        .output()?;
+        .args(args);
+    #[cfg(windows)]
+    command.env("SYSTEMROOT", "C:\\Windows");
+    let output = command.output()?;
     if !output.status.success() {
         return Err(invalid(String::from_utf8_lossy(&output.stderr)));
     }
@@ -304,7 +361,14 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
     cmd.env_clear()
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", plan.toolchain_bin.display()),
+            if cfg!(windows) {
+                format!(
+                    "{};C:\\Windows\\System32;C:\\Program Files\\Git\\cmd",
+                    plan.toolchain_bin.display()
+                )
+            } else {
+                format!("{}:/usr/bin:/bin", plan.toolchain_bin.display())
+            },
         )
         .env("CARGO_HOME", plan.staging.join("cargo-home"))
         .env("RUSTUP_HOME", &plan.rustup)
@@ -366,6 +430,8 @@ pub(crate) fn execute_with_fetch(
                 .trim_end_matches('/')
                 .to_owned();
             let transferred = format!("{}/{}", mapped(&snapshot.destination)?.display(), name);
+            #[cfg(windows)]
+            let transferred = transferred.replace('\\', "/");
             motor_winagent::validate_archive_path(&transferred)?;
             check_case(&transferred, &mut cases)?;
             if !members.insert(transferred.clone()) {
@@ -502,7 +568,14 @@ fn check_sources(
             let resolved = path
                 .canonicalize()
                 .map_err(|_| invalid(format!("missing path dependency: {}", path.display())))?;
-            if !roots.iter().any(|root| resolved.starts_with(root)) {
+            #[cfg(unix)]
+            let inside = roots.iter().any(|root| resolved.starts_with(root));
+            #[cfg(windows)]
+            let inside = roots.iter().any(|root| {
+                root.canonicalize()
+                    .is_ok_and(|root| resolved.starts_with(root))
+            });
+            if !inside {
                 return Err(invalid(format!(
                     "outside path dependency: {}",
                     path.display()
@@ -557,6 +630,10 @@ fn append(
     let name = relative
         .to_str()
         .ok_or_else(|| invalid(format!("non-UTF8 path: {}", path.display())))?;
+    #[cfg(windows)]
+    let name = name.replace('\\', "/");
+    #[cfg(windows)]
+    let name = name.as_str();
     motor_winagent::validate_archive_path(name)?;
     if !seen.insert(name.to_lowercase()) {
         return Err(invalid(format!("case collision: {name}")));
@@ -602,6 +679,8 @@ pub(super) fn store_collection(
             .to_str()
             .ok_or_else(|| invalid("non-UTF8 collect path"))?
             .to_owned();
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
         if !path.starts_with("m/") {
             return Err(invalid(format!(
                 "collect member is not a source path: {path}"

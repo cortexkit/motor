@@ -149,13 +149,23 @@ impl ExecutionOutcome {
         }
     }
     pub(crate) fn wire(self) -> motor_protocol::Outcome {
+        #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
         match self {
             Self::Unix(status) => status
                 .code()
                 .map(|code| motor_protocol::Outcome::Exit { code })
                 .unwrap_or(motor_protocol::Outcome::Signal {
-                    signal: status.signal().unwrap_or(9),
+                    signal: {
+                        #[cfg(unix)]
+                        {
+                            status.signal().unwrap_or(9)
+                        }
+                        #[cfg(windows)]
+                        {
+                            9
+                        }
+                    },
                 }),
             Self::WindowsExit { code } => windows_outcome(code),
         }
@@ -859,7 +869,7 @@ impl Execution for platform::Launch {
         })
     }
     fn abort(&self) -> io::Result<()> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             // The portable backend has no restart-safe PID signalling. Here
             // the unreaped execution still owns its child and process group.

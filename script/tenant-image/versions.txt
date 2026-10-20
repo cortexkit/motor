@@ -22,7 +22,7 @@
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/motor-net.nft": "b0e1dddc368a7fca09b1c6df87b4c917319eebf75bd14be9ce9dc8193a1eb2bb",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
-    "script/runner/toolchain.json": "2483f3fe1d5f50a7e256c47b459d55d432e6dbf323ff6df48acddf462f43bafa"
+    "script/runner/toolchain.json": "6ffeb61777935c7afa8690cabed87f6a460216fd5a5c932bffbfcd44d12e7889"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",
   "rust_default": "1.99.0",

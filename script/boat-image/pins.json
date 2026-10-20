@@ -13,6 +13,6 @@
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
     "script/runner/toolchain-parity.py": "6583d1a7155dbbb5f9514b46422b1f0a1a5e2da46c46899534b82b410b64584b",
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
-    "script/runner/toolchain.json": "2483f3fe1d5f50a7e256c47b459d55d432e6dbf323ff6df48acddf462f43bafa"
+    "script/runner/toolchain.json": "6ffeb61777935c7afa8690cabed87f6a460216fd5a5c932bffbfcd44d12e7889"
   }
 }

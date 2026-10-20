@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::process::Stdio;
 use std::{
     ffi::OsString,
@@ -163,7 +163,7 @@ pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io:
 
 // The portable backend exists for protocol/in-process tests on the Mac. The
 // production crash-safe process-group launch backend is Linux-only.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io::Result<Launch> {
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::os::unix::process::CommandExt;
@@ -201,6 +201,14 @@ pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io:
         stderr,
         child,
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn launch(_: &str, _: &Path, _: &[(String, String)]) -> io::Result<Launch> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Windows hosts only execute inside Hyper-V",
+    ))
 }
 
 pub(crate) fn unit_alive(process: Option<ProcessIdentity>) -> io::Result<Option<bool>> {
@@ -368,7 +376,7 @@ fn publish_control_file_with(
         return Err(error);
     }
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    crate::filesystem::sync_directory(parent)?;
     Ok(())
 }
 

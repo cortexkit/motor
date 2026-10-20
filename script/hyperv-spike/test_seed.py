@@ -65,6 +65,32 @@ class HyperVSeedTests(unittest.TestCase):
                     seed.stage(target, Path(tmp) / "missing.zip")
             self.assertFalse(target.exists())
 
+    def test_prebuilt_runner_seed_installs_artifacts_not_agent_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / seed.ARCHIVE_NAME
+            archive.write_bytes(b"test archive")
+            agent = root / "agent.exe"
+            runner = root / "runner.exe"
+            agent.write_bytes(b"MZ prebuilt hvsock agent")
+            runner.write_bytes(b"MZ prebuilt peer runner")
+            target = root / "seed"
+            with patch.object(seed, "verify_archive"):
+                seed.stage(target, archive, agent, runner)
+            self.assertEqual((target / "motor-winagent-prebuilt.exe").read_bytes(), agent.read_bytes())
+            self.assertEqual((target / "motor-runner-prebuilt.exe").read_bytes(), runner.read_bytes())
+            self.assertTrue((target / "hyperv-runner").is_file())
+            self.assertFalse((target / "motor-winagent").exists())
+            self.assertFalse((target / "authorized_keys").exists())
+
+    def test_partial_prebuilt_pair_is_refused_before_seed_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "seed"
+            with self.assertRaisesRegex(ValueError, "together"):
+                seed.stage(target, root / "unused.zip", root / "agent.exe")
+            self.assertFalse(target.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

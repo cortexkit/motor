@@ -6,8 +6,12 @@ mod cleanup;
 mod compile_cache;
 mod cpu;
 mod engine;
+mod filesystem;
 #[cfg(target_os = "linux")]
 mod isolation;
+pub mod local_transport;
+#[cfg(windows)]
+mod native_process;
 pub mod network;
 #[cfg(target_os = "linux")]
 mod permissions;
@@ -88,3 +92,25 @@ pub fn windows_prepare(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 pub use motor_protocol::allowed_env;
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_probe_peers() -> std::io::Result<()> {
+    windows::probe_peers()
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_qualify_prep(config: &Config) -> std::io::Result<()> {
+    windows::qualify_prep(config)
+}
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_prep_probe(args: &[String]) -> std::io::Result<()> {
+    windows::prep_probe(args)
+}
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_qualify_disconnect(config: &Config) -> std::io::Result<()> {
+    windows::qualify_disconnect(config)
+}

@@ -1,10 +1,13 @@
+#[cfg(windows)]
+use super::hvsock::Stream as UnixStream;
 use super::*;
 use crate::backend;
 use motor_winagent::{Bounds, Frame, Peer, Phase, Protocol, Stream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
@@ -86,7 +89,7 @@ impl Runtime {
             .cancel
             .store(2, Ordering::Release);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     pub(super) fn setup_aborted(&self, id: Uuid) -> bool {
         self.jobs
             .lock()
@@ -553,6 +556,7 @@ fn materialize_attempt(
     }
     let nonce = Uuid::now_v7().to_string();
     let clock = Clock::new(config);
+    #[cfg(unix)]
     let listener = resources.listen(config)?;
     let agent_path = resources.agent_path();
     let unit_started_ms = clock.now();
@@ -601,6 +605,19 @@ fn materialize_attempt(
                 if let Some(stream) = injected.take() {
                     break stream;
                 }
+                #[cfg(windows)]
+                match resources.connect_agent() {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        tracing::debug!(%error, "Hyper-V agent connect attempt");
+                        std::thread::park_timeout(Duration::from_millis(
+                            motor_winagent::transport::hvsock_retry_pause_ms(
+                                error.raw_os_error().unwrap_or(0),
+                            ),
+                        ));
+                    }
+                }
+                #[cfg(unix)]
                 match listener.as_ref().expect("production VM listener").accept() {
                     Ok((stream, _)) => break stream,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

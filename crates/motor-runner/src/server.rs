@@ -1,5 +1,6 @@
 #[path = "server_activity.rs"]
 mod activity;
+use crate::local_transport::{Listener as UnixListener, Stream as UnixStream};
 use crate::{
     engine::{
         transfer_refusal, transfer_refusal_detail, workspace_setup_detail, Admission, QueueProgress,
@@ -12,7 +13,6 @@ use motor_protocol::*;
 use std::{io, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{UnixListener, UnixStream},
     sync::{mpsc, watch},
 };
 use tracing::Instrument;

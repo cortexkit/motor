@@ -462,6 +462,7 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
         .ok_or_else(|| invalid("record has no parent"))?;
     fs::create_dir_all(parent)?;
     let tmp = path.with_extension("tmp");
+    #[cfg(unix)]
     let mut file = if private {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let file = std::fs::OpenOptions::new()
@@ -476,11 +477,18 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
     } else {
         File::create(&tmp)?
     };
+    #[cfg(windows)]
+    let mut file = {
+        let _ = private;
+        // This directory inherits the installer's SYSTEM/Administrators DACL.
+        File::create(&tmp)?
+    };
     write_json(&mut file, value)?;
     file.flush()?;
     file.sync_all()?;
-    fs::rename(tmp, path)?;
-    File::open(parent)?.sync_all()
+    drop(file);
+    crate::filesystem::rename(&tmp, path)?;
+    crate::filesystem::sync_directory(parent)
 }
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {

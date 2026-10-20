@@ -14,7 +14,6 @@ path = "src/main.rs"
 motor-protocol = { path = "../motor-protocol" }
 motor-winagent = { path = "../motor-winagent" }
 tar = "0.4"
-cortexkit-cow = "=0.1.1"
 base64 = "0.22"
 fs2 = "0.4"
 libc = "0.2"
@@ -26,6 +25,14 @@ tokio = { workspace = true, features = ["fs", "process", "signal"] }
 toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["serde", "v7"] }
+
+[target.'cfg(unix)'.dependencies]
+cortexkit-cow = "=0.1.1"
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["io-std"] }
+windows-service = "0.8.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Authentication_Identity", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Environment", "Win32_System_Pipes", "Win32_System_Power", "Win32_Networking_WinSock", "Win32_System_Hypervisor"] }
 
 [dev-dependencies]
 cortexkit-test-support = "=0.1.10"

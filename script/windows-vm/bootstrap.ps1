@@ -18,7 +18,12 @@ if ($ResumeAfterUpdates) {
     if ($HyperVSpike) { Copy-Item "$($seed.DriveLetter):\hyperv-spike" C:\build\provision -Force }
     if ($JobBaseline) {
         Copy-Item "$($seed.DriveLetter):\PowerShell-7.6.7-win-x64.zip" C:\build\provision -Force
-        Copy-Item "$($seed.DriveLetter):\motor-winagent" C:\build\provision -Recurse -Force
+        if (Test-Path "$($seed.DriveLetter):\hyperv-runner") {
+            Copy-Item "$($seed.DriveLetter):\hyperv-runner" C:\build\provision -Force
+            Copy-Item "$($seed.DriveLetter):\motor-winagent-prebuilt.exe","$($seed.DriveLetter):\motor-runner-prebuilt.exe" C:\build\provision -Force
+        } else {
+            Copy-Item "$($seed.DriveLetter):\motor-winagent" C:\build\provision -Recurse -Force
+        }
     } else {
         Copy-Item "$($seed.DriveLetter):\authorized_keys" C:\build\provision -Force
     }

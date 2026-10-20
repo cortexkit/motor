@@ -1,15 +1,41 @@
 use motor_runner::{serve, Config, Runner};
-use std::{io, io::Read, io::Write, path::PathBuf, time::Instant};
+use std::{io, path::PathBuf};
+#[cfg(unix)]
+use std::{
+    io::{Read, Write},
+    time::Instant,
+};
 
 const DRAIN_TRANSPORT_MARGIN_S: u64 = 20;
 const MAX_DRAIN_TIMEOUT_S: u64 = 86_400;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+#[cfg(windows)]
+mod native_service;
+
+fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "prep-probe") {
+        return motor_runner::hyperv_prep_probe(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "service") {
+        return native_service::dispatch();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Vec<String>) -> io::Result<()> {
     if version_requested(&args) {
         println!("{}", binary_version());
         return Ok(());
+    }
+    #[cfg(windows)]
+    if args == ["probe-peers"] {
+        return motor_runner::hyperv_probe_peers();
     }
     #[cfg(target_os = "linux")]
     if args.first().is_some_and(|arg| arg == "physical-chmod") {
@@ -40,8 +66,11 @@ async fn main() -> io::Result<()> {
     }
     let mut args = args.into_iter();
     let operation = args.next().unwrap_or_else(|| "serve".into());
-    let home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unset"))?);
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| io::Error::other("HOME/USERPROFILE is unset"))?,
+    );
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
@@ -51,6 +80,18 @@ async fn main() -> io::Result<()> {
     config.build_slot_root = data.join("cortexkit/motor-build-slots");
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
+        #[cfg(windows)]
+        "qualify-prep" => {
+            let runner = Runner::open(config)?;
+            motor_runner::hyperv_qualify_prep(runner.config())?;
+            println!("PASS prep-key-read-denied prep-outside-write-denied prep-staging-write-allowed");
+            Ok(())
+        }
+        #[cfg(windows)]
+        "qualify-disconnect" => {
+            let runner = Runner::open(config)?;
+            motor_runner::hyperv_qualify_disconnect(runner.config())
+        }
         "drain" | "resume" => {
             use motor_protocol::*;
             let resume = operation == "resume";
@@ -61,7 +102,7 @@ async fn main() -> io::Result<()> {
                     drain_transport_timeout(drain_timeout_s)
                 },
                 async {
-                    let mut socket = tokio::net::UnixStream::connect(config.socket_path()).await?;
+                    let mut socket = motor_runner::local_transport::connect(&config.socket_path()).await?;
                     write_frame_async(
                         &mut socket,
                         &Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
@@ -125,7 +166,8 @@ async fn main() -> io::Result<()> {
             .await
             .map_err(|_| io::Error::other("drain transport deadline exceeded"))?;
         }
-        "connect" => tokio::task::spawn_blocking(move || -> io::Result<()> {
+        #[cfg(unix)]
+        "connect" | "forward" => tokio::task::spawn_blocking(move || -> io::Result<()> {
             let _ = motor_protocol::logging::init(LOG_PREFIX);
             let started = Instant::now();
             tracing::info!(?job, instance = %config.instance, "runner bridge starting");
@@ -148,12 +190,46 @@ async fn main() -> io::Result<()> {
         })
         .await
         .map_err(io::Error::other)?,
+        #[cfg(windows)]
+        "connect" | "forward" => {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let pipe = motor_runner::local_transport::connect(&config.socket_path()).await?;
+            let (mut read, mut write) = tokio::io::split(pipe);
+            let mut input = tokio::io::stdin();
+            let mut output = tokio::io::stdout();
+            let _ = job;
+            let result = tokio::select! {
+                result = tokio::io::copy(&mut input, &mut write) => result,
+                result = async {
+                    let mut buffer = [0; 16 * 1024];
+                    let mut total = 0;
+                    loop {
+                        let count = read.read(&mut buffer).await?;
+                        if count == 0 { return Ok::<u64, io::Error>(total); }
+                        output.write_all(&buffer[..count]).await?;
+                        output.flush().await?;
+                        total += count as u64;
+                    }
+                } => result,
+            };
+            // Stdin uses a blocking OS read. Exiting also cancels that read when
+            // sshd closes the channel, rather than retaining a bridge process.
+            if let Err(error) = result { if error.kind() != io::ErrorKind::BrokenPipe { return Err(error); } }
+            std::process::exit(0)
+        }
         "serve" => {
             // Without a subscriber every tracing event the runner reports (dispatch
             // and persistence failures among them) is silently discarded. Route
             // them to stderr, which the systemd user unit sends to the journal.
+            #[cfg(unix)]
             if let Err(error) = motor_protocol::logging::init(LOG_PREFIX) {
                 eprintln!("{LOG_PREFIX} logging unavailable: {error}");
+            }
+            #[cfg(windows)]
+            {
+                let path = config.state_root.parent().ok_or_else(|| io::Error::other("native state root has no parent"))?.join("evidence/runner.log");
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                motor_protocol::logging::init_with_writer(LOG_PREFIX, file).map_err(io::Error::other)?;
             }
             // A tenant runner is root inside its own VM; its privileged helpers
             // run directly, starting with the ones Runner::open itself needs.
@@ -162,6 +238,8 @@ async fn main() -> io::Result<()> {
                 motor_runner::run_helpers_directly_as_root()?;
             }
             let runner = Runner::open(config)?;
+            #[cfg(windows)]
+            native_service::watch_power_and_stop(runner.clone())?;
             #[cfg(unix)]
             {
                 let mut signal =
@@ -181,12 +259,19 @@ async fn main() -> io::Result<()> {
                 });
             }
             let socket = runner.config().socket_path();
+            #[cfg(unix)]
+            let listener = {
             if socket.exists() {
                 std::fs::remove_file(&socket)?;
             }
             let listener = tokio::net::UnixListener::bind(&socket)?;
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            listener
+            };
+            #[cfg(windows)]
+            let listener = motor_runner::local_transport::Listener::bind(&socket,
+                std::fs::read_to_string(runner.config().state_root.parent().unwrap().join("ssh-sid.txt"))?.trim().to_owned())?;
             tracing::info!(
                 instance = %runner.config().instance,
                 socket = %socket.display(),
@@ -209,7 +294,10 @@ async fn main() -> io::Result<()> {
             serve(runner, listener).await?;
             // A bounded drain must not wait indefinitely for a filesystem task
             // on Tokio's blocking pool while the runtime is being destroyed.
-            std::process::exit(0)
+            #[cfg(unix)]
+            std::process::exit(0);
+            #[cfg(windows)]
+            Ok(())
         }
         _ => Err(io::Error::other(
               "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm] [--tenant-vm] [--vm-config FILE]",
@@ -367,6 +455,7 @@ fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {
     std::time::Duration::from_secs(deadline_s.min(MAX_DRAIN_TIMEOUT_S) + DRAIN_TRANSPORT_MARGIN_S)
 }
 
+#[cfg(unix)]
 fn forward_output(
     read: &mut impl Read,
     write: &mut impl Write,

@@ -6,10 +6,12 @@ license = "MIT"
 description = "Bounded wire protocol for Motor's Windows job agent"
 
 [features]
-# Disposable Hyper-V experiment only; the production virtio agent stays the default.
+# Hyper-V COM transport and diagnostics; the default agent stays on virtio.
 hyperv-spike = []
 # Hyper-V experiment over a Hyper-V socket instead of the emulated COM port.
 hyperv-hvsock = ["hyperv-spike"]
+# Hyper-V runner profile: hvsock plus a small read-only per-job nonce DVD.
+hyperv-runner = ["hyperv-hvsock"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
