@@ -394,8 +394,10 @@ impl Backend for HostBackend {
         let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && path.exists() {
-            crate::isolation::restore_runner_access(&path)
-                .map_err(|error| io::Error::other(format!("restore workspace access: {error}")))?;
+            crate::setup_log::phase("restore workspace access", || {
+                crate::isolation::restore_runner_access(&path)
+            })
+            .map_err(|error| io::Error::other(format!("restore workspace access: {error}")))?;
             if path.is_dir() {
                 crate::isolation::restore_runner_checkout_root(&path).map_err(|error| {
                     io::Error::other(format!("restore workspace root ownership: {error}"))
@@ -464,18 +466,23 @@ impl Backend for HostBackend {
             });
             setup_step(
                 "populate workspace",
-                trees.populate(
-                    &r.workspace_key,
-                    &r.repository_root,
-                    &r.snapshot_commit,
-                    &r.siblings,
-                    &s.recorded,
-                    &r.tree_hash,
-                    &caller_commit,
-                ),
+                crate::setup_log::phase("populate workspace", || {
+                    trees.populate(
+                        &r.workspace_key,
+                        &r.repository_root,
+                        &r.snapshot_commit,
+                        &r.siblings,
+                        &s.recorded,
+                        &r.tree_hash,
+                        &caller_commit,
+                    )
+                }),
             )?;
         }
-        let computed = setup_step("verify workspace tree", trees.tree_hash(&path))?;
+        let computed = setup_step(
+            "verify workspace tree",
+            crate::setup_log::phase("verify workspace tree", || trees.tree_hash(&path)),
+        )?;
         if computed != r.tree_hash {
             return Err(Trees::tree_hash_mismatch(&path, &r.tree_hash, &computed));
         }
@@ -534,12 +541,14 @@ impl Backend for HostBackend {
             };
             setup_step(
                 "build compiler-slot wrapper",
-                platform::build_wrapper(
-                    &source,
-                    &wrapper,
-                    &config.build_slot_root,
-                    config.rustc_slots,
-                ),
+                crate::setup_log::phase("build compiler supervisor", || {
+                    platform::build_wrapper(
+                        &source,
+                        &wrapper,
+                        &config.build_slot_root,
+                        config.rustc_slots,
+                    )
+                }),
             )?;
             Some(wrapper)
         } else {
@@ -570,66 +579,69 @@ impl Backend for HostBackend {
             trees.refresh_dependency_aliases(&lockfile, &routes)?;
             let sandbox = setup_step(
                 "prepare isolated job sandbox",
-                if s.base {
-                    crate::isolation::Sandbox::prepare_writer(
-                        s.id,
-                        &trees.state,
-                        &path,
-                        &target,
-                        wrapper.as_deref(),
-                        &config.build_slot_root,
-                        config.rustc_slots,
-                        &routes,
-                        &r.tree_hash,
-                    )
-                } else {
-                    crate::isolation::Sandbox::prepare_with_dependencies(
-                        s.id,
-                        &trees.state,
-                        &path,
-                        &target,
-                        &r.siblings,
-                        wrapper.as_deref(),
-                        &config.build_slot_root,
-                        config.rustc_slots,
-                        &routes,
-                        &r.tree_hash,
-                        &r.repository_root,
-                    )
-                }
-                // When a job ends, the engine checks whether systemd stopped its
-                // unit for exceeding the memory limit (Result=oom-kill), then
-                // resets the unit so systemd unloads it. Keep it loaded until then.
-                .map(|sandbox| {
-                    #[cfg(test)]
-                    let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
-                    sandbox
-                        .retaining_failed_units()
-                        .in_tenant_vm(config.tenant_vm)
-                        .with_boat_profile(
-                            config.boat_profile,
-                            config.private_pids,
-                            config.boat_memory_max_bytes,
+                crate::setup_log::phase("prepare isolated sandbox", || {
+                    if s.base {
+                        crate::isolation::Sandbox::prepare_writer(
+                            s.id,
+                            &trees.state,
+                            &path,
+                            &target,
+                            wrapper.as_deref(),
+                            &config.build_slot_root,
+                            config.rustc_slots,
+                            &routes,
+                            &r.tree_hash,
                         )
-                        .without_provider_environment(&config.boat_unset_environment)
-                })
-                .and_then(|sandbox| {
-                    #[cfg(test)]
-                    if config.job_network_hook.is_some() {
-                        return Ok(sandbox);
-                    }
-                    if r.network == Some(Network::Outbound) {
-                        sandbox.with_network()
                     } else {
-                        Ok(sandbox)
+                        crate::isolation::Sandbox::prepare_with_dependencies(
+                            s.id,
+                            &trees.state,
+                            &path,
+                            &target,
+                            &r.siblings,
+                            wrapper.as_deref(),
+                            &config.build_slot_root,
+                            config.rustc_slots,
+                            &routes,
+                            &r.tree_hash,
+                            &r.repository_root,
+                            config.tenant_vm,
+                        )
                     }
-                })
-                .map_err(|e| {
-                    if missing.is_empty() {
-                        e
-                    } else {
-                        invalid(format!("{e}; {}", missing.join("; ")))
-                    }
+                    // When a job ends, the engine checks whether systemd stopped its
+                    // unit for exceeding the memory limit (Result=oom-kill), then
+                    // resets the unit so systemd unloads it. Keep it loaded until then.
+                    .map(|sandbox| {
+                        #[cfg(test)]
+                        let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
+                        sandbox
+                            .retaining_failed_units()
+                            .in_tenant_vm(config.tenant_vm)
+                            .with_boat_profile(
+                                config.boat_profile,
+                                config.private_pids,
+                                config.boat_memory_max_bytes,
+                            )
+                            .without_provider_environment(&config.boat_unset_environment)
+                    })
+                    .and_then(|sandbox| {
+                        #[cfg(test)]
+                        if config.job_network_hook.is_some() {
+                            return Ok(sandbox);
+                        }
+                        if r.network == Some(Network::Outbound) {
+                            sandbox.with_network()
+                        } else {
+                            Ok(sandbox)
+                        }
+                    })
+                    .map_err(|e| {
+                        if missing.is_empty() {
+                            e
+                        } else {
+                            invalid(format!("{e}; {}", missing.join("; ")))
+                        }
+                    })
                 }),
             )?;
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());

@@ -655,6 +655,7 @@ struct SlowSuspend {
     released: std::sync::Condvar,
     suspended: std::sync::atomic::AtomicBool,
     quota_writes: Mutex<Vec<(String, u32)>>,
+    probes_while_suspended: std::sync::atomic::AtomicUsize,
 }
 impl SlowSuspend {
     fn release(&self) {
@@ -664,6 +665,10 @@ impl SlowSuspend {
 }
 impl Control for SlowSuspend {
     fn adopt(&self, tenant: &str) -> Result<bool> {
+        if tenant == "tenant" && self.suspended.load(std::sync::atomic::Ordering::SeqCst) {
+            self.probes_while_suspended
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.inner.adopt(tenant)
     }
     fn wake(&self, tenant: &str, generation: Option<u64>) -> Result<u64> {
@@ -702,6 +707,45 @@ impl Control for SlowSuspend {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_publication_does_not_queue_helper_probes_behind_suspend() {
+    let mut host = host();
+    let now = unix_ms();
+    host.start_billing(now).unwrap();
+    host.guest_ready("tenant", 1).unwrap();
+    host.event("tenant", &event(1, TenantEventKind::Idle, None, None), now)
+        .unwrap();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let control = Arc::new(SlowSuspend {
+        entered: Mutex::new(Some(entered)),
+        ..Default::default()
+    });
+    let _release_on_failure = ReleaseSuspend(control.clone());
+    let runtime = Runtime::new("host".into(), host, control.clone());
+    runtime.tick(now).unwrap();
+    let ticker = runtime.clone();
+    let tick = tokio::task::spawn_blocking(move || ticker.tick(now + 60_001));
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut heartbeat = motor_host::broker::Heartbeats::new(runtime.clone());
+    heartbeat.step(now + 60_002).unwrap();
+    assert_eq!(
+        control
+            .probes_while_suspended
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(runtime.host.lock().unwrap().is_ready("tenant"));
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.last_alive,
+        now + 60_002
+    );
+    control.release();
+    tick.await.unwrap().unwrap();
+    assert!(!runtime.host.lock().unwrap().is_ready("tenant"));
 }
 // Unblock a failed test before Tokio waits for its blocking tasks at shutdown.
 struct ReleaseSuspend(Arc<SlowSuspend>);
@@ -943,6 +987,15 @@ async fn host_settled_attach_replays_identically_without_waking_or_relaying_vm()
 #[tokio::test]
 async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_terminal_and_usage()
 {
+    terminal_delivery_with_optional_guest_input_close(false).await;
+}
+
+#[tokio::test]
+async fn guest_input_close_after_terminal_does_not_cancel_client_billing_drain() {
+    terminal_delivery_with_optional_guest_input_close(true).await;
+}
+
+async fn terminal_delivery_with_optional_guest_input_close(close_input: bool) {
     let (runtime, fake, broker, requester, c) = fixture();
     let (mut client, server) = tokio::io::duplex(8192);
     let task = tokio::spawn(serve(runtime.clone(), server));
@@ -994,6 +1047,30 @@ async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_t
     }
     let terminal = json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":7},"wall_ms":3000,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null});
     write_json(&mut guest, &terminal).unwrap();
+    if close_input {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .host
+                    .lock()
+                    .unwrap()
+                    .snapshot
+                    .billing
+                    .get(JOB)
+                    .is_some_and(|b| b.terminal.is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        guest.shutdown(std::net::Shutdown::Read).unwrap();
+        write_frame(&mut client, &json!({"type":"heartbeat"}))
+            .await
+            .unwrap();
+    }
     // Hold the job-relay result until its lifecycle terminal event arrives,
     // or until the 30-second wait for that event expires.
     assert!(tokio::time::timeout(
@@ -1002,6 +1079,10 @@ async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_t
     )
     .await
     .is_err());
+    assert!(
+        !task.is_finished(),
+        "same connection must retain the terminal drain"
+    );
     assert!(runtime.host.lock().unwrap().snapshot.outbox.is_empty());
     runtime
         .host

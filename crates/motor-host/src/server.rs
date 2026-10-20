@@ -379,7 +379,7 @@ impl Runtime {
         self.start_events(tenant.to_owned());
         Ok(())
     }
-    fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
+    pub(crate) fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
         self.tenant_operations
             .get(tenant)
             .cloned()
@@ -518,6 +518,11 @@ impl Runtime {
                         }
                         ensure!(frame["type"] == "event", "invalid lifecycle frame");
                         let event: motor_protocol::TenantEvent = serde_json::from_value(frame)?;
+                        if let Some(phase) = &event.setup {
+                            tracing::info!(tenant, jti = ?event.jti, phase = phase.phase,
+                                finished = phase.finished, elapsed_ms = phase.elapsed_ms,
+                                replay = !observation.is_live(event.event_seq), "tenant_setup_phase");
+                        }
                         let metrics = runtime.control.metrics(&tenant).ok();
                         let update = {
                             let mut host = runtime.host.lock().expect("host lock");
@@ -752,7 +757,7 @@ impl Runtime {
         ensure!(
             matches!(
                 request["op"].as_str(),
-                Some("drain" | "resume" | "cancel" | "status")
+                Some("drain" | "resume" | "cancel" | "status" | "diagnostics")
             ),
             "invalid admin operation"
         );
@@ -1070,6 +1075,9 @@ where
         guest.write_all(&buffered).await.at(Side::Guest, "relay_start")?;
         let (mut cr, mut cw) = tokio::io::split(client);
         let (mut gr, mut gw) = guest.split();
+        // This connection owns the reverse drain after decoding Terminal or
+        // selecting host-settled final frames; ownership is not client delivery.
+        let draining_terminal = AtomicBool::new(false);
         // Copy by hand rather than with tokio::io::copy, so a failure says
         // whether reading the client or writing the guest failed.
         let to_guest = async {
@@ -1080,7 +1088,18 @@ where
                     tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
                     return Ok::<(), anyhow::Error>(());
                 }
-                gw.write_all(&buffer[..n]).await.at(Side::Guest, "relay")?;
+                if draining_terminal.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let Err(error) = gw.write_all(&buffer[..n]).await {
+                    if draining_terminal.load(Ordering::Acquire)
+                        && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected)
+                    {
+                        tracing::debug!(jti = claims.jti, side = "guest", step = "relay", cause = %error, "guest_input_closed_during_terminal_drain");
+                        continue;
+                    }
+                    return Err(error).at(Side::Guest, "relay");
+                }
             }
         };
         let to_client = async {
@@ -1094,6 +1113,7 @@ where
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                             if let Some(frames) = frames {
+                                draining_terminal.store(true, Ordering::Release);
                                 for frame in frames { write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
                                 runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
                                 break None;
@@ -1104,6 +1124,7 @@ where
                 let Some(frame) = frame else { return Ok::<(),anyhow::Error>(()); };
                 let settled = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                 if let Some(frames) = settled {
+                    draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
                     for frame in frames { write_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
                     runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
@@ -1119,6 +1140,10 @@ where
                     cursor = cursor.max(seq);
                 }
                 if frame["type"] == "terminal" {
+                    // The guest may close its input as soon as it emits Terminal.
+                    // Client heartbeats must not cancel Terminal/hosted_terminal
+                    // forwarding while this connection waits for billing.
+                    draining_terminal.store(true, Ordering::Release);
                     if runtime.sandbox_identity.is_some() {
                         write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
                         return Ok::<(),anyhow::Error>(());
@@ -1139,6 +1164,7 @@ where
                     write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
                     write_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
                     runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
+                    tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
                     return Ok::<(),anyhow::Error>(());
                 }
                 write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;

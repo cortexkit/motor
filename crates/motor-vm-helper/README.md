@@ -65,19 +65,31 @@ unmount, `xfs_repair -n`, remount, then Git integrity checks before runner start
 durably removing the host flag. Failure leaves it set. Clean starts are unchanged.
 
 The host's `motor_tenant` nftables table is independent of the guest's per-job
-`motor_net` table. It drops tenant traffic to the host, other tenants' taps,
-private/reserved IPv4 destinations, all IPv6 and unsolicited inbound traffic.
-Each drop rule counts blocked packets and bytes. Public egress is masqueraded
-per tenant. `set_egress` installs this fixed policy; callers
-cannot pass firewall rules or paths. Per-job network policy stays in the guest.
-Each tenant has its own input, forward and NAT chains and a named
-`tenant_mtap<N>_egress` counter referenced only by its public forward rule.
-Reconciliation compares the registry with existing nftables objects, including
-at helper startup. One atomic transaction adds new tenant objects or removes
-only objects for tenants whose registries were removed. Existing live counters
-and other tenants' chains are never flushed or recreated. Incomplete live object
-sets are refused rather than reset; stopping or suspending a VM does not disable
-its registered tenant or delete its cumulative counter.
+`motor_net` table. On a shared build server it also cooperates with the host's
+`motor_net`: only an exact helper-maintained `tenant_taps` set escapes that
+table's unrelated-forwarding drop. The versioned set is persisted empty; the
+helper and installed loader serialize runtime delegation with a private network
+lock. No wildcard TAP allowance bypasses the build-server job rules.
+
+The tenant policy explicitly accepts validated public IPv4 egress and established
+return traffic, then drops unmatched TAP traffic. Host/private/other-tenant,
+IPv6, spoofed-source and unsolicited inbound traffic are denied. Unknown TAPs
+and a `closed_taps` gate fail closed. The helper maintains only comment-owned,
+exact-TAP/source IPv4 UFW route grants to the existing uplink; it adds no reverse
+inbound grant and does not change foreign UFW rules. Restrictive nft policy is
+installed before those grants, and an error keeps the affected registered TAPs
+closed and unready. Install the updated host network tooling and run its
+`--check` as root; a legacy or incomplete policy is not silently delegated.
+During install-order upgrades, `--apply` can leave tenants explicitly `FENCED`
+while installing the base policy. Only a successful `--check` after helper
+reconciliation confirms the complete forwarding path.
+
+Each tenant retains a named `tenant_mtap<N>_egress` counter referenced only by
+its public forward rule. Rule chains may be rebuilt atomically for policy
+upgrades, but live named counters are never recreated. Registry removal deletes
+only that tenant's objects and owned route grant; stop/suspend retains its
+registration and cumulative counter. Per-job network policy stays in the guest.
+Callers of `set_egress` cannot pass firewall rules, interfaces or paths.
 
 The optional root-managed registry flag `capture_console` defaults to false.
 When true, tenant VMM stdout appends to the fixed `console.log` beside that

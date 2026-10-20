@@ -153,8 +153,8 @@ async fn main() -> Result<()> {
     });
     let ticker = runtime.clone();
     std::thread::spawn(move || loop {
-        if ticker.tick(unix_ms()).is_err() {
-            tracing::error!("host_tick_failed");
+        if let Err(error) = ticker.tick(unix_ms()) {
+            log_tick_failure(&error);
         }
         std::thread::sleep(Duration::from_millis(100));
     });
@@ -265,4 +265,38 @@ fn show_enrollment(args: Vec<String>) -> Result<()> {
     )?;
     print!("{}", enrollment.render());
     Ok(())
+}
+
+fn log_tick_failure(error: &anyhow::Error) {
+    tracing::error!(detail = %format!("{error:#}"), "host_tick_failed");
+}
+
+#[cfg(test)]
+mod tick_logging_tests {
+    use super::*;
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn tick_failure_log_contains_operation_context_and_root_cause() {
+        let logs = Logs::default();
+        let subscriber = motor_protocol::logging::LineSubscriber::new("[host]", logs.clone());
+        let error = anyhow::anyhow!("snapshot memory write timed out").context("suspend tenant-a");
+        tracing::subscriber::with_default(subscriber, || log_tick_failure(&error));
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("host_tick_failed"), "{output}");
+        assert!(output.contains("suspend tenant-a"), "{output}");
+        assert!(
+            output.contains("snapshot memory write timed out"),
+            "{output}"
+        );
+    }
 }

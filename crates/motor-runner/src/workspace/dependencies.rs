@@ -272,8 +272,11 @@ pub(crate) fn fetch_command(
     }
     cmd.env("CARGO_HOME", cargo)
         .env("RUSTUP_HOME", rustup)
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+        // Empty overrides also disable wrappers configured in CARGO_HOME. Merely
+        // unsetting these variables lets Cargo resurrect the shared sccache.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "");
     configure_fetch_git(&mut cmd, &empty_home, routes)?;
     Ok(cmd)
 }

@@ -117,6 +117,11 @@ written before `hosted_terminal`. Usage is enqueued after that write or after a
 60-second delivery grace. Detached results are retrieved through a host-only
 attach, never by resubmitting Run. Different broker settlement figures and final
 409 replies log `usage_billing_diverged` without changing the caller's figure.
+Once a connection owns a decoded Terminal or host-settled final records, later
+client bytes are no longer forwarded into the guest. An in-flight closed guest
+input write during that drain is a debug event, not a reason to cancel billing
+and final delivery. Pre-terminal relay failures remain errors. A terminal stored
+for the job is not proof that a particular client connection received its finals.
 
 One broker sender signs heartbeats every 15 seconds and on lifecycle change, and
 drains the durable usage outbox. Its counter is fsynced before signing, seeded at
@@ -161,9 +166,28 @@ idleness and preserves new activity; a successful snapshot clears VM readiness,
 so a later connection restores it. Async connection cleanup runs in the blocking
 pool rather than issuing helper calls from a destructor on a runtime thread.
 
+The helper's suspend reply has a separate **600-second** bound because writing
+guest memory and its durable snapshot record can take minutes. Ordinary helper
+replies and control writes retain their 60-second bounds. The reply budget also
+limits continuation reads, so a partial response cannot restart the full wait.
+Helper failures log operation, tenant, budget and elapsed time; `host_tick_failed`
+includes the error chain. Heartbeat publication skips busy/suspending tenant
+operations instead of queueing an adopt behind a long snapshot or interpreting
+the paused VM as lost. A skipped probe retains prior health rather than claiming
+an unverified recovery.
+
+New leases retain the typed retryable `capacity` refusal during suspension.
+The current first-party TLS connector budgets 60 seconds for authentication and
+runner hello, so waiting through a large snapshot can outlast the client even
+when the token's admission window is longer. Host-only deployment therefore does
+not promise that wait; callers retry once the snapshot completes. A portable
+slow-suspend test verifies the refusal and that a later connection restores the
+tenant, while other tenants can still admit and close connections.
+
 The mode-0600 admin socket uses four-byte big-endian length-prefixed JSON. A
 request combines `tenant` with one guest control operation: `drain` with
-`deadline_s` and `exit_after`, `resume`, `cancel` with `job_id`, or `status`. Only
+`deadline_s` and `exit_after`, `resume`, `cancel` with `job_id`, `status`, or
+`diagnostics` with an optional fixed HTTPS probe. Only
 those typed requests are forwarded on port 54; none is accepted on the TLS job
 path by the host admin service.
 

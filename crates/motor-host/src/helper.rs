@@ -32,33 +32,88 @@ pub struct Helper {
 }
 impl Helper {
     fn request(&self, request: Value) -> Result<(Value, Vec<OwnedFd>)> {
-        let mut stream = UnixStream::connect(&self.socket)?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-        let bytes = serde_json::to_vec(&request)?;
-        tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], "helper_request");
-        ensure!(bytes.len() < 4096, "helper request too large");
-        stream.write_all(&bytes)?;
-        stream.write_all(b"\n")?;
-        let (mut bytes, fds) = receive(&stream)?;
-        while !bytes.contains(&b'\n') {
-            ensure!(bytes.len() < 4096, "helper response too large");
-            let mut buffer = [0; 512];
-            let n = stream.read(&mut buffer)?;
-            ensure!(n > 0, "helper response closed");
-            bytes.extend_from_slice(&buffer[..n]);
+        let started = std::time::Instant::now();
+        let deadline = helper_reply_deadline(&request);
+        tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
+        let result = UnixStream::connect(&self.socket)
+            .map_err(anyhow::Error::from)
+            .and_then(|stream| exchange_helper(stream, &request))
+            .with_context(|| {
+                format!(
+                    "helper {} tenant {} reply timeout={}ms elapsed={}ms",
+                    request["op"],
+                    request["tenant"],
+                    deadline.as_millis(),
+                    started.elapsed().as_millis()
+                )
+            });
+        match &result {
+            Ok((reply, _)) => {
+                tracing::info!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], elapsed_ms = started.elapsed().as_millis() as u64, "helper_reply")
+            }
+            Err(error) => {
+                tracing::warn!(op = %request["op"], tenant = %request["tenant"], detail = %format!("{error:#}"), "helper_request_failed")
+            }
         }
-        let reply: Value = serde_json::from_slice(&bytes)?;
-        tracing::info!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], "helper_reply");
-        ensure!(
-            reply["result"] != "error",
-            "helper refused {}: {}",
-            request["op"],
-            reply["message"]
-        );
-        Ok((reply, fds))
+        result
     }
 }
+
+const ORDINARY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Suspend writes a complete guest-memory image and its durable snapshot record.
+/// Give that storage-heavy operation a separate ten-minute reply budget without
+/// weakening short control writes or waiting indefinitely for a stuck helper.
+const SUSPEND_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn helper_reply_deadline(request: &Value) -> Duration {
+    if request["op"] == "suspend" {
+        SUSPEND_HELPER_REPLY_TIMEOUT
+    } else {
+        ORDINARY_HELPER_TIMEOUT
+    }
+}
+
+fn exchange_helper(stream: UnixStream, request: &Value) -> Result<(Value, Vec<OwnedFd>)> {
+    exchange_helper_with_deadline(stream, request, helper_reply_deadline(request))
+}
+
+fn exchange_helper_with_deadline(
+    mut stream: UnixStream,
+    request: &Value,
+    deadline: Duration,
+) -> Result<(Value, Vec<OwnedFd>)> {
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(ORDINARY_HELPER_TIMEOUT))?;
+    let bytes = serde_json::to_vec(request)?;
+    ensure!(bytes.len() < 4096, "helper request too large");
+    stream.write_all(&bytes).context("write helper request")?;
+    stream
+        .write_all(b"\n")
+        .context("write helper request boundary")?;
+    let started = std::time::Instant::now();
+    let (mut bytes, fds) = receive(&stream).context("read helper reply")?;
+    while !bytes.contains(&b'\n') {
+        ensure!(bytes.len() < 4096, "helper response too large");
+        let remaining = deadline.saturating_sub(started.elapsed());
+        ensure!(!remaining.is_zero(), "helper reply deadline exceeded");
+        stream.set_read_timeout(Some(remaining))?;
+        let mut buffer = [0; 512];
+        let n = stream
+            .read(&mut buffer)
+            .context("read helper reply continuation")?;
+        ensure!(n > 0, "helper response closed");
+        bytes.extend_from_slice(&buffer[..n]);
+    }
+    let reply: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        reply["result"] != "error",
+        "helper refused {}: {}",
+        request["op"],
+        reply["message"]
+    );
+    Ok((reply, fds))
+}
+
 impl Control for Helper {
     fn metrics(&self, tenant: &str) -> Result<crate::billing::Metrics> {
         let (reply, _) = self.request(json!({"op":"tenant_metrics", "tenant":tenant}))?;
@@ -317,5 +372,77 @@ fn available_bytes(path: &Path) -> Result<u64> {
         (stat.f_bavail as u64)
             .checked_mul(stat.f_frsize as u64)
             .ok_or_else(|| anyhow!("free-space overflow"))
+    }
+}
+
+#[cfg(test)]
+mod helper_deadline_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    const REPLY: &[u8] =
+        b"{\"result\":\"tenant\",\"running\":false,\"restored\":false,\"generation\":7}\n";
+
+    #[test]
+    fn suspend_reply_budget_is_applied_to_the_actual_helper_socket_only() {
+        for (op, expected) in [
+            ("suspend", 600),
+            ("adopt", 60),
+            ("tenant_metrics", 60),
+            ("ensure", 60),
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let observer = client.try_clone().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = json!({"op":op,"tenant":"tenant-a"});
+            let worker = std::thread::spawn(move || exchange_helper(client, &request));
+            let mut line = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let read = observer.read_timeout().unwrap();
+            let write = observer.write_timeout().unwrap();
+            server.write_all(REPLY).unwrap();
+            let (reply, fds) = worker.join().unwrap().unwrap();
+            assert_eq!(read, Some(Duration::from_secs(expected)), "{op}");
+            assert_eq!(
+                write,
+                Some(Duration::from_secs(60)),
+                "control writes remain bounded"
+            );
+            assert_eq!(reply["generation"], 7);
+            assert!(fds.is_empty());
+        }
+    }
+
+    #[test]
+    fn delayed_suspend_reply_survives_a_scaled_ordinary_request_budget() {
+        let ordinary = Duration::from_millis(20);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            server.write_all(REPLY).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let (reply, fds) = exchange_helper_with_deadline(
+            client,
+            &json!({"op":"suspend","tenant":"tenant-a"}),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(started.elapsed() > ordinary);
+        assert_eq!(reply["result"], "tenant");
+        assert_eq!(reply["running"], false);
+        assert!(fds.is_empty());
     }
 }

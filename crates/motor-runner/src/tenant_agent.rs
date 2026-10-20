@@ -12,6 +12,9 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod diagnostics;
+mod dns;
+mod network;
 mod paths;
 mod runner_socket;
 mod snapshot;
@@ -125,6 +128,7 @@ async fn dispatch(
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
         TenantAgentRequest::Status => forward(Frame::Status).await,
+        TenantAgentRequest::Diagnostics { https } => diagnostics::collect(https).await,
         TenantAgentRequest::PrepareSnapshot { kind } => {
             let _guard = attach.lock().await;
             snapshot::prepare(kind).await
@@ -426,12 +430,10 @@ fn validate_identity(
 
 /// The VM's own name-service files once it takes the tenant's host name.
 ///
-/// The VM's root namespace has no route to a public DNS server: only `net`
-/// jobs reach the internet, and each gets its own resolv.conf inside its own
-/// namespace. So the attach request's resolvers are not written here; a
-/// nameserver the VM cannot reach makes every lookup that misses /etc/hosts
-/// wait out resolver timeouts. sudo, for one, looks up the machine's host name,
-/// so /etc/hosts must map the new name or each privileged helper stalls.
+/// Attach configures a VM-root default route, but that does not prove DNS is
+/// reachable during boot or setup. Keep global name service local: the daemon
+/// gets a private resolver mount and `net` jobs get their own resolver binding.
+/// Keep a local hosts entry for the tenant hostname.
 fn root_name_service_files(hostname: &str) -> [(&'static str, String); 2] {
     [
         ("/etc/resolv.conf", String::new()),
@@ -476,6 +478,7 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     for (path, contents) in root_name_service_files(&hostname) {
         fs::write(path, contents)?;
     }
+    dns::install(Path::new(dns::DIRECTORY), &resolvers, 0)?;
     command("hostname", &[&hostname])?;
     fs::write("/etc/hostname", format!("{hostname}\n"))?;
     fs::write("/etc/machine-id", format!("{machine_id}\n"))?;
@@ -688,22 +691,15 @@ fn reflink_probe(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
-    let mut cmd = Command::new("systemd-run");
-    cmd.args([
-        "--unit=motor-tenant-runner",
-        "--collect",
-        "--service-type=exec",
-        "--setenv=CARGO_HOME=/tenant/cargo-home",
-    ]);
-    for name in ["RUSTUP_HOME", "HOME", "PATH"] {
-        let value = std::env::var(name).map_err(io::Error::other)?;
-        cmd.arg(format!("--setenv={name}={value}"));
-    }
-    let status = cmd
-        .arg(std::env::current_exe()?)
-        .args(["serve", "--state-root", "/tenant/state"])
-        .args(&args.words)
-        .output()?;
+    let environment = ["RUSTUP_HOME", "HOME", "PATH"]
+        .into_iter()
+        .map(|name| {
+            std::env::var(name)
+                .map(|value| (name.to_owned(), value))
+                .map_err(io::Error::other)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let status = runner_command(args, &std::env::current_exe()?, &environment).output()?;
     if !status.status.success() {
         return Err(io::Error::other(format!(
             "tenant runner start failed: {}",
@@ -715,6 +711,29 @@ fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
         motor_protocol::TENANT_RUNNER_READINESS_WAIT,
         runner_socket::main_pid,
     )
+}
+
+fn runner_command(
+    args: &RunnerArgs,
+    executable: &Path,
+    environment: &[(String, String)],
+) -> Command {
+    let mut cmd = Command::new("systemd-run");
+    cmd.args([
+        "--unit=motor-tenant-runner",
+        "--collect",
+        "--service-type=exec",
+        "--setenv=CARGO_HOME=/tenant/cargo-home",
+        "--property=PrivateMounts=yes",
+        "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
+    ]);
+    for (name, value) in environment {
+        cmd.arg(format!("--setenv={name}={value}"));
+    }
+    cmd.arg(executable)
+        .args(["serve", "--state-root", "/tenant/state"])
+        .args(&args.words);
+    cmd
 }
 
 #[cfg(test)]
@@ -751,6 +770,27 @@ mod tests {
     }
 
     const TEST_ARGS: &str = "--backend host --tenant-vm --job-network veth --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
+
+    #[test]
+    fn daemon_start_binds_private_dns_and_persistent_cargo_home() {
+        let args = RunnerArgs::parse(TEST_ARGS).unwrap();
+        let command = runner_command(&args, Path::new("/usr/local/bin/motor-runner"), &[]);
+        let words: Vec<_> = command
+            .get_args()
+            .map(|word| word.to_str().unwrap())
+            .collect();
+        assert!(words.contains(&"--property=PrivateMounts=yes"));
+        assert!(words.contains(
+            &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
+        ));
+        assert!(words.contains(&"--setenv=CARGO_HOME=/tenant/cargo-home"));
+        assert!(!words
+            .iter()
+            .any(|word| word.contains("PrivateNetwork=yes") || word.contains("JoinsNamespaceOf")));
+        assert!(words
+            .windows(3)
+            .any(|words| words == ["serve", "--state-root", "/tenant/state"]));
+    }
 
     #[test]
     fn args_status_uses_tenant_file_values() {
@@ -833,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_keeps_resolvers_out_of_the_vm_and_maps_its_host_name_locally() {
+    fn attach_keeps_global_vm_resolver_empty_and_maps_its_host_name_locally() {
         let files = root_name_service_files("tenant-a");
         let resolv = &files
             .iter()

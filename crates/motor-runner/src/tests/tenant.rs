@@ -636,8 +636,15 @@ async fn tenant_second_run_after_started_detaches_but_original_finishes() {
     let terminal = terminal(&runner, id).await;
     assert!(matches!(terminal.outcome, Outcome::Exit { code: 0 }));
     let events = pending(&runner);
+    assert!(events
+        .iter()
+        .any(|e| e.event == TenantEventKind::SetupPhase && e.setup.is_some()));
     assert_eq!(
-        events.iter().map(|e| e.event).collect::<Vec<_>>(),
+        events
+            .iter()
+            .map(|e| e.event)
+            .filter(|e| *e != TenantEventKind::SetupPhase)
+            .collect::<Vec<_>>(),
         [
             TenantEventKind::Admitted,
             TenantEventKind::Started,

@@ -389,6 +389,9 @@ impl Host {
             return refuse(Refusal::Expired);
         }
         if self.is_suspending(&tenant.tenant) {
+            // The current first-party TLS connector budgets 60 seconds for admission and
+            // runner hello. A memory snapshot can outlast that entire budget;
+            // retain a typed retryable refusal instead of a silent client timeout.
             return refuse(Refusal::Capacity);
         }
         let old = self.snapshot.leases.get(&claims.jti).cloned();

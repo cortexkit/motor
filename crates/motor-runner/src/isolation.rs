@@ -18,6 +18,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod cargo_fetch;
 mod hosts;
 mod readable;
 
@@ -1549,6 +1550,7 @@ impl Drop for RuntimeDir {
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 fn prefetch_cargo_dependencies(
     writer: bool,
+    tenant_vm: bool,
     state: &Path,
     workspace: &Path,
     dependency_routes: &BTreeMap<String, PathBuf>,
@@ -1561,16 +1563,25 @@ fn prefetch_cargo_dependencies(
         } else {
             "fetch job dependencies"
         };
-        checked(
-            workspace::dependencies::fetch_command(
-                state,
-                workspace,
-                dependency_routes,
-                cargo,
-                rustup,
-            )?
-            .env("CARGO_NET_OFFLINE", "false"),
-        )
+        crate::setup_log::phase("fetch cargo dependencies", || {
+            let command = || {
+                workspace::dependencies::fetch_command(
+                    state,
+                    workspace,
+                    dependency_routes,
+                    cargo,
+                    rustup,
+                )
+            };
+            if tenant_vm {
+                // The daemon alone resolves/downloads sources into persistent
+                // tenant storage. Cache-only fallback can still run a warm job
+                // during an outage; both attempts bound tool and cache-lock waits.
+                cargo_fetch::prepare(command)
+            } else {
+                checked(command()?.env("CARGO_NET_OFFLINE", "false"))
+            }
+        })
         .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
     }
     Ok(())
@@ -1643,6 +1654,7 @@ impl Sandbox {
             &std::collections::BTreeMap::new(),
             &tree,
             &workspace.to_string_lossy(),
+            false,
         )
     }
 
@@ -1659,6 +1671,7 @@ impl Sandbox {
         dependency_routes: &std::collections::BTreeMap<String, PathBuf>,
         tree: &str,
         repository: &str,
+        tenant_vm: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -1673,6 +1686,7 @@ impl Sandbox {
             tree,
             repository,
             false,
+            tenant_vm,
         )
     }
 
@@ -1701,6 +1715,7 @@ impl Sandbox {
             tree,
             &workspace.to_string_lossy(),
             true,
+            false,
         )
     }
 
@@ -1718,6 +1733,7 @@ impl Sandbox {
         tree: &str,
         repository: &str,
         writer: bool,
+        tenant_vm: bool,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -1743,6 +1759,7 @@ impl Sandbox {
             );
             prefetch_cargo_dependencies(
                 writer,
+                tenant_vm,
                 state,
                 workspace,
                 dependency_routes,
@@ -1754,15 +1771,17 @@ impl Sandbox {
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
         if !writer {
-            prepare_javascript_checkouts(
-                workspace,
-                repository,
-                tree,
-                siblings,
-                |checkout, repository, checkout_tree| {
-                    prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
-                },
-            )?;
+            crate::setup_log::phase("prepare javascript dependencies", || {
+                prepare_javascript_checkouts(
+                    workspace,
+                    repository,
+                    tree,
+                    siblings,
+                    |checkout, repository, checkout_tree| {
+                        prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
+                    },
+                )
+            })?;
         }
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
@@ -1770,7 +1789,9 @@ impl Sandbox {
             .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
         {
             if path.join(".git/objects/info/alternates").is_file() {
-                workspace::git(&path, &["repack", "-a", "-d"])?;
+                crate::setup_log::phase("dissociate checkout", || {
+                    workspace::git(&path, &["repack", "-a", "-d"])
+                })?;
                 fs::remove_file(path.join(".git/objects/info/alternates"))?;
             }
         }

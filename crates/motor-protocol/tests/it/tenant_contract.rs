@@ -17,6 +17,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         event: TenantEventKind::Refused,
         jti: Some(id),
         cause: Some(RefusedCause::Mismatch),
+        setup: None,
     });
     assert_eq!(
         serde_json::to_value(event).unwrap(),
@@ -27,6 +28,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         event: TenantEventKind::Idle,
         jti: None,
         cause: None,
+        setup: None,
     });
     assert_eq!(
         serde_json::to_value(idle).unwrap(),
@@ -49,6 +51,8 @@ fn pinned_agent_operations_roundtrip_and_preserve_exit_after() {
         json!({"op":"drain","deadline_s":10,"exit_after":true}),
         json!({"op":"resume"}),
         json!({"op":"status"}),
+        json!({"op":"diagnostics"}),
+        json!({"op":"diagnostics","https":true}),
         json!({"op":"args_status"}),
     ] {
         let request: TenantAgentRequest = serde_json::from_value(value.clone()).unwrap();

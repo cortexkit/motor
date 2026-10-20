@@ -1,0 +1,532 @@
+{
+  "nftables": [
+    {
+      "metainfo": {
+        "version": "1.1.6",
+        "release_name": "Commodore Bullmoose #7",
+        "json_schema_version": 1
+      }
+    },
+    {
+      "table": {
+        "family": "inet",
+        "name": "motor_tenant",
+        "handle": 36
+      }
+    },
+    {
+      "chain": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "name": "tenant_mtap1_input",
+        "handle": 2,
+        "type": "filter",
+        "hook": "input",
+        "prio": -10,
+        "policy": "accept"
+      }
+    },
+    {
+      "chain": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "name": "tenant_mtap1_forward",
+        "handle": 4,
+        "type": "filter",
+        "hook": "forward",
+        "prio": -10,
+        "policy": "accept"
+      }
+    },
+    {
+      "chain": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "name": "tenant_mtap1_nat",
+        "handle": 14,
+        "type": "nat",
+        "hook": "postrouting",
+        "prio": 100,
+        "policy": "accept"
+      }
+    },
+    {
+      "counter": {
+        "family": "inet",
+        "name": "tenant_mtap1_egress",
+        "table": "motor_tenant",
+        "handle": 1,
+        "packets": 0,
+        "bytes": 0
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_input",
+        "handle": 3,
+        "comment": "tenant_host",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 5,
+        "comment": "tenant_taps",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "oifname"
+                }
+              },
+              "right": "mtap*"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 6,
+        "comment": "tenant_ipv6",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "nfproto"
+                }
+              },
+              "right": "ipv6"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 7,
+        "comment": "tenant_host",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "fib": {
+                  "result": "type",
+                  "flags": [
+                    "daddr"
+                  ]
+                }
+              },
+              "right": "local"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 9,
+        "comment": "tenant_private",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "payload": {
+                  "protocol": "ip",
+                  "field": "daddr"
+                }
+              },
+              "right": {
+                "set": [
+                  {
+                    "prefix": {
+                      "addr": "0.0.0.0",
+                      "len": 8
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "10.0.0.0",
+                      "len": 8
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "100.64.0.0",
+                      "len": 10
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "127.0.0.0",
+                      "len": 8
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "169.254.0.0",
+                      "len": 16
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "172.16.0.0",
+                      "len": 12
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "192.0.0.0",
+                      "len": 24
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "192.0.2.0",
+                      "len": 24
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "192.168.0.0",
+                      "len": 16
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "198.18.0.0",
+                      "len": 15
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "198.51.100.0",
+                      "len": 24
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "203.0.113.0",
+                      "len": 24
+                    }
+                  },
+                  {
+                    "prefix": {
+                      "addr": "224.0.0.0",
+                      "len": 3
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 10,
+        "comment": "tenant_source",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "!=",
+              "left": {
+                "payload": {
+                  "protocol": "ip",
+                  "field": "saddr"
+                }
+              },
+              "right": "10.200.1.2"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 11,
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "counter": "tenant_mtap1_egress"
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 12,
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "oifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "in",
+              "left": {
+                "ct": {
+                  "key": "state"
+                }
+              },
+              "right": [
+                "established",
+                "related"
+              ]
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "accept": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_forward",
+        "handle": 13,
+        "comment": "tenant_inbound",
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "oifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "drop": null
+          }
+        ]
+      }
+    },
+    {
+      "rule": {
+        "family": "inet",
+        "table": "motor_tenant",
+        "chain": "tenant_mtap1_nat",
+        "handle": 15,
+        "expr": [
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "meta": {
+                  "key": "iifname"
+                }
+              },
+              "right": "mtap1"
+            }
+          },
+          {
+            "match": {
+              "op": "==",
+              "left": {
+                "payload": {
+                  "protocol": "ip",
+                  "field": "saddr"
+                }
+              },
+              "right": "10.200.1.2"
+            }
+          },
+          {
+            "counter": {
+              "packets": 0,
+              "bytes": 0
+            }
+          },
+          {
+            "masquerade": null
+          }
+        ]
+      }
+    }
+  ]
+}

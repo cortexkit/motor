@@ -48,6 +48,7 @@ pub enum TenantEventKind {
     Started,
     Terminal,
     Idle,
+    SetupPhase,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +68,16 @@ pub struct TenantEvent {
     pub jti: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<RefusedCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<TenantSetupPhase>,
+}
+
+/// Trusted operation names only; never command arguments, paths or peer text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantSetupPhase {
+    pub phase: String,
+    pub finished: bool,
+    pub elapsed_ms: u64,
 }
 
 /// The event sequence allocated before a lifecycle connection began. Events at
@@ -104,6 +115,10 @@ pub enum TenantAgentRequest {
     },
     Resume,
     Status,
+    Diagnostics {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        https: bool,
+    },
     ArgsStatus,
     PrepareSnapshot {
         kind: SnapshotKind,
