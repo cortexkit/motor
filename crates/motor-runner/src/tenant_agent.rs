@@ -226,11 +226,21 @@ async fn forward_socket(
         if !expected {
             return Err(io::Error::other("unexpected runner agent reply"));
         }
-        let mut value = serde_json::to_value(reply)?;
-        value.as_object_mut().unwrap().remove("type");
+        let mut value = agent_reply_value(reply)?;
         value["ok"] = json!(true);
         return Ok(value);
     }
+}
+
+/// A runner reply as the JSON object the agent returns: the frame's own
+/// fields, without its `type` tag.
+fn agent_reply_value(reply: Frame) -> io::Result<Value> {
+    let mut value = serde_json::to_value(reply)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("runner reply is not a JSON object"))?
+        .remove("type");
+    Ok(value)
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
