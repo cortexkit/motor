@@ -11,15 +11,18 @@ sudo python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)"
 sudo systemctl start motor-boat motor-boat-identity
 ```
 
-`pins.json` fixes the official signed Ubuntu source URLs, Rust/rustup, Node,
-Bun, pnpm and NATS versions, and hashes the existing Cargo-tool and sccache
-build inputs. Release archives are checked against their publishers' SHA-256
+`pins.json` fixes the official signed Ubuntu source URLs and hashes the shared
+parity manifest, checker, Cargo-tool installer and sccache build inputs.
+`script/runner/toolchain.json` is the single job-tool parity manifest: Rust/rustup,
+per-toolchain targets/components, Cargo binaries and install sources, required
+packages, Node/npm, Bun, pnpm and NATS. Release archives use publishers' SHA-256
 lists; pnpm uses the exact version's published SHA-512 integrity. Rustup and
 Cargo verify distribution/crate checksums; git tools use the full revisions in
-`script/runner/tools.txt` and locked dependencies. The patched sccache is built
+the parity manifest and locked dependencies. The patched sccache is built
 with `script/runner/build-sccache.sh`; its read-only-cache patch is required
-because stock sccache touches cache files even for a hit. Anonymous commons
-access is tested inside Boat before installing its nine pinned mutation tools.
+because stock sccache touches cache files even for a hit. Anonymous access to
+`github.com/cortexkit/commons` is tested inside Boat before installing its pinned
+`ckdev-mutate` mutation-testing CLI revisions.
 No credential is forwarded if a public fetch fails. The resulting inventory
 records versions, package resolution, runner source revision and binary hash.
 The Ubuntu snapshot backend was unavailable, so rebuilds use the signed live official archive and record every installed package version plus all three Release dates; job-to-job reproducibility comes from the immutable named Boat snapshot, not from rebuilding the same OS packages later.
@@ -32,6 +35,78 @@ indexes, separately from APT's actual signature verification.
 These are reproducible tool/source pins, not a claim that independently linked Rust
 binaries have identical hashes. Reapplying a successful install reuses the disk,
 accounts, pinned Cargo tools and patched sccache build marker.
+
+## Checked tool parity
+
+Capture the build server without installing or changing anything, then compare
+its live state with the reviewed manifest:
+
+```sh
+python3 script/runner/toolchain-parity.py --capture > /tmp/toolchain-state.json
+python3 script/runner/toolchain-parity.py --check
+```
+
+To propose a manifest refresh, run the following from the source checkout.
+It writes JSON only to stdout; review the result before replacing the manifest
+and refresh the `runner_inputs_sha256` entries in `script/boat-image/pins.json`
+and `script/tenant-image/versions.txt` afterward:
+
+```sh
+python3 script/runner/toolchain-parity.py --from-capture /tmp/toolchain-state.json \
+  > /tmp/toolchain-proposed.json
+```
+
+The recipe installs every listed target and component **before** jobs are
+admitted, removes unlisted toolchains/components on a reused image, selects
+MinGW's win32 thread model, and provides the server's `gnu*` command names using
+Boat's GNU coreutils. Bun lives under `/home/ubuntu/.bun/bin`; the runner's HOME
+selects that read-only job bind, preserving the server's job PATH order.
+Rustup remains read-only in jobs; no job-side repair or tool installation is used.
+`rust-analyzer`, `rls` and `cargo-miri` are proxies, not installed components in
+the measured contract. Boat never installs the moving `stable` channel. It
+copies the pinned numbered release matching the server's captured stable compiler
+into the `stable` toolchain directory, then removes unlisted components from that
+independent copy. Rustup rejects official names such as `stable` for `toolchain
+link`; copying also preserves the server's smaller stable component set without
+removing clippy/rustfmt from the numbered release. No component superset exception
+is used, and the compiler-version check stays strict.
+
+Installation runs the parity check. Qualification reruns the **operator
+checkout's** checker against live files, not a saved inventory or the image's
+own checker, in each initial/clone/resume phase. A real Rust job additionally
+checks executable paths/versions, PATH order, wrapper/cache paths and the rustup
+mount's read-only flag. Missing targets, components, Cargo binaries or required
+packages prevent a PASS verdict, including in `--verify-prepared-image` mode.
+The checker reads rustup's installed lists and verifies each target's `libstd`
+payload exists; a stale installation receipt alone cannot qualify a target.
+GNU aliases are identified by the owning `coreutils`/`gnu-coreutils` package.
+When no package owner is reported, the checker accepts version output containing
+either `(coreutils)` or `(GNU coreutils)`.
+`gnutest` has no version flag: its host package ownership is checked without
+executing it. The probe compares the job's `gnutest` file hash with a fresh hash
+of the host's `gnutest` file because job filesystems omit dpkg's database.
+The report carries the manifest digest and observed versions.
+The manifest separates compiler entry points by role: the build server uses
+`/motor-tools/prefrontal-build-slot`, whose `.cache` must name the trusted
+`/motor-tools/sccache` script; single-job Boat uses `RUSTC_WRAPPER=sccache`
+directly. Both roles check the wrapper's source hash, backend path and read-only
+mounts for `/motor-tools` and the shared Cargo `bin` directory. All other job
+environment values use the manifest's common contract.
+`test_recipe_preinstalls_wasm32_unknown_unknown`,
+`test_missing_image_wasm_target_fails_check`, and the probe's parity tests defend
+the missing-target regression and fresh-measurement boundary.
+
+The manifest explicitly lists accepted OS-level differences rather than claiming
+identical Linux distributions. Required distro packages and GNU aliases must
+exist, but their versions are recorded rather than equal across Ubuntu releases.
+In particular, `/usr/bin/wasm-opt` comes from apt `binaryen`; its observed version
+is in each qualification report and optimizer output may differ. ENGRAM provides
+esbuild through its own nested JS lockfile install, not a global esbuild. The
+runner supplies neither `ESBUILD_BIN` nor the `WASM_*_BIN` overrides; repositories
+set those themselves. Native Cargo executable hashes can vary across builds;
+Cargo versions/default aliases are exact, while Boat's patched sccache is checked
+using its build-input marker, recorded output hashes and a distinct stock binary. The server's sccache
+hashes are checked directly. Inventory never starts either sccache executable.
 
 ## Filesystem choice
 
@@ -70,6 +145,10 @@ repair mounts beneath a running daemon. Portable tests cover delayed public-bind
 cleanup, systemd-only activation, live-consumer refusal, and readiness withdrawal;
 the real runner-host probe additionally observes the first twelve seconds after
 readiness, sequential jobs, a seven-minute idle/reclaim interval, and stop/resume.
+If the provider's counters do not prove a reclaim during that interval despite
+a successful service run, the report marks the idle-reclaim check **INCONCLUSIVE**,
+not `PASS` and not a Motor failure. That observation gap does not block
+job parity qualification; parity and storage failures remain blocking.
 At the end, on the disposable clone only, it unmounts `/Users` as deferred cleanup
 would, creates a root-disk workspace sentinel, and requests `Users.mount` again.
 The sentinel must remain visible without an overmount, and endpoint readiness

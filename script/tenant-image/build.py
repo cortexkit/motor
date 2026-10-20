@@ -21,6 +21,7 @@ BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
              "systemd.unified_cgroup_hierarchy=1")
 RUNNER_INPUTS = (
     "script/runner/tools.txt", "script/runner/install-tools.sh",
+    "script/runner/toolchain.json",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
 )

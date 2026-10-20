@@ -41,10 +41,12 @@ class RecipeTests(unittest.TestCase):
 
     def test_pins_match_real_runner_inputs(self):
         install.validate(self.pins)
-        self.assertEqual(self.pins["nats"], "2.15.0")
-        self.assertIn("libsqlite3-dev", self.pins["packages"])
-        self.assertIn("python3", self.pins["packages"])
-        self.assertEqual(set(self.pins["rust_toolchains"]), {"1.89.0", "1.91.0", "1.96.0", "1.99.0"})
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        self.assertEqual(manifest["tools"]["nats-server"]["version"], "nats-server: v2.15.0")
+        self.assertIn("libsqlite3-dev", manifest["apt_packages"]["required"])
+        self.assertIn("python3", manifest["apt_packages"]["required"])
+        self.assertEqual(set(manifest["rust_toolchains"]), {
+            name + "-x86_64-unknown-linux-gnu" for name in ("1.91.0", "1.96.0", "1.99.0", "stable")})
 
     def test_wrong_input_hash_is_refused(self):
         pins = copy.deepcopy(self.pins)
@@ -52,10 +54,111 @@ class RecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input changed"):
             install.validate(pins)
 
-    def test_unpinned_versions_and_endpoint_port_are_refused(self):
-        for key, value in (("bun", "latest"), ("probe_port", 9443)):
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                install.validate(dict(self.pins, **{key: value}))
+    def test_endpoint_port_is_refused(self):
+        with self.assertRaises(ValueError):
+            install.validate(dict(self.pins, probe_port=9443))
+
+    def test_recipe_preinstalls_wasm32_unknown_unknown(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, "run", return_value="") as run:
+            install.install_rust(manifest, "/rustup-init")
+        commands = [call.args for call in run.call_args_list if call.args[:3] == ('rustup', 'toolchain', 'install')]
+        self.assertEqual({command[3] for command in commands}, {name for name in manifest['rust_toolchains'] if not name.startswith('stable-')})
+        for command in commands:
+            components = [command[i + 1] for i, arg in enumerate(command) if arg == '--component']
+            targets = [command[i + 1] for i, arg in enumerate(command) if arg == '--target']
+            if command[3] in ('1.99.0-x86_64-unknown-linux-gnu', 'stable-x86_64-unknown-linux-gnu'):
+                self.assertIn('wasm32-unknown-unknown', targets)
+                self.assertIn('x86_64-pc-windows-gnu', targets)
+                self.assertIn('x86_64-unknown-linux-musl', targets)
+            self.assertIn('clippy', components)
+
+    def test_recipe_uses_server_bun_home_and_preserves_job_path_order(self):
+        unit = (HERE / 'motor-boat.service').read_text()
+        self.assertIn('Environment=HOME=/home/ubuntu\n', unit)
+        self.assertIn('Environment=PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:', unit)
+
+    def test_recipe_passes_exact_rustup_component_and_target_argv(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init')
+        names = ('1.99.0-x86_64-unknown-linux-gnu', 'stable-x86_64-unknown-linux-gnu')
+        actual = {call.args[3]: call.args for call in run.call_args_list
+                  if call.args[:3] == ('rustup', 'toolchain', 'install') and call.args[3] in names}
+        targets = ('--target', 'aarch64-pc-windows-msvc', '--target', 'wasm32-unknown-unknown',
+                   '--target', 'wasm32-wasip1', '--target', 'x86_64-pc-windows-gnu',
+                   '--target', 'x86_64-pc-windows-msvc', '--target', 'x86_64-unknown-linux-gnu',
+                   '--target', 'x86_64-unknown-linux-musl')
+        self.assertEqual(actual, {
+            names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
+                       '--component', 'clippy', '--component', 'rustfmt', *targets),
+        })
+        root = manifest['rustup_home'] + '/toolchains/'
+        run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[1])
+
+    def test_recipe_normalizes_preview_names_and_removes_extra_parts(self):
+        host = 'x86_64-unknown-linux-gnu'
+        self.assertEqual(install.rustup_component_name('clippy-preview-' + host, host), 'clippy')
+        self.assertEqual(install.rustup_component_name('rustfmt-preview-' + host, host), 'rustfmt')
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        name = '1.91.0-' + host
+        def run(*args, **kwargs):
+            if args == ('rustup', 'component', 'list', '--installed', '--toolchain', name):
+                return '\n'.join([*manifest['rust_toolchains'][name]['components'],
+                                  'rust-std-wasm32-unknown-unknown', 'rust-analyzer-' + host])
+            return ''
+        with patch.object(install, 'run', side_effect=run) as execute:
+            install.install_rust(manifest, '/rustup-init')
+        execute.assert_any_call('rustup', 'target', 'remove', '--toolchain', name, 'wasm32-unknown-unknown')
+        execute.assert_any_call('rustup', 'component', 'remove', '--toolchain', name, 'rust-analyzer')
+
+    def test_recipe_freezes_stable_when_upstream_has_moved(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        stable = 'stable-x86_64-unknown-linux-gnu'
+        numbered = '1.99.0-x86_64-unknown-linux-gnu'
+        state = copy.deepcopy(manifest['rust_toolchains'])
+        state[stable]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+        def run(*args, **kwargs):
+            if args[:3] == ('rustup', 'toolchain', 'list'):
+                return '\n'.join(state)
+            if args[:3] == ('rustup', 'toolchain', 'install'):
+                name = args[3]
+                state[name] = copy.deepcopy(manifest['rust_toolchains'][name])
+                if name == stable:
+                    state[name]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+            elif args[:3] == ('rustup', 'toolchain', 'uninstall'):
+                state.pop(args[3], None)
+            elif args[0] == 'cp':
+                state[Path(args[-1]).name] = copy.deepcopy(state[Path(args[-2]).name])
+            elif args[:3] == ('rustup', 'component', 'list'):
+                return '\n'.join(state[args[-1]]['components'])
+            elif args[:3] == ('rustup', 'component', 'remove'):
+                state[args[4]]['components'].remove(args[5] + '-x86_64-unknown-linux-gnu')
+            return ''
+        with patch.object(install, 'run', side_effect=run):
+            install.install_rust(manifest, '/rustup-init')
+        self.assertEqual(state[stable], manifest['rust_toolchains'][stable])
+        self.assertEqual(state[numbered], manifest['rust_toolchains'][numbered])
+
+    def test_recipe_bootstraps_empty_rustup_and_removes_unlisted_toolchains(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        stable = 'stable-x86_64-unknown-linux-gnu'
+        for listed, removed in (('no installed toolchains', [stable]),
+                                ('1.89.0-x86_64-unknown-linux-gnu', ['1.89.0-x86_64-unknown-linux-gnu', stable])):
+            def run(*args, **kwargs):
+                return listed if args == ('rustup', 'toolchain', 'list') else ''
+            with self.subTest(listed=listed), patch.object(install, 'run', side_effect=run) as execute:
+                install.install_rust(manifest, '/rustup-init')
+                self.assertEqual([call.args[3] for call in execute.call_args_list if call.args[:3] == ('rustup', 'toolchain', 'uninstall')], removed)
+
+    def test_coreutils_aliases_point_at_gnu_executables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, 'cp')
+            source.write_text('GNU coreutils fixture')
+            alias = Path(tmp, 'gnucp')
+            install.gnu_aliases({'gnu_coreutils': {'gnucp': str(alias)}})
+            self.assertEqual(alias.resolve(), source)
+            install.gnu_aliases({'gnu_coreutils': {'gnucp': str(alias)}})
 
     def test_checksum_parser_rejects_missing_ambiguous_and_malformed(self):
         sha = "a" * 64

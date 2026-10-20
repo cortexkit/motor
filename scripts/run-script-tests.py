@@ -32,6 +32,7 @@ TEST_FILES = [
     "script/runner/test_inbound_policy.py",
     "script/runner/test_review_reaper.py",
     "script/runner/test_sync_lock.py",
+    "script/runner/test_toolchain_parity.py",
     "script/tenant-provision/test_provision.py",
     "script/tenant-image/test_tenant_image.py",
     "script/tenant-vm-spike/test_hosted_spike.py",

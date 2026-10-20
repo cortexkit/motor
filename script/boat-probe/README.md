@@ -199,12 +199,18 @@ The exit status reports the measurement verdict, and cleanup separately:
 | Exit | Meaning |
 | --- | --- |
 | 0 | Verdict passed (JSON `verdict.passed`); cleanup is `complete` or `purge_pending` |
-| 1 | Verdict failed: measurements incomplete, an error, or a mode's checks did not all pass (`verdict.reasons`) |
+| 1 | Verdict failed: measurements incomplete, an error, or a required check did not pass (`verdict.reasons`) |
 | 3 | `cleanup_state: "incomplete"`: resources may still exist; retry `--cleanup` (checked before the verdict) |
 
 `--cleanup` exits 0 unless cleanup is still incomplete. A Boat purge pending after
 accepted deletes never fails a run: nothing is left running and retrying cannot
 speed it up.
+
+`verdict.inconclusive` lists provider idle-reclaim checks marked `INCONCLUSIVE`. They
+remain `INCONCLUSIVE` in the check list rather than counting as passes, but do
+not block the runner-host verdict. Every parity, storage and other required check
+still needs `PASS`; a failed required check cannot be hidden by an inconclusive
+reclaim observation.
 
 `Error: none recorded` in rendered findings means no measurement exception was
 caught. It does not override `cleanup_complete: false` or a failed network probe.

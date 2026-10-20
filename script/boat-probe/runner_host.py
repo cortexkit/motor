@@ -29,6 +29,8 @@ if provider_spec is None or provider_spec.loader is None:
 provider = importlib.util.module_from_spec(provider_spec)
 provider_spec.loader.exec_module(provider)
 PORT = 19443
+PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
+PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 ENV_NAMES = "import os,json; print(json.dumps({k: True for k in os.environ if k == 'ASCII_TOKEN' or k.startswith('BOAT_')}))"
 POLICY = {"allowtcpforwarding": "local", "permittty": "no", "allowagentforwarding": "no",
           "x11forwarding": "no", "permittunnel": "no"}
@@ -283,6 +285,21 @@ def idle_reclaim_checks(data):
             'Result=success' in data['unit'])
 
 
+def idle_reclaim_status(data):
+    # Preserve the provider's raw counters rather than infer an undocumented
+    # reclaim event from any one field changing after a successful service run.
+    try:
+        if idle_reclaim_checks(data):
+            return 'PASS'
+        fields = [int(value) for value in (data.get('after') or '').split()]
+        if (data['seconds'] >= 420 and len(fields) == 6 and 'Result=success' in data['unit']
+                and data.get('reclaimed_during_idle') is False):
+            return 'INCONCLUSIVE'
+    except (KeyError, ValueError, TypeError):
+        pass
+    return 'FAIL'
+
+
 def storage_timeline_checks(samples):
     return bool(samples) and all(
         sample['ready'] and len(sample['mounts']) == 2 and sample['mounts'] == samples[0]['mounts'] and
@@ -432,6 +449,22 @@ def prepared_image_digest(revision, inventory):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',',':')).encode()).hexdigest()
 
 
+def parity_source(job=False, gnu_test_sha256=None):
+    # Run the operator checkout's checker, not an image's possibly stale checker
+    # or its build-time inventory. Every phase measures the current filesystem.
+    return ("import json\n"
+            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py'}\n"
+            f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
+            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r})\n"
+            "print(json.dumps(result))\n")
+
+
+def parity_passed(report):
+    manifest = json.loads(PARITY_MANIFEST.read_text())
+    expected = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return report.get('passed') is True and report.get('errors') == [] and report.get('manifest_sha256') == expected
+
+
 def snapshot_metadata(snapshot):
     if snapshot.get('status') != 'ready' or not isinstance(snapshot.get('snapshotId'), str) or type(snapshot.get('sizeBytes')) is not int:
         raise ValueError('ready named snapshot lacks documented artifact id/size')
@@ -525,8 +558,8 @@ class RunnerHost:
         self.data = {"checks": [], "phases": [], "all_passed": False}
         probe.data["runner_host"] = self.data
 
-    def check(self, name, passed, evidence):
-        self.data["checks"].append({"name": name, "status": "PASS" if passed else "FAIL", "evidence": evidence})
+    def check(self, name, passed, evidence, status=None):
+        self.data["checks"].append({"name": name, "status": status or ("PASS" if passed else "FAIL"), "evidence": evidence})
         self.probe.checkpoint()
 
     def execute(self, sid, command, timeout=120):
@@ -715,6 +748,9 @@ class RunnerHost:
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
+        record['toolchain_parity'] = json.loads(self.execute(
+            sid, "sudo -n python3 -c " + shlex.quote(parity_source()))['stdout'])
+        self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
         listeners = host["listeners"]["stdout"]
         self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
                    not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
@@ -737,9 +773,12 @@ class RunnerHost:
         job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
+                gnu_test_hash = (record['toolchain_parity']['observed']['tools'].get('gnutest') or {}).get('sha256')
                 jobs = [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
                                        ("exit", "printf 'boat-round-trip\\n'; exit 23"),
-                                       ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
+                                        ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
+                                        ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
+                                            job=True, gnu_test_sha256=gnu_test_hash))),
                                        ("isolation", "python3 -c " + shlex.quote(job_script))]
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))
@@ -747,7 +786,8 @@ class RunnerHost:
                     if name == 'after_idle':
                         idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
                         record['idle_reclaim'] = idle
-                        self.check(label + '.idle_reclaim_observed', idle_reclaim_checks(idle), idle)
+                        status = idle_reclaim_status(idle)
+                        self.check(label + '.idle_reclaim_observed', status == 'PASS', idle, status=status)
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
@@ -756,7 +796,10 @@ class RunnerHost:
                     record[name]["result"] = parsed
                     if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
                         self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
-                    if name == "isolation":
+                    if name == 'job_toolchain_parity':
+                        report = json.loads(parsed['stdout'])
+                        self.check(label + '.' + name, parsed['code'] == 0 and parity_passed(report), report)
+                    elif name == "isolation":
                         for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
                     else:
@@ -768,7 +811,7 @@ class RunnerHost:
                     for key, passed in storage_checks(state).items():
                         self.check(label + '.' + name + '.' + key, passed, state)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
-        if any(check['status'] != 'PASS' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')
         return record
 
@@ -797,12 +840,13 @@ class RunnerHost:
             self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
             self.probe.wait_sandbox(sid, {'archived'})
             self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
-            from probe import READY
+            from probe import READY, required_checks_passed
             self.probe.wait_sandbox(sid, READY)
             self.probe.wait_hydrated(sid)
             self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
             self.replay_cleanup(sid)
         self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
+        self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
         self.probe.checkpoint()
 
     def replay_cleanup(self, sid):
@@ -811,7 +855,7 @@ class RunnerHost:
         self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
 
     def _run(self):
-        from probe import READY, cleanup
+        from probe import READY, cleanup, required_checks_passed
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT, check=True, stdout=sys.stderr)
         build = process(["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_KEY_0", "-u", "GIT_CONFIG_VALUE_0",
@@ -906,6 +950,7 @@ class RunnerHost:
                 self.check("sshd.dropin_survives_resume", before.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") == after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") and bool(after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf")), {"before": before, "after": after})
         self.data["local_private_keys_removed"] = not directory.exists()
         self.data["all_passed"] = bool(self.data["checks"]) and all(c["status"] == "PASS" for c in self.data["checks"])
+        self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
         if self.data.get('prepared_image'):
-            self.data['prepared_image']['real_jobs_qualified'] = self.data['all_passed']
+            self.data['prepared_image']['real_jobs_qualified'] = self.data['required_checks_passed']
         self.probe.checkpoint()

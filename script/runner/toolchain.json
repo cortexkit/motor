@@ -1,0 +1,544 @@
+{
+  "accepted_os_differences": [
+    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions.",
+    "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
+    "wasm-opt is supplied by apt binaryen (/usr/bin/wasm-opt), version 120 on the captured build server. Boat's distro version is recorded in fresh qualification evidence, not forced to 120; WebAssembly optimizer output may differ.",
+    "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
+    "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
+    "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
+    "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
+    "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
+    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper. Single-job Boat uses RUSTC_WRAPPER=sccache directly. Both roles must resolve the same pinned wrapper source and read-only shared backend; all other job environment values remain exact."
+  ],
+  "apt_packages": {
+    "by_role": {
+      "boat": [
+        "coreutils"
+      ],
+      "build-server": [
+        "gnu-coreutils"
+      ]
+    },
+    "observed_build_server_versions": {
+      "acl": "2.3.2-2",
+      "binaryen": "120-4build1",
+      "build-essential": "12.12ubuntu2.26.04.2",
+      "ca-certificates": "20260601~26.04.1",
+      "clang": "1:21.1.6-71",
+      "curl": "8.18.0-1ubuntu2.8",
+      "g++-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
+      "gcc-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
+      "git": "1:2.53.0-1ubuntu1.1",
+      "gnu-coreutils": "9.7-3ubuntu2.1",
+      "iproute2": "6.19.0-1ubuntu1.1",
+      "libsqlite3-dev": "3.46.1-9ubuntu0.3",
+      "libssl-dev": "3.5.5-1ubuntu3.7",
+      "lld": "1:21.1.6-71",
+      "nftables": "1.1.6-1",
+      "patch": "2.8-2build1",
+      "pkg-config": "2.5.1-4",
+      "procps": "2:4.0.4-9ubuntu1",
+      "python3": "3.14.3-0ubuntu2",
+      "rsync": "3.4.1+ds1-7ubuntu0.3",
+      "sqlite3": "3.46.1-9ubuntu0.3",
+      "sudo": "1.9.17p2-1ubuntu3.2",
+      "ufw": "0.36.2-9build1",
+      "unzip": "6.0-29ubuntu1",
+      "util-linux": "2.41.3-3ubuntu2.2",
+      "xfsprogs": "6.18.0-3",
+      "xz-utils": "5.8.3-1"
+    },
+    "required": [
+      "python3",
+      "libsqlite3-dev",
+      "sqlite3",
+      "sudo",
+      "acl",
+      "xfsprogs",
+      "iproute2",
+      "nftables",
+      "util-linux",
+      "procps",
+      "build-essential",
+      "clang",
+      "lld",
+      "pkg-config",
+      "libssl-dev",
+      "git",
+      "rsync",
+      "curl",
+      "ca-certificates",
+      "unzip",
+      "xz-utils",
+      "patch",
+      "ufw",
+      "binaryen",
+      "gcc-mingw-w64-x86-64",
+      "g++-mingw-w64-x86-64"
+    ]
+  },
+  "capture_sha256": "844f7432dfa9b83888e8fe36af2e20467f77b7189c96bc24d4419b9d4f1e6467",
+  "cargo_binaries": {
+    "cargo": {
+      "proxy": true
+    },
+    "cargo-clippy": {
+      "proxy": true
+    },
+    "cargo-fmt": {
+      "proxy": true
+    },
+    "cargo-miri": {
+      "proxy": true
+    },
+    "cargo-nextest": {
+      "version": "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)"
+    },
+    "ckdev-mutate": {
+      "matches": "ckdev-mutate-9d6b663d",
+      "version": "ckdev-mutate 0.12.1"
+    },
+    "ckdev-mutate-0097d269": {
+      "version": "ckdev-mutate 0.9.1"
+    },
+    "ckdev-mutate-0b3bc096": {
+      "version": "ckdev-mutate 0.12.6"
+    },
+    "ckdev-mutate-0c99c7e1": {
+      "version": "ckdev-mutate 0.9.8"
+    },
+    "ckdev-mutate-46cc166b": {
+      "version": "ckdev-mutate 0.8.0"
+    },
+    "ckdev-mutate-73c7e661": {
+      "version": "ckdev-mutate 0.9.5"
+    },
+    "ckdev-mutate-85c8b577": {
+      "version": "ckdev-mutate 0.12.4"
+    },
+    "ckdev-mutate-9d6b663d": {
+      "version": "ckdev-mutate 0.12.1"
+    },
+    "ckdev-mutate-be120e92": {
+      "version": "ckdev-mutate 0.12.0"
+    },
+    "ckdev-mutate-c1591d4a": {
+      "version": "ckdev-mutate 0.9.3"
+    },
+    "ckdev-mutate-dfdb1129": {
+      "version": "ckdev-mutate 0.9.0"
+    },
+    "clippy-driver": {
+      "proxy": true
+    },
+    "rls": {
+      "proxy": true
+    },
+    "rust-analyzer": {
+      "proxy": true
+    },
+    "rust-gdb": {
+      "proxy": true
+    },
+    "rust-gdbgui": {
+      "proxy": true
+    },
+    "rust-lldb": {
+      "proxy": true
+    },
+    "rustc": {
+      "proxy": true
+    },
+    "rustdoc": {
+      "proxy": true
+    },
+    "rustfmt": {
+      "proxy": true
+    },
+    "rustup": {},
+    "sccache": {},
+    "sccache-0.18.0-stock": {},
+    "wasm-bindgen": {
+      "version": "wasm-bindgen 0.2.126"
+    },
+    "wasm-bindgen-test-runner": {
+      "version": "wasm-bindgen-test-runner 0.2.126"
+    },
+    "wasm2es6js": {
+      "version": "wasm2es6js 0.2.126"
+    },
+    "worker-build": {
+      "version": "0.8.7"
+    },
+    "worker-codegen": {
+      "version": "worker-build 0.8.7"
+    }
+  },
+  "cargo_home": "/srv/build/cargo-home",
+  "cargo_installs": [
+    {
+      "bins": [
+        "cargo-nextest"
+      ],
+      "crate": "cargo-nextest",
+      "version": "0.9.138"
+    },
+    {
+      "bins": [
+        "wasm-bindgen",
+        "wasm-bindgen-test-runner",
+        "wasm2es6js"
+      ],
+      "crate": "wasm-bindgen-cli",
+      "version": "0.2.126"
+    },
+    {
+      "bins": [
+        "worker-build",
+        "worker-codegen"
+      ],
+      "crate": "worker-build",
+      "version": "0.8.7"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "46cc166b0df2edcfd14b3eb54ed6eeac588fed69"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0097d269a4c409db13306a11fc2c504057629791"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "c1591d4a76fa3d3a7367237922b0bca5214dbf11"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "73c7e66145e131eadffdd874c82d93548868b668"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "be120e9254c4972191b39b2e6814987918206afc"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "default": true,
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "9d6b663dac487bb982c7bfd18a96eee2292164ad"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "85c8b577795d556fb27e54b548f06ea913d8b337"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0b3bc096880e22ab43bec18eb6719a50fc59c270"
+    }
+  ],
+  "compile_wrapper": {
+    "backend": "/srv/build/cargo-home/bin/sccache",
+    "sccache_path": "/motor-tools/sccache",
+    "sccache_sha256": "3f1da40332e28d47887d4ebdf24cf753cbf9e181888c14e9c56520fca94a1570",
+    "supervisor_cache_file": "/motor-tools/prefrontal-build-slot.cache"
+  },
+  "gnu_coreutils": {
+    "gnu[": "/usr/bin/gnu[",
+    "gnuarch": "/usr/bin/gnuarch",
+    "gnub2sum": "/usr/bin/gnub2sum",
+    "gnubase32": "/usr/bin/gnubase32",
+    "gnubase64": "/usr/bin/gnubase64",
+    "gnubasename": "/usr/bin/gnubasename",
+    "gnubasenc": "/usr/bin/gnubasenc",
+    "gnucat": "/usr/bin/gnucat",
+    "gnuchcon": "/usr/bin/gnuchcon",
+    "gnuchgrp": "/usr/bin/gnuchgrp",
+    "gnuchmod": "/usr/bin/gnuchmod",
+    "gnuchown": "/usr/bin/gnuchown",
+    "gnuchroot": "/usr/sbin/gnuchroot",
+    "gnucksum": "/usr/bin/gnucksum",
+    "gnucomm": "/usr/bin/gnucomm",
+    "gnucp": "/usr/bin/gnucp",
+    "gnucsplit": "/usr/bin/gnucsplit",
+    "gnucut": "/usr/bin/gnucut",
+    "gnudate": "/usr/bin/gnudate",
+    "gnudd": "/usr/bin/gnudd",
+    "gnudf": "/usr/bin/gnudf",
+    "gnudir": "/usr/bin/gnudir",
+    "gnudircolors": "/usr/bin/gnudircolors",
+    "gnudirname": "/usr/bin/gnudirname",
+    "gnudu": "/usr/bin/gnudu",
+    "gnuecho": "/usr/bin/gnuecho",
+    "gnuenv": "/usr/bin/gnuenv",
+    "gnuexpand": "/usr/bin/gnuexpand",
+    "gnuexpr": "/usr/bin/gnuexpr",
+    "gnufactor": "/usr/bin/gnufactor",
+    "gnufalse": "/usr/bin/gnufalse",
+    "gnufmt": "/usr/bin/gnufmt",
+    "gnufold": "/usr/bin/gnufold",
+    "gnugroups": "/usr/bin/gnugroups",
+    "gnuhead": "/usr/bin/gnuhead",
+    "gnuhostid": "/usr/bin/gnuhostid",
+    "gnuid": "/usr/bin/gnuid",
+    "gnuinstall": "/usr/bin/gnuinstall",
+    "gnujoin": "/usr/bin/gnujoin",
+    "gnulink": "/usr/bin/gnulink",
+    "gnuln": "/usr/bin/gnuln",
+    "gnulogname": "/usr/bin/gnulogname",
+    "gnuls": "/usr/bin/gnuls",
+    "gnumd5sum": "/usr/bin/gnumd5sum",
+    "gnumkdir": "/usr/bin/gnumkdir",
+    "gnumkfifo": "/usr/bin/gnumkfifo",
+    "gnumknod": "/usr/bin/gnumknod",
+    "gnumktemp": "/usr/bin/gnumktemp",
+    "gnumv": "/usr/bin/gnumv",
+    "gnunice": "/usr/bin/gnunice",
+    "gnunl": "/usr/bin/gnunl",
+    "gnunohup": "/usr/bin/gnunohup",
+    "gnunproc": "/usr/bin/gnunproc",
+    "gnunumfmt": "/usr/bin/gnunumfmt",
+    "gnuod": "/usr/bin/gnuod",
+    "gnupaste": "/usr/bin/gnupaste",
+    "gnupathchk": "/usr/bin/gnupathchk",
+    "gnupinky": "/usr/bin/gnupinky",
+    "gnupr": "/usr/bin/gnupr",
+    "gnuprintenv": "/usr/bin/gnuprintenv",
+    "gnuprintf": "/usr/bin/gnuprintf",
+    "gnuptx": "/usr/bin/gnuptx",
+    "gnupwd": "/usr/bin/gnupwd",
+    "gnureadlink": "/usr/bin/gnureadlink",
+    "gnurealpath": "/usr/bin/gnurealpath",
+    "gnurm": "/usr/bin/gnurm",
+    "gnurmdir": "/usr/bin/gnurmdir",
+    "gnuruncon": "/usr/bin/gnuruncon",
+    "gnuseq": "/usr/bin/gnuseq",
+    "gnusha1sum": "/usr/bin/gnusha1sum",
+    "gnusha224sum": "/usr/bin/gnusha224sum",
+    "gnusha256sum": "/usr/bin/gnusha256sum",
+    "gnusha384sum": "/usr/bin/gnusha384sum",
+    "gnusha512sum": "/usr/bin/gnusha512sum",
+    "gnushred": "/usr/bin/gnushred",
+    "gnushuf": "/usr/bin/gnushuf",
+    "gnusleep": "/usr/bin/gnusleep",
+    "gnusort": "/usr/bin/gnusort",
+    "gnusplit": "/usr/bin/gnusplit",
+    "gnustat": "/usr/bin/gnustat",
+    "gnustdbuf": "/usr/bin/gnustdbuf",
+    "gnustty": "/usr/bin/gnustty",
+    "gnusum": "/usr/bin/gnusum",
+    "gnusync": "/usr/bin/gnusync",
+    "gnutac": "/usr/bin/gnutac",
+    "gnutail": "/usr/bin/gnutail",
+    "gnutee": "/usr/bin/gnutee",
+    "gnutest": "/usr/bin/gnutest",
+    "gnutimeout": "/usr/bin/gnutimeout",
+    "gnutouch": "/usr/bin/gnutouch",
+    "gnutr": "/usr/bin/gnutr",
+    "gnutrue": "/usr/bin/gnutrue",
+    "gnutruncate": "/usr/bin/gnutruncate",
+    "gnutsort": "/usr/bin/gnutsort",
+    "gnutty": "/usr/bin/gnutty",
+    "gnuuname": "/usr/bin/gnuuname",
+    "gnuunexpand": "/usr/bin/gnuunexpand",
+    "gnuuniq": "/usr/bin/gnuuniq",
+    "gnuunlink": "/usr/bin/gnuunlink",
+    "gnuusers": "/usr/bin/gnuusers",
+    "gnuvdir": "/usr/bin/gnuvdir",
+    "gnuwc": "/usr/bin/gnuwc",
+    "gnuwho": "/usr/bin/gnuwho",
+    "gnuwhoami": "/usr/bin/gnuwhoami",
+    "gnuyes": "/usr/bin/gnuyes"
+  },
+  "job_environment": {
+    "CARGO_HOME": "/motor-home/cargo",
+    "ESBUILD_BIN": null,
+    "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
+    "RUSTUP_HOME": "/home/ubuntu/.rustup",
+    "SCCACHE_DIR": "/motor-cache",
+    "WASM_BINDGEN_BIN": null,
+    "WASM_OPT_BIN": null
+  },
+  "job_environment_by_role": {
+    "boat": {
+      "RUSTC_WRAPPER": "sccache"
+    },
+    "build-server": {
+      "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot"
+    }
+  },
+  "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
+  "rust_profile": "minimal",
+  "rust_toolchains": {
+    "1.91.0-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "clippy-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rustc-x86_64-unknown-linux-gnu",
+        "rustfmt-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+      "targets": [
+        "x86_64-unknown-linux-gnu"
+      ]
+    },
+    "1.96.0-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "clippy-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rustc-x86_64-unknown-linux-gnu",
+        "rustfmt-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "targets": [
+        "x86_64-unknown-linux-gnu"
+      ]
+    },
+    "1.99.0-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "clippy-x86_64-unknown-linux-gnu",
+        "rust-std-aarch64-pc-windows-msvc",
+        "rust-std-wasm32-unknown-unknown",
+        "rust-std-wasm32-wasip1",
+        "rust-std-x86_64-pc-windows-gnu",
+        "rust-std-x86_64-pc-windows-msvc",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-musl",
+        "rustc-x86_64-unknown-linux-gnu",
+        "rustfmt-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "targets": [
+        "aarch64-pc-windows-msvc",
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+        "x86_64-pc-windows-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl"
+      ]
+    },
+    "stable-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "rust-std-aarch64-pc-windows-msvc",
+        "rust-std-wasm32-unknown-unknown",
+        "rust-std-wasm32-wasip1",
+        "rust-std-x86_64-pc-windows-gnu",
+        "rust-std-x86_64-pc-windows-msvc",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-musl",
+        "rustc-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "targets": [
+        "aarch64-pc-windows-msvc",
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+        "x86_64-pc-windows-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl"
+      ]
+    }
+  },
+  "rustup": "1.29.1",
+  "rustup_home": "/home/ubuntu/.rustup",
+  "sccache": {
+    "build_server_sha256": {
+      "sccache": "d0b240d80a8a9d595bf35ba1341d838bc3f938c81e9359ff9eee66944df0aec4",
+      "sccache-0.18.0-stock": "531dfd1af765cd11e25a06516e9e757ab2c3a4bbc511ee857ee328ba71b477e6"
+    },
+    "inputs_sha256": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
+    "version": "0.18.0"
+  },
+  "schema": 1,
+  "source": "Read-only build-server capture; refresh with toolchain-parity.py --capture and --from-capture",
+  "tools": {
+    "bun": {
+      "path": "/home/ubuntu/.bun/bin/bun",
+      "version": "1.4.2"
+    },
+    "nats-server": {
+      "path": "/usr/local/bin/nats-server",
+      "version": "nats-server: v2.15.0"
+    },
+    "node": {
+      "path": "/usr/local/bin/node",
+      "version": "v24.21.0"
+    },
+    "npm": {
+      "path": "/usr/local/bin/npm",
+      "version": "11.19.0"
+    },
+    "pnpm": {
+      "path": "/usr/local/bin/pnpm",
+      "version": "11.1.2"
+    },
+    "wasm-opt": {
+      "observed_build_server_version": "wasm-opt version 120",
+      "path": "/usr/bin/wasm-opt",
+      "version_pattern": "wasm-opt version [0-9]+"
+    },
+    "x86_64-w64-mingw32-g++": {
+      "observed_build_server_version": "x86_64-w64-mingw32-g++ (GCC) 13-win32",
+      "path": "/usr/bin/x86_64-w64-mingw32-g++",
+      "realpath_suffix": "-g++-win32",
+      "version_pattern": "x86_64-w64-mingw32-g\\+\\+ \\(GCC\\) [0-9.]+-win32"
+    },
+    "x86_64-w64-mingw32-gcc": {
+      "observed_build_server_version": "x86_64-w64-mingw32-gcc (GCC) 13-win32",
+      "path": "/usr/bin/x86_64-w64-mingw32-gcc",
+      "realpath_suffix": "-gcc-win32",
+      "version_pattern": "x86_64-w64-mingw32-gcc \\(GCC\\) [0-9.]+-win32"
+    }
+  }
+}

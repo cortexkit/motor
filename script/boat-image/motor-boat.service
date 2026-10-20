@@ -8,10 +8,10 @@ User=root
 Group=root
 RuntimeDirectory=motor-tenant
 RuntimeDirectoryMode=0700
-Environment=HOME=/var/lib/motor-boat/home
+Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup
-Environment=PATH=/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Environment=TMPDIR=/var/lib/motor-boat/tmp
 UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
 ExecStartPre=+/usr/bin/python3 /usr/local/libexec/motor-boat-credentials.py --output /run/motor-boat-credentials.json
