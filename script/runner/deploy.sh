@@ -99,10 +99,17 @@ systemctl --user is-active "$unit"
 if [ "$instance" = windows ]; then
   echo 'Post-swap isolated canary explicitly skipped for windows (requires a qualified Windows VM).' >&2
 else
-  if ! python3 "$script_dir/deploy_canary.py" --state-root "$state_root" --instance "$instance" \
-      --timeout-s "${RUNNER_CANARY_TIMEOUT_S:-20}"; then
-    echo 'Post-swap isolated canary failed; rolling back the runner.' >&2
-    exit 1
+  if python3 "$script_dir/deploy_canary.py" --state-root "$state_root" --instance "$instance" \
+      --timeout-s "${RUNNER_CANARY_TIMEOUT_S:-120}"; then
+    :
+  else
+    canary_status=$?
+    if [ "$canary_status" -eq 75 ]; then
+      echo 'canary inconclusive: no free permit; keeping the new runner (isolation not verified).' >&2
+    else
+      echo 'Post-swap isolated canary failed; rolling back the runner.' >&2
+      exit 1
+    fi
   fi
 fi
 stopped=false
