@@ -987,6 +987,15 @@ async fn host_settled_attach_replays_identically_without_waking_or_relaying_vm()
 #[tokio::test]
 async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_terminal_and_usage()
 {
+    terminal_delivery_with_optional_guest_input_close(false).await;
+}
+
+#[tokio::test]
+async fn guest_input_close_after_terminal_does_not_cancel_client_billing_drain() {
+    terminal_delivery_with_optional_guest_input_close(true).await;
+}
+
+async fn terminal_delivery_with_optional_guest_input_close(close_input: bool) {
     let (runtime, fake, broker, requester, c) = fixture();
     let (mut client, server) = tokio::io::duplex(8192);
     let task = tokio::spawn(serve(runtime.clone(), server));
@@ -1038,6 +1047,30 @@ async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_t
     }
     let terminal = json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":7},"wall_ms":3000,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null});
     write_json(&mut guest, &terminal).unwrap();
+    if close_input {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .host
+                    .lock()
+                    .unwrap()
+                    .snapshot
+                    .billing
+                    .get(JOB)
+                    .is_some_and(|b| b.terminal.is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        guest.shutdown(std::net::Shutdown::Read).unwrap();
+        write_frame(&mut client, &json!({"type":"heartbeat"}))
+            .await
+            .unwrap();
+    }
     // Hold the job-relay result until its lifecycle terminal event arrives,
     // or until the 30-second wait for that event expires.
     assert!(tokio::time::timeout(
@@ -1046,6 +1079,10 @@ async fn real_terminal_is_held_until_billing_record_then_written_before_hosted_t
     )
     .await
     .is_err());
+    assert!(
+        !task.is_finished(),
+        "same connection must retain the terminal drain"
+    );
     assert!(runtime.host.lock().unwrap().snapshot.outbox.is_empty());
     runtime
         .host

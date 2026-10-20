@@ -117,6 +117,11 @@ written before `hosted_terminal`. Usage is enqueued after that write or after a
 60-second delivery grace. Detached results are retrieved through a host-only
 attach, never by resubmitting Run. Different broker settlement figures and final
 409 replies log `usage_billing_diverged` without changing the caller's figure.
+Once a connection owns a decoded Terminal or host-settled final records, later
+client bytes are no longer forwarded into the guest. An in-flight closed guest
+input write during that drain is a debug event, not a reason to cancel billing
+and final delivery. Pre-terminal relay failures remain errors. A terminal stored
+for the job is not proof that a particular client connection received its finals.
 
 One broker sender signs heartbeats every 15 seconds and on lifecycle change, and
 drains the durable usage outbox. Its counter is fsynced before signing, seeded at
