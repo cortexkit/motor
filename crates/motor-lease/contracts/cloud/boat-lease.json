@@ -30,6 +30,7 @@
         "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
         "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
         "placement_hint": null,
+        "avoid_host": null,
         "timeout_s": 100,
         "requester_jwk": {
           "kty": "OKP",
@@ -58,6 +59,7 @@
         "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
         "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
         "placement_hint": null,
+        "avoid_host": null,
         "timeout_s": 100,
         "requester_jwk": {
           "kty": "OKP",

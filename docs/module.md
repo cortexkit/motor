@@ -217,6 +217,11 @@ a 30-minute queue-wait budget and, when the runner supports it, run ahead of
 agent jobs; see [scheduling.md](scheduling.md). Source:
 `crates/motor-module/src/cli.rs`.
 
+`--hosted` sends that one job straight to a hosted lease instead of the build
+server, as the operator's test of the hosted path; without a configured broker
+it exits 204 and submits nothing. See
+[hosted-cutover.md](hosted-cutover.md#smoke-test-the-hosted-path).
+
 ### Reattaching after a disconnect
 
 At submission `ck-motor` generates 32 random bytes with the OS CSPRNG, encoded

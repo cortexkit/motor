@@ -368,11 +368,16 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
             .unwrap()
             .success());
     }
+    // The spilled lease must name the build server as the host to avoid.
+    let config = Config {
+        spill_avoid_host: Some("build-server-1".into()),
+        ..boat.config.clone()
+    };
     let mut results = Vec::new();
     for direct in [true, false] {
         let withdrawn = Arc::new(AtomicBool::new(false));
         let motor = Motor::with_connector(
-            boat.config.clone(),
+            config.clone(),
             &scratch.join(if direct {
                 "direct-state"
             } else {
@@ -438,6 +443,17 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
         .unwrap()
         .iter()
         .any(|(path, _)| path.ends_with("/release")));
+    // One provisioning reply, then the booking: both requests avoid the build
+    // server, so the spilled job is never placed back on it.
+    let avoided: Vec<_> = boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/v1/leases")
+        .map(|(_, body)| body["avoid_host"].clone())
+        .collect();
+    assert_eq!(avoided, ["build-server-1"; 2]);
 }
 
 #[tokio::test]

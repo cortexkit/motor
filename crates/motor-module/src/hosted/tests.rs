@@ -11,6 +11,7 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
         "spill_to_hosted",
         "spill_after_s",
         "spill_max_vcpus",
+        "spill_avoid_host",
     ] {
         assert!(json.get(key).is_none(), "{key}");
     }
@@ -19,6 +20,28 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
     assert!(config.validate().is_err());
     config.runner_instance = "test".into();
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn spill_avoid_host_follows_the_broker_host_id_grammar() {
+    let mut config = Config::default();
+    for good in [
+        "build-server-1",
+        "a",
+        "Host_2.example",
+        "a".repeat(64).as_str(),
+    ] {
+        config.spill_avoid_host = Some(good.to_string());
+        assert!(config.validate().is_ok(), "{good}");
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["spill_avoid_host"],
+            good
+        );
+    }
+    for bad in ["", "boat:test", "a b", "host/1", "a".repeat(65).as_str()] {
+        config.spill_avoid_host = Some(bad.to_string());
+        assert!(config.validate().is_err(), "{bad:?}");
+    }
 }
 
 #[test]
@@ -222,6 +245,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                     .unwrap(),
                 repo_hash: keyed_hash(&salt, "ck-repo-v1", scratch.0.to_str().unwrap()).unwrap(),
                 placement_hint: None,
+                avoid_host: None,
                 timeout_s: 30,
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
             },
@@ -796,10 +820,30 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         &request,
         (workspace, repo),
         Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
+        serde_json::from_value(v["request"]["body"]["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
+    // The broker's lease hash takes the fields in this order, and
+    // `avoid_host` comes right after `placement_hint`.
+    let text = serde_json::to_string(&body).unwrap();
+    let positions: Vec<_> = [
+        "job_id",
+        "vcpus",
+        "platform",
+        "net",
+        "workspace_key_hash",
+        "repo_hash",
+        "placement_hint",
+        "avoid_host",
+        "timeout_s",
+        "requester_jwk",
+    ]
+    .iter()
+    .map(|key| text.find(&format!("\"{key}\":")).unwrap())
+    .collect();
+    assert!(positions.is_sorted(), "{text}");
     assert_eq!(
         serde_json::to_value(reattach_body(&key)).unwrap(),
         v["reattach"]["request"]["body"]

@@ -18,6 +18,12 @@ pub struct Config {
     pub spill_after_s: u64,
     #[serde(skip_serializing_if = "is_default_spill_max_vcpus")]
     pub spill_max_vcpus: u32,
+    /// The build server's broker host id. A spilled lease asks the broker to
+    /// avoid this host, so a job leaving the busy build server is never placed
+    /// back on it. Unset sends no host to avoid. Omitted when unset so older
+    /// clients with a closed Config schema can still load the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spill_avoid_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_url: Option<String>,
     #[serde(skip_serializing_if = "BrokerTokenSource::is_default")]
@@ -99,6 +105,7 @@ impl Default for Config {
             spill_to_hosted: false,
             spill_after_s: 45,
             spill_max_vcpus: 8,
+            spill_avoid_host: None,
             broker_url: None,
             broker_token_source: BrokerTokenSource::CkAccount,
             runner_instance: "main".into(),
@@ -217,6 +224,15 @@ impl Config {
         }
         if self.worktree_roots.iter().any(|p| !p.is_absolute()) {
             return Err(io::Error::other("worktree_roots must be absolute"));
+        }
+        if self
+            .spill_avoid_host
+            .as_deref()
+            .is_some_and(|host| !motor_lease::valid_name(host))
+        {
+            return Err(io::Error::other(
+                "spill_avoid_host must be 1-64 ASCII letters, digits, '.', '_' or '-'",
+            ));
         }
         Ok(())
     }

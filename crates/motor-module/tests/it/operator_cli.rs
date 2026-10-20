@@ -242,6 +242,8 @@ fn body(frame: &Frame) -> String {
 struct WireClient {
     daemon: Arc<Daemon>,
     channel: u16,
+    /// Send `hosted: true` with each run, as `ck motor run --hosted` does.
+    hosted: bool,
 }
 
 struct WireStream(mpsc::UnboundedReceiver<Frame>);
@@ -267,9 +269,13 @@ impl RecordStream for WireStream {
 #[subc_client_rs::async_trait]
 impl ExecClient for WireClient {
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+        let mut params = json!(request);
+        if self.hosted {
+            params["hosted"] = json!(true);
+        }
         let frames = self
             .daemon
-            .send(self.channel, json!({"op":"exec.run", "params":request}))
+            .send(self.channel, json!({"op":"exec.run", "params":params}))
             .await;
         Ok(Box::new(WireStream(frames)))
     }
@@ -385,6 +391,7 @@ async fn drive(
     let client = WireClient {
         daemon: daemon.clone(),
         channel: DIRECT_CHANNEL,
+        hosted: false,
     };
     let mut out = Side("out", terminal.clone());
     let mut err = Side("err", terminal.clone());
@@ -609,6 +616,7 @@ async fn direct_secret_attach_streams_a_running_job_and_original_route_needs_no_
     let client = WireClient {
         daemon: daemon.clone(),
         channel: OTHER_DIRECT_CHANNEL,
+        hosted: false,
     };
     let args = cli::AttachArgs {
         job_id: id,
@@ -651,6 +659,7 @@ async fn attached_cli_cancels_with_secret_and_status_is_read_only() {
     let client = WireClient {
         daemon: daemon.clone(),
         channel: OTHER_DIRECT_CHANNEL,
+        hosted: false,
     };
     let mut args = cli::AttachArgs {
         job_id: id,
@@ -746,6 +755,7 @@ async fn cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret
     let client = WireClient {
         daemon: daemon.clone(),
         channel: DIRECT_CHANNEL,
+        hosted: false,
     };
     let terminal = Terminal::default();
     let path = f.scratch.join("reattach.key");
@@ -779,6 +789,7 @@ async fn cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret
     let client = WireClient {
         daemon,
         channel: OTHER_DIRECT_CHANNEL,
+        hosted: false,
     };
     for status in [false, true] {
         let mut errors = Vec::new();
@@ -1267,4 +1278,87 @@ async fn cli_returns_the_timeout_code_when_the_runner_stops_the_command() {
         "{:?}",
         terminal.lines()
     );
+}
+
+#[tokio::test]
+async fn hosted_runs_are_direct_only_and_need_a_configured_broker() {
+    // No broker URL, and a broker URL whose account token source is missing.
+    for broker_url in [None, Some("https://runners.example".to_string())] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let config = Config {
+            broker_url,
+            ..direct_config(&f)
+        };
+        let daemon = Daemon::start(&f, config).await;
+        for (channel, principal) in [(DIRECT_CHANNEL, direct()), (AFT_CHANNEL, aft())] {
+            assert_eq!(
+                daemon.bind(channel, principal).await.header.ty,
+                FrameType::Response
+            );
+        }
+        let mut params = json!(timed(&f, "true", 60));
+        params["hosted"] = json!(true);
+        let refused = error(
+            &daemon
+                .request(DIRECT_CHANNEL, "exec.run", params.clone())
+                .await,
+        );
+        assert_eq!(refused["code"], module::HOSTED_TEST_UNAVAILABLE);
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot run a job on a hosted runner"),
+            "{refused}"
+        );
+        // The CLI reports it as a usage refusal, with nothing submitted.
+        let client = WireClient {
+            daemon: daemon.clone(),
+            channel: DIRECT_CHANNEL,
+            hosted: true,
+        };
+        let terminal = Terminal::default();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let code = cli::drive(
+            &client,
+            &timed(&f, "true", 60),
+            &mut Side("out", terminal.clone()),
+            &mut Side("err", terminal.clone()),
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, cli::EXIT_USAGE, "{:?}", terminal.lines());
+        assert!(
+            terminal
+                .text("err")
+                .starts_with("ck motor run: --hosted unavailable: "),
+            "{:?}",
+            terminal.lines()
+        );
+        assert!(
+            f.proxy.frames.lock().unwrap().is_empty(),
+            "a refused hosted run must not reach the build server"
+        );
+        // An agent route can't ask for it: the key is ignored and the job runs
+        // on the build server as usual.
+        let mut frames = daemon
+            .send(AFT_CHANNEL, json!({"op":"exec.run", "params":params}))
+            .await;
+        let terminal = loop {
+            let frame = next(&mut frames).await;
+            assert_eq!(frame.header.ty, FrameType::StreamData, "{}", body(&frame));
+            if let StreamRecord::Terminal(terminal) = serde_json::from_slice(&frame.body).unwrap() {
+                break terminal;
+            }
+        };
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+        assert!(f
+            .proxy
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| matches!(frame,
+            motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id)));
+    }
 }

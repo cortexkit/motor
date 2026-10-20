@@ -43,6 +43,7 @@ pub fn lease_request() -> LeaseRequest {
         workspace_key_hash: base64url(&[5; 32]),
         repo_hash: base64url(&[6; 32]),
         placement_hint: None,
+        avoid_host: None,
         timeout_s: 10,
         requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
     }

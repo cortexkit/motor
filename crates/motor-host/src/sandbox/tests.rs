@@ -82,7 +82,7 @@ impl Fixture {
         let body = serde_json::to_vec(&json!({
             "job_id":JOB,"vcpus":1,"platform":"linux-x64","net":false,
             "workspace_key_hash":motor_lease::base64url(&[1;32]),
-            "repo_hash":motor_lease::base64url(&[2;32]),"placement_hint":null,
+            "repo_hash":motor_lease::base64url(&[2;32]),"placement_hint":null,"avoid_host":null,
             "timeout_s":30,"requester_jwk":RequesterJwk::from_key(&self.requester.verifying_key())
         }))
         .unwrap();
