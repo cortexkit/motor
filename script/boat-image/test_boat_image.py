@@ -72,15 +72,48 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn('x86_64-pc-windows-gnu', targets)
                 self.assertIn('x86_64-unknown-linux-musl', targets)
             if command[3].startswith('stable-'):
-                self.assertNotIn('clippy-x86_64-unknown-linux-gnu', components)
-                self.assertNotIn('rustfmt-x86_64-unknown-linux-gnu', components)
+                self.assertNotIn('clippy', components)
+                self.assertNotIn('rustfmt', components)
             else:
-                self.assertIn('clippy-x86_64-unknown-linux-gnu', components)
+                self.assertIn('clippy', components)
 
     def test_recipe_uses_server_bun_home_and_preserves_job_path_order(self):
         unit = (HERE / 'motor-boat.service').read_text()
         self.assertIn('Environment=HOME=/home/ubuntu\n', unit)
         self.assertIn('Environment=PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:', unit)
+
+    def test_recipe_passes_exact_rustup_component_and_target_argv(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init')
+        names = ('1.99.0-x86_64-unknown-linux-gnu', 'stable-x86_64-unknown-linux-gnu')
+        actual = {call.args[3]: call.args for call in run.call_args_list
+                  if call.args[:3] == ('rustup', 'toolchain', 'install') and call.args[3] in names}
+        targets = ('--target', 'aarch64-pc-windows-msvc', '--target', 'wasm32-unknown-unknown',
+                   '--target', 'wasm32-wasip1', '--target', 'x86_64-pc-windows-gnu',
+                   '--target', 'x86_64-pc-windows-msvc', '--target', 'x86_64-unknown-linux-gnu',
+                   '--target', 'x86_64-unknown-linux-musl')
+        self.assertEqual(actual, {
+            names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
+                       '--component', 'clippy', '--component', 'rustfmt', *targets),
+            names[1]: ('rustup', 'toolchain', 'install', names[1], '--profile', 'minimal', *targets),
+        })
+
+    def test_recipe_normalizes_preview_names_and_removes_extra_parts(self):
+        host = 'x86_64-unknown-linux-gnu'
+        self.assertEqual(install.rustup_component_name('clippy-preview-' + host, host), 'clippy')
+        self.assertEqual(install.rustup_component_name('rustfmt-preview-' + host, host), 'rustfmt')
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        name = '1.91.0-' + host
+        def run(*args, **kwargs):
+            if args == ('rustup', 'component', 'list', '--installed', '--toolchain', name):
+                return '\n'.join([*manifest['rust_toolchains'][name]['components'],
+                                  'rust-std-wasm32-unknown-unknown', 'rust-analyzer-' + host])
+            return ''
+        with patch.object(install, 'run', side_effect=run) as execute:
+            install.install_rust(manifest, '/rustup-init')
+        execute.assert_any_call('rustup', 'target', 'remove', '--toolchain', name, 'wasm32-unknown-unknown')
+        execute.assert_any_call('rustup', 'component', 'remove', '--toolchain', name, 'rust-analyzer')
 
     def test_recipe_bootstraps_empty_rustup_and_removes_unlisted_toolchains(self):
         manifest = json.loads(install.PARITY_PATH.read_text())

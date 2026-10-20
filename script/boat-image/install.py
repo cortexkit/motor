@@ -177,6 +177,11 @@ def state(pins):
             raise ValueError("FICLONE content mismatch")
 
 
+def rustup_component_name(component: str, host: str) -> str:
+    name = component.removesuffix('-' + host)
+    return {'clippy-preview': 'clippy', 'rustfmt-preview': 'rustfmt'}.get(name, name)
+
+
 def install_rust(manifest, installer):
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
     for line in run('rustup', 'toolchain', 'list', capture=True).splitlines():
@@ -186,16 +191,23 @@ def install_rust(manifest, installer):
         if name not in manifest['rust_toolchains']:
             run('rustup', 'toolchain', 'uninstall', name)
     for toolchain, spec in manifest["rust_toolchains"].items():
+        host = toolchain.split('-', 1)[1]
         args = ["rustup", "toolchain", "install", toolchain, "--profile", manifest["rust_profile"]]
-        for component in spec["components"]:
-            if not component.startswith("rust-std-"):
-                args.extend(("--component", component))
+        # Installed IDs include the host; --component takes bare names. The
+        # minimal profile supplies Cargo/rustc, and --target supplies rust-std.
+        components = {rustup_component_name(component, host) for component in spec['components']
+                      if not component.startswith('rust-std-')}
+        for component in sorted(components - {'cargo', 'rustc', 'rust-std'}):
+            args.extend(("--component", component))
         for target in spec["targets"]:
             args.extend(("--target", target))
         run(*args)
         installed = run('rustup', 'component', 'list', '--installed', '--toolchain', toolchain, capture=True)
         for component in set(installed.splitlines()) - set(spec['components']):
-            run('rustup', 'component', 'remove', '--toolchain', toolchain, component)
+            if component.startswith('rust-std-'):
+                run('rustup', 'target', 'remove', '--toolchain', toolchain, component.removeprefix('rust-std-'))
+            else:
+                run('rustup', 'component', 'remove', '--toolchain', toolchain, rustup_component_name(component, host))
     run("rustup", "default", manifest["rust_default"])
 
 
