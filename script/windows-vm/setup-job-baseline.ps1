@@ -176,6 +176,10 @@ if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $toolchain" -or $rustc
 $rustc | Write-Host
 & 'C:\rust\cargo\bin\cargo.exe' --version
 if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Cargo verification failed' }
+if (Test-Path "$PSScriptRoot\hyperv-runner") {
+    & 'C:\rust\cargo\bin\rustup.exe' component add clippy rustfmt --toolchain $toolchain
+    if ($LASTEXITCODE -ne 0) { throw 'Sealed hvsock image gate components failed to install' }
+}
 $git = 'C:\Program Files\Git\cmd\git.exe'
 if (-not (Test-Path 'C:\Program Files\Git\bin\bash.exe')) { throw 'Git Bash is missing' }
 & $git --version
@@ -185,6 +189,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Git long-path configuration failed' }
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
 foreach ($path in @('C:\m', 'C:\rust', $jobCargo)) { Add-MpPreference -ExclusionPath $path }
 
+$prebuiltHvsock = Test-Path "$PSScriptRoot\hyperv-runner"
+if ($prebuiltHvsock) {
+    if (-not $HyperVSpike) { throw 'Prebuilt hvsock agent requires Hyper-V provisioning mode' }
+    $prebuilt = "$PSScriptRoot\motor-winagent-prebuilt.exe"
+    $info = & $prebuilt --build-info
+    if ($LASTEXITCODE -ne 0 -or $info -notmatch 'transport=hvsock' -or $info -notmatch 'nonce=dvd') { throw 'Prebuilt agent is not a sealed-runner hvsock/DVD-nonce build' }
+    Copy-Item $prebuilt "$motor\motor-winagent.exe" -Force
+    Copy-Item "$PSScriptRoot\motor-runner-prebuilt.exe" "$motor\motor-peer.exe" -Force
+    # This task performs no action on normal job media. Qualification media asks
+    # it to contact a victim listener before any parent connection is admitted.
+    $action = New-ScheduledTaskAction -Execute "$motor\motor-peer.exe" -Argument 'probe-peers'
+    Register-ScheduledTask -TaskName MotorPeerQualification -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -User SYSTEM -RunLevel Highest -Force | Out-Null
+} else {
 foreach ($name in @('Cargo.toml', 'Cargo.lock', 'src')) {
     if (-not (Test-Path (Join-Path $AgentSource $name))) { throw "Standalone agent source is missing $name" }
 }
@@ -194,10 +211,11 @@ if ($HyperVSpike) { $agentOptions = @('--features', 'hyperv-spike') }
 & 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple @agentOptions
 if ($LASTEXITCODE -ne 0) { throw "Agent release build failed: $LASTEXITCODE" }
 Copy-Item "$AgentSource\target\$hostTriple\release\motor-winagent.exe" "$motor\motor-winagent.exe" -Force
+}
 $agentHash = (Get-FileHash "$motor\motor-winagent.exe" -Algorithm SHA256).Hash
 Set-Content "$PSScriptRoot\winagent.sha256" "$agentHash  motor-winagent.exe" -Encoding ascii
 Write-Host "Installed motor-winagent SHA-256: $agentHash"
-if ($HyperVSpike) {
+if ($HyperVSpike -and -not $prebuiltHvsock) {
     & 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple --example hyperv-spike
     if ($LASTEXITCODE -ne 0) { throw "Spike host client build failed: $LASTEXITCODE" }
     Copy-Item "$AgentSource\target\$hostTriple\release\examples\hyperv-spike.exe" "$PSScriptRoot\hyperv-spike.exe"

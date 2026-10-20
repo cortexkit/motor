@@ -3,11 +3,13 @@ use crate::storage::atomic_json;
 use crate::storage::{invalid, Catalog, Workspace};
 use motor_protocol::*;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
 };
@@ -125,10 +127,21 @@ fn stage_snapshot_ignored(path: &Path, tree_hash: &str) -> io::Result<()> {
 }
 
 pub(crate) fn absolute(path: &str) -> bool {
-    Path::new(path).is_absolute()
-        && !Path::new(path)
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    #[cfg(windows)]
+    {
+        // These are caller checkout identifiers, not paths on the Windows host.
+        // A POSIX root is intentionally not Path::is_absolute on Windows.
+        path.starts_with('/')
+            && !path.contains(['\\', '\0'])
+            && !path.split('/').any(|part| matches!(part, "." | ".."))
+    }
+    #[cfg(unix)]
+    {
+        Path::new(path).is_absolute()
+            && !Path::new(path)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    }
 }
 
 pub(crate) fn validate(
@@ -748,7 +761,12 @@ impl Trees {
                         return Err(invalid("sibling link conflicts"));
                     }
                 } else {
+                    #[cfg(unix)]
                     std::os::unix::fs::symlink(path, link)?;
+                    #[cfg(windows)]
+                    return Err(invalid(
+                        "native Windows hosts do not materialize host workspaces",
+                    ));
                 }
             }
         }

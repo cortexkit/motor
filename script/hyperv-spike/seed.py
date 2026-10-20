@@ -53,7 +53,11 @@ def answer(template, password):
     return ET.tostring(root, encoding="unicode")
 
 
-def stage(destination, archive):
+def stage(destination, archive, guest_agent=None, peer_runner=None):
+    if (guest_agent is None) != (peer_runner is None):
+        raise ValueError("Prebuilt hvsock agent and peer runner must be supplied together")
+    if guest_agent is not None and (not guest_agent.is_file() or not peer_runner.is_file()):
+        raise ValueError("Both prebuilt executables must exist")
     if destination.exists():
         raise ValueError("Seed already exists; remove deliberately after saving logs")
     verify_archive(archive)
@@ -70,6 +74,12 @@ def stage(destination, archive):
         print(f"PASS seed-copy {name} SHA256={digest}")
     shutil.copyfile(archive, destination / ARCHIVE_NAME)
     verify_archive(destination / ARCHIVE_NAME)
+    if guest_agent is not None:
+        (destination / "hyperv-runner").touch()
+        shutil.copyfile(guest_agent, destination / "motor-winagent-prebuilt.exe")
+        shutil.copyfile(peer_runner, destination / "motor-runner-prebuilt.exe")
+        print("PASS seed-stage prebuilt hvsock runner image; no agent build in guest")
+        return
     agent = REPO / "crates/motor-winagent"
     target = destination / "motor-winagent"
     target.mkdir()
@@ -84,9 +94,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--powershell-archive", required=True, type=Path)
+    parser.add_argument("--guest-agent", type=Path)
+    parser.add_argument("--peer-runner", type=Path)
     args = parser.parse_args()
     try:
-        stage(args.destination, args.powershell_archive)
+        stage(args.destination, args.powershell_archive, args.guest_agent, args.peer_runner)
     except (OSError, ValueError) as error:
         raise SystemExit(f"FAIL seed-stage {error}") from error
 

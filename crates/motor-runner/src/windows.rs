@@ -5,17 +5,32 @@
 use crate::{backend::*, engine::Config, platform, storage::*, workspace::Trees};
 use motor_protocol::Uuid;
 use serde::Deserialize;
+#[cfg(any(unix, test))]
+use std::process::Output;
 use std::{
     fs, io,
-    os::unix::fs::PermissionsExt,
-    path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    path::{Path, PathBuf},
+    process::Command,
 };
+#[cfg(unix)]
+use std::{os::unix::fs::PermissionsExt, path::Component};
 
 mod agent;
 mod caches;
+#[cfg(unix)]
 mod host;
+#[cfg(windows)]
+#[path = "windows/hyperv_host.rs"]
+mod host;
+#[cfg(windows)]
+mod hvsock;
 pub(crate) mod prep;
+#[cfg(windows)]
+mod trusted_prep;
+#[cfg(unix)]
+pub(crate) mod vm;
+#[cfg(windows)]
+#[path = "windows/hyperv.rs"]
 pub(crate) mod vm;
 pub(crate) use agent::{PreparedVm, Runtime};
 pub(crate) use caches::CacheDisks;
@@ -24,6 +39,22 @@ pub(crate) use vm::VmHook;
 
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
     prep::execute(path)
+}
+#[cfg(windows)]
+pub(crate) fn probe_peers() -> io::Result<()> {
+    hvsock::probe_peers()
+}
+#[cfg(windows)]
+pub(crate) fn qualify_prep(config: &Config) -> io::Result<()> {
+    trusted_prep::qualify(config)
+}
+#[cfg(windows)]
+pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {
+    trusted_prep::probe(args)
+}
+#[cfg(windows)]
+pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
+    vm::qualify_disconnect(config)
 }
 
 #[cfg(test)]
@@ -40,12 +71,24 @@ pub(crate) struct VmConfig {
     pub memory_mib: u64,
     pub cpu_set: Vec<u32>,
     pub toolchain_version: String,
+    #[cfg(windows)]
+    pub parent_sha256: String,
+    #[cfg(windows)]
+    pub prep_cargo_sha256: String,
+    #[cfg(windows)]
+    #[serde(default = "one_slot")]
+    pub concurrent_jobs: u32,
+}
+#[cfg(windows)]
+fn one_slot() -> u32 {
+    1
 }
 fn default_quota() -> u64 {
     40 << 30
 }
 
 impl VmConfig {
+    #[cfg(unix)]
     pub(crate) fn load(path: &Path) -> io::Result<Self> {
         let vm: Self = toml::from_str(&fs::read_to_string(path)?)
             .map_err(|e| invalid(format!("--vm-config: {e}")))?;
@@ -99,6 +142,10 @@ impl VmConfig {
         }
         Ok(vm)
     }
+    #[cfg(windows)]
+    pub(crate) fn load(path: &Path) -> io::Result<Self> {
+        host::load(path)
+    }
     pub(crate) fn baseline_path(&self) -> PathBuf {
         self.layout_root.join("baselines").join(&self.baseline)
     }
@@ -107,6 +154,7 @@ impl VmConfig {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn command(config: &Config, program: &str, args: &[String]) -> io::Result<Output> {
     #[cfg(test)]
     if let Some(run) = &config.windows_command {
@@ -237,12 +285,15 @@ impl Backend for WindowsBackend {
                 }
             }
         }
+        #[cfg(windows)]
+        vm::cleanup_orphans(config)?;
         config
             .windows
             .as_ref()
             .expect("validated Windows config")
             .caches()
             .reconcile()?;
+        #[cfg(unix)]
         vm::cleanup_orphans(config)?;
         Ok(Vec::new())
     }

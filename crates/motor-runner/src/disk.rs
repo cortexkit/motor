@@ -13,7 +13,6 @@ fn javascript_entry_lock(state: &Path, path: &Path) -> io::Result<Option<File>> 
         Err(error) => Err(error),
     }
 }
-use std::os::unix::fs::MetadataExt;
 
 struct Candidate {
     path: PathBuf,
@@ -82,11 +81,12 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
     let mut bytes: u64 = 0;
     while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.dev() != device {
+        let (dev, ino, allocated) = crate::filesystem::identity(&path)?;
+        if dev != device {
             return Err(invalid("pressure cleanup cannot cross a mount"));
         }
-        if inodes.insert((metadata.dev(), metadata.ino())) {
-            bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+        if inodes.insert((dev, ino)) {
+            bytes = bytes.saturating_add(allocated);
         }
         if metadata.is_dir() {
             for entry in fs::read_dir(path)? {
@@ -526,7 +526,7 @@ impl Runner {
 
     fn windows_disk_candidates(&self, inner: &Inner) -> io::Result<Vec<Candidate>> {
         let vm = self.core.config.windows.as_ref().expect("Windows config");
-        let device = fs::symlink_metadata(&self.core.trees.state)?.dev();
+        let device = crate::filesystem::device(&self.core.trees.state)?;
         let mut candidates: Vec<_> = vm
             .caches()
             .candidates(&self.live_cache_disks(inner), device)?
@@ -551,7 +551,7 @@ impl Runner {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            if !metadata.is_dir() || metadata.dev() != device {
+            if !metadata.is_dir() || crate::filesystem::device(&root)? != device {
                 return Err(invalid(
                     "Windows cleanup root is a symlink or crosses a mount",
                 ));
@@ -559,7 +559,7 @@ impl Runner {
             for entry in fs::read_dir(root)? {
                 let entry = entry?;
                 let metadata = fs::symlink_metadata(entry.path())?;
-                if !metadata.is_dir() || metadata.dev() != device {
+                if !metadata.is_dir() || crate::filesystem::device(&entry.path())? != device {
                     continue;
                 }
                 let id = entry.file_name().to_string_lossy().parse::<Uuid>().ok();
@@ -617,7 +617,7 @@ impl Runner {
         if free >= soft {
             return Ok(None);
         }
-        let device = fs::metadata(&self.core.trees.state)?.dev();
+        let device = crate::filesystem::device(&self.core.trees.state)?;
         let mut attempted = BTreeSet::new();
         let mut skipped_recent = BTreeSet::new();
         loop {

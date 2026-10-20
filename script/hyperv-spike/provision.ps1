@@ -13,6 +13,8 @@ param(
     [string]$Root = 'C:\motor-spike\hyperv',
     [string]$ProvisionSwitch = 'Default Switch',
     [string]$Python = 'python',
+    [string]$GuestAgentPath,
+    [string]$PeerRunnerPath,
     [int]$TimeoutMinutes = 180
 )
 . "$PSScriptRoot\common.ps1"
@@ -45,7 +47,12 @@ try {
     if (-not (Test-Path $archive)) {
         Invoke-WebRequest 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive -UseBasicParsing
     }
-    & $Python "$PSScriptRoot\seed.py" --destination $seed --powershell-archive $archive | Out-Host
+    $prebuilt = @()
+    if ($GuestAgentPath -or $PeerRunnerPath) {
+        if (-not $GuestAgentPath -or -not $PeerRunnerPath) { throw 'Supply both prebuilt hvsock agent and peer runner' }
+        $prebuilt = @('--guest-agent', (Resolve-Path $GuestAgentPath).Path, '--peer-runner', (Resolve-Path $PeerRunnerPath).Path)
+    }
+    & $Python "$PSScriptRoot\seed.py" --destination $seed --powershell-archive $archive @prebuilt | Out-Host
     Assert-Spike ($LASTEXITCODE -eq 0) 'seed-rendered' $seed
     New-SpikeIso $seed $seedIso
 
@@ -111,13 +118,19 @@ try {
         $agent = Join-Path $volume 'ProgramData\Motor\motor-winagent.exe'
         $expected = ((Get-Content (Join-Path $provision 'winagent.sha256') -Raw) -split '\s+')[0]
         Assert-Spike ((Get-FileHash $agent).Hash -eq $expected) 'installed-agent-hash' $expected
-        Copy-Item (Join-Path $provision 'hyperv-spike.exe') (Join-Path $Root 'hyperv-spike.exe')
+        if (-not $GuestAgentPath) { Copy-Item (Join-Path $provision 'hyperv-spike.exe') (Join-Path $Root 'hyperv-spike.exe') }
+        if ($GuestAgentPath) {
+            Assert-Spike ((Get-FileHash $agent).Hash -eq (Get-FileHash $GuestAgentPath).Hash) 'sealed-prebuilt-agent' $agent
+            Assert-Spike (-not (Test-Path (Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'))) 'no-serial-queue-setting' $disk
+        }
         # A baseline never carries a job nonce. Each differencing disk gets its own.
         Assert-Spike (-not (Test-Path (Join-Path $volume 'ProgramData\Motor\hyperv-nonce.txt'))) 'no-baseline-nonce' $disk
     } -ReadOnly
     $expected = ((Get-Content (Join-Path $logs 'winagent.sha256') -Raw) -split '\s+')[0]
-    & (Join-Path $Root 'hyperv-spike.exe') --version | Out-Host
-    Assert-Spike ($LASTEXITCODE -eq 0) 'host-probe-runnable' ((Get-FileHash (Join-Path $Root 'hyperv-spike.exe')).Hash)
+    if (-not $GuestAgentPath) {
+        & (Join-Path $Root 'hyperv-spike.exe') --version | Out-Host
+        Assert-Spike ($LASTEXITCODE -eq 0) 'host-probe-runnable' ((Get-FileHash (Join-Path $Root 'hyperv-spike.exe')).Hash)
+    }
     Remove-Item $seed -Recurse -Force
     Remove-Item $seedIso -Force
     Remove-Item (Join-Path $Root 'provision-vm') -Recurse -Force

@@ -5,6 +5,40 @@ use std::time::Instant;
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
 
+#[derive(serde::Deserialize)]
+pub struct HypervDisk {
+    pub number: u32,
+    pub lun: u32,
+    pub boot: bool,
+    pub system: bool,
+}
+
+/// This runner expects the OS at SCSI LUN 0 and the cache at LUN 1. Require the
+/// complete two-disk topology, not merely the absence of a virtio serial.
+pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
+    if disks.len() != 2
+        || disks
+            .iter()
+            .filter(|d| d.lun == 0 && d.boot && d.system)
+            .count()
+            != 1
+    {
+        return Err(io::Error::other(
+            "unexpected Hyper-V OS/cache disk topology",
+        ));
+    }
+    let cache = disks
+        .iter()
+        .find(|d| d.lun == 1 && !d.boot && !d.system)
+        .ok_or_else(|| {
+            io::Error::other("Hyper-V cache must be the non-system disk at SCSI LUN 1")
+        })?;
+    if disks[0].number == disks[1].number {
+        return Err(io::Error::other("duplicate Hyper-V disk number"));
+    }
+    Ok(cache.number)
+}
+
 pub fn select_cache_disk<'a>(disks: impl IntoIterator<Item = (u32, &'a str)>) -> io::Result<u32> {
     let mut matches = disks
         .into_iter()
@@ -88,8 +122,12 @@ pub struct PreparedCache {
     pub volume_ms: u64,
 }
 
-fn check_disk(storage: &mut impl CacheStorage, number: u32) -> io::Result<DiskLayout> {
-    if storage.serial()? != CACHE_DISK_SERIAL {
+fn check_disk(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    serial: &str,
+) -> io::Result<DiskLayout> {
+    if storage.serial()? != serial {
         return Err(io::Error::other("cache disk serial changed"));
     }
     let windows = storage.windows_disks()?;
@@ -133,7 +171,18 @@ fn check_disk(storage: &mut impl CacheStorage, number: u32) -> io::Result<DiskLa
 }
 
 pub fn prepare_cache(storage: &mut impl CacheStorage, number: u32) -> io::Result<PreparedCache> {
-    let raw = matches!(check_disk(storage, number)?, DiskLayout::Raw);
+    prepare_cache_with_serial(storage, number, CACHE_DISK_SERIAL)
+}
+
+pub fn prepare_cache_with_serial(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    serial: &str,
+) -> io::Result<PreparedCache> {
+    if serial.trim().is_empty() || serial.len() > 256 {
+        return Err(io::Error::other("cache disk lacks a bounded stable serial"));
+    }
+    let raw = matches!(check_disk(storage, number, serial)?, DiskLayout::Raw);
     let started = Instant::now();
     storage.make_writable()?;
     let native_attributes_ms = started.elapsed().as_millis() as u64;
@@ -142,7 +191,7 @@ pub fn prepare_cache(storage: &mut impl CacheStorage, number: u32) -> io::Result
     if raw {
         storage.initialize_raw()?;
         powershell_ms = started.elapsed().as_millis() as u64;
-        if !matches!(check_disk(storage, number)?, DiskLayout::Gpt(_)) {
+        if !matches!(check_disk(storage, number, serial)?, DiskLayout::Gpt(_)) {
             return Err(io::Error::other("cache initialization did not create GPT"));
         }
     }
@@ -201,11 +250,16 @@ pub fn empty_mount_directory(path: &std::path::Path) -> io::Result<()> {
 }
 
 pub fn mount_script(number: u32) -> String {
+    mount_script_with_serial(number, CACHE_DISK_SERIAL)
+}
+
+pub fn mount_script_with_serial(number: u32, serial: &str) -> String {
+    let serial = serial.replace('\'', "''");
     format!(
         r#"$ErrorActionPreference='Stop';
 $d=Get-Disk -Number {number};
 if($d.IsBoot -or $d.IsSystem) {{ throw 'cache disk is a boot or system disk' }};
-if($d.SerialNumber.Trim() -cne 'motor-cache') {{ throw 'cache disk serial changed' }};
+if($d.SerialNumber.Trim() -cne '{serial}') {{ throw 'cache disk serial changed' }};
 if($d.IsOffline -or $d.IsReadOnly) {{ throw 'cache disk is not online and writable' }};
 if($d.PartitionStyle -ne 'RAW') {{ throw 'only a RAW cache disk may be initialized' }};
 $d | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null"#,
@@ -215,6 +269,47 @@ $d | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hyperv_cache_selection_requires_exact_two_disk_scsi_topology() {
+        use super::*;
+        let os = || HypervDisk {
+            number: 0,
+            lun: 0,
+            boot: true,
+            system: true,
+        };
+        let cache = || HypervDisk {
+            number: 1,
+            lun: 1,
+            boot: false,
+            system: false,
+        };
+        assert_eq!(select_hyperv_cache_disk(&[os(), cache()]).unwrap(), 1);
+        assert_eq!(select_hyperv_cache_disk(&[cache(), os()]).unwrap(), 1);
+        assert!(select_hyperv_cache_disk(&[cache()]).is_err());
+        assert!(select_hyperv_cache_disk(&[os(), cache(), cache()]).is_err());
+        let mut system_cache = cache();
+        system_cache.system = true;
+        assert!(select_hyperv_cache_disk(&[os(), system_cache]).is_err());
+        let mut wrong_lun = cache();
+        wrong_lun.lun = 2;
+        assert!(select_hyperv_cache_disk(&[os(), wrong_lun]).is_err());
+        let mut duplicate = cache();
+        duplicate.number = 0;
+        assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
+    }
+
+    #[test]
+    fn hyperv_formatter_quotes_the_captured_serial_and_retains_raw_guard() {
+        let script = super::mount_script_with_serial(1, "serial'quoted");
+        assert!(script.contains("-cne 'serial''quoted'"));
+        assert!(script.contains("$d.IsBoot -or $d.IsSystem"));
+        assert!(script.contains("$d.PartitionStyle -ne 'RAW'"));
+        assert_eq!(
+            super::mount_script(1),
+            super::mount_script_with_serial(1, super::CACHE_DISK_SERIAL)
+        );
+    }
     #[test]
     fn privileged_dismount_never_resolves_the_job_mount_folder() {
         // Dismount runs after the job can replace C:\t. Fence the actual
@@ -290,6 +385,19 @@ mod tests {
                 formats: 0,
             }
         }
+    }
+    #[test]
+    fn captured_hyperv_serial_is_rechecked_before_any_cache_write() {
+        let mut storage = FakeStorage {
+            serial: "hyperv-stable-serial".into(),
+            ..Default::default()
+        };
+        assert!(prepare_cache_with_serial(&mut storage, 7, "different-serial").is_err());
+        assert_eq!(storage.mutations, 0);
+        assert!(prepare_cache_with_serial(&mut storage, 7, "").is_err());
+        assert_eq!(storage.mutations, 0);
+        assert!(prepare_cache_with_serial(&mut storage, 7, "hyperv-stable-serial").is_ok());
+        assert_eq!(storage.mutations, 1);
     }
     impl CacheStorage for FakeStorage {
         fn serial(&mut self) -> io::Result<String> {

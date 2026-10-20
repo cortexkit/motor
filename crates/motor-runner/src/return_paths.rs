@@ -4,14 +4,18 @@ use motor_protocol::{
     MAX_FRAME_BYTES,
 };
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::{
     ffi::CString,
-    fs::{self, File},
-    io::{self, Read},
+    fs, io,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
+};
+use std::{
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -21,6 +25,7 @@ use std::{
 // Follow links through pinned directory descriptors, never through openat.
 // Resolving '..' against the descriptor stack prevents a link from leaving the
 // workspace, including a dangling link whose outside target does not exist.
+#[cfg(unix)]
 fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cause> {
     let mut directories = vec![directory.try_clone().map_err(|_| Cause::Missing)?];
     let mut pending: std::collections::VecDeque<_> = relative
@@ -98,6 +103,7 @@ fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cau
     Err(Cause::NotRegular)
 }
 
+#[cfg(unix)]
 fn open_directory(path: &Path) -> Result<(File, PathBuf), Cause> {
     let parent = path
         .parent()
@@ -121,6 +127,16 @@ fn open_directory(path: &Path) -> Result<(File, PathBuf), Cause> {
     let directory = unsafe { File::from_raw_fd(fd) };
     let root = parent.join(root_name);
     Ok((directory, root))
+}
+
+// Windows jobs collect through the guest protocol, never through host paths.
+#[cfg(windows)]
+fn open_file(_: &Path, _: &File, _: &Path) -> Result<File, Cause> {
+    Err(Cause::Escape)
+}
+#[cfg(windows)]
+fn open_directory(_: &Path) -> Result<(File, PathBuf), Cause> {
+    Err(Cause::Escape)
 }
 
 pub(crate) fn collect(request: &Run, seq: u64) -> ReturnResult {

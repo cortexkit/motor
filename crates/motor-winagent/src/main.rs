@@ -8,7 +8,11 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "hyperv-spike")]
     if std::env::args().skip(1).eq(["--build-info"]) {
-        if cfg!(feature = "hyperv-hvsock") {
+        if cfg!(feature = "hyperv-runner") {
+            println!(
+                "motor-winagent hyperv-runner agent_diag=3 transport=hvsock peer=parent nonce=dvd protocol=4"
+            );
+        } else if cfg!(feature = "hyperv-hvsock") {
             println!(
                 "motor-winagent hyperv-spike agent_diag=3 transport=hvsock peer=parent protocol=4"
             );
@@ -34,12 +38,14 @@ mod guest {
     macro_rules! diagnostic {
         ($($arg:tt)*) => {{ #[cfg(feature = "hyperv-spike")] crate::hyperv_diag::event(&format!($($arg)*)); }};
     }
+    #[cfg(not(feature = "hyperv-runner"))]
+    use motor_winagent::SMBIOS_NONCE_PREFIX;
+    #[cfg(not(feature = "hyperv-runner"))]
+    use motor_winagent::cache::{prepare_cache, select_cache_disk, storage_serial};
     use motor_winagent::{
         CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CACHE_MOUNT, CHUNK_BYTES, CacheAce, CacheTimings,
         Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
-        SMBIOS_NONCE_PREFIX, Stream,
-        cache::{prepare_cache, select_cache_disk, storage_serial},
-        cache_has_modify_grant,
+        Stream, cache_has_modify_grant,
         cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
         collect_changes,
         environment::{encode_block, git_native_bin, read_user_environment},
@@ -547,22 +553,40 @@ mod guest {
             .map_err(|_| invalid("PowerShell output is not UTF-8"))
     }
     fn boot_nonce() -> io::Result<String> {
-        if cfg!(feature = "hyperv-spike") {
-            return motor_winagent::transport::hyperv_nonce(&std::fs::read_to_string(
-                motor_winagent::transport::HYPERV_NONCE_FILE,
-            )?);
+        #[cfg(feature = "hyperv-runner")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(media) = motor_winagent::transport::nonce_dvd()? {
+                    return motor_winagent::transport::hyperv_nonce(&std::fs::read_to_string(
+                        media.join("nonce.txt"),
+                    )?);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(invalid("boot requires exactly one MOTORNONCE DVD"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
-        let strings = powershell(
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); (Get-CimInstance Win32_ComputerSystem).OEMStringArray",
-        )?;
-        let nonces: Vec<_> = strings
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(SMBIOS_NONCE_PREFIX))
-            .collect();
-        if nonces.len() != 1 || nonces[0].is_empty() {
-            return Err(invalid("SMBIOS must contain exactly one motor boot nonce"));
+        #[cfg(not(feature = "hyperv-runner"))]
+        {
+            if cfg!(feature = "hyperv-spike") {
+                return motor_winagent::transport::hyperv_nonce(&std::fs::read_to_string(
+                    motor_winagent::transport::HYPERV_NONCE_FILE,
+                )?);
+            }
+            let strings = powershell(
+                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); (Get-CimInstance Win32_ComputerSystem).OEMStringArray",
+            )?;
+            let nonces: Vec<_> = strings
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix(SMBIOS_NONCE_PREFIX))
+                .collect();
+            if nonces.len() != 1 || nonces[0].is_empty() {
+                return Err(invalid("SMBIOS must contain exactly one motor boot nonce"));
+            }
+            Ok(nonces[0].to_owned())
         }
-        Ok(nonces[0].to_owned())
     }
 
     struct User {
@@ -705,66 +729,85 @@ mod guest {
         }
     }
     fn cache_disk(reporter: &CacheReporter) -> io::Result<u32> {
-        let mut disks = Vec::new();
-        // The sealed VM has two disks. Enumerate a bounded set so unexpected
-        // device topology fails closed instead of selecting an arbitrary disk.
-        for number in 0..32 {
-            let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
-            let disk = reporter.step(CacheStep::DiskOpen, || {
-                let raw = unsafe {
-                    CreateFileW(
-                        path.as_ptr(),
-                        0,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        null(),
-                        OPEN_EXISTING,
-                        0,
-                        null_mut(),
-                    )
-                };
-                if raw == INVALID_HANDLE_VALUE {
-                    let error = io::Error::last_os_error();
-                    if matches!(error.raw_os_error(), Some(2 | 3)) {
-                        return Ok(None);
-                    }
-                    return Err(error);
-                }
-                Ok(Some(Handle::new(raw)?))
-            })?;
-            let Some(disk) = disk else {
-                continue;
-            };
-            // StorageDeviceProperty / PropertyStandardQuery, with no additional
-            // parameters. The descriptor includes the virtio block serial.
-            let query = [0u32; 3];
-            let mut descriptor = [0u8; 4096];
-            let mut returned = 0;
-            reporter.step(CacheStep::DiskSerial, || unsafe {
-                win32(DeviceIoControl(
-                    disk.0,
-                    IOCTL_STORAGE_QUERY_PROPERTY,
-                    query.as_ptr().cast(),
-                    size_of_val(&query) as u32,
-                    descriptor.as_mut_ptr().cast(),
-                    descriptor.len() as u32,
-                    &mut returned,
-                    null_mut(),
-                ))
-            })?;
-            disks.push((
-                number,
-                storage_serial(&descriptor[..returned as usize])?.to_owned(),
-            ));
+        #[cfg(feature = "hyperv-runner")]
+        {
+            let inventory = reporter.step(CacheStep::DiskSerial, || powershell(r#"
+$ErrorActionPreference='Stop'
+$items = @(Get-CimInstance Win32_DiskDrive | ForEach-Object {
+    $disk = Get-Disk -Number $_.Index
+    if ([string]$disk.BusType -ne 'SCSI') { throw 'Unexpected non-SCSI disk in Hyper-V job' }
+    @{number=[uint32]$_.Index; lun=[uint32]$_.SCSILogicalUnit; boot=[bool]$disk.IsBoot; system=[bool]$disk.IsSystem}
+})
+ConvertTo-Json -InputObject $items -Compress
+"#))?;
+            diagnostic!("Hyper-V disk topology {}", inventory);
+            let disks: Vec<motor_winagent::cache::HypervDisk> =
+                serde_json::from_str(&inventory).map_err(|e| invalid(e.to_string()))?;
+            motor_winagent::cache::select_hyperv_cache_disk(&disks)
         }
-        select_cache_disk(
-            disks
-                .iter()
-                .map(|(number, serial)| (*number, serial.as_str())),
-        )
+        #[cfg(not(feature = "hyperv-runner"))]
+        {
+            let mut disks = Vec::new();
+            // QEMU assigns a fixed serial to the cache disk. Bound enumeration
+            // and select only that serial, never a disk merely by its number.
+            for number in 0..32 {
+                let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
+                let disk = reporter.step(CacheStep::DiskOpen, || {
+                    let raw = unsafe {
+                        CreateFileW(
+                            path.as_ptr(),
+                            0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            null(),
+                            OPEN_EXISTING,
+                            0,
+                            null_mut(),
+                        )
+                    };
+                    if raw == INVALID_HANDLE_VALUE {
+                        let error = io::Error::last_os_error();
+                        if matches!(error.raw_os_error(), Some(2 | 3)) {
+                            return Ok(None);
+                        }
+                        return Err(error);
+                    }
+                    Ok(Some(Handle::new(raw)?))
+                })?;
+                let Some(disk) = disk else {
+                    continue;
+                };
+                // StorageDeviceProperty / PropertyStandardQuery, with no additional
+                // parameters. The descriptor includes the virtio block serial.
+                let query = [0u32; 3];
+                let mut descriptor = [0u8; 4096];
+                let mut returned = 0;
+                reporter.step(CacheStep::DiskSerial, || unsafe {
+                    win32(DeviceIoControl(
+                        disk.0,
+                        IOCTL_STORAGE_QUERY_PROPERTY,
+                        query.as_ptr().cast(),
+                        size_of_val(&query) as u32,
+                        descriptor.as_mut_ptr().cast(),
+                        descriptor.len() as u32,
+                        &mut returned,
+                        null_mut(),
+                    ))
+                })?;
+                disks.push((
+                    number,
+                    storage_serial(&descriptor[..returned as usize])?.to_owned(),
+                ));
+            }
+            select_cache_disk(
+                disks
+                    .iter()
+                    .map(|(number, serial)| (*number, serial.as_str())),
+            )
+        }
     }
     impl Cache {
         fn mount(user: &User, reporter: &CacheReporter) -> io::Result<Self> {
-            if cfg!(feature = "hyperv-spike") {
+            if cfg!(feature = "hyperv-spike") && !cfg!(feature = "hyperv-runner") {
                 // This spike measures one disposable OS disk, not cache reuse.
                 // Keep the same empty-folder checks and SID-only Modify grant;
                 // C:\t and all command writes disappear with the OS overlay.
@@ -793,10 +836,17 @@ mod guest {
             let started = Instant::now();
             let number = reporter.step(CacheStep::DiskSelection, || cache_disk(reporter))?;
             let disk_selection_ms = started.elapsed().as_millis() as u64;
+            #[cfg(not(feature = "hyperv-runner"))]
             let disk = prepare_cache(
                 &mut crate::storage::WindowsStorage::open(number, reporter)?,
                 number,
             )?;
+            #[cfg(feature = "hyperv-runner")]
+            let disk = {
+                let mut storage = crate::storage::WindowsStorage::open(number, reporter)?;
+                let serial = storage.capture_serial()?;
+                motor_winagent::cache::prepare_cache_with_serial(&mut storage, number, &serial)?
+            };
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")
                 || !volume.ends_with("}\\")
@@ -980,7 +1030,7 @@ mod guest {
             }
         }
         fn dismount(&mut self) -> io::Result<()> {
-            if cfg!(feature = "hyperv-spike") {
+            if cfg!(feature = "hyperv-spike") && !cfg!(feature = "hyperv-runner") {
                 self.clean = true;
                 return Ok(());
             }

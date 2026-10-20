@@ -1,8 +1,9 @@
 //! Native queries for the sealed VM's RAW or GPT cache disk.
 
+#[cfg(not(feature = "hyperv-runner"))]
+use motor_winagent::cache::mount_script;
 use motor_winagent::cache::{
-    CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout, PartitionKind, mount_script,
-    storage_serial,
+    CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout, PartitionKind, storage_serial,
 };
 use motor_winagent::cache_steps::{CacheReporter, CacheStep};
 use std::{
@@ -198,6 +199,8 @@ fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Vec<u32>> {
 }
 
 pub struct WindowsStorage {
+    #[cfg(feature = "hyperv-runner")]
+    expected_serial: String,
     disk: Handle,
     number: u32,
     reporter: CacheReporter,
@@ -205,6 +208,8 @@ pub struct WindowsStorage {
 impl WindowsStorage {
     pub fn open(number: u32, reporter: &CacheReporter) -> io::Result<Self> {
         Ok(Self {
+            #[cfg(feature = "hyperv-runner")]
+            expected_serial: CACHE_DISK_SERIAL.to_owned(),
             disk: Handle::open(
                 &format!("\\\\.\\PhysicalDrive{number}"),
                 GENERIC_READ | GENERIC_WRITE,
@@ -214,6 +219,25 @@ impl WindowsStorage {
             number,
             reporter: reporter.clone(),
         })
+    }
+    #[cfg(feature = "hyperv-runner")]
+    pub fn capture_serial(&mut self) -> io::Result<String> {
+        let serial = disk_serial(&self.disk, &self.reporter)?;
+        if serial.trim().is_empty() || serial.len() > 256 {
+            return Err(invalid("Hyper-V cache lacks a bounded serial"));
+        }
+        self.expected_serial.clone_from(&serial);
+        Ok(serial)
+    }
+    fn expected_serial(&self) -> &str {
+        #[cfg(feature = "hyperv-runner")]
+        {
+            &self.expected_serial
+        }
+        #[cfg(not(feature = "hyperv-runner"))]
+        {
+            CACHE_DISK_SERIAL
+        }
     }
     fn attributes(&self) -> io::Result<u64> {
         let bytes = query(
@@ -404,7 +428,7 @@ impl CacheStorage for WindowsStorage {
     }
 
     fn make_writable(&mut self) -> io::Result<()> {
-        if disk_serial(&self.disk, &self.reporter)? != CACHE_DISK_SERIAL {
+        if disk_serial(&self.disk, &self.reporter)? != self.expected_serial() {
             return Err(invalid("cache disk serial changed"));
         }
         let mask = DISK_ATTRIBUTE_OFFLINE | DISK_ATTRIBUTE_READ_ONLY;
@@ -435,6 +459,11 @@ impl CacheStorage for WindowsStorage {
 
     fn initialize_raw(&mut self) -> io::Result<()> {
         self.reporter.step(CacheStep::InitializeRaw, || {
+            #[cfg(feature = "hyperv-runner")]
+            let script =
+                motor_winagent::cache::mount_script_with_serial(self.number, &self.expected_serial);
+            #[cfg(not(feature = "hyperv-runner"))]
+            let script = mount_script(self.number);
             // The script rechecks serial, boot/system status and RAW before formatting.
             // Discard output to keep both process memory and the wait bounded.
             let mut child =
@@ -444,7 +473,7 @@ impl CacheStorage for WindowsStorage {
                         "-NoProfile",
                         "-NonInteractive",
                         "-Command",
-                        &mount_script(self.number),
+                        &script,
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())

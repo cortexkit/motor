@@ -1,7 +1,55 @@
-//! Transport selection for the standalone Hyper-V experiment, not a runner backend.
+//! Transport and boot metadata shared by Hyper-V probes and runner images.
 use std::io;
 
 pub const HYPERV_NONCE_FILE: &str = r"C:\ProgramData\Motor\hyperv-nonce.txt";
+
+/// A nonce DVD contains immutable job metadata, never a host filesystem share.
+#[cfg(windows)]
+pub fn nonce_dvd() -> io::Result<Option<std::path::PathBuf>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+    const DRIVE_CDROM: u32 = 5;
+    let drives = unsafe { GetLogicalDrives() };
+    if drives == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut found = None;
+    for index in 0..26u8 {
+        if drives & (1 << index) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + index) as char);
+        let wide: Vec<_> = root.encode_utf16().chain(Some(0)).collect();
+        if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_CDROM {
+            continue;
+        }
+        let mut label = [0u16; 64];
+        if unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                label.as_mut_ptr(),
+                label.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            continue;
+        }
+        let length = label.iter().position(|c| *c == 0).unwrap_or(label.len());
+        if String::from_utf16_lossy(&label[..length]) == "MOTORNONCE" {
+            if found.is_some() {
+                return Err(io::Error::other("multiple MOTORNONCE DVDs"));
+            }
+            found = Some(std::path::PathBuf::from(root));
+        }
+    }
+    Ok(found)
+}
 pub const HYPERV_QUEUE_FILE: &str = r"C:\ProgramData\Motor\hyperv-serial-queue.txt";
 pub const HYPERV_QUEUE_BYTES: u32 = 2 * crate::MAX_FRAME_BYTES as u32;
 

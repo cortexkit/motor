@@ -88,15 +88,12 @@ pub(crate) fn reader_missed(state: &Path, id: motor_protocol::Uuid) -> bool {
 }
 
 pub(crate) fn statistics(state: &Path, id: motor_protocol::Uuid) -> io::Result<serde_json::Value> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    use std::io::Read;
     let path = state
         .join("sandboxes")
         .join(id.to_string())
         .join("output/cache-stats");
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
+    let file = crate::filesystem::read_nofollow(&path)
         .map_err(|e| io::Error::other(format!("cannot read {}: {e}", path.display())))?;
     let mut bytes = Vec::new();
     file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;

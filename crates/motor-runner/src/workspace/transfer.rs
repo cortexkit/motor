@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
     io::{self, Read},
@@ -54,7 +55,8 @@ impl Progress {
 }
 
 pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(path)
@@ -66,9 +68,13 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         .env_remove("GIT_CONFIG_KEY_0")
         .env_remove("GIT_CONFIG_VALUE_0")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(unix)]
+    let mut child = command.spawn()?;
+    #[cfg(windows)]
+    let mut child = crate::native_process::Child::spawn(&mut command)?;
     let mut stderr = child.stderr.take().unwrap();
     let (tx, rx) = mpsc::sync_channel(8);
     let reader = std::thread::spawn(move || {
@@ -119,6 +125,7 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
     if result.is_err() {
         // index-pack is a child of git; killing only git can leave it writing
         // the mirror and keep the progress-reader pipe open indefinitely.
+        #[cfg(unix)]
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }

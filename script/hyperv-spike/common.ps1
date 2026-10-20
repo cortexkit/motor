@@ -106,7 +106,7 @@ function Use-SpikeWindowsDisk([string]$Path, [scriptblock]$Action, [switch]$Read
     } finally { if ($mounted) { Dismount-VHD -Path $Path } }
 }
 
-function New-SpikeIso([string]$Tree, [string]$Path) {
+function New-SpikeIso([string]$Tree, [string]$Path, [string]$VolumeName = 'CKSETUP') {
     if (-not ('MotorSpikeIso' -as [type])) {
         Add-Type @'
 using System;
@@ -134,7 +134,7 @@ public static class MotorSpikeIso {
     }
     $image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
     $image.FileSystemsToCreate = 3
-    $image.VolumeName = 'CKSETUP'
+    $image.VolumeName = $VolumeName
     $image.Root.AddTree($Tree, $false)
     $result = $image.CreateResultImage()
     [MotorSpikeIso]::Save($result.ImageStream, $Path)
