@@ -1,56 +1,88 @@
 # Runs elevated once from the unattended first logon. No fleet credentials are used.
-param([switch]$JobBaseline)
+param([switch]$JobBaseline, [switch]$ResumeAfterUpdates)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$seed = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\bootstrap.ps1") } | Select-Object -First 1
-if (-not $seed) { throw 'Provisioning CD not found' }
-$JobBaseline = $JobBaseline -or (Test-Path "$($seed.DriveLetter):\job-baseline")
-New-Item C:\build\provision -ItemType Directory -Force | Out-Null
-Copy-Item "$($seed.DriveLetter):\*.ps1" C:\build\provision -Force
-if ($JobBaseline) {
-    Copy-Item "$($seed.DriveLetter):\PowerShell-7.6.7-win-x64.zip" C:\build\provision -Force
-    Copy-Item "$($seed.DriveLetter):\motor-winagent" C:\build\provision -Recurse -Force
+if ($ResumeAfterUpdates) {
+    $JobBaseline = $true
+    $HyperVSpike = Test-Path C:\build\provision\hyperv-spike
 } else {
-    Copy-Item "$($seed.DriveLetter):\authorized_keys" C:\build\provision -Force
+    $seed = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\bootstrap.ps1") } | Select-Object -First 1
+    if (-not $seed) { throw 'Provisioning CD not found' }
+    $JobBaseline = $JobBaseline -or (Test-Path "$($seed.DriveLetter):\job-baseline")
+    $HyperVSpike = Test-Path "$($seed.DriveLetter):\hyperv-spike"
+    if ($HyperVSpike -and -not $JobBaseline) { throw 'Hyper-V seed must be a job baseline' }
+    New-Item C:\build\provision -ItemType Directory -Force | Out-Null
+    Copy-Item "$($seed.DriveLetter):\*.ps1" C:\build\provision -Force
+    if ($HyperVSpike) { Copy-Item "$($seed.DriveLetter):\hyperv-spike" C:\build\provision -Force }
+    if ($JobBaseline) {
+        Copy-Item "$($seed.DriveLetter):\PowerShell-7.6.7-win-x64.zip" C:\build\provision -Force
+        Copy-Item "$($seed.DriveLetter):\motor-winagent" C:\build\provision -Recurse -Force
+    } else {
+        Copy-Item "$($seed.DriveLetter):\authorized_keys" C:\build\provision -Force
+    }
+    # Files copied from a CD retain its read-only attribute; allow later maintenance.
+    Get-ChildItem C:\build\provision -File -Recurse | ForEach-Object { $_.IsReadOnly = $false }
 }
-# Files copied from a CD retain its read-only attribute; allow later maintenance.
-Get-ChildItem C:\build\provision -File -Recurse | ForEach-Object { $_.IsReadOnly = $false }
 Start-Transcript C:\build\provision\bootstrap.log -Append
-Remove-Item C:\build\provision\FAILED.txt -Force -ErrorAction SilentlyContinue
+if (-not $ResumeAfterUpdates) { Remove-Item C:\build\provision\FAILED.txt -Force -ErrorAction SilentlyContinue }
 try {
+    if ($ResumeAfterUpdates) {
+        if (-not $HyperVSpike -or -not (Test-Path C:\build\provision\os-updated)) { throw 'OS servicing must complete before resuming Hyper-V setup' }
+        if (Test-Path C:\build\provision\FAILED.txt) { throw 'Refusing to resume a failed image' }
+        Write-Host 'PASS OS servicing completed before toolchain and PowerShell installation'
+    }
     if ($JobBaseline) { Unregister-ScheduledTask -TaskName MotorBootstrap -Confirm:$false -ErrorAction SilentlyContinue }
     # Provisioning needs a NIC for Windows Update and official tool installers.
-    $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
-    if (-not $nic) {
-        $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf") } | Select-Object -First 1
-        if (-not $drivers) { throw 'Official virtio-win driver CD not found' }
-        & pnputil /add-driver "$($drivers.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf" /install
-        # Already-staged drivers can return a nonzero status despite a working NIC.
+    if ($HyperVSpike) {
+        # Hyper-V's synthetic NIC uses the inbox Server driver, not NetKVM.
+        $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Hyper-V*' -and $_.Status -eq 'Up' }
+        if (-not $nic) { throw 'Hyper-V provisioning network unavailable' }
+    } else {
         $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
-        if (-not $nic) { throw "VirtIO network unavailable after pnputil: $LASTEXITCODE" }
+        if (-not $nic) {
+            $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf") } | Select-Object -First 1
+            if (-not $drivers) { throw 'Official virtio-win driver CD not found' }
+            & pnputil /add-driver "$($drivers.DriveLetter):\NetKVM\2k22\amd64\netkvm.inf" /install
+            # Already-staged drivers can return a nonzero status despite a working NIC.
+            $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*VirtIO*' -and $_.Status -eq 'Up' }
+            if (-not $nic) { throw "VirtIO network unavailable after pnputil: $LASTEXITCODE" }
+        }
     }
 
-    # Clear autologon and replace the temporary setup passwords with random,
-    # guest-local values. Neither password is saved or used for remote access.
-    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-    Set-ItemProperty $winlogon AutoAdminLogon '0'
-    Remove-ItemProperty $winlogon DefaultPassword -ErrorAction SilentlyContinue
-    Remove-ItemProperty $winlogon AutoLogonCount -ErrorAction SilentlyContinue
-    foreach ($account in @('builder','Administrator')) {
-        $bytes = New-Object byte[] 48
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        $rng.GetBytes($bytes)
-        $rng.Dispose()
-        $password = ConvertTo-SecureString ('Aa1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force
-        Set-LocalUser $account -Password $password -PasswordNeverExpires $true
+    if (-not $ResumeAfterUpdates) {
+        # Clear autologon and replace the temporary setup passwords with random,
+        # guest-local values. Neither password is saved or used for remote access.
+        $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        Set-ItemProperty $winlogon AutoAdminLogon '0'
+        Remove-ItemProperty $winlogon DefaultPassword -ErrorAction SilentlyContinue
+        Remove-ItemProperty $winlogon AutoLogonCount -ErrorAction SilentlyContinue
+        foreach ($account in @('builder','Administrator')) {
+            $bytes = New-Object byte[] 48
+            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+            $rng.GetBytes($bytes)
+            $rng.Dispose()
+            $password = ConvertTo-SecureString ('Aa1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force
+            Set-LocalUser $account -Password $password -PasswordNeverExpires $true
+        }
+        Disable-LocalUser Administrator
+        # Server otherwise ignores the host's ACPI power button when nobody is logged on.
+        # The console and QMP socket remain private to the trusted host administrators.
+        New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name ShutdownWithoutLogon -PropertyType DWord -Value 1 -Force | Out-Null
+        Remove-Item C:\Windows\Panther\unattend.xml,C:\Windows\Panther\Unattend\unattend.xml,C:\Windows\System32\Sysprep\unattend.xml -Force -ErrorAction SilentlyContinue
     }
-    Disable-LocalUser Administrator
-    # Server otherwise ignores the host's ACPI power button when nobody is logged on.
-    # The console and QMP socket remain private to the trusted host administrators.
-    New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name ShutdownWithoutLogon -PropertyType DWord -Value 1 -Force | Out-Null
-    Remove-Item C:\Windows\Panther\unattend.xml,C:\Windows\Panther\Unattend\unattend.xml,C:\Windows\System32\Sysprep\unattend.xml -Force -ErrorAction SilentlyContinue
+
+    if ($HyperVSpike -and -not $ResumeAfterUpdates) {
+        # The offline-applied ISO lacks CET servicing required by .NET 10.
+        # Resume as SYSTEM after updates; do not weaken a runtime mitigation.
+        $action = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\build\provision\finalize-job-baseline.ps1 -BeforeToolchain'
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $trigger.Delay = 'PT30S'
+        Register-ScheduledTask -TaskName MotorUpdateFirst -Action $action -Trigger $trigger -User SYSTEM -RunLevel Highest -Force | Out-Null
+        Start-ScheduledTask -TaskName MotorUpdateFirst
+        return
+    }
 
     if (-not $JobBaseline) {
     Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
@@ -99,7 +131,7 @@ Match Group administrators
     & C:\build\provision\setup-guest.ps1 -JobBaseline:$JobBaseline
     if (-not $?) { throw 'Guest toolchain setup failed' }
     if ($JobBaseline) {
-        & C:\build\provision\setup-job-baseline.ps1
+        & C:\build\provision\setup-job-baseline.ps1 -HyperVSpike:$HyperVSpike
         if (-not $?) { throw 'Job baseline setup failed' }
         foreach ($option in @('/dlv', '/xpr')) {
             & cscript.exe //nologo C:\Windows\System32\slmgr.vbs $option
@@ -111,7 +143,7 @@ Match Group administrators
     }
     Set-Content C:\build\provision\provisioned (Get-Date -Format o)
 } catch {
-    $_ | Out-String | Set-Content C:\build\provision\FAILED.txt
+    if (-not (Test-Path C:\build\provision\FAILED.txt)) { $_ | Out-String | Set-Content C:\build\provision\FAILED.txt }
     if ($JobBaseline) {
         # Setup can fail before the finalizer exists. Close the transcript and
         # power off the failed image rather than leaving the VM slot occupied.

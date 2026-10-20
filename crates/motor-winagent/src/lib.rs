@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub mod cache;
 pub mod cache_steps;
 pub mod environment;
+pub mod transport;
 
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;

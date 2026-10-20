@@ -1,6 +1,6 @@
 # Runs elevated after setup-guest.ps1 -JobBaseline has installed Git and MSVC.
 # This image is for disposable job VMs, never for the standing SSH build VM.
-param([string]$AgentSource = "$PSScriptRoot\motor-winagent")
+param([string]$AgentSource = "$PSScriptRoot\motor-winagent", [switch]$HyperVSpike)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -150,10 +150,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Job source directory ACL setup failed' }
 & icacls $jobCargo /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
 if ($LASTEXITCODE -ne 0) { throw 'Job cargo home ACL setup failed' }
 
-$drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\vioserial\2k22\amd64\vioser.inf") } | Select-Object -First 1
-if (-not $drivers) { throw 'Official virtio-win CD with the Server 2022 serial driver not found' }
-& pnputil /add-driver "$($drivers.DriveLetter):\vioserial\2k22\amd64\vioser.inf" /install
-if ($LASTEXITCODE -notin @(0,3010)) { throw "Virtio-serial driver installation failed: $LASTEXITCODE" }
+if (-not $HyperVSpike) {
+    $drivers = Get-Volume | Where-Object { $_.DriveLetter -and (Test-Path "$($_.DriveLetter):\vioserial\2k22\amd64\vioser.inf") } | Select-Object -First 1
+    if (-not $drivers) { throw 'Official virtio-win CD with the Server 2022 serial driver not found' }
+    & pnputil /add-driver "$($drivers.DriveLetter):\vioserial\2k22\amd64\vioser.inf" /install
+    if ($LASTEXITCODE -notin @(0,3010)) { throw "Virtio-serial driver installation failed: $LASTEXITCODE" }
+}
 
 $env:RUSTUP_HOME = 'C:\rust\rustup'
 $env:CARGO_HOME = 'C:\rust\cargo'
@@ -187,12 +189,19 @@ foreach ($name in @('Cargo.toml', 'Cargo.lock', 'src')) {
     if (-not (Test-Path (Join-Path $AgentSource $name))) { throw "Standalone agent source is missing $name" }
 }
 # Build with the pinned toolchain and lockfile inside this MSVC-equipped seed VM.
-& 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple
+$agentOptions = @()
+if ($HyperVSpike) { $agentOptions = @('--features', 'hyperv-spike') }
+& 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple @agentOptions
 if ($LASTEXITCODE -ne 0) { throw "Agent release build failed: $LASTEXITCODE" }
 Copy-Item "$AgentSource\target\$hostTriple\release\motor-winagent.exe" "$motor\motor-winagent.exe" -Force
 $agentHash = (Get-FileHash "$motor\motor-winagent.exe" -Algorithm SHA256).Hash
 Set-Content "$PSScriptRoot\winagent.sha256" "$agentHash  motor-winagent.exe" -Encoding ascii
 Write-Host "Installed motor-winagent SHA-256: $agentHash"
+if ($HyperVSpike) {
+    & 'C:\rust\cargo\bin\cargo.exe' build --release --locked --manifest-path "$AgentSource\Cargo.toml" --target $hostTriple --example hyperv-spike
+    if ($LASTEXITCODE -ne 0) { throw "Spike host client build failed: $LASTEXITCODE" }
+    Copy-Item "$AgentSource\target\$hostTriple\release\examples\hyperv-spike.exe" "$PSScriptRoot\hyperv-spike.exe"
+}
 # Freeze toolchain files after building; jobs use their own writable Cargo home.
 # Set the protected ACL on C:\rust only, then make every descendant inherit it.
 # Granting (OI)(CI) entries recursively with /inheritance:r leaves each file

@@ -6,18 +6,38 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "hyperv-spike")]
+    if std::env::args().skip(1).eq(["--build-info"]) {
+        if cfg!(feature = "hyperv-hvsock") {
+            println!(
+                "motor-winagent hyperv-spike agent_diag=3 transport=hvsock peer=parent protocol=4"
+            );
+        } else {
+            println!(
+                "motor-winagent hyperv-spike agent_diag=3 transport=com partial_read=4096,250ms queue_config=0,2097152 protocol=4"
+            );
+        }
+        return Ok(());
+    }
     guest::run()
 }
 
+#[cfg(all(windows, feature = "hyperv-hvsock"))]
+mod hvsock;
+#[cfg(all(windows, feature = "hyperv-spike"))]
+mod hyperv_diag;
 #[cfg(windows)]
 mod storage;
 
 #[cfg(windows)]
 mod guest {
+    macro_rules! diagnostic {
+        ($($arg:tt)*) => {{ #[cfg(feature = "hyperv-spike")] crate::hyperv_diag::event(&format!($($arg)*)); }};
+    }
     use motor_winagent::{
         CACHE_INHERIT_FLAGS, CACHE_MODIFY_MASK, CACHE_MOUNT, CHUNK_BYTES, CacheAce, CacheTimings,
         Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
-        SMBIOS_NONCE_PREFIX, Stream, VIRTIO_PORT_NAME,
+        SMBIOS_NONCE_PREFIX, Stream,
         cache::{prepare_cache, select_cache_disk, storage_serial},
         cache_has_modify_grant,
         cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
@@ -155,12 +175,52 @@ mod guest {
 
     #[derive(Clone)]
     struct Port {
+        #[cfg(not(feature = "hyperv-hvsock"))]
         handle: Arc<Handle>,
+        #[cfg(feature = "hyperv-hvsock")]
+        socket: Arc<crate::hvsock::Socket>,
         stop: Arc<Handle>,
+        #[cfg(feature = "hyperv-spike")]
+        read_total: Arc<std::sync::atomic::AtomicU64>,
+        #[cfg(feature = "hyperv-spike")]
+        write_total: Arc<std::sync::atomic::AtomicU64>,
     }
     impl Port {
+        #[cfg(feature = "hyperv-hvsock")]
         fn open(stop: Arc<Handle>) -> io::Result<Self> {
-            let path = wide(&format!("\\\\.\\Global\\{VIRTIO_PORT_NAME}"));
+            let address = motor_winagent::transport::hvsock_listen_address(
+                match std::fs::read_to_string(motor_winagent::transport::HVSOCK_LISTEN_FILE) {
+                    Ok(text) => Some(text),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                }
+                .as_deref(),
+            )?;
+            // Same bound as the host client's overall cap: the host dials as
+            // soon as the VM starts, so a longer silence means no host exists.
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let (socket, peer) = crate::hvsock::accept_host(stop.0, deadline, address)?;
+            diagnostic!("hvsock accepted peer vm_id={peer:032x} listen={address:?}");
+            // Make the diagnostic log durable while the job runs, so a forced
+            // VM stop still leaves the byte counters on disk.
+            let sync_stop = stop.clone();
+            thread::spawn(move || {
+                while !sync_stop.signalled() {
+                    crate::hyperv_diag::sync();
+                    thread::sleep(Duration::from_millis(500));
+                }
+            });
+            Ok(Self {
+                socket: Arc::new(socket),
+                stop,
+                read_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                write_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            })
+        }
+
+        #[cfg(not(feature = "hyperv-hvsock"))]
+        fn open(stop: Arc<Handle>) -> io::Result<Self> {
+            let path = wide(&motor_winagent::transport::port_path());
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 let handle = unsafe {
@@ -176,9 +236,57 @@ mod guest {
                 };
                 match Handle::new(handle) {
                     Ok(handle) => {
+                        #[cfg(feature = "hyperv-spike")]
+                        {
+                            let setup = motor_winagent::transport::configure_com(unsafe {
+                                std::os::windows::io::BorrowedHandle::borrow_raw(handle.0)
+                            })?;
+                            diagnostic!("COM configured {setup}");
+                        }
+                        let handle = Arc::new(handle);
+                        #[cfg(feature = "hyperv-spike")]
+                        {
+                            let monitor = handle.clone();
+                            let monitor_stop = stop.clone();
+                            thread::spawn(move || {
+                                let mut previous = None;
+                                let mut tick = 0u64;
+                                while !monitor_stop.signalled() {
+                                    let status = motor_winagent::transport::serial_status(unsafe {
+                                        std::os::windows::io::BorrowedHandle::borrow_raw(monitor.0)
+                                    });
+                                    match status {
+                                        Ok(value) => {
+                                            if value.0 != 0
+                                                || previous != Some(value)
+                                                || tick.is_multiple_of(10)
+                                            {
+                                                diagnostic!(
+                                                    "COM status errors=0x{:x} rxover={} overrun={} queued_in={} queued_out={}",
+                                                    value.0,
+                                                    value.0 & 1 != 0,
+                                                    value.0 & 2 != 0,
+                                                    value.1,
+                                                    value.2
+                                                );
+                                            }
+                                            previous = Some(value);
+                                        }
+                                        Err(error) => diagnostic!("COM status error: {error}"),
+                                    }
+                                    tick += 1;
+                                    crate::hyperv_diag::sync();
+                                    thread::sleep(Duration::from_millis(500));
+                                }
+                            });
+                        }
                         return Ok(Self {
-                            handle: Arc::new(handle),
+                            handle,
                             stop,
+                            #[cfg(feature = "hyperv-spike")]
+                            read_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                            #[cfg(feature = "hyperv-spike")]
+                            write_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         });
                     }
                     Err(error) if stop.signalled() || Instant::now() >= deadline => {
@@ -189,13 +297,44 @@ mod guest {
             }
         }
 
+        #[cfg(feature = "hyperv-spike")]
+        fn record_transfer(&self, count: u32, write: bool) {
+            let counter = if write {
+                &self.write_total
+            } else {
+                &self.read_total
+            };
+            let total = counter.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed)
+                + count as u64;
+            diagnostic!(
+                "io {} done bytes={count} total={total}",
+                if write { "write" } else { "read" }
+            );
+        }
+
         fn transfer(&self, bytes: *mut u8, length: usize, write: bool) -> io::Result<usize> {
+            diagnostic!(
+                "io {} start requested={length}",
+                if write { "write" } else { "read" }
+            );
             if self.stop.signalled() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "service stopped",
                 ));
             }
+            #[cfg(feature = "hyperv-hvsock")]
+            {
+                let count = self.socket.transfer(self.stop.0, bytes, length, write)?;
+                self.record_transfer(count as u32, write);
+                Ok(count)
+            }
+            #[cfg(not(feature = "hyperv-hvsock"))]
+            self.transfer_file(bytes, length, write)
+        }
+
+        #[cfg(not(feature = "hyperv-hvsock"))]
+        fn transfer_file(&self, bytes: *mut u8, length: usize, write: bool) -> io::Result<usize> {
             let event = Handle::event()?;
             // The stack OVERLAPPED, event and caller buffer remain alive until
             // completion, including after cancellation has been requested.
@@ -221,14 +360,57 @@ mod guest {
                         &mut operation,
                     )
                 };
-                if result == 0 && GetLastError() != ERROR_IO_PENDING {
-                    let error = io::Error::last_os_error();
-                    if !write && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                let last_error = if result == 0 { GetLastError() } else { 0 };
+                diagnostic!(
+                    "io submitted success={} transferred={} last_error={last_error}",
+                    result != 0,
+                    transferred
+                );
+                if result == 0 && last_error != ERROR_IO_PENDING {
+                    let error = io::Error::from_raw_os_error(last_error as i32);
+                    if !cfg!(feature = "hyperv-spike")
+                        && !write
+                        && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
+                    {
                         return Ok(0);
                     }
                     return Err(error);
                 }
+                #[cfg(feature = "hyperv-spike")]
+                if result != 0 {
+                    win32(GetOverlappedResult(
+                        self.handle.0,
+                        &operation,
+                        &mut transferred,
+                        0,
+                    ))?;
+                    self.record_transfer(transferred, write);
+                    return Ok(transferred as usize);
+                }
                 let handles = [self.stop.0, event.0];
+                #[cfg(feature = "hyperv-spike")]
+                let ready = loop {
+                    let ready = WaitForMultipleObjects(2, handles.as_ptr(), 0, 250);
+                    if ready == WAIT_TIMEOUT {
+                        // Poll completion after a bounded event wait. This also
+                        // distinguishes a pending IRP from a completed operation.
+                        if GetOverlappedResult(self.handle.0, &operation, &mut transferred, 0) != 0
+                        {
+                            diagnostic!("io completion observed by poll");
+                            self.record_transfer(transferred, write);
+                            return Ok(transferred as usize);
+                        }
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE as i32) {
+                            continue;
+                        }
+                        CancelIoEx(self.handle.0, &operation);
+                        GetOverlappedResult(self.handle.0, &operation, &mut transferred, 1);
+                        return Err(error);
+                    }
+                    break ready;
+                };
+                #[cfg(not(feature = "hyperv-spike"))]
                 let ready = WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE);
                 if ready != WAIT_OBJECT_0 + 1 {
                     CancelIoEx(self.handle.0, &operation);
@@ -244,6 +426,8 @@ mod guest {
                     &mut transferred,
                     1,
                 ))?;
+                #[cfg(feature = "hyperv-spike")]
+                self.record_transfer(transferred, write);
                 Ok(transferred as usize)
             }
         }
@@ -253,7 +437,18 @@ mod guest {
             if bytes.is_empty() {
                 Ok(0)
             } else {
-                self.transfer(bytes.as_mut_ptr(), bytes.len(), false)
+                // Only the COM port needs timeout retries; on a socket, and on
+                // virtio-serial, a zero-byte read means the host closed.
+                #[cfg(all(feature = "hyperv-spike", not(feature = "hyperv-hvsock")))]
+                {
+                    motor_winagent::transport::read_serial(bytes, |chunk| {
+                        self.transfer(chunk.as_mut_ptr(), chunk.len(), false)
+                    })
+                }
+                #[cfg(any(not(feature = "hyperv-spike"), feature = "hyperv-hvsock"))]
+                {
+                    self.transfer(bytes.as_mut_ptr(), bytes.len(), false)
+                }
             }
         }
     }
@@ -312,7 +507,18 @@ mod guest {
             })
         };
         report(ServiceState::Running, 0)?;
+        #[cfg(feature = "hyperv-spike")]
+        if let Err(error) = crate::hyperv_diag::init() {
+            report(
+                ServiceState::Stopped,
+                error.raw_os_error().unwrap_or(1) as u32,
+            )?;
+            return Err(error.into());
+        }
         let result = serve(stop.clone());
+        diagnostic!("service result: {result:?}");
+        #[cfg(feature = "hyperv-spike")]
+        crate::hyperv_diag::sync();
         stop.signal();
         report(ServiceState::Stopped, if result.is_ok() { 0 } else { 1 })?;
         result.map_err(Into::into)
@@ -341,6 +547,11 @@ mod guest {
             .map_err(|_| invalid("PowerShell output is not UTF-8"))
     }
     fn boot_nonce() -> io::Result<String> {
+        if cfg!(feature = "hyperv-spike") {
+            return motor_winagent::transport::hyperv_nonce(&std::fs::read_to_string(
+                motor_winagent::transport::HYPERV_NONCE_FILE,
+            )?);
+        }
         let strings = powershell(
             "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); (Get-CimInstance Win32_ComputerSystem).OEMStringArray",
         )?;
@@ -553,6 +764,32 @@ mod guest {
     }
     impl Cache {
         fn mount(user: &User, reporter: &CacheReporter) -> io::Result<Self> {
+            if cfg!(feature = "hyperv-spike") {
+                // This spike measures one disposable OS disk, not cache reuse.
+                // Keep the same empty-folder checks and SID-only Modify grant;
+                // C:\t and all command writes disappear with the OS overlay.
+                reporter.step(CacheStep::MountDirectory, || {
+                    motor_winagent::cache::empty_mount_directory(Path::new(CACHE_MOUNT))
+                })?;
+                let updated = reporter.step(CacheStep::FolderAcl, || {
+                    Self::grant_access(
+                        CACHE_MOUNT.trim_end_matches('\\'),
+                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                        user,
+                        true,
+                    )
+                })?;
+                return Ok(Self {
+                    volume: String::new(),
+                    clean: false,
+                    acl_updated: false,
+                    mountpoint_acl_updated: updated,
+                    timings: CacheTimings {
+                        folder_acl_updated: updated,
+                        ..Default::default()
+                    },
+                });
+            }
             let started = Instant::now();
             let number = reporter.step(CacheStep::DiskSelection, || cache_disk(reporter))?;
             let disk_selection_ms = started.elapsed().as_millis() as u64;
@@ -743,6 +980,10 @@ mod guest {
             }
         }
         fn dismount(&mut self) -> io::Result<()> {
+            if cfg!(feature = "hyperv-spike") {
+                self.clean = true;
+                return Ok(());
+            }
             let handle = self.open_volume()?;
             let mut returned = 0;
             unsafe {
@@ -811,7 +1052,21 @@ mod guest {
             let mut port = port;
             loop {
                 match read_frame(&mut port) {
-                    Ok(Some(frame)) => post(&tx, &reader_stop, Event::Host(frame)),
+                    Ok(Some(frame)) => {
+                        #[cfg(feature = "hyperv-spike")]
+                        match &frame {
+                            Frame::ReceiveTree { bytes } => {
+                                diagnostic!("reader frame ReceiveTree bytes={}", bytes.len())
+                            }
+                            Frame::TreeEnd { .. } => diagnostic!("reader frame TreeEnd"),
+                            Frame::Start {} => diagnostic!("reader frame Start"),
+                            Frame::Collect {} => diagnostic!("reader frame Collect"),
+                            Frame::Dismount {} => diagnostic!("reader frame Dismount"),
+                            Frame::Cancel {} => diagnostic!("reader frame Cancel"),
+                            _ => diagnostic!("reader unexpected host frame"),
+                        }
+                        post(&tx, &reader_stop, Event::Host(frame));
+                    }
                     Ok(None) => {
                         post(
                             &tx,
@@ -824,6 +1079,7 @@ mod guest {
                         break;
                     }
                     Err(error) => {
+                        diagnostic!("reader error: {error}");
                         post(&tx, &reader_stop, Event::Lost(error));
                         break;
                     }
@@ -1192,9 +1448,13 @@ mod guest {
             .write(true)
             .create_new(true)
             .open(temp.join("motor-tree.tar"))?;
+        diagnostic!("staging archive opened");
         let command = loop {
             match receive(protocol, rx, &port.stop)? {
-                Frame::ReceiveTree { bytes } => archive.write_all(&bytes)?,
+                Frame::ReceiveTree { bytes } => {
+                    diagnostic!("staging ReceiveTree bytes={}", bytes.len());
+                    archive.write_all(&bytes)?;
+                }
                 Frame::TreeEnd { command } => break command,
                 _ => return Err(invalid("expected tree transfer")),
             }
@@ -1218,6 +1478,7 @@ mod guest {
         drop(archive);
         std::fs::remove_file(temp.join("motor-tree.tar"))?;
         send(protocol, port, &Frame::TreeReceived {})?;
+        diagnostic!("staging TreeReceived sent");
         Ok((command, before))
     }
 
@@ -1378,6 +1639,7 @@ mod guest {
             enable_privilege(privilege)?;
         }
         let nonce = boot_nonce()?;
+        diagnostic!("boot nonce={nonce}");
         let mut protocol = Protocol::new(&nonce)?;
         let mut port = Port::open(stop)?;
         let (tx, rx) = mpsc::sync_channel(16);
