@@ -1546,6 +1546,145 @@ impl Drop for RuntimeDir {
     }
 }
 
+const MAX_CARGO_LOCKFILES: usize = 128;
+const NESTED_CARGO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Optional fetches use only immutable snapshot entries, never warm untracked files.
+fn cargo_lockfiles(
+    workspace: &Path,
+    tree: &str,
+    skip: &mut impl FnMut(&Path, &str),
+) -> io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    let entries = javascript_git(
+        workspace,
+        &["ls-tree".as_ref(), "-rz".as_ref(), tree.as_ref()],
+    )?;
+    let mut files = BTreeMap::new();
+    for entry in entries
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (header, path) = entry.split_at(
+            entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| io::Error::other("malformed Cargo Git tree entry"))?,
+        );
+        let path = PathBuf::from(std::ffi::OsString::from_vec(path[1..].to_vec()));
+        files.insert(
+            path,
+            header.starts_with(b"100644 blob ") || header.starts_with(b"100755 blob "),
+        );
+    }
+    let mut locks = Vec::new();
+    let mut count = usize::from(files.contains_key(Path::new("Cargo.lock")));
+    for (path, regular) in &files {
+        if path != Path::new("Cargo.lock")
+            && path.file_name().is_some_and(|name| name == "Cargo.lock")
+        {
+            count += 1;
+            if count > MAX_CARGO_LOCKFILES {
+                skip(path, "snapshot exceeds the 128 tracked Cargo.lock limit");
+                continue;
+            }
+            let manifest = path.with_file_name("Cargo.toml");
+            let valid = (|| {
+                Ok::<_, io::Error>(
+                    *regular
+                        && files.get(&manifest) == Some(&true)
+                        && optional_regular_file(&workspace.join(path))?
+                        && optional_regular_file(&workspace.join(&manifest))?,
+                )
+            })();
+            match valid {
+                Ok(true) => locks.push(path.clone()),
+                Ok(false) => skip(path, "nested prefetch requires tracked regular Cargo.lock and sibling Cargo.toml files"),
+                Err(error) => skip(path, &error.to_string()),
+            }
+        }
+    }
+    Ok(locks)
+}
+
+fn bounded_cargo_fetch(command: &mut Command, limit: Duration) -> io::Result<()> {
+    // GNU timeout owns a process group so its deadline also stops Cargo's Git
+    // children. Give a TERM-resistant fetch only one additional second to exit.
+    let mut bounded = Command::new("/usr/bin/timeout");
+    bounded
+        .args([
+            "--verbose",
+            "--kill-after=1s",
+            &format!("{}s", limit.as_secs_f64()),
+        ])
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(directory) = command.get_current_dir() {
+        bounded.current_dir(directory);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            bounded.env(name, value);
+        } else {
+            bounded.env_remove(name);
+        }
+    }
+    let output = crate::systemd::output(&mut bounded)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let timeout = if matches!(output.status.code(), Some(124 | 137)) {
+        format!("timed out after {limit:?}: ")
+    } else {
+        String::new()
+    };
+    Err(io::Error::other(format!(
+        "{timeout}{command:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn prefetch_cargo_with(
+    workspace: &Path,
+    tree: &str,
+    tenant_vm: bool,
+    nested_limit: Duration,
+    mut command: impl FnMut(&Path) -> io::Result<Command>,
+    mut skip: impl FnMut(&Path, &str),
+) -> io::Result<()> {
+    // Only the root graph is an admission requirement. Experimental nested
+    // crates may have stale locks or unavailable dependencies without breaking
+    // unrelated jobs in the same repository.
+    if workspace.join("Cargo.toml").is_file() {
+        if tenant_vm {
+            // The daemon alone resolves and downloads sources into persistent
+            // tenant storage. A cache-only fallback can still run a warm job
+            // during an outage; both attempts bound tool and cache-lock waits.
+            cargo_fetch::prepare(|| command(workspace))?;
+        } else {
+            checked(&mut command(workspace)?)?;
+        }
+    }
+    let locks = match cargo_lockfiles(workspace, tree, &mut skip) {
+        Ok(locks) => locks,
+        Err(error) => {
+            skip(
+                Path::new("."),
+                &format!("nested lockfile discovery failed: {error}"),
+            );
+            return Ok(());
+        }
+    };
+    for lockfile in locks {
+        let fetched = command(&workspace.join(lockfile.parent().unwrap_or(Path::new(""))))
+            .and_then(|mut command| bounded_cargo_fetch(&mut command, nested_limit));
+        if let Err(error) = fetched {
+            skip(&lockfile, &error.to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 fn prefetch_cargo_dependencies(
@@ -1553,38 +1692,41 @@ fn prefetch_cargo_dependencies(
     tenant_vm: bool,
     state: &Path,
     workspace: &Path,
+    tree: &str,
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
 ) -> io::Result<()> {
-    if workspace.join("Cargo.toml").is_file() {
-        let stage = if writer {
-            "fetch integration-tip dependencies"
-        } else {
-            "fetch job dependencies"
-        };
-        crate::setup_log::phase("fetch cargo dependencies", || {
-            let command = || {
-                workspace::dependencies::fetch_command(
+    let stage = if writer {
+        "fetch integration-tip dependencies (Cargo.lock)"
+    } else {
+        "fetch job dependencies (Cargo.lock)"
+    };
+    crate::setup_log::phase("fetch cargo dependencies", || {
+        prefetch_cargo_with(
+            workspace,
+            tree,
+            tenant_vm,
+            NESTED_CARGO_FETCH_TIMEOUT,
+            |directory| {
+                let mut command = workspace::dependencies::fetch_command(
                     state,
-                    workspace,
+                    directory,
                     dependency_routes,
                     cargo,
                     rustup,
-                )
-            };
-            if tenant_vm {
-                // The daemon alone resolves/downloads sources into persistent
-                // tenant storage. Cache-only fallback can still run a warm job
-                // during an outage; both attempts bound tool and cache-lock waits.
-                cargo_fetch::prepare(command)
-            } else {
-                checked(command()?.env("CARGO_NET_OFFLINE", "false"))
-            }
-        })
-        .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
-    }
-    Ok(())
+                )?;
+                // The tenant fallback re-runs this builder in offline mode, so
+                // only the build server forces network on here.
+                if !tenant_vm {
+                    command.env("CARGO_NET_OFFLINE", "false");
+                }
+                Ok(command)
+            },
+            crate::setup_log::cargo_skip,
+        )
+    })
+    .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
 }
 
 /// A stale lockfile is the caller's to fix, and it can't be fixed remotely:
@@ -1745,7 +1887,7 @@ impl Sandbox {
         // Fetch from a neutral directory: Cargo does not load an uploaded
         // .cargo/config.toml (credential providers/rustc wrappers can execute
         // programs). No build.rs or test runs in this trusted preparation step.
-        if workspace.join("Cargo.toml").is_file() {
+        {
             // Read-only default ACLs on the shared Cargo registry and Git cache
             // make newly fetched files readable to jobs without rescanning the
             // cache after every trusted dependency fetch.
@@ -1762,6 +1904,7 @@ impl Sandbox {
                 tenant_vm,
                 state,
                 workspace,
+                tree,
                 dependency_routes,
                 &cargo,
                 &rustup,

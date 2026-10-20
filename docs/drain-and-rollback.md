@@ -81,6 +81,26 @@ records.
 
 ## Deploy a new runner binary
 
+Before changing dependency preparation, inspect nested Cargo graphs with the
+optional fleet audit (alongside `script/runner/check_nested_js.sh`):
+
+```sh
+bash script/runner/check_nested_cargo.sh /path/to/fleet/checkouts
+```
+
+Run it on the operator Mac or a host holding those checkouts. It clones each
+locally recorded default-branch snapshot into temporary storage (falling back
+to HEAD when that ref is unset), excludes the root graph, and
+runs a separately bounded `cargo fetch --locked --offline` from a neutral
+directory for each eligible nested lock. Refresh Git refs separately when current
+remote tips are needed; this audit never fetches them. It uses that host's Cargo cache;
+missing sources may be inconclusive, not stale locks. Review its path-labelled
+`WARN`/`SKIP` output, but do not turn it into a deployment or job-admission gate:
+experimental nested crates are best-effort prefetches. Source checkouts remain
+unchanged, and no network fetch or toolchain installation is attempted.
+`script/runner/test_check_nested_cargo.py` covers root exclusion, stale-lock
+warnings, invalid/over-budget skips and timeout continuation.
+
 On the build server, as the account that owns the runner's user units:
 
 ```sh

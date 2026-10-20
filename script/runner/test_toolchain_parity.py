@@ -95,6 +95,14 @@ class ParityTests(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads(parity.MANIFEST.read_text())
 
+    def registry(self):
+        checksum = 'a' * 64
+        path = 'registry/cache/index.crates.io-fixture/cortexkit-cow-0.1.0.crate'
+        return {'schema': 1, 'scope': 'tenant-1-private-fleet', 'crate_count': 1,
+                'crates': [{'registry': 'index.crates.io-fixture', 'name': 'cortexkit-cow',
+                            'version': '0.1.0', 'checksum': checksum, 'bytes': 7}],
+                'files': {path: {'sha256': checksum, 'bytes': 7}}}
+
     def observed(self, role='build-server'):
         manifest = self.manifest
         bins = {}
@@ -126,11 +134,27 @@ class ParityTests(unittest.TestCase):
                     'supervisor_cache': '/motor-tools/sccache' if role == 'build-server' else None,
                     'wrapper_readonly': True, 'backend_readonly': True,
                 },
-                'mountinfo': '1 0 0:0 / /home/ubuntu/.rustup ro - ext4 /dev/example rw'}
+                'mountinfo': '1 0 0:0 / /home/ubuntu/.rustup ro - ext4 /dev/example rw',
+                'cargo_registry': self.registry()}
 
     def report(self, actual, job=False, role='build-server'):
-        with patch.object(parity, 'capture', return_value=actual):
-            return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test')
+        with patch.object(parity, 'capture', return_value=copy.deepcopy(actual)):
+            return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test',
+                                cargo_registry=self.registry())
+
+    def test_missing_registry_crate_fails_boat_qualification(self):
+        actual = self.observed('boat')
+        actual['cargo_registry']['crates'] = []
+        report = self.report(actual, job=True, role='boat')
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['cargo_registry']['missing_crates'], 1)
+        self.assertEqual(report['cargo_registry']['missing_examples'], ['index.crates.io-fixture/cortexkit-cow 0.1.0'])
+
+    def test_boat_qualification_requires_operator_seed_inventory(self):
+        with patch.object(parity, 'capture', return_value=self.observed('boat')):
+            report = parity.check(self.manifest, role='boat', job=True)
+        self.assertFalse(report['passed'])
+        self.assertIn('Cargo registry parity requires the operator-supplied server seed manifest', report['errors'])
 
     def test_measured_contract_passes(self):
         self.assertTrue(self.report(self.observed())['passed'])
