@@ -173,10 +173,7 @@ impl Connector for RoutingPeer {
                             }
                         }
                         Frame::Run(run) => {
-                            let stored: Value = serde_json::from_slice(
-                                &fs::read(module_state.join("state.json")).unwrap(),
-                            )
-                            .unwrap();
+                            let stored = crate::storage::durable_value(&module_state).unwrap();
                             assert_eq!(
                                 stored["jobs"][id.to_string()]["runner_instance"],
                                 instance,
@@ -439,8 +436,7 @@ async fn windows_run_binding_echo_and_reconnect_survive_module_restart() {
             .collect();
         assert_eq!(cursors, vec![0, 1]);
     }
-    let state: Value =
-        serde_json::from_slice(&fs::read(peer.module_state.join("state.json")).unwrap()).unwrap();
+    let state = crate::storage::durable_value(&peer.module_state).unwrap();
     assert_eq!(state["jobs"][id.to_string()]["runner_instance"], "windows");
     drop(motor);
     let restarted = super::reopen_motor(|| {

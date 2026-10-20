@@ -47,6 +47,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&args[3]),
         Arc::new(TcpConnector(args[1].clone())),
     )?;
+    if args[4] == "store" {
+        // Opening above exercises the archived Motor deserializer and lease.
+        // The expired renewal deadline makes the archived Motor rewrite
+        // state.json on attach; tests verify that the old writer preserved
+        // pending_cancel and hosted.run_sent.
+        let id: Uuid = args[5].parse()?;
+        motor.attach(AttachRequest::new(id, 0))?;
+        println!("{}", std::fs::read_to_string(Path::new(&args[3]).join("state.json"))?);
+        return Ok(());
+    }
     if args[4] == "status" {
         let status = motor.status().await;
         if !status.server_reachable {

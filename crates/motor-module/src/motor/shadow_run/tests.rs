@@ -245,7 +245,7 @@ async fn shadow_hanging_or_refused_never_changes_callers_stream_or_exit() {
         assert_eq!(leases[0].1["shadow"], true);
         assert_eq!(leases[0].1["avoid_host"], "build-server");
         let shadow_id = leases[0].1["job_id"].as_str().unwrap();
-        let state = std::fs::read_to_string(root.join("state.json")).unwrap();
+        let state = crate::storage::durable_value(&root).unwrap().to_string();
         assert!(
             !state.contains(shadow_id),
             "shadows must not write job state"

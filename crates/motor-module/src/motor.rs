@@ -120,7 +120,7 @@ impl Motor {
     ) -> io::Result<JobStream> {
         self.run_classified(
             request,
-            attribution,
+            (attribution, None),
             false,
             false,
             false,
@@ -135,7 +135,7 @@ impl Motor {
     ) -> io::Result<JobStream> {
         self.run_classified(
             request,
-            attribution,
+            (attribution, None),
             true,
             false,
             false,
@@ -147,32 +147,42 @@ impl Motor {
         request: RunRequest,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, None, false, false, false, returns)
-    }
-    pub(crate) fn run_direct_with_spill(
-        &self,
-        request: RunRequest,
-        attribution: Option<JobAttribution>,
-        returns: crate::ReturnOptions,
-        allow_spill: bool,
-    ) -> io::Result<JobStream> {
-        self.run_classified(request, attribution, true, allow_spill, false, returns)
+        self.run_classified(request, (None, None), false, false, false, returns)
     }
     /// Send one direct job straight to a hosted lease, to test the hosted
     /// path. It needs neither `hosted_runners` nor spill, and changes neither
     /// for any other job. The lease avoids no host, is not retried for
     /// capacity, and a lease that can't be granted or connected refuses the
     /// job instead of falling back to the build server.
+    #[cfg(test)]
     pub(crate) fn run_direct_hosted(
         &self,
         request: RunRequest,
         attribution: Option<JobAttribution>,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, attribution, true, false, true, returns)
+        self.run_classified(request, (attribution, None), true, false, true, returns)
     }
-    pub(crate) fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
-        self.storage.set_direct_secret_hash(id, hash)
+    pub(crate) fn run_direct_authorized(
+        &self,
+        request: RunRequest,
+        attribution: Option<JobAttribution>,
+        returns: crate::ReturnOptions,
+        allow_spill: bool,
+        hosted: bool,
+        secret_hash: [u8; 32],
+    ) -> io::Result<JobStream> {
+        self.run_classified(
+            request,
+            (attribution, Some(secret_hash)),
+            true,
+            allow_spill,
+            hosted,
+            returns,
+        )
+    }
+    pub(crate) fn shutdown_storage(&self) -> io::Result<()> {
+        self.storage.shutdown()
     }
     pub(crate) fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
         self.storage.direct_authorized(id, secret)
@@ -180,12 +190,13 @@ impl Motor {
     fn run_classified(
         &self,
         mut request: RunRequest,
-        attribution: Option<JobAttribution>,
+        identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
         allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
+        let (attribution, secret_hash) = identity;
         let mut env_not_forwarded: Vec<_> = request
             .env
             .keys()
@@ -213,7 +224,7 @@ impl Motor {
             .ok()
             .map(|t| t.instance);
         self.storage
-            .create(id, wait, attribution, instance, gate_job)?;
+            .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
         if hosted_test {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
@@ -281,7 +292,19 @@ impl Motor {
         reason: RefusalReason,
         detail: Option<String>,
     ) -> io::Result<JobStream> {
+        self.refuse_authorized(reason, detail, None)
+    }
+    pub(crate) fn refuse_authorized(
+        &self,
+        reason: RefusalReason,
+        detail: Option<String>,
+        secret_hash: Option<[u8; 32]>,
+    ) -> io::Result<JobStream> {
         let id = Uuid::now_v7();
+        if secret_hash.is_some() {
+            self.storage
+                .create_authorized(id, 0, None, None, true, secret_hash)?;
+        }
         let (stream, tx, _) = self.stream(id);
         if self.config.hosted_runners {
             self.storage

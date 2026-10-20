@@ -880,9 +880,7 @@ async fn cancel_before_seen_survives_module_restart_and_attach_cancel() {
     // The attach caller's Cancel is the same durable path used by subc pump.
     let attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
     attached.cancel().unwrap();
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&fs::read(f.scratch.join("module-state/state.json")).unwrap())
-            .unwrap();
+    let persisted = crate::storage::durable_value(&f.scratch.join("module-state")).unwrap();
     assert_eq!(persisted["jobs"][id.to_string()]["pending_cancel"], true);
     drop(attached);
     drop(stream);

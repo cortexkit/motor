@@ -139,3 +139,18 @@ disk. The newer binary may have migrated that state at startup
 (`crates/motor-runner/src/migration.rs`). `scripts/mixed-version.py` proves
 wire compatibility between versions; that an older runner reads state written
 by a newer one is not covered by a test.
+
+
+## SUBC module rollback is a separate storage handoff
+
+The runner instructions above do not export ck-motor's device-local store.
+Before SUBC replaces ck-motor with an older binary, stop it with SIGTERM and wait
+for successful checkpoint export and exit. After a crash or failed shutdown
+export, stop the daemon and run the new binary's
+`ck-motor store-checkpoint --root /path/to/store.db.ck-motor`; require exit status
+0 before replacing the binary. Never delete its journal to make an old binary
+start. An unexported rollback can lose cancellation/Run fences since the last
+checkpoint. See [the complete ck-motor rollback procedure](module.md#subc-rollback-procedure)
+for the five-minute healthy-checkpoint bound and failure handling. Tests:
+`rollback_clean_shutdown_exports_every_transition_for_222d833`,
+`rollback_offline_checkpoint_exports_crash_suffix_for_222d833`.

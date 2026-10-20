@@ -526,7 +526,7 @@ mod tests {
         assert_eq!(f.tip(), None);
         let store = f._scratch.join("store");
         let calls = f.calls.clone();
-        let state = fs::read_to_string(store.join("state.json")).unwrap();
+        let state = crate::storage::durable_value(&store).unwrap().to_string();
         assert!(!state.contains("failed_tips"));
         drop(f.storage);
         let storage = Storage::open(&store).unwrap();
