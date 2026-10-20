@@ -1,7 +1,10 @@
-"""Portable unit tests for network-check.py: mock socket outcomes to prove its
-errno and timeout assertions reject leaks instead of accepting them as isolation.
+"""Portable packet-probe, policy-checker and loader-plan regressions.
+
+Socket mocks check leak grading. Loader tests validate planned transactions,
+not kernel packet verdicts; live namespace qualification remains operator-only.
 """
 import copy
+import contextlib
 import errno
 import importlib.util
 import json
@@ -115,18 +118,19 @@ class NetworkForwardPolicyTests(unittest.TestCase):
         table = pathlib.Path(__file__).with_name('motor-net.nft').read_text()
         forward = table.split('chain forward {', 1)[1].split('chain postrouting', 1)[0]
         self.assertIn('oifname "mnet-*" counter drop', forward, 'NEW inbound traffic must be silently dropped')
-        self.assertIn('iifname != "mnet-*" oifname != "mnet-*" counter drop', forward, 'unrelated forwarding must remain disabled')
+        catchall = 'iifname != "mnet-*" oifname != "mnet-*" iifname != @tenant_taps oifname != @tenant_taps counter drop'
+        self.assertIn(catchall, forward, 'only exact registered TAPs may escape unrelated-forwarding drop')
         reply = forward.index('ct state established,related accept')
         inbound = forward.index('oifname "mnet-*" counter drop')
         outbound = forward.index('iifname "mnet-*" oifname "enp6s0"')
-        unrelated = forward.index('iifname != "mnet-*" oifname != "mnet-*" counter drop')
+        unrelated = forward.index(catchall)
         self.assertLess(reply, inbound, 'only replies may enter a job')
         self.assertLess(inbound, outbound, 'inbound drop follows the reply exception')
         self.assertLess(outbound, unrelated, 'unrelated drop must not shadow job egress')
 
-    def test_installer_check_validates_real_json_and_rejects_removed_guards(self):
+    def test_installer_check_validates_captured_schema_plus_v2_fields_and_rejects_removed_guards(self):
         installer = load_script('install-job-network.py')
-        fixture = pathlib.Path(__file__).parent / 'test-fixtures/nft-motor-net-1.1.6.json'
+        fixture = pathlib.Path(__file__).parent / 'test-fixtures/nft-motor-net-v2-added-set.json'
         table = json.loads(fixture.read_text())
         installer.check_ruleset(table)
         # Handles, packet counters and ct-state display order are not policy.
@@ -158,10 +162,16 @@ class NetworkForwardPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'forward'):
             installer.check_ruleset(broken)
 
+    def test_legacy_v1_policy_is_not_reported_as_v2_healthy(self):
+        installer = load_script('install-job-network.py')
+        fixture = pathlib.Path(__file__).parent / 'test-fixtures/nft-motor-net-1.1.6.json'
+        with self.assertRaises(AssertionError):
+            installer.check_ruleset(json.loads(fixture.read_text()))
+
     def test_check_cli_rejects_real_json_with_both_input_rules_removed(self):
         installer = load_script('install-job-network.py')
         fixture = pathlib.Path(__file__).parent / 'test-fixtures/nft-motor-net-1.1.6-no-input.json'
-        with patch.object(installer, 'sudo', return_value=SimpleNamespace(stdout=fixture.read_text())) as sudo, patch('sys.argv', ['install-job-network.py', '--check']):
+        with patch.object(installer.os, 'geteuid', return_value=0), patch.object(installer.tenant_policy, 'network_lock', return_value=contextlib.nullcontext()), patch.object(installer, 'sudo', return_value=SimpleNamespace(stdout=fixture.read_text())) as sudo, patch('sys.argv', ['install-job-network.py', '--check']):
             with self.assertRaisesRegex(AssertionError, 'motor_net input'):
                 installer.main()
         sudo.assert_called_once_with('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net')
@@ -223,6 +233,162 @@ class NetworkFixtureTests(unittest.TestCase):
         for group in ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']:
             for spec in manifest.get(group, {}).values():
                 self.assertNotRegex(spec, r'^(file:|link:|workspace:|git|https?:|\.\./)')
+
+
+class TenantDelegationTests(unittest.TestCase):
+    OWNED = ('### tuple ### route:allow any any 0.0.0.0/0 any 10.200.1.2 in_mtap1!out_enp6s0 '
+             'comment=6d6f746f722d74656e616e742d6d74617031\n'
+             '-A ufw-user-forward -i mtap1 -o enp6s0 -s 10.200.1.2 -j ACCEPT\n')
+
+    def setUp(self):
+        self.installer = load_script('install-job-network.py')
+        self.policy = self.installer.tenant_policy
+        self.root = pathlib.Path(__file__).parent
+        self.source = (self.root / 'motor-net.nft').read_text()
+        self.net = json.loads((self.root / 'test-fixtures/nft-motor-net-v2-added-set.json').read_text())
+        self.tenant = json.loads((self.root / 'test-fixtures/nft-motor-tenant-v2-added-guards.json').read_text())
+
+    def test_checker_rejects_wildcard_tap_and_extra_inbound_grant(self):
+        self.installer.check_ruleset(self.net, set())
+        self.assertEqual(self.policy.owned_grants(self.OWNED), {'mtap1'})
+        self.assertEqual(self.policy.live_grants('-A ufw-user-forward -s 10.200.1.2/32 -i mtap1 -o enp6s0 -j ACCEPT'), {'mtap1'})
+        widened = copy.deepcopy(self.net)
+        next(e['set'] for e in widened['nftables'] if e.get('set', {}).get('name') == 'tenant_taps')['elem'] = ['mtap*']
+        with self.assertRaises(AssertionError):
+            self.installer.check_ruleset(widened)
+        for broken in [self.OWNED.replace('-i mtap1', '-i mtap+'),
+                       self.OWNED + '-A ufw-user-forward -i enp6s0 -o mtap1 -j ACCEPT\n']:
+            with self.subTest(broken=broken), self.assertRaises(AssertionError):
+                self.policy.owned_grants(broken)
+            with self.subTest(live=broken), self.assertRaises(AssertionError):
+                self.policy.live_grants(broken)
+        with self.assertRaises(AssertionError):
+            self.policy.owned_grants(self.OWNED, True)
+
+    def test_checker_rejects_missing_source_in_comment_owned_grant(self):
+        with self.assertRaises(AssertionError):
+            self.policy.owned_grants(self.OWNED.replace(' -s 10.200.1.2', ''))
+
+    def test_full_check_matches_exact_kernel_members_to_guarded_helper_authority(self):
+        original_read = pathlib.Path.read_text
+        def read(path, *args, **kwargs):
+            return '1' if str(path) == '/proc/sys/net/ipv4/ip_forward' else original_read(path, *args, **kwargs)
+        for tap, allowed in [('mtap1', True), ('mtap2', False)]:
+            document = copy.deepcopy(self.net)
+            next(e['set'] for e in document['nftables'] if e.get('set', {}).get('name') == 'tenant_taps')['elem'] = [tap]
+            def sudo(*args, **kwargs):
+                return SimpleNamespace(stdout=json.dumps(document) if args[0] == '/usr/sbin/nft' else 'mnet-+ enp6s0 ALLOW FWD')
+            with self.subTest(tap=tap), patch.object(self.installer.os, 'geteuid', return_value=0), \
+                    patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), \
+                    patch.object(self.installer, 'sudo', side_effect=sudo), patch.object(self.installer, 'permissions'), patch.object(self.installer, 'check_persistence'), \
+                    patch.object(self.policy, 'table', return_value=self.tenant), \
+                    patch.object(self.policy, 'inspect_ufw', return_value=({'mtap1'}, {'mtap1'})), \
+                    patch.object(pathlib.Path, 'read_text', read):
+                if allowed:
+                    self.installer.prerequisites()
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'delegation/UFW'):
+                        self.installer.prerequisites()
+
+    def test_persistent_loader_check_reads_installed_bytes_and_rejects_self_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / 'loader'
+            target.write_text('correct loader\n')
+            target.chmod(0o755)
+            expected = {target: ('correct loader\n', 0o755)}
+            self.installer.verify_files(expected, owner=self.installer.os.geteuid())
+            target.write_text('wrong loader\n')
+            with self.assertRaisesRegex(AssertionError, 'differs'):
+                self.installer.verify_files(expected, owner=self.installer.os.geteuid())
+            nft_copy, policy_copy = pathlib.Path(directory) / 'nft', pathlib.Path(directory) / 'policy'
+            nft_copy.write_bytes((self.root / 'motor-net.nft').read_bytes())
+            policy_copy.write_bytes((self.root / 'motor_network_policy.py').read_bytes())
+            with patch.object(self.installer, 'NFT', nft_copy), patch.object(self.installer, 'POLICY', policy_copy), patch.object(self.installer, 'verify_files') as verify:
+                self.installer.check_persistence()
+            verify.assert_called_once()
+        with patch.object(self.installer, 'NFT', self.root / 'motor-net.nft'), patch.object(self.installer, 'verify_files') as verify:
+            with self.assertRaisesRegex(AssertionError, 'versioned source'):
+                self.installer.check_persistence()
+        verify.assert_not_called()
+
+    def test_helper_policy_checker_requires_explicit_verdicts_unknown_tap_fence_and_exact_source(self):
+        self.assertEqual(self.policy.tenant_snapshot(self.tenant, self.source), ({'mtap1'}, set()))
+        canonical = copy.deepcopy(self.tenant)
+        dependency = {'match': {'op': '==', 'left': {'meta': {'key': 'nfproto'}}, 'right': 'ipv4'}}
+        for entry in canonical['nftables']:
+            if 'rule' in entry:
+                entry['rule']['expr'] = [e for e in entry['rule']['expr'] if e != dependency]
+        self.assertEqual(self.policy.tenant_snapshot(canonical, self.source), ({'mtap1'}, set()))
+        for chain, at in [('tenant_guard_forward', 0), ('tenant_mtap1_forward', 8), ('tenant_mtap1_forward', 4)]:
+            broken = copy.deepcopy(self.tenant)
+            rules = [e for e in broken['nftables'] if e.get('rule', {}).get('chain') == chain]
+            broken['nftables'].remove(rules[at])
+            with self.subTest(chain=chain, at=at), self.assertRaises(AssertionError):
+                self.policy.tenant_snapshot(broken, self.source)
+        wrong_uplink = copy.deepcopy(self.tenant)
+        public = next(e['rule'] for e in wrong_uplink['nftables'] if e.get('rule', {}).get('chain') == 'tenant_mtap1_forward' and any(s.get('counter') == 'tenant_mtap1_egress' for s in e['rule']['expr']))
+        public['expr'][1]['match']['right'] = 'other0'
+        with self.assertRaises(AssertionError):
+            self.policy.tenant_snapshot(wrong_uplink, self.source)
+
+    def test_comment_owned_reconciliation_does_not_touch_mnet_or_foreign_rules(self):
+        stale = self.OWNED.replace('mtap1', 'mtap2').replace('10.200.1.2', '10.200.2.2')
+        stale = stale.replace('6d6f746f722d74656e616e742d6d74617031', '6d6f746f722d74656e616e742d6d74617032')
+        old = self.policy.owned_grants(stale + '### tuple ### route:allow any any 0.0.0.0/0 any 0.0.0.0/0 in_mnet-+!out_enp6s0\n-A ufw-user-forward -i mnet-+ -o enp6s0 -j ACCEPT\n')
+        with patch.object(self.policy, 'command') as command, patch.object(self.policy, 'inspect_ufw', return_value=({'mtap1'}, {'mtap1'})):
+            self.policy.reconcile_ufw({'mtap1'}, (old, old))
+        self.assertEqual(command.call_args_list[0].args, ('/usr/sbin/ufw', '--force', 'delete', 'route', 'allow', 'in', 'on', 'mtap2', 'out', 'on', 'enp6s0', 'from', '10.200.2.2', 'to', 'any', 'comment', 'motor-tenant-mtap2'))
+        self.assertEqual(command.call_args_list[1].args, ('/usr/sbin/ufw', 'route', 'allow', 'in', 'on', 'mtap1', 'out', 'on', 'enp6s0', 'from', '10.200.1.2', 'to', 'any', 'comment', 'motor-tenant-mtap1'))
+        with patch.object(self.policy, 'command') as command, patch.object(self.policy, 'inspect_ufw', return_value=({'mtap1'}, {'mtap1'})):
+            self.policy.reconcile_ufw({'mtap1'}, ({'mtap1'}, {'mtap1'}))
+        command.assert_not_called()
+
+    def load_plan(self, tenant, net, prior=({'mtap1'}, {'mtap1'}), failure=False, inspect_failure=False):
+        source = SimpleNamespace(read_text=lambda: self.source, lstat=lambda: SimpleNamespace(st_mode=0o100644, st_uid=0))
+        writes = []
+        with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), patch.object(self.policy, 'SOURCE', source), \
+                patch.object(self.policy, 'table', side_effect=lambda family, name: tenant if name == 'motor_tenant' else net), \
+                patch.object(self.policy, 'apply', side_effect=writes.append), patch.object(self.policy, 'inspect_ufw', return_value=prior, side_effect=RuntimeError('UFW failure') if inspect_failure else None) as inspect, \
+                patch.object(self.policy, 'reconcile_ufw', side_effect=RuntimeError('UFW failure') if failure else None):
+            if failure or inspect_failure:
+                with self.assertRaisesRegex(RuntimeError, 'UFW failure'):
+                    self.policy.load()
+            else:
+                self.policy.load()
+        return writes, inspect.call_count
+
+    def test_load_plans_are_fail_closed_for_both_install_orders_and_reboot(self):
+        first, calls = self.load_plan(None, self.net)
+        self.assertEqual(calls, 0, 'no protected policy: do not infer tenants from persisted UFW')
+        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(first))
+        for net in [None, self.net]:
+            writes, _ = self.load_plan(self.tenant, net)
+            self.assertIn('add element inet motor_net tenant_taps { "mtap1" }', ''.join(writes))
+            self.assertNotIn('delete counter', ''.join(writes))
+        reboot, _ = self.load_plan(None, None)
+        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(reboot))
+        legacy = json.loads((self.root / 'test-fixtures/nft-motor-tenant-v1-capture.json').read_text())
+        fenced, calls = self.load_plan(legacy, self.net)
+        self.assertEqual(calls, 0, 'legacy object presence cannot authorize delegation')
+        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(fenced))
+
+    def test_loader_ufw_failure_closes_tap_and_removes_delegation(self):
+        writes, _ = self.load_plan(self.tenant, self.net, failure=True)
+        self.assertEqual(writes[-1], 'flush set inet motor_tenant closed_taps\nadd element inet motor_tenant closed_taps { "mtap1" }\nflush set inet motor_net tenant_taps\n')
+
+    def test_loader_cannot_open_tenant_when_ufw_inspection_fails(self):
+        writes, _ = self.load_plan(self.tenant, self.net, inspect_failure=True)
+        self.assertEqual(len(writes), 1)
+        self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+        self.assertNotIn('add element inet motor_net tenant_taps', writes[0])
+
+    def test_unknown_ufw_status_and_widened_return_state_are_not_assumed_safe(self):
+        with patch.object(self.policy, 'read_owned', return_value=''), patch.object(self.policy, 'command', return_value='unavailable'):
+            with self.assertRaisesRegex(AssertionError, 'unrecognized UFW status'):
+                self.policy.inspect_ufw()
+        with patch.object(self.policy, 'read_owned', return_value=''), patch.object(self.policy, 'command', side_effect=['Status: active', '', '-A ufw-before-forward -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT']):
+            with self.assertRaisesRegex(AssertionError, 'established/related'):
+                self.policy.inspect_ufw()
 
 
 if __name__ == '__main__':

@@ -214,7 +214,7 @@ fn summary(proc: &Path, pid: u32) -> io::Result<Value> {
     Ok(
         json!({"routes":routes,"daemon_resolvers":resolvers(&resolver)?,
         "resolver_uid":metadata.uid(),"resolver_mode":format!("{:o}",metadata.mode() & 0o777),
-        "global_resolvers":resolvers(&proc.join("1/root/etc/resolv.conf")).unwrap_or_default(),
+        "global_resolvers":resolvers(&proc.join("1/root/etc/resolv.conf")).ok(),
         "daemon_mount_namespace":ns(&root.join("ns/mnt")),"daemon_network_namespace":ns(&root.join("ns/net")),
             "init_mount_namespace":ns(&proc.join("1/ns/mnt")),"init_network_namespace":ns(&proc.join("1/ns/net")),
             "cargo_cache":{"archive_count":archive_count,"truncated":archives_truncated,"available":archives_available}}),
@@ -267,6 +267,8 @@ mod tests {
         assert_eq!(value["cargo_cache"]["archive_count"], 1);
         assert!(!value.to_string().contains("private-name"));
         assert!(!value.to_string().contains("TOKEN"));
+        std::fs::remove_file(root.join("1/root/etc/resolv.conf")).unwrap();
+        assert!(summary(&root, 245).unwrap()["global_resolvers"].is_null());
     }
 
     #[tokio::test]

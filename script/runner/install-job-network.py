@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""Operator-only motor_net v1 installer. Default is a read-only diff; --apply installs.
+"""Operator-only motor_net v2 installer. Default is a read-only diff; --apply installs.
 
-Run as the runner's trusted operator account, not motor-job. This never changes
-ufw's input rules or any table other than inet motor_net.
+Run --apply/--check as root, never motor-job. UFW input rules and foreign rules
+are unchanged; only exact comment-owned tenant route grants are reconciled.
 """
 import argparse
 import difflib
 import json
+import os
 import pathlib
 import re
 import subprocess
 import tempfile
+import sys
+import stat
+import types
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
+# Compile the versioned source directly: ignored/stale bytecode must not replace
+# the policy that the read-only checker is supposed to inspect.
+tenant_policy = types.ModuleType('motor_network_policy')
+tenant_policy.__file__ = str(HERE / 'motor_network_policy.py')
+exec(compile((HERE / 'motor_network_policy.py').read_bytes(), tenant_policy.__file__, 'exec'), tenant_policy.__dict__)
 NFT = pathlib.Path('/etc/nftables.d/motor-net.nft')
 SYSCTL = pathlib.Path('/etc/sysctl.d/90-motor-net.conf')
 LOADER = pathlib.Path('/usr/local/libexec/motor-net-load')
 UNIT = pathlib.Path('/etc/systemd/system/motor-net-rules.service')
+POLICY = pathlib.Path('/usr/local/libexec/motor_network_policy.py')
 
 
 def run(*args, check=True):
@@ -28,6 +39,9 @@ def sudo(*args, check=True):
 
 
 def permissions():
+    if os.geteuid() == 0:
+        print('SKIP: root cannot establish non-root runner sudo grants; run --dry-run as the trusted runner account')
+        return
     for command in json.loads((HERE / 'network-sudo-probes.json').read_text()):
         result = run('/usr/bin/sudo', '-n', '-l', *command, check=False)
         if result.returncode:
@@ -35,16 +49,34 @@ def permissions():
     print('PASS: sudo -n accepts all 18 network command forms (permission queries only)')
 
 
-def prerequisites():
-    check_ruleset(json.loads(sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net').stdout))
+def prerequisites(allow_fenced=False):
+    assert os.geteuid() == 0, 'run full network --check as root'
+    with tenant_policy.network_lock():
+        actual = check_ruleset(json.loads(sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net').stdout))
+        source = (HERE / 'motor-net.nft').read_text()
+        document = tenant_policy.table('inet', 'motor_tenant')
+        try:
+            taps, closed = tenant_policy.tenant_snapshot(document, source)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            if not allow_fenced:
+                raise
+            assert not actual, 'unsupported tenant policy must have no delegation'
+            print('FENCED: base policy installed; update helper and run mandatory --check before tenant traffic')
+        else:
+            owned, ready = tenant_policy.inspect_ufw()
+            if allow_fenced and document is None and not actual:
+                print('FENCED: no helper policy yet; persistent tenant grants confer no delegation')
+            else:
+                assert not closed and actual == taps == owned == ready, 'tenant delegation/UFW state is closed, stale or incomplete'
     route = sudo('/usr/sbin/ufw', 'status').stdout
     assert any('mnet-+' in line and 'enp6s0' in line and 'ALLOW FWD' in line for line in route.splitlines()), 'narrow ufw route allowance missing'
     assert pathlib.Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() == '1', 'ip_forward is not 1'
+    check_persistence()
     permissions()
     print('PASS: motor_net loaded and IPv4 forwarding enabled')
 
 
-def check_ruleset(document):
+def check_ruleset(document, tenant_taps=None):
     """Validate nft's expression tree, ignoring handles and live counter values."""
     def match(left, right, op='=='):
         return {'match': {'op': op, 'left': left, 'right': right}}
@@ -78,7 +110,7 @@ def check_ruleset(document):
             [interface('iifname'), interface('oifname', 'enp6s0'), address('saddr', pool), address('daddr', '@non_public_v4', '!='), states('established', 'related', 'new'), {'accept': None}],
             [interface('iifname'), tcp, reset],
             [interface('iifname'), unreachable],
-            [interface('iifname', op='!='), interface('oifname', op='!='), {'counter': None}, {'drop': None}],
+            [interface('iifname', op='!='), interface('oifname', op='!='), interface('iifname', '@tenant_taps', '!='), interface('oifname', '@tenant_taps', '!='), {'counter': None}, {'drop': None}],
         ],
         'postrouting': [[address('saddr', pool), interface('oifname', 'enp6s0'), {'masquerade': None}]],
     }
@@ -111,8 +143,12 @@ def check_ruleset(document):
     assert chains == expected_chains, 'motor_net chain hooks, priorities or policies differ'
     for name, expected in expected_rules.items():
         assert rules[name] == expected, f'motor_net {name} rule predicates, order or verdicts differ'
-    assert len(sets) == 1, 'motor_net needs exactly one non_public_v4 set'
-    ranges = sets[0]
+    assert len(sets) == 2 and {s['name'] for s in sets} == {'non_public_v4', 'tenant_taps'}, 'motor_net needs exact private and tenant TAP sets'
+    by_name = {s['name']: s for s in sets}
+    taps = tenant_policy.exact_taps(by_name['tenant_taps'])
+    if tenant_taps is not None:
+        assert taps == tenant_taps, 'tenant TAP delegation differs from guarded policy'
+    ranges = by_name['non_public_v4']
     assert ranges['name'] == 'non_public_v4' and ranges['type'] == 'ipv4_addr' and ranges['flags'] == ['interval'], 'invalid private/special IPv4 set'
     # The versioned nft source is the only maintained range inventory. Captured
     # JSON fixtures contain snapshots, not a second policy list to update.
@@ -122,37 +158,20 @@ def check_ruleset(document):
     expected_ranges = set(re.findall(r'\b[0-9.]+/[0-9]+\b', inventory[1]))
     actual_ranges = {f"{element['prefix']['addr']}/{element['prefix']['len']}" for element in ranges['elem']}
     assert actual_ranges == expected_ranges, 'loaded private/special IPv4 ranges differ from versioned source'
+    return taps
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--apply', action='store_true')
-    mode.add_argument('--check', action='store_true')
-    mode.add_argument('--dry-run', '--diff', action='store_true')
-    args = parser.parse_args()
-    print('motor_net host tooling v1')
-    if args.check:
-        prerequisites()
-        return
-    permissions()
-    desired = {
+def desired_files():
+    return {
         NFT: (HERE / 'motor-net.nft').read_text(),
         SYSCTL: 'net.ipv4.ip_forward=1\n',
-        LOADER: '''#!/bin/sh
-set -eu
-# Delete and recreate only our table in one atomic nft transaction.
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-if /usr/sbin/nft list table inet motor_net >/dev/null 2>&1; then
-    printf 'delete table inet motor_net\\n' >"$tmp"
-fi
-printf 'include "/etc/nftables.d/motor-net.nft"\\n' >>"$tmp"
-/usr/sbin/nft --check --file "$tmp"
-/usr/sbin/nft --file "$tmp"
+        POLICY: (HERE / 'motor_network_policy.py').read_text(),
+        LOADER: '''#!/usr/bin/python3 -I
+import runpy
+runpy.run_path('/usr/local/libexec/motor_network_policy.py')['load']()
 ''',
         UNIT: '''[Unit]
-Description=Motor outbound IPv4 firewall v1
+Description=Motor outbound IPv4 firewall v2 with exact tenant delegation
 After=network-pre.target
 Before=motor-runner.service
 [Service]
@@ -163,6 +182,37 @@ ExecStart=/usr/local/libexec/motor-net-load
 WantedBy=multi-user.target
 ''',
     }
+
+
+def verify_files(expected, owner=0):
+    for path, (text, mode) in expected.items():
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and metadata.st_nlink == 1, f'unsafe installed network file: {path}'
+        assert stat.S_IMODE(metadata.st_mode) == mode, f'wrong installed network mode: {path}'
+        assert path.read_bytes() == text.encode(), f'installed network file differs: {path}'
+
+
+def check_persistence():
+    for source, target in [(HERE / 'motor-net.nft', NFT), (HERE / 'motor_network_policy.py', POLICY)]:
+        assert not target.exists() or not os.path.samefile(source, target), 'run checker from versioned source, not the installed file itself'
+    verify_files({path: (text, 0o755 if path == LOADER else 0o644) for path, text in desired_files().items()})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--apply', action='store_true')
+    mode.add_argument('--check', action='store_true')
+    mode.add_argument('--dry-run', '--diff', action='store_true')
+    args = parser.parse_args()
+    print('motor_net host tooling v2')
+    if args.check:
+        prerequisites()
+        return
+    if args.apply:
+        assert os.geteuid() == 0, 'run network --apply as root'
+    permissions()
+    desired = desired_files()
     current = sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net', check=False)
     if current.returncode:
         print('Live motor_net is absent; the versioned table will be installed.')
@@ -192,8 +242,8 @@ WantedBy=multi-user.target
     sudo('/usr/sbin/sysctl', '-q', '-w', 'net.ipv4.ip_forward=1')
     sudo('/usr/sbin/ufw', 'route', 'allow', 'in', 'on', 'mnet-+', 'out', 'on', 'enp6s0')
     sudo('/usr/bin/systemctl', 'enable', '--now', 'motor-net-rules.service')
-    prerequisites()
-    print('PASS: persistent rules and sysctl installed; ufw input rules unchanged')
+    prerequisites(allow_fenced=True)
+    print('Persistent rules/sysctl installed; run --check after helper reconciliation. UFW input rules unchanged.')
 
 
 if __name__ == '__main__':

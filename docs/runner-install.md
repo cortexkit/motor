@@ -291,15 +291,21 @@ which shows a diff by default:
 
 ```sh
 python3 script/runner/install-job-network.py            # show what would change
-python3 script/runner/install-job-network.py --apply    # install
-python3 script/runner/install-job-network.py --check    # verify
+sudo python3 script/runner/install-job-network.py --apply    # install
+sudo python3 script/runner/install-job-network.py --check    # verify
 ```
 
 It installs `/etc/nftables.d/motor-net.nft` from `script/runner/motor-net.nft`,
-`/etc/sysctl.d/90-motor-net.conf`, and a `motor-net-rules.service` that loads
-the table at boot. It changes no other table. The rules name the host's uplink
-interface and the job address range literally; edit `motor-net.nft` for your
-host before applying.
+`/etc/sysctl.d/90-motor-net.conf`, a root-owned loader/policy module, and the
+`motor-net-rules.service` boot unit. `--check` compares installed bytes/modes as
+well as live rules, guarded tenant sets and owned UFW grants. Outside
+`motor_net`, reconciliation changes only helper-owned tenant gate sets and
+comment-owned tenant UFW routes; existing job rules and foreign policy remain.
+The policy/checker use the existing `enp6s0` uplink and literal job address pool;
+a different uplink needs a coherent policy/checker update, not a wildcard grant.
+Run the default read-only diff as the trusted runner account to verify its
+non-root `sudo` grants. Running `--check` as root skips verification of that
+account's non-root `sudo` grants.
 
 Then add `--job-network veth` to the instance's `serve` line. At startup the
 runner checks the table and prerequisites; when they fail it keeps running but

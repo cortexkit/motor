@@ -4,6 +4,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+mod lock;
+mod ufw;
+
 fn run(args: &[&str]) -> Result<()> {
     let output = Command::new("/usr/sbin/ip").args(args).output()?;
     if !output.status.success() {
@@ -48,36 +51,172 @@ pub fn ensure(r: &Registry, uid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile only tenant-owned objects in one transaction. A live tenant's
-/// named counter is never recreated when another tenant is enabled or disabled.
+#[cfg(test)]
 fn rules(registries: &[Registry], existing: Option<&serde_json::Value>) -> Result<String> {
-    use std::collections::BTreeSet;
-    let mut counters = BTreeSet::new();
-    let mut chains = BTreeSet::new();
-    if let Some(value) = existing {
-        let objects = value["nftables"]
-            .as_array()
-            .ok_or_else(|| Error("missing nft objects".into()))?;
-        for item in objects {
-            for (kind, names) in [("counter", &mut counters), ("chain", &mut chains)] {
-                let object = &item[kind];
-                if object["family"] == "inet" && object["table"] == "motor_tenant" {
-                    if let Some(name) = object["name"].as_str() {
-                        names.insert(name.to_owned());
-                    }
-                }
-            }
-        }
+    policy_rules(registries, existing, &std::collections::BTreeSet::new())
+}
+
+fn private_inventory() -> Result<String> {
+    let source = include_str!("../../../../script/runner/motor-net.nft");
+    source
+        .split_once("set non_public_v4")
+        .and_then(|(_, s)| s.split_once("elements"))
+        .and_then(|(_, s)| s.split_once('{'))
+        .and_then(|(_, s)| s.split_once('}'))
+        .map(|(s, _)| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .ok_or_else(|| Error("versioned non-public inventory missing".into()))
+}
+
+fn object_names(
+    existing: Option<&serde_json::Value>,
+    kind: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let Some(value) = existing else {
+        return Ok(Default::default());
+    };
+    let objects = value["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft objects".into()))?;
+    Ok(objects
+        .iter()
+        .filter_map(|item| {
+            let object = &item[kind];
+            (object["family"] == "inet" && object["table"] == "motor_tenant")
+                .then(|| object["name"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect())
+}
+
+fn replace_chain(
+    text: &mut String,
+    chains: &std::collections::BTreeSet<String>,
+    name: &str,
+    attributes: &str,
+) {
+    if chains.contains(name) {
+        text.push_str(&format!(
+            "flush chain inet motor_tenant {name}\ndelete chain inet motor_tenant {name}\n"
+        ));
     }
-    let desired: BTreeSet<_> = registries.iter().map(Registry::tap).collect();
-    if desired.len() != registries.len() {
-        return Err(Error("duplicate tenant tap".into()));
+    text.push_str(&format!(
+        "add chain inet motor_tenant {name} {{ {attributes} }}\n"
+    ));
+}
+
+fn set_members(table: &str, name: &str, taps: &std::collections::BTreeSet<String>) -> String {
+    let mut text = format!("flush set inet {table} {name}\n");
+    if !taps.is_empty() {
+        text.push_str(&format!(
+            "add element inet {table} {name} {{ {} }}\n",
+            taps.iter()
+                .map(|tap| format!("\"{tap}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
+    text
+}
+
+fn prelude(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    closed: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    let desired: std::collections::BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    if desired.len() != registries.len() || !closed.is_subset(&desired) {
+        return Err(Error("duplicate or invalid tenant tap set".into()));
+    }
+    let sets = object_names(existing, "set")?;
+    let chains = object_names(existing, "chain")?;
     let mut text = String::new();
     if existing.is_none() {
         text.push_str("add table inet motor_tenant\n");
     }
-    let mut managed = BTreeSet::new();
+    for name in ["tenant_taps", "closed_taps"] {
+        if !sets.contains(name) {
+            text.push_str(&format!(
+                "add set inet motor_tenant {name} {{ type ifname; }}\n"
+            ));
+        }
+    }
+    text.push_str(&set_members("motor_tenant", "tenant_taps", &desired));
+    text.push_str(&set_members("motor_tenant", "closed_taps", closed));
+    if !sets.contains("non_public_v4") {
+        text.push_str(
+            "add set inet motor_tenant non_public_v4 { type ipv4_addr; flags interval; }\n",
+        );
+    }
+    text.push_str(&format!("flush set inet motor_tenant non_public_v4\nadd element inet motor_tenant non_public_v4 {{ {} }}\n",private_inventory()?));
+    replace_chain(
+        &mut text,
+        &chains,
+        "tenant_guard_input",
+        "type filter hook input priority -20; policy accept;",
+    );
+    text.push_str("add rule inet motor_tenant tenant_guard_input iifname \"mtap*\" counter drop\n");
+    replace_chain(
+        &mut text,
+        &chains,
+        "tenant_guard_forward",
+        "type filter hook forward priority -20; policy accept;",
+    );
+    for interface in ["iifname", "oifname"] {
+        text.push_str(&format!("add rule inet motor_tenant tenant_guard_forward {interface} @closed_taps counter drop\n"));
+    }
+    for interface in ["iifname", "oifname"] {
+        text.push_str(&format!("add rule inet motor_tenant tenant_guard_forward {interface} \"mtap*\" {interface} != @tenant_taps counter drop\n"));
+    }
+    Ok(text)
+}
+
+fn policy_rules(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    closed: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    // Object presence alone cannot prove that an older forward chain has the
+    // current denies. Replace rule chains atomically, retaining named counters.
+    if existing.is_some_and(|value| {
+        value["nftables"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_object().is_none_or(|object| {
+                    object.len() != 1
+                        || object.keys().any(|kind| {
+                            !["metainfo", "table", "counter", "chain", "set", "rule"]
+                                .contains(&kind.as_str())
+                        })
+                })
+            })
+        })
+    }) {
+        return Err(Error(
+            "foreign objects in helper-owned tenant policy".into(),
+        ));
+    }
+    let counters = object_names(existing, "counter")?;
+    let chains = object_names(existing, "chain")?;
+    let sets = object_names(existing, "set")?;
+    if counters
+        .iter()
+        .any(|name| managed_tap(name, "_egress").is_none())
+        || chains.iter().any(|name| {
+            !["tenant_guard_input", "tenant_guard_forward"].contains(&name.as_str())
+                && !["_input", "_forward", "_nat"]
+                    .iter()
+                    .any(|suffix| managed_tap(name, suffix).is_some())
+        })
+        || sets
+            .iter()
+            .any(|name| !["tenant_taps", "closed_taps", "non_public_v4"].contains(&name.as_str()))
+    {
+        return Err(Error(
+            "foreign objects in helper-owned tenant policy".into(),
+        ));
+    }
+    let desired: std::collections::BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    let mut text = prelude(registries, existing, closed)?;
+    let mut managed = std::collections::BTreeSet::new();
     for name in &counters {
         if let Some(tap) = managed_tap(name, "_egress") {
             managed.insert(tap);
@@ -92,14 +231,16 @@ fn rules(registries: &[Registry], existing: Option<&serde_json::Value>) -> Resul
     }
     for tap in managed.difference(&desired) {
         for suffix in ["input", "forward", "nat"] {
-            let chain = format!("tenant_{tap}_{suffix}");
-            if chains.contains(&chain) {
-                text.push_str(&format!("flush chain inet motor_tenant {chain}\ndelete chain inet motor_tenant {chain}\n"));
+            let name = format!("tenant_{tap}_{suffix}");
+            if chains.contains(&name) {
+                text.push_str(&format!(
+                    "flush chain inet motor_tenant {name}\ndelete chain inet motor_tenant {name}\n"
+                ));
             }
         }
-        let counter = format!("tenant_{tap}_egress");
-        if counters.contains(&counter) {
-            text.push_str(&format!("delete counter inet motor_tenant {counter}\n"));
+        let name = format!("tenant_{tap}_egress");
+        if counters.contains(&name) {
+            text.push_str(&format!("delete counter inet motor_tenant {name}\n"));
         }
     }
     for r in registries {
@@ -110,35 +251,47 @@ fn rules(registries: &[Registry], existing: Option<&serde_json::Value>) -> Resul
                 .iter()
                 .filter(|suffix| chains.contains(&format!("tenant_{tap}_{suffix}")))
                 .count();
-        if present == 4 {
-            continue;
-        }
-        if present != 0 {
+        if present != 0 && present != 4 {
             return Err(Error(format!("incomplete tenant firewall objects: {tap}")));
         }
-        text.push_str(&format!("add counter inet motor_tenant {counter} {{ }}\n"));
+        if present == 0 {
+            text.push_str(&format!("add counter inet motor_tenant {counter} {{ }}\n"));
+        }
         let input = format!("tenant_{tap}_input");
         let forward = format!("tenant_{tap}_forward");
         let nat = format!("tenant_{tap}_nat");
-        text.push_str(&format!("add chain inet motor_tenant {input} {{ type filter hook input priority -10; policy accept; }}\n"));
+        replace_chain(
+            &mut text,
+            &chains,
+            &input,
+            "type filter hook input priority -10; policy accept;",
+        );
         text.push_str(&format!("add rule inet motor_tenant {input} iifname \"{tap}\" counter drop comment \"tenant_host\"\n"));
-        text.push_str(&format!("add chain inet motor_tenant {forward} {{ type filter hook forward priority -10; policy accept; }}\n"));
-        for (predicate,comment) in [
+        replace_chain(
+            &mut text,
+            &chains,
+            &forward,
+            "type filter hook forward priority -10; policy accept;",
+        );
+        for (predicate, comment) in [
             ("oifname \"mtap*\"", "tenant_taps"),
             ("meta nfproto ipv6", "tenant_ipv6"),
             ("fib daddr type local", "tenant_host"),
-            ("ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 }", "tenant_private"),
+            ("ip daddr @non_public_v4", "tenant_private"),
         ] {
             text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" {predicate} counter drop comment \"{comment}\"\n"));
         }
         text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" ip saddr != 10.200.{}.2 counter drop comment \"tenant_source\"\n",r.tap_index));
-        text.push_str(&format!(
-            "add rule inet motor_tenant {forward} iifname \"{tap}\" counter name {counter}\n"
-        ));
-        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" ct state established,related counter accept\n"));
-        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" counter drop comment \"tenant_inbound\"\n"));
-        text.push_str(&format!("add chain inet motor_tenant {nat} {{ type nat hook postrouting priority srcnat; policy accept; }}\n"));
-        text.push_str(&format!("add rule inet motor_tenant {nat} iifname \"{tap}\" ip saddr 10.200.{}.2 counter masquerade\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" oifname \"enp6s0\" meta nfproto ipv4 ip saddr 10.200.{}.2 ct state new,established,related counter name {counter} accept comment \"tenant_public\"\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" iifname \"enp6s0\" meta nfproto ipv4 ip daddr 10.200.{}.2 ct state established,related counter accept\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" counter drop comment \"tenant_inbound\"\nadd rule inet motor_tenant {forward} iifname \"{tap}\" counter drop comment \"tenant_unmatched\"\n"));
+        replace_chain(
+            &mut text,
+            &chains,
+            &nat,
+            "type nat hook postrouting priority srcnat; policy accept;",
+        );
+        text.push_str(&format!("add rule inet motor_tenant {nat} iifname \"{tap}\" oifname \"enp6s0\" ip saddr 10.200.{}.2 counter masquerade\n",r.tap_index));
     }
     Ok(text)
 }
@@ -150,18 +303,165 @@ fn managed_tap(name: &str, suffix: &str) -> Option<String> {
 }
 
 pub fn install(registries: &[Registry]) -> Result<()> {
+    let _lock = lock::acquire()?;
     let tables = nft_json(&["-j", "list", "tables"])?;
-    let exists = tables["nftables"]
-        .as_array()
-        .ok_or_else(|| Error("missing nft tables".into()))?
-        .iter()
-        .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == "motor_tenant");
-    let existing = if exists {
-        Some(nft_json(&["-j", "list", "table", "inet", "motor_tenant"])?)
-    } else {
-        None
+    let table = |name: &str| -> Result<Option<serde_json::Value>> {
+        let exists = tables["nftables"]
+            .as_array()
+            .ok_or_else(|| Error("missing nft tables".into()))?
+            .iter()
+            .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == name);
+        if exists {
+            Ok(Some(nft_json(&["-j", "list", "table", "inet", name])?))
+        } else {
+            Ok(None)
+        }
     };
-    let transaction = rules(registries, existing.as_ref())?;
+    let existing = table("motor_tenant")?;
+    let motor_net = table("motor_net")?;
+    let inspected = if registries.is_empty() && !std::path::Path::new("/usr/sbin/ufw").exists() {
+        Ok(ufw::State::default())
+    } else {
+        ufw::inspect()
+    };
+    reconcile_policy(
+        registries,
+        existing.as_ref(),
+        motor_net.as_ref(),
+        inspected,
+        apply,
+        |prior| {
+            if !registries.is_empty() || std::path::Path::new("/usr/sbin/ufw").exists() {
+                ufw::reconcile(registries, prior)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn reconcile_policy(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    motor_net: Option<&serde_json::Value>,
+    inspected: Result<ufw::State>,
+    mut apply: impl FnMut(&str) -> Result<()>,
+    reconcile_ufw: impl FnOnce(&ufw::State) -> Result<()>,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let desired: BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    let ready: BTreeSet<_> = inspected
+        .as_ref()
+        .map(|state| {
+            registries
+                .iter()
+                .filter(|r| state.ready.contains(&r.tap_index))
+                .map(Registry::tap)
+                .collect()
+        })
+        .unwrap_or_default();
+    let closed = desired.difference(&ready).cloned().collect();
+    let transaction = policy_rules(registries, existing, &closed).and_then(|mut text| {
+        text.push_str(&motor_net_members(motor_net, &ready)?);
+        Ok(text)
+    });
+    match transaction {
+        Ok(text) => apply(&text)?,
+        Err(error) => {
+            // Guards close every registered TAP even if a legacy/partial policy
+            // cannot be upgraded. Never publish exemptions without protection.
+            apply(&prelude(registries, existing, &desired)?)?;
+            return Err(error);
+        }
+    }
+    let prior = inspected?;
+    if let Err(error) = reconcile_ufw(&prior) {
+        if !ready.is_empty() {
+            let mut fence = set_members("motor_tenant", "closed_taps", &desired);
+            fence.push_str(&motor_net_members(motor_net, &BTreeSet::new())?);
+            apply(&fence)?;
+        }
+        return Err(error);
+    }
+    // Only live, comment-owned UFW grants may release the per-TAP gate. An
+    // earlier failure leaves new/mismatched tenants closed and unready.
+    let mut open = set_members("motor_tenant", "closed_taps", &BTreeSet::new());
+    open.push_str(&motor_net_members(motor_net, &desired)?);
+    apply(&open)
+}
+
+fn motor_net_members(
+    existing: Option<&serde_json::Value>,
+    taps: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    let Some(value) = existing else {
+        return Ok(String::new());
+    };
+    let items = value["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing motor_net objects".into()))?;
+    let set = items
+        .iter()
+        .map(|v| &v["set"])
+        .find(|v| v["name"] == "tenant_taps");
+    let Some(set) = set else {
+        // Legacy policy already blocks TAPs. Empty delegation needs no new
+        // grant, so standalone non-tenant helper users remain compatible.
+        if taps.is_empty() {
+            return Ok(String::new());
+        }
+        return Err(Error(
+            "legacy motor_net policy: run updated install-job-network.py --apply".into(),
+        ));
+    };
+    if set["type"] != "ifname"
+        || set
+            .get("flags")
+            .is_some_and(|flags| flags.as_array().is_none_or(|flags| !flags.is_empty()))
+    {
+        return Err(Error("unsafe motor_net tenant_taps schema".into()));
+    }
+    let expression = value["nftables"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|v| {
+                    let rule = &v["rule"];
+                    (rule["chain"] == "forward")
+                        .then(|| rule["expr"].as_array())
+                        .flatten()
+                })
+                .next_back()
+        })
+        .ok_or_else(|| Error("motor_net forward catch-all missing".into()))?;
+    if expression.len() != 6
+        || expression[5] != serde_json::json!({"drop":null})
+        || expression[4]
+            .as_object()
+            .is_none_or(|v| v.len() != 1 || !v.contains_key("counter"))
+    {
+        return Err(Error(
+            "motor_net tenant delegation catch-all differs".into(),
+        ));
+    }
+    for (at, key, right) in [
+        (0, "iifname", "mnet-*"),
+        (1, "oifname", "mnet-*"),
+        (2, "iifname", "@tenant_taps"),
+        (3, "oifname", "@tenant_taps"),
+    ] {
+        if expression[at]
+            != serde_json::json!({"match":{"op":"!=","left":{"meta":{"key":key}},"right":right}})
+        {
+            return Err(Error(
+                "motor_net tenant delegation catch-all differs".into(),
+            ));
+        }
+    }
+    Ok(set_members("motor_net", "tenant_taps", taps))
+}
+
+fn apply(transaction: &str) -> Result<()> {
     if transaction.is_empty() {
         return Ok(());
     }
@@ -261,14 +561,17 @@ mod tests {
         assert!(text.find("tenant_private").unwrap() < text.find("ct state").unwrap());
         assert!(text.contains("10.200.1.2 counter masquerade"));
         assert!(text.contains("10.200.2.2 counter masquerade"));
-        assert!(text.contains("iifname \"mtap1\" counter name tenant_mtap1_egress"));
-        assert!(text.contains("iifname \"mtap2\" counter name tenant_mtap2_egress"));
+        assert!(text.contains("counter name tenant_mtap1_egress accept comment \"tenant_public\""));
+        assert!(text.contains("counter name tenant_mtap2_egress accept comment \"tenant_public\""));
+        assert!(text.contains("ct state new,established,related"));
+        assert!(text.contains("counter drop comment \"tenant_unmatched\""));
     }
 
     #[derive(Default)]
     struct NftObjects {
         counters: std::collections::BTreeMap<String, u64>,
         chains: std::collections::BTreeSet<String>,
+        sets: std::collections::BTreeSet<String>,
     }
     impl NftObjects {
         fn snapshot(&self) -> serde_json::Value {
@@ -278,6 +581,11 @@ mod tests {
             }
             for name in &self.chains {
                 objects.push(serde_json::json!({"chain":{"family":"inet","table":"motor_tenant","name":name}}));
+            }
+            for name in &self.sets {
+                objects.push(
+                    serde_json::json!({"set":{"family":"inet","table":"motor_tenant","name":name}}),
+                );
             }
             serde_json::json!({"nftables":objects})
         }
@@ -289,6 +597,12 @@ mod tests {
                 assert!(!(words[0] == "delete" && words[1] == "table"));
                 match (words[0], words[1]) {
                     ("add", "table") => {}
+                    ("add", "set") => {
+                        assert!(self.sets.insert(words[4].into()));
+                    }
+                    ("flush", "set") | ("add", "element") => {
+                        assert!(self.sets.contains(words[4]));
+                    }
                     ("add", "counter") => {
                         assert!(
                             self.counters.insert(words[4].into(), 0).is_none(),
@@ -334,21 +648,22 @@ mod tests {
         nft.apply(&rules(std::slice::from_ref(&a), None).unwrap());
         nft.traffic("mtap1", 100);
         let enable_b = rules(&[a.clone(), b], Some(&nft.snapshot())).unwrap();
-        assert!(!enable_b.contains("tenant_mtap1"));
+        assert!(!enable_b.contains("add counter inet motor_tenant tenant_mtap1_egress"));
         assert!(!enable_b.contains("table inet"));
         nft.apply(&enable_b);
         nft.traffic("mtap1", 25);
         nft.traffic("mtap2", 70);
         assert_eq!(forward_bytes(&nft.snapshot(), "mtap1").unwrap(), 125);
         let disable_b = rules(std::slice::from_ref(&a), Some(&nft.snapshot())).unwrap();
-        assert!(!disable_b.contains("tenant_mtap1"));
+        assert!(!disable_b.contains("add counter inet motor_tenant tenant_mtap1_egress"));
         assert!(!disable_b.contains("table inet"));
         nft.apply(&disable_b);
         nft.traffic("mtap1", 30);
         assert_eq!(forward_bytes(&nft.snapshot(), "mtap1").unwrap(), 155);
         assert!(forward_bytes(&nft.snapshot(), "mtap2").is_err());
         let reconcile = rules(&[a], Some(&nft.snapshot())).unwrap();
-        assert!(reconcile.is_empty());
+        assert!(!reconcile.contains("add counter inet motor_tenant tenant_mtap1_egress"));
+        assert!(!reconcile.contains("delete counter inet motor_tenant tenant_mtap1_egress"));
         nft.apply(&reconcile);
         nft.traffic("mtap1", 10);
         assert_eq!(forward_bytes(&nft.snapshot(), "mtap1").unwrap(), 165);
@@ -364,5 +679,151 @@ mod tests {
             "_egress"
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    #[test]
+    fn ufw_failure_keeps_new_tenant_gate_closed_and_returns_unready() {
+        let registry = crate::tenant::tests::registry("a");
+        let writes = std::cell::RefCell::new(Vec::<String>::new());
+        let error = reconcile_policy(
+            &[registry],
+            None,
+            None,
+            Ok(ufw::State::default()),
+            |text| {
+                writes.borrow_mut().push(text.into());
+                Ok(())
+            },
+            |_| {
+                assert!(writes.borrow()[0]
+                    .contains("add element inet motor_tenant closed_taps { \"mtap1\" }"));
+                Err(Error("simulated UFW failure".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("simulated UFW failure"));
+        assert_eq!(
+            writes.borrow().len(),
+            1,
+            "must not publish the final open transaction"
+        );
+    }
+    #[test]
+    fn guarded_policy_precedes_ufw_and_only_success_releases_the_tenant_gate() {
+        let registry = crate::tenant::tests::registry("a");
+        let writes = std::cell::RefCell::new(Vec::<String>::new());
+        reconcile_policy(
+            &[registry],
+            None,
+            None,
+            Ok(ufw::State::default()),
+            |text| {
+                writes.borrow_mut().push(text.into());
+                Ok(())
+            },
+            |_| {
+                assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
+                assert!(writes.borrow()[0].contains("tenant_unmatched"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(writes.borrow().len(), 2);
+        assert_eq!(
+            writes.borrow()[1],
+            "flush set inet motor_tenant closed_taps\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ufw_failure_fence_tests {
+    use super::*;
+    #[test]
+    fn ufw_failure_revokes_previously_ready_tenant_egress_before_returning_error() {
+        let registry = crate::tenant::tests::registry("a");
+        let mut writes = Vec::<String>::new();
+        let state = ufw::State {
+            owned: [1].into(),
+            ready: [1].into(),
+        };
+        assert!(reconcile_policy(
+            &[registry],
+            None,
+            None,
+            Ok(state),
+            |text| {
+                writes.push(text.into());
+                Ok(())
+            },
+            |_| Err(Error("UFW failure".into()))
+        )
+        .is_err());
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1], "flush set inet motor_tenant closed_taps\nadd element inet motor_tenant closed_taps { \"mtap1\" }\n");
+    }
+}
+
+#[cfg(test)]
+mod delegation_schema_tests {
+    use super::*;
+    #[test]
+    fn motor_net_delegation_requires_exact_set_and_final_guard_shape() {
+        let document: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-net-v2-added-set.json"
+        ))
+        .unwrap();
+        let taps = ["mtap1".to_owned()].into();
+        assert_eq!(motor_net_members(Some(&document), &taps).unwrap(), "flush set inet motor_net tenant_taps\nadd element inet motor_net tenant_taps { \"mtap1\" }\n");
+        let mut widened = document.clone();
+        let objects = widened["nftables"].as_array_mut().unwrap();
+        let expression = objects
+            .iter_mut()
+            .filter_map(|v| v.get_mut("rule"))
+            .filter_map(|rule| {
+                if rule["chain"] == "forward" {
+                    rule["expr"].as_array_mut()
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .unwrap();
+        expression[2]["match"]["right"] = serde_json::json!("mtap*");
+        assert!(motor_net_members(Some(&widened), &taps).is_err());
+        assert_eq!(motor_net_members(None, &taps).unwrap(), "");
+        let legacy: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-net-1.1.6.json"
+        ))
+        .unwrap();
+        assert!(motor_net_members(Some(&legacy), &taps).is_err());
+        assert_eq!(
+            motor_net_members(Some(&legacy), &Default::default()).unwrap(),
+            ""
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_migration_tests {
+    use super::*;
+    #[test]
+    fn legacy_policy_upgrade_rewrites_forward_guards_without_recreating_named_counter() {
+        let document: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-tenant-v1-capture.json"
+        ))
+        .unwrap();
+        let registry = crate::tenant::tests::registry("a");
+        let text = policy_rules(&[registry], Some(&document), &["mtap1".into()].into()).unwrap();
+        assert!(text.contains("tenant_public"));
+        assert!(text.contains("tenant_unmatched"));
+        assert!(text.contains("closed_taps { \"mtap1\" }"));
+        assert!(!text.contains("add counter inet motor_tenant tenant_mtap1_egress"));
+        assert!(!text.contains("delete counter inet motor_tenant tenant_mtap1_egress"));
+        assert_eq!(forward_bytes(&document, "mtap1").unwrap(), 0);
     }
 }
