@@ -1,0 +1,18 @@
+[Unit]
+Description=Establish and verify Boat reflink storage after file restoration
+# Boat's root-disk sysbinds can satisfy .mount units without mounting our disk.
+# Run before the local-fs mounts without pulling basic.target into their graph.
+DefaultDependencies=no
+Requires=motor-boat-restored.service
+After=motor-boat-restored.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --prepare-storage
+TimeoutStartSec=120

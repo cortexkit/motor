@@ -141,29 +141,22 @@ def state(pins):
             stream.truncate(pins["state_gib"] * 1024**3)
         run("mkfs.xfs", "-q", "-m", "reflink=1", str(image))
     mount = Path("/etc/systemd/system/var-lib-motor\\x2dboat.mount")
-    # On a sandbox created from a snapshot, Boat's in-guest agent starts this
-    # enabled mount while it is still restoring the snapshot's files and serves
-    # /var/lib/motor-boat from a temporary FUSE filesystem. When the restore
-    # ends it moves that FUSE mount aside, and a loop mount stacked on top of
-    # it moves too, so the runner loses its state. Wait for the restore gate.
+    # Boat's root-disk sysbind can make this mount unit appear active without
+    # mounting XFS. The storage service establishes the real mounts first.
     mount.write_text("[Unit]\nDescription=Boat reflink runner disk\n"
-                     "Requires=motor-boat-restored.service\nAfter=motor-boat-restored.service\n[Mount]\n"
+                     "Requires=motor-boat-restored.service motor-boat-storage.service\n"
+                     "After=motor-boat-restored.service motor-boat-storage.service\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"
                      "Type=xfs\nOptions=loop,noatime\n[Install]\nWantedBy=multi-user.target\n")
-    run("systemctl", "daemon-reload")
-    run("systemctl", "enable", "--now", mount.name)
-    if run("findmnt", "-n", "-o", "FSTYPE", str(STATE), capture=True) != "xfs":
-        raise ValueError("runner disk is not XFS")
-    for directory in ("state", "state/workspaces", "home", "tmp"):
-        (STATE / directory).mkdir(parents=True, exist_ok=True)
-        run("chown", "root:root", str(STATE / directory))
-    run("chown", "root:root", str(STATE))
     Path("/Users").mkdir(exist_ok=True)
     Path("/etc/systemd/system/Users.mount").write_text(
-        "[Unit]\nRequires=var-lib-motor\\x2dboat.mount\nAfter=var-lib-motor\\x2dboat.mount\n"
+        "[Unit]\nRequires=var-lib-motor\\x2dboat.mount motor-boat-storage.service\n"
+        "After=var-lib-motor\\x2dboat.mount motor-boat-storage.service\n"
         "[Mount]\nWhat=/var/lib/motor-boat/state/workspaces\nWhere=/Users\nType=none\n"
         "Options=bind\n[Install]\nWantedBy=multi-user.target\n")
     run("systemctl", "daemon-reload")
+    run("systemctl", "start", "motor-boat-storage.service")
+    run("systemctl", "enable", "--now", mount.name)
     run("systemctl", "enable", "--now", "Users.mount")
     with tempfile.NamedTemporaryFile(dir=STATE) as source, tempfile.NamedTemporaryFile(dir="/Users") as target:
         source.write(os.urandom(4096))
@@ -245,7 +238,7 @@ def service_preflight():
         run('/usr/bin/systemctl', 'start', 'motor-boat.service')
         run('/usr/bin/systemctl', 'is-active', '--quiet', 'motor-boat.service')
     except subprocess.CalledProcessError:
-        for unit in ('motor-boat-restored.service', 'motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service', 'motor-boat-bridge.service'):
+        for unit in ('motor-boat-restored.service', 'motor-boat-storage.service', r'var-lib-motor\x2dboat.mount', 'Users.mount', 'motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service', 'motor-boat-bridge.service'):
             subprocess.run(['/usr/bin/systemctl', 'status', '--no-pager', '-l', unit], check=False)
             subprocess.run(['/usr/bin/journalctl', '-u', unit, '-b', '--no-pager', '-n', '200'], check=False)
         raise
@@ -253,7 +246,7 @@ def service_preflight():
         subprocess.run(['/usr/bin/systemctl', 'stop', 'motor-boat.service'], check=False)
 
 
-UNITS = ("motor-boat-restored.service", "motor-boat.service", "motor-boat-bridge.service",
+UNITS = ("motor-boat-restored.service", "motor-boat-storage.service", "motor-boat.service", "motor-boat-bridge.service",
          "motor-boat-host.service", "motor-boat-identity.service")
 # Units earlier recipes installed; a recipe reapplied on such an image removes them.
 RETIRED_UNITS = ("motor-boat-host.path",)
