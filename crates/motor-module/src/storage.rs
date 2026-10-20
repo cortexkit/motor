@@ -83,8 +83,14 @@ impl Job {
     }
 
     fn legacy_expired(&self, id: Uuid, now: u64) -> bool {
+        // Legacy shapes predate terminal tracking; the later of the two also
+        // carries runner_instance, so that field alone doesn't exclude it.
         self.legacy_shape
-            && self.lacks_newer_fields()
+            && Job {
+                runner_instance: None,
+                ..self.clone()
+            }
+            .lacks_newer_fields()
             && id.get_version_num() == 7
             && id.get_timestamp().is_some_and(|timestamp| {
                 let (seconds, nanos) = timestamp.to_unix();
@@ -137,11 +143,17 @@ fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
     impl<'de> Deserialize<'de> for StoredJob {
         fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             let value = serde_json::Value::deserialize(deserializer)?;
+            // Records written before terminal tracking existed come in two
+            // shapes: the original three keys, and the same three plus a
+            // runner_instance name (added with Windows routing). Current ck-motor
+            // always writes retain_until_ms and workspace_key, so it never
+            // produces either shape.
             let legacy_shape = value.as_object().is_some_and(|fields| {
-                fields.len() == 3
-                    && ["local_terminal", "pending_cancel", "queue_wait_limit_s"]
-                        .iter()
-                        .all(|key| fields.contains_key(*key))
+                let base = ["local_terminal", "pending_cancel", "queue_wait_limit_s"];
+                base.iter().all(|key| fields.contains_key(*key))
+                    && (fields.len() == 3
+                        || (fields.len() == 4
+                            && fields.get("runner_instance").is_some_and(|v| v.is_string())))
             });
             let mut job: Job = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
             job.legacy_shape = legacy_shape;
@@ -694,21 +706,28 @@ mod retention_tests {
         let legacy = json!({
             "queue_wait_limit_s": 60, "pending_cancel": false, "local_terminal": null,
         });
-        let mut state: State = serde_json::from_value(json!({
-            "jobs": {old.to_string(): legacy, fresh.to_string(): legacy},
-            "snapshots": {},
-        }))
-        .unwrap();
+        // The later legacy shape: the same three keys plus runner_instance.
+        let routed = json!({
+            "runner_instance": "main", "queue_wait_limit_s": 300,
+            "pending_cancel": false, "local_terminal": null,
+        });
+        for record in [legacy, routed] {
+            let mut state: State = serde_json::from_value(json!({
+                "jobs": {old.to_string(): record, fresh.to_string(): record},
+                "snapshots": {},
+            }))
+            .unwrap();
 
-        state.prune(now);
-        assert!(
-            !state.jobs.contains_key(&old),
-            "old legacy history must expire"
-        );
-        assert!(
-            state.jobs.contains_key(&fresh),
-            "fresh history must survive"
-        );
+            state.prune(now);
+            assert!(
+                !state.jobs.contains_key(&old),
+                "old legacy history must expire: {record}"
+            );
+            assert!(
+                state.jobs.contains_key(&fresh),
+                "fresh history must survive: {record}"
+            );
+        }
     }
 
     #[test]
