@@ -37,6 +37,9 @@ pub struct Config {
     pub windows_runner_instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_runner_state_root: Option<String>,
+    /// Ordered Windows endpoints. An empty list keeps the legacy instance pair.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows_runners: Vec<WindowsRunner>,
     pub worktree_roots: Vec<PathBuf>,
     pub queue_wait_limit_s: u64,
     pub ssh_config_override: Option<PathBuf>,
@@ -118,6 +121,90 @@ fn is_default_direct_timeout(value: &u64) -> bool {
 /// The default for [`Config::direct_exec_max_timeout_secs`]: two hours.
 pub const DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS: u64 = 7200;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowsRunner {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(skip_serializing_if = "is_ssh_port")]
+    pub port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host_key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub instance: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub state_root: String,
+    #[serde(skip_serializing_if = "is_one")]
+    pub max_concurrent: usize,
+}
+
+fn is_ssh_port(port: &u16) -> bool {
+    *port == 22
+}
+fn is_one(count: &usize) -> bool {
+    *count == 1
+}
+impl Default for WindowsRunner {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            host_key: String::new(),
+            instance: String::new(),
+            state_root: String::new(),
+            max_concurrent: 1,
+        }
+    }
+}
+impl WindowsRunner {
+    pub(crate) fn target(&self) -> RunnerTarget {
+        RunnerTarget {
+            instance: self.instance.clone(),
+            state_root: Some(self.state_root.clone()),
+            windows: Some(self.clone()),
+        }
+    }
+    fn validate(&self) -> io::Result<()> {
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        };
+        if !plain(&self.name)
+            || !plain(&self.host)
+            || !plain(&self.user)
+            || self.host.starts_with('-')
+            || self.user.starts_with('-')
+            || self.port == 0
+            || self.instance.is_empty()
+            || !self
+                .instance
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            || !self.state_root.starts_with('/')
+            || !self
+                .state_root
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+            || self.max_concurrent == 0
+            || self.max_concurrent > tokio::sync::Semaphore::MAX_PERMITS
+            || self.host_key.contains(['\r', '\n'])
+            || ssh_key::PublicKey::from_openssh(&self.host_key).is_err()
+        {
+            return Err(io::Error::other(
+                "invalid Windows runner endpoint, instance, state root, host key or concurrency",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var_os("HOME")
@@ -138,6 +225,7 @@ impl Default for Config {
             runner_instance: "main".into(),
             windows_runner_instance: None,
             windows_runner_state_root: None,
+            windows_runners: Vec::new(),
             worktree_roots: vec![data.join("cortexkit/alfonso/worktrees")],
             queue_wait_limit_s: 300,
             ssh_config_override: None,
@@ -173,6 +261,13 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> io::Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for runner in &self.windows_runners {
+            runner.validate()?;
+            if !names.insert(&runner.name) {
+                return Err(io::Error::other("Windows runner names must be unique"));
+            }
+        }
         if !self.shadow_to_hosted.sample_rate.is_finite()
             || !(0.0..=1.0).contains(&self.shadow_to_hosted.sample_rate)
             || self.shadow_to_hosted.max_concurrent == 0
@@ -281,7 +376,11 @@ impl Config {
             None | Some(Platform::Linux) => Ok(RunnerTarget {
                 instance: self.runner_instance.clone(),
                 state_root: None,
+                windows: None,
             }),
+            Some(Platform::Windows) if !self.windows_runners.is_empty() => {
+                Ok(self.windows_runners[0].target())
+            }
             Some(Platform::Windows) => match (
                 &self.windows_runner_instance,
                 &self.windows_runner_state_root,
@@ -289,6 +388,7 @@ impl Config {
                 (Some(instance), Some(root)) => Ok(RunnerTarget {
                     instance: instance.clone(),
                     state_root: Some(root.clone()),
+                    windows: None,
                 }),
                 _ => Err(io::Error::other(
                     "requested platform windows is not configured",
@@ -305,7 +405,11 @@ impl Config {
             return self.target(None);
         }
         if instance == self.windows_runner_instance.as_deref() {
-            return self.target(Some(&motor_protocol::Platform::Windows));
+            return Ok(RunnerTarget {
+                instance: instance.unwrap().into(),
+                state_root: self.windows_runner_state_root.clone(),
+                windows: None,
+            });
         }
         Err(io::Error::other(format!(
             "stored runner instance {} is no longer configured",
@@ -318,4 +422,5 @@ impl Config {
 pub(crate) struct RunnerTarget {
     pub instance: String,
     pub state_root: Option<String>,
+    pub windows: Option<WindowsRunner>,
 }

@@ -13,6 +13,7 @@ pub(crate) struct HealthCache {
     last_success: Option<Instant>,
     sample: Option<RunnerHealth>,
     failures: u32,
+    pub(crate) windows: Vec<Value>,
 }
 
 impl Default for HealthCache {
@@ -22,6 +23,7 @@ impl Default for HealthCache {
             last_success: None,
             sample: None,
             failures: 0,
+            windows: Vec::new(),
         }
     }
 }
@@ -47,6 +49,9 @@ impl HealthCache {
             "sample_age_ms": self.last_success.map(|_| age.as_millis() as u64),
             "headline": ["build_server", "queue_wait_1h"],
         });
+        if !self.windows.is_empty() {
+            metrics["windows_runners"] = json!(self.windows);
+        }
         let mut detail = if self.failures > 0 {
             "build server unreachable".to_owned()
         } else {
@@ -97,6 +102,17 @@ impl HealthCache {
         if age >= STALE_AFTER {
             detail.push_str(", sample stale");
         }
+        for runner in &self.windows {
+            let name = runner["name"].as_str().unwrap_or("windows");
+            let state = if runner["reachable"] == false {
+                "unreachable"
+            } else if runner["busy"] == true {
+                "busy"
+            } else {
+                "available"
+            };
+            detail.push_str(&format!("; Windows {name}: {state}"));
+        }
         HealthReport {
             status: if degraded {
                 HealthStatus::Degraded
@@ -132,6 +148,25 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_runner_samples_surface_reachability_and_busy_state() {
+        let mut cache = HealthCache::default();
+        cache.update(Some(sample()), Instant::now());
+        cache.windows = vec![
+            json!({"name": "portable", "reachable": false, "busy": null}),
+            json!({"name": "fallback", "reachable": true, "busy": true}),
+        ];
+        let report = cache.report(Instant::now());
+        assert_eq!(report.status, HealthStatus::Ok);
+        let detail = report.detail.unwrap();
+        assert!(detail.contains("Windows portable: unreachable"));
+        assert!(detail.contains("Windows fallback: busy"));
+        assert_eq!(
+            report.metrics.unwrap()["windows_runners"],
+            json!(cache.windows)
+        );
+    }
 
     pub(super) fn sample() -> RunnerHealth {
         serde_json::from_value(json!({

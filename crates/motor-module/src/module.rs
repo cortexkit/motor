@@ -120,7 +120,9 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
 
 pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest {
     let mut provides = vec![CAPABILITY.into(), FLOW_SCOPES_CAPABILITY.into()];
-    if config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some() {
+    if !config.windows_runners.is_empty()
+        || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
+    {
         provides.push(WINDOWS_CAPABILITY.into());
     }
     if config.network_routing {
@@ -501,10 +503,10 @@ impl Handler {
                 .await
                 .ok()
                 .and_then(Result::ok);
-                cache
-                    .lock()
-                    .unwrap()
-                    .update(sample, std::time::Instant::now());
+                let windows = motor.windows_health().await;
+                let mut cache = cache.lock().unwrap();
+                cache.update(sample, std::time::Instant::now());
+                cache.windows = windows;
             }
         }));
     }

@@ -45,6 +45,10 @@ pub(crate) struct Job {
     pub gate_job: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_instance: Option<String>,
+    /// Snapshot the endpoint as well as the instance: names can repeat across hosts,
+    /// and reordering or editing configuration must not move an admitted job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_runner: Option<crate::WindowsRunner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<JobAttribution>,
     pub queue_wait_limit_s: u64,
@@ -74,6 +78,7 @@ impl Job {
             && self.direct_secret_hash.is_none()
             && !self.gate_job
             && self.runner_instance.is_none()
+            && self.windows_runner.is_none()
             && self.attribution.is_none()
             && self.terminal_observed_at_ms.is_none()
             && self.terminal_delivered_at_ms.is_none()
@@ -488,6 +493,14 @@ impl Storage {
             state.verified_tips.insert(repository, tip);
         })
     }
+    pub(crate) fn bind_windows(&self, id: Uuid, runner: crate::WindowsRunner) -> io::Result<()> {
+        self.update(|state| {
+            let job = state.jobs.get_mut(&id).expect("job exists before binding");
+            job.runner_instance = Some(runner.instance.clone());
+            job.windows_runner = Some(runner);
+        })
+    }
+
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
     }

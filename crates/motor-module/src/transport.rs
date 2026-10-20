@@ -38,6 +38,9 @@ pub trait Connector: Send + Sync {
     fn refusal(&self) -> Option<&'static str> {
         None
     }
+    fn windows_refusal(&self) -> Option<&'static str> {
+        self.refusal()
+    }
     fn connect(&self, id: Uuid) -> ConnectFuture<'_>;
     fn connect_to<'a>(
         &'a self,
@@ -54,6 +57,13 @@ pub trait Connector: Send + Sync {
         }
         self.connect(id)
     }
+    fn connect_windows<'a>(
+        &'a self,
+        id: Uuid,
+        runner: &'a crate::WindowsRunner,
+    ) -> ConnectFuture<'a> {
+        self.connect_to(id, &runner.instance, Some(&runner.state_root))
+    }
 }
 
 pub(crate) struct InstanceConnector {
@@ -62,14 +72,22 @@ pub(crate) struct InstanceConnector {
 }
 impl Connector for InstanceConnector {
     fn refusal(&self) -> Option<&'static str> {
-        self.connector.refusal()
+        if self.target.windows.is_some() {
+            self.connector.windows_refusal()
+        } else {
+            self.connector.refusal()
+        }
     }
     fn connect(
         &self,
         id: Uuid,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
-        self.connector
-            .connect_to(id, &self.target.instance, self.target.state_root.as_deref())
+        if let Some(runner) = &self.target.windows {
+            self.connector.connect_windows(id, runner)
+        } else {
+            self.connector
+                .connect_to(id, &self.target.instance, self.target.state_root.as_deref())
+        }
     }
 }
 
@@ -411,6 +429,7 @@ struct SshPipe {
     read: tokio::process::ChildStdout,
     write: tokio::process::ChildStdin,
     _child: Child,
+    _pin: Option<WindowsPin>,
 }
 impl AsyncRead for SshPipe {
     fn poll_read(
@@ -443,6 +462,19 @@ impl AsyncWrite for SshPipe {
     }
 }
 impl Connector for SshConnector {
+    fn windows_refusal(&self) -> Option<&'static str> {
+        match self.refusal() {
+            Some("runner_ssh_config_invalid") => self
+                .credentials
+                .current
+                .lock()
+                .unwrap()
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.refusal()),
+            reason => reason,
+        }
+    }
     fn refusal(&self) -> Option<&'static str> {
         if self.credentials.stopped.load(Ordering::Acquire) {
             return Some("runner_agent_stopped");
@@ -480,15 +512,202 @@ impl Connector for SshConnector {
                 read: child.stdout.take().unwrap(),
                 write: child.stdin.take().unwrap(),
                 _child: child,
+                _pin: None,
             }) as Box<dyn Duplex>)
         })
     }
+    fn connect_windows<'a>(
+        &'a self,
+        id: Uuid,
+        runner: &'a crate::WindowsRunner,
+    ) -> ConnectFuture<'a> {
+        Box::pin(async move {
+            if self.credentials.unresolved() {
+                self.credentials.refresh().await;
+            }
+            if let Some(reason) = self.windows_refusal() {
+                return Err(io::Error::other(reason));
+            }
+            let agent = self
+                .credentials
+                .current
+                .lock()
+                .unwrap()
+                .agent
+                .clone()
+                .ok_or_else(|| io::Error::other("runner_credential_unavailable"))?;
+            let pin = WindowsPin::new(runner)?;
+            let mut command = windows_command(id, runner, &agent.socket, &agent.identity, &pin.0);
+            let mut child = command.spawn()?;
+            Ok(Box::new(SshPipe {
+                read: child.stdout.take().unwrap(),
+                write: child.stdin.take().unwrap(),
+                _child: child,
+                _pin: Some(pin),
+            }) as Box<dyn Duplex>)
+        })
+    }
+}
+
+struct WindowsPin(std::path::PathBuf);
+impl WindowsPin {
+    fn new(runner: &crate::WindowsRunner) -> io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path =
+            std::env::temp_dir().join(format!("motor-windows-{}.known_hosts", Uuid::now_v7()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let pin = Self(path);
+        writeln!(file, "motor-windows {}", runner.host_key)?;
+        Ok(pin)
+    }
+}
+impl Drop for WindowsPin {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn windows_command(
+    id: Uuid,
+    runner: &crate::WindowsRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
+    let mut command = windows_ssh_command(runner, socket, identity, known_hosts);
+    command.arg(format!(
+        "~/.cargo/bin/motor-runner connect --instance {} --state-root {} --job {id}",
+        runner.instance, runner.state_root
+    ));
+    command
+}
+
+fn windows_ssh_command(
+    runner: &crate::WindowsRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
+    let mut command = Command::new("ssh");
+    // Each explicit endpoint has its own pin and no shared master. In particular,
+    // the legacy build-server master must never carry an explicit endpoint's connection.
+    command
+        .args([
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "HostKeyAlias=motor-windows",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ConnectTimeout=3",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+        ])
+        .arg("-o")
+        .arg(format!("IdentityAgent={}", socket.display()))
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-i")
+        .arg(identity)
+        .arg("-p")
+        .arg(runner.port.to_string())
+        .arg("-l")
+        .arg(&runner.user)
+        .arg(&runner.host)
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .env_remove("SUBC_LAUNCH_NONCE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
 }
 
 // Boxing decoded frames allocates for every message and makes each consumer
 // unpack a wrapper before it can handle the protocol variant.
 pub(crate) use motor_protocol::DecodedFrame as Incoming;
 type WriteRequest = (Frame, oneshot::Sender<io::Result<()>>);
+
+#[cfg(test)]
+mod windows_command_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_windows_endpoint_offers_only_vault_identity_and_never_legacy_host() {
+        let runner = crate::WindowsRunner {
+            host: "192.0.2.41".into(),
+            port: 2222,
+            user: "worker".into(),
+            instance: "windows".into(),
+            state_root: "/srv/windows".into(),
+            ..Default::default()
+        };
+        let command = windows_command(
+            Uuid::nil(),
+            &runner,
+            Path::new("/vault/s"),
+            Path::new("/vault/identity.pub"),
+            Path::new("/private/pin"),
+        );
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        for required in [
+            "/dev/null",
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "IdentitiesOnly=yes",
+            "StrictHostKeyChecking=yes",
+            "GlobalKnownHostsFile=/dev/null",
+            "IdentityAgent=/vault/s",
+            "UserKnownHostsFile=/private/pin",
+            "ControlPath=none",
+            "192.0.2.41",
+            "worker",
+            "2222",
+        ] {
+            assert!(args.contains(&required), "missing {required}: {args:?}");
+        }
+        assert_eq!(args.iter().filter(|a| **a == "-F").count(), 1);
+        assert_eq!(args.iter().filter(|a| **a == "-i").count(), 1);
+        assert!(args.windows(2).any(|a| a == ["-i", "/vault/identity.pub"]));
+        assert!(!args.contains(&"alfonso-runner"));
+        assert!(args
+            .last()
+            .unwrap()
+            .contains("--instance windows --state-root /srv/windows"));
+        for name in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
+            assert!(command
+                .as_std()
+                .get_envs()
+                .any(|(n, v)| n == name && v.is_none()));
+        }
+    }
+}
+
 pub(crate) struct Channel {
     pub return_paths: bool,
     pub gate_jobs: bool,

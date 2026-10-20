@@ -42,6 +42,8 @@ struct RoutingPeer {
     cut_attaches: Arc<AtomicUsize>,
     fail_cancel_once: Arc<AtomicBool>,
     fail_windows: AtomicBool,
+    ally_behavior: AtomicUsize,
+    endpoints: Mutex<Vec<crate::WindowsRunner>>,
 }
 
 impl RoutingPeer {
@@ -62,6 +64,8 @@ impl RoutingPeer {
             cut_attaches: Arc::new(AtomicUsize::new(0)),
             fail_cancel_once: Arc::new(AtomicBool::new(false)),
             fail_windows: AtomicBool::new(false),
+            ally_behavior: AtomicUsize::new(0),
+            endpoints: Mutex::new(Vec::new()),
         })
     }
     fn motor(self: &Arc<Self>, config: Config) -> Motor {
@@ -93,6 +97,14 @@ fn terminal(id: Uuid, seq: u64) -> Frame {
 }
 
 impl Connector for RoutingPeer {
+    fn connect_windows<'a>(
+        &'a self,
+        id: Uuid,
+        runner: &'a crate::WindowsRunner,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + 'a>> {
+        self.endpoints.lock().unwrap().push(runner.clone());
+        self.connect_to(id, &runner.instance, Some(&runner.state_root))
+    }
     fn connect(
         &self,
         _id: Uuid,
@@ -110,7 +122,12 @@ impl Connector for RoutingPeer {
             instance: instance.into(),
             root: root.map(str::to_owned),
         });
-        let windows = instance == "windows";
+        let ally_behavior = if instance == "ally-windows" {
+            self.ally_behavior.load(Ordering::SeqCst)
+        } else {
+            0
+        };
+        let windows = instance == "windows" || instance == "ally-windows";
         let offline = windows && self.fail_windows.load(Ordering::SeqCst);
         let platforms = if windows {
             self.platforms.clone()
@@ -133,6 +150,9 @@ impl Connector for RoutingPeer {
         let cut_attaches = self.cut_attaches.clone();
         let fail_cancel = self.fail_cancel_once.clone();
         Box::pin(async move {
+            if ally_behavior == 1 {
+                return std::future::pending().await;
+            }
             if offline {
                 return Err(io::Error::other("windows peer offline"));
             }
@@ -183,12 +203,46 @@ impl Connector for RoutingPeer {
                                 "binding must be durable before Run"
                             );
                             assert_eq!(run.platform, windows.then_some(Platform::Windows));
+                            if ally_behavior == 2 {
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Refusal(Refusal {
+                                        job_id: Some(id),
+                                        transfer_id: None,
+                                        reason: RefusalReason::RunnerFull,
+                                        disk_full: None,
+                                        retry_after_ms: None,
+                                        detail: Some("windows_slot_busy".into()),
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                            if ally_behavior == 3 {
+                                return;
+                            }
                             let mut accepted = Accepted::new(id, 3);
                             accepted.platform = echo;
                             let _ = write_frame_async(&mut peer, &Frame::Accepted(accepted)).await;
+                            if ally_behavior == 4 {
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Started {
+                                        job_id: id,
+                                        seq: 0,
+                                        queue_wait_ms: 0,
+                                        started_at_ms: 1,
+                                        path_mapping: None,
+                                    },
+                                )
+                                .await;
+                            }
                             return;
                         }
                         Frame::Attach(request) => {
+                            if ally_behavior == 6 {
+                                std::future::pending::<()>().await;
+                            }
                             if cut_attaches
                                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     n.checked_sub(1)
@@ -240,6 +294,11 @@ impl Connector for RoutingPeer {
                             return;
                         }
                         Frame::Status => {
+                            let mut status = status;
+                            if ally_behavior == 5 {
+                                status.status.queue_depth = 1;
+                                status.health.as_mut().unwrap().queue_depth = 1;
+                            }
                             let _ = write_frame_async(&mut peer, &Frame::StatusReply(status)).await;
                             return;
                         }
@@ -250,6 +309,215 @@ impl Connector for RoutingPeer {
             Ok(Box::new(client) as Box<dyn Duplex>)
         })
     }
+}
+
+fn ordered(config: Config) -> Config {
+    let key = ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
+    Config {
+        windows_runners: vec![
+            crate::WindowsRunner {
+                name: "ally".into(),
+                host: "192.0.2.41".into(),
+                user: "runner".into(),
+                host_key: key.clone(),
+                instance: "ally-windows".into(),
+                state_root: WINDOWS_ROOT.into(),
+                ..Default::default()
+            },
+            crate::WindowsRunner {
+                name: "build-server".into(),
+                host: "192.0.2.42".into(),
+                user: "runner".into(),
+                host_key: key,
+                instance: "windows".into(),
+                state_root: WINDOWS_ROOT.into(),
+                ..Default::default()
+            },
+        ],
+        ..config
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_runners_prefer_first_and_persist_full_binding_across_restart() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let config = ordered(f.config.clone());
+    let motor = peer.motor(config.clone());
+    let mut request = f.request("true");
+    request.platform = Some(Platform::Windows);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    collect(stream).await;
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|v| v.instance == "ally-windows"));
+    let stored: Value =
+        serde_json::from_slice(&fs::read(peer.module_state.join("state.json")).unwrap()).unwrap();
+    assert_eq!(
+        stored["jobs"][id.to_string()]["windows_runner"]["host"],
+        "192.0.2.41"
+    );
+    drop(motor);
+    let mut changed = config;
+    changed.windows_runners.reverse();
+    changed.windows_runners[1].host = "192.0.2.99".into();
+    let motor = peer.motor(changed);
+    peer.visits.lock().unwrap().clear();
+    peer.endpoints.lock().unwrap().clear();
+    assert_eq!(motor.job_status(id).await.unwrap().state, "ally-windows");
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|v| v.instance == "ally-windows"));
+    assert!(peer
+        .endpoints
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.host == "192.0.2.41"));
+    let stored: Value =
+        serde_json::from_slice(&fs::read(peer.module_state.join("state.json")).unwrap()).unwrap();
+    assert_eq!(
+        stored["jobs"][id.to_string()]["windows_runner"]["host"],
+        "192.0.2.41"
+    );
+}
+
+#[tokio::test]
+async fn ordered_windows_unreachable_handshake_falls_through_within_three_seconds() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(1, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true");
+    request.platform = Some(Platform::Windows);
+    let start = tokio::time::Instant::now();
+    collect(motor.run(request).unwrap()).await;
+    assert!(start.elapsed() >= Duration::from_secs(3));
+    assert!(start.elapsed() < Duration::from_secs(6));
+    let visits = peer.visits.lock().unwrap();
+    assert_eq!(visits[0].instance, "ally-windows");
+    assert!(visits.iter().skip(1).all(|v| v.instance == "windows"));
+}
+
+#[tokio::test]
+async fn ordered_windows_local_slot_reservation_falls_through_without_queueing() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(6, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut first = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    assert!(matches!(
+        first.records.recv().await.unwrap().unwrap(),
+        StreamRecord::Accepted(_)
+    ));
+    let second = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    let second_id = second.job_id;
+    collect(second).await;
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v.id == second_id)
+        .all(|v| v.instance == "windows"));
+    drop(first);
+}
+
+#[tokio::test]
+async fn ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_move() {
+    for behavior in [2, 3, 4, 5] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(behavior, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let mut request = f.request("true");
+        request.platform = Some(Platform::Windows);
+        let records = collect(motor.run(request).unwrap()).await;
+        let visits = peer.visits.lock().unwrap();
+        assert_eq!(visits[0].instance, "ally-windows");
+        assert_eq!(
+            visits.iter().any(|v| v.instance == "windows"),
+            matches!(behavior, 2 | 5),
+            "behavior {behavior}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+                .count(),
+            usize::from(behavior != 3)
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_health_reports_each_runner_reachability_and_busy_state() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let samples = motor.windows_health().await;
+    assert_eq!(samples[0]["name"], "ally");
+    assert_eq!(samples[0]["reachable"], true);
+    assert_eq!(samples[0]["busy"], true);
+    assert_eq!(samples[1]["name"], "build-server");
+    assert_eq!(samples[1]["busy"], false);
+    peer.ally_behavior.store(1, Ordering::SeqCst);
+    let samples = motor.windows_health().await;
+    assert_eq!(samples[0]["reachable"], false);
+    assert_eq!(samples[0]["busy"], Value::Null);
+    assert_eq!(samples[1]["reachable"], true);
+}
+
+#[test]
+fn ordered_windows_config_defaults_are_omitted_and_legacy_pair_still_routes() {
+    let config = Config::default();
+    assert!(serde_json::to_value(&config)
+        .unwrap()
+        .get("windows_runners")
+        .is_none());
+    assert_eq!(
+        serde_json::to_value(crate::WindowsRunner::default()).unwrap(),
+        json!({})
+    );
+    let old = configured(config);
+    let decoded: Config = serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+    assert_eq!(
+        decoded.target(Some(&Platform::Windows)).unwrap().instance,
+        "windows"
+    );
+    let new = ordered(old);
+    new.validate().unwrap();
+    assert_eq!(
+        new.target(Some(&Platform::Windows)).unwrap().instance,
+        "ally-windows"
+    );
+    let mut bad = new.clone();
+    bad.windows_runners[0].host_key.push_str("\nmalicious");
+    assert!(bad.validate().is_err());
+    let mut bad = new.clone();
+    bad.windows_runners[0].max_concurrent = 0;
+    assert!(bad.validate().is_err());
+    let mut bad = new;
+    bad.windows_runners[1].name = "ally".into();
+    assert!(bad.validate().is_err());
 }
 
 fn write_job(peer: &RoutingPeer, id: Uuid, instance: Option<&str>, pending: bool) {
