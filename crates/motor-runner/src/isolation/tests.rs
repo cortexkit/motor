@@ -1530,8 +1530,16 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
             .output()
             .unwrap()
     };
-    prefetch_cargo_dependencies(false, &f.state, &branch, &BTreeMap::new(), &cargo, &rustup)
-        .unwrap();
+    prefetch_cargo_dependencies(
+        false,
+        false,
+        &f.state,
+        &branch,
+        &BTreeMap::new(),
+        &cargo,
+        &rustup,
+    )
+    .unwrap();
     let missing = metadata();
     assert!(
         !missing.status.success(),
@@ -1547,7 +1555,7 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
         "tip dependency must initially be absent"
     );
     let routes = BTreeMap::from([(url, mirror)]);
-    prefetch_cargo_dependencies(true, &f.state, &tip, &routes, &cargo, &rustup).unwrap();
+    prefetch_cargo_dependencies(true, false, &f.state, &tip, &routes, &cargo, &rustup).unwrap();
     let ready = metadata();
     assert!(
         ready.status.success(),

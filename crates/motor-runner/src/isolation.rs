@@ -18,6 +18,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod cargo_fetch;
 mod hosts;
 mod readable;
 
@@ -1549,6 +1550,7 @@ impl Drop for RuntimeDir {
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 fn prefetch_cargo_dependencies(
     writer: bool,
+    tenant_vm: bool,
     state: &Path,
     workspace: &Path,
     dependency_routes: &BTreeMap<String, PathBuf>,
@@ -1562,16 +1564,26 @@ fn prefetch_cargo_dependencies(
             "fetch job dependencies"
         };
         crate::setup_log::phase("fetch cargo dependencies", || {
-            checked(
-                workspace::dependencies::fetch_command(
+            let mut command = workspace::dependencies::fetch_command(
                     state,
                     workspace,
                     dependency_routes,
                     cargo,
                     rustup,
-                )?
-                .env("CARGO_NET_OFFLINE", "false"),
-            )
+                )?;
+            if tenant_vm {
+                // Tenant images contain tools, not a registry cache. Use only
+                // provisioned sources: network retries must not consume tenant
+                // lease time before the job command starts. A cache-lock or tool
+                // probe can still stall offline, so bound the entire child.
+                command.arg("--offline").env("CARGO_NET_OFFLINE", "true");
+                cargo_fetch::bounded(&mut command, std::time::Duration::from_secs(30))
+                    .map_err(|error| io::Error::new(error.kind(), format!(
+                        "tenant dependency preparation failed: {error}; provision the tenant Cargo registry index, crate cache and Git sources before running this locked workspace"
+                    )))
+            } else {
+                checked(command.env("CARGO_NET_OFFLINE", "false"))
+            }
         })
         .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
     }
@@ -1645,6 +1657,7 @@ impl Sandbox {
             &std::collections::BTreeMap::new(),
             &tree,
             &workspace.to_string_lossy(),
+            false,
         )
     }
 
@@ -1661,6 +1674,7 @@ impl Sandbox {
         dependency_routes: &std::collections::BTreeMap<String, PathBuf>,
         tree: &str,
         repository: &str,
+        tenant_vm: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -1675,6 +1689,7 @@ impl Sandbox {
             tree,
             repository,
             false,
+            tenant_vm,
         )
     }
 
@@ -1703,6 +1718,7 @@ impl Sandbox {
             tree,
             &workspace.to_string_lossy(),
             true,
+            false,
         )
     }
 
@@ -1720,6 +1736,7 @@ impl Sandbox {
         tree: &str,
         repository: &str,
         writer: bool,
+        tenant_vm: bool,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -1745,6 +1762,7 @@ impl Sandbox {
             );
             prefetch_cargo_dependencies(
                 writer,
+                tenant_vm,
                 state,
                 workspace,
                 dependency_routes,

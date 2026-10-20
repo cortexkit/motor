@@ -579,6 +579,7 @@ impl Backend for HostBackend {
                             &routes,
                             &r.tree_hash,
                             &r.repository_root,
+                            config.tenant_vm,
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
