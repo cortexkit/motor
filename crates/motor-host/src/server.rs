@@ -39,6 +39,108 @@ pub fn unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Which party a client connection failed on.
+#[derive(Debug, Clone, Copy)]
+pub enum Side {
+    /// The requester (ck-motor) at the far end of the TLS or forwarded stream.
+    Client,
+    /// The tenant runner behind the vsock or local job relay.
+    Guest,
+    /// motor-host itself: its journal, helper calls or internal tasks.
+    Host,
+}
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Client => "client",
+            Side::Guest => "guest",
+            Side::Host => "host",
+        }
+    }
+}
+
+/// Attached as context to the error that ends a connection, so the listener
+/// can log which side failed and at which protocol step. Holds no peer data.
+#[derive(Debug, Clone, Copy)]
+struct Closed {
+    side: Side,
+    step: &'static str,
+}
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed at {}", self.side.as_str(), self.step)
+    }
+}
+
+/// The job a failed connection was for, once its token verified.
+#[derive(Debug, Clone)]
+struct ConnectionJob(String);
+impl std::fmt::Display for ConnectionJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "job {}", self.0)
+    }
+}
+
+trait At<T> {
+    /// Tags a failure with the side and step it happened at.
+    fn at(self, side: Side, step: &'static str) -> Result<T>;
+}
+impl<T, E: Into<anyhow::Error>> At<T> for std::result::Result<T, E> {
+    fn at(self, side: Side, step: &'static str) -> Result<T> {
+        self.map_err(|error| error.into().context(Closed { side, step }))
+    }
+}
+fn closed(side: Side, step: &'static str, message: &'static str) -> anyhow::Error {
+    anyhow::Error::msg(message).context(Closed { side, step })
+}
+
+/// What the connection log says about a connection [`serve`] ended with an
+/// error: which side failed, at which step, the job if known and an error
+/// class. Peer-supplied text (frame contents, JSON parse detail, tokens) never
+/// reaches `cause`; only I/O errors, timeouts and this crate's own messages do.
+pub struct CloseReport {
+    pub side: &'static str,
+    pub step: &'static str,
+    pub jti: Option<String>,
+    pub cause: String,
+}
+pub fn describe_close(error: &anyhow::Error) -> CloseReport {
+    let closed = error.downcast_ref::<Closed>();
+    let cause = error
+        .chain()
+        .find_map(|layer| {
+            if let Some(io) = layer.downcast_ref::<std::io::Error>() {
+                return Some(if io.kind() == std::io::ErrorKind::UnexpectedEof {
+                    "eof".to_owned()
+                } else {
+                    format!("{:?}: {io}", io.kind())
+                });
+            }
+            if layer.is::<tokio::time::error::Elapsed>() {
+                return Some("timed out".to_owned());
+            }
+            if let Some(json) = layer.downcast_ref::<serde_json::Error>() {
+                return Some(format!("invalid frame ({:?})", json.classify()));
+            }
+            if let Some(Error::Refused(reason)) = layer.downcast_ref::<Error>() {
+                return Some(format!("refused {}", reason.wire()));
+            }
+            None
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_owned())
+        })
+        .unwrap_or_else(|| "host error".to_owned());
+    CloseReport {
+        side: closed.map_or("unknown", |c| c.side.as_str()),
+        step: closed.map_or("unknown", |c| c.step),
+        jti: error.downcast_ref::<ConnectionJob>().map(|j| j.0.clone()),
+        cause,
+    }
+}
+
 /// Why [`Runtime::authenticate`] refused a lease hello. It holds no token or
 /// key material, so the endpoint logs it whole; the requester only receives
 /// the wire reason of `error`.
@@ -759,14 +861,17 @@ pub async fn serve<S>(runtime: Arc<Runtime>, mut client: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let first = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client)).await??;
+    let first = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
+        .await
+        .at(Side::Client, "lease_hello")?
+        .at(Side::Client, "lease_hello")?;
     let Prelude::LeaseHello {
         token,
         requester_jwk,
         ..
-    } = serde_json::from_value(first)?
+    } = serde_json::from_value(first).at(Side::Client, "lease_hello")?
     else {
-        bail!("expected lease hello");
+        return Err(closed(Side::Client, "lease_hello", "expected lease hello"));
     };
     let auth_runtime = runtime.clone();
     let auth_requester = requester_jwk.clone();
@@ -792,7 +897,8 @@ where
             result
         }
     })
-    .await?;
+    .await
+    .at(Side::Host, "authenticate")?;
     let claims = match authentication {
         Ok(c) => c,
         Err(AuthRefusal {
@@ -805,16 +911,18 @@ where
                 &mut client,
                 &json!({"type":"lease_refused", "reason":r.wire()}),
             )
-            .await?;
+            .await
+            .at(Side::Client, "lease_refused")?;
             return Ok(());
         }
-        Err(AuthRefusal { error, .. }) => return Err(error.into()),
+        Err(AuthRefusal { error, .. }) => return Err(error).at(Side::Host, "authenticate"),
     };
     let tenant = runtime
         .host
         .lock()
         .expect("host lock")
-        .binding(&claims)?
+        .binding(&claims)
+        .at(Side::Host, "binding")?
         .tenant
         .clone();
     runtime
@@ -835,10 +943,21 @@ where
         host_id: claims.aud.clone(),
         ts: unix_ms() / 1000,
     };
-    write_frame(&mut client, &json!({"type":"challenge", "nonce":challenge.nonce, "host_id":challenge.host_id, "ts":challenge.ts})).await?;
-    let response = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client)).await??;
-    let Prelude::ChallengeResponse { sig } = serde_json::from_value(response)? else {
-        bail!("expected challenge response");
+    write_frame(&mut client, &json!({"type":"challenge", "nonce":challenge.nonce, "host_id":challenge.host_id, "ts":challenge.ts}))
+        .await
+        .at(Side::Client, "challenge")?;
+    let response = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
+        .await
+        .at(Side::Client, "challenge_response")?
+        .at(Side::Client, "challenge_response")?;
+    let Prelude::ChallengeResponse { sig } =
+        serde_json::from_value(response).at(Side::Client, "challenge_response")?
+    else {
+        return Err(closed(
+            Side::Client,
+            "challenge_response",
+            "expected challenge response",
+        ));
     };
     let verified = (|| -> Result<_, (Error, &'static str)> {
         let mut nonces = Nonces::default();
@@ -865,10 +984,11 @@ where
                 &mut client,
                 &json!({"type":"lease_refused", "reason":r.wire()}),
             )
-            .await?;
+            .await
+            .at(Side::Client, "lease_refused")?;
             return Ok(());
         }
-        Err((e, _)) => return Err(e.into()),
+        Err((e, _)) => return Err(e).at(Side::Host, "admission"),
     };
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
@@ -893,17 +1013,20 @@ where
                 &mut client,
                 &json!({"type":"lease_refused", "reason":reason.wire()}),
             )
-            .await?;
+            .await
+            .at(Side::Client, "lease_refused")?;
             return Ok(());
         }
     }
     let connected = async {
-        write_frame(&mut client, &json!({"type":"lease_ok"})).await?;
+        write_frame(&mut client, &json!({"type":"lease_ok"})).await.at(Side::Client, "lease_ok")?;
         // Wait for a client frame before waking the guest. A client that disappears
         // immediately after lease_ok has never delivered a lease to the runner.
         let remaining = claims.exp.saturating_mul(1000).saturating_sub(unix_ms());
         let first = tokio::time::timeout(Duration::from_millis(remaining), read_frame(&mut client))
-            .await??;
+            .await
+            .at(Side::Client, "first_frame")?
+            .at(Side::Client, "first_frame")?;
         let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
         if stored {
             return serve_stored(&runtime, &claims.jti, &first, &mut client).await;
@@ -919,12 +1042,14 @@ where
             tokio::select! {
                 biased;
                 n = client.read(&mut buffer), if buffered.len() < FRAME_LIMIT => {
-                    let n = n?;
-                    ensure!(n > 0, "client closed before delivery");
+                    let n = n.at(Side::Client, "delivery")?;
+                    if n == 0 {
+                        return Err(closed(Side::Client, "delivery", "client closed before delivery"));
+                    }
                     buffered.extend_from_slice(&buffer[..n]);
                 }
                 stream = &mut delivery => {
-                    match stream? {
+                    match stream.at(Side::Host, "delivery")? {
                         Ok(stream) => break stream,
                         Err(error) => {
                             let reason = error.downcast_ref::<Error>().and_then(|error| match error {
@@ -932,20 +1057,32 @@ where
                                 _ => None,
                             }).unwrap_or(Refusal::InternalFailure);
                             tracing::error!(jti = claims.jti, detail = %error, reason = reason.wire(), "tenant_delivery_failed");
-                            write_frame(&mut client,&json!({"type":"lease_refused","reason":reason.wire()})).await?;
-                            return Err(error);
+                            write_frame(&mut client,&json!({"type":"lease_refused","reason":reason.wire()})).await.at(Side::Client, "lease_refused")?;
+                            return Err(error).at(Side::Host, "delivery");
                         }
                     }
                 }
             }
         };
-        stream.set_nonblocking(true)?;
-        let mut guest = tokio::net::UnixStream::from_std(stream)?;
-        write_frame(&mut guest, &first).await?;
-        guest.write_all(&buffered).await?;
+        stream.set_nonblocking(true).at(Side::Host, "relay_start")?;
+        let mut guest = tokio::net::UnixStream::from_std(stream).at(Side::Host, "relay_start")?;
+        write_frame(&mut guest, &first).await.at(Side::Guest, "relay_start")?;
+        guest.write_all(&buffered).await.at(Side::Guest, "relay_start")?;
         let (mut cr, mut cw) = tokio::io::split(client);
         let (mut gr, mut gw) = guest.split();
-        let to_guest = tokio::io::copy(&mut cr, &mut gw);
+        // Copy by hand rather than with tokio::io::copy, so a failure says
+        // whether reading the client or writing the guest failed.
+        let to_guest = async {
+            let mut buffer = vec![0; 16384];
+            loop {
+                let n = cr.read(&mut buffer).await.at(Side::Client, "relay")?;
+                if n == 0 {
+                    tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                gw.write_all(&buffer[..n]).await.at(Side::Guest, "relay")?;
+            }
+        };
         let to_client = async {
             let mut cursor: u64 = 0;
             loop {
@@ -957,8 +1094,8 @@ where
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                             if let Some(frames) = frames {
-                                for frame in frames { write_frame(&mut cw, &frame).await?; }
-                                runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                                for frame in frames { write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
                                 break None;
                             }
                         }
@@ -968,43 +1105,43 @@ where
                 let settled = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                 if let Some(frames) = settled {
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
-                    for frame in frames { write_frame(&mut cw,&frame).await?; }
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                    for frame in frames { write_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
+                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
                     return Ok::<(),anyhow::Error>(());
                 }
-                let frame = frame?;
+                let frame = frame.at(Side::Guest, "relay")?;
                 if let Some(seq) = frame["seq"].as_u64() {
                     runtime
                         .host
                         .lock()
                         .expect("host lock")
-                        .watermark(&claims.jti, seq)?;
+                        .watermark(&claims.jti, seq).at(Side::Host, "relay")?;
                     cursor = cursor.max(seq);
                 }
                 if frame["type"] == "terminal" {
                     if runtime.sandbox_identity.is_some() {
-                        write_frame(&mut cw, &frame).await?;
+                        write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
                         return Ok::<(),anyhow::Error>(());
                     }
                     let control = runtime.control.clone();
                     let tenant = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].tenant.clone();
-                    let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await?;
+                    let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await.at(Side::Host, "relay")?;
                     {
                         let mut host = runtime.host.lock().expect("host lock");
-                        if let Ok((tenant,sample)) = sample { host.sample(&tenant,sample)?; }
-                        host.receive_terminal(&claims.jti, frame.clone(), unix_ms())?;
+                        if let Ok((tenant,sample)) = sample { host.sample(&tenant,sample).at(Side::Host, "relay")?; }
+                        host.receive_terminal(&claims.jti, frame.clone(), unix_ms()).at(Side::Host, "relay")?;
                     }
                     let hosted = loop {
                         let value = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.hosted_terminal.clone());
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
-                    write_frame(&mut cw, &frame).await?;
-                    write_frame(&mut cw, &hosted).await?;
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms())?;
+                    write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                    write_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
+                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
                     return Ok::<(),anyhow::Error>(());
                 }
-                write_frame(&mut cw, &frame).await?;
+                write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -1013,7 +1150,8 @@ where
         Ok(())
     };
     tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) }
-    }.await;
+    }.await
+    .map_err(|error| error.context(ConnectionJob(claims.jti.clone())));
     connection.finish().await;
     outcome
 }
@@ -1024,46 +1162,65 @@ async fn serve_stored(
     first: &Value,
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
 ) -> Result<()> {
-    ensure!(first["type"] == "hello", "expected hello");
+    if first["type"] != "hello" {
+        return Err(closed(Side::Client, "stored_hello", "expected hello"));
+    }
     write_frame(
         client,
         &json!({"type":"hello", "protocol_version":1,"started":true}),
     )
-    .await?;
+    .await
+    .at(Side::Client, "stored_hello")?;
     loop {
-        let request = read_frame(client).await?;
-        ensure!(request["job_id"] == job, "operation_refused");
+        let request = read_frame(client)
+            .await
+            .at(Side::Client, "stored_request")?;
+        if request["job_id"] != job {
+            return Err(closed(Side::Client, "stored_request", "operation_refused"));
+        }
         match request["type"].as_str() {
             Some("attach") => {
-                let from = request["from_seq"].as_u64().context("attach cursor")?;
+                let from = request["from_seq"]
+                    .as_u64()
+                    .context("attach cursor")
+                    .at(Side::Client, "stored_request")?;
                 let frames = runtime
                     .host
                     .lock()
                     .expect("host lock")
                     .host_settled_frames(job, from)
-                    .context("stored terminal")?;
+                    .context("stored terminal")
+                    .at(Side::Host, "stored_terminal")?;
                 for frame in frames {
-                    write_frame(client, &frame).await?;
+                    write_frame(client, &frame)
+                        .await
+                        .at(Side::Client, "stored_terminal")?;
                 }
                 runtime
                     .host
                     .lock()
                     .expect("host lock")
-                    .terminal_delivered(job, unix_ms())?;
+                    .terminal_delivered(job, unix_ms())
+                    .at(Side::Host, "stored_terminal")?;
                 return Ok(());
             }
             Some("job_status") => {
                 let mut terminal = runtime.host.lock().expect("host lock").snapshot.billing[job]
                     .terminal
                     .clone()
-                    .context("stored terminal")?;
-                terminal.as_object_mut().context("terminal")?.remove("type");
-                write_frame(client, &json!({"type":"job_status_reply","job_id":job,"state":"ended","terminal":terminal,"unit":null,"unit_alive":false})).await?;
+                    .context("stored terminal")
+                    .at(Side::Host, "stored_status")?;
+                terminal
+                    .as_object_mut()
+                    .context("terminal")
+                    .at(Side::Host, "stored_status")?
+                    .remove("type");
+                write_frame(client, &json!({"type":"job_status_reply","job_id":job,"state":"ended","terminal":terminal,"unit":null,"unit_alive":false})).await.at(Side::Client, "stored_status")?;
             }
-            Some("cancel") => {
-                write_frame(client, &json!({"type":"cancel_reply","job_id":job})).await?
-            }
-            _ => bail!("operation_refused"),
+            Some("cancel") => write_frame(client, &json!({"type":"cancel_reply","job_id":job}))
+                .await
+                .at(Side::Client, "stored_cancel")?,
+            _ => return Err(closed(Side::Client, "stored_request", "operation_refused")),
         }
     }
 }

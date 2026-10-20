@@ -880,6 +880,11 @@ impl Motor {
         };
         let uploaded = self.upload(&channel, &snapshots, &upload, Some(id)).await;
         drop(snapshots);
+        if let Err(error) = &uploaded {
+            if hosted {
+                tracing::warn!(job_id = %id, step = "upload", cause = %error, "hosted job stream closed");
+            }
+        }
         if uploaded.is_err() {
             drop(channel);
             return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
@@ -1476,7 +1481,30 @@ impl Motor {
                 Ok(Incoming::Frame(Frame::CancelReply(reply))) if hosted && reply.job_id == id => {
                     self.storage.cancel(id, false)?;
                 }
-                _ => {
+                other => {
+                    if hosted {
+                        // Name the close, so an outcome-unknown job says which
+                        // connection ended and how.
+                        let cause = match &other {
+                            Err(error) => error.to_string(),
+                            Ok(Incoming::Frame(frame)) => format!(
+                                "unexpected {} frame",
+                                serde_json::to_value(frame)
+                                    .ok()
+                                    .and_then(|v| v["type"].as_str().map(str::to_owned))
+                                    .unwrap_or_default()
+                            ),
+                            Ok(Incoming::Unknown(_)) => "unknown frame".into(),
+                        };
+                        tracing::warn!(
+                            job_id = %id,
+                            step = if reattaches == 0 { "run" } else { "reattach" },
+                            reattach = reattaches,
+                            cursor,
+                            cause,
+                            "hosted job stream closed"
+                        );
+                    }
                     channel = None;
                     hosted_terminal_deadline = None;
                     // EOF and write failure wake immediately; only failed

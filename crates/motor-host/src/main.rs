@@ -182,8 +182,15 @@ async fn main() -> Result<()> {
                 tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await;
             if let Ok(Ok(stream)) = accepted {
                 // Errors deliberately omit peer-controlled data and credentials.
-                if serve(runtime, stream).await.is_err() {
-                    tracing::warn!("connection_closed");
+                if let Err(error) = serve(runtime, stream).await {
+                    let report = motor_host::server::describe_close(&error);
+                    tracing::warn!(
+                        jti = report.jti,
+                        side = report.side,
+                        step = report.step,
+                        cause = %report.cause,
+                        "connection_closed"
+                    );
                 }
             }
         });

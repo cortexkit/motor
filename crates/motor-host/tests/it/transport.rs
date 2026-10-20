@@ -1083,3 +1083,60 @@ async fn host_loss_sends_stored_frames_even_when_guest_eof_wins_the_relay_race()
     );
     task.await.unwrap().unwrap();
 }
+
+/// ovh-1 logged a bare `connection_closed` when the tenant runner dropped a
+/// hosted job's relay after Accepted. The close now names the side, the step,
+/// the job and the cause, so that failure names itself.
+#[tokio::test]
+async fn a_guest_that_closes_after_accepted_is_reported_as_a_guest_eof_in_the_relay() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    respond(&mut client, &requester, &c, challenge).await;
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "verified_lease"
+    );
+    // Read everything the host relayed, so closing is a clean EOF, not a reset.
+    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+    write_frame(
+        &mut guest,
+        &json!({"type":"accepted","job_id":JOB,"queue_position":0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "accepted");
+    drop(guest);
+    let error = task.await.unwrap().unwrap_err();
+    let report = motor_host::server::describe_close(&error);
+    assert_eq!(
+        (
+            report.side,
+            report.step,
+            report.jti.as_deref(),
+            report.cause.as_str()
+        ),
+        ("guest", "relay", Some(JOB), "eof"),
+        "{error:#}"
+    );
+    // Before the job's token is verified, no job is named.
+    let (cold, _, _, _, _) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(cold, server));
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let report = motor_host::server::describe_close(&task.await.unwrap().unwrap_err());
+    assert_eq!(
+        (report.side, report.step, report.jti),
+        ("client", "lease_hello", None)
+    );
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}

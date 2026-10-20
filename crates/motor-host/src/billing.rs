@@ -1,11 +1,13 @@
 //! Host observations, durable settlement records and the serialized broker outbox.
 use crate::state::{Error, Host, LeaseState, Snapshot};
-use motor_lease::{Heartbeat, HostHeaders, JobState, RunningJob, Usage, UsageOutcome, WarmVm};
+use motor_lease::{Heartbeat, HostHeaders, JobState, RunningJob, Usage, UsageOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const DELIVERY_GRACE_MS: u64 = 60_000;
 pub const OUTBOX_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// How many rejected requests the journal keeps for diagnosis; older ones go.
+pub const REJECTED_OUTBOX_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -351,21 +353,13 @@ impl Host {
                 .values()
                 .filter(|l| l.state == LeaseState::Reserved && !l.delivered)
                 .count() as u64,
-            warm: self
-                .tenants
-                .iter()
-                .filter(|(_, t)| {
-                    self.snapshot
-                        .vms
-                        .get(&t.tenant)
-                        .is_some_and(|v| v.initialized_generation.is_some())
-                })
-                .map(|(vm, t)| WarmVm {
-                    tenant: t.tenant.clone(),
-                    workspace_key_hash: String::new(),
-                    vm: vm.clone(),
-                })
-                .collect(),
+            // The broker prefers a warm VM only when an entry's tenant (the
+            // lease subject, acct:<ULID>) and workspace_key_hash byte-match
+            // the lease, and it refuses any other shape with 400. Job tokens
+            // carry no workspace hash, so this host never learns one for the
+            // VMs it warms, and an empty list is always valid. Cold placement
+            // binds to the subject's tenant VM, so nothing depends on warm.
+            warm: Vec::new(),
             running: self
                 .snapshot
                 .leases
@@ -482,6 +476,20 @@ impl Host {
         }
         self.save(next)?;
         Ok(true)
+    }
+    /// Moves a request the broker can never accept out of the outbox into
+    /// `rejected_outbox`, so it is kept for diagnosis but never resent.
+    pub fn reject_request(&mut self, request: &Request) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.outbox
+            .retain(|r| r.path != request.path || r.body != request.body);
+        next.rejected_outbox.push(request.clone());
+        let excess = next
+            .rejected_outbox
+            .len()
+            .saturating_sub(REJECTED_OUTBOX_LIMIT);
+        next.rejected_outbox.drain(..excess);
+        self.save(next)
     }
 }
 

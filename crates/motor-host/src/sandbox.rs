@@ -247,8 +247,15 @@ pub async fn run(config: Config) -> Result<()> {
         let runtime = runtime.clone();
         tokio::spawn(async move {
             // This is deliberately plaintext framing, not a TLS listener.
-            if serve(runtime, socket).await.is_err() {
-                tracing::warn!("sandbox_connection_closed");
+            if let Err(error) = serve(runtime, socket).await {
+                let report = crate::server::describe_close(&error);
+                tracing::warn!(
+                    jti = report.jti,
+                    side = report.side,
+                    step = report.step,
+                    cause = %report.cause,
+                    "sandbox_connection_closed"
+                );
             }
         });
     }

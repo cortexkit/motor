@@ -8,6 +8,7 @@ pub mod journal;
 pub mod sandbox;
 pub mod server;
 pub mod state;
+pub mod wire;
 
 #[cfg(test)]
 extern crate self as motor_host;

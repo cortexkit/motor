@@ -106,10 +106,7 @@ async fn hosted_channel_heartbeats_keep_a_tenant_job_streaming_to_its_terminal()
     };
 
     let (mut host, guest) = tokio::io::duplex(1 << 20);
-    let served = tokio::spawn(motor_runner::serve_tenant_connection(
-        runner.clone(),
-        guest,
-    ));
+    let served = tokio::spawn(motor_runner::serve_tenant_connection(runner.clone(), guest));
     write_frame_async(&mut host, &Frame::VerifiedLease(lease))
         .await
         .unwrap();
