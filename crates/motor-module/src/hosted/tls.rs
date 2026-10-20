@@ -103,14 +103,56 @@ pub(super) fn claims(
     Ok(claims)
 }
 
+/// A failed connection to a hosted runner: the error ck-motor reports, the step
+/// that failed, and the reason the host gave when it refused the lease. Only
+/// public step names and the host's short reason code are kept, so the whole
+/// value is safe to log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ConnectFailure {
+    pub error: Error,
+    /// One of `claims`, `tls`, `ssh`, `lease_hello`, `challenge`, `lease_ok`,
+    /// `runner_hello` or `timeout`.
+    pub step: &'static str,
+    pub host_reason: Option<String>,
+}
+impl ConnectFailure {
+    pub(super) fn at(step: &'static str, error: Error) -> Self {
+        Self {
+            error,
+            step,
+            host_reason: None,
+        }
+    }
+    /// The host refused at `step` with `reason`. A reason that is not a short
+    /// code is replaced, so a misbehaving host cannot write arbitrary text
+    /// into our log.
+    fn refused(step: &'static str, reason: &str) -> Self {
+        let logged = if reason.len() <= 32
+            && reason
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            reason
+        } else {
+            "unrecognized"
+        };
+        Self {
+            error: Error::from_host(reason),
+            step,
+            host_reason: Some(logged.into()),
+        }
+    }
+}
+
 pub(super) async fn connect(
     id: Uuid,
     lease: &LeaseResponse,
     key: &SigningKey,
     purpose: Purpose,
-) -> Result<Channel, Error> {
-    let claims = claims(id, lease, key, purpose)?;
+) -> Result<Channel, ConnectFailure> {
+    let claims = claims(id, lease, key, purpose).map_err(|e| ConnectFailure::at("claims", e))?;
     tokio::time::timeout(Duration::from_secs(60), async {
+        let tls_failed = |error| ConnectFailure::at("tls", error);
         let provider = rustls::crypto::ring::default_provider();
         let verifier = PinVerifier {
             pin: lease.endpoint_spki_sha256.clone(),
@@ -118,30 +160,31 @@ pub(super) async fn connect(
         };
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
-            .map_err(|_| Error::Connect)?
+            .map_err(|_| tls_failed(Error::Connect))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
         let tcp = tokio::net::TcpStream::connect(&lease.endpoint)
             .await
-            .map_err(|_| Error::Connect)?;
+            .map_err(|_| tls_failed(Error::Connect))?;
         // SNI is only a TLS routing hint. The verifier above uses neither names
         // nor trust roots: the lease's SPKI is the sole certificate identity.
-        let name = ServerName::try_from("hosted.invalid").map_err(|_| Error::Connect)?;
+        let name =
+            ServerName::try_from("hosted.invalid").map_err(|_| tls_failed(Error::Connect))?;
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
             .await
             .map_err(|e| {
-                if e.to_string().contains("hosted_spki_mismatch") {
+                tls_failed(if e.to_string().contains("hosted_spki_mismatch") {
                     Error::Spki
                 } else {
                     Error::Connect
-                }
+                })
             })?;
         authenticate(Box::new(tls), lease, key, &claims).await
     })
     .await
-    .unwrap_or(Err(Error::Connect))
+    .unwrap_or(Err(ConnectFailure::at("timeout", Error::Connect)))
 }
 
 // Both transports authenticate the server before handing us a pipe. No token
@@ -151,7 +194,11 @@ pub(super) async fn authenticate(
     lease: &LeaseResponse,
     key: &SigningKey,
     claims: &Claims,
-) -> Result<Channel, Error> {
+) -> Result<Channel, ConnectFailure> {
+    // A host that refuses the token answers the hello itself; a connection
+    // that closes here instead (for example an SSH forward with nothing
+    // listening behind it) is a connect failure at the same step.
+    let at = ConnectFailure::at;
     write(
         &mut pipe,
         &Prelude::LeaseHello {
@@ -161,29 +208,37 @@ pub(super) async fn authenticate(
         },
     )
     .await
-    .map_err(|_| Error::Connect)?;
-    let challenge = match read(&mut pipe).await.map_err(|_| Error::Connect)? {
+    .map_err(|_| at("lease_hello", Error::Connect))?;
+    let challenge = match read(&mut pipe)
+        .await
+        .map_err(|_| at("lease_hello", Error::Connect))?
+    {
         Prelude::Challenge(c) => c,
-        Prelude::LeaseRefused { reason } => return Err(Error::from_host(&reason)),
-        _ => return Err(Error::Auth),
+        Prelude::LeaseRefused { reason } => {
+            return Err(ConnectFailure::refused("lease_hello", &reason))
+        }
+        _ => return Err(at("lease_hello", Error::Auth)),
     };
-    let sig =
-        motor_lease::sign_challenge(&challenge, claims, key, now_s()).map_err(|_| Error::Auth)?;
+    let sig = motor_lease::sign_challenge(&challenge, claims, key, now_s())
+        .map_err(|_| at("challenge", Error::Auth))?;
     write(&mut pipe, &Prelude::ChallengeResponse { sig })
         .await
-        .map_err(|_| Error::Connect)?;
-    match read(&mut pipe).await.map_err(|_| Error::Connect)? {
+        .map_err(|_| at("challenge", Error::Connect))?;
+    match read(&mut pipe)
+        .await
+        .map_err(|_| at("lease_ok", Error::Connect))?
+    {
         // A host that refuses tenant runner initialization says so before the
         // runner's hello; keep its reason instead of reporting a lost connection.
         Prelude::LeaseOk {} => Channel::from_hosted(pipe).await.map_err(|error| {
             error
                 .get_ref()
                 .and_then(|source| source.downcast_ref::<crate::transport::HostedHelloRefusal>())
-                .map(|refusal| Error::from_host(&refusal.0))
-                .unwrap_or(Error::Connect)
+                .map(|refusal| ConnectFailure::refused("runner_hello", &refusal.0))
+                .unwrap_or(at("runner_hello", Error::Connect))
         }),
-        Prelude::LeaseRefused { reason } => Err(Error::from_host(&reason)),
-        _ => Err(Error::Auth),
+        Prelude::LeaseRefused { reason } => Err(ConnectFailure::refused("lease_ok", &reason)),
+        _ => Err(at("lease_ok", Error::Auth)),
     }
 }
 pub(super) async fn write<W: AsyncWrite + Unpin>(

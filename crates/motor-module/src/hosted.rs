@@ -286,29 +286,21 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
         .saturating_mul(1000)
         .saturating_sub(waited_ms)
 }
-/// The smallest memory per leased vCPU a Boat token may state. CLOUD's
-/// contract makes a Boat token's `mem_mib` the chosen sandbox size's measured
-/// usable memory (13444 MiB for the 8-vCPU large size in production, 14336 MiB
-/// in the recorded test size), and the chosen size has at least the job's
-/// vCPUs, so a real token states well over 1.5 GiB per leased vCPU. Below
-/// 1 GiB per vCPU the token is malformed or names a sandbox in which builds
-/// would be killed for memory, so ck-motor refuses it rather than run there.
-const BOAT_MIN_MEM_MIB_PER_VCPU: u64 = 1024;
-
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states
 /// the runner's per-job memory cap exactly. A Boat token states the whole
-/// sandbox's usable memory, which may be below that cap; it must still lie
-/// between the floor above and the cap.
+/// sandbox's usable memory, which may be below that cap; it must lie in
+/// [`motor_lease::boat_memory_range`], the range the in-sandbox endpoint
+/// also accepts.
 fn resource_mismatch(
     claims: &motor_lease::Claims,
     body: &LeaseRequest,
     boat: bool,
 ) -> Option<(&'static str, String, String)> {
     let cap = motor_lease::memory_max_mib(body.vcpus);
-    let floor = u64::from(body.vcpus).saturating_mul(BOAT_MIN_MEM_MIB_PER_VCPU);
+    let range = motor_lease::boat_memory_range(body.vcpus);
     let memory_ok = if boat {
-        (floor..=cap).contains(&claims.mem_mib)
+        range.contains(&claims.mem_mib)
     } else {
         claims.mem_mib == cap
     };
@@ -316,7 +308,7 @@ fn resource_mismatch(
         Some(("vcpus", body.vcpus.to_string(), claims.vcpus.to_string()))
     } else if !memory_ok {
         let expected = if boat {
-            format!("{floor}..={cap}")
+            format!("{}..={}", range.start(), range.end())
         } else {
             cap.to_string()
         };
@@ -534,6 +526,11 @@ impl Client {
             .map_err(|_| Error::Broker)?;
         self.connect(id, &lease, &key, motor_lease::Purpose::Attach)
             .await
+            .map_err(|failure| {
+                tracing::info!(job_id = %id, code = failure.error.code(), step = failure.step,
+                    host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted attach failed");
+                failure.error
+            })
     }
     pub(crate) async fn run(
         &self,
@@ -648,11 +645,12 @@ impl Client {
                 .await;
             match &connected {
                 Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
-                Err(error) => {
-                    tracing::info!(job_id = %id, attempt, code = error.code(), "hosted connect failed")
+                Err(failure) => {
+                    tracing::info!(job_id = %id, attempt, code = failure.error.code(), step = failure.step,
+                        host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
                 }
             }
-            match connected {
+            match connected.map_err(|failure| failure.error) {
                 Ok(channel) => return Ok((channel, lease)),
                 Err(e) if lease.ssh.is_some() => return Err(e),
                 Err(e) if e.replaceable() && attempt < 2 => continue,
@@ -703,15 +701,18 @@ impl Client {
         lease: &Lease,
         key: &SigningKey,
         purpose: motor_lease::Purpose,
-    ) -> Result<Channel, Error> {
+    ) -> Result<Channel, tls::ConnectFailure> {
         if lease.ssh.is_some() {
-            let claims = tls::claims(id, lease, key, purpose)?;
+            let claims = tls::claims(id, lease, key, purpose)
+                .map_err(|e| tls::ConnectFailure::at("claims", e))?;
             tokio::time::timeout(Duration::from_secs(60), async {
-                let pipe = ssh::connect(lease, key).await?;
+                let pipe = ssh::connect(lease, key)
+                    .await
+                    .map_err(|e| tls::ConnectFailure::at("ssh", e))?;
                 tls::authenticate(pipe, lease, key, &claims).await
             })
             .await
-            .unwrap_or(Err(Error::Connect))
+            .unwrap_or(Err(tls::ConnectFailure::at("timeout", Error::Connect)))
         } else {
             tls::connect(id, lease, key, purpose).await
         }
@@ -734,5 +735,7 @@ pub(crate) async fn wait_after_iat(iat: u64) {
 
 #[cfg(test)]
 pub(crate) mod boat_tests;
+#[cfg(test)]
+mod sandbox_tests;
 #[cfg(test)]
 pub(crate) mod tests;

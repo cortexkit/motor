@@ -232,7 +232,8 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
     assert_eq!(
         super::tls::connect(id, &lease, &key, motor_lease::Purpose::Run)
             .await
-            .err(),
+            .err()
+            .map(|failure| failure.error),
         Some(Error::Spki)
     );
     assert_eq!(h.tokens.load(Ordering::SeqCst), 0);

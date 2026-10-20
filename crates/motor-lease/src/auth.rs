@@ -229,62 +229,120 @@ pub fn verify_token(
     required_purpose: Purpose,
     now_s: u64,
 ) -> Result<Claims, AuthError> {
+    check_token(token, keys, host_id, expected_job, required_purpose, now_s)
+        .map_err(|refusal| refusal.error)
+}
+
+/// Why [`check_token`] refused a job token. It never holds the token or a key,
+/// so it is safe to log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenRefusal {
+    /// What the host reports to the requester.
+    pub error: AuthError,
+    /// The first check that failed, such as `kid`, `signature` or `mem_mib`.
+    pub check: &'static str,
+    /// The token's job id, present only once the broker's signature over it
+    /// has verified, so a forged token cannot choose what is logged.
+    pub jti: Option<String>,
+}
+
+/// Runs the same checks as [`verify_token`], but a refusal also names the
+/// first check that failed so the host can log why it refused.
+pub fn check_token(
+    token: &str,
+    keys: &KeySet,
+    host_id: &str,
+    expected_job: Option<&str>,
+    required_purpose: Purpose,
+    now_s: u64,
+) -> Result<Claims, TokenRefusal> {
+    let refuse = |check| TokenRefusal {
+        error: AuthError::Auth,
+        check,
+        jti: None,
+    };
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(AuthError::Auth);
+        return Err(refuse("format"));
     }
-    let header: Header = serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(parts[0])
-            .map_err(|_| AuthError::Auth)?,
-    )
-    .map_err(|_| AuthError::Auth)?;
+    let header: Header = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(refuse("header"))?;
     if header.alg != "EdDSA" || header.typ != "ck-job+jwt" || !header.extra.is_empty() {
-        return Err(AuthError::Auth);
+        return Err(refuse("header"));
     }
-    let key = keys.keys.get(&header.kid).ok_or(AuthError::Auth)?;
-    let signature = Signature::from_bytes(&decode(parts[2])?);
+    let key = keys.keys.get(&header.kid).ok_or(refuse("kid"))?;
+    let signature = Signature::from_bytes(&decode(parts[2]).map_err(|_| refuse("signature"))?);
     key.verify_strict(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
-        .map_err(|_| AuthError::Auth)?;
-    let claims: Claims = serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .map_err(|_| AuthError::Auth)?,
-    )
-    .map_err(|_| AuthError::Auth)?;
-    if claims.iss != ISSUER
-        || claims.aud != host_id
-        || claims.placement.host != host_id
-        || claims
-            .placement
-            .vm
-            .as_deref()
-            .is_some_and(|vm| !valid_name(vm))
-        || !valid_job_id(&claims.jti)
-        || !valid_audience(&claims.aud)
-        || expected_job.is_some_and(|job| job != claims.jti)
-        || claims.purpose != required_purpose
-        || !valid_subject(&claims.sub)
-        || claims.iat > now_s.saturating_add(CLOCK_SKEW_S)
-        || claims.exp <= claims.iat
-        || claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_S
-        || claims.vcpus == 0
-        || claims.vcpus > 64
-        || claims.iat > MAX_SAFE_INTEGER
-        || claims.exp > MAX_SAFE_INTEGER
-        || claims.mem_mib != crate::memory_max_mib(claims.vcpus)
-        || claims.max_s == 0
-        || claims.max_s > 7200
-        || !valid_name(&claims.platform)
-        || decode::<32>(&claims.cnf.jkt).is_err()
-    {
-        return Err(AuthError::Auth);
+        .map_err(|_| refuse("signature"))?;
+    let claims: Claims = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(refuse("claims"))?;
+    // A Boat sandbox's identity is `boat:<sandbox id>`. The colon cannot occur
+    // in a registered host id, so only a sandbox endpoint can take this branch.
+    let boat = host_id.starts_with("boat:");
+    let memory_ok = if boat {
+        crate::boat_memory_range(claims.vcpus).contains(&claims.mem_mib)
+    } else {
+        claims.mem_mib == crate::memory_max_mib(claims.vcpus)
+    };
+    // Checks run in this order, and the first failure is the one reported.
+    let failed = [
+        ("iss", claims.iss != ISSUER),
+        ("aud", claims.aud != host_id),
+        ("placement_host", claims.placement.host != host_id),
+        (
+            "placement_vm",
+            claims
+                .placement
+                .vm
+                .as_deref()
+                .is_some_and(|vm| !valid_name(vm)),
+        ),
+        ("jti", !valid_job_id(&claims.jti)),
+        ("aud", !valid_audience(&claims.aud)),
+        ("jti", expected_job.is_some_and(|job| job != claims.jti)),
+        ("purpose", claims.purpose != required_purpose),
+        ("sub", !valid_subject(&claims.sub)),
+        ("iat", claims.iat > now_s.saturating_add(CLOCK_SKEW_S)),
+        (
+            "lifetime",
+            claims.exp <= claims.iat
+                || claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_S,
+        ),
+        ("vcpus", claims.vcpus == 0 || claims.vcpus > 64),
+        (
+            "lifetime",
+            claims.iat > MAX_SAFE_INTEGER || claims.exp > MAX_SAFE_INTEGER,
+        ),
+        ("mem_mib", !memory_ok),
+        ("max_s", claims.max_s == 0 || claims.max_s > 7200),
+        ("platform", !valid_name(&claims.platform)),
+        ("cnf", decode::<32>(&claims.cnf.jkt).is_err()),
+    ]
+    .into_iter()
+    .find_map(|(check, failed)| failed.then_some(check));
+    let error = if let Some(check) = failed {
+        Some((AuthError::Auth, check))
+    } else if now_s >= claims.exp {
+        // An already expired credential cannot open a new connection, even
+        // during skew.
+        Some((AuthError::Expired, "exp"))
+    } else {
+        None
+    };
+    match error {
+        Some((error, check)) => Err(TokenRefusal {
+            error,
+            check,
+            jti: Some(claims.jti).filter(|jti| valid_job_id(jti)),
+        }),
+        None => Ok(claims),
     }
-    // An already expired credential cannot open a new connection, even during skew.
-    if now_s >= claims.exp {
-        return Err(AuthError::Expired);
-    }
-    Ok(claims)
 }
 
 fn valid_audience(value: &str) -> bool {

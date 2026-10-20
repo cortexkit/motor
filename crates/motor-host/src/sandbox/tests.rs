@@ -489,3 +489,40 @@ async fn sandbox_identity_reader_rejects_wrong_owner_writable_files_and_symlinks
     std::os::unix::fs::symlink(path, &link).unwrap();
     assert!(IdentityFile { path: link, owner }.read().is_err());
 }
+
+/// Each refusal names the check that failed: the endpoint logs it, while the
+/// requester still receives only the wire reason.
+#[tokio::test]
+async fn sandbox_refusals_name_the_failing_check() {
+    let mut f = Fixture::new();
+    let (_, mut c) = f.lease();
+    let jwk = RequesterJwk::from_key(&f.requester.verifying_key());
+    let now = unix_ms() / 1000;
+    let check = |token: &str| {
+        f.runtime
+            .authenticate(token, &jwk, now)
+            .map(|_| ())
+            .map_err(|r| r.check)
+    };
+    // Boat tokens state the sandbox size's usable memory: 13312 MiB for the
+    // 8-vCPU size, below the fleet formula's 28672 MiB.
+    c.vcpus = 8;
+    c.mem_mib = 13312;
+    let boat = motor_lease::sign_token(&c, "key", &f.signer).unwrap();
+    assert_eq!(check(&boat), Ok(()));
+    c.mem_mib = motor_lease::memory_max_mib(8) + 1;
+    let too_much = motor_lease::sign_token(&c, "key", &f.signer).unwrap();
+    assert_eq!(check(&too_much), Err("mem_mib"));
+    let unknown = motor_lease::sign_token(&c, "other", &f.signer).unwrap();
+    assert_eq!(check(&unknown), Err("kid"));
+    let other = RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key());
+    assert_eq!(
+        f.runtime
+            .authenticate(&boat, &other, now)
+            .map(|_| ())
+            .map_err(|r| r.check),
+        Err("requester_key")
+    );
+    std::fs::remove_file(f.dir.path().join("id")).unwrap();
+    assert_eq!(check(&boat), Err("identity"));
+}

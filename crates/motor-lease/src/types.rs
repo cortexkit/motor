@@ -30,6 +30,22 @@ pub fn memory_max_mib(vcpus: u32) -> u64 {
     (u64::from(vcpus) * 3584).max(16384)
 }
 
+/// The smallest memory per leased vCPU a Boat token may state. Below 1 GiB per
+/// vCPU the token is malformed or names a sandbox in which builds would be
+/// killed for memory.
+pub const BOAT_MIN_MEM_MIB_PER_VCPU: u64 = 1024;
+
+/// The `mem_mib` values a Boat job token may state for `vcpus`. CLOUD's
+/// contract makes a Boat token's `mem_mib` the chosen sandbox size's measured
+/// usable memory (13312 or 13444 MiB for the 8-vCPU large size, 14336 MiB in
+/// the recorded test size), not [`memory_max_mib`]. That memory may be below
+/// the formula, so it is accepted from the per-vCPU floor up to the formula.
+/// The requester and the in-sandbox endpoint must apply this same range: a
+/// token one side accepts and the other refuses wastes a paid Boat booking.
+pub fn boat_memory_range(vcpus: u32) -> std::ops::RangeInclusive<u64> {
+    u64::from(vcpus).saturating_mul(BOAT_MIN_MEM_MIB_PER_VCPU)..=memory_max_mib(vcpus)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequesterJwk {

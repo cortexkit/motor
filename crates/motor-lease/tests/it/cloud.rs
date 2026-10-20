@@ -89,6 +89,64 @@ fn cloud_job_tokens_and_requester_thumbprint_match_code_for_both_purposes() {
     }
 }
 
+/// The in-sandbox endpoint must accept CLOUD's recorded Boat token exactly as
+/// issued. Its `mem_mib` is the recorded test size's usable memory (14336 MiB
+/// for 2 vCPUs), not the fleet formula (16384 MiB), as CLOUD's contract states
+/// for Boat. The same memory in a first-party host's token stays a refusal.
+#[test]
+fn cloud_boat_token_verifies_for_its_sandbox_identity() {
+    let tokens = vector("job-tokens.json");
+    let boat = vector("boat-lease.json");
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(serde_json::from_value(tokens["jwks"].clone()).unwrap()))
+        .unwrap();
+    let reply = &boat["booked"]["reply"]["body"];
+    let token = reply["job_token"].as_str().unwrap();
+    let host = reply["placement"]["host"].as_str().unwrap();
+    let job = reply["job_id"].as_str().unwrap();
+    let claims = check_token(token, &keys, host, Some(job), Purpose::Run, 1900000010).unwrap();
+    assert_eq!(claims.mem_mib, boat["boat_sizes"][0]["mem_mib"]);
+    assert_ne!(claims.mem_mib, memory_max_mib(claims.vcpus));
+    assert!(boat_memory_range(claims.vcpus).contains(&claims.mem_mib));
+    assert_eq!(
+        check_token(
+            token,
+            &keys,
+            "boat:bx_33333333",
+            Some(job),
+            Purpose::Run,
+            1900000010
+        )
+        .unwrap_err()
+        .check,
+        "aud"
+    );
+    let mut first_party = claims;
+    first_party.aud = "host-a".into();
+    first_party.placement.host = "host-a".into();
+    let resigned = sign_token(
+        &first_party,
+        tokens["key_id"].as_str().unwrap(),
+        &seed(tokens["seed_hex"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        check_token(
+            &resigned,
+            &keys,
+            "host-a",
+            Some(job),
+            Purpose::Run,
+            1900000010
+        ),
+        Err(TokenRefusal {
+            error: AuthError::Auth,
+            check: "mem_mib",
+            jti: Some(job.into()),
+        })
+    );
+}
+
 #[test]
 fn cloud_host_signature_bytes_header_and_verification_match() {
     let v = vector("host-signature.json");
