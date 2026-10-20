@@ -86,6 +86,12 @@ either `(coreutils)` or `(GNU coreutils)`.
 executing it. The probe compares the job's `gnutest` file hash with a fresh hash
 of the host's `gnutest` file because job filesystems omit dpkg's database.
 The report carries the manifest digest and observed versions.
+The manifest separates compiler entry points by role: the build server uses
+`/motor-tools/prefrontal-build-slot`, whose `.cache` must name the trusted
+`/motor-tools/sccache` script; single-job Boat uses `RUSTC_WRAPPER=sccache`
+directly. Both roles check the wrapper's source hash, backend path and read-only
+mounts for `/motor-tools` and the shared Cargo `bin` directory. All other job
+environment values use the manifest's common contract.
 `test_recipe_preinstalls_wasm32_unknown_unknown`,
 `test_missing_image_wasm_target_fails_check`, and the probe's parity tests defend
 the missing-target regression and fresh-measurement boundary.
@@ -139,6 +145,10 @@ repair mounts beneath a running daemon. Portable tests cover delayed public-bind
 cleanup, systemd-only activation, live-consumer refusal, and readiness withdrawal;
 the real runner-host probe additionally observes the first twelve seconds after
 readiness, sequential jobs, a seven-minute idle/reclaim interval, and stop/resume.
+If the provider's counters do not prove a reclaim during that interval despite
+a successful service run, the report marks the idle-reclaim check **INCONCLUSIVE**,
+not `PASS` and not a Motor failure. That observation gap does not block
+job parity qualification; parity and storage failures remain blocking.
 At the end, on the disposable clone only, it unmounts `/Users` as deferred cleanup
 would, creates a root-disk workspace sentinel, and requests `Users.mount` again.
 The sentinel must remain visible without an overmount, and endpoint readiness

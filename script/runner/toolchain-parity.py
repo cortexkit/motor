@@ -20,6 +20,13 @@ def output(*args, env=None):
     return result.stdout.strip()
 
 
+def optional_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
 def binary_version(path, env):
     # sccache may contact a long-lived daemon even for informational commands.
     # Inventory must never start or depend on a cache server.
@@ -101,6 +108,24 @@ def capture(manifest=None, job=False):
         name, version, status = line.split("\t")
         if status == "installed":
             packages[name] = version
+    job_names = set(paths.get('job_environment', {}))
+    for role_environment in paths.get('job_environment_by_role', {}).values():
+        job_names.update(role_environment)
+    mountinfo = Path('/proc/self/mountinfo').read_text() if job else ''
+    wrapper = {}
+    if job:
+        contract = paths['compile_wrapper']
+        resolved = shutil.which(os.environ.get('RUSTC_WRAPPER', ''), path=env['PATH'])
+        cache_path = shutil.which('sccache', path=env['PATH'])
+        wrapper = {
+            'resolved': resolved,
+            'supervisor_cache': optional_text(contract['supervisor_cache_file']),
+            'sccache_path': cache_path,
+            'sccache_sha256': hashlib.sha256(Path(cache_path).read_bytes()).hexdigest() if cache_path else None,
+            'backend': optional_text(contract['sccache_path'] + '.backend'),
+            'wrapper_readonly': readonly_mount(contract['sccache_path'], mountinfo),
+            'backend_readonly': readonly_mount(contract['backend'], mountinfo),
+        }
     return {
         "schema": 1,
         "os_release": "" if job else Path("/etc/os-release").read_text(),
@@ -115,8 +140,9 @@ def capture(manifest=None, job=False):
         "environment": {name: env.get(name) for name in (
             "PATH", "CC", "CXX", "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN",
             "RUSTFLAGS", "CARGO_BUILD_TARGET", "PKG_CONFIG_PATH")},
-        "job_environment": {name: os.environ.get(name) for name in paths.get("job_environment", {})},
-        "mountinfo": Path("/proc/self/mountinfo").read_text() if job else "",
+        "job_environment": {name: os.environ.get(name) for name in sorted(job_names)},
+        "compile_wrapper": wrapper,
+        "mountinfo": mountinfo,
     }
 
 
@@ -161,6 +187,8 @@ def validate(manifest):
             expected = manifest["cargo_binaries"][binary]
             if "git" not in tool and tool["version"] not in expected.get("version", "").split():
                 raise ValueError("Cargo install and binary versions disagree: " + name)
+    if not re.fullmatch(r'[a-f0-9]{64}', manifest['compile_wrapper']['sccache_sha256']):
+        raise ValueError('invalid trusted compiler cache wrapper hash')
 
 
 def readonly_mount(path, mountinfo):
@@ -237,8 +265,18 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         if not observed.get("path") or not identified:
             errors.append(name + ": missing GNU coreutils alias")
     if job:
-        for name, expected in manifest["job_environment"].items():
+        environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
+        for name, expected in environment.items():
             equal("job " + name, expected, actual.get("job_environment", {}).get(name))
+        contract, wrapper = manifest['compile_wrapper'], actual.get('compile_wrapper', {})
+        entry = contract['sccache_path'] if role == 'boat' else environment['RUSTC_WRAPPER']
+        equal('compiler wrapper resolution', entry, wrapper.get('resolved'))
+        if role == 'build-server':
+            equal('compiler supervisor cache', contract['sccache_path'], wrapper.get('supervisor_cache'))
+        for name in ('sccache_path', 'sccache_sha256', 'backend'):
+            equal('compiler cache ' + name, contract[name], wrapper.get(name))
+        for name in ('wrapper_readonly', 'backend_readonly'):
+            equal('compiler cache ' + name, True, wrapper.get(name))
         if not readonly_mount(manifest["rustup_home"], actual.get("mountinfo", "")):
             errors.append("job rustup home is not mounted read-only")
     else:

@@ -686,6 +686,26 @@ class RunnerHostRenderTests(unittest.TestCase):
         self.assertIn('Reasons: ["runner_host checks did not all pass"].', text)
         self.assertIn("Exit status: 1", text)
 
+    def test_inconclusive_reclaim_is_visible_and_does_not_mask_required_failures(self):
+        data = self.runner_data()
+        data['runner_host']['all_passed'] = False
+        data['runner_host']['checks'].append({'name': 'prepared_clone.idle_reclaim_observed', 'status': 'INCONCLUSIVE'})
+        outcome = probe.verdict(data)
+        self.assertTrue(outcome['passed'])
+        self.assertEqual(outcome['inconclusive'], ['runner_host.prepared_clone.idle_reclaim_observed'])
+        self.assertEqual(probe.exit_status(data), 0)
+        text = self.rendered(data)
+        self.assertIn('**PASSED**. Checks: 3 of 4 passed.', text)
+        self.assertIn('Inconclusive preconditions: ["runner_host.prepared_clone.idle_reclaim_observed"].', text)
+        for name in ('prepared_clone.toolchain_parity', 'prepared_clone.storage_identity'):
+            with self.subTest(name=name):
+                data['runner_host']['checks'].append({'name': name, 'status': 'FAIL'})
+                self.assertFalse(probe.verdict(data)['passed'])
+                self.assertEqual(probe.exit_status(data), 1)
+                data['runner_host']['checks'].pop()
+        data['runner_host']['checks'][-1]['name'] = 'prepared_clone.toolchain_parity'
+        self.assertFalse(probe.verdict(data)['passed'])
+
     def test_missing_runner_evidence_stays_unmeasured(self):
         data = evidence()
         data["runner_host"] = {"checks": [], "phases": [{"name": "initial"}], "all_passed": False}

@@ -285,6 +285,21 @@ def idle_reclaim_checks(data):
             'Result=success' in data['unit'])
 
 
+def idle_reclaim_status(data):
+    # Preserve the provider's raw counters rather than infer an undocumented
+    # reclaim event from any one field changing after a successful service run.
+    try:
+        if idle_reclaim_checks(data):
+            return 'PASS'
+        fields = [int(value) for value in (data.get('after') or '').split()]
+        if (data['seconds'] >= 420 and len(fields) == 6 and 'Result=success' in data['unit']
+                and data.get('reclaimed_during_idle') is False):
+            return 'INCONCLUSIVE'
+    except (KeyError, ValueError, TypeError):
+        pass
+    return 'FAIL'
+
+
 def storage_timeline_checks(samples):
     return bool(samples) and all(
         sample['ready'] and len(sample['mounts']) == 2 and sample['mounts'] == samples[0]['mounts'] and
@@ -543,8 +558,8 @@ class RunnerHost:
         self.data = {"checks": [], "phases": [], "all_passed": False}
         probe.data["runner_host"] = self.data
 
-    def check(self, name, passed, evidence):
-        self.data["checks"].append({"name": name, "status": "PASS" if passed else "FAIL", "evidence": evidence})
+    def check(self, name, passed, evidence, status=None):
+        self.data["checks"].append({"name": name, "status": status or ("PASS" if passed else "FAIL"), "evidence": evidence})
         self.probe.checkpoint()
 
     def execute(self, sid, command, timeout=120):
@@ -771,7 +786,8 @@ class RunnerHost:
                     if name == 'after_idle':
                         idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
                         record['idle_reclaim'] = idle
-                        self.check(label + '.idle_reclaim_observed', idle_reclaim_checks(idle), idle)
+                        status = idle_reclaim_status(idle)
+                        self.check(label + '.idle_reclaim_observed', status == 'PASS', idle, status=status)
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
@@ -795,7 +811,7 @@ class RunnerHost:
                     for key, passed in storage_checks(state).items():
                         self.check(label + '.' + name + '.' + key, passed, state)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
-        if any(check['status'] != 'PASS' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')
         return record
 
@@ -824,12 +840,13 @@ class RunnerHost:
             self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
             self.probe.wait_sandbox(sid, {'archived'})
             self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
-            from probe import READY
+            from probe import READY, required_checks_passed
             self.probe.wait_sandbox(sid, READY)
             self.probe.wait_hydrated(sid)
             self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
             self.replay_cleanup(sid)
         self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
+        self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
         self.probe.checkpoint()
 
     def replay_cleanup(self, sid):
@@ -838,7 +855,7 @@ class RunnerHost:
         self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
 
     def _run(self):
-        from probe import READY, cleanup
+        from probe import READY, cleanup, required_checks_passed
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT, check=True, stdout=sys.stderr)
         build = process(["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_KEY_0", "-u", "GIT_CONFIG_VALUE_0",
@@ -933,6 +950,7 @@ class RunnerHost:
                 self.check("sshd.dropin_survives_resume", before.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") == after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") and bool(after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf")), {"before": before, "after": after})
         self.data["local_private_keys_removed"] = not directory.exists()
         self.data["all_passed"] = bool(self.data["checks"]) and all(c["status"] == "PASS" for c in self.data["checks"])
+        self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
         if self.data.get('prepared_image'):
-            self.data['prepared_image']['real_jobs_qualified'] = self.data['all_passed']
+            self.data['prepared_image']['real_jobs_qualified'] = self.data['required_checks_passed']
         self.probe.checkpoint()

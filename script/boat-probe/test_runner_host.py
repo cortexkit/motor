@@ -23,6 +23,19 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_successful_service_without_proven_reclaim_is_inconclusive(self):
+        data = {'seconds': 1020.0268031730001, 'started': 267.587254226,
+                'before': None, 'seeded': '25618 211478 35468037632 4613912571 0 -900\n',
+                'after': '30846 998171 36174351872 4627422811 2 619\n',
+                'unit': 'Result=success\nExecMainStartTimestampMonotonic=1252467097\n',
+                'reclaimed_during_idle': False}
+        self.assertFalse(host.idle_reclaim_checks(data))
+        self.assertEqual(host.idle_reclaim_status(data), 'INCONCLUSIVE')
+        self.assertEqual(host.idle_reclaim_status(dict(data, unit='Result=exit-code\n')), 'FAIL')
+        self.assertEqual(host.idle_reclaim_status(dict(data, after='malformed')), 'FAIL')
+        self.assertEqual(host.idle_reclaim_status(dict(data, after='30846 998171 36174351872 4627422811 6 619\n',
+                                                       reclaimed_during_idle=True)), 'PASS')
+
     def test_parity_report_cannot_qualify_on_missing_target_or_stale_manifest(self):
         manifest = json.loads(host.PARITY_MANIFEST.read_text())
         digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

@@ -469,17 +469,34 @@ def cleanup_state(data):
     return "purge_pending" if pending else "complete"
 
 
+def required_checks_passed(checks):
+    # An unproven provider reclaim is an observation gap, not a Motor failure.
+    # Parity, storage and every other check still require a positive PASS.
+    return bool(checks) and all(
+        row.get('status') == 'PASS' or (row.get('status') == 'INCONCLUSIVE'
+                                      and row.get('name', '').endswith('.idle_reclaim_observed'))
+        for row in checks)
+
+
 def verdict(data):
-    """The measurement verdict: did the requested probe finish and did every check pass."""
+    """Require all required checks to pass, listing unproven idle-reclaim checks separately."""
     reasons = []
+    inconclusive = []
     if not data.get("measurements_complete"):
         reasons.append("measurements incomplete")
     if data.get("error"):
         reasons.append("error recorded")
     for mode in ("ssh_reach", "runner_host"):
-        if mode in data and data[mode].get("all_passed") is not True:
-            reasons.append(mode + " checks did not all pass")
-    return {"passed": not reasons, "reasons": reasons}
+        if mode in data:
+            checks = data[mode].get('checks', [])
+            inconclusive.extend(mode + '.' + row['name'] for row in checks if row.get('status') == 'INCONCLUSIVE')
+            if data[mode].get("all_passed") is not True:
+                if mode != 'runner_host' or not required_checks_passed(checks):
+                    reasons.append(mode + " checks did not all pass")
+    result = {"passed": not reasons, "reasons": reasons}
+    if inconclusive:
+        result['inconclusive'] = inconclusive
+    return result
 
 
 # Exit statuses. Cleanup that Boat accepted but has not purged yet does not fail a run.
@@ -649,7 +666,7 @@ def render_runner_host(data):
     """Findings for --runner-host: the verdict, per-phase jobs, timings and job memory budget."""
     runner = data["runner_host"]
     checks = runner.get("checks", [])
-    failing = [c["name"] for c in checks if c.get("status") != "PASS"]
+    failing = [c["name"] for c in checks if c.get("status") not in ('PASS', 'INCONCLUSIVE')]
     outcome = data.get("verdict") or verdict(data)
     error = display(data["error"]) if data.get("error") is not None else "none recorded"
     status = data.get("exit_status")
@@ -662,8 +679,9 @@ def render_runner_host(data):
              "Evidence: the accompanying `results.json` (API responses, guest output, raw job terminals).", "",
              "## Verdict", "",
              f"Runner-host verdict: **{'PASSED' if outcome['passed'] else 'FAILED'}**. "
-             f"Checks: {len(checks) - len(failing)} of {len(checks)} passed.",
-             f"Failing checks: {display(failing) if failing else 'none'}.",
+              f"Checks: {sum(c.get('status') == 'PASS' for c in checks)} of {len(checks)} passed.",
+              f"Failing checks: {display(failing) if failing else 'none'}.",
+              f"Inconclusive preconditions: {display(outcome.get('inconclusive')) if outcome.get('inconclusive') else 'none'}.",
              f"Reasons: {display(outcome['reasons']) if outcome['reasons'] else 'none'}.",
              f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
              f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "

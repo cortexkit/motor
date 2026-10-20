@@ -95,7 +95,7 @@ class ParityTests(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads(parity.MANIFEST.read_text())
 
-    def observed(self):
+    def observed(self, role='build-server'):
         manifest = self.manifest
         bins = {}
         for name, expected in manifest['cargo_binaries'].items():
@@ -119,12 +119,18 @@ class ParityTests(unittest.TestCase):
                 'rust_target_payloads': {name: {target: True for target in spec['targets']} for name, spec in manifest['rust_toolchains'].items()},
                 'apt_packages': {name: 'distro-version' for name in manifest['apt_packages']['required'] + ['coreutils', 'gnu-coreutils']},
                 'sccache_inputs_sha256': manifest['sccache']['inputs_sha256'],
-                'job_environment': manifest['job_environment'].copy(),
+                'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
+                'compile_wrapper': {
+                    **manifest['compile_wrapper'],
+                    'resolved': '/motor-tools/sccache' if role == 'boat' else '/motor-tools/prefrontal-build-slot',
+                    'supervisor_cache': '/motor-tools/sccache' if role == 'build-server' else None,
+                    'wrapper_readonly': True, 'backend_readonly': True,
+                },
                 'mountinfo': '1 0 0:0 / /home/ubuntu/.rustup ro - ext4 /dev/example rw'}
 
-    def report(self, actual, job=False):
+    def report(self, actual, job=False, role='build-server'):
         with patch.object(parity, 'capture', return_value=actual):
-            return parity.check(self.manifest, job=job, gnu_test_sha256='package-qualified-test')
+            return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test')
 
     def test_measured_contract_passes(self):
         self.assertTrue(self.report(self.observed())['passed'])
@@ -146,6 +152,25 @@ class ParityTests(unittest.TestCase):
         self.assertTrue(self.report(actual, job=True)['passed'])
         actual['tools']['gnutest']['sha256'] = 'different-file'
         self.assertFalse(self.report(actual, job=True)['passed'])
+
+    def test_compiler_wrapper_roles_both_reach_the_trusted_cache_wrapper(self):
+        for role in ('build-server', 'boat'):
+            with self.subTest(role=role):
+                self.assertTrue(self.report(self.observed(role), job=True, role=role)['passed'])
+                for key, value in (('sccache_sha256', 'untrusted-script'), ('backend', '/tmp/sccache'),
+                                   ('sccache_path', '/usr/local/bin/sccache'), ('backend_readonly', False)):
+                    actual = self.observed(role)
+                    actual['compile_wrapper'][key] = value
+                    self.assertFalse(self.report(actual, job=True, role=role)['passed'])
+
+    def test_server_supervisor_cache_cannot_bypass_the_trusted_wrapper(self):
+        actual = self.observed()
+        actual['compile_wrapper']['supervisor_cache'] = '/srv/build/cargo-home/bin/sccache'
+        self.assertFalse(self.report(actual, job=True)['passed'])
+
+    def test_trusted_compiler_wrapper_hash_matches_runner_source(self):
+        source = parity.HERE.parents[1] / 'crates/motor-runner/src/sccache-wrapper.sh'
+        self.assertEqual(parity.hashlib.sha256(source.read_bytes()).hexdigest(), self.manifest['compile_wrapper']['sccache_sha256'])
 
     def test_missing_image_wasm_target_fails_check(self):
         actual = self.observed()
