@@ -111,7 +111,8 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('motor-boat-start.py --host-exec --sandbox /etc/motor/sandbox.json', unit)
         self.assertIn('motor-boat-start.py --watch-identity', watcher)
         self.assertIn('WantedBy=multi-user.target', watcher)
-        # The inotify path unit stayed armed on Boat's retired FUSE /etc.
+        # The inotify path unit is gone: on Boat it armed on the temporary FUSE
+        # /etc used during the snapshot restore and missed the real file.
         self.assertFalse((HERE / 'motor-boat-host.path').exists())
         self.assertIn('motor-boat-host.path', install.RETIRED_UNITS)
         self.assertNotIn('motor-boat-host.path', install.UNITS)

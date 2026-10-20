@@ -97,7 +97,8 @@ def serving_mount(path, rows):
 
 
 def restore_pending(mountinfo, restore_active):
-    """Why Boat's file restore is not finished yet, or None once it is."""
+    """A description of what still shows Boat's file restore in progress, or
+    None once every checked path is on the real disk."""
     if restore_active:
         return f'Boat restore marker {RESTORE_ACTIVE} is present'
     rows = mount_table(mountinfo)

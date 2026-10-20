@@ -167,8 +167,8 @@ image is built (`install.py`, followed by `daemon-reload` and
    the snapshot's files. Until that finishes it serves `/etc`, `/usr`, `/srv`,
    `/var/lib/motor-boat` and other system directories from a FUSE filesystem
    (`ascii-lazyfs`), keeps `/var/lib/ascii-lazy/active`, and starts every
-   enabled unit of the snapshot. When the restore is done it removes that file
-   and moves the real-disk directories into place (`hydrated` turns true about
+   enabled unit of the snapshot. When the restore is done Boat removes
+   `/var/lib/ascii-lazy/active` and moves the real-disk directories into place (`hydrated` turns true about
    then). Observed on `bx_bph8zpug`: units started 3 min 27 s after boot, the
    switch to the real disk came 48 s later.
 2. **`motor-boat-restored.service` gates everything.** The runner, its XFS

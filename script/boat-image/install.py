@@ -141,9 +141,11 @@ def state(pins):
             stream.truncate(pins["state_gib"] * 1024**3)
         run("mkfs.xfs", "-q", "-m", "reflink=1", str(image))
     mount = Path("/etc/systemd/system/var-lib-motor\\x2dboat.mount")
-    # Boat's agent starts this enabled mount while its file restore still
-    # serves /var/lib/motor-boat from a temporary view, and moves that view
-    # aside when it finishes, taking a mount stacked on it along.
+    # On a sandbox created from a snapshot, Boat's in-guest agent starts this
+    # enabled mount while it is still restoring the snapshot's files and serves
+    # /var/lib/motor-boat from a temporary FUSE filesystem. When the restore
+    # ends it moves that FUSE mount aside, and a loop mount stacked on top of
+    # it moves too, so the runner loses its state. Wait for the restore gate.
     mount.write_text("[Unit]\nDescription=Boat reflink runner disk\n"
                      "Requires=motor-boat-restored.service\nAfter=motor-boat-restored.service\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"

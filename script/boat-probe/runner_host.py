@@ -1,5 +1,7 @@
-"""Real motor jobs in a disposable Boat host, and the endpoint start-up path
-replayed in the broker's order; no broker-signed token reaches the endpoint."""
+"""Real motor jobs in a disposable Boat host. The admission endpoint is started
+the way the production broker does it (identity install, then polling the
+readiness marker) in each order the broker can produce. The endpoint only
+trusts the production broker's signing keys, so no token it accepts is used."""
 import contextlib
 import errno
 import hashlib
@@ -148,9 +150,9 @@ print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('n
     'inventory': json.loads(pathlib.Path('/var/lib/motor-boat/inventory.json').read_text())}))
 '''.replace('ENV_NAMES', repr(ENV_NAMES))
 
-# The broker's identity install, byte for byte (CLOUD boat-pool.ts): Boat's
-# file API writes the id as the sandbox user under /tmp, then one exec call
-# installs it root-owned 0444. The broker accepts only exit 0 with stdout
+# The broker's identity install with its exact path, content and command
+# (CLOUD boat-pool.ts): Boat's file API writes the id as the sandbox user
+# under /tmp, then one exec call installs it root-owned 0444. The broker accepts only exit 0 with stdout
 # equal to the id.
 IDENTITY_STAGING = '/tmp/ck-motor-tenant-id'
 IDENTITY_INSTALL = ('sudo install -D -m 0444 -o root -g root /tmp/ck-motor-tenant-id /etc/motor/tenant/id'
