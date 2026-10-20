@@ -53,7 +53,8 @@ pub const HEADLINE: &str = "run a command on the remote build server (ck motor r
 pub const TOP_HELP: &str = "\
 usage: ck motor run [OPTIONS] -- COMMAND...
        ck motor attach JOB_ID [--secret-file PATH] [--status]
-       ck motor hosted-check
+        ck motor hosted-check
+        ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]
 
 Runs COMMAND on the remote build server and streams its output here.
 See `ck motor run --help` for the options and exit statuses.";
@@ -1553,6 +1554,117 @@ mod hosted_cli_tests {
             .await;
             assert_eq!(code, 23);
             assert!(String::from_utf8(err).unwrap().contains(expected));
+        }
+    }
+}
+
+fn shadow_since(args: &[String]) -> Result<u64, String> {
+    match args {
+        [] => Ok(0),
+        [flag, value] if flag == "--since" => {
+            let (number, factor) = match value.as_bytes().last() {
+                Some(b'h') => (&value[..value.len() - 1], 3600),
+                Some(b'm') => (&value[..value.len() - 1], 60),
+                Some(b's') => (&value[..value.len() - 1], 1),
+                _ => {
+                    return value.parse().map_err(|_| {
+                        "--since requires UNIX seconds or a duration such as 1h".into()
+                    })
+                }
+            };
+            let seconds = number
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(factor))
+                .ok_or("invalid --since duration")?;
+            Ok(crate::hosted::now_s().saturating_sub(seconds))
+        }
+        _ => Err("usage: ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]".into()),
+    }
+}
+
+pub async fn shadow_report_main(args: &[String]) -> u8 {
+    if args == ["--help"] {
+        println!("usage: ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]");
+        return 0;
+    }
+    let since = match shadow_since(args) {
+        Ok(since) => since,
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_USAGE;
+        }
+    };
+    let result = async {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let client = SubcClient::connect(&cwd).await?;
+        let bytes = client
+            .consumer
+            .request(
+                &client.route,
+                direct_envelope("shadow.report", json!({"since": since}), None),
+                CallOptions::default(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let records: Vec<crate::shadow::Record> =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        for record in &records {
+            println!(
+                "{} job={} mismatch={} shadow_failure={:?}",
+                record.timestamp_s,
+                record.job_id,
+                record.mismatch.join(","),
+                record.shadow_failure
+            );
+            for (name, side) in [
+                ("build_server", &record.build_server),
+                ("shadow", &record.shadow),
+            ] {
+                println!(
+                    "{name}: outcome={:?} exit={:?} run_ms={}",
+                    side.outcome, side.exit_code, side.run_ms
+                );
+                for (stream, summary) in [("stdout", &side.stdout), ("stderr", &side.stderr)] {
+                    println!(
+                        "--- {name} {stream} ({} bytes, sha256 {}) ---\n{}",
+                        summary.bytes,
+                        summary.sha256,
+                        summary.tail.as_deref().unwrap_or_default()
+                    );
+                }
+            }
+        }
+        println!("{} shadow mismatches (bounded retained log)", records.len());
+        Ok::<_, String>(())
+    }
+    .await;
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("shadow-report: {error}");
+            EXIT_REFUSED
+        }
+    }
+}
+
+#[cfg(test)]
+mod shadow_report_cli_tests {
+    use super::*;
+    #[test]
+    fn shadow_since_accepts_epoch_and_bounded_durations_and_rejects_unknown_flags() {
+        let words = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(shadow_since(&[]).unwrap(), 0);
+        assert_eq!(shadow_since(&words(&["--since", "1234"])).unwrap(), 1234);
+        let before = crate::hosted::now_s().saturating_sub(3600);
+        assert!((before..=before + 1).contains(&shadow_since(&words(&["--since", "1h"])).unwrap()));
+        for values in [
+            vec!["--unknown"],
+            vec!["--since"],
+            vec!["--since", "bad"],
+            vec!["--since", "18446744073709551615h"],
+        ] {
+            assert!(shadow_since(&words(&values)).is_err());
         }
     }
 }

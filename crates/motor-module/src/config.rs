@@ -13,6 +13,10 @@ pub struct Config {
     /// omitted so older clients with a closed Config schema can still load it.
     #[serde(skip_serializing_if = "is_false")]
     pub spill_to_hosted: bool,
+    /// Compare sampled build-server jobs against hosted runners without routing
+    /// caller traffic there. Omit defaults for older closed config schemas.
+    #[serde(skip_serializing_if = "ShadowConfig::is_default")]
+    pub shadow_to_hosted: ShadowConfig,
     /// Capacity-permit wait before attempting spill, in seconds (default 45).
     #[serde(skip_serializing_if = "is_default_spill_after")]
     pub spill_after_s: u64,
@@ -68,6 +72,28 @@ pub enum BrokerTokenSource {
     CkAccount,
     Fake,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShadowConfig {
+    pub enabled: bool,
+    pub sample_rate: f64,
+    pub max_concurrent: usize,
+}
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_rate: 0.1,
+            max_concurrent: 2,
+        }
+    }
+}
+impl ShadowConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
 impl BrokerTokenSource {
     fn is_default(&self) -> bool {
         *self == Self::CkAccount
@@ -103,6 +129,7 @@ impl Default for Config {
         Self {
             hosted_runners: false,
             spill_to_hosted: false,
+            shadow_to_hosted: ShadowConfig::default(),
             spill_after_s: 45,
             spill_max_vcpus: 8,
             spill_avoid_host: None,
@@ -146,6 +173,14 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> io::Result<()> {
+        if !self.shadow_to_hosted.sample_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.shadow_to_hosted.sample_rate)
+            || self.shadow_to_hosted.max_concurrent == 0
+        {
+            return Err(io::Error::other(
+                "shadow sample_rate must be 0..1 and max_concurrent must be positive",
+            ));
+        }
         if self.runner_instance == "main" && self.broker_token_source == BrokerTokenSource::Fake {
             return Err(io::Error::other(
                 "fake broker is forbidden for runner_instance main",

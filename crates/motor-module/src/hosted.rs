@@ -393,6 +393,14 @@ fn reattach_body(key: &SigningKey) -> ReattachRequest {
     }
 }
 
+#[derive(Serialize)]
+struct ShadowLeaseRequest<'a> {
+    #[serde(flatten)]
+    request: &'a LeaseRequest,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    shadow: bool,
+}
+
 pub(crate) struct Client {
     http: reqwest::Client,
     route: HostedJobState,
@@ -477,9 +485,6 @@ impl Client {
             http_status = reply.status().as_u16(),
             "hosted broker replied"
         );
-        if matches!(reply.status().as_u16(), 401 | 403) {
-            return Err(Error::Auth);
-        }
         if reply.status().as_u16() == 202 && path == "/v1/leases" {
             let provisioning: ProvisioningReply = reply.json().await.map_err(|_| Error::Broker)?;
             return if provisioning.status == "provisioning" {
@@ -503,6 +508,9 @@ impl Client {
                 "hosted broker refused"
             );
             *self.broker_code.lock().unwrap() = broker_code.map(str::to_owned);
+            if matches!(status, 401 | 403) {
+                return Err(Error::Auth);
+            }
             return Err(
                 match code
                     .as_ref()
@@ -724,6 +732,54 @@ impl Client {
             }
         }
     }
+    /// Shadows share lease validation and the pinned transport with spill, but
+    /// have no durable job or attach credentials in the motor store.
+    pub(crate) async fn shadow_run(
+        &self,
+        id: Uuid,
+        request: &RunRequest,
+        salt: &[u8; 32],
+        booked: &mut Option<Lease>,
+    ) -> Result<Channel, Error> {
+        let key = requester()?;
+        let body = lease_body(
+            id,
+            request,
+            (
+                keyed_hash(salt, "ck-ws-v1", &request.workspace_key).map_err(|_| Error::Path)?,
+                keyed_hash(salt, "ck-repo-v1", &request.repository_root)
+                    .map_err(|_| Error::Path)?,
+            ),
+            None,
+            self.route.avoid_host.clone(),
+            RequesterJwk::from_key(&key.verifying_key()),
+        )?;
+        // Extend only this request: older brokers may reject shadows, but normal
+        // leases must retain their closed wire schema.
+        let wire = ShadowLeaseRequest {
+            request: &body,
+            shadow: true,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let lease: Lease = self
+            .post_ready_authorized("/v1/leases", &wire, self.bearer().await?, deadline)
+            .await?;
+        *booked = Some(lease.clone());
+        let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
+        if lease.ssh.is_none()
+            || self.route.avoid_host.as_ref() == Some(&lease.placement.host)
+            || resource_mismatch(&claims, &body, true).is_some()
+            || lease.max_s < body.timeout_s
+        {
+            return Err(Error::Auth);
+        }
+        self.connect(id, &lease, &key, motor_lease::Purpose::Run)
+            .await
+            .map_err(|failure| {
+                tracing::warn!(job_id = %id, step = failure.step, code = failure.error.code(), "shadow connection failed");
+                failure.error
+            })
+    }
     async fn post_ready<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -807,3 +863,44 @@ mod sandbox_tests;
 mod tenant_heartbeat_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod shadow_wire_tests {
+    use super::*;
+    #[test]
+    fn shadow_wire_omits_false_appends_true_and_preserves_ordinary_fields() {
+        let request =
+            RunRequest::new("/tmp/repo", "/tmp/repo", "/tmp/repo", "true").with_timeout(30);
+        let ordinary = lease_body(
+            Uuid::nil(),
+            &request,
+            ("a".repeat(64), "b".repeat(64)),
+            None,
+            Some("build-server".into()),
+            RequesterJwk::from_key(&SigningKey::from_bytes(&[1; 32]).verifying_key()),
+        )
+        .unwrap();
+        let absent = serde_json::to_string(&ordinary).unwrap();
+        let false_body = serde_json::to_string(&ShadowLeaseRequest {
+            request: &ordinary,
+            shadow: false,
+        })
+        .unwrap();
+        assert_eq!(absent, false_body);
+        let true_body = serde_json::to_string(&ShadowLeaseRequest {
+            request: &ordinary,
+            shadow: true,
+        })
+        .unwrap();
+        assert_eq!(
+            true_body,
+            format!("{},\"shadow\":true}}", &absent[..absent.len() - 1])
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&true_body).unwrap();
+        assert_eq!(
+            value.as_object_mut().unwrap().remove("shadow"),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(value, serde_json::to_value(&ordinary).unwrap());
+    }
+}

@@ -59,10 +59,12 @@ pub struct Motor {
     connector: Arc<dyn Connector>,
     spool_root: PathBuf,
     account_tokens: Option<Arc<crate::AccountTokens>>,
+    shadows: Arc<crate::shadow::Manager>,
 }
 #[cfg(test)]
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;
+mod shadow_run;
 impl Motor {
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
         self.connector = connector;
@@ -83,6 +85,7 @@ impl Motor {
             connector,
             spool_root: storage_root.join("spools"),
             account_tokens: None,
+            shadows: Arc::new(crate::shadow::Manager::new(storage_root)),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -566,6 +569,18 @@ impl Motor {
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let (mut request, returns) = submission;
+        let shadow_request = (self.hosted_state(id).is_none()
+            && self
+                .storage
+                .job(id)
+                .is_some_and(|job| !job.gate_job && job.direct_secret_hash.is_none())
+            && crate::shadow::eligible(
+                &self.config,
+                &request,
+                false,
+                !returns.return_paths.is_empty(),
+            ))
+        .then(|| request.clone());
         let hosted = self.hosted_state(id).is_some();
         let windows = request.platform == Some(Platform::Windows);
         let build_server_id = self.build_server_id(id);
@@ -801,6 +816,7 @@ impl Motor {
                 .hosted_update(id, |state| state.run_sent = true)
                 .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         }
+        let shadow_run = shadow_request.map(|request| (request, run.clone()));
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
             drop(channel);
@@ -840,6 +856,11 @@ impl Motor {
                         .map(|_| false);
                 }
                 let wrong_platform = windows && accepted.platform != Some(Platform::Windows);
+                if !wrong_platform && !resubmitted {
+                    if let Some((request, run)) = shadow_run {
+                        self.start_shadow(id, request, run, snapshots.clone());
+                    }
+                }
                 self.storage
                     .accepted(request.workspace_key, snapshots.commits())?;
                 // A runner cannot grant network access the caller did not request.
@@ -1415,6 +1436,9 @@ impl Motor {
                     // Unknown streams still advance the replay cursor; they are
                     // not terminal and cannot authorize a local fallback.
                     if matches!(output.stream, OutputStream::Stdout | OutputStream::Stderr) {
+                        if !hosted {
+                            self.shadows.output(id, &output);
+                        }
                         emit(tx, StreamRecord::Output(output)).await?;
                     }
                     backoff = 1;
@@ -1449,6 +1473,9 @@ impl Motor {
                         terminal.retry_after_ms = None;
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+                    if !hosted {
+                        self.shadows.terminal(id, &terminal);
+                    }
                     if !self.pending(id)
                         && spill_watch
                             .as_ref()

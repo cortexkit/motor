@@ -13,6 +13,40 @@ enum Reply {
 }
 
 impl Client {
+    /// Best-effort settlement without a durable retry. A lost lease response can
+    /// still have booked a sandbox, so cleanup also runs when placement is unknown.
+    pub(crate) async fn cleanup_shadow(
+        &self,
+        id: Uuid,
+        terminal: Option<&TerminalRecord>,
+        max_s: u64,
+    ) {
+        let result = async {
+            match self.release(id).await {
+                Ok(()) | Err(Error::NotGranted | Error::Released | Error::Finished) => Ok(()),
+                Err(Error::Admitted) => {
+                    let body =
+                        terminal
+                            .map(|t| Finish::from_terminal(t, max_s))
+                            .unwrap_or(Finish {
+                                outcome: "lost".into(),
+                                run_ms: 0,
+                            });
+                    match self.finish_once(id, &body).await? {
+                        Reply::Settled(_) | Reply::Lost => Ok(()),
+                        Reply::Refused => Err(Error::Rejected),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), result).await,
+            Ok(Ok(()))
+        ) {
+            tracing::warn!(job_id = %id, "shadow lease cleanup failed; broker backstop must reclaim it");
+        }
+    }
     pub(crate) async fn finish(
         &self,
         id: Uuid,
