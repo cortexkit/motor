@@ -257,18 +257,28 @@ impl Host {
         self.save(next)
     }
     pub fn binding(&self, claims: &Claims) -> Result<&Tenant, Error> {
-        let vm = claims
-            .placement
-            .vm
-            .as_deref()
-            .ok_or(Error::Refused(Refusal::Auth))?;
         // Sandbox placement is authenticated against its freshly read identity
         // before this shared reservation state is reached. The broker, not a
         // second local tenant registry, binds the subject to that sandbox.
-        let entry = self
-            .tenants
-            .get(if self.provider_managed { "sandbox" } else { vm })
-            .ok_or(Error::Refused(Refusal::Auth))?;
+        let entry = if self.provider_managed {
+            self.tenants.get("sandbox")
+        } else {
+            match claims.placement.vm.as_deref() {
+                Some(vm) => self.tenants.get(vm),
+                // A cold placement names no VM: the broker picked this host,
+                // not one of its VMs. The subject then selects the tenant, and
+                // only when exactly one VM on this host belongs to it, so a
+                // token can never pick between two tenants' VMs.
+                None => {
+                    let mut owned = self.tenants.values().filter(|t| t.sub == claims.sub);
+                    match (owned.next(), owned.next()) {
+                        (Some(only), None) => Some(only),
+                        _ => None,
+                    }
+                }
+            }
+        }
+        .ok_or(Error::Refused(Refusal::Auth))?;
         if !self.provider_managed && entry.sub != claims.sub {
             return refuse(Refusal::Auth);
         }

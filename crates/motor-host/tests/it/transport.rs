@@ -158,7 +158,9 @@ async fn invalid_signature_never_wakes_or_attaches_and_refuses_before_lease_ok()
 }
 #[tokio::test]
 async fn unknown_vm_wrong_sub_and_wrong_requester_are_auth_before_challenge_with_no_usage() {
-    for case in 0..5 {
+    // A cold placement (`vm: null`) is not refused here: the contract allows
+    // it, and binding by subject is covered in admission.rs.
+    for case in [0, 1, 2, 4] {
         let (runtime, fake, broker, requester, mut c) = fixture();
         if case == 0 {
             c.placement.vm = Some("unknown".into());
@@ -168,9 +170,6 @@ async fn unknown_vm_wrong_sub_and_wrong_requester_are_auth_before_challenge_with
         }
         if case == 2 {
             c.cnf.jkt = motor_lease::base64url(&[4; 32]);
-        }
-        if case == 3 {
-            c.placement.vm = None;
         }
         if case == 4 {
             c.platform = "linux".into();

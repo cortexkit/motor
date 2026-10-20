@@ -30,6 +30,28 @@ fn binding_refuses_unknown_vm_cross_tenant_and_changed_job_binding_without_mutat
     refused(h.claim(changed, NOW * 1000), Refusal::Auth);
 }
 #[test]
+fn cold_placement_binds_the_subjects_only_tenant_and_refuses_ambiguity() {
+    // The broker's cold placement names the host but no VM (`vm: null`).
+    let mut h = host();
+    let mut cold = claims(JOB);
+    cold.placement.vm = None;
+    assert_eq!(h.binding(&cold).unwrap().tenant, "tenant");
+    let mut stranger = cold.clone();
+    stranger.sub = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+    refused(h.binding(&stranger), Refusal::Auth);
+    // A second VM for the same subject makes a cold token ambiguous.
+    h.tenants.insert(
+        "vm-2".into(),
+        Tenant {
+            tenant: "tenant-2".into(),
+            ..tenants()["vm"].clone()
+        },
+    );
+    refused(h.binding(&cold), Refusal::Auth);
+    // A token naming a VM still binds exactly that VM.
+    assert_eq!(h.binding(&claims(JOB)).unwrap().tenant, "tenant");
+}
+#[test]
 fn every_run_checks_host_full_without_summing_memory_caps_and_attach_is_free() {
     let mut h = host();
     h.guest_ready("tenant", 1).unwrap();
