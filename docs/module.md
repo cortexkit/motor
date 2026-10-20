@@ -270,3 +270,43 @@ refusal equivalence (`crates/motor-module/tests/it/operator_cli.rs`):
 `cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret`.
 CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
 `attach_never_accepts_an_argv_secret_or_echoes_it`.
+
+## Hosted shadow comparisons
+
+`shadow_to_hosted` is independent of `spill_to_hosted` and defaults to
+`{"enabled":false,"sample_rate":0.1,"max_concurrent":2}`. The entire default
+object is omitted when serializing configuration, so older clients still load
+it. Set `spill_avoid_host` to the build server's broker host ID before enabling
+shadowing; without it, selection fails closed.
+
+After build-server acceptance, sampled offline Linux jobs of at most 8 vCPUs
+can run a second copy on Boat. Direct-caller jobs (which have reattach secrets),
+return-path requests, Windows jobs and network requests are excluded. The
+broker must grant the account shadow permission and enable its shadow pool;
+`shadow_not_allowed` and `no_capacity` skip the shadow, never reroute the caller.
+Shadows use the captured snapshot and filtered environment, never attach, and
+never wait on the caller's delivery path. The concurrency bound covers a shadow
+and its pending comparison, so a slow primary cannot create unbounded captures.
+
+Completed comparisons append to `shadow.jsonl` in the module's store directory,
+rotated at 4 MiB with one previous file. No shadow job is persisted in
+`state.json`. Each side records outcome, exit code, wall time and raw-byte
+stdout/stderr SHA-256 and byte counts. Only mismatches retain the last 16 KiB of
+each stream, displayed as lossy UTF-8; files are created private (0600).
+Mismatch classes distinguish refusal before start, outcome kind, exit code and
+output differences. Output can legitimately differ because of timestamps and
+runner paths, so a mismatch is a triage signal, not a caller failure.
+
+`ck health ck-motor --verbose` includes `shadow` counts for retained comparisons
+from the last hour. `ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]`
+prints retained mismatches with both sides' stdout/stderr tails; like the other
+local motor commands, it needs `admit_direct_exec`. Shutdown cancels in-flight
+shadows and attempts broker release/finish within a bounded deadline. An abrupt
+process kill cannot perform cleanup; the broker's timeout remains the backstop.
+No shadow is replayed after restart.
+
+The shadow contracts are exercised by `shadow_hanging_or_refused_never_changes_callers_stream_or_exit`,
+`shadow_eligibility_excludes_net_windows_oversize_secrets_returns_and_unknown_host`,
+`shadow_concurrency_cap_and_zero_sampling_are_nonblocking`,
+`shadow_reuses_pinned_boat_path_and_records_both_tails`, and
+`restart_cancels_running_shadow_finishes_lease_and_never_resumes_it`.
