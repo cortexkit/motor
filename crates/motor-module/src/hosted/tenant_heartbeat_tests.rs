@@ -117,7 +117,7 @@ async fn hosted_channel_heartbeats_keep_a_tenant_job_streaming_to_its_terminal()
         Incoming::Frame(Frame::Accepted(_))
     ));
     // A real bundle upload over a WAN link outlasts several heartbeats. Let
-    // two go out before the first chunk, as they did in production.
+    // two go out before the first chunk to stand in for a slow upload.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     channel
         .send(Frame::BundleChunk {

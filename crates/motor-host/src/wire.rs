@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn the_heartbeat_ovh_1_sent_is_refused_and_a_contract_heartbeat_passes() {
+    fn a_local_tenant_label_and_empty_hash_are_refused_and_a_contract_heartbeat_passes() {
         assert_eq!(heartbeat_violation(&heartbeat()), None);
         // The body CLOUD answered with 400: a host-local tenant label and an
         // empty workspace hash.

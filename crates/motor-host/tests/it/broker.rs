@@ -216,8 +216,8 @@ fn read_request(stream: &std::net::TcpStream) -> (String, u64) {
     (path, headers["ck-timestamp"].parse().unwrap())
 }
 
-/// ovh-1's sender retried a heartbeat the broker refused with 400 about once
-/// a second, forever, and the usage report queued behind it never went out.
+/// The sender used to retry a heartbeat the broker refused with 400 about
+/// once a second, forever, and a usage report queued behind it never went out.
 /// A 400 now sets the body aside, the next attempt waits at least the
 /// heartbeat interval, and the usage report is sent next.
 #[test]

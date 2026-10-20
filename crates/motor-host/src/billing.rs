@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 pub const DELIVERY_GRACE_MS: u64 = 60_000;
 pub const OUTBOX_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-/// How many rejected requests the journal keeps for diagnosis; older ones go.
+/// How many rejected requests the journal keeps for diagnosis; older ones are dropped.
 pub const REJECTED_OUTBOX_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

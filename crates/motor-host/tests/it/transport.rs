@@ -1084,9 +1084,9 @@ async fn host_loss_sends_stored_frames_even_when_guest_eof_wins_the_relay_race()
     task.await.unwrap().unwrap();
 }
 
-/// ovh-1 logged a bare `connection_closed` when the tenant runner dropped a
-/// hosted job's relay after Accepted. The close now names the side, the step,
-/// the job and the cause, so that failure names itself.
+/// When the tenant runner drops a hosted job's relay after Accepted, the close
+/// names the side, the step, the job and the cause, not a bare
+/// `connection_closed`.
 #[tokio::test]
 async fn a_guest_that_closes_after_accepted_is_reported_as_a_guest_eof_in_the_relay() {
     let (runtime, fake, broker, requester, c) = fixture();
