@@ -55,18 +55,28 @@ def index_path(name):
     return f'{name[:2]}/{name[2:4]}/{name}'
 
 
-def index_checksum(home, registry, name, version):
+def index_identities(home, registry, files):
     index = home / 'registry/index' / registry
     if (index / '.git').exists():
         raise ValueError('legacy Git registry index cannot be seeded as sparse metadata: ' + registry)
-    path = index / '.cache' / index_path(name)
-    # Cargo's sparse cache has a binary header and NUL-delimited JSON records.
-    for record in path.read_bytes().split(b'\0'):
-        if record.startswith(b'{'):
-            row = json.loads(record)
-            if row.get('name') == name and row.get('vers') == version:
-                return row['cksum']
-    raise ValueError(f'missing sparse index entry: {registry}/{name} {version}')
+    identities = {}
+    prefix = f'registry/index/{registry}/.cache/'
+    for name in files:
+        if not name.startswith(prefix):
+            continue
+        # Sparse cache records are authoritative: archive filenames cannot be
+        # split unambiguously when versions contain hyphenated build metadata.
+        for record in (home / name).read_bytes().split(b'\0'):
+            if record.startswith(b'{'):
+                row = json.loads(record)
+                if name != prefix + index_path(row['name']):
+                    raise ValueError('crate stored at the wrong sparse index path: ' + name)
+                identity = (row['name'], row['vers'])
+                checksum = row['cksum']
+                if checksum in identities and identities[checksum] != identity:
+                    raise ValueError('ambiguous crate checksum in sparse index: ' + checksum)
+                identities[checksum] = identity
+    return identities
 
 
 def capture(home, strict=True):
@@ -81,17 +91,25 @@ def capture(home, strict=True):
                 files[name] = {'sha256': digest(path), 'bytes': path.stat().st_size}
             if name.endswith('/objects/info/alternates') and path.read_text().strip():
                 raise ValueError('Git seed depends on external alternates: ' + name)
+    indexes = {}
     for name, spec in files.items():
         if name.startswith('registry/cache/'):
             registry, filename = PurePosixPath(name).parts[2:]
-            match = re.fullmatch(r'(.+)-(\d+\.\d+\.\d+[^/]*)\.crate', filename)
-            if not match:
-                raise ValueError('invalid crate filename: ' + name)
-            crate, version = match.groups()
             try:
-                checksum = index_checksum(home, registry, crate, version)
-                if checksum != spec['sha256']:
-                    raise ValueError(f'index checksum mismatch: {crate} {version}')
+                if registry not in indexes:
+                    try:
+                        indexes[registry] = index_identities(home, registry, files)
+                    except (OSError, ValueError) as error:
+                        indexes[registry] = error
+                identities = indexes[registry]
+                if isinstance(identities, Exception):
+                    raise identities
+                checksum = spec['sha256']
+                if checksum not in identities:
+                    raise ValueError('index checksum mismatch: ' + filename + ' has no matching index record')
+                crate, version = identities[checksum]
+                if filename != f'{crate}-{version}.crate':
+                    raise ValueError('cache filename disagrees with authoritative index identity: ' + filename)
             except (OSError, ValueError) as error:
                 if strict:
                     raise

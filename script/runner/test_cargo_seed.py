@@ -86,6 +86,26 @@ class CargoSeedTests(unittest.TestCase):
         self.assertEqual(list(self.home.rglob('Cargo.lock')), [])
         self.assertTrue(self.manifest['captured_at'].endswith('+00:00'))
 
+    def export_identity_fixture(self, name, version, expected_index_path):
+        home = self.root / ('identity-' + name)
+        cached_crate(home, name, version)
+        manifest = seed.export(home, self.root / (name + '-seed.tar.gz'))
+        self.assertEqual(manifest['crate_count'], 1)
+        self.assertEqual([(row['name'], row['version']) for row in manifest['crates']], [(name, version)])
+        self.assertIn(f'registry/cache/{REGISTRY}/{name}-{version}.crate', manifest['files'])
+        self.assertIn(f'registry/index/{REGISTRY}/.cache/{expected_index_path}', manifest['files'])
+
+    def test_export_uses_index_identity_for_spirv_build_metadata(self):
+        self.export_identity_fixture('spirv', '0.4.0+sdk-1.3.268.0', 'sp/ir/spirv')
+
+    def test_export_uses_index_identity_for_hyphenated_crate_name(self):
+        self.export_identity_fixture('cortexkit-bus-testkit', '0.1.3', 'co/rt/cortexkit-bus-testkit')
+
+    def test_export_uses_lowercase_cargo_index_prefixes_for_short_names(self):
+        for name, path in [('a', '1/a'), ('ab', '2/ab'), ('aBc', '3/a/abc'), ('AbCd', 'ab/cd/abcd')]:
+            with self.subTest(name=name):
+                self.export_identity_fixture(name, '0.1.0', path)
+
     def test_seed_excludes_credentials_config_sources_and_git_checkouts(self):
         with tarfile.open(self.archive) as archive:
             names = archive.getnames()
