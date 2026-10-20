@@ -696,10 +696,28 @@ def render_runner_host(data):
                          ("Prepared image save", prepared.get("seconds")),
                          ("Measurement snapshot save", snapshot.get("seconds")),
                          ("Create from measurement snapshot to Boat-ready", runner.get("create_from_snapshot", {}).get("seconds_to_ready")),
+                         ("Create from measurement snapshot to hydrated", runner.get("create_from_snapshot", {}).get("seconds_to_hydrated")),
+                         ("Create from measurement snapshot to endpoint ready marker", runner.get("snapshot_create_to_endpoint_ready_seconds")),
                          ("Create from measurement snapshot to first finished job", runner.get("snapshot_create_to_first_job_seconds"))):
         lines.append(f"| {label} | {display(rounded(value, 1))} |")
-    lines += ["", "First-job time includes waiting for Boat to report full hydration, SSH, service restart and "
-              "memory budgeting. Prepared-image save is absent when an existing image was reused.", "",
+    lines += ["", "First-job time includes waiting for Boat to report full hydration, the endpoint start-up "
+              "checks below, SSH and memory budgeting. Prepared-image save is absent when an existing image was reused.", "",
+              "## Endpoint start-up", "",
+              "Seconds until `cat /run/motor/endpoint-ready` printed the sandbox id, from the broker's identity "
+              "install (or from hydration when the identity predates it).", "",
+              "| Phase | Order | Ready | Seconds | Polls |", "| --- | --- | --- | --- | --- |"]
+    for phase in runner.get("phases", []):
+        flows = phase.get("broker_order") or {}
+        rows = [("broker order, install before restore finished", flows.get("after_hydration")),
+                ("broker order, re-install", flows.get("after_reinstall")),
+                ("watcher armed, then install", (phase.get("armed_then_install") or {}).get("wait")),
+                ("identity already present", (phase.get("existing_then_reinstall") or {}).get("first")),
+                ("re-install while serving", (phase.get("existing_then_reinstall") or {}).get("after"))]
+        for order, wait in rows:
+            if wait:
+                lines.append(f"| {phase.get('name')} | {order} | {display(wait.get('ready'))} | "
+                             f"{display(rounded(wait.get('seconds'), 1))} | {display(wait.get('polls'))} |")
+    lines += ["",
               "## Job memory budget", "",
               "memory.max = MemAvailable before runner start - runner idle - margin, rounded down to whole MiB.", "",
               "| Phase | MemAvailable bytes | Runner idle bytes | Margin bytes | Budget memory.max bytes | Budget MiB | Job memory.max bytes |",

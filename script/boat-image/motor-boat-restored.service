@@ -1,0 +1,19 @@
+[Unit]
+Description=Wait until Boat has restored this sandbox's files onto its real disk
+# Boat's agent starts enabled units while it still serves system directories
+# from a temporary FUSE view; the runner, its disk mounts and the identity
+# watcher must not start until the real disk is in place. No default
+# dependencies, so the runner disk mount (ordered before local-fs.target) can
+# order after this unit without a cycle.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
+ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --wait-restored
+TimeoutStartSec=35min

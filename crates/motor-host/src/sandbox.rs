@@ -13,7 +13,7 @@ use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 
@@ -71,6 +71,10 @@ pub struct Config {
     pub id_file: PathBuf,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Where to publish the readiness marker. The broker books a sandbox only
+    /// after this file exists and holds the sandbox id; absent means no marker.
+    #[serde(default)]
+    pub ready_marker: Option<PathBuf>,
 }
 fn default_identity() -> PathBuf {
     ID_FILE.into()
@@ -154,8 +158,55 @@ pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await
 }
 
+/// How often a missing JWKS is fetched again while no key set is loaded.
+const KEY_RETRY_S: u64 = 5;
+
+/// Make the readiness marker agree with the endpoint's current state: the
+/// sandbox id when broker keys are loaded and the identity file is valid,
+/// otherwise no file. Called only once the loopback listener is bound. The
+/// marker is replaced by rename, so a reader never sees a partial id.
+pub(crate) fn publish_readiness(runtime: &Runtime, marker: &Path) -> std::io::Result<()> {
+    let wanted = if runtime.keys.read().expect("keys lock").is_empty() {
+        None
+    } else {
+        runtime
+            .sandbox_identity
+            .as_ref()
+            .and_then(|identity| identity.read().ok())
+    };
+    let current = std::fs::read_to_string(marker).ok();
+    if wanted == current {
+        return Ok(());
+    }
+    match wanted {
+        Some(id) => {
+            let temporary = marker.with_extension("tmp");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)?;
+            // The creation mode is filtered by the umask; readers outside root
+            // (the broker's exec user) need 0644 exactly.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            std::io::Write::write_all(&mut file, id.as_bytes())?;
+            drop(file);
+            std::fs::rename(&temporary, marker)?;
+            tracing::info!("endpoint_ready_marker_written");
+        }
+        None => {
+            std::fs::remove_file(marker)?;
+            tracing::info!("endpoint_ready_marker_removed");
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let port = config.port;
+    let marker = config.ready_marker.clone();
     let runtime = runtime(config)?;
     runtime.fetch_keys.store(true, Ordering::Relaxed);
     let startup = runtime.clone();
@@ -177,6 +228,20 @@ pub async fn run(config: Config) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     });
     let listener = bind(port).await.context("sandbox loopback listener")?;
+    if let Some(marker) = marker {
+        let ready = runtime.clone();
+        std::thread::spawn(move || loop {
+            // A startup fetch can fail (network not up yet); retry until a
+            // key set is held instead of waiting for the 10-minute refresh.
+            if ready.keys.read().expect("keys lock").is_empty() {
+                ready.refresh_keys(KEY_RETRY_S);
+            }
+            if publish_readiness(&ready, &marker).is_err() {
+                tracing::warn!("endpoint_ready_marker_failed");
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        });
+    }
     loop {
         let (socket, _) = listener.accept().await?;
         let runtime = runtime.clone();

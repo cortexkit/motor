@@ -33,6 +33,7 @@ impl Fixture {
             vcpu_ceiling: 8,
             id_file,
             port: 0,
+            ready_marker: None,
         };
         let jobs = tokio::net::UnixListener::bind(&config.job_socket).unwrap();
         let mut runtime = runtime(config).unwrap();
@@ -525,4 +526,37 @@ async fn sandbox_refusals_name_the_failing_check() {
     );
     std::fs::remove_file(f.dir.path().join("id")).unwrap();
     assert_eq!(check(&boat), Err("identity"));
+}
+
+/// The readiness marker the broker polls holds exactly the sandbox id, only
+/// while broker keys are loaded and the identity file is valid, and follows a
+/// rewritten identity file instead of keeping a stale id.
+// The fixture binds a tokio Unix listener, so it needs a runtime.
+#[tokio::test]
+async fn sandbox_ready_marker_tracks_keys_and_identity() {
+    let f = Fixture::new();
+    let marker = f.dir.path().join("endpoint-ready");
+    let id = f.dir.path().join("id");
+    let keys = std::mem::take(&mut *f.runtime.keys.write().unwrap());
+    publish_readiness(&f.runtime, &marker).unwrap();
+    assert!(!marker.exists(), "no marker before a JWKS is loaded");
+    *f.runtime.keys.write().unwrap() = keys;
+    publish_readiness(&f.runtime, &marker).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+    let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o644);
+    std::fs::remove_file(&id).unwrap();
+    publish_readiness(&f.runtime, &marker).unwrap();
+    assert!(!marker.exists(), "a missing identity withdraws readiness");
+    std::fs::write(&id, "bx_other").unwrap();
+    std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o644)).unwrap();
+    publish_readiness(&f.runtime, &marker).unwrap();
+    assert!(
+        !marker.exists(),
+        "an identity file with the wrong mode is not ready"
+    );
+    std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o444)).unwrap();
+    publish_readiness(&f.runtime, &marker).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "bx_other");
+    assert!(!marker.with_extension("tmp").exists());
 }

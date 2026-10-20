@@ -137,6 +137,10 @@ pub struct KeySet {
     last_fetch_s: Option<u64>,
 }
 impl KeySet {
+    /// True until a refresh has stored at least one usable key.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
     /// Call before fetching JWKS. Record attempts, including failed fetches, so an
     /// unknown signing key cannot trigger more than one network request a minute.
     pub fn should_refetch(&mut self, token: &str, now_s: u64) -> bool {

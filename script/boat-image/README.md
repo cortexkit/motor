@@ -8,7 +8,7 @@ exact revision being installed:
 
 ```sh
 sudo python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)"
-sudo systemctl start motor-boat motor-boat-host.path
+sudo systemctl start motor-boat motor-boat-identity
 ```
 
 `pins.json` fixes the official signed Ubuntu source URLs, Rust/rustup, Node,
@@ -139,18 +139,76 @@ The runner uses `--tenant-vm --tenant-socket-dir /run/motor-tenant`, never vsock
 the Boat profile. Readiness requires the daemon PID to own its ordinary socket
 and all three root-0600 `jobs.sock`, `events.sock` and `admin.sock` listeners.
 `motor-host --sandbox /etc/motor/sandbox.json` reads those channels and listens on
-**127.0.0.1:9443**. Its root-owned config records the journal path and measured
-vCPU ceiling. A systemd path unit starts admission only after the broker writes
-the identity file; endpoint readiness checks the endpoint PID's loopback listener.
-The probe installs a temporary root-0444 test identity, verifies an actual
-`lease_refused/auth` frame for an invalid token, stops admission and removes the
-identity before snapshot capture. This is a negative admission check, not a
-successful broker-token job test.
+**127.0.0.1:9443**. Its root-owned config records the journal path, the measured
+vCPU ceiling and the readiness marker path. `motor-boat-identity.service` starts
+admission once the broker's identity file exists; endpoint readiness checks the
+endpoint PID's loopback listener, and the readiness marker (below) tells the
+broker when to book. The probe replays the broker's identity install, verifies an
+actual `lease_refused/auth` frame for an invalid token, stops admission and
+removes the identity before snapshot capture. This is a negative admission
+check, not a successful broker-token job test: the endpoint trusts only the
+production broker's JWKS, so the probe cannot mint a token it accepts. The
+accepted-token path is covered in process by
+`crates/motor-module/src/hosted/sandbox_tests.rs`.
 
 The unauthenticated bridge is **probe-only**, loopback **127.0.0.1:19443** to the
 ordinary runner Unix socket. Its unit is installed but never enabled; only the
 probe starts it, stops it before snapshot, and restarts it explicitly on the
 disposable clone. Never expose it as a production endpoint.
+
+## Image contract: start-up after create and resume
+
+What the broker relies on, in order. The units are installed only while the
+image is built (`install.py`, followed by `daemon-reload` and
+`systemd-analyze verify`); nothing rewrites a unit at runtime.
+
+1. **Boat restores files after boot.** A sandbox created from a snapshot (and
+   one resumed from archive) boots Boat's base image; Boat's agent then restores
+   the snapshot's files. Until that finishes it serves `/etc`, `/usr`, `/srv`,
+   `/var/lib/motor-boat` and other system directories from a FUSE filesystem
+   (`ascii-lazyfs`), keeps `/var/lib/ascii-lazy/active`, and starts every
+   enabled unit of the snapshot. When the restore is done Boat removes
+   `/var/lib/ascii-lazy/active` and moves the real-disk directories into place (`hydrated` turns true about
+   then). Observed on `bx_bph8zpug`: units started 3 min 27 s after boot, the
+   switch to the real disk came 48 s later.
+2. **`motor-boat-restored.service` gates everything.** The runner, its XFS
+   mount (and so `/Users`), the endpoint and the identity watcher all require
+   it. It waits until that file is gone and none of those directories is served
+   by FUSE, for at most 30 minutes. Starting earlier strands work on the FUSE
+   view: the previous image's inotify path unit stayed armed on the retired
+   `/etc` and never saw the broker's identity file, and the runner's first
+   start failed because its state mounts were moved aside mid-start.
+3. **Identity.** The broker writes `/tmp/ck-motor-tenant-id` through Boat's file
+   API, then runs `sudo install -D -m 0444 -o root -g root /tmp/ck-motor-tenant-id
+   /etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id && cat /etc/motor/tenant/id`
+   after every create and resume. `motor-boat-identity.service` polls for that
+   path once a second with no deadline: by path, not inotify, so it works
+   whether the file is written in place or renamed in, whether it predates the
+   watcher, and whatever Boat did to the mounts before. An install that landed
+   on the FUSE view and was lost in the switch simply waits for the broker's
+   next install. Starting an already-running endpoint is a no-op, so repeated
+   installs never start a second endpoint.
+4. **Readiness marker.** `motor-host` writes `/run/motor/endpoint-ready`
+   (root, 0644, tmpfs, so per boot) only while it listens on 127.0.0.1:9443,
+   holds a loaded broker JWKS and the identity file is valid, and the file
+   holds exactly that identity (no newline). It is rechecked every second: a
+   missing or invalid identity removes it, a changed identity rewrites it, and
+   a failed JWKS fetch is retried every 5 s. Stopping the endpoint removes
+   `/run/motor` with it. The broker reads it with `cat /run/motor/endpoint-ready`
+   through Boat's exec API as the sandbox user and books only on exit 0 with
+   stdout equal to the sandbox id (optionally plus a newline).
+   `/run/motor/endpoint-revision` holds the image's source revision.
+
+The restart that used to rescue the runner's failed first start is no longer
+needed for it: start deadlines are 120 s (bootstrap and readiness) inside a 300 s
+`TimeoutStartSec`, and `Restart=on-failure` is only a backstop.
+
+`systemctl status` on a restored sandbox may still warn that our units (and
+Boat's own `ariana-fswatch-*` units) "changed on disk": systemd loaded them
+through the FUSE view, whose file times differ from the real disk's. The content
+is the same file; units restored by other means (`ssh.service`) do not warn. It
+is a Boat restore artifact, not a rewrite, and the image does not reload systemd
+at runtime to hide it.
 
 ## Disk budget
 
@@ -191,12 +249,12 @@ absolute `/usr/sbin/ip`, `nft`, `sysctl` and `ufw` paths, validates the nft tran
 and checks UFW route syntax without applying rules or sysctl writes. The root
 service PATH also includes administrative directories. After installation,
 `systemd-analyze verify` checks the units and an actual start/stop of the runner
-unit exercises its exact flags, mounted state, root account validation, memory
-budget and all required socket listeners without exposing a job connection.
-The endpoint still waits for the probe/broker identity file.
+unit exercises its exact flags, the restore gate, mounted state, root account
+validation, memory budget and all required socket listeners without exposing a
+job connection. The endpoint still waits for the probe/broker identity file.
 
 Any failed guest command records `systemctl status --no-pager -l` and 200 boot
-journal lines separately for every runner, host, host-path and bridge unit under
+journal lines separately for the restore gate, runner, endpoint, identity watcher and bridge units under
 `runner_host.guest_failures[].unit_diagnostics`; collection errors and raw command
 results are retained rather than silently discarded. The recipe's startup
 preflight prints the same per-unit evidence before stopping a failed service.
@@ -230,6 +288,24 @@ the clone, also with noEnv. It measures create request → first real terminal
 received, including hydration, SSH and service readiness; then tests stop/resume
 and effective SSH policy again. Never two live sandboxes. Measurement time is
 capped at 30 minutes; deletion/purge latency is separate.
+
+The endpoint start-up path is replayed in the broker's order, with the
+broker's exact identity install (see the image contract) and its exact marker
+read, `cat /run/motor/endpoint-ready` as the sandbox user, which must print the
+sandbox id. Each wait has a hard limit of 120 s and its measured seconds are
+recorded; the worst observed so far is 3.3 s (see the measured run below):
+
+- **original and clone, watcher armed first:** stop the endpoint, remove the
+  identity, restart the watcher, confirm no marker and nothing on 9443, then
+  install. The marker must appear root 0644 with the id.
+- **clone, broker order:** install right after the create returns, while Boat
+  may still be restoring files; wait for `hydrated`; then wait for the marker.
+  If that early install was lost in Boat's switch to the real disk, install
+  again (as the broker does) and wait again. Results record whether the early
+  install survived.
+- **resumed clone, identity already present:** the file is on disk before the
+  watcher starts, so the marker must appear without a new install; a repeated
+  install must keep the same endpoint PID and restart count.
 
 The audit explicitly checks every passwd account home for Boat's in-sandbox API
 key, classifies `.npmrc` by **key names only**, and records sensitive environment
@@ -297,6 +373,31 @@ retained prepared image is excluded from requested cleanup; it is listed under
 `--cleanup RESULTS.json --delete-retained-images` explicitly deletes it too.
 No image is retained by default, and a borrowed source image is not owned/deleted
 by the new run.
+
+## Endpoint start-up measured on Boat (2026-10-20)
+
+One `--runner-host --prepared-image --from-prepared-image
+motor-boat-prepared-cbc6493de2f6` run at source revision `4420d92` passed 133 of
+133 checks and retained the prepared image **`motor-boat-prepared-5dab50642cb0`**
+(qualified by its real jobs). Seconds from the broker's identity install (or
+from `hydrated`, when the identity was already there) until
+`cat /run/motor/endpoint-ready` printed the sandbox id:
+
+| Phase | Order | Seconds |
+| --- | --- | --- |
+| initial | watcher armed, then install | 3.3 |
+| snapshot clone | broker order, install sent before the restore finished | 2.9 |
+| snapshot clone | watcher armed, then install | 0.9 |
+| resumed | identity already present | 0.5 |
+| resumed | re-install while serving | 0.9 |
+
+On the clone and after resume, `motor-boat.service` and `motor-boat-host.service`
+reported `NRestarts=0`: the first start succeeded, without the restart that
+rescued the previous image. The early install, sent right after create,
+survived Boat's switch to the real disk in this run, so the re-install branch
+was not exercised. Create from snapshot to hydrated took 43.1 s and to the
+readiness marker 46.0 s. The 120 s probe limit stays the hard bound; the broker
+itself waits up to 10 minutes.
 
 ## Measured on Boat (2026-10-19)
 

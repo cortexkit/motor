@@ -1,7 +1,7 @@
 [Unit]
 Description=Motor runner in a single-tenant Boat sandbox
-Requires=Users.mount var-lib-motor\x2dboat.mount
-After=Users.mount var-lib-motor\x2dboat.mount network-online.target
+Requires=Users.mount var-lib-motor\x2dboat.mount motor-boat-restored.service
+After=Users.mount var-lib-motor\x2dboat.mount network-online.target motor-boat-restored.service
 
 [Service]
 User=root
@@ -18,6 +18,7 @@ ExecStartPre=+/usr/bin/python3 /usr/local/libexec/motor-boat-credentials.py --ou
 ExecStartPre=+/usr/local/libexec/motor-boat-network
 ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py serve --boat-profile --tenant-vm --tenant-socket-dir /run/motor-tenant --reserve-daemon-core false --free-space-floor-bytes 25769803776 --free-space-eviction-bytes 34359738368 --backend host --instance boat --state-root /var/lib/motor-boat/state --build-slot-root /var/lib/motor-boat/slots --max-weight @VCPUS@ --rustc-slots @VCPUS@ --sccache-size-gib 8 --job-network veth
 ExecStartPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --wait-ready
+TimeoutStartSec=300
 Restart=on-failure
 RestartSec=2
 KillMode=mixed
