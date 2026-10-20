@@ -33,6 +33,20 @@ pub const HVSOCK_LISTEN_FILE: &str = r"C:\ProgramData\Motor\hyperv-listen.txt";
 pub const HV_GUID_PARENT: u128 = 0xa42e7cda_d03f_480c_9cc2_a4de20abb878;
 /// HV_GUID_LOOPBACK: a connection from inside the same partition.
 pub const HV_GUID_LOOPBACK: u128 = 0xe0e16197_dd56_4a10_9195_5ee7a155a838;
+/// How long one host connect attempt may wait. A Hyper-V socket connect issued
+/// before the guest listens does not complete when the listener appears later;
+/// it waits out its timeout (30 s by default), so the host retries short
+/// attempts until its overall deadline instead.
+pub const HVSOCK_CONNECT_ATTEMPT_MS: u32 = 250;
+/// WSAETIMEDOUT: a connect attempt used up its whole timeout.
+const WSAETIMEDOUT: i32 = 10060;
+
+/// Pause before the next host connect attempt. An attempt that timed out has
+/// already waited, so the next one starts at once; any other failure returns
+/// quickly and gets a short pause so the loop does not spin.
+pub fn hvsock_retry_pause_ms(os_code: i32) -> u64 {
+    if os_code == WSAETIMEDOUT { 0 } else { 100 }
+}
 
 /// Parse a textual GUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, optional
 /// braces, any case) into the integer form `windows_sys::core::GUID::from_u128`
@@ -56,11 +70,10 @@ pub fn parse_guid(text: &str) -> io::Result<u128> {
 }
 
 /// Which VM ID the guest agent's listener binds. `Wildcard` is the documented
-/// listener form; it accepts any partition, so the agent refuses loopback
-/// peers (`hvsock_peer_allowed`) and accepts only one connection. `Parent`
-/// binds HV_GUID_PARENT to accept only the host, but Microsoft documents that
-/// ID as a connect address, so it is kept as an alternative to try if the
-/// wildcard bind does not work.
+/// listener form; it accepts any partition, so `accept_parent` refuses every
+/// peer except the parent partition. `Parent` binds HV_GUID_PARENT, but
+/// Microsoft documents that ID as a connect address, so it is kept as an
+/// alternative to try if the wildcard bind does not work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenAddress {
     Wildcard,
@@ -87,10 +100,31 @@ pub fn hvsock_listen_address(text: Option<&str>) -> io::Result<ListenAddress> {
     }
 }
 
-/// A job process inside the guest could reach the agent's listener over
-/// loopback; only a connection from another partition (the host) is accepted.
+/// The agent talks only to the Hyper-V host. Its connection arrives with the
+/// parent partition's VM ID; a process in this guest (loopback) or in another
+/// VM shows a different ID and must never reach the protocol.
 pub fn hvsock_peer_allowed(peer_vm_id: u128) -> bool {
-    peer_vm_id != HV_GUID_LOOPBACK
+    peer_vm_id == HV_GUID_PARENT
+}
+
+/// Accept connections until one comes from the parent partition and return
+/// it with its VM ID. `next` yields `None` when no connection arrived in its
+/// wait slice and is responsible for stop and deadline errors. Every other
+/// peer's connection is closed (dropped) and reported through `refused`.
+pub fn accept_parent<C>(
+    mut next: impl FnMut() -> io::Result<Option<(C, u128)>>,
+    mut refused: impl FnMut(u128),
+) -> io::Result<(C, u128)> {
+    loop {
+        match next()? {
+            None => {}
+            Some((connection, peer)) if hvsock_peer_allowed(peer) => return Ok((connection, peer)),
+            Some((connection, peer)) => {
+                drop(connection);
+                refused(peer);
+            }
+        }
+    }
 }
 
 pub fn hyperv_queue_bytes(text: Option<&str>) -> io::Result<u32> {
@@ -248,10 +282,73 @@ mod tests {
     }
 
     #[test]
-    fn loopback_peer_is_refused_and_other_partitions_are_not() {
+    fn only_the_parent_partition_reaches_the_agent() {
+        // Track whether each refused connection was closed before the next accept.
+        struct Connection<'a>(u128, &'a std::cell::RefCell<Vec<u128>>);
+        impl Drop for Connection<'_> {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(self.0);
+            }
+        }
+        let closed = std::cell::RefCell::new(Vec::new());
+        let other_vm = 0x4ae3c7f2_1d39_4c6b_9e58_0123456789ab;
+        let children = 0x90db8b89_0d35_4f79_8ce9_49ea0ac8b7cd;
+        let mut arrivals = vec![
+            None,
+            Some(HV_GUID_LOOPBACK),
+            Some(other_vm),
+            None,
+            Some(0),
+            Some(children),
+            Some(HV_GUID_PARENT),
+            Some(other_vm),
+        ]
+        .into_iter();
+        let mut refused = Vec::new();
+        let (connection, peer) = accept_parent(
+            || {
+                Ok(arrivals
+                    .next()
+                    .unwrap()
+                    .map(|peer| (Connection(peer, &closed), peer)))
+            },
+            |peer| refused.push(peer),
+        )
+        .unwrap();
+        assert_eq!(peer, HV_GUID_PARENT);
+        assert_eq!(connection.0, HV_GUID_PARENT);
+        assert_eq!(refused, [HV_GUID_LOOPBACK, other_vm, 0, children]);
+        assert_eq!(*closed.borrow(), refused, "every refused peer was closed");
+        // Accepting stops at the parent; later arrivals are never taken.
+        assert_eq!(arrivals.next(), Some(Some(other_vm)));
         assert!(!hvsock_peer_allowed(HV_GUID_LOOPBACK));
+        assert!(!hvsock_peer_allowed(other_vm));
         assert!(hvsock_peer_allowed(HV_GUID_PARENT));
-        assert!(hvsock_peer_allowed(0x1234));
+    }
+
+    #[test]
+    fn accept_errors_end_the_wait_without_admitting_anyone() {
+        let mut calls = 0;
+        let error = accept_parent::<()>(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(Some(((), HV_GUID_LOOPBACK)))
+                } else {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"))
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn timed_out_connects_retry_at_once_and_fast_failures_pause() {
+        assert_eq!(hvsock_retry_pause_ms(10060), 0);
+        assert_eq!(hvsock_retry_pause_ms(10061), 100);
+        assert_eq!(hvsock_retry_pause_ms(0), 100);
     }
 
     #[test]

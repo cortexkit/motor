@@ -466,9 +466,9 @@ mod hvsock {
         Win32::{
             Networking::WinSock::{
                 AF_HYPERV, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSADATA,
-                WSAGetLastError, WSAStartup, closesocket, connect, recv, send, socket,
+                WSAGetLastError, WSAStartup, closesocket, connect, recv, send, setsockopt, socket,
             },
-            System::Hypervisor::{HV_PROTOCOL_RAW, SOCKADDR_HV},
+            System::Hypervisor::{HV_PROTOCOL_RAW, HVSOCKET_CONNECT_TIMEOUT, SOCKADDR_HV},
         },
         core::GUID,
     };
@@ -503,9 +503,12 @@ mod hvsock {
         }
     }
 
-    /// Retry until the agent's listener is up or 120 s pass (the same budget as
-    /// the named-pipe path). Every distinct error code is traced once, so a
-    /// permanent refusal such as a missing service registration stays visible.
+    /// Retry short connect attempts until the agent's listener is up or 120 s
+    /// pass (the same budget as the named-pipe path). Each attempt is capped at
+    /// `HVSOCK_CONNECT_ATTEMPT_MS`, so boot-to-Hello measures the guest rather
+    /// than a connect that started before the listener existed. Every distinct
+    /// error code is traced once, so a permanent refusal such as a missing
+    /// service registration stays visible.
     pub fn dial(vm_id: u128) -> io::Result<Stream> {
         let service =
             motor_winagent::transport::parse_guid(motor_winagent::transport::HVSOCK_SERVICE_ID)?;
@@ -523,9 +526,10 @@ mod hvsock {
             ServiceId: GUID::from_u128(service),
         };
         let deadline = Instant::now() + Duration::from_secs(120);
+        let attempt_ms = motor_winagent::transport::HVSOCK_CONNECT_ATTEMPT_MS;
         trace(
             "hvsock-connect-start",
-            serde_json::json!({"vm_id":format!("{vm_id:032x}"),"service_id":format!("{service:032x}")}),
+            serde_json::json!({"vm_id":format!("{vm_id:032x}"),"service_id":format!("{service:032x}"),"attempt_ms":attempt_ms}),
         );
         let mut attempts = 0u32;
         let mut seen = BTreeSet::new();
@@ -535,6 +539,24 @@ mod hvsock {
                 let candidate = socket(i32::from(AF_HYPERV), SOCK_STREAM, HV_PROTOCOL_RAW as i32);
                 if candidate == INVALID_SOCKET {
                     return Err(io::Error::from_raw_os_error(WSAGetLastError()));
+                }
+                // Refuse to fall back to the 30 s default: that would silently
+                // measure our timeout instead of the guest's boot.
+                if setsockopt(
+                    candidate,
+                    HV_PROTOCOL_RAW as i32,
+                    HVSOCKET_CONNECT_TIMEOUT as i32,
+                    (&raw const attempt_ms).cast::<u8>(),
+                    size_of::<u32>() as i32,
+                ) == SOCKET_ERROR
+                {
+                    let error = io::Error::from_raw_os_error(WSAGetLastError());
+                    closesocket(candidate);
+                    trace(
+                        "hvsock-connect-timeout-error",
+                        serde_json::json!({"error":error.to_string(),"os_code":error.raw_os_error()}),
+                    );
+                    return Err(error);
                 }
                 if connect(
                     candidate,
@@ -558,7 +580,9 @@ mod hvsock {
             if Instant::now() >= deadline {
                 return Err(io::Error::from_raw_os_error(error));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(
+                motor_winagent::transport::hvsock_retry_pause_ms(error),
+            ));
         }
     }
 }
@@ -567,8 +591,9 @@ fn run() -> io::Result<()> {
     let values: Vec<_> = std::env::args().skip(1).collect();
     if values == ["--version"] {
         println!(
-            "motor Hyper-V spike protocol {} trace=3 transports=pipe,hvsock",
-            motor_winagent::PROTOCOL_VERSION
+            "motor Hyper-V spike protocol {} trace=3 transports=pipe,hvsock hvsock_connect_attempt_ms={}",
+            motor_winagent::PROTOCOL_VERSION,
+            motor_winagent::transport::HVSOCK_CONNECT_ATTEMPT_MS
         );
         return Ok(());
     }

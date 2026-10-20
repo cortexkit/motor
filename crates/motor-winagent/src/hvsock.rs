@@ -1,9 +1,9 @@
 //! Hyper-V socket channel for the opt-in Hyper-V experiment.
 //!
 //! The guest agent listens on Motor's service ID and the host dials this VM's
-//! ID. The agent accepts exactly one host connection and then closes its
-//! listener, so nothing inside the guest (in particular a job process, which
-//! only starts after the host is connected) can connect later. The framing and
+//! ID. The agent admits only a connection from the parent partition (the
+//! Hyper-V host), accepts exactly one, and then closes its listener, so nothing
+//! in this guest or in another VM can reach the protocol. The framing and
 //! protocol on top of the stream are the same as on virtio-serial.
 use motor_winagent::transport::{self, ListenAddress};
 use std::{
@@ -159,9 +159,9 @@ impl Drop for Socket {
     }
 }
 
-/// Listen on Motor's service ID and return the first connection from another
-/// partition, with the peer's VM ID for the diagnostic log. The listener is
-/// closed when this returns.
+/// Listen on Motor's service ID and return the first connection from the
+/// parent partition, with the peer's VM ID for the diagnostic log. The listener
+/// is closed when this returns.
 pub fn accept_host(
     stop: HANDLE,
     deadline: Instant,
@@ -200,7 +200,9 @@ pub fn accept_host(
             address.vm_id(),
             service
         ));
-        loop {
+        // Only the parent partition (the Hyper-V host) is admitted; any other
+        // peer's connection is closed and logged, and listening continues.
+        let next = || -> io::Result<Option<(Socket, u128)>> {
             if stopped(stop) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -223,7 +225,7 @@ pub fn accept_host(
             };
             match select(0, &mut ready, null_mut(), null_mut(), &slice) {
                 SOCKET_ERROR => return Err(wsa_error()),
-                0 => continue,
+                0 => return Ok(None),
                 _ => {}
             }
             let mut peer: SOCKADDR_HV = zeroed();
@@ -233,12 +235,10 @@ pub fn accept_host(
                 (&raw mut peer).cast::<SOCKADDR>(),
                 &mut peer_length,
             ))?;
-            let peer_id = guid_u128(peer.VmId);
-            if !transport::hvsock_peer_allowed(peer_id) {
-                crate::hyperv_diag::event(&format!("hvsock refused peer vm_id={peer_id:032x}"));
-                continue;
-            }
-            return Ok((connection, peer_id));
-        }
+            Ok(Some((connection, guid_u128(peer.VmId))))
+        };
+        transport::accept_parent(next, |peer| {
+            crate::hyperv_diag::event(&format!("hvsock refused peer vm_id={peer:032x}"))
+        })
     }
 }

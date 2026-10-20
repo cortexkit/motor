@@ -45,7 +45,10 @@ try {
     Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=3') 'probe-version' ((Get-FileHash $client).Hash)
     $python = $null
     if ($Transport -eq 'hvsock') {
-        Assert-Spike ($version.stdout -match 'transports=pipe,hvsock') 'probe-supports-hvsock' $version.stdout.Trim()
+        # Require the client that caps each connect attempt. An uncapped connect
+        # started before the guest listens waits 30 s, which would make
+        # boot-to-Hello report that timeout instead of the guest's boot time.
+        Assert-Spike ($version.stdout -match 'transports=pipe,hvsock hvsock_connect_attempt_ms=\d+') 'probe-supports-hvsock' $version.stdout.Trim()
         $serviceKey = Get-SpikeServiceKeyState
         Assert-Spike ($serviceKey.exists -and $serviceKey.owner -eq $SpikeHvsockOwner) 'hvsock-service-registered' "$(Get-SpikeServiceKeyPath) $($serviceKey | ConvertTo-Json -Compress) (run hvsock-service.ps1 -Install first)"
         $python = (Get-Command python -ErrorAction Stop).Source

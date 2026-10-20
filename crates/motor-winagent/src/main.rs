@@ -9,7 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "hyperv-spike")]
     if std::env::args().skip(1).eq(["--build-info"]) {
         if cfg!(feature = "hyperv-hvsock") {
-            println!("motor-winagent hyperv-spike agent_diag=3 transport=hvsock protocol=4");
+            println!(
+                "motor-winagent hyperv-spike agent_diag=3 transport=hvsock peer=parent protocol=4"
+            );
         } else {
             println!(
                 "motor-winagent hyperv-spike agent_diag=3 transport=com partial_read=4096,250ms queue_config=0,2097152 protocol=4"
