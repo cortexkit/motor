@@ -196,6 +196,30 @@ def frame(conn):
     return json.loads(exact(conn, size))
 
 
+# Upper bound on one job's whole exchange, from lease hello to its terminal
+# frame. The first job also waits for tenant attachment (host deadline 60 s),
+# and each job runs for at most its 30 s timeout; the rest is ample room for
+# bundle upload, workspace setup and queueing.
+JOB_DEADLINE_S = 600
+
+
+def reply_frame(conn, deadline, read=frame):
+    """The next frame that is not a heartbeat, read before deadline.
+
+    The runner writes heartbeats on its own schedule, starting on its writer's
+    first tick, so one can arrive before the reply to hello or any other
+    request. Waiting for a specific reply therefore reads past heartbeats, but
+    only until the monotonic deadline; each read is also bounded by the
+    socket timeout.
+    """
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("no reply frame before the deadline; only heartbeats arrived")
+        item = read(conn)
+        if item.get("type") != "heartbeat":
+            return item
+
+
 def job_id():
     value = (int(time.time() * 1000) << 80) | (7 << 76) | (int.from_bytes(os.urandom(2), "big") & 4095) << 64
     value |= (2 << 62) | (int.from_bytes(os.urandom(8), "big") & ((1 << 62) - 1))
@@ -589,7 +613,6 @@ class Harness:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        frames = []
         with socket.create_connection(("127.0.0.1", self.port), timeout=180) as tcp, context.wrap_socket(tcp) as conn:
             cert_bytes = conn.getpeercert(binary_form=True)
             if not cert_bytes:
@@ -600,39 +623,46 @@ class Harness:
             if hashlib.sha256(spki).hexdigest() != lease["endpoint_spki_sha256"]:
                 raise RuntimeError("host TLS SPKI did not match the fake broker lease")
             send_frame(conn, dict(type="lease_hello", v=1, token=lease["job_token"], requester_jwk=self.requester_jwk))
-            challenge = frame(conn)
-            if challenge["type"] != "challenge" or challenge["host_id"] != self.name:
-                raise RuntimeError(f"host challenge refused: {challenge}")
-            signing_input = (f"motor-host-challenge-v1\n{challenge['nonce']}\n{self.name}\n{identifier}\n{challenge['ts']}\n").encode()
-            message = self.work / "challenge"
-            message.write_bytes(signing_input)
-            signature = subprocess.check_output(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(self.requester), "-in", str(message)], timeout=30)
-            send_frame(conn, dict(type="challenge_response", sig=b64(signature)))
-            reply = frame(conn)
-            self.record("lease_admission", reply=reply)
-            if reply["type"] != "lease_ok":
-                raise RuntimeError(f"host refused lease: {reply}")
-            send_frame(conn, dict(type="hello", protocol_version=1, started=True, default_branch_tip=True))
-            reply = frame(conn)
-            if reply.get("type") != "hello" or reply.get("protocol_version") != 1:
-                raise RuntimeError(f"runner hello failed: {reply}")
-            send_frame(conn, run_request(identifier, commit, tree, bundle, command))
-            reply = frame(conn)
+            return self.converse(conn, identifier, lease, run_request(identifier, commit, tree, bundle, command), bundle)
+
+    def sign(self, signing_input):
+        message = self.work / "challenge"
+        message.write_bytes(signing_input)
+        return subprocess.check_output(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(self.requester), "-in", str(message)], timeout=30)
+
+    def converse(self, conn, identifier, lease, request, bundle):
+        """Admission challenge, runner hello, Run, bundle upload and output frames."""
+        deadline = time.monotonic() + JOB_DEADLINE_S
+        challenge = reply_frame(conn, deadline)
+        if challenge["type"] != "challenge" or challenge["host_id"] != self.name:
+            raise RuntimeError(f"host challenge refused: {challenge}")
+        signing_input = (f"motor-host-challenge-v1\n{challenge['nonce']}\n{self.name}\n{identifier}\n{challenge['ts']}\n").encode()
+        send_frame(conn, dict(type="challenge_response", sig=b64(self.sign(signing_input))))
+        reply = reply_frame(conn, deadline)
+        self.record("lease_admission", reply=reply)
+        if reply["type"] != "lease_ok":
+            raise RuntimeError(f"host refused lease: {reply}")
+        send_frame(conn, dict(type="hello", protocol_version=1, started=True, default_branch_tip=True))
+        reply = reply_frame(conn, deadline)
+        if reply.get("type") != "hello" or reply.get("protocol_version") != 1:
+            raise RuntimeError(f"runner hello failed: {reply}")
+        send_frame(conn, request)
+        reply = reply_frame(conn, deadline)
+        self.record("job_frame", job_id=identifier, frame=reply)
+        if reply["type"] != "accepted":
+            raise RuntimeError(f"runner refused Run: {reply}")
+        for offset in range(0, len(bundle), 65536):
+            send_frame(conn, dict(type="bundle_chunk", index=0, offset=offset,
+                                 data=base64.b64encode(bundle[offset:offset + 65536]).decode()))
+        frames = []
+        while True:
+            reply = reply_frame(conn, deadline)
             self.record("job_frame", job_id=identifier, frame=reply)
-            if reply["type"] != "accepted":
-                raise RuntimeError(f"runner refused Run: {reply}")
-            for offset in range(0, len(bundle), 65536):
-                send_frame(conn, dict(type="bundle_chunk", index=0, offset=offset,
-                                     data=base64.b64encode(bundle[offset:offset + 65536]).decode()))
-            while True:
-                reply = frame(conn)
-                self.record("job_frame", job_id=identifier, frame=reply)
-                frames.append(reply)
-                if reply["type"] in ("refusal", "lease_refused"):
-                    raise RuntimeError(f"job refused: {reply}")
-                if reply["type"] == "hosted_terminal":
-                    break
-        return frames
+            frames.append(reply)
+            if reply["type"] in ("refusal", "lease_refused"):
+                raise RuntimeError(f"job refused: {reply}")
+            if reply["type"] == "hosted_terminal":
+                return frames
 
     def stop_processes(self):
         for process in reversed(self.processes):

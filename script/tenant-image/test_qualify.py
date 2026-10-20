@@ -335,6 +335,45 @@ class QualificationTests(unittest.TestCase):
             with self.assertRaises(EOFError):
                 q.frame(b)
 
+    def test_job_exchange_reads_past_heartbeats_before_every_reply(self):
+        harness = q.Harness.__new__(q.Harness)
+        harness.name = "qualify-host"
+        harness.record = mock.Mock()
+        harness.sign = lambda signing_input: b"signature"
+        heartbeat = {"type": "heartbeat"}
+        terminal = {"type": "hosted_terminal", "outcome": {"type": "exit", "code": 0}}
+        # The host itself sends the challenge and lease_ok; runner heartbeats
+        # can only follow, once the relay to the runner is open.
+        replies = [{"type": "challenge", "host_id": "qualify-host", "nonce": "n", "ts": 1}, {"type": "lease_ok"},
+                   heartbeat, heartbeat, {"type": "hello", "protocol_version": 1},
+                   heartbeat, {"type": "accepted"},
+                   heartbeat, {"type": "output", "stream": "stdout", "bytes": ""}, heartbeat, terminal]
+        client, runner = socket.socketpair()
+        with client, runner:
+            for item in replies:
+                q.send_frame(runner, item)
+            frames = harness.converse(client, "job", {}, {"type": "run"}, b"bundle")
+            client.shutdown(socket.SHUT_WR)
+            sent = []
+            while True:
+                try:
+                    sent.append(q.frame(runner)["type"])
+                except EOFError:
+                    break
+        self.assertEqual(frames, [{"type": "output", "stream": "stdout", "bytes": ""}, terminal])
+        self.assertEqual(sent, ["challenge_response", "hello", "run", "bundle_chunk"])
+
+    def test_reply_wait_is_bounded_when_only_heartbeats_arrive(self):
+        reads = []
+        def heartbeat(_conn):
+            reads.append(1)
+            return {"type": "heartbeat"}
+        with self.assertRaisesRegex(TimeoutError, "only heartbeats"):
+            q.reply_frame(None, q.time.monotonic() + 0.05, read=heartbeat)
+        self.assertGreater(len(reads), 0)
+        self.assertEqual(q.reply_frame(None, q.time.monotonic() + 1, read=lambda _: {"type": "hello"}),
+                         {"type": "hello"})
+
     def test_uuid_is_lowercase_version_seven_with_unique_random_bits(self):
         ids = [q.job_id() for _ in range(20)]
         self.assertEqual(len(set(ids)), 20)

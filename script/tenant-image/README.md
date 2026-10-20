@@ -358,7 +358,9 @@ the real TLS `motor-host` admission server. A separate `motor-lease` fake broker
 issues a requester-bound lease for each job. The fake broker's seed is never
 passed to the host. TLS SPKI pinning, the challenge signature, the runner Hello,
 Git bundle upload, output frames, nonzero exit 23, second-job target path/inode
-and sentinel reuse are all checked. The helper performs suspend/restore with
+and sentinel reuse are all checked. While waiting for any reply the harness
+reads past runner heartbeats, which can precede even the hello reply, within a
+600 s per-job deadline. The helper performs suspend/restore with
 its normal quiesce/freeze/thaw and durable-snapshot implementation; fallback to
 a fresh base fails qualification. A third leased job proves persistence after
 restore. This tests the production admission/launch path with a fake **control
