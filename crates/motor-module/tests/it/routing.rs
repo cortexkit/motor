@@ -356,8 +356,9 @@ async fn ordered_windows_runners_prefer_first_and_persist_full_binding_across_re
         .unwrap()
         .iter()
         .all(|v| v.instance == "ally-windows"));
-    let stored: Value =
-        serde_json::from_slice(&fs::read(peer.module_state.join("state.json")).unwrap()).unwrap();
+    // The store keeps recent mutations in its journal, so read the durable
+    // state (checkpoint plus journal), not the checkpoint file alone.
+    let stored = crate::storage::durable_value(&peer.module_state).unwrap();
     assert_eq!(
         stored["jobs"][id.to_string()]["windows_runner"]["host"],
         "192.0.2.41"
@@ -384,8 +385,7 @@ async fn ordered_windows_runners_prefer_first_and_persist_full_binding_across_re
         .unwrap()
         .iter()
         .all(|r| r.host == "192.0.2.41"));
-    let stored: Value =
-        serde_json::from_slice(&fs::read(peer.module_state.join("state.json")).unwrap()).unwrap();
+    let stored = crate::storage::durable_value(&peer.module_state).unwrap();
     assert_eq!(
         stored["jobs"][id.to_string()]["windows_runner"]["host"],
         "192.0.2.41"
