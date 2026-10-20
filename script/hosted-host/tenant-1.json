@@ -1,0 +1,16 @@
+{
+  "tenant": "tenant-1",
+  "vm": "vm-1",
+  "image_version": "tenant-20261020-main-806a6d3-20261020T021255Z",
+  "vcpu_ceiling": 8,
+  "guest_ram_mib": 28672,
+  "disk_quota_bytes": 107374182400,
+  "cpuset": "8-11,24-27",
+  "tap_index": 1,
+  "idle_suspend_s": 600,
+  "host_floor_bytes": 137438953472,
+  "memory_headroom_mib": 512,
+  "snapshot_memory_high_mib": 16384,
+  "io_weight": 100,
+  "resolvers": ["1.1.1.1", "9.9.9.9"]
+}

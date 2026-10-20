@@ -24,6 +24,30 @@ Configuration is a closed JSON object with these required fields:
   (use the root-trusted `/var/lib/motor-vm` bind view, not `/srv/build/vm`);
 - `admin_socket`, in a private directory writable by the host user.
 
+## Keys and enrollment
+
+`motor-host keygen --signing-key <path> --tls-cert <path> --tls-key <path>
+--host-id <id> --endpoint <public IPv4>:<port>` creates the raw 32-byte host
+signing seed and a self-signed Ed25519 TLS certificate and PKCS#8 key, each mode
+0600 and owned by the calling user (run it as the host user). It refuses before
+writing anything if any of the three files exists. `motor-host show-enrollment
+<config.json> --endpoint <public IPv4>:<port>` recomputes the facts from an
+existing config's files. Both print the broker's `register-host` arguments,
+`host_id`, `public_key_hex` (64 lowercase hex), `endpoint`,
+`endpoint_spki_sha256` (unpadded base64url SHA-256 of the certificate's DER
+SubjectPublicKeyInfo, computed as the hosted client's pin check does) and
+`platform` (`linux-x64`), one labelled line each, then the filled-in
+`register-host` line. Values outside the contract's grammar are refused: the
+endpoint must be a public IPv4 address with an explicit port. show-enrollment
+also requires the endpoint's port to be the listen port, a listen address of
+`0.0.0.0` or the endpoint's own address, no `fake_broker_url`, and a TLS key
+matching the certificate. `tests/it/enroll.rs` checks the output against an
+RFC 8032 seed and an OpenSSL-made certificate whose pin OpenSSL computed.
+
+`systemd/motor-host.service` runs the agent as the `motor-host` system user,
+after and requiring `motor-vm-helper.service`. `script/hosted-host/install.sh`
+installs it with the configs; see [docs/hosted-host.md](../../docs/hosted-host.md).
+
 The agent derives the guest address and gateway from the registered tap index.
 Guest hostnames use that index, and machine IDs derive from host, subject and VM
 identity. Fresh starts receive `attach_tenant`; restored guests receive only

@@ -40,7 +40,19 @@ to the tenant-image builder, not this provisioning tool.
 
 Provisioning checks **bytes** before allocating anything for the tenant: disk
 quota + suspend RAM + host floor, plus RAM and the temporary placeholder when a
-new size base is needed. It builds `base/<ceiling>-<ram>/{base.vmstate,base.memory}`
+new size base is needed. On a host that also runs `motor-runner serve`, it reads
+each runner's live arguments (`--free-space-floor-bytes` and `--state-root`,
+defaulting as the runner does). For every runner whose state shares the
+filesystem of `/var/lib/motor-vm`, it refuses unless the free space left after
+the disk, the suspend snapshot and any new size base stays at or above that
+runner's refusal floor, below which the runner refuses jobs. The refusal reads
+"would leave X GiB free ... below motor-runner pid N's refusal floor Y GiB".
+The runner's higher eviction threshold is not reserved: evicting idle
+workspaces there is the runner's normal way to free space. Provisioning also refuses if a
+runner's arguments cannot be parsed, or if its state root comes from an
+environment it cannot read
+(`test_runner_on_the_same_filesystem_keeps_its_refusal_floor_before_any_mutation`).
+It builds `base/<ceiling>-<ram>/{base.vmstate,base.memory}`
 only if absent. It fully allocates a new disk (never reflinks it), formats XFS
 with reflink enabled, and mounts it only during initial creation of
 `/tenant/runner-args`. It writes generation zero, a root-only helper registry

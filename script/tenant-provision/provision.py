@@ -120,6 +120,86 @@ def trusted(path):
             raise ValueError(f"path must be root-owned, non-writable and not a symlink: {p}")
 
 
+# motor-runner's default free-space floor (crates/motor-runner/src/engine.rs):
+# below it the runner refuses jobs. Between it and the runner's higher eviction
+# threshold the runner deletes idle workspaces and caches by design; nothing
+# fails there.
+RUNNER_DEFAULT_FLOOR = 128 * 1024**3
+# The runner's options that take no value; every other option takes one.
+RUNNER_FLAGS = {"--tenant-vm", "--boat-profile"}
+
+
+def runner_processes(proc=Path("/proc")):
+    """(pid, argv, environment) of every live `motor-runner serve` on this host.
+
+    A runner whose arguments or environment cannot be read is still returned,
+    with None in place of what was unreadable, so the caller fails closed."""
+    found = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0")[:-1]]
+        except OSError:
+            continue  # exited, or a kernel thread
+        name = os.path.basename(argv[0]) if argv else ""
+        # deploy.sh installs instance binaries as motor-runner-<instance>; serve
+        # is the default operation only when no operation is named.
+        serving = argv[1:2] == ["serve"] or (name == "motor-runner" and len(argv) == 1)
+        if not (name == "motor-runner" or name.startswith("motor-runner-")) or not serving:
+            continue
+        try:
+            pairs = (entry / "environ").read_bytes().split(b"\0")
+            environ = dict(p.decode(errors="replace").split("=", 1) for p in pairs if b"=" in p)
+        except OSError:
+            environ = None
+        found.append((int(entry.name), argv, environ))
+    return found
+
+
+def runner_floor(argv, environ):
+    """(state root, refusal floor bytes) of one runner, from its argv."""
+    options = {}
+    rest = argv[2:]
+    while rest:
+        if rest[0] in RUNNER_FLAGS:
+            rest = rest[1:]
+            continue
+        if len(rest) < 2:
+            raise ValueError(f"cannot parse motor-runner arguments: {argv}")
+        options[rest[0]] = rest[1]
+        rest = rest[2:]
+    floor = int(options.get("--free-space-floor-bytes", RUNNER_DEFAULT_FLOOR))
+    if "--state-root" in options:
+        return Path(options["--state-root"]), floor
+    if environ is None or not (environ.get("XDG_DATA_HOME") or environ.get("HOME")):
+        raise ValueError(f"cannot find the state root of motor-runner {argv}: its environment is unreadable")
+    data = Path(environ["XDG_DATA_HOME"]) if environ.get("XDG_DATA_HOME") else Path(environ["HOME"]) / ".local/share"
+    return data / "cortexkit/motor-runner", floor
+
+
+def device(path):
+    """Filesystem of the nearest existing ancestor of path."""
+    for p in [path, *path.parents]:
+        try:
+            return p.stat().st_dev
+        except FileNotFoundError:
+            continue
+    raise ValueError(f"no existing ancestor of {path}")
+
+
+def runner_reserve(root, runners):
+    """(floor, pid) of the motor-runner with the highest refusal floor whose state
+    shares root's filesystem, or (0, None). A tenant must never push free space
+    there below it: that runner would refuse every job."""
+    reserve, owner = 0, None
+    for pid, argv, environ in runners:
+        state, floor = runner_floor(argv, environ)
+        if device(state) == device(root) and floor > reserve:
+            reserve, owner = floor, pid
+    return reserve, owner
+
+
 class HTTP(http.client.HTTPConnection):
     def __init__(self, path, timeout=300):
         super().__init__("localhost", timeout=timeout)
@@ -420,7 +500,7 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
-def provision(c, make_base=build_base, execute=run, stage=None):
+def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     home = ROOT / "tenants" / c["tenant"]
     image = ROOT / "tenant-images" / c["image_version"]
     base = base_path(c, image)
@@ -451,8 +531,21 @@ def provision(c, make_base=build_base, execute=run, stage=None):
     needed = c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576 + c["host_floor_bytes"]
     if not base.exists():
         needed += c["guest_ram_mib"] * 1048576 + 512 * 1048576
-    if shutil.disk_usage(ROOT).free < needed:
+    free = shutil.disk_usage(ROOT).free
+    if free < needed:
         raise ValueError("insufficient host free bytes")
+    # On a host that also runs motor-runner, the bytes this tenant can consume
+    # (its disk, a suspend snapshot and any new size base) must leave free space
+    # at or above that runner's refusal floor. Between the floor and its
+    # eviction threshold the runner evicts idle workspaces, which is expected.
+    consumed = needed - c["host_floor_bytes"]
+    reserve, pid = runner_reserve(ROOT, runner_processes() if runners is None else runners)
+    # The free figure is rounded down, so a shortfall never prints as equal.
+    if reserve and free - consumed < reserve:
+        raise ValueError(
+            f"tenant would leave {(free - consumed) * 10 // 1024**3 / 10:.1f} GiB free on {ROOT} ({free} free, tenant needs {consumed} bytes), "
+            f"below motor-runner pid {pid}'s refusal floor {reserve / 1024**3:.1f} GiB; "
+            "lower disk_quota_bytes or free space first")
     if not base.exists():
         make_base(c, image, base)
     home.mkdir(mode=0o700)

@@ -15,6 +15,8 @@ spec = importlib.util.spec_from_file_location("provision", Path(__file__).with_n
 assert spec is not None and spec.loader is not None
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
+# Kept before setUp replaces it, for the one test that reads a fake /proc.
+REAL_RUNNER_PROCESSES = p.runner_processes
 
 
 def config():
@@ -27,7 +29,10 @@ class ProvisionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", BINDINGS=self.root / "host/tenants.json")
+        # runner_processes would read this machine's real /proc; tests that need
+        # a runner pass one explicitly.
+        self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", BINDINGS=self.root / "host/tenants.json",
+                                         runner_processes=lambda: [])
         self.patch.start()
         for directory in [p.REGISTRY, p.BINDINGS.parent, p.ROOT / "tenants"]:
             directory.mkdir(parents=True)
@@ -105,6 +110,72 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-a": {"tenant": "a", "sub": c["sub"]}})
         self.assertEqual(records["runner-args"], p.runner_args(c))
         self.assertEqual((self.root / "tenants/a/generation").read_text(), "0\n")
+
+    def test_runner_refusal_floor_comes_from_the_live_runner_arguments(self):
+        home = {"HOME": "/home/ubuntu"}
+        gib = 1024**3
+        cases = [
+            (["/home/ubuntu/.cargo/bin/motor-runner", "serve", "--instance", "main", "--max-weight", "80", "--tenant-vm"], 128 * gib),
+            (["motor-runner", "serve", "--free-space-floor-bytes", str(64 * gib)], 64 * gib),
+            # The eviction threshold is not the floor: below it nothing fails.
+            (["motor-runner-windows", "serve", "--free-space-floor-bytes", str(64 * gib), "--free-space-eviction-bytes", str(100 * gib)], 64 * gib),
+            (["motor-runner", "serve", "--free-space-floor-bytes", "0"], 0),
+        ]
+        for argv, floor in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(p.runner_floor(argv, home), (Path("/home/ubuntu/.local/share/cortexkit/motor-runner"), floor))
+        self.assertEqual(p.runner_floor(["motor-runner", "serve", "--state-root", "/srv/build/state"], None)[0], Path("/srv/build/state"))
+        self.assertEqual(p.runner_floor(["motor-runner", "serve"], {"XDG_DATA_HOME": "/data", "HOME": "/h"})[0], Path("/data/cortexkit/motor-runner"))
+        for argv, environ in ((["motor-runner", "serve"], None), (["motor-runner", "serve", "--max-weight"], home)):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                p.runner_floor(argv, environ)
+
+    def test_runner_processes_finds_serving_runners_only(self):
+        proc = self.root / "proc"
+        for pid, argv in ((10, ["/home/ubuntu/.cargo/bin/motor-runner", "serve", "--instance", "main"]),
+                          (11, ["/home/ubuntu/.cargo/bin/motor-runner-windows", "serve", "--instance", "windows"]),
+                          (12, ["/home/ubuntu/.cargo/bin/motor-runner", "drain", "--instance", "main"]),
+                          (13, ["/usr/local/libexec/motor-runner-permissions", "physical-chmod"]),
+                          (14, ["motor-runner"]), (15, ["bash"])):
+            (proc / str(pid)).mkdir(parents=True)
+            (proc / str(pid) / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+            (proc / str(pid) / "environ").write_bytes(b"HOME=/home/ubuntu\0")
+        (proc / "self").mkdir()
+        found = sorted(REAL_RUNNER_PROCESSES(proc))
+        self.assertEqual([pid for pid, _, _ in found], [10, 11, 14])
+        self.assertEqual(found[0][2], {"HOME": "/home/ubuntu"})
+
+    def test_runner_on_the_same_filesystem_keeps_its_refusal_floor_before_any_mutation(self):
+        c = config()
+        (p.base_path(c, self.image)).mkdir(parents=True)
+        for name in ("base.vmstate", "base.memory"):
+            (p.base_path(c, self.image) / name).write_bytes(b"x")
+        consumed = c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576
+        state = self.root / "runner-state"
+        floor = 128 * 1024**3
+        # The lower-floor runner does not decide; the highest floor on the
+        # filesystem does, and the refusal names its pid.
+        runner = [(4241, ["motor-runner", "serve", "--state-root", str(state), "--free-space-floor-bytes", str(floor // 2)], None),
+                  (4242, ["motor-runner", "serve", "--state-root", str(state)], None)]
+        def allocate(*args):
+            if args[0] == "fallocate":
+                args[-1].write_bytes(b"allocated")
+        execute = mock.Mock(side_effect=allocate)
+        free = type("Usage", (), {"free": consumed + floor - 1})
+        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
+                self.assertRaisesRegex(ValueError, r"would leave 127\.9 GiB free .* below motor-runner pid 4242's refusal floor 128\.0 GiB"):
+            p.provision(c, execute=execute, runners=runner)
+        execute.assert_not_called()
+        self.assertFalse((p.ROOT / "tenants" / c["tenant"]).exists())
+        # A runner whose state is on another filesystem does not count.
+        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
+                mock.patch.object(p, "device", side_effect=lambda path: 1 if path == state else 2):
+            p.provision(c, execute=execute, runners=runner)
+        execute.reset_mock()
+        c2 = dict(c, tenant="b", vm="vm-b", tap_index=2)
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": consumed + floor})):
+            p.provision(c2, execute=execute, runners=runner)
+        execute.assert_called()
 
     def test_existing_disk_is_never_overwritten(self):
         home = self.root / "tenants/a"

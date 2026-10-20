@@ -1,4 +1,5 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use motor_host::enroll;
 use motor_host::helper::Helper;
 use motor_host::journal::FileJournal;
 use motor_host::server::{admin_socket, serve, unix_ms, Runtime};
@@ -41,6 +42,11 @@ struct Binding {
 #[tokio::main]
 async fn main() -> Result<()> {
     motor_protocol::logging::init("[motor-host]")?;
+    match std::env::args().nth(1).as_deref() {
+        Some("keygen") => return keygen(std::env::args().skip(2).collect()),
+        Some("show-enrollment") => return show_enrollment(std::env::args().skip(2).collect()),
+        _ => {}
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--sandbox")
@@ -133,27 +139,7 @@ async fn main() -> Result<()> {
         startup.recover()
     })
     .await??;
-    use std::{
-        io::Read,
-        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    };
-    let mut signing_file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&config.host_signing_key)?;
-    let metadata = signing_file.metadata()?;
-    // SAFETY: geteuid has no arguments or preconditions.
-    ensure!(
-        metadata.is_file()
-            && metadata.permissions().mode() & 0o077 == 0
-            && metadata.uid() == unsafe { libc::geteuid() },
-        "host signing key must be a private, owned regular file"
-    );
-    let mut bytes = Vec::new();
-    signing_file.by_ref().take(33).read_to_end(&mut bytes)?;
-    let seed: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("host_signing_key must contain a 32-byte Ed25519 seed"))?;
+    let seed = enroll::read_signing_seed(&config.host_signing_key)?;
     let sender = runtime.clone();
     std::thread::spawn(move || {
         if motor_host::broker::run(sender, ed25519_dalek::SigningKey::from_bytes(&seed)).is_err() {
@@ -202,4 +188,74 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+const KEYGEN_USAGE: &str = "usage: motor-host keygen --signing-key <path> --tls-cert <path> \
+                            --tls-key <path> --host-id <id> --endpoint <public IPv4>:<port>";
+const SHOW_USAGE: &str =
+    "usage: motor-host show-enrollment <config.json> --endpoint <public IPv4>:<port>";
+
+/// Parses `--name value` pairs, refusing unknown, repeated or valueless flags.
+fn flags(args: &[String], names: &[&str], usage: &str) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let name = flag
+            .strip_prefix("--")
+            .filter(|name| names.contains(name))
+            .with_context(|| format!("unexpected argument {flag:?}\n{usage}"))?;
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} needs a value\n{usage}"))?;
+        if values.insert(name.to_owned(), value.clone()).is_some() {
+            bail!("{flag} given twice\n{usage}");
+        }
+    }
+    for name in names {
+        ensure!(values.contains_key(*name), "missing --{name}\n{usage}");
+    }
+    Ok(values)
+}
+
+fn keygen(args: Vec<String>) -> Result<()> {
+    let values = flags(
+        &args,
+        &["signing-key", "tls-cert", "tls-key", "host-id", "endpoint"],
+        KEYGEN_USAGE,
+    )?;
+    let paths = enroll::KeyPaths {
+        signing_key: values["signing-key"].clone().into(),
+        tls_certificate: values["tls-cert"].clone().into(),
+        tls_key: values["tls-key"].clone().into(),
+    };
+    let endpoint = enroll::parse_endpoint(&values["endpoint"])?;
+    print!(
+        "{}",
+        enroll::keygen(&paths, &values["host-id"], endpoint)?.render()
+    );
+    Ok(())
+}
+
+fn show_enrollment(args: Vec<String>) -> Result<()> {
+    let (path, rest) = args.split_first().context(SHOW_USAGE)?;
+    let values = flags(rest, &["endpoint"], SHOW_USAGE)?;
+    let config: Config = serde_json::from_reader(File::open(path)?)?;
+    ensure!(
+        config.fake_broker_url.is_none(),
+        "a config with fake_broker_url is qualification-only and cannot be enrolled"
+    );
+    let listen: std::net::SocketAddr = config
+        .listen
+        .parse()
+        .context("listen must be a socket address")?;
+    let enrollment = enroll::show(
+        &config.host_id,
+        &config.host_signing_key,
+        &config.certificate,
+        &config.private_key,
+        listen,
+        enroll::parse_endpoint(&values["endpoint"])?,
+    )?;
+    print!("{}", enrollment.render());
+    Ok(())
 }

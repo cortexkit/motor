@@ -100,16 +100,7 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT
 sudo -n systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
-# Reject additional firewall exceptions and non-loopback service listeners.
-# Local DNS/NTP and the DHCP client are OS plumbing, not inbound services.
 sudo -n ufw status numbered
-sudo -n ufw status | awk '/ALLOW IN/ && $1 != "22\/tcp" { bad=1 } END { exit bad }'
-sudo -n ss -H -lntup | awk '
-  { addr=$5; if (addr ~ /^127\./ || addr ~ /^\[::1\]:/) next;
-    if ($1 == "tcp" && addr ~ /:22$/) next;
-    if ($1 == "udp" && addr ~ /:68$/) next;
-    print "Unexpected listener: " $0; bad=1 }
-  END { exit bad }'
 
 export CARGO_HOME=/srv/build/cargo-home
 export RUSTUP_HOME="$HOME/.rustup"
@@ -153,7 +144,19 @@ node --version
 npm --version
 pnpm --version
 REMOTE
-# A second connection proves the keys-only policy did not lock out this client.
+# Reject additional firewall exceptions and non-loopback service listeners.
+# Local DNS/NTP and the DHCP client are OS plumbing, not inbound services.
+# The one named exception is a hosted-runners host agent's TLS port (IPv4 TCP,
+# ufw comment motor-host-agent), accepted only when RUNNER_HOST_AGENT_PORT
+# names it; inbound_policy.py documents the exact rule. This second connection
+# also proves the keys-only SSH policy did not lock out this client.
+policy_args=
+if [ -n "${RUNNER_HOST_AGENT_PORT:-}" ]; then
+  [[ "$RUNNER_HOST_AGENT_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "Invalid RUNNER_HOST_AGENT_PORT: $RUNNER_HOST_AGENT_PORT" >&2; exit 2; }
+  policy_args="--host-agent-port $RUNNER_HOST_AGENT_PORT"
+fi
+# shellcheck disable=SC2086 # policy_args is empty or two validated words.
+ssh -o BatchMode=yes -o ForwardAgent=no "$host" python3 - $policy_args < "$script_dir/inbound_policy.py"
 "$script_dir/sync.sh" "$root"
 # Some source copies provide a checksum-verified NATS fixture installer.
 # The motor repository has no NATS tests or installer; provision it only when
