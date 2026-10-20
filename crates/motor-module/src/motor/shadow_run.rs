@@ -51,7 +51,11 @@ impl Motor {
             );
             let result = tokio::select! {
                 _ = stop.changed() => Err(io::Error::other("motor shutdown")),
-                result = tokio::time::timeout(deadline, execution) => result.unwrap_or_else(|_| Err(io::Error::other("shadow deadline exceeded"))),
+                result = tokio::time::timeout(deadline, execution) => result.unwrap_or_else(|_| {
+                    tracing::warn!(job_id = %id, %shadow_id, request_timeout_s = request.timeout,
+                        deadline_s = deadline.as_secs(), "shadow deadline exceeded");
+                    Err(io::Error::other("shadow deadline exceeded"))
+                }),
             };
             let (terminal, failure) = match result {
                 Ok(terminal) => {
@@ -94,6 +98,7 @@ impl Motor {
                     shadow_id,
                     Some(&terminal),
                     booked.as_ref().map_or(0, |l| l.max_s),
+                    booked.is_some(),
                 )
                 .await;
             drop(channel);
@@ -182,7 +187,7 @@ impl Motor {
         match c.next().await? {
             Incoming::Frame(Frame::Accepted(_)) => {}
             Incoming::Frame(Frame::Refusal(refusal)) => {
-                return Ok(TerminalRecord::new(
+                let mut terminal = TerminalRecord::new(
                     id,
                     Outcome::RefusedBeforeStart {
                         reason: refusal.reason,
@@ -190,7 +195,9 @@ impl Motor {
                     0,
                     0,
                     0,
-                ))
+                );
+                terminal.refusal_detail = refusal.detail;
+                return Ok(terminal);
             }
             _ => return Err(io::Error::other("shadow admission lost")),
         }

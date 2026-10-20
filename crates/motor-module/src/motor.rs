@@ -1606,10 +1606,10 @@ impl Motor {
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
                     }
-                    terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     if !hosted {
                         self.shadows.terminal(id, &terminal);
                     }
+                    terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     if !self.pending(id)
                         && spill_watch
                             .as_ref()
@@ -2290,7 +2290,8 @@ fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
 }
 
 fn log_refusal(id: Uuid, refusal: &Refusal) {
-    tracing::info!(job_id = %id, reason = ?refusal.reason,
+    let detail = refusal.detail.as_deref().map(crate::shadow::detail_tail);
+    tracing::warn!(job_id = %id, reason = ?refusal.reason, refusal_detail = ?detail,
         retry_after_ms = refusal.retry_after_ms, "runner admission refused");
 }
 

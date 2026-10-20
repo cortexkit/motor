@@ -515,7 +515,7 @@ impl Backend for HostBackend {
             wrapper
         };
         let source = path.join("crates/prefrontal-build-slot/src/main.rs");
-        let mut wrapper = if source.exists() {
+        let mut wrapper = if config.shared_compile_cache() && source.exists() {
             #[cfg(target_os = "linux")]
             let source = if config.isolate_jobs {
                 // Uploaded Rust compiled as the daemon could use include_str!
@@ -606,6 +606,7 @@ impl Backend for HostBackend {
                             &r.tree_hash,
                             &r.repository_root,
                             config.tenant_vm,
+                            config.shared_compile_cache(),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
@@ -737,40 +738,7 @@ impl Backend for HostBackend {
             "CARGO_TARGET_DIR".to_string(),
             prepared.target.to_string_lossy().to_string(),
         );
-        if let Some(wrapper) = &prepared.wrapper {
-            env.insert(
-                "RUSTC_WRAPPER".to_string(),
-                wrapper.to_string_lossy().to_string(),
-            );
-        } else {
-            env.remove("RUSTC_WRAPPER");
-        }
-        #[cfg(target_os = "linux")]
-        if config.isolate_jobs
-            && (s.base
-                || std::path::Path::new(&r.workspace_key)
-                    .join("Cargo.toml")
-                    .is_file())
-        {
-            crate::compile_cache::reader_environment(&mut env, config.sccache_size_gib);
-            if s.base {
-                env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
-                env.insert("CARGO_INCREMENTAL".into(), "1".into());
-                env.insert(
-                    "SCCACHE_SERVER_UDS".into(),
-                    config.writer_sccache_server_uds(s.id),
-                );
-            }
-            if prepared.wrapper.is_none()
-                && (s.base
-                    || !crate::compile_cache::configured_wrapper(
-                        std::path::Path::new(&r.workspace_key),
-                        &prepared.cwd,
-                    )?)
-            {
-                env.insert("RUSTC_WRAPPER".into(), "sccache".into());
-            }
-        }
+        compile_cache_environment(config, s, prepared, &mut env)?;
         let env = env.into_iter().collect::<Vec<_>>();
         let launch = if config.isolate_jobs {
             let sandbox = prepared
@@ -910,6 +878,55 @@ impl Execution for platform::Launch {
     fn reap(&self) {
         self.reap()
     }
+}
+
+fn compile_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    prepared: &Prepared,
+    env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    if !config.shared_compile_cache() {
+        env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
+        return Ok(());
+    }
+    if let Some(wrapper) = &prepared.wrapper {
+        env.insert(
+            "RUSTC_WRAPPER".into(),
+            wrapper.to_string_lossy().into_owned(),
+        );
+    } else {
+        env.remove("RUSTC_WRAPPER");
+    }
+    #[cfg(target_os = "linux")]
+    if config.isolate_jobs
+        && (setup.base
+            || Path::new(&setup.request.workspace_key)
+                .join("Cargo.toml")
+                .is_file())
+    {
+        crate::compile_cache::reader_environment(env, config.sccache_size_gib);
+        if setup.base {
+            env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
+            env.insert("CARGO_INCREMENTAL".into(), "1".into());
+            env.insert(
+                "SCCACHE_SERVER_UDS".into(),
+                config.writer_sccache_server_uds(setup.id),
+            );
+        }
+        if prepared.wrapper.is_none()
+            && (setup.base
+                || !crate::compile_cache::configured_wrapper(
+                    Path::new(&setup.request.workspace_key),
+                    &prepared.cwd,
+                )?)
+        {
+            env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = setup;
+    Ok(())
 }
 
 // Preserve only the daemon context toolchains need. Request values are filtered

@@ -22,8 +22,15 @@ pub(crate) struct Boat {
     /// received a Run frame (the connection drops).
     pub strict_attach: Arc<AtomicBool>,
     pub hang_run: Arc<AtomicBool>,
+    pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
     _http: Http,
     _host: JoinHandle<()>,
+}
+#[derive(Clone)]
+pub(crate) struct RunRefusal {
+    pub reason: RefusalReason,
+    pub detail: String,
+    pub after_accept: bool,
 }
 impl Drop for Boat {
     fn drop(&mut self) {
@@ -44,6 +51,8 @@ impl Boat {
         let strict_attach = Arc::new(AtomicBool::new(false));
         let hang_run = Arc::new(AtomicBool::new(false));
         let hang = hang_run.clone();
+        let run_refusal = Arc::new(Mutex::new(None::<RunRefusal>));
+        let refusal = run_refusal.clone();
         let ran = Arc::new(Mutex::new(std::collections::HashSet::<Uuid>::new()));
         let run_count = runs.clone();
         let attach_count = attaches.clone();
@@ -54,6 +63,7 @@ impl Boat {
                 let attaches = attach_count.clone();
                 let strict = strict.clone();
                 let hang = hang.clone();
+                let refusal = refusal.clone();
                 let ran = ran.clone();
                 let frames = captured.clone();
                 tokio::spawn(async move {
@@ -132,6 +142,41 @@ impl Boat {
                                 if drop_run {
                                     return;
                                 }
+                                let refused = refusal.lock().unwrap().clone();
+                                if let Some(refused) = refused {
+                                    let reply = if refused.after_accept {
+                                        write_frame_async(
+                                            &mut socket,
+                                            &Frame::Accepted(Accepted::new(id, 0)),
+                                        )
+                                        .await
+                                        .unwrap();
+                                        Frame::Terminal(
+                                            TerminalRecord::new(
+                                                id,
+                                                Outcome::RefusedBeforeStart {
+                                                    reason: refused.reason,
+                                                },
+                                                0,
+                                                0,
+                                                0,
+                                            )
+                                            .with_refusal_detail(refused.detail),
+                                        )
+                                    } else {
+                                        let refusal = Refusal {
+                                            job_id: Some(id),
+                                            transfer_id: None,
+                                            reason: refused.reason,
+                                            disk_full: None,
+                                            retry_after_ms: None,
+                                            detail: Some(refused.detail),
+                                        };
+                                        Frame::Refusal(refusal)
+                                    };
+                                    write_frame_async(&mut socket, &reply).await.unwrap();
+                                    return;
+                                }
                                 write_frame_async(
                                     &mut socket,
                                     &Frame::Accepted(Accepted::new(id, 0)),
@@ -196,7 +241,7 @@ impl Boat {
             let mem_mib = match token_mem.load(Ordering::SeqCst) { 0 => motor_lease::memory_max_mib(request.vcpus), mib => mib };
             let claims=Claims {iss:motor_lease::ISSUER.into(),aud:"boat:test".into(),sub:"acct:test".into(),jti:id.clone(),iat:now,exp:now+120,vcpus:request.vcpus,mem_mib,platform:request.platform,net:request.net,placement:motor_lease::Placement {host:"boat:test".into(),vm:Some("test".into())},max_s:request.timeout_s,purpose,cnf:Confirmation{jkt:jwk.thumbprint().unwrap()}};
             let lease=serde_json::json!({"provider":"boat","ssh":{"endpoint":sshd.endpoint,"host_key":sshd.host_key,"user":sshd.user},"runner_port":port,"lease_id":id,"job_id":id,"placement":claims.placement,"job_token":motor_lease::sign_token(&claims,"test",&SigningKey::from_bytes(&[7;32])).unwrap(),"token_expires_at_ms":claims.exp*1000,"max_s":claims.max_s,"reserved_vcpu_ms":60000});
-            (200,lease)
+            (201,lease)
         }).await;
         let config = Config {
             runner_instance: "test".into(),
@@ -216,6 +261,7 @@ impl Boat {
             mem_mib,
             strict_attach,
             hang_run,
+            run_refusal,
             _http: http,
             _host: task,
         }

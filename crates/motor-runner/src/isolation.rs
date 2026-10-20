@@ -1655,6 +1655,7 @@ impl Sandbox {
             &tree,
             &workspace.to_string_lossy(),
             false,
+            true,
         )
     }
 
@@ -1672,6 +1673,7 @@ impl Sandbox {
         tree: &str,
         repository: &str,
         tenant_vm: bool,
+        shared_compile_cache: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -1687,6 +1689,7 @@ impl Sandbox {
             repository,
             false,
             tenant_vm,
+            shared_compile_cache,
         )
     }
 
@@ -1716,6 +1719,7 @@ impl Sandbox {
             &workspace.to_string_lossy(),
             true,
             false,
+            true,
         )
     }
 
@@ -1734,6 +1738,7 @@ impl Sandbox {
         repository: &str,
         writer: bool,
         tenant_vm: bool,
+        shared_compile_cache: bool,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -1824,7 +1829,8 @@ impl Sandbox {
         let hosts = runtime.0.join("hosts");
         fs::write(&hosts, format!("{JOB_HOSTS}{}", declared_hosts.concat()))?;
         let cargo = home.join("cargo");
-        let rust = workspace.join("Cargo.toml").is_file();
+        let cached_rust = shared_compile_cache && workspace.join("Cargo.toml").is_file();
+        let wrapper = wrapper.filter(|_| shared_compile_cache);
         let mut mount_destinations = vec![
             workspace.to_path_buf(),
             target.to_path_buf(),
@@ -1908,27 +1914,20 @@ impl Sandbox {
             bind(&host_home, &home)?,
             bind(&tmp, Path::new("/tmp"))?,
         ];
-        if rust {
-            if writer {
-                fs::create_dir_all(workspace.join("target"))?;
-                read_write.push(bind(target, &workspace.join("target"))?);
-                mount_destinations.push(workspace.join("target"));
-            }
-            read_write.push(bind(target, Path::new(crate::compile_cache::TARGET))?);
-            mount_destinations.push(PathBuf::from(crate::compile_cache::TARGET));
-            // Eviction may remove this root between setup and unit launch. An
-            // optional bind lets the job start and compile misses locally.
-            let cache = state.join("sccache/fleet");
-            if writer {
-                read_write.push(bind(&cache, Path::new(crate::compile_cache::CACHE))?);
-            } else {
-                read_only.push(format!(
-                    "-{}",
-                    bind(&cache, Path::new(crate::compile_cache::CACHE))?
-                ));
-            }
-            mount_destinations.push(PathBuf::from(crate::compile_cache::CACHE));
+        if cached_rust && writer {
+            fs::create_dir_all(workspace.join("target"))?;
+            read_write.push(bind(target, &workspace.join("target"))?);
+            mount_destinations.push(workspace.join("target"));
         }
+        compile_cache_mounts(
+            state,
+            target,
+            writer,
+            cached_rust,
+            &mut read_only,
+            &mut read_write,
+            &mut mount_destinations,
+        )?;
         read_only.push(bind(&hosts, Path::new("/etc/hosts"))?);
         mount_destinations.push(PathBuf::from("/etc/hosts"));
         read_only.push(bind(&output, Path::new("/motor-output"))?);
@@ -1960,11 +1959,11 @@ impl Sandbox {
             }
         }
         let tools = runtime.0.join("tools");
-        if rust || wrapper.is_some() {
+        if cached_rust || wrapper.is_some() {
             use std::os::unix::fs::PermissionsExt;
             fs::create_dir_all(&tools)?;
             fs::set_permissions(&tools, fs::Permissions::from_mode(0o755))?;
-            if rust {
+            if cached_rust {
                 let cache_wrapper = tools.join("sccache");
                 fs::copy(
                     prepare_cache_readiness_probe(state)?,
@@ -2011,7 +2010,7 @@ impl Sandbox {
             fs::write(copy.with_extension("root"), "/motor-slots")?;
             fs::write(
                 copy.with_extension("cache"),
-                if rust {
+                if cached_rust {
                     PathBuf::from("/motor-tools/sccache")
                 } else {
                     PathBuf::new()
@@ -2452,6 +2451,35 @@ impl Sandbox {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn compile_cache_mounts(
+    state: &Path,
+    target: &Path,
+    writer: bool,
+    enabled: bool,
+    read_only: &mut Vec<String>,
+    read_write: &mut Vec<String>,
+    destinations: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    read_write.push(bind(target, Path::new(crate::compile_cache::TARGET))?);
+    destinations.push(PathBuf::from(crate::compile_cache::TARGET));
+    // Eviction may remove this root between setup and unit launch. An
+    // optional bind lets the job start and compile misses locally.
+    let cache = state.join("sccache/fleet");
+    if writer {
+        read_write.push(bind(&cache, Path::new(crate::compile_cache::CACHE))?);
+    } else {
+        read_only.push(format!(
+            "-{}",
+            bind(&cache, Path::new(crate::compile_cache::CACHE))?
+        ));
+    }
+    destinations.push(PathBuf::from(crate::compile_cache::CACHE));
+    Ok(())
+}
 
 fn prepare_cache_readiness_probe(state: &Path) -> io::Result<PathBuf> {
     use fs2::FileExt;

@@ -2,6 +2,7 @@ import json
 import importlib.util
 import contextlib
 import io
+import errno
 from unittest.mock import patch, Mock
 from pathlib import Path
 import sys
@@ -135,6 +136,7 @@ class RunnerHostTests(unittest.TestCase):
         return {"user": "motor-job", "uid": 997, "interfaces": ["lo"],
                 "namespaces": {"net": "net:[2]", "pid": "pid:[1]", "mnt": "mnt:[2]"},
                 "private_shm": True, "shm_writable": True, "nproc": "8",
+                "execution_capabilities": {'checks': {'a_tmpdir_hardlink_exec': True, 'b_bin_sh': True, 'c_bun_shebang': True}},
                 "limits": {"memory.max": "15569256448", "cpu.max": "800000 100000", "pids.max": "4096"},
                 "provider_environment": {"ASCII_TOKEN": False, "BOAT_ID": False, "BOAT_CLI_TOKEN": False},
                 "status_security": {'NoNewPrivs':'1','CapEff':'0000000000000000','CapBnd':'0000000000000000'},
@@ -176,6 +178,47 @@ class RunnerHostTests(unittest.TestCase):
         self.assertNotEqual(host.PORT, 9443)
         compile(host.SNAPSHOT_HYGIENE, 'snapshot-hygiene', 'exec')
         compile(host.STORAGE_STATE, 'storage-state', 'exec')
+
+    def test_job_execution_probe_reports_hardlink_shell_and_bun_failures_separately(self):
+        namespace = {}
+        exec(host.EXEC_PROBE, namespace)
+        probe = namespace['execution_capabilities']
+        with tempfile.TemporaryDirectory() as directory:
+            bun = Path(directory)/'bun'
+            bun.write_text('#!/bin/sh\nprintf boat-bun-ok\n')
+            bun.chmod(0o755)
+            with patch.dict('os.environ', {'TMPDIR': directory}), patch('shutil.which', return_value=str(bun)):
+                result = probe()
+                self.assertEqual(result['failures'], [])
+                self.assertTrue(result['a_tmpdir']['hardlink']['same_inode'])
+                self.assertEqual(result['c_bun_shebang']['shebang'], '#!' + str(bun))
+                self.assertEqual(set(result['mounts']), {'TMPDIR', '/tmp', 'bun'})
+                for mount in result['mounts'].values():
+                    self.assertEqual(mount['mount']['exit_code'], 0)
+                    self.assertTrue(json.loads(mount['mount']['stdout'])['filesystems'][0]['options'])
+                with patch('os.link', side_effect=OSError(errno.EOPNOTSUPP, 'hard links unsupported')):
+                    result = probe()
+                self.assertEqual(result['failures'], ['a_tmpdir_hardlink_exec'])
+                self.assertEqual(result['a_tmpdir']['hardlink']['errno'], errno.EOPNOTSUPP)
+                run = namespace['subprocess'].run
+                def noexec(argv, **kwargs):
+                    if argv[0].startswith(directory):
+                        raise PermissionError(errno.EACCES, 'noexec mount')
+                    return run(argv, **kwargs)
+                with patch('subprocess.run', side_effect=noexec):
+                    result = probe()
+                self.assertEqual(result['failures'], ['a_tmpdir_hardlink_exec', 'c_bun_shebang'])
+                def missing_shell(argv, **kwargs):
+                    if argv[0] == '/bin/sh':
+                        raise FileNotFoundError(errno.ENOENT, '/bin/sh missing')
+                    return run(argv, **kwargs)
+                with patch('subprocess.run', side_effect=missing_shell):
+                    result = probe()
+                self.assertEqual(result['failures'], ['b_bin_sh'])
+            with patch.dict('os.environ', {'TMPDIR': directory}), patch('shutil.which', return_value='/' + 'x'*270):
+                result = probe()
+                self.assertEqual(result['failures'], ['c_bun_shebang'])
+                self.assertGreater(result['c_bun_shebang']['shebang_bytes'], 256)
 
     def test_prepared_digest_tracks_source_and_signed_package_inputs_not_processes(self):
         inventory = {'packages':'pkg\t1\n', 'apt_release_files':{'noble':{'date':'fixed','sha256':'abc'}}, 'processes':[1]}
