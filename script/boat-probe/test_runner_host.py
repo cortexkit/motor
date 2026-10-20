@@ -23,6 +23,48 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_idle_reclaim_seeds_missing_state_via_service_and_observes_reclaim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp, 'reclaim')
+            now = [1000.0]
+            def service(command, **kwargs):
+                if command[-1] == 'ascii-idle-reclaim.service':
+                    state.write_text('1 2 3 4 0 -900')
+            def pause(seconds):
+                now[0] += seconds
+                state.write_text(f'2 3 4 5 6 {int(now[0])}')
+            output = io.StringIO()
+            script = host.IDLE_RECLAIM.replace('/run/ascii-idle-reclaim', str(state))
+            with patch('time.monotonic', side_effect=lambda: now[0]), patch('time.sleep', side_effect=pause), \
+                 patch('subprocess.run', side_effect=service) as run, \
+                 patch('subprocess.check_output', return_value='Result=success\n'), contextlib.redirect_stdout(output):
+                exec(script, {})
+            data = json.loads(output.getvalue())
+            self.assertIsNone(data['before'])
+            self.assertEqual(data['seeded'], '1 2 3 4 0 -900')
+            self.assertEqual(data['seconds'], 420)
+            self.assertEqual([call.args[0][-1] for call in run.call_args_list],
+                             ['ascii-idle-reclaim.timer', 'ascii-idle-reclaim.service'])
+            self.assertTrue(host.idle_reclaim_checks(data))
+            self.assertFalse(host.idle_reclaim_checks(dict(data, after=None)))
+            self.assertFalse(host.idle_reclaim_checks(dict(data, after='2 3 4 5 6 999')))
+
+    def test_idle_reclaim_missing_state_times_out_without_false_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [1000.0]
+            def pause(seconds):
+                now[0] += seconds
+            output = io.StringIO()
+            script = host.IDLE_RECLAIM.replace('/run/ascii-idle-reclaim', str(Path(tmp, 'absent')))
+            with patch('time.monotonic', side_effect=lambda: now[0]), patch('time.sleep', side_effect=pause), \
+                 patch('subprocess.run'), patch('subprocess.check_output', return_value='Result=success\n'), \
+                 contextlib.redirect_stdout(output):
+                exec(script, {})
+            data = json.loads(output.getvalue())
+            self.assertEqual(data['seconds'], 1020)
+            self.assertIsNone(data['after'])
+            self.assertFalse(host.idle_reclaim_checks(data))
+
     def test_cleanup_replay_requires_visible_workspace_and_withdrawn_admission(self):
         result = {'workspace_visible': True, 'users_mounts': [], 'endpoint_ready': False}
         self.assertTrue(host.cleanup_replay_checks(result))

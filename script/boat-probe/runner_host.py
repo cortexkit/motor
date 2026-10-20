@@ -228,12 +228,30 @@ print(json.dumps(samples))
 IDLE_RECLAIM = r'''
 import json, pathlib, subprocess, time
 started = time.monotonic()
-before = pathlib.Path('/run/ascii-idle-reclaim').read_text()
-time.sleep(420)
-after = pathlib.Path('/run/ascii-idle-reclaim').read_text()
+state = pathlib.Path('/run/ascii-idle-reclaim')
+def read_state():
+    try:
+        return state.read_text()
+    except FileNotFoundError:
+        return None
+before = read_state()
+# Fresh clones may not have reached the timer's first five-minute invocation.
+# Seed counters through the real service, never by fabricating its state file.
+subprocess.run(['systemctl','start','ascii-idle-reclaim.timer'],check=True)
+subprocess.run(['systemctl','start','ascii-idle-reclaim.service'],check=True)
+seeded = read_state()
+while True:
+    time.sleep(30)
+    after = read_state()
+    fields = (after or '').split()
+    elapsed = time.monotonic() - started
+    reclaimed = len(fields) == 6 and int(fields[4]) >= 5 and int(fields[5]) >= int(started)
+    if (elapsed >= 420 and reclaimed) or elapsed >= 1020:
+        break
 unit = subprocess.check_output(['systemctl','show','ascii-idle-reclaim.service',
     '-p','ExecMainStartTimestampMonotonic','-p','Result'],text=True)
-print(json.dumps({'seconds':time.monotonic()-started, 'before':before, 'after':after, 'unit':unit}))
+print(json.dumps({'seconds':elapsed, 'started':started, 'before':before, 'seeded':seeded,
+    'after':after, 'unit':unit, 'reclaimed_during_idle':reclaimed}))
 '''
 
 # Run only in a disposable probe clone, after its real-job and resume phases.
@@ -256,6 +274,13 @@ print(json.dumps({'activation_code':activation.returncode, 'activation_stderr':a
 
 def cleanup_replay_checks(data):
     return data['workspace_visible'] and not data['users_mounts'] and not data['endpoint_ready']
+
+
+def idle_reclaim_checks(data):
+    fields = (data.get('after') or '').split()
+    return (data['seconds'] >= 420 and len(fields) == 6 and int(fields[4]) >= 5 and
+            int(fields[5]) >= int(data['started']) and data.get('reclaimed_during_idle') is True and
+            'Result=success' in data['unit'])
 
 
 def storage_timeline_checks(samples):
@@ -720,12 +745,9 @@ class RunnerHost:
                     jobs.append(('after_idle', NODE_CHECK))
                 for name, command in jobs:
                     if name == 'after_idle':
-                        idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=450)['stdout'])
+                        idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
                         record['idle_reclaim'] = idle
-                        fields = idle['after'].split()
-                        self.check(label + '.idle_reclaim_observed', idle['seconds'] >= 420 and
-                                   idle['before'] != idle['after'] and len(fields) == 6 and int(fields[4]) >= 5 and
-                                   'Result=success' in idle['unit'], idle)
+                        self.check(label + '.idle_reclaim_observed', idle_reclaim_checks(idle), idle)
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
