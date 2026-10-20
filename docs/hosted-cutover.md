@@ -12,7 +12,7 @@ test run does not establish a working tenant VM, a deployed broker or a complete
 ## Prerequisites
 
 - A registered host, provisioned tenant, working TLS endpoint and production
-  broker. The mirrored contract and vectors are under
+  broker. [hosted-host.md](hosted-host.md) provisions the host and tenant. The mirrored contract and vectors are under
   `crates/motor-lease/contracts/cloud/`, pinned to the CLOUD revision recorded in
   its manifest. Do not run production against the fake broker.
 - An account grant for ck-motor's outbound route to the claustrum vault. The
@@ -101,9 +101,15 @@ claiming real service or nonce-issuance qualification.
    - `vcpu_ceiling` equals that deployed `--max-weight`;
    - `cpuset` excludes the deployed Windows CPU set;
    - `guest_ram_mib` is at least `memory_max(vcpu_ceiling)` in MiB;
-   - `disk_quota_bytes` is at least 858993459200;
-   - `args_status` reports `sccache_size_gib: 200`, plus the expected owned roots,
-     free-space floor and maximum weight from `/tenant/runner-args`.
+   - `disk_quota_bytes` is sized for that host: the tenant disk, a suspend
+     snapshot and its size base must leave free space at or above the refusal
+     floor of every runner sharing the filesystem. `provision.py` refuses a disk
+     that would not ([hosted-host.md](hosted-host.md#sizes-beside-the-runner)).
+     A tenant on the runner's filesystem makes that runner evict idle
+     workspaces sooner; a dedicated disk for tenant storage avoids that;
+   - `args_status` reports `sccache_size_gib` of a quarter of the disk in GiB
+     (at most 200), plus the expected owned roots, free-space floor and maximum
+     weight from `/tenant/runner-args`.
    `memory_max(vcpus)` is `max(16 GiB, 3.5 GiB × vcpus)`. Do not substitute the
    smaller test-tenant values for production provisioning.
 3. Keep the host agent and tenant VM beside the existing SSH runner. Move caches

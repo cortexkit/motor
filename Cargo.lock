@@ -927,11 +927,13 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tracing",
  "uuid",
+ "x509-cert",
 ]
 
 [[package]]

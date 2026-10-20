@@ -1,0 +1,49 @@
+[Unit]
+Description=Motor hosted-runners host agent (TLS admission for tenant VMs)
+# Every tenant operation goes through the helper's socket, so the agent starts
+# after it and is stopped or restarted with it.
+After=network-online.target motor-vm-helper.service
+Wants=network-online.target
+Requires=motor-vm-helper.service
+
+[Service]
+Type=simple
+User=motor-host
+Group=motor-host
+ExecStart=/usr/local/bin/motor-host /etc/motor-host/host.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+UMask=0077
+
+# The admin socket lives in /run/motor-host, created mode 0700 for this user.
+RuntimeDirectory=motor-host
+RuntimeDirectoryMode=0700
+# The durable journal (journal_dir). It is the only other writable path.
+ReadWritePaths=/var/lib/motor-host
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# The listener port is above 1024 and the helper owns every privileged action.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Unix for the helper and admin sockets; IPv4/IPv6 for the listener and broker.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

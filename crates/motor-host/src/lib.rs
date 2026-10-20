@@ -2,6 +2,7 @@
 
 pub mod billing;
 pub mod broker;
+pub mod enroll;
 pub mod helper;
 pub mod journal;
 pub mod sandbox;

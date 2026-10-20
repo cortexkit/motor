@@ -131,7 +131,10 @@ script/runner/setup.sh
   reflink copy between them; it refuses if `/Users` already holds data;
 - sets a firewall that denies inbound traffic except SSH, and an SSH policy of
   keys only, no root login, no agent or TCP forwarding; it fails if any other
-  service listens on a non-loopback address;
+  inbound allow exists or any other service listens on a non-loopback address
+  (`script/runner/inbound_policy.py` is the check). The one named exception is
+  a hosted host's agent port, accepted only with `RUNNER_HOST_AGENT_PORT` set;
+  see [hosted-host.md](hosted-host.md#firewall);
 - enables security-only unattended upgrades;
 - installs pnpm 11.1.2 globally and writes `/srv/build/runner.env`;
 - finishes by running `script/runner/sync.sh`, which proves a second SSH

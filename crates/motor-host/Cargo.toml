@@ -12,11 +12,16 @@ motor-lease = { path = "../motor-lease" }
 motor-protocol = { path = "../motor-protocol" }
 motor-vm-helper = { path = "../motor-vm-helper" }
 rand = "0.8"
+# Generates the host's self-signed Ed25519 TLS certificate (`motor-host keygen`).
+rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
+# SPKI pin computation, matching the hosted client's verifier in motor-module.
+sha2 = "0.10"
+x509-cert = "0.2"
 tokio.workspace = true
 tracing.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
@@ -24,6 +29,5 @@ uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 cortexkit-test-support = "=0.1.10"
-rcgen = "0.13"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
