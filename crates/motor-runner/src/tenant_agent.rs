@@ -226,11 +226,21 @@ async fn forward_socket(
         if !expected {
             return Err(io::Error::other("unexpected runner agent reply"));
         }
-        let mut value = serde_json::to_value(reply)?;
-        value.as_object_mut().unwrap().remove("type");
+        let mut value = agent_reply_value(reply)?;
         value["ok"] = json!(true);
         return Ok(value);
     }
+}
+
+/// A runner reply as the JSON object the agent returns: the frame's own
+/// fields, without its `type` tag.
+fn agent_reply_value(reply: Frame) -> io::Result<Value> {
+    let mut value = serde_json::to_value(reply)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("runner reply is not a JSON object"))?
+        .remove("type");
+    Ok(value)
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -414,6 +424,24 @@ fn validate_identity(
     Ok(())
 }
 
+/// The VM's own name-service files once it takes the tenant's host name.
+///
+/// The VM's root namespace has no route to a public DNS server: only `net`
+/// jobs reach the internet, and each gets its own resolv.conf inside its own
+/// namespace. So the attach request's resolvers are not written here; a
+/// nameserver the VM cannot reach makes every lookup that misses /etc/hosts
+/// wait out resolver timeouts. sudo, for one, looks up the machine's host name,
+/// so /etc/hosts must map the new name or each privileged helper stalls.
+fn root_name_service_files(hostname: &str) -> [(&'static str, String); 2] {
+    [
+        ("/etc/resolv.conf", String::new()),
+        (
+            "/etc/hosts",
+            format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n"),
+        ),
+    ]
+}
+
 fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     let TenantAgentRequest::AttachTenant {
         generation,
@@ -445,11 +473,9 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
             "route", "replace", "default", "via", &gateway, "dev", "eth0",
         ],
     )?;
-    let resolv = resolvers
-        .iter()
-        .map(|ip| format!("nameserver {ip}\n"))
-        .collect::<String>();
-    fs::write("/etc/resolv.conf", resolv)?;
+    for (path, contents) in root_name_service_files(&hostname) {
+        fs::write(path, contents)?;
+    }
     command("hostname", &[&hostname])?;
     fs::write("/etc/hostname", format!("{hostname}\n"))?;
     fs::write("/etc/machine-id", format!("{machine_id}\n"))?;
@@ -686,7 +712,7 @@ fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
     }
     runner_socket::wait(
         socket,
-        std::time::Duration::from_secs(30),
+        motor_protocol::TENANT_RUNNER_READINESS_WAIT,
         runner_socket::main_pid,
     )
 }
@@ -804,6 +830,30 @@ mod tests {
         .is_err());
         assert!(seed_bytes(&URL_SAFE_NO_PAD.encode([1; 32])).is_ok());
         assert!(seed_bytes(&URL_SAFE_NO_PAD.encode([1; 31])).is_err());
+    }
+
+    #[test]
+    fn attach_keeps_resolvers_out_of_the_vm_and_maps_its_host_name_locally() {
+        let files = root_name_service_files("tenant-a");
+        let resolv = &files
+            .iter()
+            .find(|(path, _)| *path == "/etc/resolv.conf")
+            .unwrap()
+            .1;
+        assert!(!resolv.contains("nameserver"), "{resolv}");
+        let hosts = &files
+            .iter()
+            .find(|(path, _)| *path == "/etc/hosts")
+            .unwrap()
+            .1;
+        assert!(
+            hosts.lines().any(|line| line
+                .split_whitespace()
+                .skip(1)
+                .any(|name| name == "tenant-a")),
+            "{hosts}"
+        );
+        assert!(hosts.lines().any(|line| line == "127.0.0.1\tlocalhost"));
     }
 
     #[tokio::test]

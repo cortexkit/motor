@@ -2,6 +2,23 @@
 //! accepts them only on its host-CID-only vsock listeners.
 use crate::Uuid;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// How long the guest's tenant agent waits, after starting the tenant runner,
+/// for that runner to listen on its socket. Attach fails when this expires.
+pub const TENANT_RUNNER_READINESS_WAIT: Duration = Duration::from_secs(30);
+
+/// Room for the rest of a fresh attach around the readiness wait: setting the
+/// clock and network, mounting and laying out the tenant disk, binding tool
+/// directories, the reflink probe, and writing the reply.
+pub const TENANT_ATTACH_SETUP_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long the host waits for the guest's reply to a fresh attach. It must
+/// outlast the guest's own readiness wait, so that a runner that never becomes
+/// ready is reported by the guest's error instead of a host read timeout.
+pub const TENANT_ATTACH_READ_DEADLINE: Duration = Duration::from_secs(
+    TENANT_RUNNER_READINESS_WAIT.as_secs() + TENANT_ATTACH_SETUP_MARGIN.as_secs(),
+);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

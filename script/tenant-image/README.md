@@ -27,6 +27,11 @@ The other inputs are:
   `kernel-options.txt` requests built-in XFS (including reflink), overlayfs,
   ext4, virtio block/network/vsock and the systemd job-isolation prerequisites.
   The resolved configuration, not just the requested options, is checked.
+  All nftables inet reject variants and IPv4/IPv6 reject helpers are required
+  built-in: defconfig otherwise leaves reject expressions modular, which cannot
+  work with the locked, module-store-free guest. Counter, metadata, payload and
+  interval-set expressions are part of `NF_TABLES` itself in Linux 6.1; there is
+  no separate `NFT_COUNTER` option at this pin.
 - Debian trixie from the dated Debian snapshot in `versions.txt`. Packages,
   including Python 3, C/clang/lld, SQLite, mingw win32, binaryen and hivex, are
   resolved from that signed snapshot. Systemd must be at least 257 for
@@ -55,20 +60,43 @@ for a full build. No credentials or adjacent checkout are inputs.
 ## Operator build
 
 Full image builds require root on a **dedicated Linux x86_64 operator host**;
-do not run them through the unprivileged remote-job lane. The host needs
+do not run them through the unprivileged remote-job lane. First install and
+activate the [root-trusted VM storage mount](../../docs/linux-microvm.md#install).
+The default output root is `/var/lib/motor-vm/tenant-images`; do not use the
+`/srv/build/vm` source spelling for root-run operations. The host needs
 debootstrap with trixie support and current Debian archive signing keys,
 e2fsprogs, util-linux, Python 3, curl, xz, make, GCC 13.4.0 (`gcc-13`), flex,
-bison, bc, libssl-dev and libelf-dev. Allow at least 200 GiB of scratch space
-for the tool builds plus the 32 GiB rootfs. Cargo invocations within this build
+bison, bc, libssl-dev and libelf-dev. The build requires either an explicit
+first-build allocated-byte cap (`--build-budget-gib`) or a matching successful
+`disk-usage.json` (`--peak-profile`); there is no implicit scratch estimate.
+The free-space floor is 170 GiB. A first 64 GiB cap therefore needs 234 GiB free,
+not because the build is known to need 64 GiB, but because that is the operator's
+admitted limit until a peak is measured. Cargo invocations within this build
 are serial; `--jobs` caps each build's parallelism. Both Rust compiler-wrapper
 environment variables are explicitly cleared, including in the chroot.
 
 ```sh
 sudo python3 script/tenant-image/build.py build EXAMPLE_VERSION \
-  --runner /absolute/path/to/motor-runner --jobs 4
+  --runner /absolute/path/to/motor-runner --jobs 4 --build-budget-gib 64
 python3 script/tenant-image/build.py inventory \
-  /srv/build/vm/tenant-images/EXAMPLE_VERSION
+  /var/lib/motor-vm/tenant-images/EXAMPLE_VERSION
 ```
+
+The build logs checkpoints and writes `disk-usage.json` beside its artifacts on
+both success and ordinary failure, with periodic sampled peaks of allocated
+file blocks owned by this version (nominal one-second interval plus phase
+checkpoints). Sparse holes are not counted as 32 GiB of
+real use, hardlinks are deduplicated, symlinks/mounts are not traversed, and
+reflink sharing can conservatively overcount blocks. The minimum global free
+space is reported separately: activity by other jobs cannot masquerade as the
+build's allocated-byte peak. An in-progress profile is refreshed during the build
+but cannot admit another build. A complete successful matching profile admits
+its peak plus 25%, rounded up to GiB, plus 4 GiB; recipe, runner, input pins and
+job count must match. For example, a repeat build can replace the explicit cap
+with `--peak-profile /var/lib/motor-vm/tenant-images/PRIOR_VERSION/disk-usage.json`.
+The monitor stops only its active build process group on cap/floor/measurement
+failure and retains the failed version; SIGKILL or host loss can leave only the
+last in-progress sample, never a reusable successful profile.
 
 The version directory is reserved with an exclusive `mkdir` **before** checking
 the binary, downloading or building anything. Even a concurrent invocation
@@ -76,12 +104,21 @@ cannot overwrite a version. A failed build deliberately leaves its reserved
 directory and `.work` for diagnosis; `build.py inventory` rejects any directory
 that still contains `.work`. Before manually
 removing a failed version to retry, check that no mounts remain under `.work`.
-Never recursively delete a chroot with live bind mounts. Successful builders
-unmount first, remove scratch, then write `manifest.json` as their completion
-record. Existing completed versions must never be removed to rebuild in place.
+Never recursively delete a chroot with live bind mounts. The rootfs subprocess
+runs in a private mount namespace, with its /dev subtree private too. Cleanup
+parses that namespace's mountinfo and identifies stage descendants by directory
+`(st_dev, st_ino)` ancestry (including the same directory through another bind
+alias), not by a mountpoint pathname prefix. It performs blocking, non-lazy
+unmounts deepest first, including nested or stacked mounts. It refuses
+busy/unchanged mounts by name. The parent checks its own mountinfo before artifact promotion and again
+immediately before stage removal; a failed fence retains staging and publishes
+no manifest. Successful builders remove scratch, then write `manifest.json` as
+their completion record. `python3 build.py check-mounts RETAINED_VERSION` is the
+read-only mount fence to run before any manual disposal of an incomplete
+version. Existing completed versions must never be removed to rebuild in place.
 
 The build creates the following artifacts under the operator-host output root,
-`/srv/build/vm/tenant-images/<version>/`, where `<version>` is the chosen release name:
+`/var/lib/motor-vm/tenant-images/<version>/`, where `<version>` is the chosen release name:
 
 - `vmlinux`, `rootfs`: read-only files; rootfs is an ext4 **lower**, not the
   tenant's XFS data filesystem;
@@ -114,8 +151,22 @@ then listens on vsock. The rules use `eth0` (`net.ifnames=0`) instead of the
 host installer's physical-interface name. IPv4 forwarding is enabled, kernel
 module loading is disabled, and generic firewall/update/network services are
 masked; only the agent configures tenant networking. No SSH login is installed.
+The nft and tenant-agent units forward their own stdout/stderr to the serial
+console, so an nft startup failure remains visible even when it prevents the
+agent and opt-in qualification unit from starting. Static module-load directories
+and the legacy `/etc/modules` list are cleared and checked during image creation;
+even an empty `.conf` is removed because it can activate the loader through
+`ConditionDirectoryNotEmpty`. The loader is not masked or allowed to fail. Its
+own output also forwards to the console if it is unexpectedly activated.
 `systemd-remount-fs.service` is masked as well: the init script has already set
 up both roots, and the kernel's `ro` flag must not remount the RAM overlay read-only.
+
+The image installer uses one canonical agent-path list for both root:root mode 0755
+normalization and build-time component validation: /tenant, /Users, /home and
+the image CARGO_HOME/bin. Every ancestor is checked with the agent's real-directory,
+uid 0 and no-group/other-write rule. Debian's root:staff mode 2775 /usr/local defaults
+are not accepted as immutable tool inputs, even when a version probe runs fine.
+The checked path list is recorded in tools.json before the image can complete.
 
 The agent receives `CARGO_HOME=/usr/local/lib/motor/cargo` as the **immutable
 bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/tenant`. It
@@ -136,6 +187,7 @@ Portable checks (no root, no VM, no network):
 
 ```sh
 python3 -W error script/tenant-image/test_tenant_image.py
+python3 -W error script/tenant-image/test_build_storage.py
 bash -n script/tenant-image/build-kernel.sh script/tenant-image/build-rootfs.sh
 sh -n script/tenant-image/guest/motor-init
 ```
@@ -164,3 +216,210 @@ also run `/usr/local/libexec/hosted_image_check.py --tenant` inside the guest
 to probe XFS FICLONE between `/tenant/state` and both bound workspace roots.
 These live-guest checks require the dedicated operator host and must not be
 counted as passing when skipped.
+
+## Rebuilding guest boot policy
+
+A kernel-feature, module-load policy or guest-unit change requires a **new image
+version**, using the normal `build.py build NEW_VERSION --runner ...` path. Do
+not replace only the kernel or edit an existing completed rootfs in place: that
+would retain old guest-unit/module configuration and break the manifest's artifact
+hashes. Reuse the original verified runner binary when no runner code change is
+intended; the builder executes it inside the newly built userland as before.
+Set an explicit allocated-build-byte cap for the first rebuild, or supply a
+successful peak profile matching the recipe, runner, input pins and job count.
+After the build completes, `build.py inventory NEW_IMAGE` must verify artifact
+hashes and kernel requirements; `qualify.py --image NEW_IMAGE ...` must then run
+the real boot, guest checks, leased jobs, suspend/restore and teardown gates.
+`build.py check-kernel` rejects configurations with `NFT_REJECT` or its family
+companions set to `m`: those modules cannot be loaded in a guest that has no
+module store and locks module loading.
+
+## Operator qualification
+
+`qualify.py` is an operator-only lane for an already built image. Run it as root
+on the dedicated Linux KVM server, **not** through the remote-job runner. It
+refuses an existing helper socket, registered tenants, tenant jails, tenant taps,
+tenant firewall table or base-boot network namespaces. `/var/lib/motor-vm` must
+be a mount with no shared propagation peer, so child mounts cannot be replicated
+back through `/srv/build/vm`. Install `motor-vm-storage-private.service` alongside
+the bind unit using [the VM storage install steps](../../docs/linux-microvm.md#install);
+it runs `mount --make-rprivate` on that view. Before any VM the harness also
+runs `test_mount_alias_root.py` in a private namespace: real bind-alias mounts
+must be detected/refused and then removed by the inode-aware cleanup helper.
+That privileged check is mandatory, not counted as passing when unavailable.
+It will not stop or
+replace an installed helper. Stop here if the host already serves tenant VMs;
+use a dedicated qualification host instead. Ordinary non-VM fleet jobs need not
+be stopped, but schedule the snapshot window off peak.
+
+Build the current checkout's real host/helper/fake-broker binaries and a Linux
+runner **library test executable** first. The test executable is delivered to
+the guest; neither Cargo sources nor a new runner binary are installed over the
+image's runner. Build the test executable in the image's own Debian/GNU-libc
+userland with `build-guest-test.py`, rather than assuming the host's glibc is old
+enough. The locked `cortexkit-cow` dependency does not currently compile for
+musl, so a musl test build is not a preparation path. An incompatible or absent
+test executable is a **FAIL**, never a skip.
+
+The preparation tool mounts the original rootfs read-only under a disposable
+host overlay, binds this source checkout and the populated host Cargo registry
+read-only, and compiles offline with the image's Rust/C toolchains. Compiler
+wrappers and inherited environment are cleared. It lists the required test in
+that same chroot to verify the loader/library combination, saves the executable
+and provenance, and unmounts everything before removing the overlay. This is a
+trusted root build environment, not a sandbox for untrusted source. It does not
+run the isolation test there; the exact ignored test still runs inside the real
+VM during qualification. No dependency pin or lockfile change is needed.
+
+```sh
+BUILD="$PWD/target/tenant-qualification"
+mkdir -p "$BUILD"
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_TARGET_DIR="$BUILD" \
+  cargo build --locked -j4 -p motor-host -p motor-vm-helper -p motor-lease --bins
+IMAGE=/var/lib/motor-vm/tenant-images/IMAGE_VERSION
+PREP=/var/lib/motor-vm/qualification-prep/UNUSED_PREP_NAME
+sudo python3 script/tenant-image/build-guest-test.py --image "$IMAGE" \
+  --source "$PWD" --cargo-cache "${CARGO_HOME:-$HOME/.cargo}" --output "$PREP" --jobs 4
+# Select two host CPUs excluding any CPUs reserved for Windows jobs.
+sudo python3 script/tenant-image/qualify.py \
+  --image "$IMAGE" \
+  --bin-dir "$BUILD/debug" --runner-test-binary "$PREP/runner-tests" \
+  --cpuset 0-1 --results /var/lib/motor-vm/qualification/UNUSED_RUN_NAME
+```
+
+Prerequisites are Python 3.9+, systemd 257+ (including `systemd-debug-generator`
+and binary kernel credentials), unified delegated CPU/cpuset/memory/pids/I/O
+controllers, XFS with reflink, OpenSSL with Ed25519, Git, xfsprogs, util-linux,
+iproute2, nftables and the pinned Firecracker/jailer 1.17.0. No packages or host
+users are installed. The admission server runs as `nobody` by default; choose a
+different existing unprivileged account with `--host-user` if necessary.
+
+Budget, **not measured results**: allow 5–15 minutes after builds, approximately
+53 GiB peak incremental disk plus the delivered executable/logs, and about
+17 GiB host RAM. Builds can add 5–20 minutes and their own Cargo scratch. The
+chroot preparation requires 232 GiB free (170 GiB floor + 54 GiB qualification
+reserve + an 8 GiB build allowance), without copying the 32 GiB rootfs. Its target
+files, `runner-tests`, `cargo-artifacts.jsonl` and `provenance.json` remain under
+`--output`; remove them only after confirming preparation's cleanup succeeded.
+The qualification requires **224 GiB free on `/var/lib/motor-vm` after builds**: a 170 GiB floor
+plus a 54 GiB allocation allowance. It rechecks the floor plus snapshot bytes
+before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a fully allocated 20 GiB XFS
+disk, a 16 GiB size base and one 16 GiB suspend image. Snapshot `memory.high` is
+14 GiB only during the helper's paused snapshot window; I/O weight is 10.
+These settings are a qualification workload, not production capacity approval.
+
+The source release is never changed: an exclusive temporary image version
+hard-links its read-only kernel/rootfs and copies the manifest with boot-only
+extra arguments. Provisioning builds a new size base from `manifest.boot_args`.
+The systemd debug generator receives `motor-qualification.service` as a binary
+kernel credential and wants it only on this boot. Its kernel-command-line
+condition is a second opt-in fence. A boot-only drop-in sends the existing image
+check directly to ttyS0, avoiding journald prefixes on exact evidence lines.
+The unit waits for real tenant attachment, runs `hosted_image_check.py --tenant`,
+the name-service probe below, and the delivered
+`isolation::tests::hosted_job_cannot_open_vsock --ignored --exact` test as
+root, and later checks for failed guest units. There is no
+privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
+
+The name-service probe checks what once stalled tenant runner startup. Attach
+must not give the VM itself a nameserver (only `net` jobs get resolvers, inside
+their own namespaces), and `/etc/hosts` must map the tenant host name, because
+sudo looks that name up. With `nameserver 1.1.1.1`, which the VM cannot reach,
+temporarily in place, `getent ahosts <hostname>` and `sudo -n true` must each
+finish within 3 s. The runner unit's start to the attach completion marker must
+take under 10 s. The step passes only on the exact `NAME_SERVICE` line.
+
+The tool-tree probe then checks that runner startup copied nothing from
+`/usr/local/lib/motor/rustup` or `/usr/local/lib/motor/cargo` into the overlay
+upper directory, and that every entry there is root-owned, world-readable and
+without an extended ACL (the image build verifies the same, recorded as
+`world_readable_tool_trees` in `tools.json`). It prints
+`GUEST_TOOL_TREE_MEASUREMENT` evidence: entry and byte counts, stat-walk time,
+overlay metacopy setting, and a timed `setfacl` over a 32 MiB sample of the
+toolchain, extrapolated by bytes to the whole tree. The step passes only on the
+exact `TOOL_TREES` line.
+
+The harness copies `motor-vm-helper`, `motor-host` and `motor-fake-broker` into
+a fresh root-owned mode-0755 bin directory before invoking them. Its helper config is root-owned mode 0600.
+The legacy job-slot configuration still requires a loader even though this lane
+uses only persistent tenant operations; a regular mode 0755 copy of the system
+`true` program satisfies that startup input check without pointing at a system
+symlink. No legacy job VM is exercised or claimed. Firecracker/jailer remain the
+fixed, root-managed 1.17.0 installation. Startup reads the helper's unit state
+and journal, then sends the read-only `adopt` RPC (which observes the tenant
+without waking it) to prove the daemon is accepting requests, rather than merely
+waiting for a socket pathname. If an input fails the helper's root-owner,
+non-writable and no-symlink checks, the early-exit diagnostic names that input
+or ancestor with its uid/gid, mode and symlink status.
+
+The harness starts the real `motor-vm-helper` in a delegated transient unit and
+the real TLS `motor-host` admission server. A separate `motor-lease` fake broker
+issues a requester-bound lease for each job. The fake broker's seed is never
+passed to the host. TLS SPKI pinning, the challenge signature, the runner Hello,
+Git bundle upload, output frames, nonzero exit 23, second-job target path/inode
+and sentinel reuse are all checked. While waiting for any reply the harness
+reads past runner heartbeats, which can precede even the hello reply, within a
+600 s per-job deadline. The helper performs suspend/restore with
+its normal quiesce/freeze/thaw and durable-snapshot implementation; fallback to
+a fresh base fails qualification. A third leased job proves persistence after
+restore. This tests the production admission/launch path with a fake **control
+plane**, not a real broker deployment or a billing qualification.
+
+Every step prints PASS/FAIL and raw evidence; unattempted steps are FAIL. The
+guest checker's complete success lines must equal `qualify.py`'s `LIVE` and
+`TENANT` constants, including the parenthesized check lists. These are the
+literal lines printed by `guest/hosted_image_check.py`, not substring matches. Output, manifests and summary stay under
+`--results`, outside Cargo target directories; credentials are not logged.
+Teardown stops the guest through the helper before stopping its unit, removes
+only disposable qualification resources, and prints process/tap/firewall/mount/
+failed-unit evidence. Existing unrelated failed host units are reported as a
+baseline, not cleared. Cleanup errors fail qualification and identify retained
+paths; never recursively delete them while mounts or VMMs remain. Before removal,
+the harness archives only the host journal/outbox subtree (not signer seeds,
+TLS keys or broker credentials), both before stopping the host and after it
+stops; the full helper journal is captured after stop as well. Already
+unloaded units and missing owned files are treated as removed; access-denied,
+busy-mount and other real cleanup failures still fail the lane. Failed host
+units affect the teardown verdict only if this run created their exact names or
+their control-group path contains the exact tenant-id component. Unrelated new
+fleet failures are printed/archived, never reset or cleared. SIGINT and
+SIGTERM trigger teardown; SIGKILL or host loss cannot do so.
+
+Return `summary.json`, `raw.jsonl`, `console.log`, `base-console.log`, the
+host/fake-broker logs and the complete `base-boot/` directory. Base-boot evidence
+includes exact submitted API bodies and responses, the observed Firecracker VM
+configuration, separate VMM stderr, a Debug-level Firecracker log, flushed metrics,
+cgroup memory/CPU/I/O counters, and process status before and after cleanup. A
+host-issued SIGKILL is recorded separately from a VMM that already exited. Failure
+rows always include an exception type, nonempty message and traceback; captured
+subprocess failures retain their real exit status/stdout/stderr. The terminal
+prints bounded log tails while full artifacts remain on disk.
+
+Base boot retries only transport failures before the initial `CONNECT 54`
+handshake completes, for at most 60 seconds. Host guest-control diagnostics name
+the tenant operation, request/reply stage, blocking-fd status and elapsed read
+budget; a blocking attach read deadline is described as initialization waiting
+for runner readiness, not bare EAGAIN. The host's fresh-attach read deadline is
+`motor_protocol::TENANT_ATTACH_READ_DEADLINE`, derived from the guest's
+`TENANT_RUNNER_READINESS_WAIT` plus a setup margin, so the guest's own
+"timed out waiting for runner readiness" error arrives before the host gives up.
+The boot-only qualification payload also
+prints bounded runner-unit journal/MainPID/socket-peer snapshots during startup,
+and forwards the transient runner's own output to the console. These are
+diagnostics, not a substitute for the existing PID-bound readiness check.
+Firecracker can close such an early
+connection while the guest vsock device exists but its agent has not started.
+Once a guest control request is submitted, EOF or a refusal is fatal, not retried;
+a repeated prepare request could hide an unknown operation outcome. A readiness
+timeout names the last transport failure and whether the VMM was still running.
+**No live qualification result is claimed by the portable tests or by merely
+building this harness.**
+
+Portable harness tests:
+
+```sh
+python3 -W error script/tenant-image/test_qualify.py
+python3 -W error script/tenant-image/test_build_guest_test.py
+python3 -W error script/tenant-provision/test_provision.py
+```

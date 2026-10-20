@@ -10,8 +10,37 @@ use std::{
 static FROZEN: AtomicBool = AtomicBool::new(false);
 static DRAINED: AtomicBool = AtomicBool::new(false);
 
-fn idle(value: &Value) -> bool {
-    value["ok"] == true && value["queue_depth"] == 0 && value["running_jobs"] == 0
+/// Why the runner cannot be snapshotted now, or None when it is idle. The
+/// runner reports `running_jobs` as a list of jobs, not a count; anything
+/// missing or malformed counts as busy, so a snapshot never captures a job.
+fn busy(value: &Value) -> Option<String> {
+    if value["ok"] != true {
+        return Some(format!("runner status unavailable: {value}"));
+    }
+    let Some(queued) = value["queue_depth"].as_u64() else {
+        return Some("runner status has no queue_depth".into());
+    };
+    let Some(running) = value["running_jobs"].as_array() else {
+        return Some("runner status has no running_jobs list".into());
+    };
+    if queued == 0 && running.is_empty() {
+        return None;
+    }
+    let running: Vec<String> = running
+        .iter()
+        .map(|job| {
+            format!(
+                "{} running in {} (weight {})",
+                job["job_id"].as_str().unwrap_or("?"),
+                job["workspace_key"].as_str().unwrap_or("?"),
+                job["weight"]
+            )
+        })
+        .collect();
+    Some(format!(
+        "queue_depth={queued}; running_jobs=[{}]",
+        running.join(", ")
+    ))
 }
 fn mounted(path: &str) -> io::Result<bool> {
     Ok(fs::read_to_string("/proc/self/mountinfo")?
@@ -19,13 +48,15 @@ fn mounted(path: &str) -> io::Result<bool> {
         .any(|line| line.split_whitespace().nth(4) == Some(path)))
 }
 
-async fn check_and_drain<F, Fut>(mut control: F, drained: &AtomicBool) -> io::Result<bool>
+/// None once the runner is idle and admission is drained; otherwise what is
+/// still busy.
+async fn check_and_drain<F, Fut>(mut control: F, drained: &AtomicBool) -> io::Result<Option<String>>
 where
     F: FnMut(Frame) -> Fut,
     Fut: Future<Output = io::Result<Value>>,
 {
-    if !idle(&control(Frame::Status).await?) {
-        return Ok(false);
+    if let Some(reason) = busy(&control(Frame::Status).await?) {
+        return Ok(Some(reason));
     }
     control(Frame::Drain {
         deadline_s: 0,
@@ -35,7 +66,7 @@ where
     drained.store(true, Ordering::Release);
     // Admission and drain share the runner lock. This second read catches a job
     // admitted between the first status and closing admission, without waiting.
-    Ok(idle(&control(Frame::Status).await?))
+    Ok(busy(&control(Frame::Status).await?))
 }
 
 async fn command(program: &str, args: &[&str]) -> io::Result<()> {
@@ -70,8 +101,8 @@ pub(super) async fn prepare(kind: SnapshotKind) -> io::Result<Value> {
             command("sync", &[]).await?;
             return Ok(json!({"ok":true}));
         }
-        if !check_and_drain(super::forward, &DRAINED).await? {
-            return Ok(json!({"ok":false,"error":"snapshot_busy"}));
+        if let Some(reason) = check_and_drain(super::forward, &DRAINED).await? {
+            return Ok(json!({"ok":false,"error":format!("snapshot_busy: {reason}")}));
         }
         if !mounted("/tenant")? {
             return Err(io::Error::other("tenant filesystem is not mounted"));
@@ -120,22 +151,64 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn hosted_prepare_refuses_started_and_admitted_jobs_without_drain() {
-        for (queued, running) in [(1, 0), (0, 1), (1, 1)] {
+        let job = json!({"job_id":"01a156a8-dae7-77d3-9612-855938acf185","workspace_key":"/Users/q","weight":1});
+        for (queued, running) in [(1, vec![]), (0, vec![job.clone()]), (1, vec![job])] {
             let mut calls = vec![];
+            let busy_running = !running.is_empty();
             let result = check_and_drain(
                 |frame| {
                     calls.push(frame);
                     std::future::ready(Ok(
-                        json!({"ok":true,"queue_depth":queued,"running_jobs":running}),
+                        json!({"ok":true,"queue_depth":queued,"running_jobs":running.clone()}),
                     ))
                 },
                 &AtomicBool::new(false),
             )
             .await
-            .unwrap();
-            assert!(!result);
+            .unwrap()
+            .expect("busy runner must refuse");
+            assert!(
+                result.contains(&format!("queue_depth={queued}")),
+                "{result}"
+            );
+            assert_eq!(
+                result.contains(
+                    "01a156a8-dae7-77d3-9612-855938acf185 running in /Users/q (weight 1)"
+                ),
+                busy_running,
+                "{result}"
+            );
             assert_eq!(calls, vec![Frame::Status]);
         }
+    }
+    #[tokio::test]
+    async fn hosted_prepare_drains_an_idle_runner_as_the_runner_reports_it() {
+        // Build the status exactly as the agent receives it from a real idle
+        // runner, through the same conversion the agent's forwarder uses.
+        let status = || {
+            let mut value = super::super::agent_reply_value(Frame::StatusReply(
+                motor_protocol::RunnerStatusReply {
+                    status: motor_protocol::StatusReply::new(0, vec![], true, vec![], "rustc"),
+                    disk: None,
+                    health: None,
+                },
+            ))
+            .unwrap();
+            value["ok"] = json!(true);
+            value
+        };
+        let mut calls = vec![];
+        let result = check_and_drain(
+            |frame| {
+                calls.push(frame);
+                std::future::ready(Ok(status()))
+            },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(calls.len(), 3);
     }
     #[tokio::test]
     async fn hosted_prepare_rechecks_admission_race_after_bounded_drain() {
@@ -144,16 +217,16 @@ mod tests {
             |frame| {
                 calls.push(frame);
                 std::future::ready(Ok(if calls.len() == 3 {
-                    json!({"ok":true,"queue_depth":1,"running_jobs":0})
+                    json!({"ok":true,"queue_depth":1,"running_jobs":[]})
                 } else {
-                    json!({"ok":true,"queue_depth":0,"running_jobs":0})
+                    json!({"ok":true,"queue_depth":0,"running_jobs":[]})
                 }))
             },
             &AtomicBool::new(false),
         )
         .await
         .unwrap();
-        assert!(!result);
+        assert_eq!(result.as_deref(), Some("queue_depth=1; running_jobs=[]"));
         assert_eq!(
             calls,
             vec![
@@ -167,12 +240,14 @@ mod tests {
         );
     }
     #[test]
-    fn hosted_prepare_missing_status_fields_is_not_idle() {
+    fn hosted_prepare_missing_or_malformed_status_fields_are_busy() {
         for value in [
             json!({"ok":true}),
-            json!({"ok":false,"queue_depth":0,"running_jobs":0}),
+            json!({"ok":false,"queue_depth":0,"running_jobs":[]}),
+            // A count where the runner sends a list is not proof of idleness.
+            json!({"ok":true,"queue_depth":0,"running_jobs":0}),
         ] {
-            assert!(!idle(&value));
+            assert!(busy(&value).is_some(), "{value}");
         }
     }
     #[tokio::test]

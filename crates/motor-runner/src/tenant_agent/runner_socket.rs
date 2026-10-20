@@ -88,7 +88,8 @@ pub(super) fn wait(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "runner socket {} is not listening for the current {UNIT} MainPID",
+                    "timed out waiting for runner readiness after {} ms: runner socket {} is not listening for the current {UNIT} MainPID",
+                    timeout.as_millis(),
                     path.display()
                 ),
             ));
@@ -142,6 +143,12 @@ pub(super) mod tests {
         wait(&path, Duration::ZERO, || Ok(Some(pid))).unwrap();
         let error = wait(&path, Duration::ZERO, || Ok(None)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .starts_with("timed out waiting for runner readiness"),
+            "{error}"
+        );
         assert!(error.to_string().contains(path.to_str().unwrap()));
     }
 }

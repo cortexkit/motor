@@ -96,10 +96,21 @@ pub(crate) fn command(policy: Policy, paths: &[&Path]) -> io::Result<Command> {
             "permission repair requires absolute tree paths",
         ));
     }
-    let mut command = Command::new("/usr/bin/sudo");
+    // A root tenant runner has no sudo grant and no installed helper copy: it
+    // runs its own binary's physical-chmod directly, as it runs every other
+    // privileged helper. Everywhere else the fixed root-owned helper runs
+    // through the operator's narrow sudo rule.
+    let mut command = if crate::privilege::direct() {
+        let own = std::env::current_exe()?;
+        let mut command = Command::new(own);
+        command.env_clear();
+        command
+    } else {
+        let mut command = Command::new("/usr/bin/sudo");
+        command.arg("-n").arg(HELPER);
+        command
+    };
     command
-        .arg("-n")
-        .arg(HELPER)
         .args(["physical-chmod", policy.argument(), "--"])
         .args(paths);
     Ok(command)

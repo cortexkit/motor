@@ -119,6 +119,7 @@ pub(crate) enum Error {
     BrokerRefused,
     HostFull,
     Capacity,
+    InternalFailure,
     Connect,
     Broker,
     NoTimeout,
@@ -159,6 +160,7 @@ impl Error {
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull => "hosted_host_full",
             Self::Capacity => "hosted_capacity",
+            Self::InternalFailure => "hosted_internal_failure",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
             Self::NoTimeout => "hosted_no_timeout",
@@ -216,6 +218,7 @@ impl Error {
         match reason {
             "host_full" => Self::HostFull,
             "capacity" => Self::Capacity,
+            "internal_failure" => Self::InternalFailure,
             "expired" => Self::Expired,
             _ => Self::Auth,
         }

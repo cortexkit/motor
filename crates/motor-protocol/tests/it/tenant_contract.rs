@@ -92,3 +92,16 @@ fn tenant_snapshot_control_roundtrips_additively() {
     .is_err());
     assert!(serde_json::from_str::<TenantAgentRequest>(r#"{"op":"prepare_snapshot"}"#).is_err());
 }
+
+#[test]
+fn host_attach_deadline_outlasts_guest_runner_readiness_wait() {
+    // If the host gave up first, a slow runner start would surface as an
+    // anonymous host read timeout instead of the guest's readiness error.
+    let margin = TENANT_ATTACH_READ_DEADLINE
+        .checked_sub(TENANT_RUNNER_READINESS_WAIT)
+        .filter(|margin| !margin.is_zero());
+    assert!(
+        margin.is_some_and(|margin| margin >= std::time::Duration::from_secs(10)),
+        "host attach deadline {TENANT_ATTACH_READ_DEADLINE:?} must exceed the guest readiness wait {TENANT_RUNNER_READINESS_WAIT:?} by at least 10 s"
+    );
+}

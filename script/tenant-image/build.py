@@ -9,7 +9,10 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import signal
 import subprocess
+
+from build_storage import DiskMeter, FREE_FLOOR, GIB, assert_unmounted, choose_budget, read_mountinfo, unmount_tree
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -106,16 +109,25 @@ def kernel_env(pins, jobs):
                RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="")
 
 
-def build_artifacts(stage, pins, runner, jobs):
+def build_artifacts(stage, pins, runner, jobs, run=subprocess.run):
     if platform.system() != "Linux" or platform.machine() != "x86_64" or os.geteuid() != 0:
         raise ValueError("image builds need root on a dedicated Linux x86_64 operator host")
     stage_inputs(stage, pins, runner)
     env = kernel_env(pins, jobs)
-    subprocess.run(["bash", str(HERE / "build-kernel.sh"), str(stage / "kernel")], check=True, env=env)
-    subprocess.run(["bash", str(HERE / "build-rootfs.sh"), str(stage)], check=True, env=env)
+    run(["bash", str(HERE / "build-kernel.sh"), str(stage / "kernel")], check=True, env=env)
+    run(["unshare", "--mount", "--propagation", "private", "--", "bash", str(HERE / "build-rootfs.sh"), str(stage)], check=True, env=env)
 
 
-def build(version, output, versions, runner, jobs=4, builder=build_artifacts):
+def recipe_digest(pins, runner, jobs):
+    files = [HERE / name for name in ("build.py", "build_storage.py", "build-kernel.sh", "build-rootfs.sh", "install-guest.py", "kernel-options.txt")]
+    files.extend(path for path in (HERE / "guest").iterdir() if path.is_file())
+    recipe = dict(pins=pins, runner_sha256=digest(runner), jobs=jobs,
+                  sources={str(path.relative_to(HERE)): digest(path) for path in sorted(files)})
+    return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+
+
+def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
+          build_budget=None, peak_profile=None, free_floor=FREE_FLOOR, mountinfo_reader=read_mountinfo):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", version) or jobs < 1:
         raise ValueError("version must be one safe path component and jobs must be positive")
     output.mkdir(parents=True, exist_ok=True)
@@ -124,11 +136,25 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts):
     target.mkdir()
     stage = target / ".work"
     stage.mkdir()
+    meter = None
     try:
         shutil.copy2(versions, stage / "versions.txt")
         pins = load_versions(stage / "versions.txt")
-        builder(stage, pins, runner.resolve(), jobs)
+        recipe = recipe_digest(pins, runner, jobs)
+        budget, source = choose_budget(build_budget, peak_profile, recipe)
+        free = shutil.disk_usage(target).free
+        print(f"image storage preflight: free={free}, floor={free_floor}, admitted cap={budget}; {source}", flush=True)
+        if free < free_floor + budget:
+            raise ValueError(f"image build needs floor + admitted budget: {free_floor + budget} bytes, available {free}")
+        meter = DiskMeter(target, budget, recipe, floor=free_floor, reader=mountinfo_reader)
+        meter.start()
+        if builder is build_artifacts:
+            builder(stage, pins, runner.resolve(), jobs, run=meter.run)
+        else:
+            builder(stage, pins, runner.resolve(), jobs)
+        meter.checkpoint("artifacts built")
         check_kernel(stage / "kernel/kernel.config")
+        assert_unmounted(stage, mountinfo_reader)
         manifest = {
             "version": version, "versions": pins, "boot_args": BOOT_ARGS,
             "kernel_sha256": digest(stage / "kernel/vmlinux"),
@@ -140,7 +166,11 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts):
                              ("packages.txt", "packages.txt"), ("tools.json", "tools.json")):
             (stage / source).rename(target / name)
         shutil.copy2(stage / "versions.txt", target / "versions.txt")
-        # The rootfs builder must have unmounted its chroot before returning success.
+        meter.checkpoint("before stage removal")
+        meter.stop()
+        # Recheck immediately before recursive removal, even after a successful
+        # rootfs cleanup. Never traverse a late or stacked mount during deletion.
+        assert_unmounted(stage, mountinfo_reader)
         shutil.rmtree(stage)
         (target / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         for path in target.iterdir():
@@ -152,7 +182,14 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts):
             os.fsync(fd)
         finally:
             os.close(fd)
+        meter.finish("success")
     except BaseException:
+        (target / "manifest.json").unlink(missing_ok=True)
+        if meter is not None:
+            try:
+                meter.finish("failed")
+            except Exception as error:
+                print(f"storage measurement failure: {type(error).__name__}: {error}", flush=True)
         print(f"incomplete version retained at {target}; inspect mounts before removing it", flush=True)
         raise
     print(f"image build: {target} (kernel, rootfs, manifest, configuration and tool inventories)")
@@ -180,9 +217,12 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     create = subs.add_parser("build")
     create.add_argument("version")
-    create.add_argument("--output-root", type=Path, default=Path("/srv/build/vm/tenant-images"))
+    create.add_argument("--output-root", type=Path, default=Path("/var/lib/motor-vm/tenant-images"))
     create.add_argument("--runner", type=Path, required=True)
     create.add_argument("--jobs", type=int, default=4)
+    storage = create.add_mutually_exclusive_group(required=True)
+    storage.add_argument("--build-budget-gib", type=int, help="explicit first-build cap, not a measured requirement")
+    storage.add_argument("--peak-profile", type=Path, help="matching successful disk-usage.json; adds 25%% plus 4 GiB")
     for sub in (create, subs.add_parser("inventory")):
         sub.add_argument("--versions", type=Path, default=HERE / "versions.txt")
     subs.choices["inventory"].add_argument("image", type=Path)
@@ -191,9 +231,19 @@ def main():
     config.add_argument("output", type=Path)
     config.add_argument("--versions", type=Path, default=HERE / "versions.txt")
     config.add_argument("--jobs", type=int, default=4)
+    subs.add_parser("cleanup-mounts").add_argument("root", type=Path)
+    subs.add_parser("check-mounts").add_argument("root", type=Path)
     args = parser.parse_args()
     if args.command == "build":
-        build(args.version, args.output_root.resolve(), args.versions.resolve(), args.runner.resolve(), args.jobs)
+        def interrupted(signum, _frame):
+            raise RuntimeError(f"image build interrupted by signal {signum}")
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            build(args.version, args.output_root.resolve(), args.versions.resolve(), args.runner.resolve(), args.jobs,
+                  build_budget=args.build_budget_gib * GIB if args.build_budget_gib is not None else None,
+                  peak_profile=args.peak_profile)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
     elif args.command == "inventory":
         inventory(args.image, args.versions)
     elif args.command == "kernel-config":
@@ -201,6 +251,14 @@ def main():
         args.output.mkdir(parents=True)
         subprocess.run(["bash", str(HERE / "build-kernel.sh"), str(args.output.resolve()), "--config-only"],
                        check=True, env=kernel_env(pins, args.jobs))
+    elif args.command == "cleanup-mounts":
+        root = args.root.resolve()
+        if root.name != "root" or root.parent.name != ".work" or os.geteuid() != 0:
+            parser.error("internal cleanup requires root and VERSION/.work/root")
+        unmount_tree(root)
+    elif args.command == "check-mounts":
+        assert_unmounted(args.root.resolve())
+        print(f"stage mount fence: no mounts below {args.root.resolve()}")
     else:
         check_kernel(args.config)
 

@@ -40,6 +40,8 @@ pub fn unix_ms() -> u64 {
 }
 
 pub struct Runtime {
+    pub broker_endpoint: String,
+    pub jwks_url: String,
     pub host_id: String,
     pub host: Mutex<Host>,
     pub keys: RwLock<KeySet>,
@@ -53,12 +55,49 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn new(host_id: String, host: Host, control: Arc<dyn Control>) -> Arc<Self> {
-        Self::with_identity(host_id, host, control, None)
+        Self::with_broker(
+            host_id,
+            host,
+            control,
+            motor_lease::ISSUER.into(),
+            motor_lease::JWKS_URL.into(),
+        )
     }
+    /// A host that trusts tokens from `broker_endpoint`, whose keys are served
+    /// at `jwks_url`. Production uses the real broker; qualification points
+    /// this at a loopback fake broker.
+    pub fn with_broker(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        broker_endpoint: String,
+        jwks_url: String,
+    ) -> Arc<Self> {
+        Self::build(host_id, host, control, broker_endpoint, jwks_url, None)
+    }
+    /// An in-sandbox endpoint for the real broker that reads its sandbox
+    /// identity fresh for each connection.
     pub(crate) fn with_identity(
         host_id: String,
         host: Host,
         control: Arc<dyn Control>,
+        sandbox_identity: Option<crate::sandbox::IdentityFile>,
+    ) -> Arc<Self> {
+        Self::build(
+            host_id,
+            host,
+            control,
+            motor_lease::ISSUER.into(),
+            motor_lease::JWKS_URL.into(),
+            sandbox_identity,
+        )
+    }
+    fn build(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        broker_endpoint: String,
+        jwks_url: String,
         sandbox_identity: Option<crate::sandbox::IdentityFile>,
     ) -> Arc<Self> {
         let tenant_operations = host
@@ -67,6 +106,8 @@ impl Runtime {
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
         Arc::new(Self {
+            broker_endpoint,
+            jwks_url,
             host_id,
             host: Mutex::new(host),
             keys: RwLock::new(KeySet::default()),
@@ -96,8 +137,9 @@ impl Runtime {
         let fetched = (|| -> Result<motor_lease::Jwks> {
             Ok(reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?
-                .get(motor_lease::JWKS_URL)
+                .get(&self.jwks_url)
                 .send()?
                 .error_for_status()?
                 .json()?)
@@ -212,10 +254,18 @@ impl Runtime {
             )
         };
         if !ready {
+            tracing::info!(tenant, initialized_generation = ?generation, "tenant_wake_started");
             let generation = self.control.wake(tenant, generation).map_err(|error| {
                 tracing::error!(tenant, detail=%error, "tenant_recovery_or_initialization_failed");
-                Error::Refused(Refusal::Capacity)
+                error
+                    .downcast_ref::<Error>()
+                    .and_then(|error| match error {
+                        Error::Refused(reason) => Some(Error::Refused(*reason)),
+                        _ => None,
+                    })
+                    .unwrap_or(Error::Refused(Refusal::InternalFailure))
             })?;
+            tracing::info!(tenant, generation, "tenant_wake_ready");
             let mut host = self.host.lock().expect("host lock");
             host.guest_ready(tenant, generation)?;
         }
@@ -250,7 +300,22 @@ impl Runtime {
                 update.generation >= requested.generation,
                 "quota generation regressed"
             );
-            self.control.quota(&update.tenant, update.vcpus)?;
+            tracing::info!(
+                tenant = update.tenant,
+                vcpus = update.vcpus,
+                generation = update.generation,
+                "tenant_quota_requested"
+            );
+            self.control.quota(&update.tenant, update.vcpus).map_err(|error| {
+                tracing::error!(tenant = update.tenant, vcpus = update.vcpus, detail = %error, "tenant_quota_failed");
+                Error::Refused(Refusal::InternalFailure)
+            })?;
+            tracing::info!(
+                tenant = update.tenant,
+                vcpus = update.vcpus,
+                generation = update.generation,
+                "tenant_quota_applied"
+            );
             self.host.lock().expect("host lock").quota_applied(&update);
         }
     }
@@ -568,7 +633,10 @@ impl Runtime {
         let _operation = operations.lock().expect("tenant operations lock");
         self.ensure_locked(&tenant)?;
         self.start_events(tenant.clone());
-        let mut stream = self.control.relay(&tenant, 52)?;
+        let mut stream = self.control.relay(&tenant, 52).map_err(|error| {
+            tracing::error!(tenant, port = 52, detail = %error, "tenant_job_relay_failed");
+            Error::Refused(Refusal::InternalFailure)
+        })?;
         {
             let mut host = self.host.lock().expect("host lock");
             ensure!(host.connection_live(id), "connection superseded");
@@ -794,9 +862,12 @@ where
                     match stream? {
                         Ok(stream) => break stream,
                         Err(error) => {
-                            if error.downcast_ref::<Error>().is_some_and(|e| matches!(e, Error::Refused(Refusal::Capacity))) {
-                                write_frame(&mut client,&json!({"type":"lease_refused","reason":"capacity"})).await?;
-                            }
+                            let reason = error.downcast_ref::<Error>().and_then(|error| match error {
+                                Error::Refused(reason) => Some(*reason),
+                                _ => None,
+                            }).unwrap_or(Refusal::InternalFailure);
+                            tracing::error!(jti = claims.jti, detail = %error, reason = reason.wire(), "tenant_delivery_failed");
+                            write_frame(&mut client,&json!({"type":"lease_refused","reason":reason.wire()})).await?;
                             return Err(error);
                         }
                     }

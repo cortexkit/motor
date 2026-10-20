@@ -23,6 +23,15 @@ use tokio::{
 
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+#[derive(Debug)]
+pub(crate) struct HostedHelloRefusal(pub(crate) String);
+impl std::fmt::Display for HostedHelloRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("host refused tenant runner initialization")
+    }
+}
+impl std::error::Error for HostedHelloRefusal {}
 type ConnectFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + 'a>>;
 
 pub trait Connector: Send + Sync {
@@ -499,35 +508,59 @@ impl Drop for Channel {
 
 impl Channel {
     /// Exchange hello once on a TLS connection already authenticated by its lease.
-    /// On failure the hosted client requests a fresh lease before reconnecting;
-    /// SSH's independent connection retry loop must not reuse the old token.
-    pub(crate) async fn from_hosted(pipe: Box<dyn Duplex>) -> io::Result<Self> {
-        let mut channel = Self::new(pipe);
-        channel
-            .send(Frame::Hello {
+    /// Preserve explicit host refusals before starting the generic frame reader;
+    /// retryable transport failures need a fresh lease, never SSH's retry loop.
+    pub(crate) async fn from_hosted(mut pipe: Box<dyn Duplex>) -> io::Result<Self> {
+        write_frame_async(
+            &mut pipe,
+            &Frame::Hello {
                 return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: true,
                 gate_jobs: true,
                 platforms: Vec::new(),
-            })
-            .await?;
-        match channel.next().await? {
-            Incoming::Frame(Frame::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                platforms,
-                gate_jobs,
-                return_paths,
-                ..
-            }) => {
-                channel.platforms = platforms;
-                channel.gate_jobs = gate_jobs;
-                channel.return_paths = return_paths;
-                channel.enable_heartbeats();
-                Ok(channel)
+            },
+        )
+        .await?;
+        pipe.flush().await?;
+        loop {
+            let length = pipe.read_u32().await? as usize;
+            if length > MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oversized hosted runner hello",
+                ));
             }
-            _ => Err(io::Error::other("invalid hosted runner hello")),
+            let mut bytes = vec![0; length];
+            pipe.read_exact(&mut bytes).await?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if value["type"] == "lease_refused" {
+                let reason = value["reason"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("invalid hosted refusal"))?;
+                return Err(io::Error::other(HostedHelloRefusal(reason.to_owned())));
+            }
+            let frame: Frame = serde_json::from_value(value).map_err(io::Error::other)?;
+            match frame {
+                Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    platforms,
+                    gate_jobs,
+                    return_paths,
+                    ..
+                } => {
+                    let mut channel = Self::new(pipe);
+                    channel.platforms = platforms;
+                    channel.gate_jobs = gate_jobs;
+                    channel.return_paths = return_paths;
+                    channel.enable_heartbeats();
+                    return Ok(channel);
+                }
+                Frame::Heartbeat { .. } => continue,
+                _ => return Err(io::Error::other("invalid hosted runner hello")),
+            }
         }
     }
     pub async fn open(connector: &dyn Connector, id: Uuid) -> Result<Self, RefusalReason> {

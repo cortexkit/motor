@@ -7,6 +7,16 @@ instance runs jobs.
 
 [docs/linux-microvm.md](../../docs/linux-microvm.md#motor-vm-helper) describes
 its host prerequisites, installation, protocol, restart behavior and tests.
+The helper's fixed storage root is `/var/lib/motor-vm`, the root-trusted bind
+view of `/srv/build/vm`. Install and enable the versioned
+`systemd/var-lib-motor\x2dvm.mount` unit and
+`systemd/motor-vm-storage-private.service` companion before starting the helper.
+The companion runs `mount --make-rprivate` after mounting, so mounts cannot
+propagate back through the source alias; the helper requires it. The install
+sequence is in the host prerequisites linked above. Root-owned data below an
+unprivileged-owned parent is not sufficient: all VM reads use the protected
+mounted path.
+
 # Persistent tenant operations
 
 The existing connection-owned job slots are unchanged. Tenant operations are
@@ -68,3 +78,17 @@ only objects for tenants whose registries were removed. Existing live counters
 and other tenants' chains are never flushed or recreated. Incomplete live object
 sets are refused rather than reset; stopping or suspending a VM does not disable
 its registered tenant or delete its cumulative counter.
+
+The optional root-managed registry flag `capture_console` defaults to false.
+When true, tenant VMM stdout appends to the fixed `console.log` beside that
+tenant's disk (root-only, no symlink following). This supports operator image
+qualification across base load and suspend/restore; no output path is accepted
+from helper RPC callers. Base-kernel-boot console capture is separately owned
+by the provisioner.
+
+Trust refusals name the exact offending input or ancestor, numeric uid/gid,
+permission mode and symlink status. Root ownership alone does not exempt a
+symlink: provision regular files in protected directories rather than relaxing
+the no-symlink policy. In particular a system utility reached through an
+alternatives/uutils symlink is not a suitable loader input without a regular,
+root-owned staged copy.

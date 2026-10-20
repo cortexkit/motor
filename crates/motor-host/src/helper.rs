@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const FRAME_LIMIT: usize = 1_048_576;
 
@@ -36,6 +36,7 @@ impl Helper {
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
         let bytes = serde_json::to_vec(&request)?;
+        tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], "helper_request");
         ensure!(bytes.len() < 4096, "helper request too large");
         stream.write_all(&bytes)?;
         stream.write_all(b"\n")?;
@@ -48,7 +49,13 @@ impl Helper {
             bytes.extend_from_slice(&buffer[..n]);
         }
         let reply: Value = serde_json::from_slice(&bytes)?;
-        ensure!(reply["result"] != "error", "helper refused request");
+        tracing::info!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], "helper_reply");
+        ensure!(
+            reply["result"] != "error",
+            "helper refused {}: {}",
+            request["op"],
+            reply["message"]
+        );
         Ok((reply, fds))
     }
 }
@@ -114,9 +121,10 @@ impl Control for Helper {
                 result => {
                     let detail: String = format!("{result:?}").chars().take(4096).collect();
                     tracing::error!(tenant, detail, "tenant_recovery_or_initialization_failed");
-                    return Err(
-                        crate::state::Error::Refused(crate::state::Refusal::Capacity).into(),
-                    );
+                    return Err(crate::state::Error::Refused(
+                        crate::state::Refusal::InternalFailure,
+                    ))
+                    .context(format!("guest tenant initialization failed: {detail}"));
                 }
             }
             if recovery {
@@ -140,17 +148,10 @@ impl Control for Helper {
         Ok(UnixStream::from(fds.remove(0)))
     }
     fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
-        let mut stream = self.relay(tenant, 54)?;
-        stream.set_read_timeout(Some(Duration::from_secs(
-            if request["recovery_required"] == true {
-                600
-            } else {
-                30
-            },
-        )))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        write_json(&mut stream, request)?;
-        read_json(&mut stream)
+        let stream = self
+            .relay(tenant, 54)
+            .with_context(|| format!("tenant {tenant} control port54 open relay"))?;
+        exchange_control(stream, tenant, request, control_read_deadline(request))
     }
     fn suspend(&self, tenant: &str) -> Result<()> {
         self.request(json!({"op":"suspend", "tenant":tenant}))?;
@@ -158,6 +159,81 @@ impl Control for Helper {
     }
     fn available_bytes(&self) -> Result<u64> {
         available_bytes(&self.storage)
+    }
+}
+
+/// How long the host waits for the guest's reply to a control request. A
+/// fresh attach starts the tenant runner, so its deadline is derived from the
+/// guest's runner-readiness wait; recovery also checks the tenant disk.
+pub fn control_read_deadline(request: &Value) -> Duration {
+    if request["recovery_required"] == true {
+        Duration::from_secs(600)
+    } else if request["op"] == "attach_tenant" {
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+pub(crate) fn exchange_control(
+    mut stream: UnixStream,
+    tenant: &str,
+    request: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let operation = request["op"].as_str().unwrap_or("unknown");
+    // SAFETY: the stream owns a live descriptor; F_GETFL takes no pointer.
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    ensure!(
+        flags >= 0,
+        "tenant {tenant} control {operation} F_GETFL failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let nonblocking = flags & libc::O_NONBLOCK != 0;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("tenant control set read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .context("tenant control set write timeout")?;
+    let started = Instant::now();
+    tracing::info!(
+        tenant,
+        operation,
+        port = 54,
+        nonblocking,
+        timeout_ms = timeout.as_millis() as u64,
+        "tenant_control_started"
+    );
+    write_json(&mut stream, request)
+        .with_context(|| format!("tenant {tenant} control {operation} port54 write request"))?;
+    let result = read_json(&mut stream);
+    match result {
+        Ok(reply) => {
+            tracing::info!(
+                tenant,
+                operation,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "tenant_control_replied"
+            );
+            Ok(reply)
+        }
+        Err(error) => {
+            let timed_out = !nonblocking
+                && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+                });
+            tracing::error!(tenant, operation, port=54, nonblocking, timed_out,
+                elapsed_ms=started.elapsed().as_millis() as u64, detail=%format!("{error:#}"), "tenant_control_read_failed");
+            if timed_out && operation == "attach_tenant" {
+                Err(error).context(format!("tenant initialization timed out waiting for runner readiness (tenant={tenant}, operation={operation}, port54, budget_ms={})", timeout.as_millis()))
+            } else {
+                Err(error).context(format!("tenant {tenant} control {operation} port54 read reply (nonblocking={nonblocking})"))
+            }
+        }
     }
 }
 
@@ -170,11 +246,15 @@ pub fn write_json(writer: &mut impl Write, frame: &Value) -> Result<()> {
 }
 pub fn read_json(reader: &mut impl Read) -> Result<Value> {
     let mut length = [0; 4];
-    reader.read_exact(&mut length)?;
+    reader
+        .read_exact(&mut length)
+        .context("read guest JSON frame header")?;
     let length = u32::from_be_bytes(length) as usize;
     ensure!(length > 0 && length <= FRAME_LIMIT, "invalid frame length");
     let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
+    reader
+        .read_exact(&mut bytes)
+        .context("read guest JSON frame body")?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 

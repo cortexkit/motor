@@ -277,6 +277,47 @@ fn service_uses_delegation_leaf_and_kills_the_whole_unit() {
 }
 
 #[test]
+fn storage_mount_keeps_vm_reads_below_root_owned_ancestors() {
+    let mount = include_str!("../systemd/var-lib-motor\\x2dvm.mount");
+    for setting in [
+        "What=/srv/build/vm",
+        "Where=/var/lib/motor-vm",
+        "Type=none",
+        "Options=bind",
+        "WantedBy=local-fs.target",
+    ] {
+        assert!(mount.lines().any(|line| line == setting), "{setting}");
+    }
+    let service = include_str!("../systemd/motor-vm-helper.service");
+    assert!(service
+        .lines()
+        .any(|line| line == "RequiresMountsFor=/var/lib/motor-vm"));
+    #[cfg(target_os = "linux")]
+    assert_eq!(crate::linux::BUILD_ROOT, "/var/lib/motor-vm");
+}
+
+#[test]
+fn storage_companion_stops_propagation_before_helper_start() {
+    let mount = include_str!("../systemd/var-lib-motor\\x2dvm.mount");
+    assert!(mount
+        .lines()
+        .any(|line| line == "Wants=motor-vm-storage-private.service"));
+    let private = include_str!("../systemd/motor-vm-storage-private.service");
+    for setting in [
+        "After=var-lib-motor\\x2dvm.mount",
+        "BindsTo=var-lib-motor\\x2dvm.mount",
+        "ExecStart=/usr/bin/mount --make-rprivate /var/lib/motor-vm",
+        "RemainAfterExit=yes",
+    ] {
+        assert!(private.lines().any(|line| line == setting), "{setting}");
+    }
+    let helper = include_str!("../systemd/motor-vm-helper.service");
+    assert!(helper
+        .lines()
+        .any(|line| line == "Requires=motor-vm-storage-private.service"));
+}
+
+#[test]
 fn config_refuses_uid_overlap_invalid_limits_and_paths() {
     let original: crate::config::Config =
         serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();

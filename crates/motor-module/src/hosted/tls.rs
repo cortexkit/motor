@@ -173,7 +173,15 @@ pub(super) async fn authenticate(
         .await
         .map_err(|_| Error::Connect)?;
     match read(&mut pipe).await.map_err(|_| Error::Connect)? {
-        Prelude::LeaseOk {} => Channel::from_hosted(pipe).await.map_err(|_| Error::Connect),
+        // A host that refuses tenant runner initialization says so before the
+        // runner's hello; keep its reason instead of reporting a lost connection.
+        Prelude::LeaseOk {} => Channel::from_hosted(pipe).await.map_err(|error| {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::transport::HostedHelloRefusal>())
+                .map(|refusal| Error::from_host(&refusal.0))
+                .unwrap_or(Error::Connect)
+        }),
         Prelude::LeaseRefused { reason } => Err(Error::from_host(&reason)),
         _ => Err(Error::Auth),
     }

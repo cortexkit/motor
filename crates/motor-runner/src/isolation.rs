@@ -19,6 +19,7 @@ use std::{
 use uuid::Uuid;
 
 mod hosts;
+mod readable;
 
 const USER: &str = "motor-job";
 pub(crate) const WRITER_USER: &str = "motor-cache";
@@ -127,10 +128,8 @@ pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
     // before another named-user grant can recompute that mask and reopen them.
     // Default ACLs must not leak access to newly created private runner files.
     checked(
-        Command::new("/usr/bin/sudo")
+        crate::privilege::command("/usr/bin/setfacl")
             .args([
-                "-n",
-                "/usr/bin/setfacl",
                 "-b",
                 "-k",
                 "-m",
@@ -160,8 +159,8 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 checked(
-                    Command::new("/usr/bin/sudo")
-                        .args(["-n", "/usr/bin/mkdir", "-p", "--"])
+                    crate::privilege::command("/usr/bin/mkdir")
+                        .args(["-p", "--"])
                         .arg(directory),
                 )?;
             }
@@ -178,14 +177,8 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
             ));
         }
         checked(
-            Command::new("/usr/bin/sudo")
-                .args([
-                    "-n",
-                    "/usr/bin/chown",
-                    "-P",
-                    &writer_cache_owner(account),
-                    "--",
-                ])
+            crate::privilege::command("/usr/bin/chown")
+                .args(["-P", &writer_cache_owner(account), "--"])
                 .arg(directory),
         )?;
         repair_writer_cache_path(directory, true)?;
@@ -195,14 +188,8 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
     prepare_private_state(state)?;
     for ancestor in state.ancestors() {
         checked(
-            Command::new("/usr/bin/sudo")
-                .args([
-                    "-n",
-                    "/usr/bin/setfacl",
-                    "-m",
-                    &format!("u:{USER}:--x,u:{WRITER_USER}:--x"),
-                    "--",
-                ])
+            crate::privilege::command("/usr/bin/setfacl")
+                .args(["-m", &format!("u:{USER}:--x,u:{WRITER_USER}:--x"), "--"])
                 .arg(ancestor),
         )?;
     }
@@ -215,15 +202,8 @@ fn writer_cache_owner(account: WriterAccount) -> String {
 
 pub(crate) fn repair_writer_cache_path(path: &Path, directory: bool) -> io::Result<()> {
     checked(
-        Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "/usr/bin/setfacl",
-                "-P",
-                "--set",
-                &writer_cache_acl(directory),
-                "--",
-            ])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-P", "--set", &writer_cache_acl(directory), "--"])
             .arg(path),
     )
 }
@@ -303,29 +283,31 @@ fn grant_read_only_tree_as(path: &Path, inherit: bool, user: &str) -> io::Result
         )));
     }
     let acl = format!("u:{user}:rX");
+    // Rewriting every ACL is the slow part of runner startup on a large tree,
+    // and on a tenant VM's overlay it copies the whole toolchain into memory.
+    // Skip it when the tree already gives this account read access.
+    if let Some(uid) = account_uid(user)? {
+        if readable::already_readable(path, uid, inherit) {
+            tracing::info!(path = %path.display(), user, inherit, "shared tree already readable; ACL grant skipped");
+            return Ok(());
+        }
+    }
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-m", &acl, "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-m", &acl, "--"])
             .arg(path),
     )?;
     if inherit {
         // Every existing directory receives a read-only default ACL. `-P` on
         // find is essential: registry trees may contain untrusted symlinks.
-        checked(Command::new("/usr/bin/find").arg("-P").arg(path).args([
-            "-type",
-            "d",
-            "-exec",
-            "/usr/bin/sudo",
-            "-n",
-            "/usr/bin/setfacl",
-            "-P",
-            "-d",
-            "-m",
-            &acl,
-            "--",
-            "{}",
-            "+",
-        ]))?;
+        checked(
+            Command::new("/usr/bin/find")
+                .arg("-P")
+                .arg(path)
+                .args(["-type", "d", "-exec"])
+                .args(crate::privilege::exec_words("/usr/bin/setfacl"))
+                .args(["-P", "-d", "-m", &acl, "--", "{}", "+"]),
+        )?;
     }
     Ok(())
 }
@@ -1083,9 +1065,7 @@ fn allow_low_ports(id: Uuid) -> io::Result<()> {
         .ok()
         .filter(|pid| *pid != 0)
         .ok_or_else(|| io::Error::other("job unit has no main process"))?;
-    let status = crate::systemd::output(Command::new("/usr/bin/sudo").args([
-        "-n",
-        "/usr/bin/nsenter",
+    let status = crate::systemd::output(crate::privilege::command("/usr/bin/nsenter").args([
         "--target",
         &pid.to_string(),
         "--net",
@@ -1189,8 +1169,8 @@ fn grant_paths(paths: &[&Path]) -> io::Result<()> {
     // restore daemon access only after the job has stopped.
     let acl = format!("u:{USER}:rwX");
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-k", "-m", &acl, "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-k", "-m", &acl, "--"])
             .args(paths),
     )
 }
@@ -1229,15 +1209,8 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
         return Ok(());
     }
     checked(
-        Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "/usr/bin/chown",
-                "-R",
-                "-P",
-                "motor-job:motor-job",
-                "--",
-            ])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-R", "-P", "motor-job:motor-job", "--"])
             .arg(path),
     )?;
     checked(&mut crate::permissions::command(
@@ -1278,20 +1251,20 @@ fn set_sandbox_directory_owner_modes(groups: &[(&[PathBuf], &str)]) -> io::Resul
         }
     }
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chown", "-h", "root:root", "--"])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-h", "root:root", "--"])
             .args(&paths),
     )?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-b", "-k", "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-b", "-k", "--"])
             .args(&paths),
     )?;
     for (paths, mode) in groups {
         if !paths.is_empty() {
             checked(
-                Command::new("/usr/bin/sudo")
-                    .args(["-n", "/usr/bin/chmod", mode, "--"])
+                crate::privilege::command("/usr/bin/chmod")
+                    .args([mode, "--"])
                     .args(*paths),
             )?;
         }
@@ -1367,20 +1340,13 @@ fn secure_root_owned_mount_ancestors(root: &Path, destination: &Path) -> io::Res
 
 fn prepare_job_home(path: &Path) -> io::Result<()> {
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-b", "-k", "--"])
             .arg(path),
     )?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "/usr/bin/chown",
-                "-R",
-                "-P",
-                "motor-job:motor-job",
-                "--",
-            ])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-R", "-P", "motor-job:motor-job", "--"])
             .arg(path),
     )?;
     checked(&mut crate::permissions::command(
@@ -1388,8 +1354,8 @@ fn prepare_job_home(path: &Path) -> io::Result<()> {
         &[path],
     )?)?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "0700", "--"])
+        crate::privilege::command("/usr/bin/chmod")
+            .args(["0700", "--"])
             .arg(path),
     )
 }
@@ -1403,13 +1369,13 @@ pub(crate) fn prepare_job_checkout_root(path: &Path) -> io::Result<()> {
         )));
     }
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chown", "motor-job:motor-job", "--"])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["motor-job:motor-job", "--"])
             .arg(path),
     )?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "0755", "--"])
+        crate::privilege::command("/usr/bin/chmod")
+            .args(["0755", "--"])
             .arg(path),
     )
 }
@@ -1428,13 +1394,13 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
         libc::getegid()
     });
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chown", &owner, "--"])
+        crate::privilege::command("/usr/bin/chown")
+            .args([&owner, "--"])
             .arg(path),
     )?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chmod", "0755", "--"])
+        crate::privilege::command("/usr/bin/chmod")
+            .args(["0755", "--"])
             .arg(path),
     )
 }
@@ -1449,8 +1415,8 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
         libc::getegid()
     });
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/chown", "-R", "-P", &owner, "--"])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-R", "-P", &owner, "--"])
             .arg(path),
     )?;
     checked(&mut crate::permissions::command(
@@ -1469,8 +1435,8 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     // cleanup or a reflink clone; it never follows job-created symlinks.
     let acl = format!("u:{}:rwX", unsafe { libc::geteuid() });
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-m", &acl, "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-m", &acl, "--"])
             .arg(path),
     )
 }
@@ -1493,20 +1459,13 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
         crate::test_cleanup::record_checkout_work("prepare_writer_tree", path);
     }
     checked(
-        Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "/usr/bin/chown",
-                "-R",
-                "-P",
-                &writer_cache_owner(account),
-                "--",
-            ])
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-R", "-P", &writer_cache_owner(account), "--"])
             .args(paths),
     )?;
     checked(
-        Command::new("/usr/bin/sudo")
-            .args(["-n", "/usr/bin/setfacl", "-R", "-P", "-b", "-k", "--"])
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-b", "-k", "--"])
             .args(paths),
     )?;
     checked(&mut crate::permissions::command(
@@ -2104,14 +2063,8 @@ impl Sandbox {
                 writer_grants.push(output.join(name));
             }
             checked(
-                Command::new("/usr/bin/sudo")
-                    .args([
-                        "-n",
-                        "/usr/bin/setfacl",
-                        "-m",
-                        &format!("u:{WRITER_USER}:rw"),
-                        "--",
-                    ])
+                crate::privilege::command("/usr/bin/setfacl")
+                    .args(["-m", &format!("u:{WRITER_USER}:rw"), "--"])
                     .args(writer_grants),
             )?;
         }
@@ -2198,7 +2151,7 @@ impl Sandbox {
         requested_vcpus: u32,
     ) -> io::Result<Command> {
         let user = self.user;
-        let mut cmd = Command::new("/usr/bin/sudo");
+        let mut cmd = crate::privilege::command("/usr/bin/systemd-run");
         let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR");
         // Output is a read-only directory with fixed writable file bind mounts,
         // so an exit file cannot be created or replaced by rename here. A normal
@@ -2216,8 +2169,6 @@ impl Sandbox {
             "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
         };
         cmd.args([
-            "-n",
-            "/usr/bin/systemd-run",
             "--wait",
             "--service-type=exec",
             // The job command is shell source, not systemd command-line syntax.

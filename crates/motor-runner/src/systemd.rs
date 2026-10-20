@@ -62,9 +62,7 @@ pub(crate) fn systemctl(args: &[&str], privileged: bool) -> io::Result<Output> {
         )
     });
     let mut command = if privileged && !query {
-        let mut command = Command::new("/usr/bin/sudo");
-        command.args(["-n", "/usr/bin/systemctl"]);
-        command
+        crate::privilege::command("/usr/bin/systemctl")
     } else {
         Command::new("/usr/bin/systemctl")
     };

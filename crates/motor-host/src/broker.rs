@@ -9,6 +9,43 @@ use motor_lease::Heartbeat;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 
+/// An explicit operator configuration can redirect broker transport, not token
+/// identity. Never expose fake-broker admission on a public listener.
+pub fn fake_broker_endpoint(url: &str, listen: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(url)?;
+    anyhow::ensure!(
+        parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]"))
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "fake broker must be an http loopback origin"
+    );
+    let listen: std::net::SocketAddr = listen.parse()?;
+    anyhow::ensure!(
+        listen.ip().is_loopback(),
+        "fake broker requires loopback listen"
+    );
+    Ok(parsed.as_str().trim_end_matches('/').into())
+}
+
+pub fn trusted_override_config(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(path.is_absolute(), "override config must be absolute");
+    for ancestor in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o022 == 0,
+            "override config and ancestors must be root-owned and not writable by others"
+        );
+    }
+    Ok(())
+}
+
 pub struct Sender {
     runtime: Arc<Runtime>,
     key: SigningKey,
@@ -27,12 +64,13 @@ impl Sender {
         Ok(Self {
             #[cfg(test)]
             heartbeats: Heartbeats::new(runtime.clone()),
+            endpoint: runtime.broker_endpoint.clone(),
             runtime,
             key,
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            endpoint: motor_lease::ISSUER.into(),
             in_flight: None,
         })
     }
@@ -203,4 +241,43 @@ fn mem_available_mib() -> Result<u64> {
         .context("MemAvailable value")?
         .parse()?;
     Ok(kb / 1024)
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::*;
+    #[test]
+    fn fake_broker_override_refuses_nonloopback_origins() {
+        for url in [
+            "http://example.com",
+            "https://127.0.0.1",
+            "http://127.0.0.2",
+            "http://localhost",
+            "http://127.0.0.1/x",
+            "http://127.0.0.1?x",
+            "http://u@127.0.0.1",
+        ] {
+            assert!(
+                fake_broker_endpoint(url, "127.0.0.1:1234").is_err(),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            fake_broker_endpoint("http://127.0.0.1:1234", "127.0.0.1:4321").unwrap(),
+            "http://127.0.0.1:1234"
+        );
+        assert_eq!(
+            fake_broker_endpoint("http://[::1]:1234", "[::1]:4321").unwrap(),
+            "http://[::1]:1234"
+        );
+    }
+    #[test]
+    fn fake_broker_override_refuses_public_listen() {
+        for listen in ["0.0.0.0:1234", "[::]:1234", "192.0.2.1:1234"] {
+            assert!(
+                fake_broker_endpoint("http://127.0.0.1:1234", listen).is_err(),
+                "{listen}"
+            );
+        }
+    }
 }

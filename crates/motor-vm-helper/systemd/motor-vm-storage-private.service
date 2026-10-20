@@ -1,0 +1,14 @@
+[Unit]
+Description=Stop mount propagation from the root-trusted Motor VM view
+Requires=var-lib-motor\x2dvm.mount
+After=var-lib-motor\x2dvm.mount
+BindsTo=var-lib-motor\x2dvm.mount
+Before=motor-vm-helper.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mount --make-rprivate /var/lib/motor-vm
+RemainAfterExit=yes
+
+[Install]
+WantedBy=var-lib-motor\x2dvm.mount
