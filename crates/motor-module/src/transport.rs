@@ -517,7 +517,7 @@ impl Channel {
                 return_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
-                default_branch_tip: true,
+                default_branch_tip: false,
                 gate_jobs: true,
                 platforms: Vec::new(),
             },
@@ -839,6 +839,36 @@ mod hello_tests {
                 Ok(Box::new(self.0.lock().unwrap().take().unwrap()) as Box<dyn Duplex>)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn hosted_hello_does_not_advertise_background_fill_support() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let server = async {
+            let hello = read_frame_async(&mut peer).await.unwrap().unwrap();
+            assert!(matches!(
+                hello,
+                Frame::Hello {
+                    default_branch_tip: false,
+                    ..
+                }
+            ));
+            write_frame_async(
+                &mut peer,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    started: true,
+                    default_branch_tip: true,
+                    gate_jobs: true,
+                    return_paths: false,
+                    platforms: vec!["linux".into()],
+                },
+            )
+            .await
+            .unwrap();
+        };
+        let (channel, ()) = tokio::join!(Channel::from_hosted(Box::new(client)), server);
+        assert!(channel.is_ok());
     }
 
     #[tokio::test]

@@ -16,6 +16,92 @@ fn writer_count(runner: &Runner) -> usize {
         .count()
 }
 
+async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) {
+    let f = Fixture::new();
+    let release = f.scratch.join("release-fill");
+    let mut config = f.config();
+    config.tenant_vm = tenant_vm;
+    config.boat_profile = boat_profile;
+    config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
+    config.max_weight = 4;
+    config.base_commands = vec![format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    )];
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("true");
+    let upload = f.spool(&runner, &request, &bytes);
+    let mut prepare = prepare_for(&request);
+    prepare.bundles = request.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    runner.prepare(&prepare, true).unwrap();
+    runner.tick().unwrap();
+    let fill = runner.core.inner.lock().unwrap().writer;
+    if let Some(id) = fill {
+        until(|| {
+            runner.core.inner.lock().unwrap().jobs[&id]
+                .started_ms
+                .is_some()
+        })
+        .await;
+    }
+    // The old scheduler starts a four-permit fill while idle and cannot admit
+    // this two-permit job until that fill finishes. Leased modes must not fill.
+    let (mut job, bytes) = job_at(&f, "leased-job", "true");
+    job.weight_hint = Some(2);
+    f.submit(&runner, &job, &bytes);
+    let completed =
+        tokio::time::timeout(Duration::from_secs(5), terminal(&runner, job.job_id)).await;
+    fs::write(release, "").unwrap();
+    let final_result = terminal(&runner, job.job_id).await;
+    base_done(&runner).await;
+    assert!(completed.is_ok(), "a background fill delayed a leased job");
+    assert_eq!(final_result.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(writer_count(&runner), 0);
+}
+
+#[tokio::test]
+async fn tenant_vm_fill_cannot_delay_a_leased_job() {
+    leased_job_is_not_delayed_by_fill(true, false).await;
+}
+
+#[tokio::test]
+async fn boat_fill_cannot_delay_a_leased_job() {
+    leased_job_is_not_delayed_by_fill(false, true).await;
+}
+
+#[tokio::test]
+async fn leased_modes_do_not_requeue_persisted_fills() {
+    for (tenant_vm, boat_profile) in [(true, false), (false, true)] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.manual_tick = true;
+        let runner = Runner::open(config.clone()).unwrap();
+        let (request, bytes) = f.run("true");
+        let upload = f.spool(&runner, &request, &bytes);
+        let mut prepare = prepare_for(&request);
+        prepare.bundles = request.bundles.clone();
+        runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+        runner.prepare(&prepare, true).unwrap();
+        assert_eq!(writer_count(&runner), 1);
+        drop(upload);
+        drop(runner);
+        config.tenant_vm = tenant_vm;
+        config.boat_profile = boat_profile;
+        config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
+        let runner = reopen(config);
+        runner.tick().unwrap();
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(inner.writer.is_none());
+        assert!(inner
+            .jobs
+            .values()
+            .filter(|job| job.base)
+            .all(|job| job.terminal.is_some()));
+        assert_eq!(inner.jobs.values().filter(|job| job.base).count(), 1);
+    }
+}
+
 #[tokio::test]
 async fn descriptor_reuses_source_only_tips_and_refills_manifest_and_config_changes() {
     let f = Fixture::new();

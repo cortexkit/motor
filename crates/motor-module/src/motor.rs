@@ -770,7 +770,13 @@ impl Motor {
             } else {
                 hash
             },
-            integration_tip: snapshots.main.tip.clone().unwrap_or_default(),
+            // Omit the fill tip so hosted runners cannot queue background cache
+            // fills on leased CPUs, even when the snapshot resolved a tip.
+            integration_tip: if hosted {
+                String::new()
+            } else {
+                snapshots.main.tip.clone().unwrap_or_default()
+            },
             siblings: snapshots.sibling_frames(),
             bundles: bundles.clone(),
             git_dependencies,

@@ -349,7 +349,7 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
     let repo = scratch.join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
-        vec!["init", "-q"],
+        vec!["init", "-q", "--initial-branch=main"],
         vec![
             "-c",
             "user.name=Fixture",
@@ -359,6 +359,22 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
             "--allow-empty",
             "-qm",
             "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    for args in [
+        vec!["remote", "add", "origin", repo.to_str().unwrap()],
+        vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+        vec![
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
         ],
     ] {
         assert!(std::process::Command::new("git")
@@ -395,6 +411,10 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
             .create(id, 30, None, Some("test".into()), false)
             .unwrap();
         let path = repo.to_str().unwrap();
+        assert!(
+            crate::default_tip::tip(&repo, &motor.storage, scratch.path()).is_some(),
+            "the fixture must resolve a real default-branch tip to exercise fill suppression"
+        );
         let request = RunRequest::new(path, path, path, "exit 23").with_timeout(30);
         let (tx, mut rx) = mpsc::channel(32);
         let (_wake, wake) = watch::channel(false);
@@ -437,6 +457,26 @@ async fn spill_after_permit_wait_preserves_original_stream_output_and_exit() {
     assert_eq!(results[1].1, Outcome::Exit { code: 23 });
     assert_eq!(boat.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(boat.attaches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let frames = boat.frames.lock().unwrap();
+    assert!(frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Hello {
+                default_branch_tip, ..
+            } => Some(default_branch_tip),
+            _ => None,
+        })
+        .all(|enabled| !enabled));
+    let runs: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Run(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].integration_tip.is_empty());
+    drop(frames);
     assert!(!boat
         .requests
         .lock()
@@ -729,6 +769,84 @@ pub(crate) fn fixture_repo(scratch: &Path) -> PathBuf {
             .success());
     }
     repo
+}
+
+#[tokio::test]
+async fn direct_hosted_submission_omits_a_resolved_fill_tip() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    let scratch = ScratchDir::new("hosted-fill-tip");
+    let repo = fixture_repo(scratch.path());
+    let motor = Motor::with_connector(
+        boat.config.clone(),
+        &scratch.join("state"),
+        Arc::new(SpillPeer {
+            withdrawn: Arc::new(AtomicBool::new(false)),
+            direct: true,
+        }),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor
+        .storage
+        .create(id, 30, None, Some("test".into()), false)
+        .unwrap();
+    motor
+        .storage
+        .hosted_route(id, crate::HostedJobState::new(&motor.config))
+        .unwrap();
+    let path = repo.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "exit 23").with_timeout(30);
+    let mut snapshots = Snapshots::build(
+        &motor.config,
+        path,
+        path,
+        &[],
+        scratch.path(),
+        id,
+        None,
+        &motor.storage,
+    )
+    .unwrap();
+    // Model a resolved default branch independently of the route: the wire
+    // submission must suppress even a nonempty, valid fill tip.
+    snapshots.main.tip = Some(snapshots.main.head.clone());
+    let (tx, mut rx) = mpsc::channel(32);
+    let (_wake, wake) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        motor
+            .run_snapshot(
+                id,
+                (request, crate::ReturnOptions::default()),
+                Vec::new(),
+                30,
+                false,
+                Arc::new(snapshots),
+                &tx,
+                wake,
+            )
+            .await
+    });
+    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let StreamRecord::Terminal(terminal) = rx.recv().await.unwrap().unwrap() {
+                break terminal;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    let frames = boat.frames.lock().unwrap();
+    let runs: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Run(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].integration_tip.is_empty());
 }
 
 /// Runs a spill-eligible job with the given queue-wait limit in seconds and

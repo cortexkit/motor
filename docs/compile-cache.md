@@ -11,6 +11,35 @@ cache sits; [job-isolation.md](job-isolation.md) describes the reader's sandbox.
 The Windows backend has its own per-workspace cache disks, described in
 [windows-jobs.md](windows-jobs.md#cache-disks).
 
+## Leased runners
+
+Tenant-VM and Boat profiles never queue background cache fills or warm builds.
+An idle-started fill could outlive the idle period, compete for leased CPU time,
+or hold a setup lock when the next job arrives. Existing cache entries remain
+readable; foreground jobs compile misses themselves. Restart still stops old
+writer processes, but does not requeue their saved requests in these profiles.
+Tests: `tenant_vm_fill_cannot_delay_a_leased_job`,
+`boat_fill_cannot_delay_a_leased_job`, `leased_modes_do_not_requeue_persisted_fills`
+(`crates/motor-runner/src/tests/dependency_writer.rs`).
+
+ck-motor's hosted channels, including spills to Boat, omit the default-branch
+fill capability and send an empty integration tip even when the snapshot has a
+resolved default branch. Ordinary build-server channels retain fills. Tests:
+`hosted_hello_does_not_advertise_background_fill_support`,
+`hello_advertises_default_branch_tip_on_the_wire`,
+`direct_hosted_submission_omits_a_resolved_fill_tip`,
+`spill_after_permit_wait_preserves_original_stream_output_and_exit`
+(`crates/motor-module/src/transport.rs`, `crates/motor-module/src/queue_tests.rs`).
+
+Before `Started`, INFO logs identify the job's materialization start and finish,
+each tree-access, dependency-mirror, and build-wrapper lock wait (start and elapsed
+milliseconds), and the hand-off to execution. Wait messages do not include
+checkout paths or command/environment contents. A start without a matching finish
+names the last phase entered, but can also mean the daemon stopped before logging
+completion; queue-wait time alone excludes materialization.
+Test: `materialization_logs_identity_waits_and_failure_without_paths`
+(`crates/motor-runner/src/setup_log.rs`).
+
 ## Parts
 
 | Part | Where | Owner |

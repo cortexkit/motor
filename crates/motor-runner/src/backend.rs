@@ -535,7 +535,12 @@ impl Backend for HostBackend {
                 .values()
                 .map(|mirror| trees.dependency_lock(mirror))
                 .collect();
-            let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+            let _guards: Vec<_> = locks
+                .iter()
+                .map(|lock| {
+                    crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap())
+                })
+                .collect();
             trees.refresh_dependency_aliases(&lockfile, &routes)?;
             let sandbox = setup_step(
                 "prepare isolated job sandbox",

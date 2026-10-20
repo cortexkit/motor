@@ -329,6 +329,11 @@ impl Config {
         self.state_dir().join("writer-scratch")
     }
     pub(crate) fn writer_enabled(&self) -> bool {
+        // These runners spend leased CPU time. Even an idle-started fill can
+        // consume the next job's quota or hold a setup lock after it arrives.
+        if self.tenant_vm || self.boat_profile {
+            return false;
+        }
         #[cfg(test)]
         if self.writer_unavailable {
             return false;
@@ -3851,6 +3856,10 @@ impl Runner {
     }
     /// The long part of starting a job, run without the state lock.
     fn setup(&self, s: &Setup) -> io::Result<Prepared> {
+        crate::setup_log::materialize(s.id, s.base, || self.materialize(s))
+    }
+
+    fn materialize(&self, s: &Setup) -> io::Result<Prepared> {
         #[cfg(test)]
         if self.core.config.fail_materialize {
             return Err(io::Error::other(
@@ -3959,6 +3968,7 @@ impl Runner {
             }
             return Ok(());
         }
+        tracing::info!(job_id = %id, cache_fill = s.base, "handing materialized job to execution");
         let launch = match self.core.backend.launch(
             &self.core.config,
             &self.core.trees,
@@ -4012,6 +4022,7 @@ impl Runner {
             drop(inner);
             return self.failed_launch(id, launch.execution, error, true, "start_not_persisted");
         }
+        tracing::info!(job_id = %id, cache_fill = s.base, "job Started recorded");
         self.core.health.lock().unwrap().record_queue_wait(
             j.started_ms.unwrap(),
             j.started.as_ref().unwrap().queue_wait_ms,

@@ -348,7 +348,7 @@ pub(crate) fn build_wrapper(
         .truncate(false)
         .write(true)
         .open(slots.join("configure.lock"))?;
-    lock.lock_exclusive()?;
+    crate::setup_log::lock_wait("build_wrapper", || lock.lock_exclusive())?;
     publish_control_file(&slots.join("limit"), limit.to_string().as_bytes(), false)?;
     if !output.exists() {
         let status = Command::new("rustc")
