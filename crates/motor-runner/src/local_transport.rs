@@ -1,4 +1,9 @@
 //! Local-only runner transport. SSH is the authenticated public boundary.
+#[cfg(any(windows, test))]
+fn service_owns_pipe(pipe_pid: u32, service_pid: Option<u32>, running: bool) -> bool {
+    running && pipe_pid != 0 && service_pid == Some(pipe_pid)
+}
+
 #[cfg(unix)]
 pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(unix)]
@@ -12,6 +17,7 @@ pub use native::{connect, Listener, Stream};
 mod native {
     use std::{
         io,
+        os::windows::io::AsRawHandle,
         path::{Path, PathBuf},
         ptr::null_mut,
     };
@@ -21,12 +27,17 @@ mod native {
         },
         sync::Mutex,
     };
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::{
             Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
             SECURITY_ATTRIBUTES,
         },
+        System::Pipes::GetNamedPipeServerProcessId,
     };
     pub type Stream = NamedPipeServer;
     pub struct Listener {
@@ -94,7 +105,33 @@ mod native {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match ClientOptions::new().open(path) {
-                Ok(pipe) => return Ok(pipe),
+                Ok(pipe) => {
+                    // A local user can pre-create a pipe while the service is
+                    // offline. Authenticate its server before sending any job
+                    // data; the name alone is not the runner's identity.
+                    let mut pid = 0;
+                    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let manager =
+                        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                            .map_err(io::Error::other)?;
+                    let status = manager
+                        .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
+                        .and_then(|service| service.query_status())
+                        .map_err(io::Error::other)?;
+                    if !super::service_owns_pipe(
+                        pid,
+                        status.process_id,
+                        status.current_state == ServiceState::Running,
+                    ) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "local pipe is not owned by the running MotorRunner service",
+                        ));
+                    }
+                    return Ok(pipe);
+                }
                 Err(error)
                     if error.raw_os_error() == Some(231)
                         && tokio::time::Instant::now() < deadline =>
@@ -104,5 +141,22 @@ mod native {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_owns_pipe;
+    #[test]
+    fn pipe_identity_accepts_the_running_service_process() {
+        assert!(service_owns_pipe(42, Some(42), true));
+        assert!(service_owns_pipe(9001, Some(9001), true));
+    }
+    #[test]
+    fn pipe_identity_refuses_stopped_mismatched_or_missing_service() {
+        assert!(!service_owns_pipe(42, Some(42), false));
+        assert!(!service_owns_pipe(42, Some(43), true));
+        assert!(!service_owns_pipe(42, None, true));
+        assert!(!service_owns_pipe(0, Some(0), true));
     }
 }

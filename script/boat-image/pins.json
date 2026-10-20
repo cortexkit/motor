@@ -12,6 +12,6 @@
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
     "script/runner/toolchain-parity.py": "fe5773ba5d3cc5c8e339db18bd8a55fcf52079e95a83f3c9c6a5eabe1cbe420f",
-    "script/runner/toolchain.json": "668caddcc294fe2c2a4e93e4b943bf83f49d2ddfb31765a701e53bd3ef38538d"
+    "script/runner/toolchain.json": "586a1ad101c69cff8081b5ce75323b19aeca7a6d147232dbf8a5fe5b48bd3b35"
   }
 }

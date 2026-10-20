@@ -115,7 +115,7 @@ impl io::Write for Stream {
 /// nonce DVD. The refusal must also appear in the victim's
 /// C:\ProgramData\Motor\hyperv-agent.log; a failed connect alone is not proof.
 pub(super) fn probe_peers() -> io::Result<()> {
-    use io::Read;
+    use io::{Read, Write};
     use std::time::{Duration, Instant};
     let media_deadline = Instant::now() + Duration::from_secs(20);
     let media = loop {
@@ -168,8 +168,8 @@ pub(super) fn probe_peers() -> io::Result<()> {
         }
         results.push(serde_json::json!({"target":target,"transport_connected":reached}));
     }
-    std::fs::write(
-        r"C:\ProgramData\Motor\peer-proof.json",
-        serde_json::to_vec_pretty(&results).map_err(io::Error::other)?,
-    )
+    let bytes = serde_json::to_vec_pretty(&results).map_err(io::Error::other)?;
+    let mut proof = std::fs::File::create(r"C:\ProgramData\Motor\peer-proof.json")?;
+    proof.write_all(&bytes)?;
+    proof.sync_all()
 }
