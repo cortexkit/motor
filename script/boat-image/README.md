@@ -292,7 +292,8 @@ capped at 30 minutes; deletion/purge latency is separate.
 The endpoint start-up path is replayed in the broker's order, with the
 broker's exact identity install (see the image contract) and its exact marker
 read, `cat /run/motor/endpoint-ready` as the sandbox user, which must print the
-sandbox id. Each wait is bounded by 120 s and its measured seconds are recorded:
+sandbox id. Each wait has a hard limit of 120 s and its measured seconds are
+recorded; the worst observed so far is 3.3 s (see the measured run below):
 
 - **original and clone, watcher armed first:** stop the endpoint, remove the
   identity, restart the watcher, confirm no marker and nothing on 9443, then
@@ -372,6 +373,31 @@ retained prepared image is excluded from requested cleanup; it is listed under
 `--cleanup RESULTS.json --delete-retained-images` explicitly deletes it too.
 No image is retained by default, and a borrowed source image is not owned/deleted
 by the new run.
+
+## Endpoint start-up measured on Boat (2026-10-20)
+
+One `--runner-host --prepared-image --from-prepared-image
+motor-boat-prepared-cbc6493de2f6` run at source revision `4420d92` passed 133 of
+133 checks and retained the prepared image **`motor-boat-prepared-5dab50642cb0`**
+(qualified by its real jobs). Seconds from the broker's identity install (or
+from `hydrated`, when the identity was already there) until
+`cat /run/motor/endpoint-ready` printed the sandbox id:
+
+| Phase | Order | Seconds |
+| --- | --- | --- |
+| initial | watcher armed, then install | 3.3 |
+| snapshot clone | broker order, install sent before the restore finished | 2.9 |
+| snapshot clone | watcher armed, then install | 0.9 |
+| resumed | identity already present | 0.5 |
+| resumed | re-install while serving | 0.9 |
+
+On the clone and after resume, `motor-boat.service` and `motor-boat-host.service`
+reported `NRestarts=0`: the first start succeeded, without the restart that
+rescued the previous image. The early install, sent right after create,
+survived Boat's switch to the real disk in this run, so the re-install branch
+was not exercised. Create from snapshot to hydrated took 43.1 s and to the
+readiness marker 46.0 s. The 120 s probe limit stays the hard bound; the broker
+itself waits up to 10 minutes.
 
 ## Measured on Boat (2026-10-19)
 
