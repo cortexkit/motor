@@ -38,6 +38,8 @@ impl Motor {
             // just execution. Shadows never reattach or resubmit after a loss.
             let deadline = Duration::from_secs(request.timeout.unwrap_or(0).saturating_add(120))
                 + crate::hosted::SHADOW_PROVISIONING_BUDGET;
+            #[cfg(test)]
+            let deadline = motor.shadow_deadline.unwrap_or(deadline);
             let execution = motor.execute_shadow(
                 shadow_id,
                 &request,

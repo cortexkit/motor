@@ -386,7 +386,7 @@ async fn shadow_deadline_after_booking_finishes_lost_with_zero_runtime() {
     boat.hang_run.store(true, Ordering::SeqCst);
     let dir = ScratchDir::new("shadow-deadline-booked");
     let repo = repo(&dir);
-    let motor = Motor::with_connector(
+    let mut motor = Motor::with_connector(
         config(boat.config.broker_url.as_ref().unwrap()),
         &dir.join("state"),
         Arc::new(PrimaryPeer {
@@ -394,6 +394,9 @@ async fn shadow_deadline_after_booking_finishes_lost_with_zero_runtime() {
         }),
     )
     .unwrap();
+    // Expire only the outer deadline. Advancing through the reader's 60-second
+    // inactivity window would make the winning error depend on poll order.
+    motor.shadow_deadline = Some(Duration::from_secs(30));
     let path = repo.to_str().unwrap();
     let mut stream = motor
         .run(RunRequest::new(path, path, path, "exit 17").with_timeout(30))
@@ -407,7 +410,7 @@ async fn shadow_deadline_after_booking_finishes_lost_with_zero_runtime() {
     .await
     .unwrap();
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(451)).await;
+    tokio::time::advance(Duration::from_secs(31)).await;
     tokio::time::resume();
     tokio::time::timeout(Duration::from_secs(5), motor.shadows.join_for_test())
         .await
