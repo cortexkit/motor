@@ -1687,6 +1687,7 @@ fn prefetch_cargo_with(
 
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
+#[allow(clippy::too_many_arguments)]
 fn prefetch_cargo_dependencies(
     writer: bool,
     tenant_vm: bool,
