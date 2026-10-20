@@ -479,6 +479,35 @@ async fn records(mut command: Command) -> Vec<StreamRecord> {
         .collect()
 }
 
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production client"]
+async fn oldest_production_client_reads_current_module_store() {
+    let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
+        .expect("run python3 scripts/mixed-version.py to build the real pinned client");
+    let f = Fixture::new(Cut::None, 0).await;
+    let motor = f.motor();
+    let live = super::recovery::collect(
+        motor
+            .refuse_before_start(RefusalReason::RunnerFull, None)
+            .unwrap(),
+    )
+    .await;
+    let terminal = super::recovery::terminal(&live);
+    drop(motor);
+
+    let config = f.scratch.join("rollback-config.json");
+    fs::write(&config, serde_json::to_vec(&f.config).unwrap()).unwrap();
+    let mut command = Command::new(helper);
+    // Replaying a stored local refusal must not need a runner connection.
+    command
+        .args(["127.0.0.1:1", config.to_str().unwrap()])
+        .arg(f.scratch.join("module-state"))
+        .args(["attach", &terminal.job_id.to_string(), "0"])
+        .kill_on_drop(true);
+    let replay = records(command).await;
+    assert_eq!(super::recovery::terminal(&replay), terminal);
+}
+
 fn assert_stream(records: &[StreamRecord], from: u64, started: bool) {
     let mut cursor = from;
     let mut started_count = 0;

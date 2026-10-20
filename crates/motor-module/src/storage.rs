@@ -13,6 +13,11 @@ use std::{
 // Keep routing and local refusal history for at least the runner's replay horizon,
 // starting at successful terminal delivery or the caller's latest access.
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+const RETENTION_RENEWAL_MS: u64 = 60 * 1000;
+// Only records whose stored keys are exactly local_terminal, pending_cancel,
+// and queue_wait_limit_s use this migration horizon. Agent jobs can run without
+// a timeout, so mint time alone cannot expire current job records.
+const LEGACY_RETENTION_MS: u64 = 49 * 60 * 60 * 1000;
 const MAX_VERIFIED_TIPS: usize = 256;
 const MAX_FAILED_TIPS: usize = 256;
 const FAILED_TIP_TTL: Duration = Duration::from_secs(60);
@@ -28,6 +33,8 @@ fn now_ms() -> u64 {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Job {
+    #[serde(skip)]
+    pub(crate) legacy_shape: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted: Option<crate::hosted::HostedJobState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +68,32 @@ pub(crate) struct Job {
     pub build_server_job_id: Option<Uuid>,
 }
 impl Job {
+    fn lacks_newer_fields(&self) -> bool {
+        self.hosted.is_none()
+            && self.return_result.is_none()
+            && self.direct_secret_hash.is_none()
+            && !self.gate_job
+            && self.runner_instance.is_none()
+            && self.attribution.is_none()
+            && self.terminal_observed_at_ms.is_none()
+            && self.terminal_delivered_at_ms.is_none()
+            && self.retain_until_ms.is_none()
+            && self.workspace_key.is_none()
+            && self.build_server_job_id.is_none()
+    }
+
+    fn legacy_expired(&self, id: Uuid, now: u64) -> bool {
+        self.legacy_shape
+            && self.lacks_newer_fields()
+            && id.get_version_num() == 7
+            && id.get_timestamp().is_some_and(|timestamp| {
+                let (seconds, nanos) = timestamp.to_unix();
+                let minted = seconds * 1000 + u64::from(nanos) / 1_000_000;
+                now.checked_sub(minted)
+                    .is_some_and(|age| age >= LEGACY_RETENTION_MS)
+            })
+    }
+
     /// The hosted route that governs this job, if any. A resubmitted spill
     /// keeps its route record, but the job now runs on the build server, so it
     /// is no longer routed hosted. The record stays because an older ck-motor
@@ -84,6 +117,7 @@ pub(crate) struct JobAttribution {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
+    #[serde(deserialize_with = "deserialize_jobs")]
     jobs: BTreeMap<Uuid, Job>,
     snapshots: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
@@ -92,6 +126,36 @@ struct State {
     verified_tips: BTreeMap<String, VerifiedTip>,
     #[serde(skip)]
     active_jobs: BTreeMap<Uuid, usize>,
+}
+
+fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Uuid, Job>, D::Error> {
+    // Inspect the stored keys, not just deserialized defaults: a newer field
+    // explicitly set to null or false still excludes a record from migration.
+    struct StoredJob(Job);
+    impl<'de> Deserialize<'de> for StoredJob {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let value = serde_json::Value::deserialize(deserializer)?;
+            let legacy_shape = value.as_object().is_some_and(|fields| {
+                fields.len() == 3
+                    && ["local_terminal", "pending_cancel", "queue_wait_limit_s"]
+                        .iter()
+                        .all(|key| fields.contains_key(*key))
+            });
+            let mut job: Job = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            job.legacy_shape = legacy_shape;
+            // Default-valued newer fields disappear on serialization. Keep a
+            // retention marker so a rewrite cannot turn a newer record into a
+            // three-field legacy record eligible for the age-only migration.
+            if !legacy_shape && job.lacks_newer_fields() {
+                job.retain_until_ms = Some(now_ms().saturating_add(RETENTION_MS));
+            }
+            Ok(Self(job))
+        }
+    }
+    BTreeMap::<Uuid, StoredJob>::deserialize(deserializer)
+        .map(|jobs| jobs.into_iter().map(|(id, job)| (id, job.0)).collect())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -141,9 +205,10 @@ impl State {
                     .hosted
                     .as_ref()
                     .is_some_and(|s| s.pending_finish.is_some())
-                || job.terminal_observed_at_ms.is_none()
-                || job.terminal_delivered_at_ms.is_none()
-                || job.retain_until_ms.is_none_or(|until| until > now)
+                || (!job.legacy_expired(*id, now)
+                    && (job.terminal_observed_at_ms.is_none()
+                        || job.terminal_delivered_at_ms.is_none()
+                        || job.retain_until_ms.is_none_or(|until| until > now)))
         });
         // Legacy cache entries get a full horizon on first load. Snapshot entries
         // are transfer hints, but keep those named by retained jobs as well.
@@ -175,6 +240,8 @@ pub(crate) struct Storage {
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
     _lease: File,
+    #[cfg(test)]
+    write_count: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct JobLease {
@@ -329,6 +396,8 @@ impl Storage {
             tip_checks: Mutex::new(BTreeMap::new()),
             failed_tips: Mutex::new(BTreeMap::new()),
             _lease: lease,
+            #[cfg(test)]
+            write_count: std::sync::atomic::AtomicUsize::new(0),
         };
         if pruned {
             storage.update(|_| {})?;
@@ -336,7 +405,17 @@ impl Storage {
         Ok(storage)
     }
     fn update(&self, f: impl FnOnce(&mut State)) -> io::Result<()> {
+        self.update_when(|_| true, f)
+    }
+    fn update_when(
+        &self,
+        needed: impl FnOnce(&State) -> bool,
+        f: impl FnOnce(&mut State),
+    ) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if !needed(&state) {
+            return Ok(());
+        }
         let mut next = state.clone();
         f(&mut next);
         next.prune(now_ms());
@@ -346,6 +425,9 @@ impl Storage {
         file.sync_all()?;
         fs::rename(path, self.root.join("state.json"))?;
         File::open(&self.root)?.sync_all()?;
+        #[cfg(test)]
+        self.write_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *state = next;
         Ok(())
     }
@@ -426,19 +508,32 @@ impl Storage {
         }
     }
     pub fn retain_job(&self, id: Uuid, key: Option<String>) -> io::Result<()> {
-        self.update(|s| {
-            let Some(job) = s.jobs.get_mut(&id) else {
-                return;
-            };
-            job.retain_until_ms = Some(
-                job.retain_until_ms
-                    .unwrap_or_default()
-                    .max(now_ms().saturating_add(RETENTION_MS)),
-            );
-            if key.is_some() {
-                job.workspace_key = key;
-            }
-        })
+        self.retain_job_at(id, key, now_ms())
+    }
+    fn retain_job_at(&self, id: Uuid, key: Option<String>, now: u64) -> io::Result<()> {
+        // Round up so even a skipped renewal has a durable deadline at least
+        // one full retention horizon after this access, including after a crash.
+        let until = now
+            .saturating_add(RETENTION_MS)
+            .div_ceil(RETENTION_RENEWAL_MS)
+            .saturating_mul(RETENTION_RENEWAL_MS);
+        self.update_when(
+            |s| {
+                s.jobs.get(&id).is_some_and(|job| {
+                    job.retain_until_ms.is_none_or(|saved| saved < until)
+                        || key
+                            .as_ref()
+                            .is_some_and(|key| job.workspace_key.as_ref() != Some(key))
+                })
+            },
+            |s| {
+                let job = s.jobs.get_mut(&id).unwrap();
+                job.retain_until_ms = Some(job.retain_until_ms.unwrap_or_default().max(until));
+                if key.is_some() {
+                    job.workspace_key = key.clone();
+                }
+            },
+        )
     }
     pub fn terminal_observed(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
@@ -586,6 +681,114 @@ mod retention_tests {
     use serde_json::json;
 
     #[test]
+    fn legacy_jobs_expire_by_mint_time_without_terminal_timestamps() {
+        let old = Uuid::now_v7();
+        let (seconds, nanos) = old.get_timestamp().unwrap().to_unix();
+        let minted = seconds * 1000 + u64::from(nanos) / 1_000_000;
+        let now = minted + 49 * 60 * 60 * 1000;
+        let fresh = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            now / 1000,
+            ((now % 1000) * 1_000_000) as u32,
+        ));
+        let legacy = json!({
+            "queue_wait_limit_s": 60, "pending_cancel": false, "local_terminal": null,
+        });
+        let mut state: State = serde_json::from_value(json!({
+            "jobs": {old.to_string(): legacy, fresh.to_string(): legacy},
+            "snapshots": {},
+        }))
+        .unwrap();
+
+        state.prune(now);
+        assert!(
+            !state.jobs.contains_key(&old),
+            "old legacy history must expire"
+        );
+        assert!(
+            state.jobs.contains_key(&fresh),
+            "fresh history must survive"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_preserves_richer_records_and_live_jobs() {
+        let id = Uuid::now_v7();
+        let (seconds, nanos) = id.get_timestamp().unwrap().to_unix();
+        let minted = seconds * 1000 + u64::from(nanos) / 1_000_000;
+        let now = minted + LEGACY_RETENTION_MS;
+        let legacy = json!({
+            "queue_wait_limit_s": 60, "pending_cancel": false, "local_terminal": null,
+        });
+        let load = |record| {
+            serde_json::from_value::<State>(json!({
+                "jobs": {id.to_string(): record}, "snapshots": {},
+            }))
+            .unwrap()
+        };
+
+        let mut state = load(legacy.clone());
+        state.prune(now - 1);
+        assert!(state.jobs.contains_key(&id), "the full horizon is retained");
+        state.active_jobs.insert(id, 1);
+        state.prune(now);
+        assert!(state.jobs.contains_key(&id), "live streams fence migration");
+        state.active_jobs.clear();
+        state.jobs.get_mut(&id).unwrap().pending_cancel = true;
+        state.prune(now);
+        assert!(state.jobs.contains_key(&id), "cancel intent must survive");
+        state.jobs.get_mut(&id).unwrap().pending_cancel = false;
+        state.jobs.get_mut(&id).unwrap().retain_until_ms = Some(now + RETENTION_MS);
+        state.prune(now);
+        assert!(
+            state.jobs.contains_key(&id),
+            "caller access extends retention"
+        );
+
+        for (field, value) in [
+            ("hosted", json!(null)),
+            ("return_result", json!(null)),
+            ("direct_secret_hash", json!(null)),
+            ("gate_job", json!(false)),
+            ("runner_instance", json!(null)),
+            ("attribution", json!(null)),
+            ("terminal_observed_at_ms", json!(null)),
+            ("terminal_delivered_at_ms", json!(null)),
+            ("retain_until_ms", json!(null)),
+            ("workspace_key", json!(null)),
+            ("build_server_job_id", json!(null)),
+            ("unknown_future_field", json!(null)),
+        ] {
+            let mut record = legacy.clone();
+            record[field] = value;
+            let mut state = load(record);
+            state.prune(now);
+            assert!(
+                state.jobs.contains_key(&id),
+                "newer field {field} fences migration"
+            );
+            let mut rewritten: State =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            rewritten.prune(now);
+            assert!(
+                rewritten.jobs.contains_key(&id),
+                "newer field {field} survives rewrite"
+            );
+        }
+
+        let mut state = load(legacy);
+        state.prune(minted - 1);
+        assert!(state.jobs.contains_key(&id), "future IDs must survive");
+        let job = state.jobs.remove(&id).unwrap();
+        state.jobs.insert(Uuid::nil(), job);
+        state.prune(now);
+        assert!(
+            state.jobs.contains_key(&Uuid::nil()),
+            "non-v7 IDs must survive"
+        );
+    }
+
+    #[test]
     fn pruning_removes_only_delivered_expired_jobs_and_inactive_snapshots() {
         let temp = cortexkit_test_support::ScratchDir::new("motor-storage-retention");
         let now = now_ms();
@@ -717,6 +920,120 @@ mod retention_tests {
         storage.cancel(id, true).unwrap();
         storage.terminal_delivered(id).unwrap();
         assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod retention_renewal_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn status_poll_retention_writes_once_per_job_per_minute() {
+        const JOBS: usize = 8;
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-polls");
+        let storage = Storage::open(&scratch).unwrap();
+        let ids: Vec<_> = (0..JOBS).map(|_| Uuid::now_v7()).collect();
+        for id in &ids {
+            storage.create(*id, 60, None, None, false).unwrap();
+        }
+        let start = now_ms().div_ceil(RETENTION_RENEWAL_MS) * RETENTION_RENEWAL_MS;
+        let before = storage.write_count.load(Ordering::SeqCst);
+        for second in 1..=120 {
+            for id in &ids {
+                storage
+                    .retain_job_at(*id, None, start + second * 1000)
+                    .unwrap();
+            }
+        }
+        let writes = storage.write_count.load(Ordering::SeqCst) - before;
+        eprintln!(
+            "{JOBS} jobs x 120 status polls: {writes} durable state writes (expected {})",
+            JOBS * 2
+        );
+        assert_eq!(writes, JOBS * 2);
+
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        for id in ids {
+            assert_eq!(
+                reopened.job(id).unwrap().retain_until_ms,
+                Some(start + 120_000 + RETENTION_MS),
+                "the last poll's full horizon must survive a restart"
+            );
+        }
+    }
+
+    #[test]
+    fn covered_retention_skips_io_but_new_deadlines_and_bindings_are_synchronous() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-io");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        let start = now_ms().div_ceil(RETENTION_RENEWAL_MS) * RETENTION_RENEWAL_MS;
+        storage
+            .retain_job_at(id, Some("original".into()), start + 1)
+            .unwrap();
+        let until = start + RETENTION_RENEWAL_MS + RETENTION_MS;
+        assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(until));
+        let before = storage.write_count.load(Ordering::SeqCst);
+
+        // A directory at the temporary-file path makes any attempted write fail.
+        // If the saved deadline covers the requested deadline, the access must
+        // succeed without attempting to write the state file.
+        fs::create_dir(scratch.join("state.tmp")).unwrap();
+        storage
+            .retain_job_at(id, None, start + RETENTION_RENEWAL_MS - 1)
+            .unwrap();
+        storage
+            .retain_job_at(id, Some("original".into()), start + RETENTION_RENEWAL_MS)
+            .unwrap();
+        storage
+            .retain_job_at(Uuid::now_v7(), None, start + RETENTION_RENEWAL_MS)
+            .unwrap();
+        assert!(storage
+            .retain_job_at(id, None, start + RETENTION_RENEWAL_MS + 1)
+            .is_err());
+        assert!(storage
+            .retain_job_at(id, Some("changed".into()), start + 2)
+            .is_err());
+        assert!(storage.cancel(id, true).is_err());
+        assert!(storage
+            .resubmitted(id, Uuid::now_v7(), "unreachable")
+            .is_err());
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
+        let job = storage.job(id).unwrap();
+        assert_eq!(job.retain_until_ms, Some(until));
+        assert_eq!(job.workspace_key.as_deref(), Some("original"));
+        assert!(!job.pending_cancel);
+        assert!(job.build_server_job_id.is_none());
+
+        fs::remove_dir(scratch.join("state.tmp")).unwrap();
+        storage
+            .retain_job_at(id, Some("changed".into()), start + 2)
+            .unwrap();
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before + 1);
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        let job = reopened.job(id).unwrap();
+        assert_eq!(job.workspace_key.as_deref(), Some("changed"));
+        assert_eq!(job.retain_until_ms, Some(until));
+    }
+
+    #[test]
+    fn retention_rounding_saturates_and_never_shortens_a_longer_deadline() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-overflow");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        storage.retain_job_at(id, None, u64::MAX).unwrap();
+        assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(u64::MAX));
+        let before = storage.write_count.load(Ordering::SeqCst);
+        storage.retain_job_at(id, None, now_ms()).unwrap();
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        assert_eq!(reopened.job(id).unwrap().retain_until_ms, Some(u64::MAX));
     }
 }
 
