@@ -39,6 +39,16 @@ struct TenantConnection {
     stop_write: tokio::sync::Notify,
 }
 
+/// The wire `type` tag of a frame, for logs. Only refused frames reach this,
+/// and the connection closes right after, so serializing the frame is cheap
+/// enough here.
+fn frame_type(frame: &Frame) -> String {
+    serde_json::to_value(frame)
+        .ok()
+        .and_then(|value| value["type"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 impl TenantConnection {
     async fn admitted(&self) -> bool {
         self.state.lock().await.admitted
@@ -56,8 +66,11 @@ impl TenantConnection {
         self.changed.notify_one();
         true
     }
-    fn operation_refused(&self) {
-        tracing::warn!(jti = %self.lease.jti, "operation_refused");
+    /// Logs why this tenant connection is being closed. `frame` names the
+    /// refused frame's type (or why no frame could be decoded), never its
+    /// contents, so a refusal names itself without copying peer data.
+    fn operation_refused(&self, frame: &str, reason: &'static str) {
+        tracing::warn!(jti = %self.lease.jti, frame, reason, "operation_refused");
     }
     fn allowed(&self, frame: &Frame, hello: &mut bool, ran: &mut bool) -> bool {
         if !*hello {
@@ -66,6 +79,11 @@ impl TenantConnection {
         }
         let run = self.lease.purpose == LeasePurpose::Run;
         match frame {
+            // ck-motor's hosted channel writes a heartbeat every second after
+            // hello on run and attach connections alike. It carries no
+            // authority and the session skips it, so it must not close the
+            // connection.
+            Frame::Heartbeat { .. } => true,
             Frame::Have { .. } | Frame::BundleChunk { .. } => run,
             Frame::Run(request) if run && !*ran && request.job_id == self.lease.jti => {
                 if self.runner.has_job_record(self.lease.jti) {
@@ -167,7 +185,13 @@ async fn reader<R: AsyncRead + Unpin>(
                 result = read_record_async(&mut read) => match result {
                     Ok(Some(DecodedFrame::Frame(frame))) => Ok(Some(frame)),
                     Ok(None) => Ok(None),
-                    _ => { ctx.operation_refused(); break; }
+                    Ok(Some(DecodedFrame::Unknown(_))) => { ctx.operation_refused("unknown", "unknown frame type"); break; }
+                    Err(error) => {
+                        // The decode error text can quote peer bytes; log its kind only.
+                        tracing::warn!(jti = %ctx.lease.jti, kind = ?error.kind(), "tenant frame read failed");
+                        ctx.operation_refused("undecodable", "frame read failed");
+                        break;
+                    }
                 },
                 _ = tokio::time::sleep_until(ctx.deadline()), if ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
                     if ctx.expire().await { break; }
@@ -187,7 +211,7 @@ async fn reader<R: AsyncRead + Unpin>(
         };
         if let Some(ctx) = &tenant {
             if !ctx.allowed(&frame, &mut hello, &mut ran) {
-                ctx.operation_refused();
+                ctx.operation_refused(&frame_type(&frame), "not allowed on this tenant connection");
                 break;
             }
         }
@@ -473,7 +497,7 @@ async fn session(
                 match locked(&runner, move |r| r.accept(admitted)).await? {
                     Admission::Duplicate => {
                         if let Some(ctx) = tenant {
-                            ctx.operation_refused();
+                            ctx.operation_refused("run", "job already has a record");
                         }
                         return Ok(());
                     }
