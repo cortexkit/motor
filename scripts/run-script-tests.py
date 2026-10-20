@@ -28,6 +28,7 @@ TEST_FILES = [
     "script/hosted-host/test_hosted_host.py",
     "script/runner/network-check-tests.py",
     "script/runner/test_check_nested_js.py",
+    "script/runner/test_check_nested_cargo.py",
     "script/runner/test_deploy.py",
     "script/runner/test_inbound_policy.py",
     "script/runner/test_review_reaper.py",

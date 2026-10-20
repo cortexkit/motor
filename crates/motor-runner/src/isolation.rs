@@ -1545,8 +1545,15 @@ impl Drop for RuntimeDir {
     }
 }
 
-/// Only immutable snapshot entries authorize a fetch; warm untracked files do not.
-fn cargo_lockfiles(workspace: &Path, tree: &str) -> io::Result<Vec<PathBuf>> {
+const MAX_CARGO_LOCKFILES: usize = 128;
+const NESTED_CARGO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Optional fetches use only immutable snapshot entries, never warm untracked files.
+fn cargo_lockfiles(
+    workspace: &Path,
+    tree: &str,
+    skip: &mut impl FnMut(&Path, &str),
+) -> io::Result<Vec<PathBuf>> {
     use std::os::unix::ffi::OsStringExt;
     let entries = javascript_git(
         workspace,
@@ -1570,32 +1577,103 @@ fn cargo_lockfiles(workspace: &Path, tree: &str) -> io::Result<Vec<PathBuf>> {
         );
     }
     let mut locks = Vec::new();
+    let mut count = usize::from(files.contains_key(Path::new("Cargo.lock")));
     for (path, regular) in &files {
-        if path.file_name().is_some_and(|name| name == "Cargo.lock") {
-            let manifest = path.with_file_name("Cargo.toml");
-            if !regular
-                || files.get(&manifest) != Some(&true)
-                || !optional_regular_file(&workspace.join(path))?
-                || !optional_regular_file(&workspace.join(&manifest))?
-            {
-                return Err(io::Error::other(format!(
-                    "{}: Cargo prefetch requires tracked regular Cargo.lock and Cargo.toml files",
-                    path.display()
-                )));
+        if path != Path::new("Cargo.lock")
+            && path.file_name().is_some_and(|name| name == "Cargo.lock")
+        {
+            count += 1;
+            if count > MAX_CARGO_LOCKFILES {
+                skip(path, "snapshot exceeds the 128 tracked Cargo.lock limit");
+                continue;
             }
-            locks.push(path.clone());
+            let manifest = path.with_file_name("Cargo.toml");
+            let valid = (|| {
+                Ok::<_, io::Error>(
+                    *regular
+                        && files.get(&manifest) == Some(&true)
+                        && optional_regular_file(&workspace.join(path))?
+                        && optional_regular_file(&workspace.join(&manifest))?,
+                )
+            })();
+            match valid {
+                Ok(true) => locks.push(path.clone()),
+                Ok(false) => skip(path, "nested prefetch requires tracked regular Cargo.lock and sibling Cargo.toml files"),
+                Err(error) => skip(path, &error.to_string()),
+            }
         }
     }
-    if locks.len() > 128 {
-        return Err(io::Error::other(
-            "Cargo prefetch exceeds the 128 tracked Cargo.lock limit",
-        ));
-    }
-    if files.contains_key(Path::new("Cargo.toml")) && !locks.contains(&PathBuf::from("Cargo.lock"))
-    {
-        return Err(io::Error::other("Cargo.toml has no tracked Cargo.lock; generate and commit it in your own checkout before retrying"));
-    }
     Ok(locks)
+}
+
+fn bounded_cargo_fetch(command: &mut Command, limit: Duration) -> io::Result<()> {
+    // GNU timeout owns a process group so its deadline also stops Cargo's Git
+    // children. Give a TERM-resistant fetch only one additional second to exit.
+    let mut bounded = Command::new("/usr/bin/timeout");
+    bounded
+        .args([
+            "--verbose",
+            "--kill-after=1s",
+            &format!("{}s", limit.as_secs_f64()),
+        ])
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(directory) = command.get_current_dir() {
+        bounded.current_dir(directory);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            bounded.env(name, value);
+        } else {
+            bounded.env_remove(name);
+        }
+    }
+    let output = crate::systemd::output(&mut bounded)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let timeout = if matches!(output.status.code(), Some(124 | 137)) {
+        format!("timed out after {limit:?}: ")
+    } else {
+        String::new()
+    };
+    Err(io::Error::other(format!(
+        "{timeout}{command:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn prefetch_cargo_with(
+    workspace: &Path,
+    tree: &str,
+    nested_limit: Duration,
+    mut command: impl FnMut(&Path) -> io::Result<Command>,
+    mut skip: impl FnMut(&Path, &str),
+) -> io::Result<()> {
+    // Only the root graph is an admission requirement. Experimental nested
+    // crates may have stale locks or unavailable dependencies without breaking
+    // unrelated jobs in the same repository.
+    if workspace.join("Cargo.toml").is_file() {
+        checked(&mut command(workspace)?)?;
+    }
+    let locks = match cargo_lockfiles(workspace, tree, &mut skip) {
+        Ok(locks) => locks,
+        Err(error) => {
+            skip(
+                Path::new("."),
+                &format!("nested lockfile discovery failed: {error}"),
+            );
+            return Ok(());
+        }
+    };
+    for lockfile in locks {
+        let fetched = command(&workspace.join(lockfile.parent().unwrap_or(Path::new(""))))
+            .and_then(|mut command| bounded_cargo_fetch(&mut command, nested_limit));
+        if let Err(error) = fetched {
+            skip(&lockfile, &error.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Populate sources as the trusted daemon, never as the cache-writing account.
@@ -1609,30 +1687,29 @@ fn prefetch_cargo_dependencies(
     cargo: &Path,
     rustup: &Path,
 ) -> io::Result<()> {
-    for lockfile in cargo_lockfiles(workspace, tree)? {
-        let stage = if writer {
-            "fetch integration-tip dependencies"
-        } else {
-            "fetch job dependencies"
-        };
-        checked(
-            workspace::dependencies::fetch_command(
+    let stage = if writer {
+        "fetch integration-tip dependencies (Cargo.lock)"
+    } else {
+        "fetch job dependencies (Cargo.lock)"
+    };
+    prefetch_cargo_with(
+        workspace,
+        tree,
+        NESTED_CARGO_FETCH_TIMEOUT,
+        |directory| {
+            let mut command = workspace::dependencies::fetch_command(
                 state,
-                &workspace.join(lockfile.parent().unwrap_or(Path::new(""))),
+                directory,
                 dependency_routes,
                 cargo,
                 rustup,
-            )?
-            .env("CARGO_NET_OFFLINE", "false"),
-        )
-        .map_err(|error| {
-            io::Error::other(fetch_failure(
-                &format!("{stage} ({})", lockfile.display()),
-                &error.to_string(),
-            ))
-        })?;
-    }
-    Ok(())
+            )?;
+            command.env("CARGO_NET_OFFLINE", "false");
+            Ok(command)
+        },
+        crate::setup_log::cargo_skip,
+    )
+    .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
 }
 
 /// A stale lockfile is the caller's to fix, and it can't be fixed remotely:

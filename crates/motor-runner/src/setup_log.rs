@@ -39,6 +39,12 @@ pub(crate) fn lock_wait<T>(lock: &'static str, acquire: impl FnOnce() -> T) -> T
     result
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn cargo_skip(lockfile: &std::path::Path, error: &str) {
+    tracing::warn!(job_id = ?JOB.get(), lockfile = %lockfile.display(), %error,
+        "optional nested Cargo prefetch skipped; job will run offline");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +99,31 @@ mod tests {
         assert!(lines[7].contains("elapsed_ms="));
         assert!(lines[7].contains("success=false"));
         assert!(!output.contains("/secret/path"));
+    }
+
+    #[test]
+    fn optional_cargo_warning_names_job_lockfile_and_cargo_error() {
+        let logs = Logs::default();
+        let subscriber = motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone());
+        let id = Uuid::now_v7();
+        tracing::subscriber::with_default(subscriber, || {
+            materialize(id, false, || {
+                cargo_skip(
+                    std::path::Path::new("probes/helper/Cargo.lock"),
+                    "Cargo.lock needs updating: --locked was passed to prevent this",
+                );
+                Ok(())
+            })
+            .unwrap();
+        });
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let warning = output.lines().find(|line| line.contains(" WARN ")).unwrap();
+        assert!(warning.contains(&id.to_string()), "{output}");
+        assert!(warning.contains("probes/helper/Cargo.lock"), "{output}");
+        assert!(
+            warning.contains("--locked was passed to prevent this"),
+            "{output}"
+        );
+        assert!(output.contains("success=true"), "{output}");
     }
 }

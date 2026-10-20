@@ -87,11 +87,19 @@ archive/payload/source/installed bytes and import seconds. Transfer time and
 the rest of the image build remain visible in the probe's upload/install timings.
 
 The seed is a point-in-time floor, not a promise of future cache completeness.
-The runner fetches **every tracked Cargo.lock** in the immutable job snapshot
-(up to 128), including independent nested manifests, before offline execution.
-Untracked warm files never authorize a fetch. Refusals name the lockfile and
-retain Cargo's failing crate/error. New crates without a tracked lockfile cannot
-be prefetched this way: refresh the fleet seed or commit their lockfile.
+The root manifest's locked fetch remains mandatory before offline execution.
+Nested tracked lockfiles are **best-effort cache warming**, not job-admission
+requirements: stale experimental crates must not prevent unrelated jobs from
+starting. Within a 128-lock snapshot budget (including the root), each eligible
+nested manifest gets its own 30-second trusted fetch, with at most one additional
+second for forced teardown through GNU `/usr/bin/timeout`. A failed fetch,
+missing sibling manifest, nonregular pair or over-budget lock is skipped with a
+setup warning containing the job ID, lockfile and error. Untracked nested locks
+are ignored. A job that later builds an unavailable nested graph fails with
+Cargo's own offline error; refresh the seed or fix and commit that graph's lock.
+`stale_nested_lock_does_not_refuse_and_root_still_fetches`,
+`stale_root_lock_still_refuses_before_nested_fetch`, and
+`nested_lockfile_prefetch_populates_offline_sources` defend these boundaries.
 
 Parity compares fresh files with the operator's server seed inventory, not the
 image's saved receipt. Extra image crates are allowed. Missing crates are reported
