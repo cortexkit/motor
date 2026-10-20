@@ -90,27 +90,43 @@ impl Policy {
     }
 }
 
+/// Repair modes on `paths` without following any symlink. A root process (the
+/// runner inside a tenant VM, or tests run as root there) walks the trees
+/// itself: going through sudo would add nothing, and the tenant image has no
+/// installed helper copy. Everywhere else the fixed root-owned helper runs
+/// through the operator's narrow sudo rule, the only way an unprivileged
+/// runner can change modes on job-owned trees.
+pub(crate) fn repair_tree(policy: Policy, paths: &[&Path]) -> io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        if paths.is_empty() || paths.iter().any(|path| !path.is_absolute()) {
+            return Err(io::Error::other(
+                "permission repair requires absolute tree paths",
+            ));
+        }
+        return apply(policy, paths);
+    }
+    let mut command = command(policy, paths)?;
+    let output = crate::systemd::output(&mut command)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn command(policy: Policy, paths: &[&Path]) -> io::Result<Command> {
     if paths.is_empty() || paths.iter().any(|path| !path.is_absolute()) {
         return Err(io::Error::other(
             "permission repair requires absolute tree paths",
         ));
     }
-    // A root tenant runner has no sudo grant and no installed helper copy: it
-    // runs its own binary's physical-chmod directly, as it runs every other
-    // privileged helper. Everywhere else the fixed root-owned helper runs
-    // through the operator's narrow sudo rule.
-    let mut command = if crate::privilege::direct() {
-        let own = std::env::current_exe()?;
-        let mut command = Command::new(own);
-        command.env_clear();
-        command
-    } else {
-        let mut command = Command::new("/usr/bin/sudo");
-        command.arg("-n").arg(HELPER);
-        command
-    };
+    let mut command = Command::new("/usr/bin/sudo");
     command
+        .arg("-n")
+        .arg(HELPER)
         .args(["physical-chmod", policy.argument(), "--"])
         .args(paths);
     Ok(command)

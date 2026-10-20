@@ -1213,10 +1213,7 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
             .args(["-R", "-P", "motor-job:motor-job", "--"])
             .arg(path),
     )?;
-    checked(&mut crate::permissions::command(
-        crate::permissions::Policy::OwnerWrite,
-        &[path],
-    )?)?;
+    crate::permissions::repair_tree(crate::permissions::Policy::OwnerWrite, &[path])?;
     fs::create_dir_all(marker.parent().unwrap())?;
     fs::write(marker, identity)?;
     Ok(())
@@ -1349,10 +1346,7 @@ fn prepare_job_home(path: &Path) -> io::Result<()> {
             .args(["-R", "-P", "motor-job:motor-job", "--"])
             .arg(path),
     )?;
-    checked(&mut crate::permissions::command(
-        crate::permissions::Policy::Private,
-        &[path],
-    )?)?;
+    crate::permissions::repair_tree(crate::permissions::Policy::Private, &[path])?;
     checked(
         crate::privilege::command("/usr/bin/chmod")
             .args(["0700", "--"])
@@ -1419,10 +1413,7 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
             .args(["-R", "-P", &owner, "--"])
             .arg(path),
     )?;
-    checked(&mut crate::permissions::command(
-        crate::permissions::Policy::OwnerWrite,
-        &[path],
-    )?)
+    crate::permissions::repair_tree(crate::permissions::Policy::OwnerWrite, &[path])
 }
 
 pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
@@ -1468,10 +1459,7 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
             .args(["-R", "-P", "-b", "-k", "--"])
             .args(paths),
     )?;
-    checked(&mut crate::permissions::command(
-        crate::permissions::Policy::Private,
-        paths,
-    )?)?;
+    crate::permissions::repair_tree(crate::permissions::Policy::Private, paths)?;
     Ok(())
 }
 

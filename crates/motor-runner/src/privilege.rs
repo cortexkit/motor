@@ -38,7 +38,7 @@ pub fn run_helpers_directly_as_root() -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn direct() -> bool {
+fn direct() -> bool {
     DIRECT.load(Ordering::SeqCst)
 }
 
