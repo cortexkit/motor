@@ -14,6 +14,7 @@ pub(crate) struct Boat {
     pub requests: test_http::Requests,
     pub runs: Arc<AtomicUsize>,
     pub attaches: Arc<AtomicUsize>,
+    pub frames: Arc<Mutex<Vec<Frame>>>,
     pub lost: Arc<AtomicUsize>,
     /// Usable memory the job token states; 0 states the fleet formula.
     pub mem_mib: Arc<AtomicU64>,
@@ -37,6 +38,8 @@ impl Boat {
         let port = host.local_addr().unwrap().port();
         let runs = Arc::new(AtomicUsize::new(0));
         let attaches = Arc::new(AtomicUsize::new(0));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = frames.clone();
         let strict_attach = Arc::new(AtomicBool::new(false));
         let ran = Arc::new(Mutex::new(std::collections::HashSet::<Uuid>::new()));
         let run_count = runs.clone();
@@ -48,6 +51,7 @@ impl Boat {
                 let attaches = attach_count.clone();
                 let strict = strict.clone();
                 let ran = ran.clone();
+                let frames = captured.clone();
                 tokio::spawn(async move {
                     let Ok(motor_lease::Prelude::LeaseHello {
                         token,
@@ -85,10 +89,9 @@ impl Boat {
                     tls::write(&mut socket, &motor_lease::Prelude::LeaseOk {})
                         .await
                         .unwrap();
-                    assert!(matches!(
-                        read_frame_async(&mut socket).await.unwrap(),
-                        Some(Frame::Hello { .. })
-                    ));
+                    let hello = read_frame_async(&mut socket).await.unwrap().unwrap();
+                    assert!(matches!(hello, Frame::Hello { .. }));
+                    frames.lock().unwrap().push(hello);
                     write_frame_async(
                         &mut socket,
                         &Frame::Hello {
@@ -118,7 +121,8 @@ impl Boat {
                                 .await
                                 .unwrap();
                             }
-                            Frame::Run(_) => {
+                            Frame::Run(request) => {
+                                frames.lock().unwrap().push(Frame::Run(request));
                                 runs.fetch_add(1, Ordering::SeqCst);
                                 ran.lock().unwrap().insert(id);
                                 if drop_run {
@@ -194,6 +198,7 @@ impl Boat {
             requests: http.requests.clone(),
             runs,
             attaches,
+            frames,
             lost,
             mem_mib,
             strict_attach,

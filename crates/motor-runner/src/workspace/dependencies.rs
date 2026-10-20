@@ -69,7 +69,7 @@ impl Trees {
             }
             let mirror = self.dependency_mirror(&url);
             let lock = self.dependency_lock(&mirror);
-            let _guard = lock.lock().unwrap();
+            let _guard = crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap());
             let listed = git(
                 &mirror,
                 &[
@@ -173,7 +173,7 @@ impl Trees {
             let Some(b) = &d.bundle else { continue };
             let mirror = self.dependency_mirror(&d.url);
             let lock = self.dependency_lock(&mirror);
-            let _guard = lock.lock().unwrap();
+            let _guard = crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap());
             if !mirror.exists() {
                 fs::create_dir_all(&mirror)?;
                 git(
@@ -222,7 +222,7 @@ impl Trees {
         for (url, commits) in &grouped {
             let mirror = self.dependency_mirror(url);
             let lock = self.dependency_lock(&mirror);
-            let _guard = lock.lock().unwrap();
+            let _guard = crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap());
             let absent: Vec<_> = commits
                 .iter()
                 .filter(|c| {

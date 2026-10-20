@@ -46,7 +46,7 @@ fn acquire(path: &Path, wait: bool) -> Option<TreeAccess> {
     })
 }
 pub(crate) fn lock(path: &Path) -> TreeAccess {
-    acquire(path, true).unwrap()
+    crate::setup_log::lock_wait("tree_access", || acquire(path, true).unwrap())
 }
 pub(crate) fn try_lock(path: &Path) -> Option<TreeAccess> {
     acquire(path, false)
