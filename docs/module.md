@@ -81,13 +81,19 @@ the background every 15 seconds with a ten-second timeout; it never connects to
 the runner itself. Metrics include host capacity, hourly queue wait, and the top
 five repositories by reserved vCPU-hours over 24 hours. A failed sample makes
 runner fields null; three consecutive failures or two minutes without a
-successful sample degrade module health. Busy queues alone remain healthy.
-Startup and credential failures still report failing health, and the existing
-unreachable-refusal diagnostics remain in the detail. Tests:
+successful sample degrade module health. Busy queues alone remain healthy. The
+`history` metric contains at most 180 oldest-first minute points with the keys
+`minute_ms`, `permits_held`, `permits_cap`, `queue_depth`, and `queue_p90_ms`;
+only minutes with a successful sample appear. Startup and credential failures
+still report failing health, and the detail still includes diagnostics for an
+unreachable runner. Tests:
 `health_check_reads_only_cache_without_runner_calls`,
 `busy_server_is_healthy_and_metrics_have_cli_shape`,
 `idle_cache_stales_after_two_minutes_and_recovers`,
-`unreachable_samples_are_null_and_three_failures_degrade`.
+`unreachable_samples_are_null_and_three_failures_degrade`,
+`history_keeps_the_last_sample_in_each_minute`,
+`history_is_bounded_to_180_points_and_evicts_the_oldest`,
+`history_leaves_a_gap_for_a_minute_without_a_successful_sample`.
 
 For scoped `exec.run` requests, `ck-motor` stores the caller's session, scope
 reference and epoch, and the optional `preset` with the job, for attribution
