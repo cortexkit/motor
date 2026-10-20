@@ -378,6 +378,9 @@ async fn shadow_reuses_pinned_boat_path_and_records_both_tails() {
     assert!(run.integration_tip.is_empty());
     assert_eq!(run.command, "exit 17");
     assert_eq!(run.timeout, Some(30));
+    // The request named no vCPUs; the hosted runner refuses a Run whose vCPU
+    // count differs from the lease's, so the shadow must send the default.
+    assert_eq!(run.weight_hint, Some(2));
 }
 
 #[tokio::test]

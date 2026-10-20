@@ -184,6 +184,13 @@ impl Motor {
         run.git_dependencies = dependencies;
         run.gate_job = false;
         run.integration_tip.clear();
+        // The hosted runner admits a Run only when it matches the lease exactly,
+        // so normalise it the same way the spill path does: an unset vCPU count
+        // is the default 2, and the time limit is the lease's own.
+        run.weight_hint = Some(run.weight_hint.unwrap_or(2));
+        if let Some(lease) = booked.as_ref() {
+            run.timeout = Some(lease.max_s);
+        }
         *run_sent = true;
         c.send(Frame::Run(run.clone())).await?;
         match c.next().await? {
