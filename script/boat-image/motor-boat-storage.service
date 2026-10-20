@@ -1,7 +1,7 @@
 [Unit]
 Description=Establish and verify Boat reflink storage after file restoration
-# Boat's root-disk sysbinds can satisfy .mount units without mounting our disk.
-# Run before the local-fs mounts without pulling basic.target into their graph.
+# Start the mount units only after restore cleanup, without a dependency cycle
+# through the runner or basic.target.
 DefaultDependencies=no
 Requires=motor-boat-restored.service
 After=motor-boat-restored.service

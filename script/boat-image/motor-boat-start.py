@@ -31,11 +31,13 @@ READY_DEADLINE_S = 120
 RESTORE_ACTIVE = Path('/var/lib/ascii-lazy/active')
 RESTORED_PATHS = ('/etc', '/usr', '/srv', '/var/lib/motor-boat', '/Users')
 RESTORE_DEADLINE_S = 30 * 60
+RESTORE_STABLE_S = 5
 IDENTITY = Path('/etc/motor/tenant/id')
 STATE = Path('/var/lib/motor-boat')
 USERS = Path('/Users')
 IMAGE = Path('/var/lib/motor-boat.xfs')
 STORAGE_EVIDENCE = Path('/run/motor-boat-storage.json')
+ENDPOINT_READY = Path('/run/motor/endpoint-ready')
 
 
 def budget(available, overhead, margin=MARGIN):
@@ -112,17 +114,29 @@ def restore_pending(mountinfo, restore_active):
         row = serving_mount(path, rows)
         if row is not None and row[1].startswith('fuse'):
             return f'{path} is still served by {row[2]} ({row[1]}), not the real disk'
+    # The active marker disappears before Boat's deferred public-bind cleanup.
+    # Do not replace those binds: that cleanup would unmount our replacement.
+    for path in (str(STATE), str(USERS)):
+        if any(row[0] == path and row[1] == 'ext4' for row in rows):
+            return f'Boat public restore bind at {path} has not been retired'
     return None
 
 
 def wait_restored(clock=time.monotonic, pause=time.sleep):
     started = clock()
     last = None
+    stable_since = None
     while True:
         reason = restore_pending(Path('/proc/self/mountinfo').read_text(), RESTORE_ACTIVE.exists())
         if reason is None:
-            print(f'system files are on the real disk after {clock() - started:.1f} s', flush=True)
-            return
+            if stable_since is None:
+                stable_since = clock()
+            if clock() - stable_since >= RESTORE_STABLE_S:
+                print(f'system files and public mount cleanup settled after {clock() - started:.1f} s', flush=True)
+                return
+            reason = 'waiting for a stable real-disk mount view'
+        else:
+            stable_since = None
         if reason != last:
             print('waiting for Boat to finish restoring files: ' + reason, flush=True)
             last = reason
@@ -168,20 +182,6 @@ def empty_mountpoint(path):
         raise RuntimeError(f'refusing to mount over non-empty directory {path}; stop services and inspect the root-disk data')
 
 
-def unmount_root_view(path):
-    empty_mountpoint(path)
-    rows = mounts()
-    exact = [row for row in rows if row[0] == str(path)]
-    if not exact:
-        return
-    if len(exact) != 1 or exact[0][1] != 'ext4' or path.stat().st_dev != Path('/').stat().st_dev:
-        raise RuntimeError(f'refusing to unmount an unexpected storage view at {path}: {exact}')
-    # Only the public, empty root-disk bind is retired. Boat's references under
-    # /var/lib/ascii-lazy/sysbind remain mounted and owned by its restore agent.
-    subprocess.run(['/usr/bin/umount', '--', str(path)], check=True)
-    empty_mountpoint(path)
-
-
 def check_storage():
     rows = mounts()
     state, users = state_mount(rows), users_mount(rows)
@@ -200,40 +200,61 @@ def check_storage():
 
 
 def prepare_storage():
-    """Replace Boat's empty root-disk sysbind views only after file restoration.
-    A .mount unit can be active for that foreign bind, so systemctl start alone
-    cannot establish the disk identity. Retire only the empty public root-disk
-    binds, so neither path has duplicate mount targets after preparation."""
+    """Prepare storage with systemd after Boat removes its public bind mounts."""
     reason = restore_pending(Path('/proc/self/mountinfo').read_text(), RESTORE_ACTIVE.exists())
     if reason:
         raise RuntimeError('cannot prepare storage before Boat restore: ' + reason)
+    for unit in ('motor-boat.service', 'motor-boat-host.service'):
+        pid = subprocess.check_output(['/usr/bin/systemctl', 'show', unit, '-p', 'MainPID', '--value'], text=True).strip()
+        if pid != '0':
+            raise RuntimeError(f'refusing to change storage while {unit} has MainPID={pid}')
     rows = mounts()
-    ready = []
     for path, validate in ((STATE, state_mount), (USERS, users_mount)):
         path.mkdir(exist_ok=True)
         try:
             validate(rows)
-            ready.append(True)
         except (OSError, RuntimeError):
             empty_mountpoint(path)
-            ready.append(False)
-    # Check both views before mounting either: a dirty root-disk workspace must
-    # not be hidden even when the state mount point is empty.
-    for path, mounted in ((USERS, ready[1]), (STATE, ready[0])):
-        if not mounted:
-            unmount_root_view(path)
-    if not ready[0]:
-        subprocess.run(['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(IMAGE), str(STATE)], check=True)
+    # The evidence file blocks fresh mount-unit starts after verification. It may be
+    # removed only with both consumers stopped and both target views checked.
+    STORAGE_EVIDENCE.unlink(missing_ok=True)
+    subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['/usr/bin/systemctl', 'start', r'var-lib-motor\x2dboat.mount'], check=True)
     state_mount(mounts())
     for directory in ('state', 'state/workspaces', 'home', 'tmp'):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
-    if not ready[1]:
-        subprocess.run(['/usr/bin/mount', '--bind', str(STATE / 'state/workspaces'), str(USERS)], check=True)
+    subprocess.run(['/usr/bin/systemctl', 'start', 'Users.mount'], check=True)
+    subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', r'var-lib-motor\x2dboat.mount', 'Users.mount'], check=True)
     evidence = check_storage()
-    evidence.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+    evidence.update(identity=storage_identity(), boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                     verified_monotonic_ns=time.monotonic_ns())
     STORAGE_EVIDENCE.write_text(json.dumps(evidence) + '\n')
     print('Boat storage ready: ' + json.dumps(evidence), flush=True)
+
+
+def storage_identity():
+    state, users = STATE.stat(), USERS.stat()
+    if state.st_dev == Path('/').stat().st_dev or users.st_dev != state.st_dev or not USERS.samefile(STATE / 'state/workspaces'):
+        raise RuntimeError('Boat storage view changed: /Users must bind the runner state disk workspaces')
+    return state.st_dev, state.st_ino, users.st_ino
+
+
+def watch_storage(pause=time.sleep):
+    expected = tuple(json.loads(STORAGE_EVIDENCE.read_text())['identity'])
+    broken = False
+    while True:
+        try:
+            if storage_identity() != expected:
+                raise RuntimeError('Boat runner state disk identity changed')
+        except (OSError, RuntimeError) as error:
+            if not broken:
+                print(f'Boat storage unhealthy; withdrawing endpoint readiness: {error}', flush=True)
+            broken = True
+        # Keep removing endpoint-ready on every later poll after a failed check,
+        # even if a restarting endpoint writes the file again.
+        if broken:
+            ENDPOINT_READY.unlink(missing_ok=True)
+        pause(1)
 
 
 def identity_present(path=IDENTITY):
@@ -260,6 +281,8 @@ def main():
     clear_provider_environment()
     if sys.argv[1:] == ['--prepare-storage']:
         return prepare_storage()
+    if sys.argv[1:] == ['--watch-storage']:
+        return watch_storage()
     if sys.argv[1:] == ['--check-mountpoints']:
         for path in (STATE, USERS):
             empty_mountpoint(path)

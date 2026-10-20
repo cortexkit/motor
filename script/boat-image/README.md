@@ -45,14 +45,36 @@ or ioctl failure aborts installation rather than changing copy semantics.
 Both mount points must be empty on the root disk in the image. After hydration,
 `motor-boat-storage.service` checks the current views before mounting anything;
 non-empty directories cause a logged refusal, never automatic deletion or a
-mount hiding existing data. After hydration it unmounts only the **empty public**
-root-disk binds at our two paths, leaving Boat's references under
-`/var/lib/ascii-lazy/sysbind` untouched. It checks the exposed bare directories
-again, mounts XFS, then binds the workspace directory onto `/Users`. Each runner
+mount hiding existing data. The restore gate waits for Boat to retire its public
+ext4 binds at both paths and for five seconds of stable real-disk observations;
+the early restore marker alone does not cover deferred mount cleanup. Boat's
+private bind mounts under `/var/lib/ascii-lazy/sysbind` remain owned by Boat's
+restore agent; Motor does not unmount them. Storage preparation reloads the
+restored unit definitions, starts the XFS mount unit, creates the workspace
+directory on that mount, then starts `Users.mount`. Only systemd mounts these paths.
+Neither mount unit is enabled at boot or depends back on storage preparation.
+Once storage evidence is published, a condition on both units blocks a fresh
+activation from mounting over live state. Re-establishment requires stopping the
+runner, endpoint and storage watcher before restarting storage preparation.
+Each runner
 and endpoint start independently rejects duplicate mount targets and checks the exact XFS
 mount, its loop device's backing file `/var/lib/motor-boat.xfs`, the `/Users`
 bind identity, `reflink=1`, and a real cross-path FICLONE. An active mount unit
 alone is not evidence of usable storage.
+
+Before each Boat job launch the runner also checks the workspace exists on the
+same non-root device as `/Users` and runner state. The storage watcher polls
+device and directory identities once a second and withdraws the endpoint-ready
+marker for the remainder of the watcher's current run if a view changes. It does not
+repair mounts beneath a running daemon. Portable tests cover delayed public-bind
+cleanup, systemd-only activation, live-consumer refusal, and readiness withdrawal;
+the real runner-host probe additionally observes the first twelve seconds after
+readiness, sequential jobs, a seven-minute idle/reclaim interval, and stop/resume.
+At the end, on the disposable clone only, it unmounts `/Users` as deferred cleanup
+would, creates a root-disk workspace sentinel, and requests `Users.mount` again.
+The sentinel must remain visible without an overmount, and endpoint readiness
+must disappear. This deterministic replay fails on images that remount over
+populated `/Users`, even when the original restore timing race does not occur.
 
 This keeps the server's reflink contract and cache behavior unchanged; a copy
 fallback would broaden runner semantics and hide unsupported storage. The live
@@ -185,8 +207,9 @@ image is built (`install.py`, followed by `daemon-reload` and
    switch to the real disk came 48 s later.
 2. **`motor-boat-restored.service` gates everything.** The runner, its XFS
    mount (and so `/Users`), the endpoint and the identity watcher all require
-   it. It waits until that file is gone and none of those directories is served
-   by FUSE, for at most 30 minutes. Starting earlier strands work on the FUSE
+    it. It waits until that file is gone, none of those directories is served
+    by FUSE, and Boat's public storage binds are gone for five seconds, for at
+    most 30 minutes. Starting earlier strands work on the FUSE
    view: the previous image's inotify path unit stayed armed on the retired
    `/etc` and never saw the broker's identity file, and the runner's first
     start failed because its state mounts were moved aside mid-start.
@@ -197,8 +220,11 @@ image is built (`install.py`, followed by `daemon-reload` and
    required both mount units, but those dependencies were satisfied by Boat's
    binds: the runner wrote state on ext4, and a later job's mount activation
    hid its workspace and stdin FIFO. The storage service is a direct requirement
-   of both runner and endpoint, and runs before both mount units, so neither an
-   already-active foreign mount nor a later mount activation can bypass it.
+    of both runner and endpoint. It starts the mount units itself, after checking
+    both exposed directories and confirming neither consumer has a live PID.
+    After storage evidence is published, a mount-unit condition blocks later
+    activation; it cannot
+    silently repair storage underneath a live runner.
    `/run/motor-boat-storage.json` records verified mount identities, boot ID and
    monotonic time before either service starts. The image snapshot procedure
    stops services and mount units and checks both exposed directories are empty.
@@ -300,7 +326,7 @@ create/hydrate/identity order, use the qualification-only mode:
 set -o pipefail
 <key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
   --verify-prepared-image motor-boat-prepared-213a82180779 \
-  --output .cortexkit/internal-docs/research/boat-storage-old-image --max-minutes 15
+  --output .cortexkit/internal-docs/research/boat-storage-old-image --max-minutes 30
 ```
 
 The old image above must fail storage checks. Substitute the newly prepared

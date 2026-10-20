@@ -142,14 +142,18 @@ class RecipeTests(unittest.TestCase):
         for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
-                self.assertIn('motor-boat-storage.service', values)
+                self.assertNotIn('motor-boat-storage.service', values)
+            self.assertIn('ConditionPathExists=!/run/motor-boat-storage.json', writes[name])
+            self.assertNotIn('WantedBy=', writes[name])
 
     def test_storage_service_orders_all_storage_writers(self):
         for name in ('motor-boat.service', 'motor-boat-host.service'):
             unit = (HERE / name).read_text()
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in unit.splitlines() if line.startswith(directive + '='))
-                self.assertTrue({'Users.mount', r'var-lib-motor\x2dboat.mount', 'motor-boat-storage.service'} <= set(values))
+                self.assertIn('motor-boat-storage.service', values)
+                self.assertNotIn('Users.mount', values)
+                self.assertNotIn(r'var-lib-motor\x2dboat.mount', values)
         storage = (HERE / 'motor-boat-storage.service').read_text()
         self.assertIn('DefaultDependencies=no', storage)
         self.assertIn('Requires=motor-boat-restored.service', storage)
@@ -186,27 +190,6 @@ class RecipeTests(unittest.TestCase):
         with patch.object(start.Path, 'samefile', return_value=True), self.assertRaisesRegex(RuntimeError, 'stacked mount targets'):
             start.users_mount(users)
 
-    def test_only_empty_public_root_disk_binds_are_unmounted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            point = Path(tmp)
-            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
-                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), patch.object(start.subprocess, 'run') as run:
-                start.unmount_root_view(point)
-                run.assert_called_once_with(['/usr/bin/umount', '--', str(point)], check=True)
-            with patch.object(start, 'mounts', return_value=[(str(point), 'xfs', '/dev/loop9')]), \
-                 patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'unexpected storage view'):
-                start.unmount_root_view(point)
-            run.assert_not_called()
-
-    def test_unmount_refuses_underlying_nonempty_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            point = Path(tmp)
-            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
-                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), \
-                 patch.object(start.subprocess, 'run', side_effect=lambda *args, **kwargs: (point / 'hidden-data').touch()), \
-                 self.assertRaisesRegex(RuntimeError, 'non-empty directory'):
-                start.unmount_root_view(point)
-
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
              patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
@@ -228,6 +211,7 @@ class RecipeTests(unittest.TestCase):
             with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
                  patch.object(start.Path, 'read_text', return_value=''), \
                  patch.object(start, 'restore_pending', return_value=None), patch.object(start, 'mounts', return_value=[]), \
+                 patch.object(start.subprocess, 'check_output', return_value='0'), \
                  patch.object(start, 'state_mount', side_effect=RuntimeError('ext4')), \
                  patch.object(start, 'users_mount', side_effect=RuntimeError('ext4')), patch.object(start.subprocess, 'run') as run:
                 with self.assertRaisesRegex(RuntimeError, 'non-empty directory'):
@@ -235,7 +219,7 @@ class RecipeTests(unittest.TestCase):
                 run.assert_not_called()
             self.assertTrue((users / 'job-stdin').exists())
 
-    def test_prepare_storage_mounts_empty_sysbinds_in_order_and_records_readiness(self):
+    def test_prepare_storage_uses_systemd_owners_and_records_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
             state, users, evidence = Path(tmp, 'state'), Path(tmp, 'Users'), Path(tmp, 'evidence')
             with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
@@ -244,14 +228,63 @@ class RecipeTests(unittest.TestCase):
                  patch.object(start, 'mounts', return_value=[]), \
                  patch.object(start, 'state_mount', side_effect=[RuntimeError('ext4'), ('state', 'xfs', 'loop')]), \
                  patch.object(start, 'users_mount', side_effect=RuntimeError('ext4')), \
-                 patch.object(start, 'unmount_root_view') as retire, \
+                 patch.object(start, 'storage_identity', return_value=(1792, 128, 131)), \
+                 patch.object(start.subprocess, 'check_output', return_value='0'), \
                  patch.object(start, 'check_storage', return_value={'reflink': True}), patch.object(start.subprocess, 'run') as run:
                 start.prepare_storage()
-                self.assertEqual([call.args[0] for call in retire.call_args_list], [users, state])
             self.assertEqual([call.args[0] for call in run.call_args_list], [
-                ['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(start.IMAGE), str(state)],
-                ['/usr/bin/mount', '--bind', str(state / 'state/workspaces'), str(users)]])
+                ['/usr/bin/systemctl', 'daemon-reload'],
+                ['/usr/bin/systemctl', 'start', r'var-lib-motor\x2dboat.mount'],
+                ['/usr/bin/systemctl', 'start', 'Users.mount'],
+                ['/usr/bin/systemctl', 'is-active', '--quiet', r'var-lib-motor\x2dboat.mount', 'Users.mount']])
             self.assertGreater(json.loads(evidence.read_text())['verified_monotonic_ns'], 0)
+            self.assertTrue((state / 'state/workspaces').is_dir())
+
+    def test_storage_prepare_refuses_live_consumers_without_clearing_fence(self):
+        with patch.object(start.Path, 'read_text', return_value=''), \
+             patch.object(start, 'restore_pending', return_value=None), \
+             patch.object(start.subprocess, 'check_output', return_value='123'), \
+             patch.object(start.Path, 'unlink') as unlink, patch.object(start.subprocess, 'run') as run, \
+             self.assertRaisesRegex(RuntimeError, 'refusing to change storage'):
+            start.prepare_storage()
+        unlink.assert_not_called()
+        run.assert_not_called()
+
+    def test_deferred_public_bind_cleanup_blocks_readiness_after_marker_removal(self):
+        root = '32 2 253:1 / / rw - ext4 /dev/vda1 rw\n'
+        public = '100 32 253:1 /Users /Users rw - ext4 /dev/vda1 rw\n'
+        self.assertIn('not been retired', start.restore_pending(root + public, False))
+        state = public.replace('/Users', '/var/lib/motor-boat')
+        self.assertIn('not been retired', start.restore_pending(root + state, False))
+        self.assertIsNone(start.restore_pending(root, False))
+        now = [0]
+        def pause(seconds):
+            now[0] += seconds
+        # Model marker removal at zero, deferred cleanup at three, then require
+        # five uninterrupted seconds before storage can be established.
+        def table():
+            return root + (public if now[0] < 3 else '')
+        with patch.object(start.Path, 'read_text', side_effect=table), \
+             patch.object(start.RESTORE_ACTIVE.__class__, 'exists', return_value=False):
+            start.wait_restored(clock=lambda: now[0], pause=pause)
+        self.assertEqual(now[0], 3 + start.RESTORE_STABLE_S)
+
+    def test_storage_watch_withdraws_readiness_and_stays_failed_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, marker = Path(tmp, 'evidence'), Path(tmp, 'ready')
+            evidence.write_text(json.dumps({'identity': [1792, 128, 131]}))
+            marker.touch()
+            observations = []
+            def pause(_):
+                observations.append(marker.exists())
+                marker.touch()  # A restarting endpoint cannot restore admission.
+                if len(observations) == 3:
+                    raise InterruptedError('stop watcher')
+            with patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'ENDPOINT_READY', marker), \
+                 patch.object(start, 'storage_identity', side_effect=[(1792, 128, 131), RuntimeError('view lost'), (1792, 128, 131)]), \
+                 self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(observations, [True, False, False])
 
     def test_runner_refuses_unmounted_storage_before_spawning(self):
         with patch.object(sys, 'argv', ['start', 'serve']), \
