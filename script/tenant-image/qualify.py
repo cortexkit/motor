@@ -592,7 +592,7 @@ class Harness:
         lease_body = dict(job_id=identifier, vcpus=1, platform="linux-x64", net=False,
                           workspace_key_hash=b64(hmac.digest(self.salt, ("ck-ws-v1\n" + WORKSPACE).encode(), "sha256")),
                           repo_hash=b64(hmac.digest(self.salt, ("ck-repo-v1\n" + WORKSPACE).encode(), "sha256")),
-                          placement_hint=None, timeout_s=30, requester_jwk=self.requester_jwk)
+                          placement_hint=None, avoid_host=None, timeout_s=30, requester_jwk=self.requester_jwk)
         request = urllib.request.Request(f"http://127.0.0.1:{self.broker_port}/v1/leases",
                                          data=json.dumps(lease_body).encode(),
                                          headers={"Authorization": "Bearer " + self.bearer, "Content-Type": "application/json"})

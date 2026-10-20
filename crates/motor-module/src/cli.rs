@@ -60,7 +60,8 @@ See `ck motor run --help` for the options and exit statuses.";
 
 pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
-                    [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...
+                    [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
+                    [--allow-spill | --hosted] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
 that contains --cwd (default: the current directory), and streams its stdout
@@ -79,6 +80,10 @@ and stderr here as they arrive.
   --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
   --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
   --allow-spill       allow this gate job to spill to hosted capacity when configured
+  --hosted            operator test of the hosted path: run this one job on a
+                      hosted runner, never on the build server; a lease that
+                      can't be granted or connected refuses (200). Needs a
+                      broker configured in ck-motor (else 204)
 
 The words after -- are joined with single spaces into one command line, which
 bash runs on the runner (bash -c). Quote shell syntax as one argument:
@@ -115,6 +120,7 @@ pub struct RunArgs {
     pub return_paths: Vec<String>,
     pub return_max_bytes: Option<u64>,
     pub allow_spill: bool,
+    pub hosted: bool,
 }
 
 /// Parse the words after `ck motor run`. An option takes its value as the
@@ -131,6 +137,9 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             if parsed.command.iter().all(|word| word.trim().is_empty()) {
                 return Err("no command after --".into());
             }
+            if parsed.hosted && parsed.allow_spill {
+                return Err("--hosted and --allow-spill cannot be combined".into());
+            }
             return Ok(Invocation::Run(parsed));
         }
         if word == "-h" || word == "--help" {
@@ -138,6 +147,10 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
         if word == "--allow-spill" {
             parsed.allow_spill = true;
+            continue;
+        }
+        if word == "--hosted" {
+            parsed.hosted = true;
             continue;
         }
         let (name, inline) = match word.split_once('=') {
@@ -575,6 +588,16 @@ async fn consume<C: ExecClient + ?Sized>(
                     );
                     return EXIT_REFUSED;
                 }
+                if !received
+                    && failure.code.as_deref() == Some(crate::module::HOSTED_TEST_UNAVAILABLE)
+                {
+                    let _ = writeln!(
+                        err,
+                        "ck motor {name}: --hosted unavailable: {}",
+                        failure.message
+                    );
+                    return EXIT_USAGE;
+                }
                 let _ = writeln!(
                     err,
                     "ck motor {name}: outcome unknown: {}. {}",
@@ -786,6 +809,7 @@ pub struct SubcClient {
     module_id: String,
     returns: crate::ReturnOptions,
     allow_spill: bool,
+    hosted: bool,
 }
 
 impl SubcClient {
@@ -826,6 +850,7 @@ impl SubcClient {
             module_id,
             returns: crate::ReturnOptions::default(),
             allow_spill: false,
+            hosted: false,
         })
     }
 
@@ -897,6 +922,9 @@ impl ExecClient for SubcClient {
         let mut params = self.returns.params(request);
         if self.allow_spill {
             params["allow_spill"] = json!(true);
+        }
+        if self.hosted {
+            params["hosted"] = json!(true);
         }
         self.subscribe("exec.run", params, None).await
     }
@@ -1014,6 +1042,7 @@ pub async fn main(args: &[String]) -> u8 {
             .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
     };
     client.allow_spill = args.allow_spill;
+    client.hosted = args.hosted;
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     drive_run(
@@ -1225,6 +1254,7 @@ mod tests {
                 return_paths: Vec::new(),
                 return_max_bytes: None,
                 allow_spill: false,
+                hosted: false,
             }
         );
         assert_eq!(command_line(&args.command), "cargo test -p x");
@@ -1242,6 +1272,15 @@ mod tests {
             panic!("expected a run")
         };
         assert!(args.allow_spill);
+        assert!(!args.hosted);
+        let Ok(Invocation::Run(args)) = parse_args(&words("--hosted -- true")) else {
+            panic!("expected a run")
+        };
+        assert!(args.hosted && !args.allow_spill);
+        assert_eq!(
+            parse_args(&words("--hosted --allow-spill -- true")),
+            Err("--hosted and --allow-spill cannot be combined".into())
+        );
         assert!(args.env.is_empty() && args.siblings.is_empty());
         // Everything after -- belongs to the command, options included.
         let Ok(Invocation::Run(args)) = parse_args(&words("-- ls --help")) else {

@@ -210,6 +210,10 @@ impl FakeBroker {
             })
             || !valid_keyed_hash(&request.workspace_key_hash)
             || !valid_keyed_hash(&request.repo_hash)
+            || request
+                .avoid_host
+                .as_deref()
+                .is_some_and(|h| !valid_name(h))
         {
             return BrokerReply::error(400, "bad_request");
         }
@@ -234,6 +238,11 @@ impl FakeBroker {
         } else {
             if let Some((status, code)) = &self.knobs.refusal {
                 return BrokerReply::error(*status, code);
+            }
+            // The fake serves a single host. When the lease avoids it, nothing
+            // else is selectable, which the contract answers as no capacity.
+            if request.avoid_host.as_deref() == Some(self.config.placement.host.as_str()) {
+                return BrokerReply::error(503, "no_capacity");
             }
             let used: u64 = self
                 .jobs

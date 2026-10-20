@@ -365,6 +365,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
             booked_request["repo_hash"].as_str().unwrap().into(),
         ),
         serde_json::from_value(booked_request["placement_hint"].clone()).unwrap(),
+        serde_json::from_value(booked_request["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
     )
     .unwrap();
@@ -380,6 +381,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
             "workspace_key_hash",
             "repo_hash",
             "placement_hint",
+            "avoid_host",
             "timeout_s",
         ] {
             assert_eq!(
@@ -763,4 +765,341 @@ fn cloud_boat_vector_token_memory_is_accepted_for_boat_only() {
         resource_mismatch(&wrong, &body, true).map(|(field, ..)| field),
         Some("max_s")
     );
+}
+
+/// The `avoid_host` value of every lease request the broker saw, in order.
+fn avoided(requests: &test_http::Requests) -> Vec<serde_json::Value> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/v1/leases")
+        .map(|(_, body)| body["avoid_host"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it() {
+    let scratch = cortexkit_test_support::ScratchDir::new("boat-avoid-host");
+    let path = scratch.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+    // An ordinary hosted route avoids no host, even when the spill key is set.
+    let ordinary = Boat::new(0, true).await;
+    let config = Config {
+        spill_avoid_host: Some("build-server-1".into()),
+        ..ordinary.config.clone()
+    };
+    let storage = Arc::new(Storage::open(&scratch.join("ordinary")).unwrap());
+    let id = Uuid::now_v7();
+    storage.create(id, 300, None, None, false).unwrap();
+    let route = HostedJobState::new(&config);
+    storage.hosted_route(id, route.clone()).unwrap();
+    Client::new(route)
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    assert_eq!(avoided(&ordinary.requests), [serde_json::Value::Null]);
+
+    // A spilled route carries the build server's host id. The broker answers
+    // provisioning twice, so the first run sends three lease requests.
+    let boat = Boat::new(2, true).await;
+    let config = Config {
+        spill_avoid_host: Some("build-server-1".into()),
+        ..boat.config.clone()
+    };
+    let storage = Arc::new(Storage::open(&scratch.join("spilled")).unwrap());
+    let id = Uuid::now_v7();
+    storage.create(id, 300, None, None, false).unwrap();
+    let mut route = HostedJobState::new(&config);
+    route.spill_wait_ms = Some(45_000);
+    route.avoid_host = config.spill_avoid_host.clone();
+    storage.hosted_route(id, route.clone()).unwrap();
+    let (channel, _) = Client::new(route)
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    drop(channel);
+    assert_eq!(avoided(&boat.requests), ["build-server-1"; 3]);
+    // After a restart the job's stored lease body is sent again, unchanged,
+    // whatever the configuration says now.
+    drop(storage);
+    let storage = Arc::new(Storage::open(&scratch.join("spilled")).unwrap());
+    let route = storage.job(id).unwrap().hosted.unwrap();
+    Client::new(route)
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    assert_eq!(avoided(&boat.requests), ["build-server-1"; 4]);
+}
+
+#[test]
+fn a_lease_body_stored_before_avoid_host_existed_loads_as_avoiding_none() {
+    let mut body = serde_json::to_value(
+        lease_body(
+            Uuid::now_v7(),
+            &RunRequest::new("/home/a", "/home/a", "/home/a", "true").with_timeout(30),
+            (
+                motor_lease::base64url(&[1; 32]),
+                motor_lease::base64url(&[2; 32]),
+            ),
+            None,
+            Some("build-server-1".into()),
+            RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let state = |body: &serde_json::Value| {
+        serde_json::from_value::<HostedJobState>(serde_json::json!({
+            "hosted_no_fallback": false, "hosted_code": null, "placement": null,
+            "endpoint": null, "endpoint_spki_sha256": null, "max_runtime_s": null,
+            "billed_vcpu_ms": null, "billing": "pending", "terminal": null,
+            "broker_url": "https://runners.example", "token_source": "fake",
+            "lease_request": body,
+        }))
+        .unwrap()
+        .lease_request
+        .unwrap()
+    };
+    assert_eq!(state(&body).avoid_host.as_deref(), Some("build-server-1"));
+    body.as_object_mut().unwrap().remove("avoid_host");
+    assert_eq!(state(&body).avoid_host, None);
+}
+
+/// A git checkout with one commit below this crate's target directory. Hosted
+/// workspace paths must be under /Users or /home, so the tests using it need a
+/// checkout in one of those roots, which test scratch directories are not.
+fn committed_repo() -> (tests::harness::Scratch, std::path::PathBuf) {
+    let scratch = tests::harness::Scratch(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("hosted-fixture-{}", Uuid::now_v7())),
+    );
+    let repo = scratch.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(allowed_path(&std::fs::canonicalize(&repo).unwrap()));
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    (scratch, repo)
+}
+
+/// Every output byte of `stream`, and its terminal.
+async fn records(mut stream: crate::JobStream) -> (Vec<u8>, TerminalRecord) {
+    let mut output = Vec::new();
+    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match stream.records.recv().await.unwrap().unwrap() {
+                StreamRecord::Output(record) => output.extend(record.bytes.0),
+                StreamRecord::Terminal(terminal) => break terminal,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    (output, terminal)
+}
+
+/// A broker that has no capacity for any lease.
+async fn no_capacity_broker() -> Http {
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (503, serde_json::json!({"error":"no_capacity"}))
+        } else {
+            (404, serde_json::json!({"error":"not_found"}))
+        }
+    })
+    .await
+}
+
+fn broker_config(http: &Http) -> Config {
+    Config {
+        runner_instance: "test".into(),
+        broker_url: Some(http.url.clone()),
+        broker_token_source: BrokerTokenSource::Fake,
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_back() {
+    let http = no_capacity_broker().await;
+    let scratch = cortexkit_test_support::ScratchDir::new("direct-hosted-route");
+    let config = Config {
+        spill_to_hosted: true,
+        spill_avoid_host: Some("build-server-1".into()),
+        ..broker_config(&http)
+    };
+    assert!(!config.hosted_runners);
+    let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
+    let motor = crate::Motor::with_connector(config, &scratch.join("state"), ssh.clone()).unwrap();
+    // A path outside the hosted roots refuses before any lease or snapshot.
+    let request =
+        RunRequest::new("/tmp/missing", "/tmp/missing", "/tmp/missing", "true").with_timeout(30);
+    let stream = motor
+        .run_direct_hosted(request.clone(), None, crate::ReturnOptions::default())
+        .unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_test && state.hosted_no_fallback);
+    assert_eq!(state.spill_wait_ms, None);
+    assert_eq!(state.avoid_host, None);
+    assert_eq!(
+        state.hosted_code.as_deref(),
+        Some("hosted_path_outside_roots")
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0, "no build-server fallback");
+    // The next job is not hosted: hosted routing stayed off.
+    let stream = motor.run_direct(request, None).unwrap();
+    let id = stream.job_id;
+    records(stream).await;
+    assert!(motor.hosted_state(id).is_none());
+    assert!(ssh.0.load(Ordering::SeqCst) >= 1);
+    assert!(http.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hosted_test_lease_is_not_retried_for_capacity_and_keeps_the_broker_code() {
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-test-capacity");
+    let path = scratch.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+    for hosted_test in [true, false] {
+        let http = no_capacity_broker().await;
+        let config = broker_config(&http);
+        let storage = Arc::new(Storage::open(&scratch.join(format!("{hosted_test}"))).unwrap());
+        let id = Uuid::now_v7();
+        storage.create(id, 300, None, None, true).unwrap();
+        let mut route = HostedJobState::new(&config);
+        route.hosted_test = hosted_test;
+        storage.hosted_route(id, route.clone()).unwrap();
+        let client = Client::new(route);
+        assert_eq!(
+            client.run(id, &request, &storage).await.err(),
+            Some(Error::Capacity)
+        );
+        assert_eq!(client.broker_code().as_deref(), Some("no_capacity"));
+        // A hosted test asks once; an ordinary hosted job tries three times.
+        let avoided = avoided(&http.requests);
+        assert_eq!(avoided.len(), if hosted_test { 1 } else { 3 });
+        assert!(avoided.iter().all(serde_json::Value::is_null));
+    }
+    assert_eq!(
+        Error::Capacity.detail_with_broker_code(Some("no_capacity")),
+        "hosted_capacity: broker no_capacity"
+    );
+    assert_eq!(
+        Error::Capacity.detail_with_broker_code(None),
+        "hosted_capacity"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires checkout under /Users or /home"]
+async fn direct_hosted_job_runs_on_a_lease_avoiding_no_host_with_hosted_routing_off() {
+    use tests::harness::{Behavior, Harness};
+    // The runner drops the connection after the Run frame, so the result
+    // arrives by reattach, as in the hosted snapshot test.
+    let h = Harness::new(Behavior::DropRunAck).await;
+    h.broker.lock().unwrap().knobs.max_s = Some(30);
+    let (scratch, repo) = committed_repo();
+    // `test-host` is the fake broker's only host. Configuring it as the host
+    // a spill avoids shows this job avoids no host: a lease avoiding it would
+    // have no capacity.
+    let config = Config {
+        hosted_runners: false,
+        spill_to_hosted: true,
+        spill_avoid_host: Some("test-host".into()),
+        ..h.config()
+    };
+    let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let stream = motor
+        .run_direct_hosted(
+            Harness::request(&repo).with_timeout(120),
+            None,
+            crate::ReturnOptions::default(),
+        )
+        .unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 }, "{terminal:?}");
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.as_str() == "/v1/leases")
+            .count(),
+        1
+    );
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_test);
+    assert_eq!(state.lease_request.unwrap().avoid_host, None);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires checkout under /Users or /home"]
+async fn direct_hosted_lease_refusal_is_typed_at_once_and_never_falls_back() {
+    let http = no_capacity_broker().await;
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(broker_config(&http), &scratch.0.join("state"), ssh.clone())
+            .unwrap();
+    let path = repo.to_str().unwrap();
+    let stream = motor
+        .run_direct_hosted(
+            RunRequest::new(path, path, path, "true").with_timeout(30),
+            None,
+            crate::ReturnOptions::default(),
+        )
+        .unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some("hosted_capacity: broker no_capacity")
+    );
+    // One lease request: no capacity retries, and no build-server fallback.
+    assert_eq!(avoided(&http.requests), [serde_json::Value::Null]);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_no_fallback);
+    assert_eq!(state.hosted_code.as_deref(), Some("hosted_capacity"));
 }

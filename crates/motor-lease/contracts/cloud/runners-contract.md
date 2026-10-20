@@ -78,7 +78,7 @@ exponent. Body field order need not match the canonical order.
 | --- | --- |
 | `job_id` | Lowercase UUIDv7: `^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$` |
 | `workspace_key_hash`, `repo_hash` | `^[A-Za-z0-9_-]{43}$`: opaque to the broker, which checks only this shape and compares values for equality (see below) |
-| `platform`, `host_id`, warm `vm` | `^[A-Za-z0-9._-]{1,64}$` |
+| `platform`, `host_id`, warm `vm`, non-null `avoid_host` | `^[A-Za-z0-9._-]{1,64}$` |
 | Account ULID | `^[0-7][0-9A-HJKMNP-TV-Z]{25}$` |
 | Warm `tenant` | `acct:` followed by an account ULID |
 | `requester_jwk` | Exactly `{kty:"OKP",crv:"Ed25519",x}`, where `x` is unpadded base64url encoding 32 bytes |
@@ -117,7 +117,7 @@ Every error body is exactly `{"error":"<code>"}`, with no other member.
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 500 | `internal` |
-| 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal names a longer wait |
+| 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal or the tenant's Boat start limit names a longer wait |
 
 Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
 retryable transport failures. `sandbox_lost` is final for that job: its Boat sandbox stopped or
@@ -136,14 +136,26 @@ The exact body fields, in canonical order, are:
 
 ```text
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
- placement_hint, timeout_s, requester_jwk}
+ placement_hint, avoid_host, timeout_s, requester_jwk}
 ```
 
 `vcpus` is 1–64 and `timeout_s` 10–7200. `net` is boolean. There is no client `mem_mib` field:
 the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
-grammar. A matching selectable warm placement is preferred; an unusable hint falls back to
-normal placement. Other strings and the requester key follow the common grammars.
+grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
+send back the placement it was last given. A matching selectable warm placement is preferred; an
+unusable hint, including any `boat:` hint, falls back to normal placement. Other strings and the requester key follow the grammar table under "Common wire rules" above.
+
+`avoid_host` is required: JSON `null`, or a host id string matching
+`^[A-Za-z0-9._-]{1,64}$` (no `boat:` prefix; a Boat sandbox is not a host). A body without the
+key, or with any other value, is 400 `bad_request`. The named host is not selectable for this
+lease, even when `placement_hint` names it; placement proceeds through the other hosts and then
+Boat spill exactly as if that host had failed selection. ck-motor sends the host it is spilling
+away from, so a job leaving a busy machine is never placed back on it. Because the host stays
+registered, a platform served only by the avoided host answers `no_capacity` (or spills), not
+`platform_unsupported`. A value naming no registered host, and `null`, change nothing. The lease
+hash covers `avoid_host`, so a re-request must repeat it exactly; a different value is 409
+`job_conflict`.
 
 After authentication and schema validation, checks proceed in this order:
 
@@ -413,7 +425,8 @@ the broker's reservation authority. Allowances are lifetime vCPU-ms; a missing r
 
 When no registered host fits a lease, the broker can spill it to a Boat (boat.dev) sandbox that it
 drives through Boat's API. Spill is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
-is configured. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
+is configured; with it off no lease spills, while sandboxes that already exist are still stopped
+and cleaned up. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
 serves at most one live lease**. Placement hints never select a sandbox.
 
 **Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), and `BOAT_SIZES`
@@ -424,21 +437,42 @@ fitting size is 503 `no_capacity`.
 **Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
 lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
 (after a Boat 429 or 503), the lease is 503 `no_capacity` at once with that wait as Retry-After.
-Then a provisioning record keyed by `job_id` claims a pool slot: a free ready sandbox, else an
-archived one to resume, else one being stopped (waited for, then resumed), else a new sandbox
-under the cap and a limit of 6 creates per tenant per hour. No slot is 503 `no_capacity`.
+Then, in one transaction that computes the budget candidate again (402 `budget_exhausted` below
+10 seconds), a provisioning record keyed by `job_id` claims a pool slot: a free ready sandbox,
+else an archived one to resume, else one being stopped (waited for, then resumed), else a new
+sandbox under the cap. Every slot but a free ready one needs a start (a create or a resume), and
+a tenant gets at most its hourly start limit in any hour, resumes included: the account's own
+limit when the operator set one (1 to 1000), else `BOAT_MAX_STARTS_PER_HOUR` (6). Past that the
+lease is 503 `no_capacity` with Retry-After the wait until a start leaves the hour. No slot is
+503 `no_capacity`.
 
-**Provisioning reply.** While the claimed sandbox starts, the answer is **202** with exactly
-`{"status":"provisioning","retry_after_ms":5000}`. No budget is held. A re-request with the same
-`job_id` and lease hash joins the record and answers from broker state; a different body is 409
-`job_conflict`. A record lives 120 seconds; after that, or after Boat refuses to start the
-sandbox (answered once as 503 `no_capacity` with Boat's wait), the next re-request starts over.
+**Provisioning hold.** The claiming transaction reserves a provisioning hold of
+`min(vcpus × 60000, vcpus × max_s × 1000)` vCPU-ms, the minimum a booked Boat job is charged; it
+appears in the tenant's `reserved_vcpu_ms`. Booking turns the hold into the job's reservation. A
+record that ends without a booking (it expired, Boat refused the start, or the budget was gone)
+**charges the hold** if a Boat create or resume was sent for it: it moves to `settled_vcpu_ms`,
+reason `lost`, on the broker clock, and like every Boat settlement is never counted in the usage
+aggregate. This includes a resume whose reply was lost and whose retry Boat then refused: the first
+attempt may have started the machine. A record that started nothing releases its hold.
+
+**Provisioning reply.** While the claimed sandbox starts (until Boat reports it `ready` and
+`hydrated`, then through setup), the answer is **202** with exactly
+`{"status":"provisioning","retry_after_ms":5000}`. A re-request with the same `job_id` and lease
+hash joins the record and answers from broker state; a different body is 409 `job_conflict`. A
+record lives 180 seconds; after that, or after Boat refuses to start the sandbox (answered once as
+503 `no_capacity` with Boat's wait), the next re-request starts over. A re-request after the record
+expired is a new lease in every respect: registered hosts are tried first, so its answer can be an
+ordinary host reply (201, no `provider`) for the same `job_id`, and Boat is used only if no host
+fits.
 
 **Booking.** The reservation is booked in the request that returns the lease, in one transaction
-that re-checks the budget, and only if Boat's auto-stop for the sandbox falls after the lease's
-deadline. A booked Boat job is **admitted at booking**: release answers 409 `job_admitted`. The
-key file is then written and read back; if that fails the job stays booked and re-requests
-answer 202 while the broker retries, and after 3 failures the job settles as `lost`.
+that re-checks the budget (counting the record's own hold as available) and that the record is
+the same one the request read (same generation and lease hash, before its deadline on the
+broker's current clock, a sandbox of its size), and only if Boat's auto-stop for the sandbox falls
+after the lease's deadline. Anything else answers 202, and the re-request decides afresh. A
+booked Boat job is **admitted at booking**: release answers 409 `job_admitted`. The key file is
+then written and read back; if that fails the job stays booked and re-requests answer 202 while
+the broker retries, and after 3 failures the job settles as `lost`.
 
 **Reply.** **201** with exactly these fields, in this order (reattach uses the same shape with
 200 and an `attach` token):
@@ -485,10 +519,18 @@ machine-time meter per run window) are recorded in D1 only, until a billing rule
 
 - Tenant sandboxes are created confined (`noEnv`), so the snapshot must not depend on any account
   secret, and is built from a `noEnv` sandbox through the clean image pipeline.
-- The broker writes `/etc/motor/tenant/id` once per sandbox, root-owned `0444`, holding the
-  sandbox id as ASCII with no newline; a resume keeps it. The runner reads it, refuses all
+- The broker writes `/etc/motor/tenant/id` after every create or resume, once Boat reports the
+  sandbox hydrated, root-owned `0444`, holding the sandbox id as ASCII with no newline: it stages
+  the id with Boat's file API at `/tmp/ck-motor-tenant-id`, then runs `sudo install -D -m 0444 -o
+  root -g root /tmp/ck-motor-tenant-id /etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id &&
+  cat /etc/motor/tenant/id` and requires the printed id back. The runner reads it, refuses all
   connections while it is missing, and checks the token's `aud` equals `boat:<id>`.
 - The runner listens only on `127.0.0.1:9443`.
+- Once the runner listens with its signing keys loaded, the image writes `/run/motor/endpoint-ready`
+  holding the sandbox id (the content of `/etc/motor/tenant/id`, a trailing newline allowed). The
+  broker reads it with the fixed command `cat /run/motor/endpoint-ready` through Boat's exec API
+  after every start, create or resume, and books no lease onto the sandbox until it names this
+  sandbox. `/run` is cleared at boot, so the marker always belongs to the current start.
 - sshd sets `AllowTcpForwarding local`, `PermitTTY no`, `AllowAgentForwarding no`,
   `X11Forwarding no` and `PermitTunnel no`, and the boot unit empties `authorized_keys` on every
   resume.

@@ -92,6 +92,47 @@ or CKCRED service. A separate in-process fake daemon test,
 checks the production SDK transport's route identity and wire envelope without
 claiming real service or nonce-issuance qualification.
 
+## Smoke-test the hosted path
+
+`ck motor run --hosted -- COMMAND` sends one job straight to a hosted lease, so
+an operator can test the broker, a hosted runner and the account token before
+turning hosted routing on. It does not set `hosted_runners` or spill, and no
+other job changes route.
+
+- Only a direct caller can ask for it, and only while `admit_direct_exec` is
+  on. The agent's and scheduler's routes cannot: their requests ignore the key.
+- ck-motor needs `broker_url` and a usable broker token source (the account
+  vault, which the installed module always has). Without them the command
+  creates no job and exits 204 with `--hosted unavailable:` and the reason.
+- The lease avoids no host (`avoid_host` is null) and is not retried for
+  capacity: a `no_capacity` or `host_full` answer refuses at once.
+- The result returns as for any direct job: the command's exit code, with the
+  job ID and reattach secret on stderr. A lease that can't be granted or
+  connected is a before-start refusal, exit 200, whose detail is the hosted code
+  followed by the broker's error code, for example
+  `hosted_capacity: broker no_capacity`. It never falls back to the build
+  server: the point is to test the hosted path.
+
+Run it from a checkout under `/Users` or `/home`, with a timeout:
+
+```sh
+ck motor run --hosted --timeout 120 -- 'uname -a; nproc'
+```
+
+Check that the output comes from the hosted runner and the exit status is the
+command's. Tests: `direct_hosted_job_runs_on_a_lease_avoiding_no_host_with_hosted_routing_off`
+and `direct_hosted_lease_refusal_is_typed_at_once_and_never_falls_back` (both
+need a checkout under `/Users` or `/home`, so they are ignored by default),
+`direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_back`,
+`hosted_test_lease_is_not_retried_for_capacity_and_keeps_the_broker_code` and
+`hosted_runs_are_direct_only_and_need_a_configured_broker`.
+
+Ordinary hosted leases also avoid no host. A lease spilled from the build
+server names the build server's broker host id from the ck-motor config key
+`spill_avoid_host` (omitted when unset), so the job is never placed back on the
+machine it left; the value is stored with the job and every re-request repeats
+it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
+
 ## Enable on one machine
 
 1. Preserve the current unit, config and rollback binary. Record the **deployed**

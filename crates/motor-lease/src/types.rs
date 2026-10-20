@@ -107,6 +107,12 @@ pub struct LeaseRequest {
     pub repo_hash: String,
     #[serde(deserialize_with = "required_nullable")]
     pub placement_hint: Option<Placement>,
+    /// A host the broker must not place this lease on, even when
+    /// `placement_hint` names it: null, or a host id in the common name
+    /// grammar. Required on the wire, and covered by the lease hash, so every
+    /// re-request of a job must repeat the value it was first sent with.
+    #[serde(deserialize_with = "required_nullable")]
+    pub avoid_host: Option<String>,
     pub timeout_s: u64,
     pub requester_jwk: RequesterJwk,
 }

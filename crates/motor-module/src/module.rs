@@ -536,6 +536,11 @@ pub fn direct_timeout_refusal(timeout: Option<u64>, cap: u64) -> Option<String> 
     }
 }
 
+/// The error code for a direct `ck motor run --hosted` this ck-motor can't
+/// serve, because it has no broker URL or no broker token source. Nothing was
+/// created; the CLI exits with its bad-arguments status.
+pub(crate) const HOSTED_TEST_UNAVAILABLE: &str = "motor_hosted_test_unavailable";
+
 /// What a direct caller gets for a job its route did not start. The bytes are
 /// the same whether the job belongs to another caller or does not exist, so a
 /// direct caller can't learn which job IDs are live.
@@ -547,6 +552,27 @@ fn direct_job_not_found(module_id: &str) -> HandlerOutcome {
 }
 
 impl Handler {
+    /// Why this ck-motor can't send a direct job straight to a hosted lease,
+    /// or `None` when it can: that needs a configured broker URL and a broker
+    /// token source able to mint a bearer (the account vault, or the fake
+    /// token outside the main runner instance).
+    fn hosted_test_unavailable(&self) -> Option<String> {
+        if self.config.broker_url.is_none() {
+            return Some(format!(
+                "{} has no broker_url configured, so it cannot run a job on a hosted runner",
+                self.module_id
+            ));
+        }
+        match self.config.broker_token_source {
+            crate::config::BrokerTokenSource::CkAccount if self.account_tokens.is_none() => {
+                Some(format!(
+                    "{} has no account token source, so it cannot run a job on a hosted runner",
+                    self.module_id
+                ))
+            }
+            _ => None,
+        }
+    }
     /// Requests on a route the daemon attested as `Principal::Direct`. Enabling
     /// `admit_direct_exec` permits these local non-agent callers to start jobs and
     /// attach to, cancel or check jobs their route started or whose secret they
@@ -585,8 +611,21 @@ impl Handler {
                 struct SpillOptions {
                     #[serde(default)]
                     allow_spill: bool,
+                    /// `ck motor run --hosted`: send this job straight to a
+                    /// hosted lease. Only this direct route reads it; the
+                    /// agent route's request parser ignores the key.
+                    #[serde(default)]
+                    hosted: bool,
                 }
                 let spill: SpillOptions = parse(envelope.params.clone())?;
+                if spill.hosted {
+                    if let Some(message) = self.hosted_test_unavailable() {
+                        return Ok(HandlerOutcome::Error {
+                            code: HOSTED_TEST_UNAVAILABLE.into(),
+                            message,
+                        });
+                    }
+                }
                 let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
                 let request: RunRequest = parse(envelope.params)?;
                 let motor = self.initialized()?;
@@ -612,12 +651,20 @@ impl Handler {
                         return Ok(HandlerOutcome::Streamed);
                     }
                 };
-                let stream = motor.run_direct_with_spill(
-                    request,
-                    self.attribution(route, envelope.preset),
-                    returns,
-                    spill.allow_spill,
-                )?;
+                let stream = if spill.hosted {
+                    motor.run_direct_hosted(
+                        request,
+                        self.attribution(route, envelope.preset),
+                        returns,
+                    )?
+                } else {
+                    motor.run_direct_with_spill(
+                        request,
+                        self.attribution(route, envelope.preset),
+                        returns,
+                        spill.allow_spill,
+                    )?
+                };
                 motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
                 self.direct_jobs
                     .lock()

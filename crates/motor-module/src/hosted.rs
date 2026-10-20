@@ -56,8 +56,19 @@ pub struct HostedJobState {
     pub(crate) placement_attempts: u8,
     #[serde(default)]
     pub(crate) retry_iat: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "stored_lease_request")]
     pub(crate) lease_request: Option<LeaseRequest>,
+    /// The host the broker must not place this job's lease on. Only a spill
+    /// sets it, to the build server's host id; it is fixed when the route is
+    /// created and copied into the stored lease body, so every re-request of
+    /// the job repeats it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) avoid_host: Option<String>,
+    /// The job was sent straight to a hosted lease by a direct caller's
+    /// `ck motor run --hosted`, to test the hosted path. Its lease is not
+    /// retried for capacity and the job never falls back to the build server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) hosted_test: bool,
     /// Set durably just before ck-motor sends the Run frame to a hosted
     /// runner. Until then no runner holds the command, so whatever happened to
     /// the lease, the job provably never ran; afterwards it may have.
@@ -65,6 +76,24 @@ pub struct HostedJobState {
     pub(crate) run_sent: bool,
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
+}
+/// Reads a stored lease body. Bodies stored before the broker required
+/// `avoid_host` lack the key; they are read as avoiding no host, so an older
+/// job record still loads instead of making the whole store unreadable.
+fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<LeaseRequest>, D::Error> {
+    let Some(mut body) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(fields) = body.as_object_mut() {
+        fields
+            .entry("avoid_host")
+            .or_insert(serde_json::Value::Null);
+    }
+    serde_json::from_value(body)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
     pub(crate) fn new(config: &Config) -> Self {
@@ -204,6 +233,14 @@ impl Error {
             self.code().into()
         }
     }
+    /// [`Self::detail`], followed by the broker's own error code when it
+    /// sent one, as `hosted_capacity: broker no_capacity`.
+    pub(crate) fn detail_with_broker_code(self, broker_code: Option<&str>) -> String {
+        match broker_code {
+            Some(code) => format!("{}: broker {code}", self.detail()),
+            None => self.detail(),
+        }
+    }
     pub(crate) fn retry_after_ms(self) -> Option<u64> {
         match self {
             Self::AccountTransient(delay) => delay,
@@ -332,6 +369,7 @@ fn lease_body(
     request: &RunRequest,
     hashes: (String, String),
     hint: Option<Placement>,
+    avoid_host: Option<String>,
     requester_jwk: RequesterJwk,
 ) -> Result<LeaseRequest, Error> {
     Ok(LeaseRequest {
@@ -342,6 +380,7 @@ fn lease_body(
         workspace_key_hash: hashes.0,
         repo_hash: hashes.1,
         placement_hint: hint.filter(|placement| placement.vm.is_some()),
+        avoid_host,
         timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
         requester_jwk,
     })
@@ -356,6 +395,9 @@ pub(crate) struct Client {
     http: reqwest::Client,
     route: HostedJobState,
     account_tokens: Option<Arc<account::AccountTokens>>,
+    /// The `error` code of the broker's last refusal, when it was a valid
+    /// name. A direct hosted test shows it to the operator.
+    broker_code: std::sync::Mutex<Option<String>>,
 }
 impl Client {
     pub(crate) fn new(route: HostedJobState) -> Self {
@@ -367,7 +409,12 @@ impl Client {
                 .expect("HTTP client configuration"),
             route,
             account_tokens: None,
+            broker_code: std::sync::Mutex::new(None),
         }
+    }
+    /// The `error` code of the broker's last refusal seen by this client.
+    pub(crate) fn broker_code(&self) -> Option<String> {
+        self.broker_code.lock().unwrap().clone()
     }
     pub(crate) fn with_account_tokens(
         mut self,
@@ -453,6 +500,7 @@ impl Client {
                 broker_code,
                 "hosted broker refused"
             );
+            *self.broker_code.lock().unwrap() = broker_code.map(str::to_owned);
             return Err(
                 match code
                     .as_ref()
@@ -542,6 +590,10 @@ impl Client {
         let provisioning_deadline =
             tokio::time::Instant::now() + Duration::from_millis(spill_wait_budget_ms(&job));
         let salt = storage.hosted_salt().map_err(|_| Error::Auth)?;
+        let avoid_host = job
+            .hosted
+            .as_ref()
+            .and_then(|state| state.avoid_host.clone());
         let mut body = match job.hosted.and_then(|state| state.lease_request) {
             Some(request) => request,
             None => lease_body(
@@ -554,6 +606,7 @@ impl Client {
                         .map_err(|_| Error::Path)?,
                 ),
                 storage.hosted_placement(&request.workspace_key),
+                avoid_host,
                 RequesterJwk::from_key(&requester()?.verifying_key()),
             )?,
         };
@@ -578,6 +631,7 @@ impl Client {
             }
             let attempt = state.placement_attempts;
             let spilled = state.spill_wait_ms.is_some();
+            let hosted_test = state.hosted_test;
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -610,6 +664,9 @@ impl Client {
                         // gain it within seconds (its Boat start cap is hourly);
                         // the build server is the better place to retry.
                         Error::Capacity if spilled => return Err(error),
+                        // A direct hosted test reports the broker's answer at
+                        // once rather than waiting for capacity to appear.
+                        Error::Capacity | Error::HostFull if hosted_test => return Err(error),
                         Error::Broker if attempt < 2 => continue,
                         error if error.replaceable() && attempt < 2 => continue,
                         error => return Err(error),
@@ -653,6 +710,7 @@ impl Client {
             match connected.map_err(|failure| failure.error) {
                 Ok(channel) => return Ok((channel, lease)),
                 Err(e) if lease.ssh.is_some() => return Err(e),
+                Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
                 Err(e) if e.replaceable() && attempt < 2 => continue,
                 Err(e) => return Err(e),
             }

@@ -892,6 +892,52 @@ fn heartbeat_elapsed_is_monotonic_capped_and_refreshes_do_not_move_loss_deadline
 }
 
 #[test]
+fn avoid_host_is_required_validated_never_placed_on_and_part_of_the_lease_hash() {
+    // A body without the key is refused, as is a value outside the grammar.
+    let mut missing = serde_json::to_value(lease_request()).unwrap();
+    missing.as_object_mut().unwrap().remove("avoid_host");
+    assert_eq!(
+        post(&mut broker(), "/v1/leases", &missing, NOW).body,
+        json!({"error":"bad_request"})
+    );
+    for bad in [
+        "".to_string(),
+        "a".repeat(65),
+        "boat:test".into(),
+        "a b".into(),
+    ] {
+        let mut request = lease_request();
+        request.avoid_host = Some(bad.clone());
+        assert_eq!(
+            post(&mut broker(), "/v1/leases", &request, NOW).status,
+            400,
+            "{bad:?}"
+        );
+    }
+    // The avoided host is not selectable even when the hint names it; the
+    // fake has no other host, so the lease has no capacity.
+    let mut b = broker();
+    let mut request = lease_request();
+    request.placement_hint = Some(config().placement);
+    request.avoid_host = Some(config().placement.host);
+    let refused = post(&mut b, "/v1/leases", &request, NOW);
+    assert_eq!(
+        (refused.status, refused.body),
+        (503, json!({"error":"no_capacity"}))
+    );
+    // A host the fake does not run changes nothing, and a re-request must
+    // repeat the value it was first sent with.
+    request.avoid_host = Some("build-server-1".into());
+    issued(&mut b, &request, NOW);
+    issued(&mut b, &request, NOW + 1000);
+    request.avoid_host = None;
+    assert_eq!(
+        post(&mut b, "/v1/leases", &request, NOW + 2000).body,
+        json!({"error":"job_conflict"})
+    );
+}
+
+#[test]
 fn unusable_placement_hint_is_a_hint_and_finite_budget_uses_granted_runtime() {
     let mut b = broker();
     let mut request = lease_request();

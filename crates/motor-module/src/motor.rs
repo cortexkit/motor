@@ -117,6 +117,7 @@ impl Motor {
             attribution,
             false,
             false,
+            false,
             crate::ReturnOptions::default(),
         )
     }
@@ -131,6 +132,7 @@ impl Motor {
             attribution,
             true,
             false,
+            false,
             crate::ReturnOptions::default(),
         )
     }
@@ -139,7 +141,7 @@ impl Motor {
         request: RunRequest,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, None, false, false, returns)
+        self.run_classified(request, None, false, false, false, returns)
     }
     pub(crate) fn run_direct_with_spill(
         &self,
@@ -148,7 +150,20 @@ impl Motor {
         returns: crate::ReturnOptions,
         allow_spill: bool,
     ) -> io::Result<JobStream> {
-        self.run_classified(request, attribution, true, allow_spill, returns)
+        self.run_classified(request, attribution, true, allow_spill, false, returns)
+    }
+    /// Send one direct job straight to a hosted lease, to test the hosted
+    /// path. It needs neither `hosted_runners` nor spill, and changes neither
+    /// for any other job. The lease avoids no host, is not retried for
+    /// capacity, and a lease that can't be granted or connected refuses the
+    /// job instead of falling back to the build server.
+    pub(crate) fn run_direct_hosted(
+        &self,
+        request: RunRequest,
+        attribution: Option<JobAttribution>,
+        returns: crate::ReturnOptions,
+    ) -> io::Result<JobStream> {
+        self.run_classified(request, attribution, true, false, true, returns)
     }
     pub(crate) fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
         self.storage.set_direct_secret_hash(id, hash)
@@ -162,6 +177,7 @@ impl Motor {
         attribution: Option<JobAttribution>,
         gate_job: bool,
         allow_gate_spill: bool,
+        hosted_test: bool,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
         let mut env_not_forwarded: Vec<_> = request
@@ -182,7 +198,8 @@ impl Motor {
                 .queue_wait_limit_s
                 .unwrap_or(self.config.queue_wait_limit_s)
         };
-        let spill = crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill)
+        let spill = !hosted_test
+            && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill)
             && self.config.spill_after_s <= wait;
         let instance = self
             .config
@@ -191,7 +208,11 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create(id, wait, attribution, instance, gate_job)?;
-        if self.config.hosted_runners && request.platform != Some(Platform::Windows) {
+        if hosted_test {
+            let mut route = crate::HostedJobState::new(&self.config);
+            route.hosted_test = true;
+            self.storage.hosted_route(id, route)?;
+        } else if self.config.hosted_runners && request.platform != Some(Platform::Windows) {
             self.storage
                 .hosted_route(id, crate::HostedJobState::new(&self.config))?;
         }
@@ -578,7 +599,15 @@ impl Motor {
                                 return self.lost_sandbox(id, tx).await.map(|_| false)
                             }
                             error => {
-                                Err((error.reason(), Some(error.detail()), error.retry_after_ms()))
+                                // A direct hosted test exists to show what the
+                                // broker answered, so name its error code too.
+                                let detail = if self.hosted_state(id).is_some_and(|s| s.hosted_test)
+                                {
+                                    error.detail_with_broker_code(client.broker_code().as_deref())
+                                } else {
+                                    error.detail()
+                                };
+                                Err((error.reason(), Some(detail), error.retry_after_ms()))
                             }
                         }
                     }
@@ -1371,6 +1400,7 @@ impl Motor {
                         tracing::info!(job_id = %id, wait_ms, "capacity permit wait spilled to hosted runner");
                         let mut route = crate::HostedJobState::new(&self.config);
                         route.spill_wait_ms = Some(wait_ms);
+                        route.avoid_host = self.config.spill_avoid_host.clone();
                         self.storage.hosted_route(id, route)?;
                         return Ok(true);
                     }
