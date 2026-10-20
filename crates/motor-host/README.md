@@ -164,6 +164,24 @@ same broker key cache, platform checks, run/attach purpose binding and typed
 refusals apply as on tenant VM hosts. A changed identity applies to subsequent
 connections, not to a connection already authenticated.
 
+One token rule differs. CLOUD's contract makes a Boat token's `mem_mib` the
+chosen sandbox size's usable memory, not the fleet formula
+`motor_lease::memory_max_mib`. So for a `boat:` audience the endpoint accepts
+any `mem_mib` in `motor_lease::boat_memory_range`: 1 GiB per leased vCPU up to
+the formula. ck-motor applies the same range before it connects. A first-party
+host still requires the formula exactly. The `motor-module`
+`hosted::sandbox_tests` drive ck-motor's real lease authentication against
+this endpoint with tokens shaped like CLOUD's Boat lease vector.
+
+Every `lease_refused` the endpoint sends is also logged as a `lease_refused`
+record. The record carries `stage` (`lease_hello`, `challenge` or
+`admission_wait`), the wire `reason`, the first failing `check` (for example
+`identity`, `kid`, `signature`, `aud`, `mem_mib`, `exp`, `requester_key`,
+`challenge_signature` or `admission`) and, once the broker's signature has
+verified, the job id as `jti`. It never logs the token, a key or a signature.
+`sandbox::tests::sandbox_refusals_name_the_failing_check` and
+`motor-lease` `refused_tokens_name_their_first_failed_check` cover the names.
+
 The runner starts with `--tenant-vm --tenant-socket-dir <directory>` and exposes
 `jobs.sock`, `events.sock` and `admin.sock` in a pre-created root-owned mode-0700
 directory. Those are the three configured endpoint socket paths. The directory's

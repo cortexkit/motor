@@ -2,7 +2,7 @@ use crate::helper::{read_json, write_json, Control, FRAME_LIMIT};
 use crate::state::{ConnectionState, Error, Host, LeaseState, QuotaUpdate, Refusal};
 use anyhow::{bail, ensure, Context, Result};
 use motor_lease::{
-    bind_requester, verify_token, AuthError, Challenge, Claims, KeySet, Nonces, Prelude, Purpose,
+    bind_requester, check_token, AuthError, Challenge, Claims, KeySet, Nonces, Prelude, Purpose,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +37,30 @@ pub fn unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Why [`Runtime::authenticate`] refused a lease hello. It holds no token or
+/// key material, so the endpoint logs it whole; the requester only receives
+/// the wire reason of `error`.
+#[derive(Debug)]
+pub struct AuthRefusal {
+    pub error: Error,
+    /// The first check that failed, such as `identity`, `kid` or `mem_mib`.
+    pub check: &'static str,
+    /// The job id, once the broker's signature over the token has verified.
+    pub jti: Option<String>,
+}
+
+/// Records every lease refusal the endpoint sends, with the step and failing
+/// check that produced it. Never pass token, key or signature material here.
+fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&str>) {
+    tracing::info!(
+        stage,
+        reason = reason.wire(),
+        check,
+        jti = jti.unwrap_or(""),
+        "lease_refused"
+    );
 }
 
 pub struct Runtime {
@@ -184,45 +208,66 @@ impl Runtime {
         token: &str,
         jwk: &motor_lease::RequesterJwk,
         now_s: u64,
-    ) -> Result<Claims, Error> {
+    ) -> Result<Claims, AuthRefusal> {
+        let refuse = |check| AuthRefusal {
+            error: Error::Refused(Refusal::Auth),
+            check,
+            jti: None,
+        };
         let identity = self
             .sandbox_identity
             .as_ref()
             .map(|file| file.read())
             .transpose()
-            .map_err(|_| Error::Refused(Refusal::Auth))?;
+            .map_err(|_| refuse("identity"))?;
         let audience = identity
             .as_deref()
             .map(crate::sandbox::audience)
             .unwrap_or_else(|| self.host_id.clone());
         let keys = self.keys.read().expect("keys lock");
-        let claims = verify_token(token, &keys, &audience, None, Purpose::Run, now_s)
-            .or_else(|e| {
-                if e == AuthError::Expired {
-                    Err(e)
+        // A token is accepted for either purpose. Try `attach` only when the run
+        // check failed on purpose alone; any other failure applies to both, and
+        // reporting the attach attempt would wrongly name `purpose`.
+        let claims = check_token(token, &keys, &audience, None, Purpose::Run, now_s)
+            .or_else(|refusal| {
+                if refusal.check == "purpose" {
+                    check_token(token, &keys, &audience, None, Purpose::Attach, now_s)
                 } else {
-                    verify_token(token, &keys, &audience, None, Purpose::Attach, now_s)
+                    Err(refusal)
                 }
             })
-            .map_err(|e| {
-                Error::Refused(if e == AuthError::Expired {
+            .map_err(|refusal| AuthRefusal {
+                error: Error::Refused(if refusal.error == AuthError::Expired {
                     Refusal::Expired
                 } else {
                     Refusal::Auth
-                })
+                }),
+                check: refusal.check,
+                jti: refusal.jti,
             })?;
-        uuid::Uuid::parse_str(&claims.jti).map_err(|_| Error::Refused(Refusal::Auth))?;
+        let refuse = |check| AuthRefusal {
+            jti: Some(claims.jti.clone()),
+            ..refuse(check)
+        };
+        uuid::Uuid::parse_str(&claims.jti).map_err(|_| refuse("jti"))?;
         if claims.platform != "linux-x64" {
-            return Err(Error::Refused(Refusal::Auth));
+            return Err(refuse("platform"));
         }
         if identity
             .as_ref()
             .is_some_and(|id| claims.placement.vm.as_ref() != Some(id))
         {
-            return Err(Error::Refused(Refusal::Auth));
+            return Err(refuse("placement_vm"));
         }
-        bind_requester(&claims, jwk).map_err(|_| Error::Refused(Refusal::Auth))?;
-        self.host.lock().expect("host lock").binding(&claims)?;
+        bind_requester(&claims, jwk).map_err(|_| refuse("requester_key"))?;
+        self.host
+            .lock()
+            .expect("host lock")
+            .binding(&claims)
+            .map_err(|error| AuthRefusal {
+                error,
+                ..refuse("binding")
+            })?;
         Ok(claims)
     }
     fn ensure(self: &Arc<Self>, tenant: &str) -> Result<()> {
@@ -727,7 +772,13 @@ where
     let auth_requester = requester_jwk.clone();
     let authentication = tokio::task::spawn_blocking(move || {
         let result = auth_runtime.authenticate(&token, &auth_requester, unix_ms() / 1000);
-        if matches!(result, Err(Error::Refused(Refusal::Auth))) {
+        if matches!(
+            result,
+            Err(AuthRefusal {
+                error: Error::Refused(Refusal::Auth),
+                ..
+            })
+        ) {
             let refetch = auth_runtime
                 .keys
                 .write()
@@ -744,7 +795,12 @@ where
     .await?;
     let claims = match authentication {
         Ok(c) => c,
-        Err(Error::Refused(r)) => {
+        Err(AuthRefusal {
+            error: Error::Refused(r),
+            check,
+            jti,
+        }) => {
+            log_refusal("lease_hello", r, check, jti.as_deref());
             write_frame(
                 &mut client,
                 &json!({"type":"lease_refused", "reason":r.wire()}),
@@ -752,7 +808,7 @@ where
             .await?;
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Err(AuthRefusal { error, .. }) => return Err(error.into()),
     };
     let tenant = runtime
         .host
@@ -784,19 +840,27 @@ where
     let Prelude::ChallengeResponse { sig } = serde_json::from_value(response)? else {
         bail!("expected challenge response");
     };
-    let verified = (|| -> Result<_, Error> {
+    let verified = (|| -> Result<_, (Error, &'static str)> {
         let mut nonces = Nonces::default();
         nonces
             .verify(&challenge, &claims, &requester_jwk, &sig, unix_ms() / 1000)
-            .map_err(|_| Error::Refused(Refusal::Auth))?;
+            .map_err(|_| (Error::Refused(Refusal::Auth), "challenge_signature"))?;
         let mut host = runtime.host.lock().expect("host lock");
-        host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)?;
-        let (id, _) = host.claim(claims.clone(), unix_ms())?;
-        Ok((id, host.watch_connection(id)?))
+        host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)
+            .map_err(|error| (error, "challenge_nonce"))?;
+        let (id, _) = host
+            .claim(claims.clone(), unix_ms())
+            .map_err(|error| (error, "admission"))?;
+        Ok((
+            id,
+            host.watch_connection(id)
+                .map_err(|error| (error, "admission"))?,
+        ))
     })();
     let (id, mut updates) = match verified {
         Ok(value) => value,
-        Err(Error::Refused(r)) => {
+        Err((Error::Refused(r), check)) => {
+            log_refusal("challenge", r, check, Some(&claims.jti));
             write_frame(
                 &mut client,
                 &json!({"type":"lease_refused", "reason":r.wire()}),
@@ -804,7 +868,7 @@ where
             .await?;
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Err((e, _)) => return Err(e.into()),
     };
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
@@ -824,6 +888,7 @@ where
         Ok(true) => {}
         Ok(false) => return Ok(()),
         Err(reason) => {
+            log_refusal("admission_wait", reason, "admission", Some(&claims.jti));
             write_frame(
                 &mut client,
                 &json!({"type":"lease_refused", "reason":reason.wire()}),

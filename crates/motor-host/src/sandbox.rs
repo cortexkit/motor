@@ -32,9 +32,6 @@ pub(crate) struct IdentityFile {
     owner: u32,
 }
 impl IdentityFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path, owner: 0 }
-    }
     pub(crate) fn read(&self) -> Result<String> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -124,6 +121,14 @@ impl Control for LocalRunner {
 }
 
 pub fn runtime(config: Config) -> Result<Arc<Runtime>> {
+    runtime_with_identity_owner(config, 0)
+}
+
+/// [`runtime`], but trusting an identity file owned by `identity_owner`
+/// instead of root. Only for tests in other crates, which cannot create a
+/// root-owned file; the `--sandbox` binary always calls [`runtime`].
+#[doc(hidden)]
+pub fn runtime_with_identity_owner(config: Config, identity_owner: u32) -> Result<Arc<Runtime>> {
     ensure!(config.vcpu_ceiling > 0, "vcpu_ceiling must be positive");
     let (journal, snapshot) = FileJournal::open(&config.journal_dir)?;
     let mut host = Host::sandbox(config.vcpu_ceiling, snapshot, Box::new(journal));
@@ -137,7 +142,10 @@ pub fn runtime(config: Config) -> Result<Arc<Runtime>> {
             events: config.event_socket,
             admin: config.admin_socket,
         }),
-        Some(IdentityFile::new(config.id_file)),
+        Some(IdentityFile {
+            path: config.id_file,
+            owner: identity_owner,
+        }),
     ))
 }
 

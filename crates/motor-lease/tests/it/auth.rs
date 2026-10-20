@@ -644,3 +644,76 @@ fn exact_claims_and_nullable_cold_placement_are_enforced() {
     value["placement"].as_object_mut().unwrap().remove("vm");
     assert!(serde_json::from_value::<Claims>(value).is_err());
 }
+
+/// A refusal names the first check that failed, and carries the job id only
+/// once the broker's signature over it has verified.
+#[test]
+fn refused_tokens_name_their_first_failed_check() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let c = claims();
+    let now = c.iat;
+    let check = |token: &str, host: &str, now: u64| {
+        check_token(token, &keys(), host, None, Purpose::Run, now).map(|_| ())
+    };
+    let job = Some(c.jti.clone());
+    let refused = |check, jti: &Option<String>| {
+        Err(TokenRefusal {
+            error: AuthError::Auth,
+            check,
+            jti: jti.clone(),
+        })
+    };
+    let valid = sign_token(&c, "current", &key).unwrap();
+    assert_eq!(check(&valid, "test-host", now), Ok(()));
+    assert_eq!(check("a.b", "test-host", now), refused("format", &None));
+    let unknown = sign_token(&c, "unknown", &key).unwrap();
+    assert_eq!(check(&unknown, "test-host", now), refused("kid", &None));
+    let forged = sign_token(&c, "current", &SigningKey::from_bytes(&[9; 32])).unwrap();
+    assert_eq!(
+        check(&forged, "test-host", now),
+        refused("signature", &None)
+    );
+    assert_eq!(check(&valid, "other-host", now), refused("aud", &job));
+    let mut wrong = c.clone();
+    wrong.mem_mib = 14336;
+    let wrong = sign_token(&wrong, "current", &key).unwrap();
+    assert_eq!(check(&wrong, "test-host", now), refused("mem_mib", &job));
+    assert_eq!(
+        check(&valid, "test-host", c.exp),
+        Err(TokenRefusal {
+            error: AuthError::Expired,
+            check: "exp",
+            jti: job,
+        })
+    );
+}
+
+/// A Boat sandbox accepts its size's usable memory between 1 GiB per vCPU and
+/// the fleet formula; a first-party host still requires the formula exactly.
+#[test]
+fn boat_audience_accepts_sandbox_memory_within_the_shared_range() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let mut c = claims();
+    c.aud = "boat:bx_test".into();
+    c.placement.host = c.aud.clone();
+    c.vcpus = 8;
+    for (mem_mib, accepted) in [
+        (8191, false),
+        (8192, true),
+        (13312, true),
+        (13444, true),
+        (memory_max_mib(8), true),
+        (memory_max_mib(8) + 1, false),
+    ] {
+        c.mem_mib = mem_mib;
+        let token = sign_token(&c, "current", &key).unwrap();
+        let result = check_token(&token, &keys(), "boat:bx_test", None, Purpose::Run, c.iat);
+        assert_eq!(
+            result.map(|_| ()).map_err(|refusal| refusal.check),
+            if accepted { Ok(()) } else { Err("mem_mib") },
+            "{mem_mib} MiB"
+        );
+    }
+    assert_eq!(boat_memory_range(8), 8192..=28672);
+    assert_eq!(boat_memory_range(4), 4096..=16384);
+}

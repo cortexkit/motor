@@ -959,6 +959,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "libc",
+ "motor-host",
  "motor-lease",
  "motor-protocol",
  "motor-runner",
