@@ -140,7 +140,7 @@ mod tests {
         let subscriber = motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone());
         let id = Uuid::now_v7();
         tracing::subscriber::with_default(subscriber, || {
-            materialize(id, false, || {
+            materialize(id, false, None, || {
                 cargo_skip(
                     std::path::Path::new("probes/helper/Cargo.lock"),
                     "Cargo.lock needs updating: --locked was passed to prevent this",
