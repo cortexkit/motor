@@ -63,7 +63,7 @@ class RecipeTests(unittest.TestCase):
         with patch.object(install, "run", return_value="") as run:
             install.install_rust(manifest, "/rustup-init")
         commands = [call.args for call in run.call_args_list if call.args[:3] == ('rustup', 'toolchain', 'install')]
-        self.assertEqual({command[3] for command in commands}, set(manifest['rust_toolchains']))
+        self.assertEqual({command[3] for command in commands}, {name for name in manifest['rust_toolchains'] if not name.startswith('stable-')})
         for command in commands:
             components = [command[i + 1] for i, arg in enumerate(command) if arg == '--component']
             targets = [command[i + 1] for i, arg in enumerate(command) if arg == '--target']
@@ -71,11 +71,7 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn('wasm32-unknown-unknown', targets)
                 self.assertIn('x86_64-pc-windows-gnu', targets)
                 self.assertIn('x86_64-unknown-linux-musl', targets)
-            if command[3].startswith('stable-'):
-                self.assertNotIn('clippy', components)
-                self.assertNotIn('rustfmt', components)
-            else:
-                self.assertIn('clippy', components)
+            self.assertIn('clippy', components)
 
     def test_recipe_uses_server_bun_home_and_preserves_job_path_order(self):
         unit = (HERE / 'motor-boat.service').read_text()
@@ -96,8 +92,9 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(actual, {
             names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
                        '--component', 'clippy', '--component', 'rustfmt', *targets),
-            names[1]: ('rustup', 'toolchain', 'install', names[1], '--profile', 'minimal', *targets),
         })
+        root = manifest['rustup_home'] + '/toolchains/'
+        run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[1])
 
     def test_recipe_normalizes_preview_names_and_removes_extra_parts(self):
         host = 'x86_64-unknown-linux-gnu'
@@ -115,10 +112,39 @@ class RecipeTests(unittest.TestCase):
         execute.assert_any_call('rustup', 'target', 'remove', '--toolchain', name, 'wasm32-unknown-unknown')
         execute.assert_any_call('rustup', 'component', 'remove', '--toolchain', name, 'rust-analyzer')
 
+    def test_recipe_freezes_stable_when_upstream_has_moved(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        stable = 'stable-x86_64-unknown-linux-gnu'
+        numbered = '1.99.0-x86_64-unknown-linux-gnu'
+        state = copy.deepcopy(manifest['rust_toolchains'])
+        state[stable]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+        def run(*args, **kwargs):
+            if args[:3] == ('rustup', 'toolchain', 'list'):
+                return '\n'.join(state)
+            if args[:3] == ('rustup', 'toolchain', 'install'):
+                name = args[3]
+                state[name] = copy.deepcopy(manifest['rust_toolchains'][name])
+                if name == stable:
+                    state[name]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+            elif args[:3] == ('rustup', 'toolchain', 'uninstall'):
+                state.pop(args[3], None)
+            elif args[0] == 'cp':
+                state[Path(args[-1]).name] = copy.deepcopy(state[Path(args[-2]).name])
+            elif args[:3] == ('rustup', 'component', 'list'):
+                return '\n'.join(state[args[-1]]['components'])
+            elif args[:3] == ('rustup', 'component', 'remove'):
+                state[args[4]]['components'].remove(args[5] + '-x86_64-unknown-linux-gnu')
+            return ''
+        with patch.object(install, 'run', side_effect=run):
+            install.install_rust(manifest, '/rustup-init')
+        self.assertEqual(state[stable], manifest['rust_toolchains'][stable])
+        self.assertEqual(state[numbered], manifest['rust_toolchains'][numbered])
+
     def test_recipe_bootstraps_empty_rustup_and_removes_unlisted_toolchains(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
-        for listed, removed in (('no installed toolchains', []),
-                                ('1.89.0-x86_64-unknown-linux-gnu', ['1.89.0-x86_64-unknown-linux-gnu'])):
+        stable = 'stable-x86_64-unknown-linux-gnu'
+        for listed, removed in (('no installed toolchains', [stable]),
+                                ('1.89.0-x86_64-unknown-linux-gnu', ['1.89.0-x86_64-unknown-linux-gnu', stable])):
             def run(*args, **kwargs):
                 return listed if args == ('rustup', 'toolchain', 'list') else ''
             with self.subTest(listed=listed), patch.object(install, 'run', side_effect=run) as execute:

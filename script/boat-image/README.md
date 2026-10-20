@@ -63,9 +63,13 @@ Boat's GNU coreutils. Bun lives under `/home/ubuntu/.bun/bin`; the runner's HOME
 selects that read-only job bind, preserving the server's job PATH order.
 Rustup remains read-only in jobs; no job-side repair or tool installation is used.
 `rust-analyzer`, `rls` and `cargo-miri` are proxies, not installed components in
-the measured contract. The separately installed `stable` channel is checked
-against its captured compiler version: channel movement fails closed and needs
-a reviewed refresh rather than silently changing the image.
+the measured contract. Boat never installs the moving `stable` channel. It
+copies the pinned numbered release matching the server's captured stable compiler
+into the `stable` toolchain directory, then removes unlisted components from that
+independent copy. Rustup rejects official names such as `stable` for `toolchain
+link`; copying also preserves the server's smaller stable component set without
+removing clippy/rustfmt from the numbered release. No component superset exception
+is used, and the compiler-version check stays strict.
 
 Installation runs the parity check. Qualification reruns the **operator
 checkout's** checker against live files, not a saved inventory or the image's

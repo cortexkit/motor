@@ -6,7 +6,7 @@
     "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
-    "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt; qualification checks its exact measured rustc version so channel movement requires a new capture.",
+    "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
     "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly."
   ],
   "apt_packages": {

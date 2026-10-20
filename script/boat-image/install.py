@@ -182,6 +182,20 @@ def rustup_component_name(component: str, host: str) -> str:
     return {'clippy-preview': 'clippy', 'rustfmt-preview': 'rustfmt'}.get(name, name)
 
 
+def freeze_stable(manifest, toolchain, spec, host):
+    numbered = spec['rustc'].split()[1] + '-' + host
+    source = manifest['rust_toolchains'].get(numbered)
+    if (not source or source['rustc'] != spec['rustc']
+            or not set(spec['components']) <= set(source['components'])):
+        raise ValueError('frozen stable requires a matching numbered release containing its components')
+    root = Path(manifest['rustup_home']) / 'toolchains'
+    # Rustup reserves official channel names, so `toolchain link stable` fails.
+    # An independent copy lets stable omit clippy/rustfmt without removing them
+    # from the numbered release or consulting the moving stable channel.
+    run('rustup', 'toolchain', 'uninstall', toolchain)
+    run('cp', '-a', '--reflink=auto', str(root / numbered) + '/.', str(root / toolchain))
+
+
 def install_rust(manifest, installer):
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
     for line in run('rustup', 'toolchain', 'list', capture=True).splitlines():
@@ -190,18 +204,21 @@ def install_rust(manifest, installer):
         name = line.split()[0]
         if name not in manifest['rust_toolchains']:
             run('rustup', 'toolchain', 'uninstall', name)
-    for toolchain, spec in manifest["rust_toolchains"].items():
+    for toolchain, spec in sorted(manifest["rust_toolchains"].items(), key=lambda row: row[0].startswith('stable-')):
         host = toolchain.split('-', 1)[1]
-        args = ["rustup", "toolchain", "install", toolchain, "--profile", manifest["rust_profile"]]
-        # Installed IDs include the host; --component takes bare names. The
-        # minimal profile supplies Cargo/rustc, and --target supplies rust-std.
-        components = {rustup_component_name(component, host) for component in spec['components']
-                      if not component.startswith('rust-std-')}
-        for component in sorted(components - {'cargo', 'rustc', 'rust-std'}):
-            args.extend(("--component", component))
-        for target in spec["targets"]:
-            args.extend(("--target", target))
-        run(*args)
+        if toolchain.startswith('stable-'):
+            freeze_stable(manifest, toolchain, spec, host)
+        else:
+            args = ["rustup", "toolchain", "install", toolchain, "--profile", manifest["rust_profile"]]
+            # Installed IDs include the host; --component takes bare names. The
+            # minimal profile supplies Cargo/rustc, and --target supplies rust-std.
+            components = {rustup_component_name(component, host) for component in spec['components']
+                          if not component.startswith('rust-std-')}
+            for component in sorted(components - {'cargo', 'rustc', 'rust-std'}):
+                args.extend(("--component", component))
+            for target in spec["targets"]:
+                args.extend(("--target", target))
+            run(*args)
         installed = run('rustup', 'component', 'list', '--installed', '--toolchain', toolchain, capture=True)
         for component in set(installed.splitlines()) - set(spec['components']):
             if component.startswith('rust-std-'):
