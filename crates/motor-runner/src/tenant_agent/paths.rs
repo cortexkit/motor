@@ -170,7 +170,11 @@ pub(super) fn prepare_disk_layout(tenant: &Path, owner: u32) -> io::Result<DiskL
     let tenant = Directory::open(tenant, owner)?;
     let state = tenant.create("state", 0o755)?;
     let runner = state.create("main", 0o700)?;
-    let cargo_bin = tenant.create("cargo-home", 0o755)?.create("bin", 0o755)?;
+    let cargo = tenant.create("cargo-home", 0o755)?;
+    let cargo_bin = cargo.create("bin", 0o755)?;
+    // Even a cold tenant binds both shared source trees read-only into jobs.
+    cargo.create("registry", 0o755)?;
+    cargo.create("git", 0o755)?;
     let roots = tenant.create("roots", 0o755)?;
     let roots = super::ROOTS
         .iter()
@@ -293,5 +297,22 @@ mod tests {
         symlink("/etc/passwd", &path).unwrap();
         assert!(layout.runner.remove_stale_socket("runner.sock").is_err());
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+}
+
+#[cfg(test)]
+mod cargo_layout_tests {
+    use super::*;
+    #[test]
+    fn cold_tenant_creates_shared_source_roots_for_read_only_job_binds() {
+        let root = cortexkit_test_support::ScratchDir::new("tenant-cargo-layout");
+        let owner = unsafe { libc::geteuid() };
+        prepare_disk_layout(&root, owner).unwrap();
+        for name in ["registry", "git"] {
+            let metadata = std::fs::metadata(root.join("cargo-home").join(name)).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.uid(), owner);
+            assert_eq!(metadata.mode() & 0o777, 0o755);
+        }
     }
 }

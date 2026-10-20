@@ -5,7 +5,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Offline Cargo can still wait for a cache lock or a stuck toolchain probe.
+pub(super) fn prepare(command: impl FnMut() -> io::Result<Command>) -> io::Result<()> {
+    prepare_with_limits(command, Duration::from_secs(120), Duration::from_secs(30))
+}
+
+fn prepare_with_limits(
+    mut command: impl FnMut() -> io::Result<Command>,
+    online: Duration,
+    offline: Duration,
+) -> io::Result<()> {
+    let online_result = crate::setup_log::phase("fetch cargo dependencies online", || {
+        bounded(command()?.env("CARGO_NET_OFFLINE", "false"), online)
+    });
+    let Err(online_error) = online_result else {
+        return Ok(());
+    };
+    crate::setup_log::phase("fetch cargo dependencies offline fallback", || {
+        bounded(command()?.arg("--offline").env("CARGO_NET_OFFLINE", "true"), offline)
+    }).map_err(|offline_error| io::Error::new(offline_error.kind(), format!(
+        "tenant dependency preparation failed: online fetch: {online_error}; offline fallback could not supply locked sources: {offline_error}; provision the tenant Cargo registry index, crate cache and Git sources before running this locked workspace"
+    )))
+}
+
+/// Even offline Cargo can wait for a cache lock or a stuck toolchain probe.
 /// Bound the entire Cargo fetch, drain diagnostics, and stop its process group
 /// before releasing the setup reservation; no job command has started yet.
 pub(super) fn bounded(command: &mut Command, timeout: Duration) -> io::Result<()> {
@@ -48,7 +70,7 @@ pub(super) fn bounded(command: &mut Command, timeout: Duration) -> io::Result<()
             }
             if started.elapsed() >= timeout {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
-                    "cargo fetch --locked --offline exceeded {} ms (cache lock or toolchain/fetch stall)", timeout.as_millis()
+                    "cargo dependency fetch exceeded {} ms (cache lock or toolchain/fetch stall)", timeout.as_millis()
                 )));
             }
             std::thread::park_timeout(Duration::from_millis(10));
@@ -92,6 +114,39 @@ fn drain(stderr: &mut impl Read, diagnostic: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_online_fetch_uses_persistent_cache_and_skips_fallback_on_success() {
+        let root = cortexkit_test_support::ScratchDir::new("tenant-fetch-online");
+        let calls = std::cell::Cell::new(0);
+        prepare_with_limits(|| {
+            calls.set(calls.get() + 1);
+            let mut command = Command::new("sh");
+            command.args(["-c", "test \"$CARGO_NET_OFFLINE\" = false && test $# = 0 && touch \"$CARGO_HOME/cached\"", "sh"])
+                .env("CARGO_HOME", &*root);
+            Ok(command)
+        }, Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(root.join("cached").is_file());
+    }
+
+    #[test]
+    fn tenant_network_failure_falls_back_to_existing_offline_cache() {
+        let root = cortexkit_test_support::ScratchDir::new("tenant-fetch-fallback");
+        std::fs::write(root.join("cached"), "verified source").unwrap();
+        let calls = std::cell::Cell::new(0);
+        prepare_with_limits(|| {
+            let mut command = Command::new("sh");
+            command.args(["-c", if calls.get() == 0 {
+                "test \"$CARGO_NET_OFFLINE\" = false || exit 99; exit 76"
+            } else {
+                "test \"$CARGO_NET_OFFLINE\" = true && test \"$1\" = --offline && test -f \"$CARGO_HOME/cached\""
+            }, "sh"]).env("CARGO_HOME", &*root);
+            calls.set(calls.get() + 1);
+            Ok(command)
+        }, Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+        assert_eq!(calls.get(), 2);
+    }
 
     #[test]
     fn tenant_fetch_deadline_kills_a_stuck_fetch_and_its_child() {
@@ -172,19 +227,32 @@ mod offline_tests {
                 .join(".rustup")
                 .into_os_string()
         }));
-        let error = super::super::prefetch_cargo_dependencies(
-            false,
-            true,
-            &state,
-            &workspace,
-            &BTreeMap::new(),
-            &cargo,
-            &rustup,
+        let calls = std::cell::Cell::new(0);
+        let error = super::prepare_with_limits(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Ok(std::process::Command::new("false"));
+                }
+                crate::workspace::dependencies::fetch_command(
+                    &state,
+                    &workspace,
+                    &BTreeMap::new(),
+                    &cargo,
+                    &rustup,
+                )
+            },
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("no matching package named"), "{error}");
         assert!(error.contains("offline"), "{error}");
+        assert!(
+            error.contains("offline fallback could not supply locked sources"),
+            "{error}"
+        );
         assert!(
             error.contains("provision the tenant Cargo registry index"),
             "{error}"

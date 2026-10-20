@@ -1564,25 +1564,22 @@ fn prefetch_cargo_dependencies(
             "fetch job dependencies"
         };
         crate::setup_log::phase("fetch cargo dependencies", || {
-            let mut command = workspace::dependencies::fetch_command(
+            let command = || {
+                workspace::dependencies::fetch_command(
                     state,
                     workspace,
                     dependency_routes,
                     cargo,
                     rustup,
-                )?;
+                )
+            };
             if tenant_vm {
-                // Tenant images contain tools, not a registry cache. Use only
-                // provisioned sources: network retries must not consume tenant
-                // lease time before the job command starts. A cache-lock or tool
-                // probe can still stall offline, so bound the entire child.
-                command.arg("--offline").env("CARGO_NET_OFFLINE", "true");
-                cargo_fetch::bounded(&mut command, std::time::Duration::from_secs(30))
-                    .map_err(|error| io::Error::new(error.kind(), format!(
-                        "tenant dependency preparation failed: {error}; provision the tenant Cargo registry index, crate cache and Git sources before running this locked workspace"
-                    )))
+                // The daemon alone resolves/downloads sources into persistent
+                // tenant storage. Cache-only fallback can still run a warm job
+                // during an outage; both attempts bound tool and cache-lock waits.
+                cargo_fetch::prepare(command)
             } else {
-                checked(command.env("CARGO_NET_OFFLINE", "false"))
+                checked(command()?.env("CARGO_NET_OFFLINE", "false"))
             }
         })
         .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;

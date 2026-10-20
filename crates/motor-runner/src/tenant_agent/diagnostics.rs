@@ -16,7 +16,7 @@ const MAX_PROC_ENTRIES: usize = 8192;
 const MAX_STATE_ENTRIES: usize = 4096;
 const MAX_JOURNAL_BYTES: u64 = 32 * 1024;
 
-pub(super) async fn collect() -> io::Result<Value> {
+pub(super) async fn collect(https: bool) -> io::Result<Value> {
     let pid = runner_socket::main_pid()?
         .ok_or_else(|| io::Error::other("tenant runner has no current MainPID"))?;
     let mut result = tokio::task::spawn_blocking(move || {
@@ -27,11 +27,14 @@ pub(super) async fn collect() -> io::Result<Value> {
     result["journal"] = journal()
         .await
         .unwrap_or_else(|_| json!({"unavailable":true}));
+    result["network"] = super::network::collect(pid, https)
+        .await
+        .unwrap_or_else(|_| json!({"unavailable":true}));
     result["ok"] = json!(true);
     Ok(result)
 }
 
-fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+pub(super) fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)?.take(limit).read_to_end(&mut bytes)?;
     Ok(bytes)

@@ -115,7 +115,10 @@ pub enum TenantAgentRequest {
     },
     Resume,
     Status,
-    Diagnostics,
+    Diagnostics {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        https: bool,
+    },
     ArgsStatus,
     PrepareSnapshot {
         kind: SnapshotKind,

@@ -692,9 +692,10 @@ test "$(cat "$TMPDIR/write-probe")" = 'private scratch'
 #[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
 fn isolated_job_cannot_write_shared_registry() {
     let f = Fixture::new();
+    fs::create_dir_all(PathBuf::from(std::env::var_os("CARGO_HOME").unwrap()).join("git")).unwrap();
     let sandbox = f.sandbox();
     let (status, stdout, stderr) = output(&sandbox,
-        "set -eu; test \"$CARGO_HOME\" = \"$HOME/cargo\"; test -d \"$CARGO_HOME/registry/src\"; if touch \"$CARGO_HOME/registry/.motor-write-probe\"; then exit 42; fi; touch \"$CARGO_HOME/private-lock\"",
+        "set -eu; test \"$CARGO_HOME\" = \"$HOME/cargo\"; test -d \"$CARGO_HOME/registry/src\"; for source in registry git; do if touch \"$CARGO_HOME/$source/.motor-write-probe\"; then exit 42; fi; done; test ! -e /run/motor-tenant-daemon/resolv.conf; touch \"$CARGO_HOME/private-lock\"",
         &f.workspace);
     assert!(status.success(), "{stdout}\n{stderr}");
     assert!(stderr.contains("Read-only file system"), "{stderr}");
@@ -1799,4 +1800,32 @@ fn isolated_net_startup_reconciles_leftovers_but_preserves_live_unit() {
 async fn isolated_net_forward_drops_inbound_and_unrelated() {
     let _guard = net_operator_lock();
     crate::engine::net_operator_case("forward").await;
+}
+
+#[test]
+fn tenant_job_unit_does_not_inherit_daemon_dns_or_network_authority() {
+    let f = Fixture::new();
+    let sandbox = f.command_sandbox().in_tenant_vm(true);
+    let command = sandbox
+        .command("true", &f.workspace, &[], false, &[], 2)
+        .unwrap();
+    let words: Vec<_> = command
+        .get_args()
+        .map(|word| word.to_string_lossy())
+        .collect();
+    assert!(words
+        .iter()
+        .any(|word| word == "--property=PrivateNetwork=yes"));
+    assert!(words
+        .iter()
+        .any(|word| word == "--property=CapabilityBoundingSet="));
+    assert!(words.iter().any(|word| word == "--property=User=motor-job"));
+    assert!(words
+        .iter()
+        .any(|word| word == "--setenv=CARGO_HOME=/motor-home/cargo"));
+    assert!(
+        !words.iter().any(|word| word.contains("motor-tenant-daemon")
+            || word.contains("JoinsNamespaceOf")
+            || word.contains("CARGO_HOME=/tenant/cargo-home"))
+    );
 }

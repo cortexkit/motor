@@ -323,12 +323,23 @@ root, and later checks for failed guest units. There is no
 privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
 
 The name-service probe checks what once stalled tenant runner startup. Attach
-must not give the VM itself a nameserver (only `net` jobs get resolvers, inside
-their own namespaces), and `/etc/hosts` must map the tenant host name, because
-sudo looks that name up. With `nameserver 1.1.1.1`, which the VM cannot reach,
-temporarily in place, `getent ahosts <hostname>` and `sudo -n true` must each
+keeps the VM-global resolver empty and maps the tenant hostname in `/etc/hosts`.
+The daemon has a private, root-only resolver
+binding for trusted dependency fetches; `net` jobs get separate resolver bindings.
+The root namespace has a default route after attach, but DNS reachability during
+early startup must not be assumed. With `nameserver 1.1.1.1` temporarily in the
+global resolver, `getent ahosts <hostname>` and `sudo -n true` must each
 finish within 3 s. The runner unit's start to the attach completion marker must
 take under 10 s. The step passes only on the exact `NAME_SERVICE` line.
+
+The host-only port-54 `diagnostics` operation reports daemon routes, resolver
+addresses/mode and namespace IDs, plus a bounded lookup of `index.crates.io` from
+the daemon's mount and network namespaces. `{"op":"diagnostics","https":true}`
+also makes a bounded read of that registry's fixed HTTPS config URL. No caller
+can supply a hostname, URL or executable. Default jobs retain their empty network
+namespace and read-only shared Cargo registry/Git mounts. Tenant preparation
+allows 120 seconds for online locked fetch, then 30 seconds for offline cache
+fallback; missing locked sources refuse before Started with provisioning guidance.
 
 The tool-tree probe then checks that runner startup copied nothing from
 `/usr/local/lib/motor/rustup` or `/usr/local/lib/motor/cargo` into the overlay
