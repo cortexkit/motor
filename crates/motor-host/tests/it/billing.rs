@@ -330,7 +330,9 @@ fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
     h.guest_ready("tenant", 1).unwrap();
     let hb = h.heartbeat(MS, 123, true);
     assert_eq!((hb.free_vcpus, hb.free_mem_mib, hb.queued), (1, 123, 1));
-    assert_eq!(hb.warm[0].vm, "vm");
+    // A warm VM is never advertised: no token carries the workspace hash a
+    // contract warm entry needs, and an entry without one is a 400.
+    assert!(hb.warm.is_empty());
     h.close(id).unwrap();
     let hb = h.heartbeat(MS, 123, true);
     assert_eq!(

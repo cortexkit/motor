@@ -60,6 +60,11 @@ pub struct Snapshot {
     pub outbox: Vec<crate::billing::Request>,
     #[serde(default)]
     pub expired_outbox: Vec<crate::billing::Request>,
+    /// Requests the broker refused as malformed (400), or that broke the
+    /// contract grammar before signing. Resending the same body cannot
+    /// succeed, so they are set aside here for diagnosis, newest last.
+    #[serde(default)]
+    pub rejected_outbox: Vec<crate::billing::Request>,
     #[serde(default)]
     pub counter: u64,
     #[serde(default)]

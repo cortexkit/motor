@@ -52,8 +52,35 @@ pub struct Sender {
     client: reqwest::blocking::Client,
     endpoint: String,
     in_flight: Option<Request>,
+    /// Consecutive failed attempts, which set how long the next one waits.
+    failures: u32,
+    /// No request is sent before this time after a failure.
+    retry_at_ms: u64,
     #[cfg(test)]
     heartbeats: Heartbeats,
+}
+
+/// The heartbeat interval. After a failure the sender waits at least this
+/// long, doubling up to `MAX_RETRY_MS`, so a broker that keeps refusing a
+/// request never sees a tight retry loop.
+const RETRY_MS: u64 = 15_000;
+const MAX_RETRY_MS: u64 = 120_000;
+
+fn retry_delay_ms(failures: u32) -> u64 {
+    RETRY_MS
+        .saturating_mul(1 << failures.saturating_sub(1).min(8))
+        .min(MAX_RETRY_MS)
+}
+
+/// Names an outbox entry in logs by its route and job, never its body.
+fn kind(request: &Request) -> &'static str {
+    if request.path.ends_with("/usage") {
+        "usage"
+    } else if request.path.ends_with("/heartbeat") {
+        "heartbeat"
+    } else {
+        "other"
+    }
 }
 impl Sender {
     #[cfg(test)]
@@ -72,6 +99,8 @@ impl Sender {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             in_flight: None,
+            failures: 0,
+            retry_at_ms: 0,
         })
     }
     #[cfg(test)]
@@ -80,6 +109,9 @@ impl Sender {
         self.send_next(now_ms)
     }
     pub fn send_next(&mut self, now_ms: u64) -> Result<()> {
+        if now_ms < self.retry_at_ms {
+            return Ok(());
+        }
         {
             let mut host = self.runtime.host.lock().expect("host lock");
             host.expire_outbox(now_ms)?;
@@ -88,16 +120,48 @@ impl Sender {
             }) {
                 self.in_flight = None;
             }
+            // Queuing a heartbeat replaces the unsent one, including one this
+            // sender is retrying. The newer body carries the current state,
+            // so retrying the replaced one would only hold up what follows.
+            if self.in_flight.as_ref().is_some_and(|r| {
+                r.job.is_none()
+                    && !host
+                        .snapshot
+                        .outbox
+                        .iter()
+                        .any(|q| q.path == r.path && q.body == r.body)
+            }) {
+                self.in_flight = None;
+            }
             if self.in_flight.is_none() {
                 self.in_flight = host.snapshot.outbox.first().cloned();
             }
+            if let Some(request) = self.in_flight.as_ref() {
+                if let Some(check) = crate::wire::request_violation(&request.path, &request.body) {
+                    tracing::error!(
+                        request = kind(request),
+                        job_id = request.job,
+                        check,
+                        "host_request_invalid"
+                    );
+                    host.reject_request(request)?;
+                    self.in_flight = None;
+                    return Ok(());
+                }
+            }
         }
-        let Some(request) = self.in_flight.as_ref() else {
+        let Some(request) = self.in_flight.clone() else {
             return Ok(());
         };
         let headers = {
             let mut host = self.runtime.host.lock().expect("host lock");
-            sign_request(&mut host, &self.runtime.host_id, request, now_ms, &self.key)?
+            sign_request(
+                &mut host,
+                &self.runtime.host_id,
+                &request,
+                now_ms,
+                &self.key,
+            )?
         };
         let response = self
             .client
@@ -108,22 +172,67 @@ impl Sender {
             .header("CK-Signature", headers.signature)
             .header("Content-Type", "application/json")
             .body(request.body.clone())
-            .send()?;
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.failed(now_ms);
+                return Err(error.into());
+            }
+        };
         let status = response.status().as_u16();
         let body: Value = response.json().unwrap_or(Value::Null);
+        // CLOUD's error bodies are exactly {"error":"<code>"}; the code is the
+        // only part of a reply worth logging.
+        let code = body["error"].as_str().unwrap_or("");
         if status == 401 {
             tracing::error!("host_auth_failed_retire_key_if_clock_reversed");
+        }
+        if status == 400 {
+            // The broker refused this body's shape. Resending it cannot
+            // succeed, so set it aside and move on to the next request.
+            tracing::error!(
+                request = kind(&request),
+                job_id = request.job,
+                status,
+                code,
+                "host_request_rejected"
+            );
+            self.runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .reject_request(&request)?;
+            self.in_flight = None;
+            self.failed(now_ms);
+            return Ok(());
         }
         if self
             .runtime
             .host
             .lock()
             .expect("host lock")
-            .finish_request(request, status, &body)?
+            .finish_request(&request, status, &body)?
         {
             self.in_flight = None;
+            self.failures = 0;
+            self.retry_at_ms = 0;
+        } else {
+            self.failed(now_ms);
+            tracing::warn!(
+                request = kind(&request),
+                job_id = request.job,
+                status,
+                code,
+                retry_in_ms = self.retry_at_ms.saturating_sub(now_ms),
+                "host_request_unconfirmed"
+            );
         }
         Ok(())
+    }
+    fn failed(&mut self, now_ms: u64) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at_ms = now_ms.saturating_add(retry_delay_ms(self.failures));
     }
 }
 
@@ -223,7 +332,13 @@ impl Heartbeats {
         let heartbeat = host.heartbeat(now_ms, memory, healthy);
         let state = lifecycle_state(heartbeat.clone());
         if due || self.last_state.as_ref() != Some(&state) {
-            host.queue_heartbeat(&self.runtime.host_id, &heartbeat, now_ms)?;
+            // A body the broker would refuse with 400 is never queued. It is
+            // checked again at the next interval or state change.
+            if let Some(check) = crate::wire::heartbeat_violation(&heartbeat) {
+                tracing::error!(check, "heartbeat_invalid");
+            } else {
+                host.queue_heartbeat(&self.runtime.host_id, &heartbeat, now_ms)?;
+            }
             self.last_heartbeat = now_ms;
             self.last_state = Some(state);
         }

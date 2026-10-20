@@ -68,6 +68,19 @@ pub use tenant_agent::serve_agent;
 #[cfg(target_os = "linux")]
 pub use tenant_local::serve_tenant_local;
 
+/// Serves one tenant job connection whose first frame is motor-host's
+/// `verified_lease`, exactly as the vsock and local tenant listeners do.
+/// Those listeners need a tenant VM or root-owned socket directories, so
+/// hosted-client tests use this to drive the real tenant boundary in process.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub async fn serve_tenant_connection<S>(runner: Runner, socket: S) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    server::tenant_channel(runner, socket).await
+}
+
 #[doc(hidden)]
 pub fn windows_prepare(path: &std::path::Path) -> std::io::Result<()> {
     windows::prepare_entry(path)
