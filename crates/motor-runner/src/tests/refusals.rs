@@ -197,6 +197,7 @@ fn policy_and_withdrawal_refusals_log_their_diagnostics() {
             .withdraw_for(
                 request.job_id,
                 Some(RefusalReason::Unknown("transfer_stalled".into())),
+                false,
             )
             .unwrap();
     });

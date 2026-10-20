@@ -79,6 +79,8 @@ const FRAME_CASES: &[&str] = &[
     "prepare-two-bundle-bundle-rejected",
     "attach-transfer-interrupted",
     "attach-truncated-replay",
+    "withdraw-spill",
+    "status-health-spill-withdrawals",
 ];
 const OUTCOME_CASES: &[&str] = &[
     "request-network-outbound",
@@ -121,6 +123,7 @@ const OUTCOME_CASES: &[&str] = &[
     "lost_to_restart-detail",
     "request_rejected-direct-timeout-detail",
     "runner_authentication_failed-detail",
+    "queue_wait_exceeded-spill-detail",
 ];
 const REPLY_CASES: &[&str] = &[
     "prepare-prepared",
@@ -255,7 +258,7 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 133);
+    assert_eq!(count, 136);
 }
 
 #[test]
@@ -393,6 +396,7 @@ fn outcome_vectors_pin_before_start_proofs_and_nullability() {
                         "request_rejected-direct-timeout-detail" => "request_rejected",
                         "transfer_interrupted-stalled-detail" => "transfer_interrupted",
                         "runner_full-slot-busy-detail" => "runner_full",
+                        "queue_wait_exceeded-spill-detail" => "queue_wait_exceeded",
                         "workspace_setup_failed-start-not-persisted-detail"
                         | "workspace_setup_failed-output-unavailable-detail" => {
                             "workspace_setup_failed"
@@ -425,6 +429,7 @@ fn outcome_vectors_pin_before_start_proofs_and_nullability() {
                             | "transfer_stalled"
                             | "lost_to_restart-detail"
                             | "queue_wait_exceeded-detail"
+                            | "queue_wait_exceeded-spill-detail"
                             | "workspace_setup_failed-detail"
                             | "transfer_interrupted-stalled-detail"
                             | "runner_full-slot-busy-detail"
@@ -1153,6 +1158,11 @@ fn typed_refusal_detail_vectors_preserve_codes_and_before_start_proof() {
             "waiting_on=permits; requested_permits=1; held_permits=0/1",
         ),
         (
+            "queue_wait_exceeded-spill-detail",
+            RefusalReason::QueueWaitExceeded,
+            "spill_withdrawal: waiting_on=permits; requested_permits=1; held_permits=0/1",
+        ),
+        (
             "workspace_setup_failed-detail",
             RefusalReason::WorkspaceSetupFailed,
             "prepare job workspace: populate workspace: destination path is not a directory",
@@ -1277,4 +1287,26 @@ fn grouped_refusal_detail_vectors_keep_specific_human_codes() {
         Some("prepare_unsupported: Prepare is unsupported by the Windows instance")
     );
     assert_eq!(refusal.retry_after_ms, None);
+}
+
+#[test]
+fn spill_withdrawal_fields_are_additive_and_omitted_at_default() {
+    for (name, spill) in [("withdraw", false), ("withdraw-spill", true)] {
+        let value = vector("frames", name);
+        let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(frame, Frame::Withdraw { spill: actual, .. } if actual == spill));
+        assert_eq!(serde_json::to_value(frame).unwrap(), value);
+    }
+    let Frame::StatusReply(reply) =
+        serde_json::from_value(vector("frames", "status-health-spill-withdrawals")).unwrap()
+    else {
+        panic!("expected health reply");
+    };
+    let wait = reply.health.unwrap().queue_wait_1h.unwrap();
+    assert_eq!(wait.refusals, 4);
+    assert_eq!(wait.spill_withdrawals, 65);
+    let legacy = serde_json::json!({"p50_ms": 0, "p90_ms": 0, "refusals": 0});
+    let wait: HealthQueueWait = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(wait.spill_withdrawals, 0);
+    assert_eq!(serde_json::to_value(wait).unwrap(), legacy);
 }

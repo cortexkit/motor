@@ -302,8 +302,9 @@ impl Connector for SpillPeer {
                             .await
                             .unwrap();
                         }
-                        Frame::Withdraw { job_id, .. } => {
+                        Frame::Withdraw { job_id, spill, .. } => {
                             assert_eq!(id, job_id);
+                            assert!(spill, "hosted spill must be distinguishable from a refusal");
                             withdrawn.store(true, Ordering::SeqCst);
                             write_frame_async(
                                 &mut peer,

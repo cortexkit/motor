@@ -36,10 +36,106 @@ fn queue_wait_percentiles_and_refusals_expire_with_hourly_buckets() {
         HealthQueueWait {
             p50_ms: 5000,
             p90_ms: 9000,
-            refusals: 1
+            refusals: 1,
+            spill_withdrawals: 0,
         }
     );
     assert_eq!(health.queue_wait(3_660_000), HealthQueueWait::default());
+}
+
+#[tokio::test]
+async fn spill_withdrawal_is_not_a_queue_wait_refusal() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (socket, server) = listener(&f, &runner);
+    for spill in [true, false] {
+        let (mut request, _) = f.run("touch must-not-run");
+        request.queue_wait_limit_s = 0;
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Queued;
+            job.queued_ms = Some(runner.now());
+            runner.save(job).unwrap();
+        }
+        let mut value = serde_json::json!({"type": "withdraw", "job_id": request.job_id});
+        if spill {
+            value["spill"] = true.into();
+        }
+        let frame: Frame = serde_json::from_value(value).unwrap();
+        let mut stream = connect(&socket).await;
+        if spill {
+            write_frame_async(
+                &mut stream,
+                &Frame::Attach(AttachRequest::new(request.job_id, 0)),
+            )
+            .await
+            .unwrap();
+        }
+        write_frame_async(&mut stream, &frame).await.unwrap();
+        assert!(matches!(
+            read_next(&mut stream).await,
+            Frame::WithdrawReply {
+                outcome: WithdrawOutcome::Withdrawn
+            }
+        ));
+        let record = terminal(&runner, request.job_id).await;
+        assert_eq!(
+            record.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::QueueWaitExceeded,
+            }
+        );
+        assert_eq!(record.ran, Some(Ran::None));
+        assert_eq!(
+            record
+                .refusal_detail()
+                .unwrap()
+                .starts_with("spill_withdrawal: "),
+            spill
+        );
+        // Replaying a withdrawal cannot count the same job twice.
+        let mut stream = connect(&socket).await;
+        write_frame_async(&mut stream, &frame).await.unwrap();
+        assert!(matches!(
+            read_next(&mut stream).await,
+            Frame::WithdrawReply {
+                outcome: WithdrawOutcome::Started
+            }
+        ));
+        let report = runner.runner_status().health.unwrap();
+        let wait = serde_json::to_value(report.queue_wait_1h.unwrap()).unwrap();
+        assert_eq!(wait["spill_withdrawals"], 1);
+        assert_eq!(wait["refusals"], u64::from(!spill));
+        assert_eq!(
+            report
+                .counts
+                .refusals
+                .get("queue_wait_exceeded")
+                .copied()
+                .unwrap_or(0),
+            u64::from(!spill)
+        );
+        let repository = Path::new(&request.repository_root)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            report.repository_usage[repository].queue_wait_refusals,
+            u64::from(!spill)
+        );
+    }
+    f.clock.fetch_add(3_600_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.runner_status().health.unwrap().queue_wait_1h,
+        Some(HealthQueueWait::default())
+    );
+    assert!(!Path::new(&f.key).join("must-not-run").exists());
+    server.abort();
 }
 
 #[test]

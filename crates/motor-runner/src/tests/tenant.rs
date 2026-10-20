@@ -197,6 +197,7 @@ async fn tenant_operations_fail_closed_without_job_changes() {
         Frame::Withdraw {
             job_id: other,
             reason: None,
+            spill: false,
         },
         Frame::Cancel(CancelRequest::new(other)),
         Frame::Run(run.clone()),
@@ -422,6 +423,7 @@ async fn tenant_accepted_is_admitted_and_withdraw_is_terminal() {
         &Frame::Withdraw {
             job_id: id,
             reason: None,
+            spill: false,
         },
     )
     .await

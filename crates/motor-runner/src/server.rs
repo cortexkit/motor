@@ -760,8 +760,13 @@ async fn session(
                 }
                 return Ok(());
             }
-            Frame::Withdraw { job_id, reason } => {
-                let outcome = locked(&runner, move |r| r.withdraw_for(job_id, reason)).await?;
+            Frame::Withdraw {
+                job_id,
+                reason,
+                spill,
+            } => {
+                let outcome =
+                    locked(&runner, move |r| r.withdraw_for(job_id, reason, spill)).await?;
                 send(tx, Frame::WithdrawReply { outcome }).await?;
                 if tenant.is_some() {
                     continue;
@@ -937,8 +942,8 @@ async fn attach(
                     let status = locked(runner, move |r| r.job_status(id)).await?;
                     send(tx, Frame::JobStatusReply(status)).await?;
                 },
-                Some(Frame::Withdraw { reason, .. }) => {
-                    let outcome = locked(runner, move |r| r.withdraw_for(id, reason)).await?;
+                Some(Frame::Withdraw { reason, spill, .. }) => {
+                    let outcome = locked(runner, move |r| r.withdraw_for(id, reason, spill)).await?;
                     send(tx, Frame::WithdrawReply { outcome }).await?;
                 },
                 _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected attach frame")),

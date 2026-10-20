@@ -215,6 +215,13 @@ pub struct HealthQueueWait {
     pub p50_ms: u64,
     pub p90_ms: u64,
     pub refusals: u64,
+    /// Jobs withdrawn by the client to try hosted capacity, not runner refusals.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spill_withdrawals: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +286,9 @@ pub enum WithdrawOutcome {
     Withdrawn,
     Started,
 }
+
+/// Prefix on the legacy queue-wait terminal detail for a move to hosted capacity.
+pub const SPILL_WITHDRAWAL_DETAIL_PREFIX: &str = "spill_withdrawal: ";
 
 // Generate the tag probe from the same declaration as Frame so new variants
 // cannot be mistaken for future records when their payload is malformed.
@@ -363,6 +373,10 @@ define_frames! {
         job_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<RefusalReason>,
+        /// The client is leaving the capacity queue to try a hosted runner.
+        /// Older runners ignore this field and retain queue-wait accounting.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        spill: bool,
     },
     WithdrawReply {
         outcome: WithdrawOutcome,

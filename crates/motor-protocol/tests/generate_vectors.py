@@ -224,6 +224,13 @@ def main():
                            "queue_wait_refusals": 1},
         }},
     }
+    frames["withdraw-spill"] = {"type": "withdraw", "job_id": JOB, "spill": True}
+    frames["status-health-spill-withdrawals"] = {
+        **health_status,
+        "health": {**health, "queue_wait_1h": {
+            "p50_ms": 2000, "p90_ms": 190000, "refusals": 4, "spill_withdrawals": 65,
+        }},
+    }
     for name, frame in frames.items():
         emit("frames", name, frame)
     new_have = {**frames["have"], "git_dependencies": [DEP_URL]}
@@ -320,6 +327,7 @@ def main():
 
     for name, reason, detail in [
         ("queue_wait_exceeded-detail", "queue_wait_exceeded", "waiting_on=permits; requested_permits=1; held_permits=0/1"),
+        ("queue_wait_exceeded-spill-detail", "queue_wait_exceeded", "spill_withdrawal: waiting_on=permits; requested_permits=1; held_permits=0/1"),
         ("workspace_setup_failed-detail", "workspace_setup_failed", "prepare job workspace: populate workspace: destination path is not a directory"),
         ("transfer_interrupted-stalled-detail", "transfer_interrupted", "transfer_stalled: git fetch made no progress for 60 seconds"),
         ("runner_full-slot-busy-detail", "runner_full", "windows_slot_busy"),

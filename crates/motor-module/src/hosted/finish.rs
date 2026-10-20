@@ -49,6 +49,8 @@ impl Client {
         let Some(body) = body else {
             return Ok(false);
         };
+        tracing::info!(job_id = %id, step = "finish", cause = ?terminal.or(state.terminal.as_ref()).map(|terminal| &terminal.outcome),
+            run_sent = state.run_sent, outcome = %body.outcome, run_ms = body.run_ms, "Boat finish requested");
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(attempt)).await;
@@ -76,7 +78,9 @@ impl Client {
                     })?;
                     return Ok(lost);
                 }
-                Err(_) => {}
+                Err(error) => {
+                    tracing::warn!(job_id = %id, step = "finish", cause = error.code(), attempt, "Boat finish failed; retry remains pending");
+                }
             }
         }
         // The durable body survives this bounded attempt and is retried on restart.
@@ -92,6 +96,7 @@ impl Client {
         id: Uuid,
         storage: &Storage,
     ) -> std::io::Result<()> {
+        tracing::info!(job_id = %id, step = "finish", cause = "no Run frame sent", "Boat never-ran cleanup requested");
         storage.hosted_update(id, |state| {
             if !state.finish_done && state.pending_finish.is_none() {
                 state.pending_finish = Some(Finish {
@@ -118,7 +123,7 @@ impl Client {
         tracing::info!(job_id = %id, outcome = %body.outcome, run_ms = body.run_ms,
             http_status = status, "Boat finish replied");
         if matches!(status, 400 | 404 | 409) {
-            tracing::warn!(job_id = %id, http_status = status, "Boat finish refused without retry");
+            tracing::warn!(job_id = %id, step = "finish", cause = "broker refused finish", http_status = status, "Boat finish refused without retry");
             if status == 409
                 && reply
                     .json::<serde_json::Value>()

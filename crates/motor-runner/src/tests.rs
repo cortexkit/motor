@@ -1900,6 +1900,7 @@ fn hello_is_answered_while_a_locked_request_waits_for_the_state_lock() {
             Frame::Withdraw {
                 job_id: unknown,
                 reason: None,
+                spill: false,
             },
         ),
         ("drop", Frame::Drop(DropRequest::new(f.key.clone()))),

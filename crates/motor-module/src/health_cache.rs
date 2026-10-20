@@ -177,6 +177,26 @@ mod tests {
     }
 
     #[test]
+    fn spill_withdrawals_are_exposed_but_not_reported_as_refusals() {
+        let now = Instant::now();
+        let mut sample = sample();
+        let wait = sample.queue_wait_1h.as_mut().unwrap();
+        wait.refusals = 0;
+        wait.spill_withdrawals = 65;
+        let mut cache = HealthCache::default();
+        cache.update(Some(sample), now);
+        let report = cache.report(now);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("build server busy: queue p90 3m 10s, 0 refusals in the last hour")
+        );
+        assert_eq!(
+            report.metrics.unwrap()["queue_wait_1h"]["spill_withdrawals"],
+            65
+        );
+    }
+
+    #[test]
     fn idle_cache_stales_after_two_minutes_and_recovers() {
         let now = Instant::now();
         let mut cache = HealthCache::default();

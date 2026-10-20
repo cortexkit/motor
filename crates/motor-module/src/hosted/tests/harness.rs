@@ -57,6 +57,7 @@ pub enum Behavior {
     DropTerminal,
     WrongHost,
     DropRunAck,
+    WrongHello,
     ReturnCapFailure,
 }
 
@@ -244,7 +245,11 @@ impl Harness {
                             &mut tls,
                             &Frame::Hello {
                                 return_paths: false,
-                                protocol_version: PROTOCOL_VERSION,
+                                protocol_version: if matches!(behavior, Behavior::WrongHello) {
+                                    PROTOCOL_VERSION + 1
+                                } else {
+                                    PROTOCOL_VERSION
+                                },
                                 started: true,
                                 default_branch_tip: true,
                                 gate_jobs: false,

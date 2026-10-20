@@ -71,6 +71,19 @@ it.
 | `job_status` / `job_status_reply` | both | One job's state. |
 | `drain` / `drain_reply`, `resume` / `resume_reply` | operator ↔ runner | Close and reopen admission; see [drain-and-rollback.md](drain-and-rollback.md). |
 
+`withdraw.spill: true` marks a client leaving the capacity queue to try a hosted
+runner. Absent or false retains ordinary queue-wait refusal accounting; false
+is omitted on the wire. The withdrawal eligibility and no-start proof are
+unchanged: the terminal retains `queue_wait_exceeded` with `ran: none`, and its
+detail begins `spill_withdrawal: `. The runner counts these jobs separately as
+`health.queue_wait_1h.spill_withdrawals`, not in hourly or per-repository queue-wait
+refusals. The new count defaults to zero and is omitted at zero. Older runners
+ignore the spill flag and continue counting it as a refusal; older clients
+remain compatible but cannot identify their spills. Tests:
+`spill_withdrawal_fields_are_additive_and_omitted_at_default`,
+`spill_withdrawal_is_not_a_queue_wait_refusal`, and
+`spill_withdrawals_are_exposed_but_not_reported_as_refusals`.
+
 ## 3. Hello and capabilities
 
 3.1. Each side sends `hello` with `protocol_version: 1`. On a mismatch the

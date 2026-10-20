@@ -47,12 +47,20 @@ impl Watch {
         })
     }
     pub(crate) fn withdrawn(&self, terminal: &TerminalRecord) -> bool {
-        !self.may_have_started
+        self.ready()
             && terminal.ran == Some(Ran::None)
-            && terminal.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded }
-            // Only a currently observed capacity-permit wait authorizes spill.
-            // Upload, workspace ownership and a missing heartbeat are not proof.
-            && self.permits.is_some_and(|_| self.wait_ms() >= self.after.saturating_mul(1000))
+            && terminal.outcome
+                == Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::QueueWaitExceeded,
+                }
+    }
+    pub(crate) fn ready(&self) -> bool {
+        // Only a currently observed capacity-permit wait authorizes spill.
+        // Upload, workspace ownership and a missing heartbeat are not proof.
+        !self.may_have_started
+            && self
+                .permits
+                .is_some_and(|_| self.wait_ms() >= self.after.saturating_mul(1000))
     }
 }
 

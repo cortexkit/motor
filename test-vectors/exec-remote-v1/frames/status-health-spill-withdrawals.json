@@ -1,0 +1,32 @@
+{
+  "type": "status_reply",
+  "queue_depth": 0,
+  "running_jobs": [],
+  "server_reachable": true,
+  "repositories": [],
+  "rustc_version": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+  "health": {
+    "runner_version": "0.1.0",
+    "since_ms": 1000,
+    "window_minutes": 60,
+    "free_bytes": 1024,
+    "queue_depth": 0,
+    "running": [],
+    "counts": {
+      "accepted": 0,
+      "refusals": {},
+      "evictions": 0,
+      "eviction_bytes": 0,
+      "eviction_failures": 0,
+      "soft_goal_unmet_passes": 0,
+      "skipped_recent": 0,
+      "oom_stops": 0
+    },
+    "queue_wait_1h": {
+      "p50_ms": 2000,
+      "p90_ms": 190000,
+      "refusals": 4,
+      "spill_withdrawals": 65
+    }
+  }
+}

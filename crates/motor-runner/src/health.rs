@@ -14,6 +14,7 @@ pub(super) struct Health {
     pub since_ms: u64,
     buckets: BTreeMap<u64, HealthCounts>,
     queue_waits: BTreeMap<u64, BTreeMap<u64, u64>>,
+    spill_withdrawals: BTreeMap<u64, u64>,
 }
 
 impl Health {
@@ -22,6 +23,7 @@ impl Health {
             since_ms,
             buckets: BTreeMap::new(),
             queue_waits: BTreeMap::new(),
+            spill_withdrawals: BTreeMap::new(),
         }
     }
 
@@ -30,6 +32,8 @@ impl Health {
         self.buckets
             .retain(|bucket, _| minute.saturating_sub(*bucket) < u64::from(WINDOW_MINUTES));
         self.queue_waits
+            .retain(|bucket, _| minute.saturating_sub(*bucket) < u64::from(WINDOW_MINUTES));
+        self.spill_withdrawals
             .retain(|bucket, _| minute.saturating_sub(*bucket) < u64::from(WINDOW_MINUTES));
     }
 
@@ -72,7 +76,13 @@ impl Health {
                 .get("queue_wait_exceeded")
                 .copied()
                 .unwrap_or(0),
+            spill_withdrawals: self.spill_withdrawals.values().sum(),
         }
+    }
+
+    pub fn record_spill_withdrawal(&mut self, now: u64) {
+        self.prune(now);
+        *self.spill_withdrawals.entry(now / MINUTE_MS).or_default() += 1;
     }
 
     pub fn record(&mut self, now: u64, update: impl FnOnce(&mut HealthCounts)) {
@@ -181,7 +191,9 @@ impl RepositoryUsage {
             return;
         };
         let queue_wait_refusal = job.terminal.as_ref().is_some_and(|terminal| {
-            matches!(
+            !terminal.refusal_detail().is_some_and(|detail| {
+                detail.starts_with(motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX)
+            }) && matches!(
                 &terminal.outcome,
                 Outcome::RefusedBeforeStart {
                     reason: RefusalReason::QueueWaitExceeded

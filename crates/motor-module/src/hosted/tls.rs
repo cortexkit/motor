@@ -231,11 +231,15 @@ pub(super) async fn authenticate(
         // A host that refuses tenant runner initialization says so before the
         // runner's hello; keep its reason instead of reporting a lost connection.
         Prelude::LeaseOk {} => Channel::from_hosted(pipe).await.map_err(|error| {
-            error
+            let mut failure = error
                 .get_ref()
                 .and_then(|source| source.downcast_ref::<crate::transport::HostedHelloRefusal>())
                 .map(|refusal| ConnectFailure::refused("runner_hello", &refusal.0))
-                .unwrap_or(at("runner_hello", Error::Connect))
+                .unwrap_or(at("runner_hello", Error::Connect));
+            if error.to_string() == "hosted runner protocol version mismatch" {
+                failure.host_reason = Some("runner_version_mismatch".into());
+            }
+            failure
         }),
         Prelude::LeaseRefused { reason } => Err(ConnectFailure::refused("lease_ok", &reason)),
         _ => Err(at("lease_ok", Error::Auth)),

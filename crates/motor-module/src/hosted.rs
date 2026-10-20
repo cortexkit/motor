@@ -158,6 +158,7 @@ pub(crate) enum Error {
     Finished,
     Rejected,
     Released,
+    NotGranted,
     Budget,
     Platform,
     AccountNotFound,
@@ -199,6 +200,7 @@ impl Error {
             Self::Finished => "hosted_job_finished",
             Self::Rejected => "lease_mismatch",
             Self::Released => "hosted_job_released",
+            Self::NotGranted => "hosted_not_granted",
             Self::Budget => "hosted_budget_exhausted",
             Self::Platform => "hosted_platform_unsupported",
             Self::AccountNotFound => "hosted_account_not_found",
@@ -512,6 +514,10 @@ impl Client {
                     Some("capacity" | "no_capacity") => Error::Capacity,
                     Some("host_full") => Error::HostFull,
                     Some("job_released") => Error::Released,
+                    // A refused lease has no granted lease for release to cancel.
+                    Some("job_unknown") if status == 404 && path.ends_with("/release") => {
+                        Error::NotGranted
+                    }
                     Some("budget_exhausted") => Error::Budget,
                     Some("platform_unsupported") => Error::Platform,
                     Some("sandbox_lost") if status == 409 => Error::SandboxLost,
@@ -576,6 +582,7 @@ impl Client {
             .await
             .map_err(|failure| {
                 tracing::info!(job_id = %id, code = failure.error.code(), step = failure.step,
+                    cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                     host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted attach failed");
                 failure.error
             })
@@ -704,6 +711,7 @@ impl Client {
                 Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
                 Err(failure) => {
                     tracing::info!(job_id = %id, attempt, code = failure.error.code(), step = failure.step,
+                        cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                         host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
                 }
             }

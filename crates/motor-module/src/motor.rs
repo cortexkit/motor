@@ -44,6 +44,9 @@ impl JobStream {
     /// not a cancel; only this explicit operation records cancellation intent.
     pub fn cancel(&self) -> io::Result<()> {
         self.storage.cancel(self.job_id, true)?;
+        if self.hosted_state().is_some() {
+            tracing::info!(job_id = %self.job_id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
+        }
         let _ = self.wake.send(true);
         Ok(())
     }
@@ -331,6 +334,10 @@ impl Motor {
         retry_after_ms: Option<u64>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
     ) -> io::Result<()> {
+        if self.hosted_state(id).is_some() {
+            tracing::warn!(job_id = %id, step = "refused_before_start", ?reason,
+                cause = detail.as_deref().unwrap_or("no refusal detail"), "hosted job stopped");
+        }
         let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
             .with_ran(Ran::None);
         terminal.retry_after_ms = retry_after_ms;
@@ -539,7 +546,8 @@ impl Motor {
                     tx,
                     wake.clone(),
                 )
-                .await?
+                .await
+                .inspect_err(|error| self.log_hosted_failure(id, "run_snapshot", error))?
             {
                 return Ok(());
             }
@@ -731,14 +739,16 @@ impl Motor {
             transfer_snapshots.transfer_bundles(id, &held.0, held.1.as_deref())
         })
         .await
-        .map_err(io::Error::other)?;
+        .map_err(io::Error::other)
+        .inspect_err(|error| self.log_hosted_failure(id, "transfer_bundles", error))?;
         let (bundles, git_dependencies, upload) = match bundles {
             Ok(b) => b,
-            Err(_) => {
+            Err(error) => {
+                self.log_hosted_failure(id, "transfer_bundles", &error);
                 return self
                     .refused(id, RefusalReason::SnapshotFailed, Some(hash), None, tx)
                     .await
-                    .map(|_| false)
+                    .map(|_| false);
             }
         };
         let run = Run {
@@ -753,10 +763,10 @@ impl Motor {
             },
             job_id: build_server_id,
             workspace_key: request.workspace_key.clone(),
-            workspace_kind: Some(snapshot::workspace_kind(
-                &self.config,
-                &request.workspace_key,
-            )?),
+            workspace_kind: Some(
+                snapshot::workspace_kind(&self.config, &request.workspace_key)
+                    .inspect_err(|error| self.log_hosted_failure(id, "workspace_kind", error))?,
+            ),
             repository_root: request.repository_root,
             cwd: request.cwd,
             command: request.command,
@@ -788,9 +798,11 @@ impl Motor {
         // spilled job from returning to the build server once it may have run.
         if hosted {
             self.storage
-                .hosted_update(id, |state| state.run_sent = true)?;
+                .hosted_update(id, |state| state.run_sent = true)
+                .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         }
-        if channel.send(Frame::Run(run)).await.is_err() {
+        if let Err(error) = channel.send(Frame::Run(run)).await {
+            self.log_hosted_failure(id, "run_send", &error);
             drop(channel);
             drop(snapshots);
             if self
@@ -801,9 +813,15 @@ impl Motor {
             }
             return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
         }
+        if hosted {
+            tracing::info!(job_id = %id, step = "run_send", cause = "Run frame written; awaiting admission", "hosted Run sent");
+        }
         let admission = channel.next().await;
         match admission {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
+                if hosted {
+                    tracing::info!(job_id = %id, step = "admission", cause = "runner accepted Run", "hosted Run accepted");
+                }
                 // Older runners may accept the job but ignore its network request.
                 // Cancel before uploading, rather than silently running it offline.
                 if request.network.is_some() && accepted.network != Some(Network::Outbound) {
@@ -830,13 +848,18 @@ impl Motor {
                 }
                 let accepted = accepted.with_env_not_forwarded(env_not_forwarded);
                 if wrong_platform {
+                    self.log_hosted_failure(id, "admission", "accepted platform mismatch");
                     self.cancel(CancelRequest::new(id)).await?;
                 }
                 // The caller already holds this job's acceptance from its first
                 // build-server submission. Neither a spill to a hosted runner
                 // nor a resubmission is a second job.
                 if !resubmitted && !spilled {
-                    emit(tx, StreamRecord::Accepted(accepted)).await?;
+                    emit(tx, StreamRecord::Accepted(accepted))
+                        .await
+                        .inspect_err(|error| {
+                            self.log_hosted_failure(id, "accepted_delivery", error)
+                        })?;
                 }
                 if wrong_platform {
                     drop(channel);
@@ -872,7 +895,8 @@ impl Motor {
             }
             // A lost acknowledgement may hide acceptance. Inspect the submitted
             // job ID rather than resubmitting a command that might already run.
-            _ => {
+            other => {
+                self.log_hosted_failure(id, "admission", incoming_cause(&other));
                 drop(channel);
                 drop(snapshots);
                 if self
@@ -926,6 +950,7 @@ impl Motor {
         }
         .await;
         if let Err(error) = &result {
+            self.log_hosted_failure(id, "have_exchange", error);
             record_unreachable(id, step, error);
         }
         result
@@ -996,6 +1021,11 @@ impl Motor {
     }
     pub fn hosted_state(&self, id: Uuid) -> Option<crate::HostedJobState> {
         self.storage.job(id).and_then(|j| j.hosted_route())
+    }
+    fn log_hosted_failure(&self, id: Uuid, step: &str, cause: impl std::fmt::Display) {
+        if self.hosted_state(id).is_some() {
+            tracing::warn!(job_id = %id, step, cause = %cause, "hosted job stopped");
+        }
     }
     /// The ID the build server knows this job by. It differs from the caller's
     /// job ID only after a spilled job whose hosted route failed before any Run
@@ -1174,6 +1204,7 @@ impl Motor {
     ) -> io::Result<()> {
         self.follow_inner(id, cursor, channel, tx, wake, None)
             .await
+            .inspect_err(|error| self.log_hosted_failure(id, "follow", error))
             .map(|_| ())
     }
     async fn follow_inner(
@@ -1210,6 +1241,7 @@ impl Motor {
         let mut hosted_terminal_deadline = None;
         loop {
             if tx.is_closed() {
+                self.log_hosted_failure(id, "follow", "caller detached");
                 return Err(io::Error::other("caller detached"));
             }
             if self.pending(id) {
@@ -1219,6 +1251,7 @@ impl Motor {
                         .unwrap()
                         .send(Frame::Cancel(CancelRequest::new(id)))
                         .await
+                        .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
                         .is_err()
                     {
                         channel = None;
@@ -1226,7 +1259,10 @@ impl Motor {
                 } else {
                     let cancel = tokio::select! {
                         result = self.send_cancel(id) => result,
-                        _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                        _ = tx.closed() => {
+                            self.log_hosted_failure(id, "cancel", "caller detached");
+                            return Err(io::Error::other("caller detached"));
+                        },
                     };
                     if cancel.is_err() {
                         if hosted {
@@ -1246,6 +1282,7 @@ impl Motor {
                 }
                 queue_deadline = None;
                 if hosted && reattaches == 3 {
+                    self.log_hosted_failure(id, "reattach", "attempt limit reached");
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 }
                 if hosted {
@@ -1256,8 +1293,14 @@ impl Motor {
                 }
                 let opened = tokio::select! {
                     result = self.open_job_channel(id) => result,
-                    _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                    _ = tx.closed() => {
+                        self.log_hosted_failure(id, "reattach", "caller detached");
+                        return Err(io::Error::other("caller detached"));
+                    },
                 };
+                if let Err(error) = &opened {
+                    self.log_hosted_failure(id, "reattach", error.code());
+                }
                 if matches!(opened, Err(crate::hosted::Error::SandboxLost)) {
                     return self.lost_sandbox(id, tx).await.map(|_| false);
                 }
@@ -1291,6 +1334,7 @@ impl Motor {
                     // terminal outcome it retained for that ID.
                     if c.send(Frame::Attach(AttachRequest::new(build_server_id, cursor)))
                         .await
+                        .inspect_err(|error| self.log_hosted_failure(id, "attach_send", error))
                         .is_ok()
                     {
                         channel = Some(c);
@@ -1314,13 +1358,15 @@ impl Motor {
                 biased;
                 frame = c.next_job() => Some(frame),
                 _ = async { if let Some(deadline) = hosted_terminal_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                    self.log_hosted_failure(id, "hosted_terminal", "timeout waiting for settlement record");
                     channel = None; hosted_terminal_deadline = None; None
                 },
                 changed = wake.changed(), if wake_open => { if changed.is_err() { wake_open = false; } None },
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
                     withdraw_sent = true;
                     queue_deadline = None;
-                    if c.send(Frame::Withdraw { job_id: build_server_id, reason: None }).await.is_err() { channel = None; }
+                    let spill = spill_watch.as_ref().is_some_and(|watch| watch.ready());
+                    if c.send(Frame::Withdraw { job_id: build_server_id, reason: None, spill }).await.is_err() { channel = None; }
                     None
                 },
             };
@@ -1391,6 +1437,7 @@ impl Motor {
                 }
                 Ok(Incoming::Frame(Frame::Terminal(mut terminal))) => {
                     if terminal.job_id != build_server_id {
+                        self.log_hosted_failure(id, "terminal", "terminal job ID mismatch");
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "terminal job ID mismatch",
@@ -1475,6 +1522,11 @@ impl Motor {
                         })
                         || state.max_runtime_s != Some(terminal.max_runtime_s)
                     {
+                        self.log_hosted_failure(
+                            id,
+                            "hosted_terminal",
+                            "terminal does not match stored route",
+                        );
                         return Err(io::Error::other(
                             "hosted terminal does not match stored route",
                         ));
@@ -1485,23 +1537,14 @@ impl Motor {
                 }
                 Ok(Incoming::Frame(Frame::WithdrawReply { .. })) => {}
                 Ok(Incoming::Frame(Frame::CancelReply(reply))) if hosted && reply.job_id == id => {
+                    tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
                     self.storage.cancel(id, false)?;
                 }
                 other => {
                     if hosted {
                         // Name the close, so an outcome-unknown job says which
                         // connection ended and how.
-                        let cause = match &other {
-                            Err(error) => error.to_string(),
-                            Ok(Incoming::Frame(frame)) => format!(
-                                "unexpected {} frame",
-                                serde_json::to_value(frame)
-                                    .ok()
-                                    .and_then(|v| v["type"].as_str().map(str::to_owned))
-                                    .unwrap_or_default()
-                            ),
-                            Ok(Incoming::Unknown(_)) => "unknown frame".into(),
-                        };
+                        let cause = incoming_cause(&other);
                         tracing::warn!(
                             job_id = %id,
                             step = if reattaches == 0 { "run" } else { "reattach" },
@@ -1533,13 +1576,21 @@ impl Motor {
             return Ok(CancelReply::new(id));
         }
         self.storage.cancel(id, true)?;
+        if self.hosted_state(id).is_some() {
+            tracing::info!(job_id = %id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
+        }
         // The task streaming a hosted job already owns its only allowed attach
         // connection. It checks pending cancellation on each heartbeat and sends
         // it there, rather than opening a conflicting second connection.
         if self.hosted_state(id).is_some() && self.storage.has_live_stream(id) {
             return Ok(CancelReply::new(id));
         }
-        if self.send_cancel(id).await.is_err() {
+        if self
+            .send_cancel(id)
+            .await
+            .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
+            .is_err()
+        {
             let motor = self.clone();
             tokio::spawn(async move {
                 let mut delay = 1;
@@ -1990,6 +2041,24 @@ mod started_tests;
 #[cfg(test)]
 #[path = "resubmit_tests.rs"]
 mod resubmit_tests;
+
+#[cfg(test)]
+#[path = "post_connect_tests.rs"]
+mod post_connect_tests;
+
+fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
+    match incoming {
+        Err(error) => error.to_string(),
+        Ok(Incoming::Frame(frame)) => format!(
+            "unexpected {} frame",
+            serde_json::to_value(frame)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(str::to_owned))
+                .unwrap_or_default()
+        ),
+        Ok(Incoming::Unknown(_)) => "unknown frame".into(),
+    }
+}
 
 fn log_refusal(id: Uuid, refusal: &Refusal) {
     tracing::info!(job_id = %id, reason = ?refusal.reason,

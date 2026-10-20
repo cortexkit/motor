@@ -2838,12 +2838,13 @@ impl Runner {
     }
     #[cfg(test)]
     pub(crate) fn withdraw(&self, id: Uuid) -> io::Result<WithdrawOutcome> {
-        self.withdraw_for(id, None)
+        self.withdraw_for(id, None, false)
     }
     pub(crate) fn withdraw_for(
         &self,
         id: Uuid,
         reason: Option<RefusalReason>,
+        spill: bool,
     ) -> io::Result<WithdrawOutcome> {
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
@@ -2900,18 +2901,40 @@ impl Runner {
                     .into_iter()
                     .flat_map(|request| request.env.values().cloned()),
             );
-            refuse_before_start(
-                &self.core.health,
-                job,
-                if stalled {
-                    RefusalReason::TransferInterrupted
-                } else {
-                    RefusalReason::QueueWaitExceeded
-                },
-                &detail,
-                Some(safe_detail),
-                self.now(),
-            );
+            if spill && !stalled {
+                // Keep the legacy outcome so old clients know the job never started,
+                // but do not count a move to hosted capacity as a runner refusal.
+                let detail = format!(
+                    "{}{safe_detail}",
+                    motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
+                );
+                tracing::info!(job_id = %id, detail, "job spill_withdrawal");
+                self.core
+                    .health
+                    .lock()
+                    .unwrap()
+                    .record_spill_withdrawal(self.now());
+                job.terminal(
+                    Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::QueueWaitExceeded,
+                    },
+                    self.now(),
+                );
+                job.terminal = job.terminal.take().map(|t| t.with_refusal_detail(detail));
+            } else {
+                refuse_before_start(
+                    &self.core.health,
+                    job,
+                    if stalled {
+                        RefusalReason::TransferInterrupted
+                    } else {
+                        RefusalReason::QueueWaitExceeded
+                    },
+                    &detail,
+                    Some(safe_detail),
+                    self.now(),
+                );
+            }
             job.state = JobState::Tombstone;
             self.save(job)?;
             Ok(WithdrawOutcome::Withdrawn)

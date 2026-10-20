@@ -225,7 +225,11 @@ fn stalled_withdrawal_keeps_private_intent_and_typed_terminal() {
     let (_scratch, runner, request, _) = fixture();
     assert_eq!(
         runner
-            .withdraw_for(request.job_id, Some(RefusalReason::TransferInterrupted))
+            .withdraw_for(
+                request.job_id,
+                Some(RefusalReason::TransferInterrupted),
+                false
+            )
             .unwrap(),
         motor_protocol::WithdrawOutcome::Started
     );
@@ -233,7 +237,8 @@ fn stalled_withdrawal_keeps_private_intent_and_typed_terminal() {
         runner
             .withdraw_for(
                 request.job_id,
-                Some(RefusalReason::Unknown("transfer_stalled".into()))
+                Some(RefusalReason::Unknown("transfer_stalled".into())),
+                false
             )
             .unwrap(),
         motor_protocol::WithdrawOutcome::Withdrawn

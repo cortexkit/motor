@@ -138,6 +138,44 @@ fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
 }
 
 #[tokio::test]
+async fn refused_lease_release_job_unknown_is_not_unreachable() {
+    let h = Harness::new(Behavior::Normal).await;
+    h.broker.lock().unwrap().knobs.refusal = Some((503, "no_capacity".into()));
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let mut route = h.route.clone();
+    route.spill_wait_ms = Some(0);
+    let storage = stored(&scratch, id, route.clone());
+    let client = Client::new(route);
+    assert_eq!(
+        client
+            .run(id, &Harness::request(&scratch.0), &storage)
+            .await
+            .err(),
+        Some(Error::Capacity)
+    );
+    assert_eq!(
+        client.release(id).await.err().map(Error::code),
+        Some("hosted_not_granted")
+    );
+    // An unknown route is not evidence of a refused or already-released lease.
+    assert_eq!(
+        client
+            .post::<_, serde_json::Value>("/missing", &serde_json::json!({}))
+            .await,
+        Err(Error::Broker)
+    );
+    assert_eq!(
+        *h.requests.lock().unwrap(),
+        vec![
+            "/v1/leases".to_string(),
+            format!("/v1/leases/{id}/release"),
+            "/missing".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn hosted_internal_failure_is_not_retried_before_or_after_lease_ok() {
     for behavior in [
         Behavior::Refuse("internal_failure"),

@@ -494,7 +494,7 @@ pub(crate) struct Channel {
     pub gate_jobs: bool,
     pub platforms: Vec<String>,
     tx: mpsc::Sender<WriteRequest>,
-    rx: mpsc::Receiver<Incoming>,
+    rx: mpsc::Receiver<io::Result<Incoming>>,
     heartbeat_enabled: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -557,6 +557,9 @@ impl Channel {
                     channel.return_paths = return_paths;
                     channel.enable_heartbeats();
                     return Ok(channel);
+                }
+                Frame::Hello { .. } => {
+                    return Err(io::Error::other("hosted runner protocol version mismatch"))
                 }
                 Frame::Heartbeat { .. } => continue,
                 _ => return Err(io::Error::other("invalid hosted runner hello")),
@@ -735,7 +738,7 @@ impl Channel {
                 .await;
                 match result {
                     Ok(frame) => {
-                        if incoming.send(frame).await.is_err() {
+                        if incoming.send(Ok(frame)).await.is_err() {
                             break;
                         }
                     }
@@ -743,10 +746,14 @@ impl Channel {
                         if error.kind() == io::ErrorKind::UnexpectedEof && !frame_started =>
                     {
                         tracing::debug!("runner closed stream at a frame boundary");
+                        let _ = incoming.send(Err(error)).await;
                         break;
                     }
                     Err(error) => {
                         tracing::warn!(%error, "runner frame read/decode failed; reconnecting job stream");
+                        // Preserve the cause for the job owner, which can name
+                        // the job and lifecycle step in its diagnostic.
+                        let _ = incoming.send(Err(error)).await;
                         break;
                     }
                 }
@@ -813,7 +820,7 @@ impl Channel {
         self.rx
             .recv()
             .await
-            .ok_or_else(|| io::Error::other("channel detached"))
+            .ok_or_else(|| io::Error::other("channel detached"))?
     }
 }
 #[cfg(test)]
