@@ -40,7 +40,8 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `runner_instance` | `main` | Runner instance for Linux jobs. |
-| `windows_runner_instance`, `windows_runner_state_root` | absent | Runner instance and its absolute state root for Windows jobs. Set both or neither; the instance must differ from `runner_instance`. Without them, Windows requests are refused with `platform_unsupported`. |
+| `windows_runner_instance`, `windows_runner_state_root` | absent | Legacy Windows runner instance and absolute state root. Set both or neither; the instance must differ from `runner_instance`. Used when `windows_runners` is empty. |
+| `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root`, `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `queue_wait_limit_s` | `300` | Default queue-wait budget for a job. |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |

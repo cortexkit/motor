@@ -20,12 +20,54 @@ boot the real image and are operator-only.
 means Linux. Test: `run_platform_uses_shared_tags_and_preserves_unknown_values`
 (`crates/motor-protocol/tests/it/platform_contract.rs`).
 
-1.2. `ck-motor` routes a Windows request to the instance named by its
-`windows_runner_instance` and `windows_runner_state_root` settings. Without
-them, or for an unknown platform, it refuses with `platform_unsupported` before
+1.2. `ck-motor` tries `windows_runners` in order. An empty list uses the legacy
+`windows_runner_instance` and `windows_runner_state_root` pair as a single
+build-server target. Without either configuration, or for an unknown platform,
+it refuses with `platform_unsupported` before
 opening any connection. Tests: `unconfigured_windows_and_unknown_platforms_refuse_before_any_channel`,
 `windows_config_load_requires_safe_distinct_paired_keys`
 (`crates/motor-module/tests/it/routing.rs`).
+
+Each list entry has `name`, `host`, `port` (default 22), `user`, `host_key`
+(an OpenSSH public-key line), `instance`, `state_root` and `max_concurrent`
+(default 1). Names must be unique; instances may repeat on different machines.
+The list takes precedence over the legacy pair. Example (documentation-only
+addresses; supply verified host keys):
+
+```jsonc
+"windows_runners": [
+  { "name": "portable", "host": "192.0.2.41", "user": "runner",
+    "host_key": "ssh-ed25519 <verified-base64-key>",
+    "instance": "windows", "state_root": "/srv/motor/windows" },
+  { "name": "build-server", "host": "192.0.2.42", "user": "runner",
+    "host_key": "ssh-ed25519 <verified-base64-key>",
+    "instance": "windows", "state_root": "/srv/motor/windows" }
+]
+```
+
+An explicit endpoint uses only the existing vault-signed runner identity: no
+ambient SSH configuration, identities or agents, no forwarded agent, and no
+shared build-server SSH master. A private temporary `known_hosts` file pins
+`host_key` with strict checking. The endpoint's dedicated non-admin account must
+authorize the vault public key and serve the runner protocol through
+`~/.cargo/bin/motor-runner connect --instance … --state-root … --job …`.
+Account provisioning and runner installation happen on the runner, not through
+ck-motor. The legacy build-server SSH path is unchanged. Tests:
+`explicit_windows_endpoint_offers_only_vault_identity_and_never_legacy_host`,
+`two_ssh_runs_share_one_master_and_one_vault_sign` (the latter needs local sshd
+and checks explicit-endpoint authentication and a wrong host-key refusal too).
+
+The explicit endpoint's handshake, status probe and job-channel handshake share
+a three-second bound. Unreachable, full, and locally reserved runners fall
+through to the next entry. A positive `runner_full` admission refusal may also
+fall through; a lost Run acknowledgement or any acceptance never moves a job.
+Snapshot upload is reused across attempts. `ck health motor` includes each
+runner's sampled reachability and busy state; a busy runner is not itself a
+module failure. Tests:
+`ordered_windows_unreachable_handshake_falls_through_within_three_seconds`,
+`ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_move`,
+`ordered_windows_local_slot_reservation_falls_through_without_queueing`,
+`ordered_windows_health_reports_each_runner_reachability_and_busy_state`.
 
 1.3. A runner lists the platforms it serves in its `hello` (`platforms:
 ["windows"]` for a Windows instance; empty for Linux). `ck-motor` sends a Windows
@@ -60,6 +102,9 @@ record; it never lets the job run as if it were on Windows. Test:
 status after a `ck-motor` restart reach the same instance. Tests:
 `windows_run_binding_echo_and_reconnect_survive_module_restart`,
 `detached_windows_cancel_retry_keeps_the_persisted_instance`.
+For explicit endpoints the entire endpoint and host-key pin are stored before
+Run, so configuration reordering or editing cannot redirect an admitted job.
+Test: `ordered_windows_runners_prefer_first_and_persist_full_binding_across_restart`.
 
 ## 3. What a Windows job sees
 

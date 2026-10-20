@@ -60,6 +60,7 @@ pub struct Motor {
     spool_root: PathBuf,
     account_tokens: Option<Arc<crate::AccountTokens>>,
     shadows: Arc<crate::shadow::Manager>,
+    windows_slots: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
 }
 #[cfg(test)]
 #[path = "hosted/account/boundary_tests.rs"]
@@ -79,6 +80,13 @@ impl Motor {
         connector: Arc<dyn Connector>,
     ) -> io::Result<Self> {
         config.validate()?;
+        let windows_slots = Arc::new(
+            config
+                .windows_runners
+                .iter()
+                .map(|r| Arc::new(tokio::sync::Semaphore::new(r.max_concurrent)))
+                .collect(),
+        );
         Ok(Self {
             config,
             storage: Arc::new(Storage::open(storage_root)?),
@@ -86,6 +94,7 @@ impl Motor {
             spool_root: storage_root.join("spools"),
             account_tokens: None,
             shadows: Arc::new(crate::shadow::Manager::new(storage_root)),
+            windows_slots,
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -214,6 +223,11 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create(id, wait, attribution, instance, gate_job)?;
+        if request.platform == Some(Platform::Windows) {
+            if let Some(runner) = self.config.windows_runners.first() {
+                self.storage.bind_windows(id, runner.clone())?;
+            }
+        }
         if hosted_test {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
@@ -597,6 +611,42 @@ impl Motor {
         } else {
             Some(self.connector_for_job(id)?)
         };
+        let explicit_windows = windows && !self.config.windows_runners.is_empty();
+        // Reserve locally before probing remote capacity so concurrent callers
+        // cannot all observe the same free slot. The runner remains authoritative.
+        let _windows_slot = if explicit_windows {
+            let runner = self
+                .storage
+                .job(id)
+                .and_then(|j| j.windows_runner)
+                .expect("Windows binding exists");
+            let index = self
+                .config
+                .windows_runners
+                .iter()
+                .position(|r| r.name == runner.name)
+                .expect("configured Windows runner");
+            match self.windows_slots[index].clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    if self.next_windows_runner(id)? {
+                        return Ok(true);
+                    }
+                    return self
+                        .refused(
+                            id,
+                            RefusalReason::RunnerFull,
+                            None,
+                            Some("windows_slots_busy".into()),
+                            tx,
+                        )
+                        .await
+                        .map(|_| false);
+                }
+            }
+        } else {
+            None
+        };
         // Measures how long a spilled job spent on its hosted route.
         let spill_started = tokio::time::Instant::now();
         let (mut channel, held) = loop {
@@ -636,13 +686,60 @@ impl Motor {
                     }
                 }
             } else {
-                open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
-                    .await
-                    .map_err(|(reason, detail)| (reason, detail, None))
+                let opened = async {
+                    let mut channel =
+                        open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
+                            .await?;
+                    if explicit_windows {
+                        channel
+                            .send(Frame::Status)
+                            .await
+                            .map_err(|e| (RefusalReason::Unreachable, Some(e.to_string())))?;
+                        match channel.next().await {
+                            Ok(Incoming::Frame(Frame::StatusReply(status))) => {
+                                let runner =
+                                    self.storage.job(id).and_then(|j| j.windows_runner).unwrap();
+                                if windows_busy(&status, runner.max_concurrent) {
+                                    return Err((
+                                        RefusalReason::RunnerFull,
+                                        Some("windows_slots_busy".into()),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                return Err((
+                                    RefusalReason::Unreachable,
+                                    Some("Windows runner status unavailable".into()),
+                                ))
+                            }
+                        }
+                        drop(channel);
+                        channel =
+                            open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
+                                .await?;
+                    }
+                    Ok(channel)
+                };
+                if explicit_windows {
+                    tokio::time::timeout(WINDOWS_PROBE_TIMEOUT, opened)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err((
+                                RefusalReason::Unreachable,
+                                Some("Windows runner handshake/status timed out after 3s".into()),
+                            ))
+                        })
+                } else {
+                    opened.await
+                }
+                .map_err(|(reason, detail)| (reason, detail, None))
             };
             let mut channel = match opened {
                 Ok(c) => c,
                 Err((reason, detail, retry_after_ms)) => {
+                    if explicit_windows && self.next_windows_runner(id)? {
+                        return Ok(true);
+                    }
                     return self
                         .refused_with_retry(
                             id,
@@ -653,7 +750,7 @@ impl Motor {
                             tx,
                         )
                         .await
-                        .map(|_| false)
+                        .map(|_| false);
                 }
             };
             if !returns.return_paths.is_empty() && !channel.return_paths {
@@ -680,6 +777,9 @@ impl Motor {
                     .iter()
                     .any(|platform| platform == "windows")
             {
+                if explicit_windows && self.next_windows_runner(id)? {
+                    return Ok(true);
+                }
                 return self
                     .refused(
                         id,
@@ -734,6 +834,9 @@ impl Motor {
                     continue;
                 }
                 Err(_) => {
+                    if explicit_windows && self.next_windows_runner(id)? {
+                        return Ok(true);
+                    }
                     return self
                         .refused(
                             id,
@@ -743,7 +846,7 @@ impl Motor {
                             tx,
                         )
                         .await
-                        .map(|_| false)
+                        .map(|_| false);
                 }
             };
             break (channel, held);
@@ -891,6 +994,14 @@ impl Motor {
             Ok(Incoming::Frame(Frame::Refusal(refusal))) => {
                 log_refusal(id, &refusal);
                 let (reason, detail) = runner_refusal_fields(&refusal);
+                // A positive refusal proves this Run did not start. A lost
+                // acknowledgement or any Accepted response never permits a move.
+                if explicit_windows
+                    && reason == RefusalReason::RunnerFull
+                    && self.next_windows_runner(id)?
+                {
+                    return Ok(true);
+                }
                 if hosted {
                     return self
                         .refused(
@@ -1659,7 +1770,10 @@ impl Motor {
             });
         }
         let connector = self.connector_for_target(self.config.target(platform)?);
-        let mut channel = Channel::open_with_cause(connector.as_ref(), Uuid::now_v7())
+        Self::status_from_connector(connector.as_ref()).await
+    }
+    async fn status_from_connector(connector: &dyn Connector) -> io::Result<RunnerStatusReply> {
+        let mut channel = Channel::open_with_cause(connector, Uuid::now_v7())
             .await
             .map_err(|(reason, cause)| {
                 io::Error::other(format!("connect to runner: {reason:?}: {cause}"))
@@ -1676,6 +1790,38 @@ impl Motor {
             Incoming::Frame(Frame::StatusReply(reply)) => Ok(reply),
             _ => Err(io::Error::other("expected runner status_reply")),
         }
+    }
+    pub(crate) async fn windows_health(&self) -> Vec<serde_json::Value> {
+        let targets: Vec<_> = if self.config.windows_runners.is_empty() {
+            self.config
+                .target(Some(&Platform::Windows))
+                .ok()
+                .into_iter()
+                .map(|t| ("build-server".to_owned(), 1, t))
+                .collect()
+        } else {
+            self.config
+                .windows_runners
+                .iter()
+                .map(|r| (r.name.clone(), r.max_concurrent, r.target()))
+                .collect()
+        };
+        let mut samples = Vec::new();
+        for (name, max, target) in targets {
+            let connector = self.connector_for_target(target);
+            let status = tokio::time::timeout(
+                WINDOWS_PROBE_TIMEOUT,
+                Self::status_from_connector(connector.as_ref()),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            samples.push(
+                serde_json::json!({"name": name, "reachable": status.is_some(),
+                "busy": status.as_ref().map(|s| windows_busy(s, max)), "max_concurrent": max}),
+            );
+        }
+        samples
     }
     pub async fn runner_health(&self) -> io::Result<RunnerHealth> {
         self.runner_health_for(None).await
@@ -1918,6 +2064,9 @@ impl Motor {
     }
     fn connector_for_job(&self, id: Uuid) -> io::Result<Arc<dyn Connector>> {
         let job = self.storage.job(id);
+        if let Some(runner) = job.as_ref().and_then(|j| j.windows_runner.as_ref()) {
+            return Ok(self.connector_for_target(runner.target()));
+        }
         // Each job record names the runner instance it was submitted to, so attach,
         // status and cancel reach the same instance after a restart. Records
         // written before that field existed were all submitted to the Linux runner.
@@ -1926,6 +2075,36 @@ impl Motor {
             .stored_target(job.as_ref().and_then(|j| j.runner_instance.as_deref()))?;
         Ok(self.connector_for_target(target))
     }
+    fn next_windows_runner(&self, id: Uuid) -> io::Result<bool> {
+        let Some(current) = self.storage.job(id).and_then(|j| j.windows_runner) else {
+            return Ok(false);
+        };
+        let next = self
+            .config
+            .windows_runners
+            .iter()
+            .position(|r| r.name == current.name)
+            .and_then(|index| self.config.windows_runners.get(index + 1));
+        if let Some(next) = next {
+            self.storage.bind_windows(id, next.clone())?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+pub(crate) const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn windows_busy(status: &RunnerStatusReply, max_concurrent: usize) -> bool {
+    status
+        .running_jobs
+        .len()
+        .saturating_add(status.queue_depth as usize)
+        >= max_concurrent
+        || status.health.as_ref().is_some_and(
+            |h| matches!((h.permits_held, h.permits_cap), (Some(held), Some(cap)) if held >= cap),
+        )
 }
 fn request_refusal_fields(reason: RefusalReason) -> (RefusalReason, Option<String>) {
     match reason {

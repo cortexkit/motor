@@ -128,14 +128,18 @@ async fn two_ssh_runs_share_one_master_and_one_vault_sign() {
                 .arg("alfonso-runner")
                 .arg(format!("printf {output}"))
                 .stdin(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .output(),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(reply.status.success());
+        assert!(
+            reply.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reply.stderr)
+        );
         assert_eq!(reply.stdout, output.as_bytes());
         assert_eq!(
             connector.master.lock().await.as_ref().unwrap().id(),
@@ -143,6 +147,69 @@ async fn two_ssh_runs_share_one_master_and_one_vault_sign() {
         );
         assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
     }
+    // A Windows endpoint must not inherit the legacy endpoint or its master.
+    connector
+        .credentials
+        .current
+        .lock()
+        .unwrap()
+        .endpoint
+        .as_mut()
+        .unwrap()
+        .hostname = "192.0.2.99".into();
+    let mut windows = crate::WindowsRunner {
+        name: "portable".into(),
+        host: "127.0.0.1".into(),
+        port,
+        user: std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| {
+                String::from_utf8(
+                    std::process::Command::new("id")
+                        .arg("-un")
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+                .trim()
+                .into()
+            }),
+        host_key: host.public_key().to_openssh().unwrap(),
+        ..Default::default()
+    };
+    let pin = WindowsPin::new(&windows).unwrap();
+    let reply = windows_ssh_command(&windows, &agent.socket, &agent.identity, &pin.0)
+        .arg("printf windows-endpoint")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        reply.status.success(),
+        "Windows endpoint must not use legacy host"
+    );
+    assert_eq!(reply.stdout, b"windows-endpoint");
+    assert_eq!(
+        vault.signs.load(Ordering::SeqCst),
+        2,
+        "Windows auth must use the vault, not the legacy master"
+    );
+    let wrong_host =
+        ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    windows.host_key = wrong_host.public_key().to_openssh().unwrap();
+    let wrong_pin = WindowsPin::new(&windows).unwrap();
+    let reply = windows_ssh_command(&windows, &agent.socket, &agent.identity, &wrong_pin.0)
+        .arg("printf must-not-run")
+        .output()
+        .await
+        .unwrap();
+    assert!(!reply.status.success(), "a wrong host pin must refuse");
+    assert!(reply.stdout.is_empty());
+    assert_eq!(
+        vault.signs.load(Ordering::SeqCst),
+        2,
+        "reject the host before vault authentication"
+    );
     connector.shutdown().await;
     assert!(connector.master.lock().await.is_none());
     assert!(!runtime.exists());
@@ -150,7 +217,7 @@ async fn two_ssh_runs_share_one_master_and_one_vault_sign() {
     assert!(connector.connect(Uuid::now_v7()).await.is_err());
     assert_eq!(
         vault.signs.load(Ordering::SeqCst),
-        1,
+        2,
         "shutdown must fence new authentication"
     );
     server.kill().await.unwrap();
