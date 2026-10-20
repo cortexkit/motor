@@ -1561,16 +1561,18 @@ fn prefetch_cargo_dependencies(
         } else {
             "fetch job dependencies"
         };
-        checked(
-            workspace::dependencies::fetch_command(
-                state,
-                workspace,
-                dependency_routes,
-                cargo,
-                rustup,
-            )?
-            .env("CARGO_NET_OFFLINE", "false"),
-        )
+        crate::setup_log::phase("fetch cargo dependencies", || {
+            checked(
+                workspace::dependencies::fetch_command(
+                    state,
+                    workspace,
+                    dependency_routes,
+                    cargo,
+                    rustup,
+                )?
+                .env("CARGO_NET_OFFLINE", "false"),
+            )
+        })
         .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
     }
     Ok(())
@@ -1754,15 +1756,17 @@ impl Sandbox {
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
         if !writer {
-            prepare_javascript_checkouts(
-                workspace,
-                repository,
-                tree,
-                siblings,
-                |checkout, repository, checkout_tree| {
-                    prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
-                },
-            )?;
+            crate::setup_log::phase("prepare javascript dependencies", || {
+                prepare_javascript_checkouts(
+                    workspace,
+                    repository,
+                    tree,
+                    siblings,
+                    |checkout, repository, checkout_tree| {
+                        prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
+                    },
+                )
+            })?;
         }
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
@@ -1770,7 +1774,9 @@ impl Sandbox {
             .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
         {
             if path.join(".git/objects/info/alternates").is_file() {
-                workspace::git(&path, &["repack", "-a", "-d"])?;
+                crate::setup_log::phase("dissociate checkout", || {
+                    workspace::git(&path, &["repack", "-a", "-d"])
+                })?;
                 fs::remove_file(path.join(".git/objects/info/alternates"))?;
             }
         }

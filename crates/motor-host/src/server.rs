@@ -518,6 +518,11 @@ impl Runtime {
                         }
                         ensure!(frame["type"] == "event", "invalid lifecycle frame");
                         let event: motor_protocol::TenantEvent = serde_json::from_value(frame)?;
+                        if let Some(phase) = &event.setup {
+                            tracing::info!(tenant, jti = ?event.jti, phase = phase.phase,
+                                finished = phase.finished, elapsed_ms = phase.elapsed_ms,
+                                replay = !observation.is_live(event.event_seq), "tenant_setup_phase");
+                        }
                         let metrics = runtime.control.metrics(&tenant).ok();
                         let update = {
                             let mut host = runtime.host.lock().expect("host lock");
@@ -752,7 +757,7 @@ impl Runtime {
         ensure!(
             matches!(
                 request["op"].as_str(),
-                Some("drain" | "resume" | "cancel" | "status")
+                Some("drain" | "resume" | "cancel" | "status" | "diagnostics")
             ),
             "invalid admin operation"
         );

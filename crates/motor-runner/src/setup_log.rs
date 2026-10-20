@@ -1,27 +1,35 @@
-use std::{cell::Cell, io, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    io,
+    sync::Arc,
+    time::Instant,
+};
 use uuid::Uuid;
 
 thread_local! {
     static JOB: Cell<Option<Uuid>> = const { Cell::new(None) };
+    static EVENTS: RefCell<Option<Arc<crate::tenant::EventLog>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn materialize<T>(
     job_id: Uuid,
     cache_fill: bool,
+    events: Option<Arc<crate::tenant::EventLog>>,
     setup: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
     // Setup is synchronous on its own thread. Keep the identity in that thread
     // so low-level lock helpers can log it without exposing checkout paths.
-    struct Reset(Option<Uuid>);
+    struct Reset(Option<Uuid>, Option<Arc<crate::tenant::EventLog>>);
     impl Drop for Reset {
         fn drop(&mut self) {
             JOB.set(self.0);
+            EVENTS.replace(self.1.take());
         }
     }
-    let _reset = Reset(JOB.replace(Some(job_id)));
+    let _reset = Reset(JOB.replace(Some(job_id)), EVENTS.replace(events));
     let started = Instant::now();
     tracing::info!(%job_id, cache_fill, "materialize started");
-    let result = setup();
+    let result = phase("materialize", setup);
     tracing::info!(%job_id, cache_fill, elapsed_ms = started.elapsed().as_millis() as u64,
         success = result.is_ok(), "materialize finished");
     result
@@ -33,9 +41,34 @@ pub(crate) fn lock_wait<T>(lock: &'static str, acquire: impl FnOnce() -> T) -> T
     };
     let started = Instant::now();
     tracing::info!(%job_id, lock, "setup lock wait started");
-    let result = acquire();
+    let result = phase(lock, acquire);
     tracing::info!(%job_id, lock, wait_ms = started.elapsed().as_millis() as u64,
         "setup lock wait finished");
+    result
+}
+
+/// Keep operation names static so diagnostics never forward uploaded text.
+pub(crate) fn phase<T>(name: &'static str, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let emit = |finished| {
+        if let Some(id) = JOB.get() {
+            EVENTS.with_borrow(|events| {
+                if let Some(events) = events {
+                    let phase = motor_protocol::TenantSetupPhase {
+                        phase: name.into(),
+                        finished,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    };
+                    if let Err(error) = events.setup(id, phase) {
+                        tracing::warn!(%id, kind = ?error.kind(), "cannot persist setup phase");
+                    }
+                }
+            });
+        }
+    };
+    emit(false);
+    let result = operation();
+    emit(true);
     result
 }
 
@@ -62,7 +95,7 @@ mod tests {
         let subscriber = motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone());
         let id = Uuid::now_v7();
         tracing::subscriber::with_default(subscriber, || {
-            let result: io::Result<()> = materialize(id, false, || {
+            let result: io::Result<()> = materialize(id, false, None, || {
                 for lock in ["tree_access", "dependency_mirror", "build_wrapper"] {
                     lock_wait(lock, || ());
                 }
@@ -93,5 +126,48 @@ mod tests {
         assert!(lines[7].contains("elapsed_ms="));
         assert!(lines[7].contains("success=false"));
         assert!(!output.contains("/secret/path"));
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn setup_phases_are_durable_ordered_and_name_the_blocked_operation() {
+        let root = cortexkit_test_support::ScratchDir::new("setup-events");
+        let events = Arc::new(crate::tenant::EventLog::open(&root).unwrap());
+        let id = Uuid::now_v7();
+        materialize(id, false, Some(events.clone()), || {
+            lock_wait("build_wrapper", || {
+                let mut phases = Vec::new();
+                while let Some(event) = events.first() {
+                    assert_eq!(event.jti, Some(id));
+                    let phase = event.setup.unwrap();
+                    phases.push((phase.phase, phase.finished));
+                    events.ack(event.event_seq).unwrap();
+                }
+                assert_eq!(
+                    phases,
+                    [
+                        ("materialize".into(), false),
+                        ("build_wrapper".into(), false)
+                    ]
+                );
+            });
+            Ok(())
+        })
+        .unwrap();
+        drop(events);
+        let events = crate::tenant::EventLog::open(&root).unwrap();
+        let mut finished = Vec::new();
+        while let Some(event) = events.first() {
+            assert_eq!(event.event, motor_protocol::TenantEventKind::SetupPhase);
+            let phase = event.setup.unwrap();
+            assert!(phase.finished);
+            finished.push(phase.phase);
+            events.ack(event.event_seq).unwrap();
+        }
+        assert_eq!(finished, ["build_wrapper", "materialize"]);
     }
 }

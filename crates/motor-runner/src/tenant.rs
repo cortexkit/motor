@@ -35,11 +35,18 @@ impl Events {
             event,
             jti,
             cause,
+            setup: None,
         });
     }
 }
 
 impl EventLog {
+    pub(crate) fn setup(&self, id: Uuid, phase: TenantSetupPhase) -> io::Result<()> {
+        self.update(|s| {
+            s.push(TenantEventKind::SetupPhase, Some(id), None);
+            s.pending.back_mut().unwrap().setup = Some(phase);
+        })
+    }
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
         let path = root.join("tenant-events.json");
         let mut state: Events = match read_json(&path) {
@@ -296,7 +303,8 @@ mod tests {
                 event_seq: 5,
                 event: TenantEventKind::Idle,
                 jti: None,
-                cause: None
+                cause: None,
+                setup: None,
             }
         );
     }

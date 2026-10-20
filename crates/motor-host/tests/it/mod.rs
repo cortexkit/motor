@@ -80,6 +80,7 @@ fn event(
         event: kind,
         jti: job.map(|s| s.parse().unwrap()),
         cause,
+        setup: None,
     }
 }
 fn disk_host(path: &std::path::Path) -> Host {

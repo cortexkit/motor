@@ -521,7 +521,7 @@ struct Reservation {
 }
 
 struct Core {
-    tenant_events: Option<crate::tenant::EventLog>,
+    tenant_events: Option<Arc<crate::tenant::EventLog>>,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
@@ -1113,7 +1113,7 @@ impl Runner {
             for job in jobs.values() {
                 log.observe(job)?;
             }
-            Some(log)
+            Some(Arc::new(log))
         } else {
             None
         };
@@ -1495,7 +1495,7 @@ impl Runner {
         Ok(())
     }
     pub(crate) fn tenant_events(&self) -> Option<&crate::tenant::EventLog> {
-        self.core.tenant_events.as_ref()
+        self.core.tenant_events.as_deref()
     }
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn tenant_idle(&self) -> bool {
@@ -3838,16 +3838,7 @@ impl Runner {
         };
         let runner = self.clone();
         std::thread::spawn(move || {
-            let prepared = runner.ensure_disk_space().and_then(|full| {
-                if let Some(full) = full {
-                    Err(io::Error::other(format!(
-                        "runner_disk_full: free_bytes={} floor_bytes={}",
-                        full.free_bytes, full.floor_bytes
-                    )))
-                } else {
-                    runner.setup(&setup)
-                }
-            });
+            let prepared = runner.setup(&setup);
             if let Err(error) = runner.launch(setup, prepared) {
                 tracing::error!(job_id = %id, %error, "job launch failed");
             }
@@ -3856,7 +3847,17 @@ impl Runner {
     }
     /// The long part of starting a job, run without the state lock.
     fn setup(&self, s: &Setup) -> io::Result<Prepared> {
-        crate::setup_log::materialize(s.id, s.base, || self.materialize(s))
+        crate::setup_log::materialize(s.id, s.base, self.core.tenant_events.clone(), || {
+            if let Some(full) =
+                crate::setup_log::phase("disk admission", || self.ensure_disk_space())?
+            {
+                return Err(io::Error::other(format!(
+                    "runner_disk_full: free_bytes={} floor_bytes={}",
+                    full.free_bytes, full.floor_bytes
+                )));
+            }
+            self.materialize(s)
+        })
     }
 
     fn materialize(&self, s: &Setup) -> io::Result<Prepared> {

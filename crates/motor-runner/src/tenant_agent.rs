@@ -12,6 +12,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod diagnostics;
 mod paths;
 mod runner_socket;
 mod snapshot;
@@ -125,6 +126,7 @@ async fn dispatch(
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
         TenantAgentRequest::Status => forward(Frame::Status).await,
+        TenantAgentRequest::Diagnostics => diagnostics::collect().await,
         TenantAgentRequest::PrepareSnapshot { kind } => {
             let _guard = attach.lock().await;
             snapshot::prepare(kind).await

@@ -439,6 +439,7 @@ async fn sandbox_max_s_cancels_through_runner_after_requester_disconnects() {
                     event,
                     jti: Some(JOB.parse().unwrap()),
                     cause: None,
+                    setup: None,
                 },
                 now,
             )
