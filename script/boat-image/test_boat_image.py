@@ -139,6 +139,133 @@ class RecipeTests(unittest.TestCase):
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
+        for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
+            for directive in ('Requires', 'After'):
+                values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
+                self.assertIn('motor-boat-storage.service', values)
+
+    def test_storage_service_orders_all_storage_writers(self):
+        for name in ('motor-boat.service', 'motor-boat-host.service'):
+            unit = (HERE / name).read_text()
+            for directive in ('Requires', 'After'):
+                values = next(line.split('=', 1)[1].split() for line in unit.splitlines() if line.startswith(directive + '='))
+                self.assertTrue({'Users.mount', r'var-lib-motor\x2dboat.mount', 'motor-boat-storage.service'} <= set(values))
+        storage = (HERE / 'motor-boat-storage.service').read_text()
+        self.assertIn('DefaultDependencies=no', storage)
+        self.assertIn('Requires=motor-boat-restored.service', storage)
+        self.assertIn('After=motor-boat-restored.service', storage)
+        self.assertIn('motor-boat-start.py --prepare-storage', storage)
+        self.assertIn('motor-boat-storage.service', install.UNITS)
+
+    def test_storage_rejects_boat_sysbind_even_when_mount_unit_would_be_active(self):
+        root = '32 2 253:1 / / rw - ext4 /dev/vda1 rw\n'
+        sysbind = root + '1200 32 253:1 /var/lib/motor-boat /var/lib/motor-boat rw - ext4 /dev/vda1 rw\n'
+        for table in (root, sysbind):
+            with self.subTest(table=table), self.assertRaisesRegex(RuntimeError, 'must be an XFS mount'):
+                start.state_mount(start.mount_table(table))
+        rows = start.mount_table('1200 32 7:0 / /var/lib/motor-boat rw - xfs /dev/loop0 rw\n')
+        with patch.object(start.Path, 'stat', return_value=Mock(st_dev=1792)), \
+             patch.object(start.Path, 'is_file', return_value=True), \
+             patch.object(start.Path, 'read_text', return_value='/var/lib/wrong.xfs'), \
+             patch.object(start.Path, 'samefile', return_value=False), \
+             self.assertRaisesRegex(RuntimeError, 'not backed by'):
+            start.state_mount(rows)
+
+    def test_users_requires_exact_bind_not_just_any_xfs_mount(self):
+        rows = start.mount_table('1 0 7:0 /elsewhere /Users rw - xfs /dev/loop0 rw\n')
+        with patch.object(start.Path, 'samefile', return_value=False), self.assertRaisesRegex(RuntimeError, 'must bind'):
+            start.users_mount(rows)
+
+    def test_storage_rejects_stacked_targets_even_when_top_mount_is_correct(self):
+        rows = start.mount_table('1 0 253:1 /var/lib/motor-boat /var/lib/motor-boat rw - ext4 /dev/vda1 rw\n'
+                                 '2 1 7:0 / /var/lib/motor-boat rw - xfs /dev/loop0 rw\n')
+        with self.assertRaisesRegex(RuntimeError, 'stacked mount targets'):
+            start.state_mount(rows)
+        users = start.mount_table('3 0 253:1 /Users /Users rw - ext4 /dev/vda1 rw\n'
+                                  '4 3 7:0 /state/workspaces /Users rw - xfs /dev/loop0 rw\n')
+        with patch.object(start.Path, 'samefile', return_value=True), self.assertRaisesRegex(RuntimeError, 'stacked mount targets'):
+            start.users_mount(users)
+
+    def test_only_empty_public_root_disk_binds_are_unmounted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            point = Path(tmp)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
+                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), patch.object(start.subprocess, 'run') as run:
+                start.unmount_root_view(point)
+                run.assert_called_once_with(['/usr/bin/umount', '--', str(point)], check=True)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'xfs', '/dev/loop9')]), \
+                 patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'unexpected storage view'):
+                start.unmount_root_view(point)
+            run.assert_not_called()
+
+    def test_unmount_refuses_underlying_nonempty_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            point = Path(tmp)
+            with patch.object(start, 'mounts', return_value=[(str(point), 'ext4', '/dev/vda1')]), \
+                 patch.object(start.Path, 'stat', return_value=Mock(st_dev=1, st_mode=0o40755)), \
+                 patch.object(start.subprocess, 'run', side_effect=lambda *args, **kwargs: (point / 'hidden-data').touch()), \
+                 self.assertRaisesRegex(RuntimeError, 'non-empty directory'):
+                start.unmount_root_view(point)
+
+    def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
+             self.assertRaisesRegex(RuntimeError, 'reflink enabled'):
+            start.check_storage()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(start, 'STATE', Path(tmp)), \
+             patch.object(start, 'USERS', Path(tmp)), patch.object(start, 'mounts', return_value=[]), \
+             patch.object(start, 'state_mount'), patch.object(start, 'users_mount'), \
+             patch.object(start.subprocess, 'check_output', return_value='reflink=1'), \
+             patch.object(start.fcntl, 'ioctl', side_effect=OSError(95, 'unsupported')), self.assertRaises(OSError):
+            start.check_storage()
+
+    def test_prepare_storage_never_mounts_over_nonempty_views(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, users = Path(tmp, 'state'), Path(tmp, 'Users')
+            state.mkdir()
+            users.mkdir()
+            (users / 'job-stdin').touch()
+            with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+                 patch.object(start.Path, 'read_text', return_value=''), \
+                 patch.object(start, 'restore_pending', return_value=None), patch.object(start, 'mounts', return_value=[]), \
+                 patch.object(start, 'state_mount', side_effect=RuntimeError('ext4')), \
+                 patch.object(start, 'users_mount', side_effect=RuntimeError('ext4')), patch.object(start.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'non-empty directory'):
+                    start.prepare_storage()
+                run.assert_not_called()
+            self.assertTrue((users / 'job-stdin').exists())
+
+    def test_prepare_storage_mounts_empty_sysbinds_in_order_and_records_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, users, evidence = Path(tmp, 'state'), Path(tmp, 'Users'), Path(tmp, 'evidence')
+            with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+                 patch.object(start.Path, 'read_text', return_value=''), \
+                 patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'restore_pending', return_value=None), \
+                 patch.object(start, 'mounts', return_value=[]), \
+                 patch.object(start, 'state_mount', side_effect=[RuntimeError('ext4'), ('state', 'xfs', 'loop')]), \
+                 patch.object(start, 'users_mount', side_effect=RuntimeError('ext4')), \
+                 patch.object(start, 'unmount_root_view') as retire, \
+                 patch.object(start, 'check_storage', return_value={'reflink': True}), patch.object(start.subprocess, 'run') as run:
+                start.prepare_storage()
+                self.assertEqual([call.args[0] for call in retire.call_args_list], [users, state])
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(start.IMAGE), str(state)],
+                ['/usr/bin/mount', '--bind', str(state / 'state/workspaces'), str(users)]])
+            self.assertGreater(json.loads(evidence.read_text())['verified_monotonic_ns'], 0)
+
+    def test_runner_refuses_unmounted_storage_before_spawning(self):
+        with patch.object(sys, 'argv', ['start', 'serve']), \
+             patch.object(start, 'check_storage', side_effect=RuntimeError('wrong storage')), \
+             patch.object(start.subprocess, 'Popen') as spawn, self.assertRaisesRegex(RuntimeError, 'wrong storage'):
+            start.main()
+        spawn.assert_not_called()
+
+    def test_host_refuses_unmounted_storage_before_exec(self):
+        with patch.object(sys, 'argv', ['start', '--host-exec']), \
+             patch.object(start, 'check_storage', side_effect=RuntimeError('wrong storage')), \
+             patch.object(start.os, 'execv') as execute, self.assertRaisesRegex(RuntimeError, 'wrong storage'):
+            start.main()
+        execute.assert_not_called()
 
     def test_endpoint_unit_publishes_marker_directory_and_keeps_restarting(self):
         unit = (HERE / 'motor-boat-host.service').read_text()
@@ -227,6 +354,7 @@ class RecipeTests(unittest.TestCase):
             self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
             raise ExecObserved()
         with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
+             patch.object(start, 'check_storage'), \
              patch.object(sys, 'argv', ['start','--host-exec','--sandbox','/etc/motor/sandbox.json']), patch.object(start.os, 'execv', execv):
             with self.assertRaises(ExecObserved):
                 start.main()
@@ -253,7 +381,7 @@ class RecipeTests(unittest.TestCase):
             with self.assertRaises(install.subprocess.CalledProcessError):
                 install.service_preflight()
         calls = [call.args[0] for call in collect.call_args_list]
-        for unit in ('motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
+        for unit in ('motor-boat-restored.service','motor-boat-storage.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
             self.assertIn(['/usr/bin/systemctl','status','--no-pager','-l',unit], calls)
             self.assertIn(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'], calls)
         self.assertEqual(calls[-1], ['/usr/bin/systemctl','stop','motor-boat.service'])

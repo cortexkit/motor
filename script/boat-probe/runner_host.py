@@ -3,15 +3,19 @@ the way the production broker does it (identity install, then polling the
 readiness marker) in each order the broker can produce. The endpoint only
 trusts the production broker's signing keys, so no token it accepts is used."""
 import contextlib
+import base64
 import errno
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shlex
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -37,7 +41,7 @@ def command(argv):
         return {'argv':argv, 'exit_code':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
     except (OSError, subprocess.TimeoutExpired) as error:
         return {'argv':argv, 'error':str(error)}
-for unit in ('motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
+for unit in ('motor-boat-restored.service','motor-boat-storage.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
     out[unit] = {'status':command(['/usr/bin/systemctl','status','--no-pager','-l',unit]),
                  'journal':command(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])}
 print(json.dumps(out))
@@ -185,6 +189,79 @@ print(json.dumps({'units':{name:unit(name) for name in ('motor-boat-restored.ser
     'listening_9443':any(r[1] == '0100007F:24E3' and r[3] == '0A' for r in rows),
     'boat_restore_active':os.path.exists('/var/lib/ascii-lazy/active'), 'etc_mount':etc}))
 '''
+
+STORAGE_STATE = r'''
+import json, os, pathlib, subprocess
+points = ('/var/lib/motor-boat', '/Users')
+data = {'mountinfo':pathlib.Path('/proc/self/mountinfo').read_text(),
+        'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+data['findmnt'] = {point:subprocess.check_output(['findmnt','-J','-T',point,'-o','TARGET,SOURCE,FSTYPE'], text=True) for point in points}
+try:
+    device = pathlib.Path(points[0]).stat().st_dev
+    backing = pathlib.Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/loop/backing_file')
+    data['backing_file'] = backing.read_text().strip()
+    data['expected_backing'] = pathlib.Path(data['backing_file']).samefile('/var/lib/motor-boat.xfs')
+    data['users_bind'] = pathlib.Path('/Users').samefile('/var/lib/motor-boat/state/workspaces')
+    data['prepared'] = json.loads(pathlib.Path('/run/motor-boat-storage.json').read_text())
+except OSError as error:
+    data['error'] = str(error)
+data['units'] = {}
+for name in ('motor-boat.service','motor-boat-host.service',r'var-lib-motor\x2dboat.mount','Users.mount'):
+    text = subprocess.check_output(['systemctl','show',name,'-p','ActiveState','-p','ExecMainStartTimestampMonotonic'], text=True)
+    data['units'][name] = dict(line.split('=',1) for line in text.splitlines() if '=' in line)
+print(json.dumps(data))
+'''
+
+
+def storage_checks(data):
+    filesystems = {point:json.loads(text)['filesystems'] for point, text in data['findmnt'].items()}
+    actual = all(len(filesystems[point]) == 1 and filesystems[point][0]['target'] == point and filesystems[point][0]['fstype'] == 'xfs'
+                 for point in ('/var/lib/motor-boat', '/Users'))
+    prepared = data.get('prepared', {})
+    verified = prepared.get('verified_monotonic_ns', 0)
+    starts = [int(data['units'][name].get('ExecMainStartTimestampMonotonic', 0)) * 1000
+              for name in ('motor-boat.service', 'motor-boat-host.service')]
+    return {'reflink_disk_and_workspace_bind': actual and data.get('expected_backing') is True and data.get('users_bind') is True,
+            'storage_verified_before_services': prepared.get('boot_id') == data['boot_id'] and
+                prepared.get('reflink') is True and verified > 0 and all(start > verified for start in starts),
+            'mount_units_active': all(data['units'][name].get('ActiveState') == 'active'
+                                     for name in (r'var-lib-motor\x2dboat.mount', 'Users.mount'))}
+
+
+NODE_CHECK = "node -e \"if (require('boat-dep') !== 'boat-node-modules') process.exit(1); console.log(require('boat-dep'))\""
+
+
+def job_repository(repository):
+    """A local tarball installs regular files in node_modules, unlike a local
+    directory dependency that leaves a symlink. Publishing and reusing
+    node_modules must therefore reflink those bytes."""
+    (repository / 'src').mkdir()
+    (repository / 'Cargo.toml').write_text('[package]\nname="boat-hello"\nversion="0.1.0"\nedition="2021"\n')
+    (repository / 'Cargo.lock').write_text('version = 4\n[[package]]\nname = "boat-hello"\nversion = "0.1.0"\n')
+    (repository / 'src/main.rs').write_text('fn main() { println!("boat-hello"); }\n')
+    manifest = {'name':'boat-node-probe', 'version':'1.0.0', 'private':True,
+                'dependencies':{'boat-dep':'file:vendor/boat-dep.tgz'}}
+    (repository / 'package.json').write_text(json.dumps(manifest) + '\n')
+    archive = io.BytesIO()
+    with gzip.GzipFile(fileobj=archive, mode='wb', mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode='w') as tar:
+            for name, content in {'package/package.json':json.dumps({'name':'boat-dep','version':'1.0.0','main':'index.js'}),
+                                  'package/index.js':"module.exports = 'boat-node-modules';\n"}.items():
+                info = tarfile.TarInfo(name)
+                payload = content.encode()
+                info.size, info.mode = len(payload), 0o644
+                tar.addfile(info, io.BytesIO(payload))
+    payload = archive.getvalue()
+    (repository / 'vendor').mkdir()
+    (repository / 'vendor/boat-dep.tgz').write_bytes(payload)
+    integrity = 'sha512-' + base64.b64encode(hashlib.sha512(payload).digest()).decode()
+    lock = {'name':manifest['name'], 'version':'1.0.0', 'lockfileVersion':3, 'requires':True,
+            'packages':{'':manifest, 'node_modules/boat-dep':{'version':'1.0.0',
+                        'resolved':'file:vendor/boat-dep.tgz', 'integrity':integrity}}}
+    (repository / 'package-lock.json').write_text(json.dumps(lock) + '\n')
+    for command in (['git','init','-q'], ['git','add','.'],
+                    ['git','-c','user.name=Boat probe','-c','user.email=probe@invalid','commit','-qm','probe input']):
+        subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)
 
 
 def marker_matches(read, sid):
@@ -404,7 +481,9 @@ class RunnerHost:
         self.execute(sid, 'sudo -n systemctl stop motor-boat-identity motor-boat-host motor-boat-bridge motor-boat')
         hygiene = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
         self.check(label + '.identity_and_probe_keys_absent', all(hygiene[k] is True for k in ('identity_absent','boat_cli_configs_absent','probe_authorizations_absent')), hygiene)
-        self.execute(sid, 'sudo -n sync && sudo -n umount /Users && sudo -n umount /var/lib/motor-boat && sudo -n sync')
+        self.execute(sid, "sudo -n sync && sudo -n systemctl stop Users.mount 'var-lib-motor\\x2dboat.mount' motor-boat-storage && "
+                          'sudo -n sync && '
+                          'sudo -n python3 /usr/local/libexec/motor-boat-start.py --check-mountpoints')
         return hygiene
 
     def save_snapshot(self, sid, name, retained=False):
@@ -541,11 +620,18 @@ class RunnerHost:
         argv = self.route(sid, directory, public)
         if label == 'snapshot_clone':
             self.broker_order(sid, label, record, pre_swap_install, hydrated_at, first_started)
-            self.arm_then_install(sid, label, record)
+        elif label == 'prepared_clone':
+            install = self.install_identity(sid)
+            record['identity_install'] = install
+            self.check(label + '.identity_install_accepted', install['accepted'], install)
+            self.readiness(label, self.wait_endpoint(sid, install['started_monotonic']), sid)
         elif label == 'resumed':
             self.existing_then_reinstall(sid, label, record, hydrated_at)
         else:
             self.arm_then_install(sid, label, record)
+        record['storage'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+        for key, passed in storage_checks(record['storage']).items():
+            self.check(label + '.' + key, passed, record['storage'])
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
@@ -571,7 +657,8 @@ class RunnerHost:
         job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
-                for name, command in [("exit", "printf 'boat-round-trip\\n'; exit 23"),
+                for name, command in [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
+                                      ("exit", "printf 'boat-round-trip\\n'; exit 23"),
                                       ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
                                       ("isolation", "python3 -c " + shlex.quote(job_script))]:
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
@@ -580,14 +667,14 @@ class RunnerHost:
                         raise ValueError("motor client failed: " + json.dumps(result))
                     parsed = job_result(result["stdout"])
                     record[name]["result"] = parsed
-                    if first_started is not None and name == "exit" and parsed['code'] == 23 and 'boat-round-trip' in parsed['stdout']:
+                    if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
                         self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
                     if name == "isolation":
                         for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
                     else:
                         expected = 23 if name == "exit" else 0
-                        marker = "boat-round-trip" if name == "exit" else "boat-hello"
+                        marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') else "boat-hello")
                         self.check(label + "." + name, parsed["code"] == expected and marker in parsed["stdout"], parsed)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
         if any(check['status'] != 'PASS' for check in self.data['checks'] if check['name'].startswith(label + '.')):
@@ -602,6 +689,30 @@ class RunnerHost:
             self.data["local_private_keys_removed"] = self.directory is None or not self.directory.exists()
             self.probe.checkpoint()
 
+    def verify_prepared(self, name, directory, public, client):
+        self.data['prepared_source'] = snapshot_metadata(self.probe.request('GET', '/named-snapshots/' + name)['snapshot'])
+        self.data['prepared_source']['borrowed_not_deleted'] = True
+        started = time.monotonic()
+        item, self.data['create_from_snapshot'] = self.probe.create(name)
+        sid = item['id']
+        self.probe.wait_hydrated(sid)
+        self.data['create_from_snapshot']['seconds_to_hydrated'] = time.monotonic() - started
+        with tempfile.TemporaryDirectory(prefix='boat-job-', dir=ROOT / '.cortexkit') as repo:
+            repository = Path(repo)
+            job_repository(repository)
+            # Do not restart, reconfigure or mount anything in the guest: that
+            # would repair the startup order this mode is meant to observe.
+            self.phase(sid, 'prepared_clone', directory, public, repository, client, first_started=started)
+            self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+            self.probe.wait_sandbox(sid, {'archived'})
+            self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
+            from probe import READY
+            self.probe.wait_sandbox(sid, READY)
+            self.probe.wait_hydrated(sid)
+            self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
+        self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
+        self.probe.checkpoint()
+
     def _run(self):
         from probe import READY, cleanup
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -615,6 +726,7 @@ class RunnerHost:
         # The 30-minute provider budget starts after the local client is available.
         self.probe.deadline = time.monotonic() + min(1800, self.probe.minutes * 60)
         self.data["source_revision"] = revision
+        (ROOT / '.cortexkit').mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="motor-boat-ssh-") as temporary:
             directory = Path(temporary)
             self.directory = directory
@@ -622,6 +734,10 @@ class RunnerHost:
             if generated.get("exit_code") != 0:
                 raise ValueError("temporary SSH key generation failed")
             public = (directory / "key.pub").read_text().strip()
+            verify_image = getattr(self.probe, 'verify_prepared_image', None)
+            if verify_image:
+                self.verify_prepared(verify_image, directory, public, client)
+                return
             source_image = getattr(self.probe, 'from_prepared_image', None)
             if source_image:
                 self.data['prepared_source'] = snapshot_metadata(self.probe.request('GET', '/named-snapshots/' + source_image)['snapshot'])
@@ -659,12 +775,7 @@ class RunnerHost:
                 self.retain_prepared(sid, public, revision, inventory)
             with tempfile.TemporaryDirectory(prefix="boat-job-", dir=ROOT / ".cortexkit") as repo:
                 repository = Path(repo)
-                (repository / "src").mkdir()
-                (repository / "Cargo.toml").write_text('[package]\nname="boat-hello"\nversion="0.1.0"\nedition="2021"\n')
-                (repository / "Cargo.lock").write_text('version = 4\n[[package]]\nname = "boat-hello"\nversion = "0.1.0"\n')
-                (repository / "src/main.rs").write_text('fn main() { println!("boat-hello"); }\n')
-                for command in (["git", "init", "-q"], ["git", "add", "."], ["git", "-c", "user.name=Boat probe", "-c", "user.email=probe@invalid", "commit", "-qm", "probe input"]):
-                    subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)
+                job_repository(repository)
                 self.phase(sid, "initial", directory, public, repository, client)
                 hygiene = self.quiesce_image(sid, public, 'snapshot')
                 name = "motor-runner-" + self.probe.data["run_id"]

@@ -1,7 +1,7 @@
 [Unit]
 Description=Motor token-checking endpoint in a Boat sandbox
-Requires=motor-boat.service motor-boat-restored.service
-After=motor-boat.service motor-boat-restored.service
+Requires=motor-boat.service motor-boat-restored.service motor-boat-storage.service Users.mount var-lib-motor\x2dboat.mount
+After=motor-boat.service motor-boat-restored.service motor-boat-storage.service Users.mount var-lib-motor\x2dboat.mount
 ConditionPathExists=/etc/motor/tenant/id
 # Keep restarting after failures; the broker waits for the readiness marker.
 StartLimitIntervalSec=0

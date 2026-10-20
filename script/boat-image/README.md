@@ -42,6 +42,18 @@ bind all share that filesystem. The recipe actually clones random nonempty data
 between the state mount and workspace bind, and checks the bytes. A loop-image
 or ioctl failure aborts installation rather than changing copy semantics.
 
+Both mount points must be empty on the root disk in the image. After hydration,
+`motor-boat-storage.service` checks the current views before mounting anything;
+non-empty directories cause a logged refusal, never automatic deletion or a
+mount hiding existing data. After hydration it unmounts only the **empty public**
+root-disk binds at our two paths, leaving Boat's references under
+`/var/lib/ascii-lazy/sysbind` untouched. It checks the exposed bare directories
+again, mounts XFS, then binds the workspace directory onto `/Users`. Each runner
+and endpoint start independently rejects duplicate mount targets and checks the exact XFS
+mount, its loop device's backing file `/var/lib/motor-boat.xfs`, the `/Users`
+bind identity, `reflink=1`, and a real cross-path FICLONE. An active mount unit
+alone is not evidence of usable storage.
+
 This keeps the server's reflink contract and cache behavior unchanged; a copy
 fallback would broaden runner semantics and hide unsupported storage. The live
 runner-host run (below) installed and used this volume for real jobs on the
@@ -177,7 +189,19 @@ image is built (`install.py`, followed by `daemon-reload` and
    by FUSE, for at most 30 minutes. Starting earlier strands work on the FUSE
    view: the previous image's inotify path unit stayed armed on the retired
    `/etc` and never saw the broker's identity file, and the runner's first
-   start failed because its state mounts were moved aside mid-start.
+    start failed because its state mounts were moved aside mid-start.
+   **`motor-boat-storage.service` then establishes the actual disk mounts.**
+   Boat's final restored view can itself be an ext4 bind mount at
+   `/var/lib/motor-boat`. systemd counts that as an active mount unit even
+   though it is not the unit's configured XFS disk. The previous image already
+   required both mount units, but those dependencies were satisfied by Boat's
+   binds: the runner wrote state on ext4, and a later job's mount activation
+   hid its workspace and stdin FIFO. The storage service is a direct requirement
+   of both runner and endpoint, and runs before both mount units, so neither an
+   already-active foreign mount nor a later mount activation can bypass it.
+   `/run/motor-boat-storage.json` records verified mount identities, boot ID and
+   monotonic time before either service starts. The image snapshot procedure
+   stops services and mount units and checks both exposed directories are empty.
 3. **Identity.** The broker writes `/tmp/ck-motor-tenant-id` through Boat's file
    API, then runs `sudo install -D -m 0444 -o root -g root /tmp/ck-motor-tenant-id
    /etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id && cat /etc/motor/tenant/id`
@@ -268,6 +292,40 @@ set -o pipefail
 <key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
   --output .cortexkit/internal-docs/research/boat-runner-host --max-minutes 30
 ```
+
+To test an **existing prepared snapshot unchanged**, including the production
+create/hydrate/identity order, use the qualification-only mode:
+
+```sh
+set -o pipefail
+<key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
+  --verify-prepared-image motor-boat-prepared-213a82180779 \
+  --output .cortexkit/internal-docs/research/boat-storage-old-image --max-minutes 15
+```
+
+The old image above must fail storage checks. Substitute the newly prepared
+snapshot handle and a fresh output directory to qualify the fix. Unlike
+`--from-prepared-image`, this mode **does not reapply the recipe, restart the
+runner/watcher, or repair mounts** before checking it. It creates a clone,
+waits for hydration, installs the identity with the broker's exact commands,
+checks readiness and disk identity/order, runs real jobs, and repeats after
+stop/resume. Only the probe-only bridge is explicitly started to transport real
+jobs. The source snapshot is borrowed and never deleted by cleanup.
+
+Every real-job fixture includes an npm lockfile and a locally generated tarball
+dependency containing regular files. No registry or project-specific dependency
+is needed. The first and second Node jobs read `node_modules/boat-dep/index.js`;
+publishing and reusing the install cache must exercise the runner's reflink
+path, rather than cloning an empty directory or symlinks only. Mount evidence
+includes current findmnt output and loop backing identity, plus the per-boot
+   storage verification timestamp preceding both runner and endpoint start times.
+
+Qualification also rejects stacked entries at either target; it does not assume
+the first `findmnt` row is the effective mount. The runner's Linux clone path
+checks the source and nearest existing destination parent's actual `st_dev`
+before creating a target, so hidden mount-table entries cannot substitute for
+the kernel's path resolution. FICLONE itself is still authoritative and there
+is no copy fallback.
 
 Expect about **10 minutes** of sandbox time when starting from a prepared image
 (the measured run below took 9 minutes plus asynchronous purge), and longer for a

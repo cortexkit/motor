@@ -773,12 +773,18 @@ def main(report_stream=None):
     mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
     parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
+    parser.add_argument('--verify-prepared-image', help='qualify an existing snapshot unchanged: hydrate, install broker identity, real jobs, resume; no recipe reapply or service restart')
     parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
     args = parser.parse_args()
-    if (args.prepared_image or args.from_prepared_image) and not args.runner_host:
+    if (args.prepared_image or args.from_prepared_image or args.verify_prepared_image) and not args.runner_host:
         parser.error('prepared image options require --runner-host')
     if args.from_prepared_image and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.from_prepared_image):
         parser.error('invalid prepared named-snapshot handle')
+    if args.verify_prepared_image:
+        if args.prepared_image or args.from_prepared_image:
+            parser.error('--verify-prepared-image cannot rebuild or retain an image')
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.verify_prepared_image):
+            parser.error('invalid prepared named-snapshot handle')
     if args.delete_retained_images and not args.cleanup:
         parser.error('--delete-retained-images requires --cleanup')
     if args.write_template:
@@ -812,6 +818,7 @@ def main(report_stream=None):
             runner.results_path = path.resolve()
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image
+            runner.verify_prepared_image = args.verify_prepared_image
             if args.runner_host:
                 from runner_host import RunnerHost
                 RunnerHost(runner).run()

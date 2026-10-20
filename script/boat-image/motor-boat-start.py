@@ -3,6 +3,7 @@
 the sandbox's single job, wait for Boat's file restore, watch for the
 broker's identity file, and check service readiness."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 MIB = 1 << 20
@@ -27,9 +29,13 @@ READY_DEADLINE_S = 120
 # strands anything started on the FUSE view: inotify watches stay on dead
 # inodes and mounts stacked on those directories are moved aside.
 RESTORE_ACTIVE = Path('/var/lib/ascii-lazy/active')
-RESTORED_PATHS = ('/etc', '/usr', '/srv', '/var/lib/motor-boat')
+RESTORED_PATHS = ('/etc', '/usr', '/srv', '/var/lib/motor-boat', '/Users')
 RESTORE_DEADLINE_S = 30 * 60
 IDENTITY = Path('/etc/motor/tenant/id')
+STATE = Path('/var/lib/motor-boat')
+USERS = Path('/Users')
+IMAGE = Path('/var/lib/motor-boat.xfs')
+STORAGE_EVIDENCE = Path('/run/motor-boat-storage.json')
 
 
 def budget(available, overhead, margin=MARGIN):
@@ -125,6 +131,111 @@ def wait_restored(clock=time.monotonic, pause=time.sleep):
         pause(1)
 
 
+def mounts():
+    return mount_table(Path('/proc/self/mountinfo').read_text())
+
+
+def state_mount(rows):
+    row = serving_mount(str(STATE), rows)
+    if row is None or row[:2] != (str(STATE), 'xfs'):
+        raise RuntimeError(f'{STATE} must be an XFS mount of {IMAGE}, found {row}')
+    unique_mount(STATE, rows)
+    device = STATE.stat().st_dev
+    backing = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/loop/backing_file')
+    if not backing.is_file() or not Path(backing.read_text().strip()).samefile(IMAGE):
+        raise RuntimeError(f'{STATE} is not backed by {IMAGE}: {row}')
+    return row
+
+
+def users_mount(rows):
+    row = serving_mount(str(USERS), rows)
+    if row is None or row[:2] != (str(USERS), 'xfs') or not USERS.samefile(STATE / 'state/workspaces'):
+        raise RuntimeError(f'{USERS} must bind {STATE}/state/workspaces, found {row}')
+    unique_mount(USERS, rows)
+    return row
+
+
+def unique_mount(path, rows):
+    count = sum(row[0] == str(path) for row in rows)
+    if count != 1:
+        raise RuntimeError(f'{path} must have exactly one mount, found {count}; stacked mount targets are unsafe')
+
+
+def empty_mountpoint(path):
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f'mount point is not a physical directory: {path}')
+    if next(path.iterdir(), None) is not None:
+        raise RuntimeError(f'refusing to mount over non-empty directory {path}; stop services and inspect the root-disk data')
+
+
+def unmount_root_view(path):
+    empty_mountpoint(path)
+    rows = mounts()
+    exact = [row for row in rows if row[0] == str(path)]
+    if not exact:
+        return
+    if len(exact) != 1 or exact[0][1] != 'ext4' or path.stat().st_dev != Path('/').stat().st_dev:
+        raise RuntimeError(f'refusing to unmount an unexpected storage view at {path}: {exact}')
+    # Only the public, empty root-disk bind is retired. Boat's references under
+    # /var/lib/ascii-lazy/sysbind remain mounted and owned by its restore agent.
+    subprocess.run(['/usr/bin/umount', '--', str(path)], check=True)
+    empty_mountpoint(path)
+
+
+def check_storage():
+    rows = mounts()
+    state, users = state_mount(rows), users_mount(rows)
+    geometry = subprocess.check_output(['/usr/sbin/xfs_info', str(STATE)], text=True)
+    if not re.search(r'\breflink=1\b', geometry):
+        raise RuntimeError(f'{STATE} does not have XFS reflink enabled')
+    with tempfile.TemporaryFile(dir=STATE) as source, tempfile.TemporaryFile(dir=USERS) as target:
+        source.write(os.urandom(4096))
+        source.flush()
+        fcntl.ioctl(target.fileno(), 0x40049409, source.fileno())
+        target.seek(0)
+        source.seek(0)
+        if target.read() != source.read():
+            raise RuntimeError('storage FICLONE content mismatch')
+    return {'state': state, 'users': users, 'reflink': True}
+
+
+def prepare_storage():
+    """Replace Boat's empty root-disk sysbind views only after file restoration.
+    A .mount unit can be active for that foreign bind, so systemctl start alone
+    cannot establish the disk identity. Retire only the empty public root-disk
+    binds, so neither path has duplicate mount targets after preparation."""
+    reason = restore_pending(Path('/proc/self/mountinfo').read_text(), RESTORE_ACTIVE.exists())
+    if reason:
+        raise RuntimeError('cannot prepare storage before Boat restore: ' + reason)
+    rows = mounts()
+    ready = []
+    for path, validate in ((STATE, state_mount), (USERS, users_mount)):
+        path.mkdir(exist_ok=True)
+        try:
+            validate(rows)
+            ready.append(True)
+        except (OSError, RuntimeError):
+            empty_mountpoint(path)
+            ready.append(False)
+    # Check both views before mounting either: a dirty root-disk workspace must
+    # not be hidden even when the state mount point is empty.
+    for path, mounted in ((USERS, ready[1]), (STATE, ready[0])):
+        if not mounted:
+            unmount_root_view(path)
+    if not ready[0]:
+        subprocess.run(['/usr/bin/mount', '-t', 'xfs', '-o', 'loop,noatime', str(IMAGE), str(STATE)], check=True)
+    state_mount(mounts())
+    for directory in ('state', 'state/workspaces', 'home', 'tmp'):
+        (STATE / directory).mkdir(parents=True, exist_ok=True)
+    if not ready[1]:
+        subprocess.run(['/usr/bin/mount', '--bind', str(STATE / 'state/workspaces'), str(USERS)], check=True)
+    evidence = check_storage()
+    evidence.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                    verified_monotonic_ns=time.monotonic_ns())
+    STORAGE_EVIDENCE.write_text(json.dumps(evidence) + '\n')
+    print('Boat storage ready: ' + json.dumps(evidence), flush=True)
+
+
 def identity_present(path=IDENTITY):
     try:
         return stat.S_ISREG(os.lstat(path).st_mode)
@@ -147,7 +258,14 @@ def watch_identity(start_host, present=identity_present, pause=time.sleep):
 
 def main():
     clear_provider_environment()
+    if sys.argv[1:] == ['--prepare-storage']:
+        return prepare_storage()
+    if sys.argv[1:] == ['--check-mountpoints']:
+        for path in (STATE, USERS):
+            empty_mountpoint(path)
+        return
     if sys.argv[1:2] == ['--host-exec']:
+        check_storage()
         os.execv('/usr/local/bin/motor-host', ['/usr/local/bin/motor-host', *sys.argv[2:]])
     if sys.argv[1:] == ['--wait-restored']:
         return wait_restored()
@@ -170,6 +288,7 @@ def main():
                 pass
             time.sleep(.1)
         raise RuntimeError('service never owned its required listening sockets')
+    check_storage()
     baseline = json.loads(Path('/run/motor-boat-memory.json').read_text())
     available = baseline['mem_available_bytes']
     command = ['/usr/local/bin/motor-runner', *sys.argv[1:]]
@@ -202,4 +321,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'Boat startup refused: {error}', file=sys.stderr, flush=True)
+        sys.exit(1)

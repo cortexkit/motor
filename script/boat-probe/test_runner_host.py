@@ -6,6 +6,9 @@ from unittest.mock import patch, Mock
 from pathlib import Path
 import sys
 import tempfile
+import tarfile
+import base64
+import hashlib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -70,6 +73,7 @@ class RunnerHostTests(unittest.TestCase):
         self.assertIn("memory.max", host.JOB)
         self.assertNotEqual(host.PORT, 9443)
         compile(host.SNAPSHOT_HYGIENE, 'snapshot-hygiene', 'exec')
+        compile(host.STORAGE_STATE, 'storage-state', 'exec')
 
     def test_prepared_digest_tracks_source_and_signed_package_inputs_not_processes(self):
         inventory = {'packages':'pkg\t1\n', 'apt_release_files':{'noble':{'date':'fixed','sha256':'abc'}}, 'processes':[1]}
@@ -132,7 +136,7 @@ class RunnerHostTests(unittest.TestCase):
         with patch.object(host.subprocess, 'run', command), contextlib.redirect_stdout(output):
             exec(host.DIAGNOSTICS, {})
         data = json.loads(output.getvalue())
-        self.assertEqual(set(data), {'motor-boat-restored.service','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'})
+        self.assertEqual(set(data), {'motor-boat-restored.service','motor-boat-storage.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'})
         for unit, record in data.items():
             self.assertEqual(record['status']['exit_code'], 3)
             self.assertEqual(record['status']['argv'], ['/usr/bin/systemctl','status','--no-pager','-l',unit])
@@ -205,6 +209,59 @@ class RunnerHostTests(unittest.TestCase):
         dead = json.loads(json.dumps(armed))
         dead['units']['motor-boat-identity.service']['ActiveState'] = 'inactive'
         self.assertFalse(host.armed_checks(dead))
+
+    def test_storage_requires_disk_identity_and_verification_before_runner_not_unit_state(self):
+        data = {'findmnt': {path:json.dumps({'filesystems':[{'target':path, 'fstype':'xfs'}]})
+                            for path in ('/var/lib/motor-boat', '/Users')},
+                'expected_backing':True, 'users_bind':True, 'boot_id':'boot',
+                'prepared':{'boot_id':'boot','reflink':True,'verified_monotonic_ns':1000},
+                'units':{name:{'ActiveState':'active','ExecMainStartTimestampMonotonic':'2'}
+                         for name in ('motor-boat.service','motor-boat-host.service',r'var-lib-motor\x2dboat.mount','Users.mount')}}
+        self.assertTrue(all(host.storage_checks(data).values()))
+        for key in ('expected_backing', 'users_bind'):
+            self.assertFalse(host.storage_checks(dict(data, **{key:False}))['reflink_disk_and_workspace_bind'])
+        wrong = dict(data, findmnt={path:text.replace('xfs', 'ext4') for path, text in data['findmnt'].items()})
+        self.assertFalse(host.storage_checks(wrong)['reflink_disk_and_workspace_bind'])
+        stacked = dict(data, findmnt={path:json.dumps({'filesystems':[
+            {'target':path,'fstype':'ext4'}, {'target':path,'fstype':'xfs'}]}) for path in data['findmnt']})
+        self.assertFalse(host.storage_checks(stacked)['reflink_disk_and_workspace_bind'])
+        self.assertFalse(host.storage_checks(dict(data, prepared={}))['storage_verified_before_services'])
+        late = dict(data, prepared=dict(data['prepared'], verified_monotonic_ns=3000))
+        self.assertFalse(host.storage_checks(late)['storage_verified_before_services'])
+
+    def test_job_repository_lockfile_installs_regular_bytes_not_symlink_only_modules(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host.subprocess, 'run'):
+            repo = Path(tmp)
+            host.job_repository(repo)
+            manifest = json.loads((repo / 'package.json').read_text())
+            self.assertEqual(manifest['dependencies'], {'boat-dep':'file:vendor/boat-dep.tgz'})
+            lock = json.loads((repo / 'package-lock.json').read_text())
+            package = lock['packages']['node_modules/boat-dep']
+            self.assertEqual(package['resolved'], 'file:vendor/boat-dep.tgz')
+            self.assertNotIn('link', package)
+            payload = (repo / 'vendor/boat-dep.tgz').read_bytes()
+            self.assertEqual(package['integrity'], 'sha512-' + base64.b64encode(hashlib.sha512(payload).digest()).decode())
+            with tarfile.open(repo / 'vendor/boat-dep.tgz', 'r:gz') as tar:
+                self.assertTrue(all(member.isfile() and member.size > 0 for member in tar.getmembers()))
+                self.assertEqual(tar.extractfile('package/index.js').read(), b"module.exports = 'boat-node-modules';\n")
+
+    def test_verify_prepared_hydrates_before_identity_phase_without_recipe_or_restart(self):
+        probe = Mock()
+        probe.data = {}
+        probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
+        probe.create.return_value = ({'id':'bx_test'}, {})
+        runner = host.RunnerHost(probe)
+        order = []
+        probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
+        runner.phase = Mock(side_effect=lambda sid, label, *args, **kwargs: order.append(label))
+        runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
+             patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe':Mock(READY={'running'})}):
+            Path(tmp, '.cortexkit').mkdir()
+            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+        self.assertEqual(order, ['hydrated', 'prepared_clone', 'hydrated', 'resumed'])
+        runner.execute.assert_not_called()
+        probe.create.assert_called_once_with('prepared')
 
 
 if __name__ == "__main__":
