@@ -156,6 +156,15 @@ class ParityTests(unittest.TestCase):
         self.assertFalse(report['passed'])
         self.assertIn('Cargo registry parity requires the operator-supplied server seed manifest', report['errors'])
 
+    def test_boat_job_has_no_compile_cache_environment(self):
+        actual = self.observed('boat')
+        actual['compile_wrapper'] = {}
+        self.assertTrue(self.report(actual, job=True, role='boat')['passed'])
+        actual['job_environment'].update(RUSTC_WRAPPER='sccache', SCCACHE_DIR='/motor-cache')
+        report = self.report(actual, job=True, role='boat')
+        self.assertFalse(report['passed'])
+        self.assertIn("job RUSTC_WRAPPER: expected None, observed 'sccache'", report['errors'])
+
     def test_measured_contract_passes(self):
         self.assertTrue(self.report(self.observed())['passed'])
         self.assertTrue(self.report(self.observed(), job=True)['passed'])
@@ -177,15 +186,13 @@ class ParityTests(unittest.TestCase):
         actual['tools']['gnutest']['sha256'] = 'different-file'
         self.assertFalse(self.report(actual, job=True)['passed'])
 
-    def test_compiler_wrapper_roles_both_reach_the_trusted_cache_wrapper(self):
-        for role in ('build-server', 'boat'):
-            with self.subTest(role=role):
-                self.assertTrue(self.report(self.observed(role), job=True, role=role)['passed'])
-                for key, value in (('sccache_sha256', 'untrusted-script'), ('backend', '/tmp/sccache'),
-                                   ('sccache_path', '/usr/local/bin/sccache'), ('backend_readonly', False)):
-                    actual = self.observed(role)
-                    actual['compile_wrapper'][key] = value
-                    self.assertFalse(self.report(actual, job=True, role=role)['passed'])
+    def test_build_server_compiler_wrapper_reaches_the_trusted_cache_wrapper(self):
+        self.assertTrue(self.report(self.observed(), job=True)['passed'])
+        for key, value in (('sccache_sha256', 'untrusted-script'), ('backend', '/tmp/sccache'),
+                           ('sccache_path', '/usr/local/bin/sccache'), ('backend_readonly', False)):
+            actual = self.observed()
+            actual['compile_wrapper'][key] = value
+            self.assertFalse(self.report(actual, job=True)['passed'])
 
     def test_server_supervisor_cache_cannot_bypass_the_trusted_wrapper(self):
         actual = self.observed()

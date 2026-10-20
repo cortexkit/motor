@@ -8,7 +8,7 @@
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
     "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
     "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
-    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper. Single-job Boat uses RUSTC_WRAPPER=sccache directly. Both roles must resolve the same pinned wrapper source and read-only shared backend; all other job environment values remain exact."
+    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. So Boat jobs have no RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. All other job environment values remain exact."
   ],
   "apt_packages": {
     "by_role": {
@@ -398,18 +398,20 @@
   "job_environment": {
     "CARGO_HOME": "/motor-home/cargo",
     "ESBUILD_BIN": null,
-    "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
     "RUSTUP_HOME": "/home/ubuntu/.rustup",
-    "SCCACHE_DIR": "/motor-cache",
     "WASM_BINDGEN_BIN": null,
     "WASM_OPT_BIN": null
   },
   "job_environment_by_role": {
     "boat": {
-      "RUSTC_WRAPPER": "sccache"
+      "PATH": "/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
+      "RUSTC_WRAPPER": null,
+      "SCCACHE_DIR": null
     },
     "build-server": {
-      "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot"
+      "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
+      "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot",
+      "SCCACHE_DIR": "/motor-cache"
     }
   },
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",

@@ -276,15 +276,17 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
         for name, expected in environment.items():
             equal("job " + name, expected, actual.get("job_environment", {}).get(name))
-        contract, wrapper = manifest['compile_wrapper'], actual.get('compile_wrapper', {})
-        entry = contract['sccache_path'] if role == 'boat' else environment['RUSTC_WRAPPER']
-        equal('compiler wrapper resolution', entry, wrapper.get('resolved'))
+        # Only build-server jobs read the shared compile cache through the
+        # runner's wrapper. Boat jobs compile directly: no cache is filled there,
+        # and an empty read-only cache breaks C builds that cc-rs routes to it.
         if role == 'build-server':
+            contract, wrapper = manifest['compile_wrapper'], actual.get('compile_wrapper', {})
+            equal('compiler wrapper resolution', environment['RUSTC_WRAPPER'], wrapper.get('resolved'))
             equal('compiler supervisor cache', contract['sccache_path'], wrapper.get('supervisor_cache'))
-        for name in ('sccache_path', 'sccache_sha256', 'backend'):
-            equal('compiler cache ' + name, contract[name], wrapper.get(name))
-        for name in ('wrapper_readonly', 'backend_readonly'):
-            equal('compiler cache ' + name, True, wrapper.get(name))
+            for name in ('sccache_path', 'sccache_sha256', 'backend'):
+                equal('compiler cache ' + name, contract[name], wrapper.get(name))
+            for name in ('wrapper_readonly', 'backend_readonly'):
+                equal('compiler cache ' + name, True, wrapper.get(name))
         if not readonly_mount(manifest["rustup_home"], actual.get("mountinfo", "")):
             errors.append("job rustup home is not mounted read-only")
     else:
