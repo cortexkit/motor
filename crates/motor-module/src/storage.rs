@@ -13,6 +13,7 @@ use std::{
 // Keep routing and local refusal history for at least the runner's replay horizon,
 // starting at successful terminal delivery or the caller's latest access.
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+const RETENTION_RENEWAL_MS: u64 = 60 * 1000;
 // Only records whose stored keys are exactly local_terminal, pending_cancel,
 // and queue_wait_limit_s use this migration horizon. Agent jobs can run without
 // a timeout, so mint time alone cannot expire current job records.
@@ -239,6 +240,8 @@ pub(crate) struct Storage {
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
     _lease: File,
+    #[cfg(test)]
+    write_count: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct JobLease {
@@ -393,6 +396,8 @@ impl Storage {
             tip_checks: Mutex::new(BTreeMap::new()),
             failed_tips: Mutex::new(BTreeMap::new()),
             _lease: lease,
+            #[cfg(test)]
+            write_count: std::sync::atomic::AtomicUsize::new(0),
         };
         if pruned {
             storage.update(|_| {})?;
@@ -400,7 +405,17 @@ impl Storage {
         Ok(storage)
     }
     fn update(&self, f: impl FnOnce(&mut State)) -> io::Result<()> {
+        self.update_when(|_| true, f)
+    }
+    fn update_when(
+        &self,
+        needed: impl FnOnce(&State) -> bool,
+        f: impl FnOnce(&mut State),
+    ) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if !needed(&state) {
+            return Ok(());
+        }
         let mut next = state.clone();
         f(&mut next);
         next.prune(now_ms());
@@ -410,6 +425,9 @@ impl Storage {
         file.sync_all()?;
         fs::rename(path, self.root.join("state.json"))?;
         File::open(&self.root)?.sync_all()?;
+        #[cfg(test)]
+        self.write_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *state = next;
         Ok(())
     }
@@ -490,19 +508,32 @@ impl Storage {
         }
     }
     pub fn retain_job(&self, id: Uuid, key: Option<String>) -> io::Result<()> {
-        self.update(|s| {
-            let Some(job) = s.jobs.get_mut(&id) else {
-                return;
-            };
-            job.retain_until_ms = Some(
-                job.retain_until_ms
-                    .unwrap_or_default()
-                    .max(now_ms().saturating_add(RETENTION_MS)),
-            );
-            if key.is_some() {
-                job.workspace_key = key;
-            }
-        })
+        self.retain_job_at(id, key, now_ms())
+    }
+    fn retain_job_at(&self, id: Uuid, key: Option<String>, now: u64) -> io::Result<()> {
+        // Round up so even a skipped renewal has a durable deadline at least
+        // one full retention horizon after this access, including after a crash.
+        let until = now
+            .saturating_add(RETENTION_MS)
+            .div_ceil(RETENTION_RENEWAL_MS)
+            .saturating_mul(RETENTION_RENEWAL_MS);
+        self.update_when(
+            |s| {
+                s.jobs.get(&id).is_some_and(|job| {
+                    job.retain_until_ms.is_none_or(|saved| saved < until)
+                        || key
+                            .as_ref()
+                            .is_some_and(|key| job.workspace_key.as_ref() != Some(key))
+                })
+            },
+            |s| {
+                let job = s.jobs.get_mut(&id).unwrap();
+                job.retain_until_ms = Some(job.retain_until_ms.unwrap_or_default().max(until));
+                if key.is_some() {
+                    job.workspace_key = key.clone();
+                }
+            },
+        )
     }
     pub fn terminal_observed(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
@@ -889,6 +920,120 @@ mod retention_tests {
         storage.cancel(id, true).unwrap();
         storage.terminal_delivered(id).unwrap();
         assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod retention_renewal_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn status_poll_retention_writes_once_per_job_per_minute() {
+        const JOBS: usize = 8;
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-polls");
+        let storage = Storage::open(&scratch).unwrap();
+        let ids: Vec<_> = (0..JOBS).map(|_| Uuid::now_v7()).collect();
+        for id in &ids {
+            storage.create(*id, 60, None, None, false).unwrap();
+        }
+        let start = now_ms().div_ceil(RETENTION_RENEWAL_MS) * RETENTION_RENEWAL_MS;
+        let before = storage.write_count.load(Ordering::SeqCst);
+        for second in 1..=120 {
+            for id in &ids {
+                storage
+                    .retain_job_at(*id, None, start + second * 1000)
+                    .unwrap();
+            }
+        }
+        let writes = storage.write_count.load(Ordering::SeqCst) - before;
+        eprintln!(
+            "{JOBS} jobs x 120 status polls: {writes} durable state writes (expected {})",
+            JOBS * 2
+        );
+        assert_eq!(writes, JOBS * 2);
+
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        for id in ids {
+            assert_eq!(
+                reopened.job(id).unwrap().retain_until_ms,
+                Some(start + 120_000 + RETENTION_MS),
+                "the last poll's full horizon must survive a restart"
+            );
+        }
+    }
+
+    #[test]
+    fn covered_retention_skips_io_but_new_deadlines_and_bindings_are_synchronous() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-io");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        let start = now_ms().div_ceil(RETENTION_RENEWAL_MS) * RETENTION_RENEWAL_MS;
+        storage
+            .retain_job_at(id, Some("original".into()), start + 1)
+            .unwrap();
+        let until = start + RETENTION_RENEWAL_MS + RETENTION_MS;
+        assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(until));
+        let before = storage.write_count.load(Ordering::SeqCst);
+
+        // A directory at the temporary-file path makes any attempted write fail.
+        // If the saved deadline covers the requested deadline, the access must
+        // succeed without attempting to write the state file.
+        fs::create_dir(scratch.join("state.tmp")).unwrap();
+        storage
+            .retain_job_at(id, None, start + RETENTION_RENEWAL_MS - 1)
+            .unwrap();
+        storage
+            .retain_job_at(id, Some("original".into()), start + RETENTION_RENEWAL_MS)
+            .unwrap();
+        storage
+            .retain_job_at(Uuid::now_v7(), None, start + RETENTION_RENEWAL_MS)
+            .unwrap();
+        assert!(storage
+            .retain_job_at(id, None, start + RETENTION_RENEWAL_MS + 1)
+            .is_err());
+        assert!(storage
+            .retain_job_at(id, Some("changed".into()), start + 2)
+            .is_err());
+        assert!(storage.cancel(id, true).is_err());
+        assert!(storage
+            .resubmitted(id, Uuid::now_v7(), "unreachable")
+            .is_err());
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
+        let job = storage.job(id).unwrap();
+        assert_eq!(job.retain_until_ms, Some(until));
+        assert_eq!(job.workspace_key.as_deref(), Some("original"));
+        assert!(!job.pending_cancel);
+        assert!(job.build_server_job_id.is_none());
+
+        fs::remove_dir(scratch.join("state.tmp")).unwrap();
+        storage
+            .retain_job_at(id, Some("changed".into()), start + 2)
+            .unwrap();
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before + 1);
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        let job = reopened.job(id).unwrap();
+        assert_eq!(job.workspace_key.as_deref(), Some("changed"));
+        assert_eq!(job.retain_until_ms, Some(until));
+    }
+
+    #[test]
+    fn retention_rounding_saturates_and_never_shortens_a_longer_deadline() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-overflow");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        storage.retain_job_at(id, None, u64::MAX).unwrap();
+        assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(u64::MAX));
+        let before = storage.write_count.load(Ordering::SeqCst);
+        storage.retain_job_at(id, None, now_ms()).unwrap();
+        assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
+        drop(storage);
+        let reopened = Storage::open(&scratch).unwrap();
+        assert_eq!(reopened.job(id).unwrap().retain_until_ms, Some(u64::MAX));
     }
 }
 
