@@ -210,7 +210,11 @@ impl<B: Backend> Controller<B> {
             Operation::Relay(port) => {
                 return Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
-                    fds: vec![self.0.relay(tenant, port)?],
+                    fds: vec![self.0.relay(tenant, port).map_err(|error| {
+                        crate::Error(format!(
+                            "open_relay tenant={tenant} port={port} step=open_guest_connection: {error}"
+                        ))
+                    })?],
                 })
             }
             Operation::Stop => {

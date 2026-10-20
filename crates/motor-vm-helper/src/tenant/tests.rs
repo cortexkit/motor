@@ -209,6 +209,19 @@ impl Backend for Fake {
 }
 
 #[test]
+fn tenant_relay_failure_identifies_tenant_port_and_step() {
+    let mut c = Controller(Fake {
+        fail: "relay-52",
+        ..Fake::default()
+    });
+    let error = c.handle("a", Operation::Relay(52)).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "open_relay tenant=a port=52 step=open_guest_connection: relay-52 failed"
+    );
+}
+
+#[test]
 fn tenant_metrics_are_read_only_bound_to_registry_and_reject_paths() {
     let mut c = Controller(Fake::default());
     assert!(matches!(

@@ -2,6 +2,80 @@ use super::*;
 use std::os::unix::net::UnixListener;
 
 #[test]
+fn hosted_connect_line_reaches_firecracker_in_one_write() {
+    struct FirstReadMuxer {
+        command: Vec<u8>,
+        rejected: bool,
+        reply: std::io::Cursor<Vec<u8>>,
+    }
+    impl Write for FirstReadMuxer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.rejected {
+                return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            // Model Firecracker reading as soon as each socket write completes,
+            // rather than letting a buffered line reader hide split writes.
+            self.rejected = bytes != self.command;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for FirstReadMuxer {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.rejected {
+                return Ok(0);
+            }
+            self.reply.read(bytes)
+        }
+    }
+    for port in 52..=54 {
+        let mut muxer = FirstReadMuxer {
+            command: format!("CONNECT {port}\n").into_bytes(),
+            rejected: false,
+            reply: std::io::Cursor::new(b"OK 123\nFRAME".to_vec()),
+        };
+        relay_handshake(&mut muxer, port)
+            .expect("Firecracker must receive the complete CONNECT command before parsing it");
+        assert!(!muxer.rejected);
+        let mut frame = [0; 5];
+        muxer.read_exact(&mut frame).unwrap();
+        assert_eq!(&frame, b"FRAME");
+    }
+}
+
+#[test]
+fn hosted_relay_refusals_name_peer_port_and_handshake_step() {
+    let scratch = cortexkit_test_support::ScratchDir::new("relay-refusal");
+    let listener = UnixListener::bind(scratch.join("vsock.sock")).unwrap();
+    let thread = std::thread::spawn(move || {
+        for reply in [b"NO\n".as_slice(), b"".as_slice()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "CONNECT 52\n");
+            stream.write_all(reply).unwrap();
+        }
+    });
+    for detail in ["invalid acknowledgement", "failed to fill whole buffer"] {
+        let error = connect_relay(scratch.path(), 52).unwrap_err().to_string();
+        assert!(error.contains(&format!("peer={}/vsock.sock", scratch.path().display())));
+        assert!(error.contains("guest_port=52 step=handshake: read_CONNECT_ack:"));
+        assert!(error.contains(detail), "{error}");
+    }
+    thread.join().unwrap();
+
+    let (mut stream, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    let error = relay_handshake(&mut stream, 52).unwrap_err().to_string();
+    assert!(error.starts_with("write_CONNECT: "), "{error}");
+    assert!(error.contains("Broken pipe"), "{error}");
+}
+
+#[test]
 fn hosted_jail_caps_use_ceiling_tasks_and_memory_headroom_not_job_memory() {
     let limits = cgroup_limits(&crate::tenant::tests::registry("a"), "0".into()).unwrap();
     assert_eq!(

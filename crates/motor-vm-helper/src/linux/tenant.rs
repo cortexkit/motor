@@ -582,27 +582,54 @@ impl Backend for LinuxTenants {
 
 fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {
     crate::tenant::validate_port(port)?;
-    let root_fd = File::open(root)?;
+    let context = |step: &str, error: &dyn std::fmt::Display| {
+        Error(format!(
+            "Firecracker vsock peer={}/vsock.sock guest_port={port} step={step}: {error}",
+            root.display()
+        ))
+    };
+    let root_fd = File::open(root).map_err(|e| context("open_jail_root", &e))?;
     let socket_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
-    let mut stream = super::wait_socket(&socket_root.join("vsock.sock"), Duration::from_secs(10))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    writeln!(stream, "CONNECT {port}")?;
+    let mut stream = super::wait_socket(&socket_root.join("vsock.sock"), Duration::from_secs(10))
+        .map_err(|e| context("connect_uds", &e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| context("set_read_timeout", &e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| context("set_write_timeout", &e))?;
+    relay_handshake(&mut stream, port).map_err(|e| context("handshake", &e))?;
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| context("clear_read_timeout", &e))?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|e| context("clear_write_timeout", &e))?;
+    Ok(stream.into())
+}
+
+fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
+    // Firecracker 1.17 parses CONNECT on the first readable event, without
+    // buffering fragments. Formatting directly into the socket can send the
+    // prefix before the port and newline, so prepare the entire line first.
+    stream
+        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .map_err(|e| Error(format!("write_CONNECT: {e}")))?;
     let mut answer = Vec::new();
     while answer.len() < 128 {
         let mut byte = [0];
-        stream.read_exact(&mut byte)?;
+        stream
+            .read_exact(&mut byte)
+            .map_err(|e| Error(format!("read_CONNECT_ack: {e}")))?;
         answer.push(byte[0]);
         if byte[0] == b'\n' {
             break;
         }
     }
     if !answer.starts_with(b"OK ") || answer.last() != Some(&b'\n') {
-        return Err(Error("tenant vsock connection refused".into()));
+        return Err(Error("read_CONNECT_ack: invalid acknowledgement".into()));
     }
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    Ok(stream.into())
+    Ok(())
 }
 
 pub fn api(root: &Path, method: &str, path: &str, body: &Value) -> Result<()> {

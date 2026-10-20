@@ -320,6 +320,64 @@ async fn tenant_drain_refuses_a_supported_run_lease() {
 // returns None on hosts that cannot run the tenant VM.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn tenant_cut_mid_upload_then_host_cancel_keeps_next_lease_reachable() {
+    use tokio::io::AsyncWriteExt;
+
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut run, bundles) = f.run("true");
+    run.weight_hint = Some(2);
+    run.queue_wait_limit_s = 0;
+    run.timeout = Some(30);
+    run.platform = None;
+    run.network = None;
+    let id = run.job_id;
+    let (mut client, task) = connect(&runner, lease(id, LeasePurpose::Run)).await;
+    motor_protocol::write_frame_async(&mut client, &Frame::Run(run))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut client).await, Some(Frame::Accepted(_))));
+    let mut chunk = Vec::new();
+    motor_protocol::write_frame(
+        &mut chunk,
+        &Frame::BundleChunk {
+            index: 0,
+            offset: 0,
+            data: BytePayload(bundles[0].clone()),
+        },
+    )
+    .unwrap();
+    client.write_all(&chunk[..chunk.len() / 2]).await.unwrap();
+    drop(client);
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("cut upload must release its tenant connection")
+        .unwrap();
+    if let Err(error) = result {
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // The guest admin channel's cancel operation calls the same runner method,
+    // independently of the lost job connection and its incomplete frame.
+    runner.cancel(id).unwrap();
+    let status = runner.job_status(id).unwrap();
+    assert_eq!(
+        status.terminal.unwrap().ran,
+        Some(motor_protocol::Ran::None)
+    );
+    let next_id = Uuid::now_v7();
+    let (client, task) = connect(&runner, lease(next_id, LeasePurpose::Run)).await;
+    assert!(!runner.has_job_record(next_id));
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("next lease must close independently")
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn tenant_accepted_is_admitted_and_withdraw_is_terminal() {
     let f = Fixture::new();
     let runner = open(&f);
