@@ -1446,6 +1446,112 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
 
 #[test]
 fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
+    cargo_prefetch_fixture(false);
+}
+
+#[test]
+fn nested_lockfile_prefetch_populates_offline_sources() {
+    cargo_prefetch_fixture(true);
+}
+
+#[test]
+fn cargo_prefetch_is_bounded_and_ignores_untracked_lockfiles() {
+    let f = Fixture::new();
+    let package = "[package]\nname='probe'\nversion='0.1.0'\n";
+    fs::write(f.workspace.join("Cargo.toml"), package).unwrap();
+    fs::write(f.workspace.join("Cargo.lock"), "version=4\n").unwrap();
+    commit_cargo_fixture(&f.workspace);
+    let untracked = f.workspace.join("untracked");
+    fs::create_dir_all(&untracked).unwrap();
+    fs::write(untracked.join("Cargo.toml"), package).unwrap();
+    fs::write(untracked.join("Cargo.lock"), "version=4\n").unwrap();
+    assert_eq!(
+        cargo_lockfiles(&f.workspace, "HEAD").unwrap(),
+        [PathBuf::from("Cargo.lock")]
+    );
+    for i in 0..128 {
+        let nested = f.workspace.join(format!("helper-{i}"));
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Cargo.toml"), package).unwrap();
+        fs::write(nested.join("Cargo.lock"), "version=4\n").unwrap();
+    }
+    commit_cargo_fixture(&f.workspace);
+    assert!(cargo_lockfiles(&f.workspace, "HEAD")
+        .unwrap_err()
+        .to_string()
+        .contains("128 tracked Cargo.lock"));
+}
+
+#[test]
+fn cargo_prefetch_refusal_names_nested_lockfile_and_failed_crate() {
+    let f = Fixture::new();
+    let helper = f.workspace.join("probes/helper");
+    fs::create_dir_all(helper.join("src")).unwrap();
+    fs::write(helper.join("src/lib.rs"), "").unwrap();
+    fs::write(helper.join("Cargo.toml"), "[package]\nname='missing-crate'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nabsent={git='file:///nonexistent-motor-prefetch-dependency'}\n").unwrap();
+    fs::write(helper.join("Cargo.lock"), "version=4\n").unwrap();
+    commit_cargo_fixture(&f.workspace);
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".rustup")
+            .into_os_string()
+    }));
+    let error = prefetch_cargo_dependencies(
+        false,
+        &f.state,
+        &f.workspace,
+        "HEAD",
+        &BTreeMap::new(),
+        &f.scratch.join("cargo"),
+        &rustup,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("probes/helper/Cargo.lock"), "{error}");
+    assert!(error.contains("absent"), "{error}");
+}
+
+#[test]
+fn cargo_prefetch_refuses_missing_or_symlinked_snapshot_lockfiles() {
+    let f = Fixture::new();
+    fs::write(f.workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    commit_cargo_fixture(&f.workspace);
+    assert!(cargo_lockfiles(&f.workspace, "HEAD")
+        .unwrap_err()
+        .to_string()
+        .contains("no tracked Cargo.lock"));
+    fs::write(f.scratch.join("external-lock"), "version=4\n").unwrap();
+    std::os::unix::fs::symlink(
+        f.scratch.join("external-lock"),
+        f.workspace.join("Cargo.lock"),
+    )
+    .unwrap();
+    commit_cargo_fixture(&f.workspace);
+    assert!(cargo_lockfiles(&f.workspace, "HEAD")
+        .unwrap_err()
+        .to_string()
+        .contains("tracked regular Cargo.lock"));
+}
+
+fn commit_cargo_fixture(path: &Path) {
+    workspace::git(path, &["init", "-q"]).unwrap();
+    workspace::git(path, &["add", "."]).unwrap();
+    workspace::git(
+        path,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "snapshot",
+        ],
+    )
+    .unwrap();
+}
+
+fn cargo_prefetch_fixture(nested: bool) {
     let f = Fixture::new();
     let dependency = f.scratch.join("tip-only-dependency");
     fs::create_dir_all(dependency.join("src")).unwrap();
@@ -1503,13 +1609,25 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
         "version=4\n[[package]]\nname='branch-first'\nversion='0.1.0'\n",
     )
     .unwrap();
+    fs::write(tip.join("Cargo.toml"), package).unwrap();
+    fs::copy(branch.join("Cargo.lock"), tip.join("Cargo.lock")).unwrap();
+    let helper = if nested {
+        tip.join("probes/helper")
+    } else {
+        tip.clone()
+    };
+    fs::create_dir_all(helper.join("src")).unwrap();
+    fs::write(helper.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
     fs::write(
-        tip.join("Cargo.toml"),
+        helper.join("Cargo.toml"),
         format!("{package}[dependencies]\ntip_only={{git='{url}',rev='{oid}'}}\n"),
     )
     .unwrap();
     let lock = format!("version=4\n[[package]]\nname='branch-first'\nversion='0.1.0'\ndependencies=['tip_only']\n[[package]]\nname='tip_only'\nversion='0.1.0'\nsource='git+{url}?rev={oid}#{oid}'\n");
-    fs::write(tip.join("Cargo.lock"), &lock).unwrap();
+    fs::write(helper.join("Cargo.lock"), &lock).unwrap();
+    for root in [&tip, &branch] {
+        commit_cargo_fixture(root);
+    }
     let cargo = f.scratch.join("empty-cargo-home");
     fs::create_dir_all(&cargo).unwrap();
     let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap_or_else(|| {
@@ -1520,18 +1638,28 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
     let metadata = || {
         Command::new("cargo")
             .args(["metadata", "--locked", "--offline", "--format-version", "1"])
-            .current_dir(&tip)
+            .current_dir(&helper)
             .env("CARGO_HOME", &cargo)
             .env("RUSTUP_HOME", &rustup)
             .env("CARGO_NET_OFFLINE", "true")
             .env_remove("GIT_CONFIG_COUNT")
             .env_remove("GIT_CONFIG_KEY_0")
             .env_remove("GIT_CONFIG_VALUE_0")
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
             .output()
             .unwrap()
     };
-    prefetch_cargo_dependencies(false, &f.state, &branch, &BTreeMap::new(), &cargo, &rustup)
-        .unwrap();
+    prefetch_cargo_dependencies(
+        false,
+        &f.state,
+        &branch,
+        "HEAD",
+        &BTreeMap::new(),
+        &cargo,
+        &rustup,
+    )
+    .unwrap();
     let missing = metadata();
     assert!(
         !missing.status.success(),
@@ -1547,7 +1675,7 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
         "tip dependency must initially be absent"
     );
     let routes = BTreeMap::from([(url, mirror)]);
-    prefetch_cargo_dependencies(true, &f.state, &tip, &routes, &cargo, &rustup).unwrap();
+    prefetch_cargo_dependencies(true, &f.state, &tip, "HEAD", &routes, &cargo, &rustup).unwrap();
     let ready = metadata();
     assert!(
         ready.status.success(),
@@ -1560,7 +1688,7 @@ fn branch_first_fetches_tip_only_git_sources_before_writer_offline_preflight() {
         .unwrap()
         .iter()
         .any(|p| p["name"] == "tip_only"));
-    assert_eq!(fs::read_to_string(tip.join("Cargo.lock")).unwrap(), lock);
+    assert_eq!(fs::read_to_string(helper.join("Cargo.lock")).unwrap(), lock);
     assert!(
         !tip.join("target").exists(),
         "trusted fetch must not compile anything"

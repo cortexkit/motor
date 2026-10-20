@@ -12,6 +12,7 @@ import io
 import json
 from pathlib import Path
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,18 @@ provider_spec.loader.exec_module(provider)
 PORT = 19443
 PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
 PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
+CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
+CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
+
+
+def upload_seed_input(argv, source, name):
+    with Path(source).open('rb') as stream:
+        sent = subprocess.run(argv + ['umask 077; cat > /home/user/' + name],
+                              stdin=stream, capture_output=True, timeout=300)
+    if sent.returncode:
+        raise ValueError('Cargo seed upload over pinned SSH failed: ' + sent.stderr.decode(errors='replace'))
+
+
 ENV_NAMES = "import os,json; print(json.dumps({k: True for k in os.environ if k == 'ASCII_TOKEN' or k.startswith('BOAT_')}))"
 POLICY = {"allowtcpforwarding": "local", "permittty": "no", "allowagentforwarding": "no",
           "x11forwarding": "no", "permittunnel": "no"}
@@ -326,7 +339,7 @@ def storage_checks(data):
 NODE_CHECK = "node -e \"if (require('boat-dep') !== 'boat-node-modules') process.exit(1); console.log(require('boat-dep'))\""
 
 
-def job_repository(repository):
+def job_repository(repository, cargo_seed_manifest=None):
     """A local tarball installs regular files in node_modules, unlike a local
     directory dependency that leaves a symlink. Publishing and reusing
     node_modules must therefore reflink those bytes."""
@@ -334,6 +347,8 @@ def job_repository(repository):
     (repository / 'Cargo.toml').write_text('[package]\nname="boat-hello"\nversion="0.1.0"\nedition="2021"\n')
     (repository / 'Cargo.lock').write_text('version = 4\n[[package]]\nname = "boat-hello"\nversion = "0.1.0"\n')
     (repository / 'src/main.rs').write_text('fn main() { println!("boat-hello"); }\n')
+    if cargo_seed_manifest:
+        shutil.copyfile(cargo_seed_manifest, repository / 'cargo-seed-expected.json')
     manifest = {'name':'boat-node-probe', 'version':'1.0.0', 'private':True,
                 'dependencies':{'boat-dep':'file:vendor/boat-dep.tgz'}}
     (repository / 'package.json').write_text(json.dumps(manifest) + '\n')
@@ -445,17 +460,21 @@ def provider_access_denied(access):
 
 
 def prepared_image_digest(revision, inventory):
-    inputs = {'revision':revision, 'packages':inventory['packages'], 'apt_release_files':inventory['apt_release_files']}
+    inputs = {'revision':revision, 'packages':inventory['packages'], 'apt_release_files':inventory['apt_release_files'],
+              'cargo_seed_sha256': inventory['cargo_seed']['manifest_sha256']}
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',',':')).encode()).hexdigest()
 
 
-def parity_source(job=False, gnu_test_sha256=None):
+def parity_source(job=False, gnu_test_sha256=None, cargo_seed_sha256=None):
     # Run the operator checkout's checker, not an image's possibly stale checker
     # or its build-time inventory. Every phase measures the current filesystem.
-    return ("import json\n"
-            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py'}\n"
+    return ("import json, types\n"
+            "seed_scope = {'__name__': 'cargo_seed'}\n"
+            f"exec({CARGO_SEED_SCRIPT.read_text()!r}, seed_scope)\n"
+            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py', 'seed': types.SimpleNamespace(**seed_scope)}\n"
             f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
-            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r})\n"
+            f"registry = seed_scope['verified_manifest']({'cargo-seed-expected.json' if job else '/home/user/cargo-seed-expected.json'!r}, {cargo_seed_sha256!r}) if {cargo_seed_sha256!r} else None\n"
+            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r}, cargo_registry=registry)\n"
             "print(json.dumps(result))\n")
 
 
@@ -729,6 +748,7 @@ class RunnerHost:
         record = {"name": label}
         self.data["phases"].append(record)
         argv = self.route(sid, directory, public)
+        upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed-expected.json')
         if label == 'snapshot_clone':
             self.broker_order(sid, label, record, pre_swap_install, hydrated_at, first_started)
         elif label == 'prepared_clone':
@@ -749,7 +769,7 @@ class RunnerHost:
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
         record['toolchain_parity'] = json.loads(self.execute(
-            sid, "sudo -n python3 -c " + shlex.quote(parity_source()))['stdout'])
+            sid, "sudo -n python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
         self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
         listeners = host["listeners"]["stdout"]
         self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
@@ -777,8 +797,9 @@ class RunnerHost:
                 jobs = [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
                                        ("exit", "printf 'boat-round-trip\\n'; exit 23"),
                                         ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
-                                        ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
-                                            job=True, gnu_test_sha256=gnu_test_hash))),
+                                         ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
+                                            job=True, gnu_test_sha256=gnu_test_hash, cargo_seed_sha256=self.probe.cargo_seed_sha256))),
+                                         ('offline_cargo_seed', 'python3 -c ' + shlex.quote(CARGO_OFFLINE_PROBE.read_text())),
                                        ("isolation", "python3 -c " + shlex.quote(job_script))]
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))
@@ -799,6 +820,9 @@ class RunnerHost:
                     if name == 'job_toolchain_parity':
                         report = json.loads(parsed['stdout'])
                         self.check(label + '.' + name, parsed['code'] == 0 and parity_passed(report), report)
+                    elif name == 'offline_cargo_seed':
+                        report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
+                        self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
                     elif name == "isolation":
                         for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
@@ -833,7 +857,7 @@ class RunnerHost:
         self.data['create_from_snapshot']['seconds_to_hydrated'] = time.monotonic() - started
         with tempfile.TemporaryDirectory(prefix='boat-job-', dir=ROOT / '.cortexkit') as repo:
             repository = Path(repo)
-            job_repository(repository)
+            job_repository(repository, self.probe.cargo_seed_manifest)
             # Do not restart, reconfigure or mount anything in the guest: that
             # would repair the startup order this mode is meant to observe.
             self.phase(sid, 'prepared_clone', directory, public, repository, client, first_started=started)
@@ -856,6 +880,8 @@ class RunnerHost:
 
     def _run(self):
         from probe import READY, cleanup, required_checks_passed
+        if hashlib.sha256(self.probe.cargo_seed_manifest.read_bytes()).hexdigest() != self.probe.cargo_seed_sha256:
+            raise ValueError('operator Cargo seed manifest SHA-256 mismatch')
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT, check=True, stdout=sys.stderr)
         build = process(["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_KEY_0", "-u", "GIT_CONFIG_VALUE_0",
@@ -909,14 +935,21 @@ class RunnerHost:
             self.data["source_upload"] = self.execute(sid, install)
             self.data["apt_preflight"] = json.loads(self.execute(sid, "sudo -n python3 /srv/build/source/script/boat-image/install.py --apt-preflight-only", timeout=180)["stdout"])
             self.probe.checkpoint()
-            self.data["install"] = self.execute(sid, f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}", timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
+            upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed.json')
+            upload_seed_input(argv, self.probe.cargo_seed_archive, 'cargo-seed.tar.gz')
+            seed_args = (' --cargo-seed-manifest /home/user/cargo-seed.json'
+                         ' --cargo-seed-archive /home/user/cargo-seed.tar.gz'
+                         ' --cargo-seed-sha256 ' + shlex.quote(self.probe.cargo_seed_sha256)
+                         + ' --acknowledge-tenant-one-private-cache')
+            self.data["install"] = self.execute(sid, f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}" + seed_args, timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
+            self.execute(sid, 'rm -f /home/user/cargo-seed.tar.gz /home/user/cargo-seed.json')
             self.data["install_seconds"] = time.monotonic() - started
             if getattr(self.probe, 'retain_prepared_image', False):
                 inventory = json.loads(self.execute(sid, 'sudo -n cat /var/lib/motor-boat/inventory.json')['stdout'])
                 self.retain_prepared(sid, public, revision, inventory)
             with tempfile.TemporaryDirectory(prefix="boat-job-", dir=ROOT / ".cortexkit") as repo:
                 repository = Path(repo)
-                job_repository(repository)
+                job_repository(repository, self.probe.cargo_seed_manifest)
                 self.phase(sid, "initial", directory, public, repository, client)
                 hygiene = self.quiesce_image(sid, public, 'snapshot')
                 name = "motor-runner-" + self.probe.data["run_id"]

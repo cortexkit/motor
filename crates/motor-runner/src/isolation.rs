@@ -1545,17 +1545,71 @@ impl Drop for RuntimeDir {
     }
 }
 
+/// Only immutable snapshot entries authorize a fetch; warm untracked files do not.
+fn cargo_lockfiles(workspace: &Path, tree: &str) -> io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    let entries = javascript_git(
+        workspace,
+        &["ls-tree".as_ref(), "-rz".as_ref(), tree.as_ref()],
+    )?;
+    let mut files = BTreeMap::new();
+    for entry in entries
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (header, path) = entry.split_at(
+            entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| io::Error::other("malformed Cargo Git tree entry"))?,
+        );
+        let path = PathBuf::from(std::ffi::OsString::from_vec(path[1..].to_vec()));
+        files.insert(
+            path,
+            header.starts_with(b"100644 blob ") || header.starts_with(b"100755 blob "),
+        );
+    }
+    let mut locks = Vec::new();
+    for (path, regular) in &files {
+        if path.file_name().is_some_and(|name| name == "Cargo.lock") {
+            let manifest = path.with_file_name("Cargo.toml");
+            if !regular
+                || files.get(&manifest) != Some(&true)
+                || !optional_regular_file(&workspace.join(path))?
+                || !optional_regular_file(&workspace.join(&manifest))?
+            {
+                return Err(io::Error::other(format!(
+                    "{}: Cargo prefetch requires tracked regular Cargo.lock and Cargo.toml files",
+                    path.display()
+                )));
+            }
+            locks.push(path.clone());
+        }
+    }
+    if locks.len() > 128 {
+        return Err(io::Error::other(
+            "Cargo prefetch exceeds the 128 tracked Cargo.lock limit",
+        ));
+    }
+    if files.contains_key(Path::new("Cargo.toml")) && !locks.contains(&PathBuf::from("Cargo.lock"))
+    {
+        return Err(io::Error::other("Cargo.toml has no tracked Cargo.lock; generate and commit it in your own checkout before retrying"));
+    }
+    Ok(locks)
+}
+
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 fn prefetch_cargo_dependencies(
     writer: bool,
     state: &Path,
     workspace: &Path,
+    tree: &str,
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
 ) -> io::Result<()> {
-    if workspace.join("Cargo.toml").is_file() {
+    for lockfile in cargo_lockfiles(workspace, tree)? {
         let stage = if writer {
             "fetch integration-tip dependencies"
         } else {
@@ -1564,14 +1618,19 @@ fn prefetch_cargo_dependencies(
         checked(
             workspace::dependencies::fetch_command(
                 state,
-                workspace,
+                &workspace.join(lockfile.parent().unwrap_or(Path::new(""))),
                 dependency_routes,
                 cargo,
                 rustup,
             )?
             .env("CARGO_NET_OFFLINE", "false"),
         )
-        .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))?;
+        .map_err(|error| {
+            io::Error::other(fetch_failure(
+                &format!("{stage} ({})", lockfile.display()),
+                &error.to_string(),
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1729,7 +1788,7 @@ impl Sandbox {
         // Fetch from a neutral directory: Cargo does not load an uploaded
         // .cargo/config.toml (credential providers/rustc wrappers can execute
         // programs). No build.rs or test runs in this trusted preparation step.
-        if workspace.join("Cargo.toml").is_file() {
+        {
             // Read-only default ACLs on the shared Cargo registry and Git cache
             // make newly fetched files readable to jobs without rescanning the
             // cache after every trusted dependency fetch.
@@ -1745,6 +1804,7 @@ impl Sandbox {
                 writer,
                 state,
                 workspace,
+                tree,
                 dependency_routes,
                 &cargo,
                 &rustup,

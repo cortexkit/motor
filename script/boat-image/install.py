@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root-only, credential-free Boat runner host installation."""
+"""Root-only Boat fleet host installation; private Cargo seed is tenant-1-only."""
 
 import argparse
 import base64
@@ -35,6 +35,7 @@ APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourcepa
 RUNNER_INPUTS = (
     'script/runner/tools.txt', 'script/runner/install-tools.sh',
     'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
+    'script/runner/cargo-seed.py',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
 )
 
@@ -397,6 +398,11 @@ def configure(pins, revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", help="exact clean source commit to build")
+    parser.add_argument('--cargo-seed-manifest', type=Path)
+    parser.add_argument('--cargo-seed-archive', type=Path)
+    parser.add_argument('--cargo-seed-sha256')
+    parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
+                        help='seed can contain private fleet Git dependencies; never use for customer images')
     parser.add_argument("--apt-preflight-only", action="store_true", help="record official archive index reachability without changing the guest")
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -409,6 +415,10 @@ def main():
         return
     if not args.revision:
         parser.error("installation requires --revision")
+    if not (args.cargo_seed_manifest and args.cargo_seed_archive and args.cargo_seed_sha256
+            and args.acknowledge_tenant_one_private_cache):
+        parser.error('fleet image installation requires an operator-supplied Cargo seed, its manifest SHA-256, and --acknowledge-tenant-one-private-cache')
+    seed_manifest = parity.seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256)
     if run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True) != args.revision:
         raise ValueError("source revision differs")
     if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", capture=True):
@@ -441,7 +451,10 @@ def main():
     # Check the administrative path and firewall transaction before long tool builds.
     run('/usr/bin/python3', str(HERE / 'motor-boat-network'), '--check', '--template', str(ROOT / 'script/runner/motor-net.nft'))
     tools(manifest)
-    parity_result = parity.check(manifest, role="boat")
+    seed_inventory = parity.seed.install(args.cargo_seed_manifest, args.cargo_seed_archive,
+                                         args.cargo_seed_sha256, manifest['cargo_home'])
+    (BUILD / 'cargo-seed.json').write_text(json.dumps(seed_manifest, indent=2) + '\n')
+    parity_result = parity.check(manifest, role="boat", cargo_registry=seed_manifest)
     if not parity_result["passed"]:
         raise ValueError("toolchain parity failed: " + json.dumps(parity_result["errors"]))
     os.chdir(ROOT)
@@ -461,6 +474,7 @@ def main():
         "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
+                      cargo_seed=seed_inventory,
                      packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
                       parity=parity_result,
                       provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))

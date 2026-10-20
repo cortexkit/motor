@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import sys
@@ -13,6 +14,12 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "toolchain.json"
+if 'seed' not in globals():
+    seed_spec = importlib.util.spec_from_file_location('cargo_seed', HERE / 'cargo-seed.py')
+    if seed_spec is None or seed_spec.loader is None:
+        raise ImportError('cannot load Cargo seed inventory')
+    seed = importlib.util.module_from_spec(seed_spec)
+    seed_spec.loader.exec_module(seed)
 
 
 def output(*args, env=None):
@@ -143,6 +150,7 @@ def capture(manifest=None, job=False):
         "job_environment": {name: os.environ.get(name) for name in sorted(job_names)},
         "compile_wrapper": wrapper,
         "mountinfo": mountinfo,
+        "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
     }
 
 
@@ -293,7 +301,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
     return errors
 
 
-def check(manifest, role="build-server", job=False, gnu_test_sha256=None):
+def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None):
     validate(manifest)
     actual = capture(manifest, job=job)
     if role == "boat" and not job:
@@ -302,8 +310,17 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None):
         artifacts = Path('/srv/build/sccache-artifacts.json')
         actual['sccache_artifacts'] = json.loads(artifacts.read_text()) if artifacts.is_file() else None
     errors = differences(manifest, actual, role, job, gnu_test_sha256)
+    registry = None
+    if cargo_registry is not None:
+        seed.validate(cargo_registry)
+        registry = seed.differences(cargo_registry, actual['cargo_registry'])
+        if not registry['passed']:
+            errors.append('Cargo registry parity: ' + json.dumps(registry, sort_keys=True))
+    elif role == 'boat':
+        errors.append('Cargo registry parity requires the operator-supplied server seed manifest')
     # Keep qualification output bounded without discarding the measured versions.
     actual.pop("cargo_metadata", None)
+    actual.pop('cargo_registry', None)
     for row in [*actual["cargo_binaries"].values(), *actual["tools"].values()]:
         if row and row.get("version"):
             row["version"] = first_line(row["version"])
@@ -314,7 +331,8 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None):
                                           if manifest["rustup_home"] in line.split()[:6])
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return {"passed": not errors, "errors": errors, "role": role, "job": job,
-            "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual}
+            "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual,
+            "cargo_registry": registry}
 
 
 def refresh(manifest, actual):
@@ -373,13 +391,18 @@ def main():
     parser.add_argument("--role", choices=("build-server", "boat"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
     parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
+    parser.add_argument('--cargo-seed-manifest', type=Path, help='trusted server seed inventory; required for Boat parity')
+    parser.add_argument('--cargo-seed-sha256', help='independently recorded server seed manifest digest')
     args = parser.parse_args()
+    if bool(args.cargo_seed_manifest) != bool(args.cargo_seed_sha256):
+        parser.error('--cargo-seed-manifest and --cargo-seed-sha256 must be supplied together')
     if args.capture:
         result = capture()
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(
-            manifest, args.role, args.job, args.gnu_test_sha256)
+            manifest, args.role, args.job, args.gnu_test_sha256,
+            seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256) if args.cargo_seed_manifest else None)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if args.check and not result["passed"] else 0
 

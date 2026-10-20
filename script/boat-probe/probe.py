@@ -152,6 +152,10 @@ def save(path, data, key=""):
 
 
 class Probe:
+    cargo_seed_manifest: 'Path | None'
+    cargo_seed_sha256: 'str | None'
+    cargo_seed_archive: 'Path | None'
+
     def __init__(self, client, data, checkpoint, port=9443, minutes=30):
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
         self.deadline = time.monotonic() + minutes * 60
@@ -793,6 +797,11 @@ def main(report_stream=None):
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
     parser.add_argument('--verify-prepared-image', help='qualify an existing snapshot unchanged: hydrate, install broker identity, real jobs, resume; no recipe reapply or service restart')
     parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
+    parser.add_argument('--cargo-seed-manifest', type=Path, help='operator server capture, required for runner-host registry parity')
+    parser.add_argument('--cargo-seed-sha256', help='independently recorded SHA-256 of the server seed manifest')
+    parser.add_argument('--cargo-seed-archive', type=Path, help='tenant-1 private seed; required when applying the recipe')
+    parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
+                        help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
     if (args.prepared_image or args.from_prepared_image or args.verify_prepared_image) and not args.runner_host:
         parser.error('prepared image options require --runner-host')
@@ -805,6 +814,11 @@ def main(report_stream=None):
             parser.error('invalid prepared named-snapshot handle')
     if args.delete_retained_images and not args.cleanup:
         parser.error('--delete-retained-images requires --cleanup')
+    if args.runner_host and not args.cleanup and not args.render:
+        if not (args.cargo_seed_manifest and args.cargo_seed_sha256 and args.acknowledge_tenant_one_private_cache):
+            parser.error('--runner-host requires --cargo-seed-manifest, --cargo-seed-sha256 and --acknowledge-tenant-one-private-cache')
+        if not args.verify_prepared_image and not args.cargo_seed_archive:
+            parser.error('recipe application requires --cargo-seed-archive (private tenant-1 fleet only)')
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
         args.write_template.write_text(TEMPLATE)
@@ -837,6 +851,9 @@ def main(report_stream=None):
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image
             runner.verify_prepared_image = args.verify_prepared_image
+            runner.cargo_seed_manifest = args.cargo_seed_manifest
+            runner.cargo_seed_sha256 = args.cargo_seed_sha256
+            runner.cargo_seed_archive = args.cargo_seed_archive
             if args.runner_host:
                 from runner_host import RunnerHost
                 RunnerHost(runner).run()

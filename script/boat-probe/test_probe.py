@@ -611,7 +611,9 @@ class ExitStatusTests(unittest.TestCase):
                 sys.path.pop(0)
         with tempfile.TemporaryDirectory() as tmp:
             output = io.StringIO()
-            with patch("sys.argv", ["probe.py", "--runner-host", "--output", str(Path(tmp) / "run")]), \
+            with patch("sys.argv", ["probe.py", "--runner-host", "--output", str(Path(tmp) / "run"),
+                                    "--cargo-seed-manifest", "operator-seed.json", "--cargo-seed-sha256", "a" * 64,
+                                    "--cargo-seed-archive", "operator-seed.tar.gz", "--acknowledge-tenant-one-private-cache"]), \
                  patch.object(probe, "read_key", return_value="fake-key"), patch.object(probe, "Client", return_value=client), \
                  patch.object(runner_host.RunnerHost, "run", passing), patch.object(probe.signal, "signal"), \
                  contextlib.redirect_stdout(output):

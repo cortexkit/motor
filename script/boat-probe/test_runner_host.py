@@ -50,7 +50,7 @@ class RunnerHostTests(unittest.TestCase):
             target = Path(tmp, 'wasm32-unknown-unknown')
             target.mkdir()
             checker = Path(tmp, 'checker.py')
-            checker.write_text('from pathlib import Path\ndef check(manifest, role, job, gnu_test_sha256=None):\n'
+            checker.write_text('from pathlib import Path\ndef check(manifest, role, job, gnu_test_sha256=None, cargo_registry=None):\n'
                                f'    return {{"passed": Path({str(target)!r}).is_dir(), "job": job}}\n')
             with patch.object(host, 'PARITY_SCRIPT', checker):
                 source = host.parity_source(job=True)
@@ -178,12 +178,14 @@ class RunnerHostTests(unittest.TestCase):
         compile(host.STORAGE_STATE, 'storage-state', 'exec')
 
     def test_prepared_digest_tracks_source_and_signed_package_inputs_not_processes(self):
-        inventory = {'packages':'pkg\t1\n', 'apt_release_files':{'noble':{'date':'fixed','sha256':'abc'}}, 'processes':[1]}
+        inventory = {'packages':'pkg\t1\n', 'apt_release_files':{'noble':{'date':'fixed','sha256':'abc'}},
+                     'cargo_seed': {'manifest_sha256': 'seed1'}, 'processes':[1]}
         digest = host.prepared_image_digest('rev1', inventory)
         self.assertEqual(len(digest), 64)
         self.assertEqual(digest, host.prepared_image_digest('rev1', dict(inventory, processes=[99])))
         self.assertNotEqual(digest, host.prepared_image_digest('rev2', inventory))
         self.assertNotEqual(digest, host.prepared_image_digest('rev1', dict(inventory, packages='pkg\t2\n')))
+        self.assertNotEqual(digest, host.prepared_image_digest('rev1', dict(inventory, cargo_seed={'manifest_sha256': 'seed2'})))
         ready = host.snapshot_metadata({'name':'image','status':'ready','snapshotId':'artifact-id','sizeBytes':123})
         self.assertEqual((ready['name'],ready['id'],ready['size_bytes']), ('image','artifact-id',123))
         with self.assertRaises(ValueError):
