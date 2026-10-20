@@ -23,6 +23,24 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_cleanup_replay_requires_visible_workspace_and_withdrawn_admission(self):
+        result = {'workspace_visible': True, 'users_mounts': [], 'endpoint_ready': False}
+        self.assertTrue(host.cleanup_replay_checks(result))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, workspace_visible=False)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, users_mounts=['overmount'])))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready=True)))
+
+    def test_storage_timeline_detects_deferred_cleanup_after_readiness(self):
+        first = {'mounts': ['1 0 7:0 / /var/lib/motor-boat rw - xfs /dev/loop0 rw',
+                            '2 0 7:0 /state/workspaces /Users rw - xfs /dev/loop0 rw'],
+                 'devices': [1792, 1792], 'ready': True}
+        self.assertTrue(host.storage_timeline_checks([first, first]))
+        missing = dict(first, mounts=first['mounts'][:1], devices=[253, 1792])
+        self.assertFalse(host.storage_timeline_checks([first, missing]))
+        remounted = dict(first, mounts=[first['mounts'][0], first['mounts'][1].replace('2 0', '3 0')])
+        self.assertFalse(host.storage_timeline_checks([first, remounted]))
+        self.assertFalse(host.storage_timeline_checks([]))
+
     def test_client_requires_a_terminal(self):
         self.assertEqual(host.job_result('{"code":23,"terminal":{"outcome":{"kind":"exit","code":23}}}')["code"], 23)
         for text in ("{}", "not json", '{"code":true,"terminal":{}}'):
@@ -254,12 +272,13 @@ class RunnerHostTests(unittest.TestCase):
         order = []
         probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
         runner.phase = Mock(side_effect=lambda sid, label, *args, **kwargs: order.append(label))
+        runner.replay_cleanup = Mock(side_effect=lambda sid: order.append('cleanup_replay'))
         runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
         with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
              patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe':Mock(READY={'running'})}):
             Path(tmp, '.cortexkit').mkdir()
             runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
-        self.assertEqual(order, ['hydrated', 'prepared_clone', 'hydrated', 'resumed'])
+        self.assertEqual(order, ['hydrated', 'prepared_clone', 'hydrated', 'resumed', 'cleanup_replay'])
         runner.execute.assert_not_called()
         probe.create.assert_called_once_with('prepared')
 

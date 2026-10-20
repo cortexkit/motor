@@ -5,6 +5,55 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_launch_rechecks_storage_and_workspace() {
+    // Use /dev/shm so this scratch directory is on a different device from
+    // root, even when the usual test temp directory shares root's XFS disk.
+    let scratch = PathBuf::from("/dev/shm").join(format!("motor-boat-storage-{}", Uuid::now_v7()));
+    fs::create_dir(&scratch).unwrap();
+    let state = scratch.join("state");
+    let workspace = scratch.join("workspace");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    verify_boat_storage(&scratch, &state, &workspace).unwrap();
+    let error = verify_boat_storage(Path::new("/proc"), &state, &workspace).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("/Users is not on the runner state disk"));
+    fs::remove_dir(&workspace).unwrap();
+    let error = verify_boat_storage(&scratch, &state, &workspace).unwrap_err();
+    assert!(error.to_string().contains("before job launch"));
+    fs::write(&workspace, "not a directory").unwrap();
+    assert!(verify_boat_storage(&scratch, &state, &workspace).is_err());
+    assert!(verify_boat_storage(Path::new("/"), Path::new("/"), Path::new("/")).is_err());
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_backend_refuses_storage_before_dispatch() {
+    let scratch = ScratchDir::new("boat-launch-storage");
+    let mut config = Config::new(scratch.join("runner"), "boat");
+    config.boat_profile = true;
+    config.isolate_jobs = true;
+    let setup = setup(&scratch);
+    let prepared = Prepared {
+        cwd: scratch.join("missing-workspace"),
+        target: scratch.join("target"),
+        sandbox: None,
+        wrapper: None,
+        windows: None,
+    };
+    let error = HostBackend
+        .launch(&config, &trees(&config), &setup, &prepared, 1)
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("Boat storage verification failed before job launch"));
+}
+
 fn trees(config: &Config) -> Trees {
     Trees {
         dependency_locks: Mutex::new(BTreeMap::new()),

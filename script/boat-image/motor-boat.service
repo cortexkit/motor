@@ -1,7 +1,7 @@
 [Unit]
 Description=Motor runner in a single-tenant Boat sandbox
-Requires=Users.mount var-lib-motor\x2dboat.mount motor-boat-restored.service motor-boat-storage.service
-After=Users.mount var-lib-motor\x2dboat.mount network-online.target motor-boat-restored.service motor-boat-storage.service
+Requires=motor-boat-restored.service motor-boat-storage.service
+After=network-online.target motor-boat-restored.service motor-boat-storage.service
 
 [Service]
 User=root

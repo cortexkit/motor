@@ -7,6 +7,8 @@ use crate::{
     workspace::{self, Trees},
 };
 use motor_protocol::*;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::{
     collections::BTreeMap,
     fs,
@@ -335,6 +337,30 @@ pub(crate) fn live_job_units(config: &Config) -> io::Result<std::collections::BT
 
 pub(crate) struct HostBackend;
 
+#[cfg(target_os = "linux")]
+fn verify_boat_storage(users: &Path, state: &Path, workspace: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let check = || -> io::Result<()> {
+        let device = std::fs::metadata(state)?.dev();
+        if std::fs::metadata(users)?.dev() != device || std::fs::metadata("/")?.dev() == device {
+            return Err(io::Error::other("/Users is not on the runner state disk"));
+        }
+        let directory = std::fs::metadata(workspace)?;
+        if !directory.is_dir() || directory.dev() != device {
+            return Err(io::Error::other(
+                "workspace is not a directory on the runner state disk",
+            ));
+        }
+        Ok(())
+    };
+    check().map_err(|error| {
+        io::Error::other(format!(
+            "Boat storage verification failed before job launch: {error}; workspace={}; stop admission and re-establish storage with the runner stopped",
+            workspace.display()
+        ))
+    })
+}
+
 impl Backend for HostBackend {
     #[cfg(target_os = "linux")]
     fn live_units(
@@ -634,6 +660,13 @@ impl Backend for HostBackend {
         weight: u32,
     ) -> io::Result<Launch> {
         let r = &s.request;
+        #[cfg(target_os = "linux")]
+        if config.boat_profile && config.isolate_jobs {
+            setup_step(
+                "verify Boat storage",
+                verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.cwd),
+            )?;
+        }
         let mut env = BTreeMap::new();
         #[cfg(test)]
         if r.network.is_some() {

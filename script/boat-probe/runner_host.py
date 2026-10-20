@@ -212,6 +212,59 @@ for name in ('motor-boat.service','motor-boat-host.service',r'var-lib-motor\x2db
 print(json.dumps(data))
 '''
 
+STORAGE_TIMELINE = r'''
+import json, os, pathlib, subprocess, time
+samples = []
+for _ in range(12):
+    rows = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines()
+            if line.split()[4] in ('/Users', '/var/lib/motor-boat')]
+    samples.append({'monotonic':time.monotonic(), 'mounts':rows,
+        'ready':pathlib.Path('/run/motor/endpoint-ready').exists(),
+        'devices':[os.stat(p).st_dev for p in ('/Users','/var/lib/motor-boat')]})
+    time.sleep(1)
+print(json.dumps(samples))
+'''
+
+IDLE_RECLAIM = r'''
+import json, pathlib, subprocess, time
+started = time.monotonic()
+before = pathlib.Path('/run/ascii-idle-reclaim').read_text()
+time.sleep(420)
+after = pathlib.Path('/run/ascii-idle-reclaim').read_text()
+unit = subprocess.check_output(['systemctl','show','ascii-idle-reclaim.service',
+    '-p','ExecMainStartTimestampMonotonic','-p','Result'],text=True)
+print(json.dumps({'seconds':time.monotonic()-started, 'before':before, 'after':after, 'unit':unit}))
+'''
+
+# Run only in a disposable probe clone, after its real-job and resume phases.
+# Reproduce Boat removing /Users after readiness, then directly start Users.mount
+# as a job dependency could, over a newly created root-disk workspace directory.
+DEFERRED_CLEANUP_REPLAY = r'''
+import json, pathlib, subprocess, time, uuid
+subprocess.run(['umount','--','/Users'],check=True)
+sentinel = pathlib.Path('/Users') / ('motor-mount-replay-' + uuid.uuid4().hex)
+sentinel.mkdir()
+(sentinel / 'materialized-workspace').touch()
+activation = subprocess.run(['systemctl','start','Users.mount'],capture_output=True,text=True)
+time.sleep(2)
+rows = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == '/Users']
+print(json.dumps({'activation_code':activation.returncode, 'activation_stderr':activation.stderr,
+    'workspace_visible':(sentinel / 'materialized-workspace').exists(), 'users_mounts':rows,
+    'endpoint_ready':pathlib.Path('/run/motor/endpoint-ready').exists()}))
+'''
+
+
+def cleanup_replay_checks(data):
+    return data['workspace_visible'] and not data['users_mounts'] and not data['endpoint_ready']
+
+
+def storage_timeline_checks(samples):
+    return bool(samples) and all(
+        sample['ready'] and len(sample['mounts']) == 2 and sample['mounts'] == samples[0]['mounts'] and
+        sample['devices'][0] == sample['devices'][1] and
+        all(' - xfs ' in row for row in sample['mounts'])
+        for sample in samples)
+
 
 def storage_checks(data):
     filesystems = {point:json.loads(text)['filesystems'] for point, text in data['findmnt'].items()}
@@ -478,7 +531,7 @@ class RunnerHost:
         self.check(label + '.no_account_credentials', audit['clean'], audit)
         if not audit['clean']:
             raise ValueError('refusing to snapshot credentials or incomplete evidence')
-        self.execute(sid, 'sudo -n systemctl stop motor-boat-identity motor-boat-host motor-boat-bridge motor-boat')
+        self.execute(sid, 'sudo -n systemctl stop motor-boat-identity motor-boat-host motor-boat-bridge motor-boat motor-boat-storage-watch')
         hygiene = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
         self.check(label + '.identity_and_probe_keys_absent', all(hygiene[k] is True for k in ('identity_absent','boat_cli_configs_absent','probe_authorizations_absent')), hygiene)
         self.execute(sid, "sudo -n sync && sudo -n systemctl stop Users.mount 'var-lib-motor\\x2dboat.mount' motor-boat-storage && "
@@ -632,6 +685,8 @@ class RunnerHost:
         record['storage'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
         for key, passed in storage_checks(record['storage']).items():
             self.check(label + '.' + key, passed, record['storage'])
+        record['storage_timeline'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_TIMELINE))['stdout'])
+        self.check(label + '.no_deferred_cleanup_after_readiness', storage_timeline_checks(record['storage_timeline']), record['storage_timeline'])
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
@@ -657,10 +712,20 @@ class RunnerHost:
         job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
-                for name, command in [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
-                                      ("exit", "printf 'boat-round-trip\\n'; exit 23"),
-                                      ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
-                                      ("isolation", "python3 -c " + shlex.quote(job_script))]:
+                jobs = [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
+                                       ("exit", "printf 'boat-round-trip\\n'; exit 23"),
+                                       ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
+                                       ("isolation", "python3 -c " + shlex.quote(job_script))]
+                if label in ('prepared_clone', 'snapshot_clone'):
+                    jobs.append(('after_idle', NODE_CHECK))
+                for name, command in jobs:
+                    if name == 'after_idle':
+                        idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=450)['stdout'])
+                        record['idle_reclaim'] = idle
+                        fields = idle['after'].split()
+                        self.check(label + '.idle_reclaim_observed', idle['seconds'] >= 420 and
+                                   idle['before'] != idle['after'] and len(fields) == 6 and int(fields[4]) >= 5 and
+                                   'Result=success' in idle['unit'], idle)
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
@@ -674,8 +739,12 @@ class RunnerHost:
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
                     else:
                         expected = 23 if name == "exit" else 0
-                        marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') else "boat-hello")
+                        marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
                         self.check(label + "." + name, parsed["code"] == expected and marker in parsed["stdout"], parsed)
+                    state = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+                    record.setdefault('storage_after_jobs', {})[name] = state
+                    for key, passed in storage_checks(state).items():
+                        self.check(label + '.' + name + '.' + key, passed, state)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
         if any(check['status'] != 'PASS' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')
@@ -710,8 +779,14 @@ class RunnerHost:
             self.probe.wait_sandbox(sid, READY)
             self.probe.wait_hydrated(sid)
             self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
+            self.replay_cleanup(sid)
         self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
         self.probe.checkpoint()
+
+    def replay_cleanup(self, sid):
+        result = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout'])
+        self.data['deferred_cleanup_replay'] = result
+        self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
 
     def _run(self):
         from probe import READY, cleanup
@@ -749,7 +824,7 @@ class RunnerHost:
             if source_image:
                 self.probe.wait_hydrated(sid)
                 # A prepared image from an older recipe still has the path unit.
-                self.execute(sid, 'sudo -n systemctl stop motor-boat-host motor-boat-bridge motor-boat && '
+                self.execute(sid, 'sudo -n systemctl stop motor-boat-host motor-boat-bridge motor-boat motor-boat-storage-watch && '
                                   '{ sudo -n systemctl stop motor-boat-host.path motor-boat-identity 2>/dev/null || true; }')
             argv = self.route(sid, directory, public)
             bundle = directory / "motor.bundle"
@@ -803,6 +878,7 @@ class RunnerHost:
                 self.probe.wait_sandbox(sid, READY)
                 self.probe.wait_hydrated(sid)
                 self.phase(sid, "resumed", directory, public, repository, client, hydrated_at=time.monotonic())
+                self.replay_cleanup(sid)
                 before = self.data["phases"][1]["host"]["ssh_config"]
                 after = self.data["phases"][2]["host"]["ssh_config"]
                 self.check("sshd.dropin_survives_resume", before.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") == after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf") and bool(after.get("/etc/ssh/sshd_config.d/00-motor-boat.conf")), {"before": before, "after": after})

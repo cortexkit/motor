@@ -141,23 +141,23 @@ def state(pins):
             stream.truncate(pins["state_gib"] * 1024**3)
         run("mkfs.xfs", "-q", "-m", "reflink=1", str(image))
     mount = Path("/etc/systemd/system/var-lib-motor\\x2dboat.mount")
-    # Boat's root-disk sysbind can make this mount unit appear active without
-    # mounting XFS. The storage service establishes the real mounts first.
+    # Storage preparation starts these units explicitly after restore cleanup.
+    # Neither unit may be pulled in independently during boot or remount live
+    # state after the storage evidence file blocks further mount activation.
     mount.write_text("[Unit]\nDescription=Boat reflink runner disk\n"
-                     "Requires=motor-boat-restored.service motor-boat-storage.service\n"
-                     "After=motor-boat-restored.service motor-boat-storage.service\n[Mount]\n"
+                     "DefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=motor-boat-restored.service\n"
+                     "After=motor-boat-restored.service\nConditionPathExists=!/run/motor-boat-storage.json\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"
-                     "Type=xfs\nOptions=loop,noatime\n[Install]\nWantedBy=multi-user.target\n")
+                     "Type=xfs\nOptions=loop,noatime\n")
     Path("/Users").mkdir(exist_ok=True)
     Path("/etc/systemd/system/Users.mount").write_text(
-        "[Unit]\nRequires=var-lib-motor\\x2dboat.mount motor-boat-storage.service\n"
-        "After=var-lib-motor\\x2dboat.mount motor-boat-storage.service\n"
+        "[Unit]\nDefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=var-lib-motor\\x2dboat.mount\n"
+        "After=var-lib-motor\\x2dboat.mount\nConditionPathExists=!/run/motor-boat-storage.json\n"
         "[Mount]\nWhat=/var/lib/motor-boat/state/workspaces\nWhere=/Users\nType=none\n"
-        "Options=bind\n[Install]\nWantedBy=multi-user.target\n")
+        "Options=bind\n")
+    run("systemctl", "disable", mount.name, "Users.mount")
     run("systemctl", "daemon-reload")
-    run("systemctl", "start", "motor-boat-storage.service")
-    run("systemctl", "enable", "--now", mount.name)
-    run("systemctl", "enable", "--now", "Users.mount")
+    run("systemctl", "restart", "motor-boat-storage.service")
     with tempfile.NamedTemporaryFile(dir=STATE) as source, tempfile.NamedTemporaryFile(dir="/Users") as target:
         source.write(os.urandom(4096))
         source.flush()
@@ -246,7 +246,7 @@ def service_preflight():
         subprocess.run(['/usr/bin/systemctl', 'stop', 'motor-boat.service'], check=False)
 
 
-UNITS = ("motor-boat-restored.service", "motor-boat-storage.service", "motor-boat.service", "motor-boat-bridge.service",
+UNITS = ("motor-boat-restored.service", "motor-boat-storage.service", "motor-boat-storage-watch.service", "motor-boat.service", "motor-boat-bridge.service",
          "motor-boat-host.service", "motor-boat-identity.service")
 # Units earlier recipes installed; a recipe reapplied on such an image removes them.
 RETIRED_UNITS = ("motor-boat-host.path",)
