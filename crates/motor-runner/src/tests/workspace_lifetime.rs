@@ -380,6 +380,10 @@ async fn destination_roots_refuse_run_prepare_and_drop_before_mutation() {
         let detail = result.refusal_detail.unwrap();
         assert!(detail.contains("allowed_roots="), "{detail}");
         assert!(detail.contains("path="), "{detail}");
+        assert!(
+            detail.contains("move the checkout under one of the allowed roots"),
+            "{detail}"
+        );
         let prepare = prepare_for(&request);
         assert!(runner.admit_prepare(&prepare).unwrap().is_err());
         assert!(runner.fetch_prepare(&prepare, f.scratch.path()).is_err());

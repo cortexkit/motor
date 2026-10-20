@@ -201,6 +201,27 @@ runs one command on the runner from a script with no agent behind it, streams
 its output, and exits with its status. It works only when `admit_direct_exec`
 is `true` in the configuration file ([Configuration](#configuration)).
 
+The words after `--` follow two rules:
+
+- **One word** is passed verbatim as the runner's `bash -c` command string.
+- **Two or more words** are an argv. Each word is POSIX-single-quoted (with
+  each `'` escaped as `'\''`) and joined with spaces, except that nonempty
+  words consisting only of `[A-Za-z0-9_@%+=:,./-]` are left unquoted for
+  readable job records and logs. Bash therefore preserves each argument.
+
+Quote a whole shell command as one word, or pass it as one argument to `sh -c`:
+
+```sh
+ck motor run -- 'cargo test -p x 2>&1 | grep FAILED'
+ck motor run -- sh -c 'cargo test -p x 2>&1 | grep FAILED'
+```
+
+Tests: `command_line_one_word_is_verbatim`,
+`command_line_plain_words_stay_readable`,
+`command_line_sh_c_round_trips_through_bash`,
+`command_line_special_word_round_trips_through_bash`,
+`command_line_empty_word_round_trips_through_bash`.
+
 | Exit status | Meaning |
 | --- | --- |
 | The command's own code | The command exited. |
