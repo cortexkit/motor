@@ -33,6 +33,7 @@ FIRECRACKER_DIR=/usr/local/lib/firecracker/1.17.0
 HOST_CONFIG=/etc/motor-host/host.json
 HELPER_CONFIG=/etc/motor-vm-helper.json
 TENANT_CONFIG=/etc/motor-host/provision/tenant-1.json
+TENANT_REGISTRY=/etc/motor-vm-helper/tenants/tenant-1.json
 BINDINGS=/etc/motor-host/tenants.json
 KEY_DIR=/etc/motor-host/keys
 SIGNING_KEY=$KEY_DIR/host-signing.key
@@ -50,7 +51,7 @@ usage() {
 }
 
 checkout='' target_dir=/srv/build/target build=0 mode=install
-port='' host_id='' public_ip='' tenant_sub='' tenant_quota=''
+port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --checkout) checkout=${2:?}; shift 2 ;;
@@ -179,11 +180,20 @@ preflight() {
     fail "$STORAGE is not a mounted private view"
   fi
   local image
-  image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_version"])' "$here/tenant-1.json")
+  if [ -n "$tenant_image" ]; then
+    image=$tenant_image
+  else
+    image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_version"])' "$here/tenant-1.json")
+  fi
   if [ -f "$STORAGE/tenant-images/$image/manifest.json" ]; then
     ok "tenant image $image is present"
   else
     fail "tenant image $STORAGE/tenant-images/$image is missing"
+  fi
+  if [ -f "$TENANT_REGISTRY" ] && [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_version"])' "$TENANT_REGISTRY")" = "$image" ]; then
+    ok "tenant image $image matches the helper registry"
+  else
+    fail "$TENANT_CONFIG image does not match $TENANT_REGISTRY"
   fi
 }
 
@@ -252,7 +262,7 @@ configs() {
   directory "$JOURNAL_DIR" "$HOST_USER:$HOST_USER" 700
   render host --host-id "$host_id" --port "$port" > "$scratch/host.json" || { fail "cannot render host config"; return; }
   render helper --uid "$uid" --gid "$gid" > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
-  render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} \
+  render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} ${tenant_image:+--image-version "$tenant_image"} \
     > "$scratch/tenant.json" || { fail "cannot render tenant config"; return; }
   place config "$scratch/host.json" "$HOST_CONFIG" root:root 644
   place config "$scratch/helper.json" "$HELPER_CONFIG" root:root 644
@@ -369,6 +379,7 @@ if [ "$mode" != install ]; then
   host_id=$(installed "$HOST_CONFIG" host_id)
   tenant_sub=$(installed "$TENANT_CONFIG" sub)
   tenant_quota=$(python3 -c 'import json,sys; q = json.load(open(sys.argv[1]))["disk_quota_bytes"]; print(q // 2**30 if q % 2**30 == 0 else q)' "$TENANT_CONFIG")
+  tenant_image=$(installed "$TENANT_CONFIG" image_version)
 fi
 port=${port:-8443}
 [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] || { echo "invalid port $port" >&2; exit 2; }

@@ -163,6 +163,27 @@ extra rule.
    sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py --config /etc/motor-host/provision/tenant-1.json
    ```
 
+   To change an existing tenant to a new image without recreating its disk, run
+   the following command from the checkout at `/srv/build/src/motor`:
+
+   ```sh
+   sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py switch-image tenant-1 <image-version>
+   ```
+
+   `switch-image` takes the shared `/var/lib/motor-vm/provision.lock` and refuses
+   unless both `motor-host.service` and `motor-vm-helper.service` are inactive; it
+   does not stop or start either service. It verifies the image with the hosted
+   image inventory command, builds the tenant's size-specific base if needed,
+   and updates the helper registry and `/etc/motor-host/provision/tenant-1.json`
+   together. An image-mismatched suspend snapshot is moved to a timestamped
+   sibling directory rather than deleted, and its new path is printed. The
+   command prints the old and new image versions and an exact rollback command.
+   A repeated switch to the same image is safe. `install.sh --check` treats the
+   installed image version as mutable state but still checks the other tenant
+   fields against the checkout template and confirms the registry agrees. The
+   command never starts the host; run the existing `install.sh --start` only
+   after `install.sh --check` and a review of its results.
+
 6. Verify without changing anything. `--check`, `--start` and `--stop` read
    the host id, subject, port and disk size from the installed configs:
 

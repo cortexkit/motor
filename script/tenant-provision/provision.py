@@ -11,8 +11,10 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -21,6 +23,7 @@ import uuid
 ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
+PROVISION = Path("/etc/motor-host/provision")
 BIN = Path("/usr/local/lib/firecracker/1.17.0")
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "tenant-vm-spike/api_schema.py"
 spec = importlib.util.spec_from_file_location("tenant_firecracker_schema", SCHEMA_PATH)
@@ -111,6 +114,185 @@ def atomic(path, value):
         sync_dir(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _atomic_restore(path, value, mode):
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            os.fchmod(out.fileno(), mode)
+            out.write(value)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        sync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def atomic_pair(updates):
+    """Write each file atomically and restore files already replaced on failure."""
+    staged = []
+    replaced = []
+    try:
+        for path, value in updates:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"refusing to replace a non-regular file: {path}")
+            original = path.read_bytes()
+            mode = stat.S_IMODE(info.st_mode)
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    os.fchmod(out.fileno(), mode)
+                    out.write(value.encode() if isinstance(value, str) else value)
+                    out.flush()
+                    os.fsync(out.fileno())
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            staged.append((path, tmp, original, mode))
+
+        for path, tmp, original, mode in staged:
+            os.replace(tmp, path)
+            replaced.append((path, original, mode))
+            sync_dir(path.parent)
+    except BaseException as error:
+        restore_errors = []
+        for path, original, mode in reversed(replaced):
+            try:
+                _atomic_restore(path, original, mode)
+            except Exception as restore_error:
+                restore_errors.append(f"{path}: {restore_error}")
+        if restore_errors:
+            raise RuntimeError(f"record update failed ({error}); rollback also failed: {'; '.join(restore_errors)}") from error
+        raise
+    finally:
+        for _, tmp, _, _ in staged:
+            tmp.unlink(missing_ok=True)
+
+
+def systemd_active_state(unit):
+    try:
+        return run("systemctl", "show", "--property=ActiveState", "--value", unit).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f"could not verify that {unit} is stopped") from error
+
+
+def inventory_image(image):
+    builder = Path(__file__).resolve().parents[1] / "tenant-image" / "build.py"
+    subprocess.run([sys.executable, str(builder), "inventory", str(image)], check=True)
+
+
+def suspend_snapshot_to_move(suspend, manifest):
+    if not suspend.exists():
+        return None
+    if suspend.is_symlink() or not suspend.is_dir():
+        raise ValueError(f"suspend path is not a directory: {suspend}")
+    key_path = suspend / "key.json"
+    snapshot_files = (suspend / "suspend.vmstate", suspend / "suspend.memory")
+    if not key_path.exists() and not key_path.is_symlink():
+        if any(path.exists() or path.is_symlink() for path in snapshot_files):
+            raise ValueError(f"suspend snapshot has no image key; refusing to switch: {suspend}")
+        return None
+    try:
+        if not stat.S_ISREG(key_path.lstat().st_mode):
+            raise ValueError("snapshot key is not a regular file")
+        key = json.loads(key_path.read_text())
+        mismatch = any(key[name] != manifest[name] for name in ("version", "kernel_sha256", "rootfs_sha256"))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"cannot verify suspend snapshot image key: {key_path}") from error
+    return suspend if mismatch else None
+
+
+def move_stale_suspend(suspend, old_version):
+    moved = suspend.with_name(f"{suspend.name}.stale-{old_version}-{time.time_ns()}")
+    os.rename(suspend, moved)
+    sync_dir(suspend.parent)
+    try:
+        suspend.mkdir(mode=0o700)
+        sync_dir(suspend.parent)
+    except BaseException:
+        os.rename(moved, suspend)
+        sync_dir(suspend.parent)
+        raise
+    return moved
+
+
+def switch_image(tenant, image_version, make_base=None, check_service=None, validate_image=None, output=print):
+    tenant = component(tenant)
+    image_version = component(image_version)
+    lock_path = ROOT / "provision.lock"
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        check_service = systemd_active_state if check_service is None else check_service
+        validate_image = inventory_image if validate_image is None else validate_image
+        make_base = build_base if make_base is None else make_base
+        for unit in ("motor-host.service", "motor-vm-helper.service"):
+            state = check_service(unit)
+            if state != "inactive":
+                raise ValueError(f"{unit} must be stopped before switching a tenant image (ActiveState={state})")
+
+        provision_path = PROVISION / f"{tenant}.json"
+        registry_path = REGISTRY / f"{tenant}.json"
+        original_config = json.loads(provision_path.read_text())
+        current = checked(original_config)
+        if current["tenant"] != tenant:
+            raise ValueError(f"provisioning record tenant does not match {tenant}")
+        record = json.loads(registry_path.read_text())
+        if not isinstance(record, dict) or record.get("image_version") != current["image_version"]:
+            raise ValueError("provisioning record and helper registry image versions differ")
+        for name, value in record.items():
+            if name in current and value != current[name]:
+                raise ValueError(f"provisioning record and helper registry differ at {name}")
+
+        image = ROOT / "tenant-images" / image_version
+        if not image.is_dir():
+            raise ValueError(f"tenant image does not exist: {image}")
+        validate_image(image)
+        manifest = json.loads((image / "manifest.json").read_text())
+        if manifest.get("version") != image_version:
+            raise ValueError("image manifest version mismatch")
+
+        updated = checked({**original_config, "image_version": image_version})
+        base = base_path(updated, image)
+        if base.exists() or base.is_symlink():
+            if base.is_symlink() or not base.is_dir():
+                raise ValueError("size base is not a directory; refusing to reuse it")
+            for name in ("base.vmstate", "base.memory"):
+                artifact = base / name
+                if not stat.S_ISREG(artifact.lstat().st_mode) or artifact.stat().st_size == 0:
+                    raise ValueError("incomplete size base; refusing to reuse it")
+        else:
+            make_base(updated, image, base)
+
+        suspend = ROOT / "tenants" / tenant / "suspend"
+        stale = suspend_snapshot_to_move(suspend, manifest)
+        old_version = current["image_version"]
+        moved = move_stale_suspend(stale, old_version) if stale is not None else None
+        record["image_version"] = image_version
+        updated_config = dict(original_config)
+        updated_config["image_version"] = image_version
+        if old_version != image_version:
+            try:
+                atomic_pair([
+                    (registry_path, json.dumps(record, indent=2) + "\n"),
+                    (provision_path, json.dumps(updated_config, indent=2) + "\n"),
+                ])
+            except BaseException:
+                if moved is not None:
+                    suspend.rmdir()
+                    os.rename(moved, suspend)
+                    sync_dir(suspend.parent)
+                raise
+
+        output(f"{tenant}: {old_version} -> {image_version}")
+        if moved is not None:
+            output(f"moved stale suspend snapshot to {moved}")
+        output(f"rollback: sudo python3 {Path(__file__).resolve()} switch-image {tenant} {old_version}")
+        return moved
 
 
 def trusted(path):
@@ -579,10 +761,37 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--config", type=Path)
+    commands = parser.add_subparsers(dest="command")
+    switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image")
+    switch.add_argument("tenant")
+    switch.add_argument("image_version")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
+    if args.command == "switch-image":
+        if args.config is not None:
+            parser.error("switch-image takes a tenant and image version, not --config")
+        tenant = component(args.tenant)
+        image_version = component(args.image_version)
+        image = ROOT / "tenant-images" / image_version
+        for directory in (ROOT, REGISTRY, PROVISION, ROOT / "tenants", ROOT / "tenants" / tenant):
+            trusted(directory)
+        trusted(PROVISION / f"{tenant}.json")
+        trusted(REGISTRY / f"{tenant}.json")
+        trusted(image / "manifest.json")
+        for name in ("vmlinux", "rootfs"):
+            trusted(image / name)
+        for binary in (BIN / "firecracker", BIN / "jailer"):
+            trusted(binary)
+            if "1.17.0" not in run(binary, "--version").stdout:
+                raise ValueError("Firecracker and jailer must both be 1.17.0")
+        switch_image(tenant, image_version)
+        return
+    if args.command is not None:
+        parser.error(f"unknown command: {args.command}")
+    if args.config is None:
+        parser.error("--config is required when provisioning a new tenant")
     trusted(args.config.resolve())
     c = checked(json.loads(args.config.read_text()))
     for directory in (ROOT, REGISTRY, BINDINGS.parent, ROOT / "jail", ROOT / "tenants"):

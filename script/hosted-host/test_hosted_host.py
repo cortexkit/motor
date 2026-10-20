@@ -99,6 +99,10 @@ class HostedHostConfigTests(unittest.TestCase):
         tenant = hosted.tenant_config(sub="org:01ARZ3NDEKTSV4RRFFQ69G5FAV", disk_quota_gib=400)
         self.assertEqual(tenant["sub"], "org:01ARZ3NDEKTSV4RRFFQ69G5FAV")
         self.assertEqual(tenant["disk_quota_bytes"], 400 * 1024**3)
+        tenant = hosted.tenant_config(sub=SUB, image_version="next-image")
+        self.assertEqual(tenant["image_version"], "next-image")
+        with self.assertRaises(ValueError):
+            hosted.tenant_config(sub=SUB, image_version="bad/image")
         for sub in ("acct:short", "01ARZ3NDEKTSV4RRFFQ69G5FAV", ""):
             with self.subTest(sub=sub), self.assertRaises(ValueError):
                 hosted.tenant_config(sub=sub)
@@ -137,6 +141,9 @@ class HostedHostConfigTests(unittest.TestCase):
         output = subprocess.run(["python3", str(HERE / "hosted_host.py"), "host", "--host-id", HOST_ID, "--port", "9443"],
                                 check=True, capture_output=True, text=True).stdout
         self.assertEqual(json.loads(output), hosted.host_config(HOST_ID, port=9443))
+        tenant_output = subprocess.run(["python3", str(HERE / "hosted_host.py"), "tenant", "--sub", SUB,
+                                        "--image-version", "next-image"], check=True, capture_output=True, text=True).stdout
+        self.assertEqual(json.loads(tenant_output)["image_version"], "next-image")
         for args in (["tenant", "--sub", "nope"], ["tenant"], ["host"]):
             with self.subTest(args=args):
                 refused = subprocess.run(["python3", str(HERE / "hosted_host.py"), *args], capture_output=True, text=True)
@@ -169,7 +176,8 @@ class InstallScriptTests(unittest.TestCase):
 
     def function(self, name):
         body = re.search(r"\n" + name + r"\(\) \{\n(.*?)\n\}\n", self.script, re.S)
-        self.assertIsNotNone(body, name)
+        if body is None:
+            self.fail(name)
         return body[0]
 
     def test_units_are_enabled_and_started_only_by_start_and_stopped_only_by_stop(self):
@@ -189,8 +197,14 @@ class InstallScriptTests(unittest.TestCase):
         self.assertLess(self.script.index('echo "$problems problem(s), $skipped declined'), self.script.index("then\n  start_units"))
 
     def test_identity_arguments_are_required_and_not_defaulted(self):
-        self.assertIn("port='' host_id='' public_ip='' tenant_sub='' tenant_quota=''", self.script)
+        self.assertIn("port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''", self.script)
         self.assertIn('[ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub"', self.script)
+
+    def test_image_version_is_operator_managed_after_a_switch(self):
+        self.assertIn('tenant_image=$(installed "$TENANT_CONFIG" image_version)', self.script)
+        self.assertIn('${tenant_image:+--image-version "$tenant_image"}', self.script)
+        self.assertIn('tenant image $image matches the helper registry', self.script)
+        self.assertIn('TENANT_REGISTRY=/etc/motor-vm-helper/tenants/tenant-1.json', self.script)
 
     def test_firewall_exception_is_the_one_inbound_policy_recognises(self):
         start = self.function("start_units")

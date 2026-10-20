@@ -124,10 +124,12 @@ def helper_config(uid: int, gid: int) -> dict:
     }
 
 
-def tenant_config(sub: str, disk_quota_gib: int | None = None) -> dict:
+def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: str | None = None) -> dict:
     """The provision.py operator JSON for tenant 1, validated by provision.py."""
     config = json.loads(TENANT_FILE.read_text())
     config["sub"] = sub
+    if image_version is not None:
+        config["image_version"] = image_version
     if disk_quota_gib is not None:
         config["disk_quota_bytes"] = disk_quota_gib * 1024**3
     provision = load_provision()
@@ -172,6 +174,7 @@ def main() -> int:
     tenant = commands.add_parser("tenant")
     tenant.add_argument("--sub", required=True)
     tenant.add_argument("--disk-quota-gib", type=int)
+    tenant.add_argument("--image-version")
     commands.add_parser("public-ip")
     args = parser.parse_args()
     try:
@@ -185,7 +188,7 @@ def main() -> int:
         elif args.command == "helper":
             value = helper_config(args.uid, args.gid)
         else:
-            value = tenant_config(args.sub, args.disk_quota_gib)
+            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version)
     except ValueError as error:
         print(f"hosted-host: {error}", file=sys.stderr)
         return 2

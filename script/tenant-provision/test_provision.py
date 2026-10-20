@@ -31,10 +31,11 @@ class ProvisionTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         # runner_processes would read this machine's real /proc; tests that need
         # a runner pass one explicitly.
-        self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", BINDINGS=self.root / "host/tenants.json",
+        self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", PROVISION=self.root / "provision",
+                                         BINDINGS=self.root / "host/tenants.json",
                                          runner_processes=lambda: [])
         self.patch.start()
-        for directory in [p.REGISTRY, p.BINDINGS.parent, p.ROOT / "tenants"]:
+        for directory in [p.REGISTRY, p.PROVISION, p.BINDINGS.parent, p.ROOT / "tenants"]:
             directory.mkdir(parents=True)
         self.image = self.root / "tenant-images/v1"
         self.image.mkdir(parents=True)
@@ -42,9 +43,134 @@ class ProvisionTests(unittest.TestCase):
         (self.image / "rootfs").write_bytes(b"root")
         (self.image / "manifest.json").write_text(json.dumps(dict(version="v1", kernel_sha256=hashlib.sha256(b"kernel").hexdigest(), rootfs_sha256=hashlib.sha256(b"root").hexdigest())))
 
+    def switch_records(self):
+        c = config()
+        provision_path = p.PROVISION / "a.json"
+        provision_path.write_text(json.dumps(c, indent=2) + "\n")
+        record = {key: value for key, value in c.items() if key not in {"tenant", "sub", "vm", "resolvers"}}
+        record.update(disk=str(p.ROOT / "tenants/a/disk.img"), generation=str(p.ROOT / "tenants/a/generation"),
+                      suspend=str(p.ROOT / "tenants/a/suspend"))
+        registry_path = p.REGISTRY / "a.json"
+        registry_path.write_text(json.dumps(record, indent=2) + "\n")
+        suspend = p.ROOT / "tenants/a/suspend"
+        suspend.mkdir(parents=True)
+        (self.root / "tenant-images/v2").mkdir(parents=True)
+        (self.root / "tenant-images/v2/vmlinux").write_bytes(b"kernel-v2")
+        (self.root / "tenant-images/v2/rootfs").write_bytes(b"root-v2")
+        manifest = dict(version="v2", kernel_sha256=hashlib.sha256(b"kernel-v2").hexdigest(),
+                        rootfs_sha256=hashlib.sha256(b"root-v2").hexdigest())
+        (self.root / "tenant-images/v2/manifest.json").write_text(json.dumps(manifest))
+        return c, provision_path, registry_path, suspend, manifest
+
+    @staticmethod
+    def fake_base(_config, _image, base):
+        base.mkdir(parents=True)
+        for name in ("base.vmstate", "base.memory"):
+            (base / name).write_bytes(b"base")
+
     def tearDown(self):
         self.patch.stop()
         self.tmp.cleanup()
+
+    def test_switch_image_refuses_when_either_service_is_running(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        old_config = provision_path.read_bytes()
+        old_record = registry_path.read_bytes()
+        for active in ("motor-host.service", "motor-vm-helper.service"):
+            with self.subTest(active=active):
+                states = {"motor-host.service": "inactive", "motor-vm-helper.service": "inactive"}
+                states[active] = "active"
+                make_base = mock.Mock(side_effect=self.fake_base)
+                validate = mock.Mock()
+                with self.assertRaisesRegex(ValueError, "must be stopped"):
+                    p.switch_image("a", "v2", make_base=make_base, check_service=states.get,
+                                   validate_image=validate, output=lambda _line: None)
+                validate.assert_not_called()
+                make_base.assert_not_called()
+                self.assertEqual(provision_path.read_bytes(), old_config)
+                self.assertEqual(registry_path.read_bytes(), old_record)
+
+    def test_switch_image_runs_the_hosted_image_inventory_command(self):
+        with mock.patch.object(p.subprocess, "run") as execute:
+            p.inventory_image(self.image)
+        command = execute.call_args.args[0]
+        self.assertEqual(command[1:], [str(Path(__file__).resolve().parents[1] / "tenant-image" / "build.py"),
+                                       "inventory", str(self.image)])
+        self.assertTrue(execute.call_args.kwargs["check"])
+
+    def test_switch_image_updates_both_records_and_builds_the_size_base(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        make_base = mock.Mock(side_effect=self.fake_base)
+        validate = mock.Mock()
+        messages = []
+        p.switch_image("a", "v2", make_base=make_base, check_service=lambda _unit: "inactive",
+                       validate_image=validate, output=messages.append)
+        self.assertEqual(json.loads(provision_path.read_text())["image_version"], "v2")
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"], "v2")
+        self.assertEqual(make_base.call_args.args[1:], (self.root / "tenant-images/v2", self.root / "tenant-images/v2/base/2-18432"))
+        validate.assert_called_once_with(self.root / "tenant-images/v2")
+        self.assertIn("a: v1 -> v2", messages)
+        self.assertTrue(any("switch-image a v1" in line for line in messages))
+
+    def test_switch_image_moves_a_mismatched_suspend_snapshot_and_prints_its_path(self):
+        _c, provision_path, registry_path, suspend, _manifest = self.switch_records()
+        old_manifest = json.loads((self.image / "manifest.json").read_text())
+        (suspend / "key.json").write_text(json.dumps({**old_manifest, "generation": 0}))
+        (suspend / "suspend.vmstate").write_bytes(b"old-state")
+        (suspend / "suspend.memory").write_bytes(b"old-memory")
+        make_base = mock.Mock(side_effect=self.fake_base)
+        messages = []
+        moved = p.switch_image("a", "v2", make_base=make_base, check_service=lambda _unit: "inactive",
+                               validate_image=lambda _image: None, output=messages.append)
+        self.assertIsNotNone(moved)
+        self.assertFalse((suspend / "suspend.vmstate").exists())
+        self.assertEqual((moved / "suspend.vmstate").read_bytes(), b"old-state")
+        self.assertEqual((moved / "suspend.memory").read_bytes(), b"old-memory")
+        self.assertTrue(any(str(moved) in line for line in messages))
+        self.assertEqual(json.loads(provision_path.read_text())["image_version"], "v2")
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"], "v2")
+
+    def test_switch_image_is_idempotent_and_can_roll_back_to_the_old_image(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        make_base = mock.Mock(side_effect=self.fake_base)
+        validate = mock.Mock()
+        messages = []
+        with mock.patch.object(p, "atomic_pair", wraps=p.atomic_pair) as persist:
+            for version in ("v2", "v2", "v1"):
+                p.switch_image("a", version, make_base=make_base, check_service=lambda _unit: "inactive",
+                               validate_image=validate, output=messages.append)
+        self.assertEqual(persist.call_count, 2)
+        self.assertEqual(json.loads(provision_path.read_text())["image_version"], "v1")
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"], "v1")
+        self.assertEqual(make_base.call_count, 2)
+        self.assertIn("a: v2 -> v1", messages)
+        self.assertTrue(any("switch-image a v2" in line for line in messages))
+
+    def test_switch_image_rolls_back_the_first_record_if_the_second_replace_fails(self):
+        _c, provision_path, registry_path, suspend, _target_manifest = self.switch_records()
+        old_manifest = json.loads((self.image / "manifest.json").read_text())
+        (suspend / "key.json").write_text(json.dumps(old_manifest))
+        (suspend / "suspend.vmstate").write_bytes(b"old-state")
+        old_config = provision_path.read_bytes()
+        old_record = registry_path.read_bytes()
+        real_replace = p.os.replace
+        failed = False
+
+        def replace_once(source, destination):
+            nonlocal failed
+            if Path(destination) == provision_path and not failed:
+                failed = True
+                raise OSError("injected second-record failure")
+            return real_replace(source, destination)
+
+        with mock.patch.object(p.os, "replace", side_effect=replace_once), self.assertRaisesRegex(OSError, "second-record"):
+            p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                           validate_image=lambda _image: None, output=lambda _line: None)
+        self.assertEqual(provision_path.read_bytes(), old_config)
+        self.assertEqual(registry_path.read_bytes(), old_record)
+        self.assertEqual((suspend / "suspend.vmstate").read_bytes(), b"old-state")
+        self.assertEqual(len(list(suspend.parent.glob("suspend.stale-*"))), 0)
+        self.assertEqual(list(p.PROVISION.glob("*.pending")), [])
 
     def test_invalid_names_and_unknown_options(self):
         for name in ["", ".", "..", "foo/bar", "a\0b"]:
