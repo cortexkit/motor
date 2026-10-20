@@ -58,6 +58,11 @@ pub struct HostedJobState {
     pub(crate) retry_iat: Option<u64>,
     #[serde(default)]
     pub(crate) lease_request: Option<LeaseRequest>,
+    /// Set durably just before ck-motor sends the Run frame to a hosted
+    /// runner. Until then no runner holds the command, so whatever happened to
+    /// the lease, the job provably never ran; afterwards it may have.
+    #[serde(default)]
+    pub(crate) run_sent: bool,
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
@@ -278,6 +283,55 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
         .saturating_mul(1000)
         .saturating_sub(waited_ms)
 }
+/// The smallest memory per leased vCPU a Boat token may state. CLOUD's
+/// contract makes a Boat token's `mem_mib` the chosen sandbox size's measured
+/// usable memory (13444 MiB for the 8-vCPU large size in production, 14336 MiB
+/// in the recorded test size), and the chosen size has at least the job's
+/// vCPUs, so a real token states well over 1.5 GiB per leased vCPU. Below
+/// 1 GiB per vCPU the token is malformed or names a sandbox in which builds
+/// would be killed for memory, so ck-motor refuses it rather than run there.
+const BOAT_MIN_MEM_MIB_PER_VCPU: u64 = 1024;
+
+/// The first leased resource whose token claim differs from what ck-motor
+/// requested, as (field, expected, actual). A first-party host's token states
+/// the runner's per-job memory cap exactly. A Boat token states the whole
+/// sandbox's usable memory, which may be below that cap; it must still lie
+/// between the floor above and the cap.
+fn resource_mismatch(
+    claims: &motor_lease::Claims,
+    body: &LeaseRequest,
+    boat: bool,
+) -> Option<(&'static str, String, String)> {
+    let cap = motor_lease::memory_max_mib(body.vcpus);
+    let floor = u64::from(body.vcpus).saturating_mul(BOAT_MIN_MEM_MIB_PER_VCPU);
+    let memory_ok = if boat {
+        (floor..=cap).contains(&claims.mem_mib)
+    } else {
+        claims.mem_mib == cap
+    };
+    if claims.vcpus != body.vcpus {
+        Some(("vcpus", body.vcpus.to_string(), claims.vcpus.to_string()))
+    } else if !memory_ok {
+        let expected = if boat {
+            format!("{floor}..={cap}")
+        } else {
+            cap.to_string()
+        };
+        Some(("mem_mib", expected, claims.mem_mib.to_string()))
+    } else if claims.platform != body.platform {
+        Some(("platform", body.platform.clone(), claims.platform.clone()))
+    } else if claims.net != body.net {
+        Some(("net", body.net.to_string(), claims.net.to_string()))
+    } else if claims.max_s > body.timeout_s {
+        Some((
+            "max_s",
+            format!("<={}", body.timeout_s),
+            claims.max_s.to_string(),
+        ))
+    } else {
+        None
+    }
+}
 fn lease_body(
     id: Uuid,
     request: &RunRequest,
@@ -365,7 +419,20 @@ impl Client {
             .json(body)
             .send()
             .await
-            .map_err(|_| Error::Broker)?;
+            .map_err(|error| {
+                tracing::info!(
+                    path,
+                    connect = error.is_connect(),
+                    timeout = error.is_timeout(),
+                    "hosted broker request failed"
+                );
+                Error::Broker
+            })?;
+        tracing::info!(
+            path,
+            http_status = reply.status().as_u16(),
+            "hosted broker replied"
+        );
         if matches!(reply.status().as_u16(), 401 | 403) {
             return Err(Error::Auth);
         }
@@ -380,6 +447,17 @@ impl Client {
         if !reply.status().is_success() {
             let status = reply.status().as_u16();
             let code = reply.json::<serde_json::Value>().await.ok();
+            let broker_code = code
+                .as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.as_str())
+                .filter(|code| motor_lease::valid_name(code));
+            tracing::info!(
+                path,
+                http_status = status,
+                broker_code,
+                "hosted broker refused"
+            );
             return Err(
                 match code
                     .as_ref()
@@ -499,6 +577,7 @@ impl Client {
                 }
             }
             let attempt = state.placement_attempts;
+            let spilled = state.spill_wait_ms.is_some();
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -517,37 +596,60 @@ impl Client {
                     state.retry_iat = Some(now_s());
                 })
                 .map_err(|_| Error::Broker)?;
+            tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
+                spilled, "hosted lease requested");
             let lease: Lease = match self
                 .post_ready_authorized("/v1/leases", &body, bearer, provisioning_deadline)
                 .await
             {
                 Ok(l) => l,
-                Err(Error::Broker) if attempt < 2 => continue,
-                Err(error) if error.replaceable() && attempt < 2 => continue,
-                Err(e) => return Err(e),
+                Err(error) => {
+                    tracing::info!(job_id = %id, attempt, code = error.code(), "hosted lease not granted");
+                    match error {
+                        // A broker without capacity for a spilled job will not
+                        // gain it within seconds (its Boat start cap is hourly);
+                        // the build server is the better place to retry.
+                        Error::Capacity if spilled => return Err(error),
+                        Error::Broker if attempt < 2 => continue,
+                        error if error.replaceable() && attempt < 2 => continue,
+                        error => return Err(error),
+                    }
+                }
             };
+            let boat = lease.ssh.is_some() || lease.placement.host.starts_with("boat:");
+            // Record the placement before judging the lease. A booked Boat job
+            // can only be settled with finish (release answers job_admitted), so
+            // whatever is decided next must know where the broker placed it.
+            storage
+                .hosted_update(id, |state| state.lease(&lease))
+                .map_err(|_| Error::Broker)?;
+            tracing::info!(job_id = %id, attempt, provider = if boat { "boat" } else { "first_party" },
+                host = %lease.placement.host, vm = lease.placement.vm.as_deref().unwrap_or(""),
+                max_s = lease.max_s, "hosted lease granted");
             let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
-            if claims.vcpus != body.vcpus
-                || claims.mem_mib != motor_lease::memory_max_mib(body.vcpus)
-                || claims.platform != body.platform
-                || claims.net != body.net
-                || claims.max_s > body.timeout_s
-            {
+            if let Some((field, expected, actual)) = resource_mismatch(&claims, &body, boat) {
+                tracing::info!(job_id = %id, field, expected = %expected, actual = %actual,
+                    "hosted lease claims mismatch");
                 return Err(Error::Auth);
             }
             storage
-                .hosted_update(id, |state| {
-                    state.retry_iat = Some(claims.iat);
-                    state.lease(&lease);
-                })
+                .hosted_update(id, |state| state.retry_iat = Some(claims.iat))
                 .map_err(|_| Error::Broker)?;
             if lease.max_s < 10 {
                 return Err(Error::Short);
             }
-            match self
+            tracing::info!(job_id = %id, attempt, transport = if lease.ssh.is_some() { "ssh" } else { "tls" },
+                "hosted connect started");
+            let connected = self
                 .connect(id, &lease, &key, motor_lease::Purpose::Run)
-                .await
-            {
+                .await;
+            match &connected {
+                Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
+                Err(error) => {
+                    tracing::info!(job_id = %id, attempt, code = error.code(), "hosted connect failed")
+                }
+            }
+            match connected {
                 Ok(channel) => return Ok((channel, lease)),
                 Err(e) if lease.ssh.is_some() => return Err(e),
                 Err(e) if e.replaceable() && attempt < 2 => continue,
@@ -630,4 +732,4 @@ pub(crate) async fn wait_after_iat(iat: u64) {
 #[cfg(test)]
 pub(crate) mod boat_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

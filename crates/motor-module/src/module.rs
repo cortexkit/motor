@@ -988,7 +988,7 @@ async fn pump_direct_secret(
         let direct_job = secret
             .take()
             .map(|secret| serde_json::json!({"job_id": id, "secret": secret.expose()}));
-        let hosted = storage.job(id).and_then(|j| j.hosted);
+        let hosted = storage.job(id).and_then(|j| j.hosted_route());
         let return_result = storage.job(id).and_then(|j| j.return_result);
         async move {
             let mut value = serde_json::to_value(record).map_err(io::Error::other)?;

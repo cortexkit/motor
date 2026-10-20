@@ -30,7 +30,7 @@ impl JobStream {
         self.storage.clone()
     }
     pub fn hosted_state(&self) -> Option<crate::HostedJobState> {
-        self.storage.job(self.job_id).and_then(|j| j.hosted)
+        self.storage.job(self.job_id).and_then(|j| j.hosted_route())
     }
     pub fn return_result(&self) -> Option<ReturnResult> {
         self.storage.job(self.job_id).and_then(|j| j.return_result)
@@ -322,20 +322,36 @@ impl Motor {
                     .placement
                     .as_ref()
                     .is_some_and(|p| p.host.starts_with("boat:"));
+                // This refuses a hosted job before or after its Run frame. Before
+                // the Run frame reaches a runner the job cannot have started, so
+                // neither a lost sandbox nor an admitted lease may turn the
+                // refusal into an unknown outcome or a reattach.
                 if boat
                     && self
                         .hosted_client(state.clone())
                         .finish(id, Some(&terminal), &self.storage)
                         .await?
+                    && state.run_sent
                 {
                     return self.lost_sandbox(id, tx).await;
                 }
-                if !boat
-                    && self.hosted_client(state).release(id).await
-                        == Err(crate::hosted::Error::Admitted)
-                {
-                    let (_, wake) = watch::channel(false);
-                    return self.follow(id, 0, None, tx, wake).await;
+                if !boat {
+                    let released = self.hosted_client(state.clone()).release(id).await;
+                    tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
+                        run_sent = state.run_sent, "hosted release");
+                    if released == Err(crate::hosted::Error::Admitted) {
+                        if state.run_sent || state.placement.is_some() {
+                            let (_, wake) = watch::channel(false);
+                            return self.follow(id, 0, None, tx, wake).await;
+                        }
+                        // Boat jobs are admitted at booking, so job_admitted
+                        // with no recorded placement and no Run frame sent is a
+                        // Boat booking whose lease reply ck-motor never
+                        // accepted. Nothing ran: settle it and refuse.
+                        self.hosted_client(state)
+                            .finish_never_ran(id, &self.storage)
+                            .await?;
+                    }
                 }
             }
             let code = detail
@@ -523,13 +539,22 @@ impl Motor {
         let (mut request, returns) = submission;
         let hosted = self.hosted_state(id).is_some();
         let windows = request.platform == Some(Platform::Windows);
-        let spill_after = (spill && !hosted).then_some(self.config.spill_after_s);
+        let build_server_id = self.build_server_id(id);
+        // A resubmitted spill gets one spill attempt only, and its queue-wait
+        // budget starts again: the first wait only proved the build server full.
+        let resubmitted = build_server_id != id;
+        let spilled = self
+            .hosted_state(id)
+            .is_some_and(|route| route.spill_wait_ms.is_some());
+        let spill_after = (spill && !hosted && !resubmitted).then_some(self.config.spill_after_s);
         let wire_wait = spill_after.map_or(wait, |after| wait.min(after));
         let connector = if hosted {
             None
         } else {
             Some(self.connector_for_job(id)?)
         };
+        // Measures how long a spilled job spent on its hosted route.
+        let spill_started = tokio::time::Instant::now();
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
                 let client = self.hosted_client(state);
@@ -539,18 +564,27 @@ impl Motor {
                         request.weight_hint = Some(request.weight_hint.unwrap_or(2));
                         Ok(channel)
                     }
-                    Err(crate::hosted::Error::Admitted) => {
-                        return self.follow_inner(id, 0, None, tx, wake, spill_after).await
-                    }
-                    Err(crate::hosted::Error::SandboxLost) => {
-                        return self.lost_sandbox(id, tx).await.map(|_| false)
-                    }
                     Err(error) => {
-                        Err((error.reason(), Some(error.detail()), error.retry_after_ms()))
+                        // The hosted client never sends a Run frame, so this
+                        // failure proves the job did not start anywhere.
+                        if self.return_spill(id, error.code(), spill_started).await? {
+                            return Ok(true);
+                        }
+                        match error {
+                            crate::hosted::Error::Admitted => {
+                                return self.follow_inner(id, 0, None, tx, wake, spill_after).await
+                            }
+                            crate::hosted::Error::SandboxLost => {
+                                return self.lost_sandbox(id, tx).await.map(|_| false)
+                            }
+                            error => {
+                                Err((error.reason(), Some(error.detail()), error.retry_after_ms()))
+                            }
+                        }
                     }
                 }
             } else {
-                open_for_request(connector.as_ref().unwrap().as_ref(), id)
+                open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
                     .await
                     .map_err(|(reason, detail)| (reason, detail, None))
             };
@@ -571,6 +605,12 @@ impl Motor {
                 }
             };
             if !returns.return_paths.is_empty() && !channel.return_paths {
+                if self
+                    .return_spill(id, "return_paths_unsupported", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 return self
                     .refused(
                         id,
@@ -610,6 +650,19 @@ impl Motor {
                 .await
             {
                 Ok(h) => h,
+                // No Run frame was sent on this connection, so a spilled job
+                // goes back to the build server rather than reattaching to a
+                // runner that never received it.
+                Err(_) if self.spill_returnable(id) => {
+                    drop(channel);
+                    if self
+                        .return_spill(id, "hosted_connect_failed", spill_started)
+                        .await?
+                    {
+                        return Ok(true);
+                    }
+                    return self.follow_inner(id, 0, None, tx, wake, None).await;
+                }
                 Err(_)
                     if self
                         .hosted_state(id)
@@ -669,7 +722,7 @@ impl Motor {
             } else {
                 None
             },
-            job_id: id,
+            job_id: build_server_id,
             workspace_key: request.workspace_key.clone(),
             workspace_kind: Some(snapshot::workspace_kind(
                 &self.config,
@@ -696,9 +749,21 @@ impl Motor {
         };
         // From this point on even a failed write might have reached the runner.
         // Never resubmit or invent a before-start outcome after attempting run.
+        // The hosted route records that durably first: it is what stops a
+        // spilled job from returning to the build server once it may have run.
+        if hosted {
+            self.storage
+                .hosted_update(id, |state| state.run_sent = true)?;
+        }
         if channel.send(Frame::Run(run)).await.is_err() {
             drop(channel);
             drop(snapshots);
+            if self
+                .return_spill(id, "hosted_run_unacknowledged", spill_started)
+                .await?
+            {
+                return Ok(true);
+            }
             return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
         }
         let admission = channel.next().await;
@@ -732,7 +797,12 @@ impl Motor {
                 if wrong_platform {
                     self.cancel(CancelRequest::new(id)).await?;
                 }
-                emit(tx, StreamRecord::Accepted(accepted)).await?;
+                // The caller already holds this job's acceptance from its first
+                // build-server submission. Neither a spill to a hosted runner
+                // nor a resubmission is a second job.
+                if !resubmitted && !spilled {
+                    emit(tx, StreamRecord::Accepted(accepted)).await?;
+                }
                 if wrong_platform {
                     drop(channel);
                     drop(snapshots);
@@ -770,6 +840,12 @@ impl Motor {
             _ => {
                 drop(channel);
                 drop(snapshots);
+                if self
+                    .return_spill(id, "hosted_run_unacknowledged", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
             }
         };
@@ -863,20 +939,100 @@ impl Motor {
         self.storage.job(id).is_some_and(|j| j.pending_cancel)
     }
     async fn send_cancel(&self, id: Uuid) -> io::Result<()> {
+        let build_server_id = self.build_server_id(id);
         let mut channel = self
             .open_job_channel(id)
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        channel.send(Frame::Cancel(CancelRequest::new(id))).await?;
+        channel
+            .send(Frame::Cancel(CancelRequest::new(build_server_id)))
+            .await?;
         match channel.next().await? {
-            Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == id => {
+            Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == build_server_id => {
                 self.storage.cancel(id, false)
             }
             _ => Err(io::Error::other("expected cancel_reply")),
         }
     }
     pub fn hosted_state(&self, id: Uuid) -> Option<crate::HostedJobState> {
-        self.storage.job(id).and_then(|j| j.hosted)
+        self.storage.job(id).and_then(|j| j.hosted_route())
+    }
+    /// The ID the build server knows this job by. It differs from the caller's
+    /// job ID only after a spilled job whose hosted route failed before any Run
+    /// frame reached a hosted runner was resubmitted to the build server.
+    fn build_server_id(&self, id: Uuid) -> Uuid {
+        self.storage
+            .job(id)
+            .and_then(|j| j.build_server_job_id)
+            .unwrap_or(id)
+    }
+    /// Whether a spilled job whose hosted route failed may go back to the build
+    /// server. A hosted runner, Boat or first-party, runs a command only from
+    /// the Run frame ck-motor sends it, and the route records `run_sent`
+    /// before that frame is written. Until then nothing has run anywhere,
+    /// whatever the broker booked. Jobs routed hosted by configuration never
+    /// fall back: only a spill records `spill_wait_ms`.
+    fn spill_returnable(&self, id: Uuid) -> bool {
+        self.hosted_state(id)
+            .is_some_and(|route| route.spill_wait_ms.is_some() && !route.run_sent)
+    }
+    /// Send a spilled job that never reached a hosted runner back to the build
+    /// server, rather than refusing a job that already gave up its place in
+    /// the queue or reattaching to a runner that never received it. Returns
+    /// false, changing nothing, when the job may not go back.
+    ///
+    /// The broker is told first so it stops holding a sandbox for the job: a
+    /// booked Boat job is settled with finish (release cannot end it), any
+    /// other lease is released. The new build-server ID is stored before the
+    /// caller's loop sends its Run frame, so a restart attaches to that ID
+    /// instead of losing the job or submitting it twice.
+    async fn return_spill(
+        &self,
+        id: Uuid,
+        cause: &str,
+        started: tokio::time::Instant,
+    ) -> io::Result<bool> {
+        if !self.spill_returnable(id) {
+            if self
+                .hosted_state(id)
+                .is_some_and(|route| route.spill_wait_ms.is_some())
+            {
+                tracing::info!(job_id = %id, cause,
+                    "spilled job's Run frame may have reached its hosted runner; reattaching, not resubmitting");
+            }
+            return Ok(false);
+        }
+        let route = self
+            .hosted_state(id)
+            .ok_or_else(|| io::Error::other("missing hosted route"))?;
+        let client = self.hosted_client(route.clone());
+        let boat = route
+            .placement
+            .as_ref()
+            .is_some_and(|p| p.host.starts_with("boat:"));
+        if boat {
+            client.finish_never_ran(id, &self.storage).await?;
+        } else if route.lease_attempted {
+            let released = client.release(id).await;
+            tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
+                "hosted release");
+            // Boat jobs are admitted at booking, so job_admitted means a Boat
+            // booking whose lease reply ck-motor never accepted. Settle it.
+            if released == Err(crate::hosted::Error::Admitted) && route.placement.is_none() {
+                client.finish_never_ran(id, &self.storage).await?;
+            }
+        }
+        let build_server_id = Uuid::now_v7();
+        self.storage.resubmitted(id, build_server_id, cause)?;
+        let spill_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            job_id = %id,
+            build_server_job_id = %build_server_id,
+            broker_code = cause,
+            spill_ms,
+            "spill not placed; resubmitted to build server"
+        );
+        Ok(true)
     }
     pub fn return_result(&self, id: Uuid) -> Option<ReturnResult> {
         self.storage.job(id).and_then(|j| j.return_result)
@@ -901,7 +1057,7 @@ impl Motor {
             let connector = self
                 .connector_for_job(id)
                 .map_err(|_| crate::hosted::Error::Connect)?;
-            Channel::open(connector.as_ref(), id)
+            Channel::open(connector.as_ref(), self.build_server_id(id))
                 .await
                 .map_err(|_| crate::hosted::Error::Connect)
         }
@@ -990,6 +1146,9 @@ impl Motor {
         spill_after: Option<u64>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
+        // Frames to and from the build server carry its ID for the job; records
+        // and storage keep the caller's.
+        let build_server_id = self.build_server_id(id);
         let mut spill_watch = spill_after.map(crate::spill::Watch::new);
         if self
             .hosted_state(id)
@@ -1090,7 +1249,7 @@ impl Motor {
                     // Attach by the submitted ID, never resubmit Run after a
                     // broken connection. The runner returns output and the
                     // terminal outcome it retained for that ID.
-                    if c.send(Frame::Attach(AttachRequest::new(id, cursor)))
+                    if c.send(Frame::Attach(AttachRequest::new(build_server_id, cursor)))
                         .await
                         .is_ok()
                     {
@@ -1121,7 +1280,7 @@ impl Motor {
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
                     withdraw_sent = true;
                     queue_deadline = None;
-                    if c.send(Frame::Withdraw { job_id: id, reason: None }).await.is_err() { channel = None; }
+                    if c.send(Frame::Withdraw { job_id: build_server_id, reason: None }).await.is_err() { channel = None; }
                     None
                 },
             };
@@ -1145,7 +1304,7 @@ impl Motor {
                     queue_wait_ms,
                     started_at_ms,
                     path_mapping,
-                })) if job_id == id => {
+                })) if job_id == build_server_id => {
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
                     }
@@ -1174,11 +1333,14 @@ impl Motor {
                     }
                     backoff = 1;
                 }
-                Ok(Incoming::Frame(Frame::ReturnResult(result))) if result.job_id == id => {
+                Ok(Incoming::Frame(Frame::ReturnResult(mut result)))
+                    if result.job_id == build_server_id =>
+                {
                     if result.seq < cursor {
                         continue;
                     }
                     cursor = result.seq.saturating_add(1);
+                    result.job_id = id;
                     self.storage.return_result(result)?;
                     backoff = 1;
                 }
@@ -1188,12 +1350,13 @@ impl Motor {
                     }
                 }
                 Ok(Incoming::Frame(Frame::Terminal(mut terminal))) => {
-                    if terminal.job_id != id {
+                    if terminal.job_id != build_server_id {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "terminal job ID mismatch",
                         ));
                     }
+                    terminal.job_id = id;
                     // A retry is safe only when the runner proves the command never started.
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
@@ -1422,9 +1585,20 @@ impl Motor {
             }
             Err(error) => return Err(io::Error::other(format!("job_id={id}: {error:?}"))),
         };
-        channel.send(Frame::JobStatus { job_id: id }).await?;
+        let build_server_id = self.build_server_id(id);
+        channel
+            .send(Frame::JobStatus {
+                job_id: build_server_id,
+            })
+            .await?;
         match channel.next().await? {
-            Incoming::Frame(Frame::JobStatusReply(mut reply)) if reply.job_id == id => {
+            Incoming::Frame(Frame::JobStatusReply(mut reply))
+                if reply.job_id == build_server_id =>
+            {
+                reply.job_id = id;
+                if let Some(terminal) = reply.terminal.as_mut() {
+                    terminal.job_id = id;
+                }
                 if let Some(terminal) = reply
                     .terminal
                     .as_ref()
@@ -1748,6 +1922,10 @@ mod queue_tests;
 #[cfg(test)]
 #[path = "started_tests.rs"]
 mod started_tests;
+
+#[cfg(test)]
+#[path = "resubmit_tests.rs"]
+mod resubmit_tests;
 
 fn log_refusal(id: Uuid, refusal: &Refusal) {
     tracing::info!(job_id = %id, reason = ?refusal.reason,

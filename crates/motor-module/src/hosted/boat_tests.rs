@@ -4,7 +4,7 @@ use base64::Engine;
 use motor_lease::{Claims, Confirmation, Purpose};
 use motor_protocol::*;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Mutex,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -15,6 +15,11 @@ pub(crate) struct Boat {
     pub runs: Arc<AtomicUsize>,
     pub attaches: Arc<AtomicUsize>,
     pub lost: Arc<AtomicUsize>,
+    /// Usable memory the job token states; 0 states the fleet formula.
+    pub mem_mib: Arc<AtomicU64>,
+    /// Like a real runner, refuse to serve an attach for a job that never
+    /// received a Run frame (the connection drops).
+    pub strict_attach: Arc<AtomicBool>,
     _http: Http,
     _host: JoinHandle<()>,
 }
@@ -32,12 +37,17 @@ impl Boat {
         let port = host.local_addr().unwrap().port();
         let runs = Arc::new(AtomicUsize::new(0));
         let attaches = Arc::new(AtomicUsize::new(0));
+        let strict_attach = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(Mutex::new(std::collections::HashSet::<Uuid>::new()));
         let run_count = runs.clone();
         let attach_count = attaches.clone();
+        let strict = strict_attach.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = host.accept().await {
                 let runs = run_count.clone();
                 let attaches = attach_count.clone();
+                let strict = strict.clone();
+                let ran = ran.clone();
                 tokio::spawn(async move {
                     let Ok(motor_lease::Prelude::LeaseHello {
                         token,
@@ -110,6 +120,7 @@ impl Boat {
                             }
                             Frame::Run(_) => {
                                 runs.fetch_add(1, Ordering::SeqCst);
+                                ran.lock().unwrap().insert(id);
                                 if drop_run {
                                     return;
                                 }
@@ -125,6 +136,11 @@ impl Boat {
                             Frame::Attach(request) => {
                                 assert_eq!(claims.purpose, Purpose::Attach);
                                 attaches.fetch_add(1, Ordering::SeqCst);
+                                if strict.load(Ordering::SeqCst)
+                                    && !ran.lock().unwrap().contains(&id)
+                                {
+                                    return;
+                                }
                                 send_result(&mut socket, id, request.from_seq).await;
                                 return;
                             }
@@ -138,9 +154,13 @@ impl Boat {
         let job = Arc::new(Mutex::new(None::<motor_lease::LeaseRequest>));
         let lost = Arc::new(AtomicUsize::new(0));
         let lost_reply = lost.clone();
+        let mem_mib = Arc::new(AtomicU64::new(0));
+        let token_mem = mem_mib.clone();
         let http=Http::new(move |path,body| {
             if path.ends_with("/reattach") && lost_reply.load(Ordering::SeqCst) != 0 { return (409, serde_json::json!({"error":"sandbox_lost"})); }
             if path.ends_with("/finish") {return (200,serde_json::json!({"job_id":path.split('/').nth(3).unwrap(),"settled_vcpu_ms":250,"released_vcpu_ms":59750}));}
+            // CLOUD admits a Boat job at booking, so release can never end it.
+            if path.ends_with("/release") { return (409, serde_json::json!({"error":"job_admitted"})); }
             if requests_seen.fetch_add(1, Ordering::SeqCst) < provisioning {
                 return (202, serde_json::json!({"status":"provisioning","retry_after_ms":10}));
             }
@@ -156,7 +176,8 @@ impl Boat {
             };
             sshd.authorize_public(&jwk,port);
             let request=job.lock().unwrap().clone().unwrap(); let now=now_s();
-            let claims=Claims {iss:motor_lease::ISSUER.into(),aud:"boat:test".into(),sub:"acct:test".into(),jti:id.clone(),iat:now,exp:now+120,vcpus:request.vcpus,mem_mib:motor_lease::memory_max_mib(request.vcpus),platform:request.platform,net:request.net,placement:motor_lease::Placement {host:"boat:test".into(),vm:Some("test".into())},max_s:request.timeout_s,purpose,cnf:Confirmation{jkt:jwk.thumbprint().unwrap()}};
+            let mem_mib = match token_mem.load(Ordering::SeqCst) { 0 => motor_lease::memory_max_mib(request.vcpus), mib => mib };
+            let claims=Claims {iss:motor_lease::ISSUER.into(),aud:"boat:test".into(),sub:"acct:test".into(),jti:id.clone(),iat:now,exp:now+120,vcpus:request.vcpus,mem_mib,platform:request.platform,net:request.net,placement:motor_lease::Placement {host:"boat:test".into(),vm:Some("test".into())},max_s:request.timeout_s,purpose,cnf:Confirmation{jkt:jwk.thumbprint().unwrap()}};
             let lease=serde_json::json!({"provider":"boat","ssh":{"endpoint":sshd.endpoint,"host_key":sshd.host_key,"user":sshd.user},"runner_port":port,"lease_id":id,"job_id":id,"placement":claims.placement,"job_token":motor_lease::sign_token(&claims,"test",&SigningKey::from_bytes(&[7;32])).unwrap(),"token_expires_at_ms":claims.exp*1000,"max_s":claims.max_s,"reserved_vcpu_ms":60000});
             (200,lease)
         }).await;
@@ -174,6 +195,8 @@ impl Boat {
             runs,
             attaches,
             lost,
+            mem_mib,
+            strict_attach,
             _http: http,
             _host: task,
         }
@@ -667,4 +690,77 @@ fn cloud_boat_provisioning_retry_delay_is_clamped() {
     assert_eq!(bounded_provisioning_retry_ms(0), 1_000);
     assert_eq!(bounded_provisioning_retry_ms(5_000), 5_000);
     assert_eq!(bounded_provisioning_retry_ms(u64::MAX), 30_000);
+}
+
+/// CLOUD's recorded Boat lease states the sandbox size's measured usable
+/// memory, not the fleet formula, and ck-motor must accept it. A first-party
+/// host's token must still state the formula exactly.
+#[test]
+fn cloud_boat_vector_token_memory_is_accepted_for_boat_only() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/boat-lease.json"
+    ))
+    .unwrap();
+    let body: motor_lease::LeaseRequest =
+        serde_json::from_value(vector["booked"]["request"]["body"].clone()).unwrap();
+    let token = vector["booked"]["reply"]["body"]["job_token"]
+        .as_str()
+        .unwrap();
+    let claims: Claims = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims.mem_mib, vector["boat_sizes"][0]["mem_mib"]);
+    assert_ne!(claims.mem_mib, motor_lease::memory_max_mib(body.vcpus));
+    assert_eq!(resource_mismatch(&claims, &body, true), None);
+    assert_eq!(
+        resource_mismatch(&claims, &body, false).map(|(field, ..)| field),
+        Some("mem_mib")
+    );
+    // Production's large size: 8 vCPUs with 13444 MiB usable.
+    let mut large = claims.clone();
+    let mut large_body = body.clone();
+    large.vcpus = 8;
+    large_body.vcpus = 8;
+    large.mem_mib = 13444;
+    assert_eq!(resource_mismatch(&large, &large_body, true), None);
+    // Below 1 GiB per leased vCPU, or above the runner's cap, is refused.
+    for mem_mib in [8191, motor_lease::memory_max_mib(8) + 1, 0] {
+        large.mem_mib = mem_mib;
+        assert_eq!(
+            resource_mismatch(&large, &large_body, true),
+            Some((
+                "mem_mib",
+                format!("8192..={}", motor_lease::memory_max_mib(8)),
+                mem_mib.to_string()
+            ))
+        );
+    }
+    // The other resources stay exact for Boat too.
+    let mut wrong = claims.clone();
+    wrong.vcpus = 4;
+    assert_eq!(
+        resource_mismatch(&wrong, &body, true).map(|(field, ..)| field),
+        Some("vcpus")
+    );
+    let mut wrong = claims.clone();
+    wrong.net = !body.net;
+    assert_eq!(
+        resource_mismatch(&wrong, &body, true).map(|(field, ..)| field),
+        Some("net")
+    );
+    let mut wrong = claims.clone();
+    wrong.platform = "linux-arm64".into();
+    assert_eq!(
+        resource_mismatch(&wrong, &body, true).map(|(field, ..)| field),
+        Some("platform")
+    );
+    let mut wrong = claims;
+    wrong.max_s = body.timeout_s + 1;
+    assert_eq!(
+        resource_mismatch(&wrong, &body, true).map(|(field, ..)| field),
+        Some("max_s")
+    );
 }
