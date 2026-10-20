@@ -210,7 +210,8 @@ pub(crate) fn validate_destinations(
             }
         }
         Err(invalid(format!(
-            "destination outside runner-owned roots: path={path} allowed_roots={roots:?}"
+            "destination outside runner-owned roots: path={path} allowed_roots={roots:?}; \
+             move the checkout under one of the allowed roots"
         )))
     };
     let workspace = resolve(key)?;

@@ -57,6 +57,9 @@ usage: ck motor run [OPTIONS] -- COMMAND...
         ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]
 
 Runs COMMAND on the remote build server and streams its output here.
+One word after -- is a verbatim bash command; multiple words are an argv,
+shell-quoted so bash preserves each word:
+  ck motor run -- sh -c 'cargo test -p x 2>&1 | grep FAILED'
 See `ck motor run --help` for the options and exit statuses.";
 
 pub const HELP: &str = "\
@@ -86,9 +89,12 @@ and stderr here as they arrive.
                       can't be granted or connected refuses (200). Needs a
                       broker configured in ck-motor (else 204)
 
-The words after -- are joined with single spaces into one command line, which
-bash runs on the runner (bash -c). Quote shell syntax as one argument:
+One word after -- is passed verbatim to bash -c on the runner:
   ck motor run -- 'cargo test 2>&1 | tail -n 20'
+Two or more words are an argv: joined with spaces, with POSIX single-quoting
+to preserve each word. Only nonempty words made of [A-Za-z0-9_@%+=:,./-]
+are left unquoted. Shell syntax inside an argument stays inside that argument:
+  ck motor run -- sh -c 'cargo test -p x 2>&1 | grep FAILED'
 
 Exit status: the command's own exit code; 128+N when a signal N killed it;
 200 refused before start (nothing ran); 201 outcome unknown or connection lost
@@ -308,10 +314,30 @@ fn read_secret(reader: impl Read) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-/// The command line the runner hands to `bash -c`: the words joined by single
-/// spaces, exactly as AFT sends a command. No word is quoted or escaped.
+/// The command line the runner hands to `bash -c`: one word is a verbatim shell
+/// command; multiple words are an argv, joined with shell quoting as needed.
+/// Only nonempty words made of `[A-Za-z0-9_@%+=:,./-]` are left unquoted;
+/// other words use POSIX single quotes, escaping each `'` as `'\''`.
+/// For example, `sh -c 'a | b'` preserves `a | b` as one argument to `sh`.
 pub fn command_line(words: &[String]) -> String {
-    words.join(" ")
+    if let [command] = words {
+        return command.clone();
+    }
+    words
+        .iter()
+        .map(|word| {
+            if !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+            {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build the `exec.run` request. The workspace is the git checkout that
@@ -1230,6 +1256,65 @@ mod tests {
 
     fn words(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn command_line_one_word_is_verbatim() {
+        let command = "cargo test -p x 2>&1 | grep 'FAILED'";
+        assert_eq!(command_line(&[command.into()]), command);
+    }
+
+    #[test]
+    fn command_line_plain_words_stay_readable() {
+        assert_eq!(
+            command_line(&words("cargo test -p x _@%+=:,./-")),
+            "cargo test -p x _@%+=:,./-"
+        );
+    }
+
+    #[cfg(unix)]
+    fn bash_argv(command: &str) -> Vec<String> {
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &format!("set -- {command}\nfor word; do printf '%s\\0' \"$word\"; done"),
+            ])
+            .output()
+            .expect("bash must be available to check argv round-trips");
+        assert!(
+            output.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_line_sh_c_round_trips_through_bash() {
+        let command = command_line(&["sh".into(), "-c".into(), "a | b".into()]);
+        assert_eq!(bash_argv(&command), ["sh", "-c", "a | b"]);
+        assert_eq!(command, "sh -c 'a | b'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_line_special_word_round_trips_through_bash() {
+        let command = command_line(&["echo".into(), r"it's $value\path".into()]);
+        assert_eq!(bash_argv(&command), ["echo", r"it's $value\path"]);
+        assert_eq!(command, r"echo 'it'\''s $value\path'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_line_empty_word_round_trips_through_bash() {
+        let command = command_line(&["printf".into(), "".into()]);
+        assert_eq!(bash_argv(&command), ["printf", ""]);
+        assert_eq!(command, "printf ''");
     }
 
     #[test]
