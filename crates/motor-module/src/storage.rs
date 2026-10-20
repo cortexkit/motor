@@ -1,3 +1,10 @@
+mod compaction;
+mod journal;
+#[cfg(test)]
+mod journal_tests;
+#[cfg(test)]
+pub(crate) use journal::durable_value;
+
 use fs2::FileExt;
 use motor_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -253,12 +260,22 @@ impl State {
 /// One process owns the lease; cancel intent is durable before a network attempt.
 pub(crate) struct Storage {
     root: PathBuf,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    persistence: Arc<compaction::Persistence>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
     _lease: File,
     #[cfg(test)]
     write_count: std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            tracing::error!(%error, root = %self.root.display(), "storage shutdown checkpoint failed; run ck-motor store-checkpoint before rollback");
+        }
+    }
 }
 
 pub(crate) struct JobLease {
@@ -278,6 +295,20 @@ impl Drop for JobLease {
 }
 
 impl Storage {
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        // Freeze mutation before exporting; the lease outlives both the worker
+        // and the final checkpoint, including when shutdown is called twice.
+        {
+            let _state = self.state.lock().unwrap();
+            self.persistence.stop();
+        }
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("storage compactor panicked"))?;
+        }
+        self.persistence.checkpoint(&self.state)
+    }
     pub(crate) fn pending_finishes(&self) -> Vec<(Uuid, crate::HostedJobState)> {
         self.state
             .lock()
@@ -401,22 +432,25 @@ impl Storage {
                 error
             }
         })?;
-        let mut state: State = match fs::read(root.join("state.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => State::default(),
-            Err(e) => return Err(e),
-        };
-        let pruned = state.prune(now_ms());
+        let metrics = Arc::new(journal::Metrics::default());
+        let (state, backend) = journal::open(root, &metrics)?;
+        let state = Arc::new(Mutex::new(state));
+        let persistence = Arc::new(compaction::Persistence::new(root, backend, metrics));
+        let worker = compaction::start(state.clone(), persistence.clone())?;
         let storage = Self {
             root: root.into(),
-            state: Mutex::new(state),
+            state,
+            persistence,
+            worker: Mutex::new(Some(worker)),
             tip_checks: Mutex::new(BTreeMap::new()),
             failed_tips: Mutex::new(BTreeMap::new()),
             _lease: lease,
             #[cfg(test)]
             write_count: std::sync::atomic::AtomicUsize::new(0),
         };
-        if pruned {
+        // Pruning belongs inside the transaction so its deletions enter the log.
+        let needs_pruning = storage.state.lock().unwrap().clone().prune(now_ms());
+        if needs_pruning {
             storage.update(|_| {})?;
         }
         Ok(storage)
@@ -426,26 +460,31 @@ impl Storage {
     }
     fn update_when(
         &self,
-        needed: impl FnOnce(&State) -> bool,
+        needed: impl Fn(&State) -> bool,
         f: impl FnOnce(&mut State),
     ) -> io::Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if !needed(&state) {
-            return Ok(());
-        }
+        let mut state = loop {
+            let state = self.state.lock().unwrap();
+            self.persistence.check_running()?;
+            if !needed(&state) {
+                return Ok(());
+            }
+            if self.persistence.has_room() {
+                break state;
+            }
+            drop(state);
+            self.persistence.wait_for_compaction()?;
+        };
         let mut next = state.clone();
         f(&mut next);
         next.prune(now_ms());
-        let path = self.root.join("state.tmp");
-        let mut file = File::create(&path)?;
-        file.write_all(&serde_json::to_vec(&next).map_err(io::Error::other)?)?;
-        file.sync_all()?;
-        fs::rename(path, self.root.join("state.json"))?;
-        File::open(&self.root)?.sync_all()?;
+        self.persistence.append(&state, &next)?;
         #[cfg(test)]
         self.write_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *state = next;
+        drop(state);
+        self.persistence.request_if_due();
         Ok(())
     }
     pub fn tip_check(&self, repository: &str) -> Arc<Mutex<()>> {
@@ -504,6 +543,7 @@ impl Storage {
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
     }
+    #[cfg(test)]
     pub fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
         self.update(|state| {
             state.jobs.entry(id).or_default().direct_secret_hash = Some(hash);
@@ -587,6 +627,7 @@ impl Storage {
             }
         })
     }
+    #[cfg(test)]
     pub fn create(
         &self,
         id: Uuid,
@@ -595,12 +636,24 @@ impl Storage {
         runner_instance: Option<String>,
         gate_job: bool,
     ) -> io::Result<()> {
+        self.create_authorized(id, wait, attribution, runner_instance, gate_job, None)
+    }
+    pub fn create_authorized(
+        &self,
+        id: Uuid,
+        wait: u64,
+        attribution: Option<JobAttribution>,
+        runner_instance: Option<String>,
+        gate_job: bool,
+        direct_secret_hash: Option<[u8; 32]>,
+    ) -> io::Result<()> {
         self.update(|s| {
             s.jobs.entry(id).or_insert(Job {
                 gate_job,
                 queue_wait_limit_s: wait,
                 attribution,
                 runner_instance,
+                direct_secret_hash,
                 ..Job::default()
             });
         })
@@ -690,7 +743,7 @@ mod retention_tests {
         storage.update(|_| {}).unwrap();
         assert!(storage.job(id).is_none());
         assert!(!storage.direct_authorized(id, Some(secret.expose())));
-        let state = fs::read_to_string(scratch.join("state.json")).unwrap();
+        let state = durable_value(&scratch).unwrap().to_string();
         assert!(!state.contains("direct_secret_hash"));
         assert!(!state.contains(secret.expose()));
         let legacy: Job = serde_json::from_str(
@@ -1010,10 +1063,13 @@ mod retention_renewal_tests {
         assert_eq!(storage.job(id).unwrap().retain_until_ms, Some(until));
         let before = storage.write_count.load(Ordering::SeqCst);
 
-        // A directory at the temporary-file path makes any attempted write fail.
-        // If the saved deadline covers the requested deadline, the access must
-        // succeed without attempting to write the state file.
-        fs::create_dir(scratch.join("state.tmp")).unwrap();
+        // A read-only journal descriptor makes any actual append fail. Covered
+        // deadlines must still succeed without reaching the persistence backend.
+        if let journal::Backend::Journal(j) = &mut *storage.persistence.backend.lock().unwrap() {
+            j.set_append_readonly(true);
+        } else {
+            panic!("test requires the journal backend");
+        }
         storage
             .retain_job_at(id, None, start + RETENTION_RENEWAL_MS - 1)
             .unwrap();
@@ -1040,7 +1096,9 @@ mod retention_renewal_tests {
         assert!(!job.pending_cancel);
         assert!(job.build_server_job_id.is_none());
 
-        fs::remove_dir(scratch.join("state.tmp")).unwrap();
+        if let journal::Backend::Journal(j) = &mut *storage.persistence.backend.lock().unwrap() {
+            j.set_append_readonly(false);
+        }
         storage
             .retain_job_at(id, Some("changed".into()), start + 2)
             .unwrap();

@@ -152,9 +152,44 @@ SQLite. It uses the descriptor's path to find a sibling directory
 `<path>.ck-motor/`. Without a descriptor it uses
 `$XDG_DATA_HOME/cortexkit/ck-motor/<runner_instance>`.
 
-That directory holds an exclusively locked `lease` file, `state.json` (written
-atomically through `state.tmp`), transient `spools/`, and the agent's runtime
-directories. `state.json` holds:
+That directory holds an exclusively locked `lease` file, a compatible
+`state.json` checkpoint (published atomically through `state.tmp`), checksummed
+`journal-<epoch>-<sequence>.jsonl` segments, transient `spools/`, and the agent's
+runtime directories. Its Engram catalog entry remains a **device-local filetree**;
+copying or restoring it to another device can replay stale intents.
+
+With the journal backend, each synchronous mutation appends the complete changed
+records and deleted keys
+as one SHA-256-checked transaction and fsyncs it before returning. Cancellation,
+Run bindings, resubmission bindings, pending broker finishes, and direct-secret
+creation are not deferred. Legacy fallback synchronously writes JSON snapshots.
+A partial or checksum-invalid final journal frame is
+ignored and truncated before the next append; interior corruption or sequence
+gaps fail startup rather than silently dropping durable intents. Tests:
+`journal_replays_atomic_upserts_and_deletions_without_shutdown`,
+`torn_final_frames_are_truncated_before_later_appends`,
+`corrupt_interior_frames_and_sequence_gaps_are_errors`.
+
+A background worker rotates the journal and publishes a checkpoint after 1 MiB
+or when a non-empty journal's checkpoint reaches five minutes. It retains covered
+segments until the checkpoint rename and directory sync succeed. At 8 MiB
+(plus at most one transaction) writers wait for compaction, or fail before their
+effect if compaction failed. Failures are logged; the five-minute freshness bound
+cannot be guaranteed while checkpointing is failing. Tests:
+`checkpoint_rotation_publication_and_cleanup_keep_the_suffix`,
+`checkpoint_age_triggers_at_five_minutes_even_below_byte_threshold`,
+`hard_budget_rejects_effects_when_background_compaction_fails`.
+
+Opening a metadata-free legacy JSON store migrates it once under the same lease.
+Migration failure logs a warning and leaves the synchronous JSON writer usable;
+errors replaying an already-active journal do not fall back to a stale checkpoint.
+The initial implementation still clones and compares the in-memory state; the
+record-sized improvement is in disk writes, not CPU complexity. The test
+`lifecycle_writes_record_sized_bytes_with_8000_retained_jobs` measures actual file
+payload bytes for the same eight-transition hosted lifecycle with 8,000 retained
+jobs and 547 snapshots, reporting compaction bytes separately.
+
+The effective checkpoint plus journal holds:
 
 - `jobs`, keyed by job ID: the queue-wait limit, any pending cancellation, the
   terminal record when `ck-motor` itself ended the job (for example a refusal
@@ -178,9 +213,47 @@ TTL. A changed key or an expired entry rechecks. These entries never enter
 `state.json`; restarting the module forgets them. Tests:
 `negative_cache_is_not_persisted`, `negative_cache_rechecks_after_ttl`.
 
-There is no schema version. Unknown fields are ignored and absent attribution
-loads as none; an incompatible change needs an explicit migration. Test:
+The legacy record fields remain compatible. The optional `_journal` checkpoint
+metadata identifies format version 1, epoch, sequence and checkpoint time; old
+readers ignore it. Absent attribution loads as none. Test:
 `older_state_loads_without_attribution_and_keeps_cancel_intent`.
+
+### SUBC rollback procedure
+
+SUBC normally sends SIGTERM, waits for ck-motor to exit, and only then places the
+previous binary. SIGTERM, GOODBYE/EOF and orderly shutdown freeze durable
+mutations, join compaction and publish a current compatible `state.json` **before
+releasing the storage lease**. Export failures are logged as errors: do not
+proceed with rollback on such an error.
+
+After a crash, or if shutdown export failed, use the **new, journal-aware binary**
+while the daemon is stopped:
+
+```sh
+ck-motor store-checkpoint --root /path/to/store.db.ck-motor
+```
+
+This offline command acquires the same exclusive lease, replays the journal,
+exports current compatible JSON and exits non-zero on any export/replay/lease
+failure. Only replace the binary after exit status 0. Do not delete journal files
+or copy state.json by hand. The previous `222d833` binary cannot replay a journal.
+An abrupt stop followed by rollback **without** this command may lose up to five
+minutes of transitions, including cancellation and Run intent fences (longer if
+checkpointing was failing). A clean stop is lossless only if its checkpoint
+export succeeds: check shutdown logs for export errors rather than treating exit
+alone as proof. After a crash or failed export, require the offline command's
+exit status 0.
+On re-upgrade, metadata removed by an old writer makes its JSON authoritative;
+stale journal epochs are not replayed over that writer's changes.
+
+`python3 scripts/mixed-version.py` retains the oldest-client wire lane and builds
+the unchanged `222d833` module for rollback. Tests
+`rollback_clean_shutdown_exports_every_transition_for_222d833` and
+`rollback_offline_checkpoint_exports_crash_suffix_for_222d833` compare all job fields except the renewed `retain_until_ms` through an actual old
+reader/writer, including `pending_cancel`, `run_sent`,
+secret hashes, pending finishes, snapshots and verified tips. The offline command's
+lease and failure behavior is covered by
+`offline_checkpoint_takes_the_lease_and_fails_closed_on_export_error`.
 
 The optional direct-secret hash defaults to absent and is omitted for other
 jobs. It expires with the retained job record, not when a route disconnects.
@@ -191,8 +264,9 @@ does not recover reattachment to those jobs. Tests:
 `direct_secret_hash_survives_reopen_and_expires_with_its_job`,
 `direct_secret_reattaches_replays_and_never_leaks`.
 
-On shutdown `ck-motor` stops its SSH control master before stopping the agent
-and removing its runtime directory. A force-kill skips that cleanup: stop any
+On shutdown `ck-motor` exports its storage checkpoint, stops its SSH control
+master before stopping the agent, and removes its runtime directory. A force-kill
+skips that cleanup: stop any
 orphaned SSH master before reusing a crashed installation's storage root.
 
 ## Direct runs

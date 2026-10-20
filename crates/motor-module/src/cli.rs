@@ -55,6 +55,7 @@ usage: ck motor run [OPTIONS] -- COMMAND...
        ck motor attach JOB_ID [--secret-file PATH] [--status]
         ck motor hosted-check
         ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]
+        ck-motor store-checkpoint --root STORE_DIR
 
 Runs COMMAND on the remote build server and streams its output here.
 One word after -- is a verbatim bash command; multiple words are an argv,
@@ -1750,6 +1751,30 @@ mod shadow_report_cli_tests {
             vec!["--since", "18446744073709551615h"],
         ] {
             assert!(shadow_since(&words(&values)).is_err());
+        }
+    }
+}
+
+/// Export the complete durable store before placing a journal-unaware binary.
+/// The normal storage open owns the same exclusive lease as the daemon.
+pub fn store_checkpoint_main(args: &[String]) -> u8 {
+    if args == ["--help"] || args == ["-h"] {
+        println!("usage: ck-motor store-checkpoint --root STORE_DIR");
+        return 0;
+    }
+    let [flag, root] = args else {
+        eprintln!("usage: ck-motor store-checkpoint --root STORE_DIR");
+        return EXIT_USAGE;
+    };
+    if flag != "--root" || root.is_empty() {
+        eprintln!("usage: ck-motor store-checkpoint --root STORE_DIR");
+        return EXIT_USAGE;
+    }
+    match crate::storage::Storage::open(Path::new(root)).and_then(|store| store.shutdown()) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("ck-motor store-checkpoint: {error}; do not roll back until export succeeds");
+            1
         }
     }
 }

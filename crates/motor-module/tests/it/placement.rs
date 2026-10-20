@@ -516,9 +516,15 @@ async fn core_is_refused_exec_run() {
         .request("exec.run", serde_json::to_value(request).unwrap())
         .await;
     assert_op_refused(&reply, "motor", "prefrontal-core", "exec.run");
-    assert!(
-        !rig.root.join("state.json").exists(),
+    let stored = crate::storage::durable_value(&rig.root).unwrap();
+    assert_eq!(
+        stored["jobs"],
+        json!({}),
         "authorization must precede job creation"
+    );
+    assert_eq!(
+        stored["_journal"]["seq"], 0,
+        "initializing an empty checkpoint must not admit a mutation"
     );
     rig.stop().await;
 }
@@ -937,8 +943,7 @@ async fn scoped_jobs_persist_session_preset_and_scope_without_preset_policy() {
     assert_eq!(rig.bind(aft(), scope).await.header.ty, FrameType::Response);
     for preset in ["mason", "unknown-to-motor"] {
         let terminal = rig.run(preset).await;
-        let state: Value =
-            serde_json::from_slice(&fs::read(rig.root.join("state.json")).unwrap()).unwrap();
+        let state = crate::storage::durable_value(&rig.root).unwrap();
         let id = terminal["job_id"].as_str().unwrap();
         assert_eq!(
             state["jobs"][id]["attribution"],

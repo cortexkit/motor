@@ -493,6 +493,7 @@ async fn oldest_production_client_reads_current_module_store() {
     )
     .await;
     let terminal = super::recovery::terminal(&live);
+    motor.shutdown_storage().unwrap();
     drop(motor);
 
     let config = f.scratch.join("rollback-config.json");

@@ -555,7 +555,9 @@ async fn direct_secret_reattaches_replays_and_never_leaks() {
         !logs.text("log").is_empty(),
         "log capture must observe the handler"
     );
-    let state = fs::read_to_string(f.scratch.join("module-state/state.json")).unwrap();
+    let state = crate::storage::durable_value(&f.scratch.join("module-state"))
+        .unwrap()
+        .to_string();
     assert!(!state.contains(&secret));
     let mut agent = daemon
         .send(

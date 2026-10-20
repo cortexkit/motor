@@ -383,6 +383,14 @@ impl Handler {
         }
         if let Ok(motor) = self.initialized() {
             motor.shutdown_shadows().await;
+            let motor = motor.clone();
+            match tokio::task::spawn_blocking(move || motor.shutdown_storage()).await {
+                Ok(Ok(())) => {}
+                result => tracing::error!(
+                    ?result,
+                    "storage shutdown export failed; run ck-motor store-checkpoint before rollback"
+                ),
+            }
         }
         if let Some(ssh) = self.ssh.get() {
             ssh.shutdown().await;
@@ -653,38 +661,37 @@ impl Handler {
                     request.timeout,
                     self.config.direct_exec_max_timeout_secs,
                 ) {
-                    let stream = motor.refuse_before_start(
+                    let stream = motor.refuse_authorized(
                         RefusalReason::RequestRejected,
                         Some(format!("{DIRECT_TIMEOUT_REFUSED}: {detail}")),
+                        Some(secret.hash()),
                     )?;
-                    motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
+
                     pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
                 let _permit = match RunPermit::acquire(&self.run_count) {
                     Some(permit) => permit,
                     None => {
-                        let stream = motor.refuse_capacity()?;
-                        motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
+                        let stream = motor.refuse_authorized(
+                            RefusalReason::RunnerFull,
+                            None,
+                            Some(secret.hash()),
+                        )?;
+
                         pump_direct_secret(&ctx, stream, Some(secret)).await?;
                         return Ok(HandlerOutcome::Streamed);
                     }
                 };
-                let stream = if spill.hosted {
-                    motor.run_direct_hosted(
-                        request,
-                        self.attribution(route, envelope.preset),
-                        returns,
-                    )?
-                } else {
-                    motor.run_direct_with_spill(
-                        request,
-                        self.attribution(route, envelope.preset),
-                        returns,
-                        spill.allow_spill,
-                    )?
-                };
-                motor.set_direct_secret_hash(stream.job_id, secret.hash())?;
+                let stream = motor.run_direct_authorized(
+                    request,
+                    self.attribution(route, envelope.preset),
+                    returns,
+                    spill.allow_spill,
+                    spill.hosted,
+                    secret.hash(),
+                )?;
+
                 self.direct_jobs
                     .lock()
                     .unwrap()

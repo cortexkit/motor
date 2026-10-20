@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", motor_module::cli::HEADLINE);
             return Ok(());
         }
+        Some("store-checkpoint") => {
+            let _ = motor_module::logging::init();
+            std::process::exit(motor_module::cli::store_checkpoint_main(&args[1..]).into())
+        }
         Some("run") => std::process::exit(motor_module::cli::main(&args[1..]).await.into()),
         Some("hosted-check") => std::process::exit(
             motor_module::cli::hosted_check_main(&args[1..])
