@@ -3,26 +3,15 @@
   "ubuntu": "24.04",
   "ubuntu_archive": "https://archive.ubuntu.com/ubuntu",
   "ubuntu_security": "https://security.ubuntu.com/ubuntu",
-  "rustup": "1.28.2",
-  "rust_default": "1.99.0",
-  "rust_toolchains": ["1.89.0", "1.91.0", "1.96.0", "1.99.0"],
-  "node": "24.21.0",
-  "bun": "1.4.2",
-  "nats": "2.15.0",
   "systemd_min": 255,
   "state_gib": 64,
   "probe_port": 19443,
-  "pnpm": "11.1.2",
-  "packages": [
-    "python3", "libsqlite3-dev", "sqlite3", "sudo", "acl", "xfsprogs",
-    "iproute2", "nftables", "util-linux", "procps", "build-essential",
-    "clang", "lld", "pkg-config", "libssl-dev", "git", "rsync", "curl",
-    "ca-certificates", "unzip", "xz-utils", "patch", "ufw"
-  ],
   "runner_inputs_sha256": {
-    "script/runner/tools.txt": "a24145ef770f822c73ac43ee4beb0e63f98bfa627bf7e32e5c6877824924e7ee",
-    "script/runner/install-tools.sh": "4e7cc41499433a0a90ce448a558d05a8dab1c9d51a96f809dbdb87c230933a37",
-    "script/runner/build-sccache.sh": "35e89b323cd3914279fa772052ed6992fb271231c5cece7a6fe683fa38229541",
-    "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870"
+    "script/runner/tools.txt": "971d6fc20abb8d76c5397803e90e7f58f0edb916c254a5b3ba4427dbc29213a1",
+    "script/runner/install-tools.sh": "3359904a3fd8984e665eaf5e4a44c60f7650e1adb1bee54e3a385a65487f0d98",
+    "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
+    "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
+    "script/runner/toolchain-parity.py": "45a19d1fb1645436aecf18a2716a636b5924ac01585fc9466c59f8c0ecddad12",
+    "script/runner/toolchain.json": "063341bc7d04241cfaad8eb4a867b9606c57e72c3c01b0db9a2882a1c239826d"
   }
 }

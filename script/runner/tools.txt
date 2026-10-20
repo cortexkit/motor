@@ -1,14 +1,13 @@
-# Cargo tools to preinstall in the runner's configured shared CARGO_HOME/bin.
+# Cargo tools are pinned in toolchain.json, the runner/Boat parity manifest.
 # Offline jobs cannot `cargo install`; list required tools here and install
-# them with install-tools.sh before admitting jobs.
+# them with install-tools.sh before admitting jobs. This file describes their
+# prerequisites; it is not a second version catalogue.
 #
-# One tool per line:
-#   <crate> <version>
-#   <crate> git=<url> rev=<full sha> [default]
+# cargo_installs entries specify a crate and either a version or git/rev pair.
 # A git tool is installed once per revision, because repositories pin different
 # revisions and their outputs differ between them. Each binary is reachable as
 # <bin>-<first 8 hex of rev>; the line marked `default` also owns the plain
-# <bin> name. Mark at most one line per crate as default.
+# <bin> name. Mark at most one revision per crate as default.
 #
 # Optional prerequisites not managed here (OS packages or non-Cargo installs):
 # - wasm-opt: binaryen, for repositories that build WebAssembly.
@@ -50,11 +49,8 @@
 # - Pinned Rust toolchains, through `rustup toolchain install <version> --profile
 #   minimal --component clippy --component rustfmt`. The same read-only rule
 #   applies: preinstall every toolchain required by a repository's pins.
-cargo-nextest 0.9.138
 # Optional integration tests using NATS require nats-server 2.10 or later,
 # installed on a PATH visible to the test environment.
-wasm-bindgen-cli 0.2.126
-worker-build 0.8.7
 # cortexkit-mutate 0.8.0, 0.9.0, 0.9.1, 0.9.3, 0.9.5, 0.9.8, 0.12.0, 0.12.1, 0.12.4 and 0.12.6;
 # repositories pin these in CK_MUTATE_REV. Before 0.9.5 the tool takes its lock
 # under .git, which is read-only in remote jobs, so only 0.9.5 and later run
@@ -62,13 +58,3 @@ worker-build 0.8.7
 # a catalogue split into a mutations.d/ directory, which 0.9.8 can't read. It
 # still reads a single mutations.toml, but since 0.10.0 it refuses duplicate
 # control ids, even within one file.
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=46cc166b0df2edcfd14b3eb54ed6eeac588fed69
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=0097d269a4c409db13306a11fc2c504057629791
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=c1591d4a76fa3d3a7367237922b0bca5214dbf11
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=73c7e66145e131eadffdd874c82d93548868b668
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=be120e9254c4972191b39b2e6814987918206afc
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=9d6b663dac487bb982c7bfd18a96eee2292164ad default
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=85c8b577795d556fb27e54b548f06ea913d8b337
-cortexkit-mutate git=https://github.com/cortexkit/commons rev=0b3bc096880e22ab43bec18eb6719a50fc59c270

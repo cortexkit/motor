@@ -29,6 +29,8 @@ if provider_spec is None or provider_spec.loader is None:
 provider = importlib.util.module_from_spec(provider_spec)
 provider_spec.loader.exec_module(provider)
 PORT = 19443
+PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
+PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 ENV_NAMES = "import os,json; print(json.dumps({k: True for k in os.environ if k == 'ASCII_TOKEN' or k.startswith('BOAT_')}))"
 POLICY = {"allowtcpforwarding": "local", "permittty": "no", "allowagentforwarding": "no",
           "x11forwarding": "no", "permittunnel": "no"}
@@ -432,6 +434,22 @@ def prepared_image_digest(revision, inventory):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',',':')).encode()).hexdigest()
 
 
+def parity_source(job=False):
+    # Run the operator checkout's checker, not an image's possibly stale checker
+    # or its build-time inventory. Every phase measures the current filesystem.
+    return ("import json\n"
+            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py'}\n"
+            f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
+            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r})\n"
+            "print(json.dumps(result))\n")
+
+
+def parity_passed(report):
+    manifest = json.loads(PARITY_MANIFEST.read_text())
+    expected = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return report.get('passed') is True and report.get('errors') == [] and report.get('manifest_sha256') == expected
+
+
 def snapshot_metadata(snapshot):
     if snapshot.get('status') != 'ready' or not isinstance(snapshot.get('snapshotId'), str) or type(snapshot.get('sizeBytes')) is not int:
         raise ValueError('ready named snapshot lacks documented artifact id/size')
@@ -715,6 +733,9 @@ class RunnerHost:
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
+        record['toolchain_parity'] = json.loads(self.execute(
+            sid, "sudo -n python3 -c " + shlex.quote(parity_source()))['stdout'])
+        self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
         listeners = host["listeners"]["stdout"]
         self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
                    not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
@@ -739,7 +760,8 @@ class RunnerHost:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
                 jobs = [("node_modules_first", NODE_CHECK), ("node_modules_reuse", NODE_CHECK),
                                        ("exit", "printf 'boat-round-trip\\n'; exit 23"),
-                                       ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
+                                        ("rust", 'cargo +1.99.0 build --offline --locked && "$CARGO_TARGET_DIR/debug/boat-hello"'),
+                                        ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(job=True))),
                                        ("isolation", "python3 -c " + shlex.quote(job_script))]
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))
@@ -756,7 +778,10 @@ class RunnerHost:
                     record[name]["result"] = parsed
                     if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
                         self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
-                    if name == "isolation":
+                    if name == 'job_toolchain_parity':
+                        report = json.loads(parsed['stdout'])
+                        self.check(label + '.' + name, parsed['code'] == 0 and parity_passed(report), report)
+                    elif name == "isolation":
                         for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
                     else:

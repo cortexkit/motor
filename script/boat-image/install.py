@@ -5,6 +5,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,12 +20,23 @@ import urllib.request
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
+PARITY_PATH = ROOT / "script/runner/toolchain.json"
+parity_spec = importlib.util.spec_from_file_location("toolchain_parity", ROOT / "script/runner/toolchain-parity.py")
+if parity_spec is None or parity_spec.loader is None:
+    raise ImportError("cannot load toolchain parity checker")
+parity = importlib.util.module_from_spec(parity_spec)
+parity_spec.loader.exec_module(parity)
 BUILD = Path("/srv/build")
 STATE = Path("/var/lib/motor-boat")
 APT_LISTS = Path('/var/lib/apt/lists/motor-boat')
 APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourceparts=/etc/apt/motor-boat.sources.d',
                '-o', 'Dir::State::lists=' + str(APT_LISTS), '-o', 'Acquire::AllowInsecureRepositories=false',
                '-o', 'APT::Get::AllowUnauthenticated=false']
+RUNNER_INPUTS = (
+    'script/runner/tools.txt', 'script/runner/install-tools.sh',
+    'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
+    'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
+)
 
 
 def run(*args, capture=False):
@@ -122,11 +134,10 @@ def validate(pins):
         raise ValueError('only official signed Ubuntu archive sources are allowed')
     if pins["probe_port"] == 9443 or not 1024 <= pins["probe_port"] <= 65535:
         raise ValueError("probe bridge must not claim the endpoint port")
-    for key in ("rustup", "rust_default", "node", "bun", "nats", "pnpm"):
-        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pins[key]):
-            raise ValueError(f"unpinned version: {key}")
-    if not {"1.99.0", "1.89.0"} <= set(pins["rust_toolchains"]):
-        raise ValueError("missing fleet Rust toolchains")
+    manifest = json.loads(PARITY_PATH.read_text())
+    parity.validate(manifest)
+    if set(pins['runner_inputs_sha256']) != set(RUNNER_INPUTS):
+        raise ValueError('runner input pins must cover the parity manifest and complete installer inputs')
     for name, expected in pins["runner_inputs_sha256"].items():
         if digest(ROOT / name) != expected:
             raise ValueError(f"runner input changed without refreshing its pin: {name}")
@@ -166,24 +177,59 @@ def state(pins):
             raise ValueError("FICLONE content mismatch")
 
 
-def tools(pins):
+def install_rust(manifest, installer):
+    run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
+    for line in run('rustup', 'toolchain', 'list', capture=True).splitlines():
+        if line.strip() == 'no installed toolchains':
+            continue
+        name = line.split()[0]
+        if name not in manifest['rust_toolchains']:
+            run('rustup', 'toolchain', 'uninstall', name)
+    for toolchain, spec in manifest["rust_toolchains"].items():
+        args = ["rustup", "toolchain", "install", toolchain, "--profile", manifest["rust_profile"]]
+        for component in spec["components"]:
+            if not component.startswith("rust-std-"):
+                args.extend(("--component", component))
+        for target in spec["targets"]:
+            args.extend(("--target", target))
+        run(*args)
+        installed = run('rustup', 'component', 'list', '--installed', '--toolchain', toolchain, capture=True)
+        for component in set(installed.splitlines()) - set(spec['components']):
+            run('rustup', 'component', 'remove', '--toolchain', toolchain, component)
+    run("rustup", "default", manifest["rust_default"])
+
+
+def gnu_aliases(manifest):
+    for name, destination in manifest["gnu_coreutils"].items():
+        target = Path(destination).with_name(name.removeprefix("gnu"))
+        if not target.is_file():
+            raise ValueError("missing GNU coreutils executable: " + str(target))
+        alias = Path(destination)
+        if alias.exists() or alias.is_symlink():
+            if alias.resolve() != target.resolve():
+                raise ValueError("refusing to overwrite coreutils alias: " + str(alias))
+        else:
+            alias.symlink_to(target)
+
+
+def tools(manifest):
+    pins = {name: spec["version"].removeprefix("v").removeprefix("nats-server: v")
+            for name, spec in manifest["tools"].items() if "version" in spec}
+    pins["rustup"] = manifest["rustup"]
+    pins["nats"] = pins["nats-server"]
     (BUILD / "downloads").mkdir(parents=True, exist_ok=True)
     (BUILD / "tmp").mkdir(exist_ok=True)
     os.environ.update(CARGO_HOME="/srv/build/cargo-home", RUSTUP_HOME="/home/ubuntu/.rustup",
                       TMPDIR="/srv/build/tmp", CARGO_TARGET_DIR="/srv/build/target",
                       RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="", GIT_TERMINAL_PROMPT="0",
                       CARGO_BUILD_JOBS="4",
-                      PATH="/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+                      PATH="/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     rustup = (f"https://static.rust-lang.org/rustup/archive/{pins['rustup']}/"
               "x86_64-unknown-linux-gnu/rustup-init")
     path = BUILD / "downloads/rustup-init"
     download(rustup, path, urllib.request.urlopen(rustup + ".sha256", timeout=60).read().decode().split()[0])
     path.chmod(0o755)
-    run(str(path), "-y", "--no-modify-path", "--profile", "minimal", "--default-toolchain", pins["rust_default"])
-    for toolchain in pins["rust_toolchains"]:
-        run("rustup", "toolchain", "install", toolchain, "--profile", "minimal",
-            "--component", "clippy", "--component", "rustfmt")
-    run("rustup", "default", pins["rust_default"])
+    install_rust(manifest, path)
     node = published(f"https://nodejs.org/dist/v{pins['node']}/", f"node-v{pins['node']}-linux-x64.tar.xz")
     run("tar", "-xJf", str(node), "--strip-components=1", "-C", "/usr/local")
     metadata = json.loads(urllib.request.urlopen(f"https://registry.npmjs.org/pnpm/{pins['pnpm']}", timeout=60).read())
@@ -197,22 +243,35 @@ def tools(pins):
     run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts", str(pnpm))
     bun = published(f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/", "bun-linux-x64.zip")
     run("unzip", "-qo", str(bun), "-d", str(BUILD / "downloads"))
-    shutil.copy2(BUILD / "downloads/bun-linux-x64/bun", "/usr/local/bin/bun")
-    Path("/usr/local/bin/bun").chmod(0o755)
+    bun_path = Path(manifest["tools"]["bun"]["path"])
+    bun_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(BUILD / "downloads/bun-linux-x64/bun", bun_path)
+    bun_path.chmod(0o755)
     nats = published(f"https://github.com/nats-io/nats-server/releases/download/v{pins['nats']}/",
                      f"nats-server-v{pins['nats']}-linux-amd64.tar.gz", "SHA256SUMS")
     run("tar", "-xzf", str(nats), "-C", str(BUILD / "downloads"))
     run("install", "-m", "0755", str(BUILD / f"downloads/nats-server-v{pins['nats']}-linux-amd64/nats-server"),
         "/usr/local/bin/nats-server")
+    for name in ("gcc", "g++"):
+        run("update-alternatives", "--set", "x86_64-w64-mingw32-" + name,
+            "/usr/bin/x86_64-w64-mingw32-" + name + "-win32")
+    gnu_aliases(manifest)
     # Fail anonymously instead of forwarding an operator's repository credentials.
     run("git", "-c", "credential.helper=", "ls-remote", "https://github.com/cortexkit/commons", "HEAD")
     run("bash", str(ROOT / "script/runner/install-tools.sh"))
     marker = BUILD / "sccache-inputs.sha256"
+    artifacts_path = BUILD / 'sccache-artifacts.json'
     inputs = digest(ROOT / "script/runner/build-sccache.sh") + digest(
         ROOT / "script/runner/patches/sccache-0.18.0-read-only-hits.patch")
-    if not marker.exists() or marker.read_text() != inputs:
+    artifacts = json.loads(artifacts_path.read_text()) if artifacts_path.is_file() else {}
+    binary_hashes = {name: digest(BUILD / 'cargo-home/bin' / name) if (BUILD / 'cargo-home/bin' / name).is_file() else None
+                     for name in manifest['sccache']['build_server_sha256']}
+    if (not marker.exists() or marker.read_text() != inputs or artifacts.get('inputs_sha256') != inputs
+            or artifacts.get('binaries') != binary_hashes or not all(binary_hashes.values())):
         run("sh", str(ROOT / "script/runner/build-sccache.sh"))
         marker.write_text(inputs)
+        artifacts_path.write_text(json.dumps({'inputs_sha256': inputs, 'binaries': {
+            name: digest(BUILD / 'cargo-home/bin' / name) for name in binary_hashes}}, indent=2) + '\n')
 
 
 def target_directories():
@@ -314,6 +373,7 @@ def main():
     if os.geteuid() != 0:
         parser.error("apply as root")
     pins = json.loads((HERE / "pins.json").read_text())
+    manifest = json.loads(PARITY_PATH.read_text())
     validate(pins)
     if args.apt_preflight_only:
         print(json.dumps(archive_preflight(pins)))
@@ -344,13 +404,17 @@ def main():
     releases = release_manifest()
     # Keep provider-managed init and SSH binaries; only our SSH drop-in is installed.
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
-    run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *pins["packages"])
+    packages = manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["boat"]
+    run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
     target_directories()
     accounts()
     run('/usr/bin/python3', str(HERE / 'motor-boat-credentials.py'), '--output', '/srv/build/boat-provider-audit.json')
     # Check the administrative path and firewall transaction before long tool builds.
     run('/usr/bin/python3', str(HERE / 'motor-boat-network'), '--check', '--template', str(ROOT / 'script/runner/motor-net.nft'))
-    tools(pins)
+    tools(manifest)
+    parity_result = parity.check(manifest, role="boat")
+    if not parity_result["passed"]:
+        raise ValueError("toolchain parity failed: " + json.dumps(parity_result["errors"]))
     os.chdir(ROOT)
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
     for binary in ('motor-runner', 'motor-host'):
@@ -365,15 +429,12 @@ def main():
         "node": ["node", "--version"], "bun": ["bun", "--version"],
         "pnpm": ["pnpm", "--version"],
         "nats": ["nats-server", "--version"], "python": ["python3", "--version"],
-        "sccache": ["sccache", "--version"], "systemd": ["systemctl", "--version"],
+        "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
                      packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
-                     provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))
-    for key, expected in {"node": "v" + pins["node"], "bun": pins["bun"], "pnpm": pins["pnpm"],
-                          "nats": "nats-server: v" + pins["nats"], "sccache": "sccache 0.18.0"}.items():
-        if inventory[key] != expected:
-            raise ValueError(f"installed {key} differs from pin: {inventory[key]}")
+                      parity=parity_result,
+                      provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))
     (STATE / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
     print(json.dumps(inventory))
 

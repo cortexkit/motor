@@ -23,6 +23,35 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_parity_report_cannot_qualify_on_missing_target_or_stale_manifest(self):
+        manifest = json.loads(host.PARITY_MANIFEST.read_text())
+        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        report = {'passed': True, 'errors': [], 'manifest_sha256': digest}
+        self.assertTrue(host.parity_passed(report))
+        self.assertFalse(host.parity_passed(dict(report, passed=False, errors=['wasm32-unknown-unknown missing'])))
+        self.assertFalse(host.parity_passed(dict(report, manifest_sha256='old image manifest')))
+        self.assertFalse(host.parity_passed({}))
+
+    def test_parity_checker_remeasures_live_files_and_uses_operator_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp, 'wasm32-unknown-unknown')
+            target.mkdir()
+            checker = Path(tmp, 'checker.py')
+            checker.write_text('from pathlib import Path\ndef check(manifest, role, job):\n'
+                               f'    return {{"passed": Path({str(target)!r}).is_dir(), "job": job}}\n')
+            with patch.object(host, 'PARITY_SCRIPT', checker):
+                source = host.parity_source(job=True)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(source, {})
+            self.assertTrue(json.loads(output.getvalue())['passed'])
+            target.rmdir()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(source, {})
+            self.assertFalse(json.loads(output.getvalue())['passed'])
+            phase = __import__('inspect').getsource(host.RunnerHost.phase)
+            self.assertIn("label + '.toolchain_parity'", phase)
+            self.assertIn('("job_toolchain_parity", "cargo --version', phase)
+
     def test_idle_reclaim_seeds_missing_state_via_service_and_observes_reclaim(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp, 'reclaim')

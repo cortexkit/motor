@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install every tool pinned in tools.txt into the build server's shared Cargo
+# Install every Cargo tool pinned in toolchain.json into the shared Cargo
 # home. Run on the server as ubuntu, from a motor checkout:
 #   bash script/runner/install-tools.sh
 # cargo skips a tool already installed at the pinned version, so rerunning is
@@ -23,6 +23,14 @@ place() {
   mv -fT "$CARGO_HOME/bin/.$2.tmp" "$CARGO_HOME/bin/$2"
 }
 
+tools=$(python3 -c '
+import json, sys
+for tool in json.load(open(sys.argv[1]))["cargo_installs"]:
+    if "git" in tool:
+        print(tool["crate"], "git=" + tool["git"], "rev=" + tool["rev"], "default" if tool.get("default") else "")
+    else:
+        print(tool["crate"], tool["version"])
+' "$here/toolchain.json")
 while read -r crate spec rev flag; do
   case "$crate" in '' | '#'*) continue ;; esac
   case "$spec" in
@@ -41,5 +49,5 @@ while read -r crate spec rev flag; do
       cargo install --locked --version "=$spec" "$crate"
       ;;
   esac
-done < "$here/tools.txt"
+done <<< "$tools"
 ls -l "$CARGO_HOME/bin"
