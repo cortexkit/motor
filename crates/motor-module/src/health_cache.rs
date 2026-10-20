@@ -1,18 +1,31 @@
 use motor_protocol::RunnerHealth;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subc_client_rs::{HealthReport, HealthStatus};
 
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 pub(crate) const SAMPLE_TIMEOUT: Duration = Duration::from_secs(10);
 const STALE_AFTER: Duration = Duration::from_secs(120);
 const FAILURE_LIMIT: u32 = 3;
+const HISTORY_LIMIT: usize = 180;
+const MINUTE_MS: u64 = 60_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryPoint {
+    minute_ms: u64,
+    permits_held: u32,
+    permits_cap: u32,
+    queue_depth: u32,
+    queue_p90_ms: u64,
+}
 
 pub(crate) struct HealthCache {
     created: Instant,
     last_success: Option<Instant>,
     sample: Option<RunnerHealth>,
     failures: u32,
+    history: VecDeque<HistoryPoint>,
     pub(crate) windows: Vec<Value>,
 }
 
@@ -23,6 +36,7 @@ impl Default for HealthCache {
             last_success: None,
             sample: None,
             failures: 0,
+            history: VecDeque::new(),
             windows: Vec::new(),
         }
     }
@@ -30,6 +44,13 @@ impl Default for HealthCache {
 
 impl HealthCache {
     pub(crate) fn update(&mut self, sample: Option<RunnerHealth>, now: Instant) {
+        self.update_at(sample, now, unix_ms_now());
+    }
+
+    fn update_at(&mut self, sample: Option<RunnerHealth>, now: Instant, unix_ms: u64) {
+        if let Some(sample) = sample.as_ref() {
+            self.record_history(sample, unix_ms);
+        }
         if sample.is_some() {
             self.last_success = Some(now);
             self.failures = 0;
@@ -40,14 +61,30 @@ impl HealthCache {
     }
 
     pub(crate) fn report(&self, now: Instant) -> HealthReport {
+        self.report_at(now, unix_ms_now())
+    }
+
+    fn report_at(&self, now: Instant, unix_ms: u64) -> HealthReport {
         let age = now.saturating_duration_since(self.last_success.unwrap_or(self.created));
         let degraded = age >= STALE_AFTER || self.failures >= FAILURE_LIMIT;
+        let newest_minute = minute_start_ms(unix_ms);
+        let oldest_minute = newest_minute.saturating_sub((HISTORY_LIMIT as u64 - 1) * MINUTE_MS);
         let mut metrics = json!({
             "build_server": null,
             "queue_wait_1h": null,
             "top_repos": null,
             "sample_age_ms": self.last_success.map(|_| age.as_millis() as u64),
             "headline": ["build_server", "queue_wait_1h"],
+            "history": self.history.iter()
+                .filter(|point| point.minute_ms >= oldest_minute && point.minute_ms <= newest_minute)
+                .map(|point| json!({
+                    "minute_ms": point.minute_ms,
+                    "permits_held": point.permits_held,
+                    "permits_cap": point.permits_cap,
+                    "queue_depth": point.queue_depth,
+                    "queue_p90_ms": point.queue_p90_ms,
+                }))
+                .collect::<Vec<_>>(),
         });
         if !self.windows.is_empty() {
             metrics["windows_runners"] = json!(self.windows);
@@ -123,6 +160,43 @@ impl HealthCache {
             metrics: Some(metrics),
         }
     }
+
+    fn record_history(&mut self, sample: &RunnerHealth, unix_ms: u64) {
+        let point = HistoryPoint {
+            minute_ms: minute_start_ms(unix_ms),
+            // Missing optional permit or queue-wait values from older runners are recorded as zero.
+            permits_held: sample.permits_held.unwrap_or_default(),
+            permits_cap: sample.permits_cap.unwrap_or_default(),
+            queue_depth: sample.queue_depth,
+            queue_p90_ms: sample
+                .queue_wait_1h
+                .as_ref()
+                .map(|wait| wait.p90_ms)
+                .unwrap_or_default(),
+        };
+        match self
+            .history
+            .binary_search_by_key(&point.minute_ms, |stored| stored.minute_ms)
+        {
+            Ok(index) => self.history[index] = point,
+            Err(index) => self.history.insert(index, point),
+        }
+        while self.history.len() > HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+    }
+}
+
+fn minute_start_ms(unix_ms: u64) -> u64 {
+    unix_ms / MINUTE_MS * MINUTE_MS
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn duration(ms: u64) -> String {
@@ -188,9 +262,10 @@ mod tests {
     #[test]
     fn busy_server_is_healthy_and_metrics_have_cli_shape() {
         let now = Instant::now();
+        let unix_ms = 1_234_567;
         let mut cache = HealthCache::default();
-        cache.update(Some(sample()), now);
-        let report = cache.report(now + Duration::from_millis(1500));
+        cache.update_at(Some(sample()), now, unix_ms);
+        let report = cache.report_at(now + Duration::from_millis(1500), unix_ms + 1500);
         assert_eq!(report.status, HealthStatus::Ok);
         assert_eq!(
             report.detail.as_deref(),
@@ -206,8 +281,104 @@ mod tests {
                     {"name": "repo-6", "vcpu_hours": 6.0}, {"name": "repo-5", "vcpu_hours": 5.0},
                     {"name": "repo-4", "vcpu_hours": 4.0}, {"name": "repo-3", "vcpu_hours": 3.0},
                     {"name": "repo-2", "vcpu_hours": 2.0}],
-                "sample_age_ms": 1500, "headline": ["build_server", "queue_wait_1h"]
+                "sample_age_ms": 1500, "headline": ["build_server", "queue_wait_1h"],
+                "history": [{"minute_ms": 1_200_000, "permits_held": 12, "permits_cap": 80,
+                    "queue_depth": 4, "queue_p90_ms": 190000}]
             })
+        );
+    }
+
+    #[test]
+    fn history_keeps_the_last_sample_in_each_minute() {
+        let now = Instant::now();
+        let mut cache = HealthCache::default();
+        let start_ms = MINUTE_MS;
+        let mut first = sample();
+        first.queue_depth = 2;
+        first.permits_held = Some(3);
+        first.queue_wait_1h.as_mut().unwrap().p90_ms = 100;
+        cache.update_at(Some(first), now, start_ms + 1_000);
+
+        let mut last = sample();
+        last.queue_depth = 7;
+        last.permits_held = Some(5);
+        last.queue_wait_1h.as_mut().unwrap().p90_ms = 250;
+        cache.update_at(Some(last), now + Duration::from_secs(20), start_ms + 50_000);
+
+        let next_minute = sample();
+        cache.update_at(
+            Some(next_minute),
+            now + Duration::from_secs(60),
+            start_ms + MINUTE_MS,
+        );
+        let history = cache
+            .report_at(now + Duration::from_secs(60), start_ms + 2 * MINUTE_MS)
+            .metrics
+            .unwrap()["history"]
+            .clone();
+        assert_eq!(
+            history,
+            json!([
+                {"minute_ms": 60_000, "permits_held": 5, "permits_cap": 80,
+                    "queue_depth": 7, "queue_p90_ms": 250},
+                {"minute_ms": 120_000, "permits_held": 12, "permits_cap": 80,
+                    "queue_depth": 4, "queue_p90_ms": 190_000}
+            ])
+        );
+    }
+
+    #[test]
+    fn history_is_bounded_to_180_points_and_evicts_the_oldest() {
+        let now = Instant::now();
+        let mut cache = HealthCache::default();
+        for minute in 0..=HISTORY_LIMIT {
+            cache.update_at(
+                Some(sample()),
+                now + Duration::from_secs(minute as u64 * 60),
+                minute as u64 * MINUTE_MS,
+            );
+        }
+        assert_eq!(cache.history.len(), HISTORY_LIMIT);
+        assert_eq!(cache.history.front().unwrap().minute_ms, MINUTE_MS);
+        let history = cache
+            .report_at(now, HISTORY_LIMIT as u64 * MINUTE_MS)
+            .metrics
+            .unwrap()["history"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(history.len(), HISTORY_LIMIT);
+        assert_eq!(history.first().unwrap()["minute_ms"], MINUTE_MS);
+        assert_eq!(
+            history.last().unwrap()["minute_ms"],
+            json!(HISTORY_LIMIT as u64 * MINUTE_MS)
+        );
+    }
+
+    #[test]
+    fn history_leaves_a_gap_for_a_minute_without_a_successful_sample() {
+        let now = Instant::now();
+        let mut cache = HealthCache::default();
+        cache.update_at(Some(sample()), now, 1_000);
+        cache.update_at(None, now + Duration::from_secs(60), MINUTE_MS + 1_000);
+        cache.update_at(
+            Some(sample()),
+            now + Duration::from_secs(120),
+            2 * MINUTE_MS + 1_000,
+        );
+        let history = cache
+            .report_at(now + Duration::from_secs(120), 3 * MINUTE_MS)
+            .metrics
+            .unwrap()["history"]
+            .clone();
+        assert_eq!(
+            history,
+            json!([
+                {"minute_ms": 0, "permits_held": 12, "permits_cap": 80,
+                    "queue_depth": 4, "queue_p90_ms": 190_000},
+                {"minute_ms": 2 * MINUTE_MS, "permits_held": 12, "permits_cap": 80,
+                    "queue_depth": 4, "queue_p90_ms": 190_000}
+            ])
         );
     }
 
