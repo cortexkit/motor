@@ -296,14 +296,31 @@ impl Heartbeats {
                 != Some(&lifecycle_state(host.heartbeat(now_ms, memory, healthy)))
         };
         if due || changed {
+            let previous_health = healthy;
             healthy = true;
             for tenant in tenants {
-                let ready = self
-                    .runtime
-                    .host
-                    .lock()
-                    .expect("host lock")
-                    .is_ready(&tenant);
+                // Snapshot I/O can exceed an ordinary helper RPC deadline.
+                // Publish lifecycle state without queueing a stale adopt behind
+                // the same tenant's suspend/wake/administrative operation.
+                let operations = self.runtime.tenant_operations(&tenant)?;
+                let _operation = match operations.try_lock() {
+                    Ok(operation) => operation,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        healthy &= previous_health;
+                        continue;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        anyhow::bail!("tenant operations lock poisoned")
+                    }
+                };
+                let ready = {
+                    let host = self.runtime.host.lock().expect("host lock");
+                    if host.is_suspending(&tenant) {
+                        healthy &= previous_health;
+                        continue;
+                    }
+                    host.is_ready(&tenant)
+                };
                 match self.runtime.control.adopt(&tenant) {
                     Ok(false) if ready => self
                         .runtime

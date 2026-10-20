@@ -379,7 +379,7 @@ impl Runtime {
         self.start_events(tenant.to_owned());
         Ok(())
     }
-    fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
+    pub(crate) fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
         self.tenant_operations
             .get(tenant)
             .cloned()
