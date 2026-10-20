@@ -62,7 +62,68 @@ for unit in ('motor-boat-restored.service','motor-boat-storage.service',r'var-li
 print(json.dumps(out))
 '''
 
-JOB = provider.ACCESS_SOURCE + r'''
+EXEC_PROBE = r'''
+import os, pathlib, shutil, subprocess, tempfile
+
+def execution_capabilities():
+    def command(argv):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+            return {'exit_code':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return {'error':str(error), 'errno':getattr(error, 'errno', None)}
+
+    def succeeded(result, output):
+        return result.get('exit_code') == 0 and result.get('stdout', '').strip() == output
+
+    tmp = os.environ.get('TMPDIR')
+    bun = shutil.which('bun')
+    if bun:
+        bun = os.path.abspath(bun)
+    mounts = {}
+    for name, path in [('TMPDIR', tmp), ('/tmp', '/tmp'), ('bun', bun)]:
+        mounts[name] = {'path':path, 'resolved':os.path.realpath(path) if path else None,
+                        'mount':command(['findmnt', '--json', '--target', path, '--output', 'TARGET,SOURCE,FSTYPE,OPTIONS']) if path else {'error':'path unavailable'}}
+    result = {'tmpdir':tmp, 'bun':bun, 'mounts':mounts,
+              'b_bin_sh':command(['/bin/sh', '-c', 'printf boat-sh-ok']),
+              'a_tmpdir':{}, 'c_bun_shebang':{}}
+    try:
+        if not tmp:
+            raise OSError('TMPDIR is unset')
+        with tempfile.TemporaryDirectory(prefix='boat-exec-', dir=tmp) as directory:
+            script = pathlib.Path(directory)/'shell-script'
+            linked = script.with_name('shell-script-link')
+            script.write_text('#!/bin/sh\nprintf boat-tmp-ok\n')
+            script.chmod(0o755)
+            result['a_tmpdir']['exec'] = command([str(script)])
+            try:
+                os.link(script, linked)
+                result['a_tmpdir']['hardlink'] = {'same_inode':script.stat().st_ino == linked.stat().st_ino}
+                result['a_tmpdir']['link_exec'] = command([str(linked)])
+            except OSError as error:
+                result['a_tmpdir']['hardlink'] = {'error':str(error), 'errno':error.errno}
+            if bun:
+                script = script.with_name('bun-script')
+                shebang = '#!' + bun + '\n'
+                script.write_text(shebang + "console.log('boat-bun-ok');\n")
+                script.chmod(0o755)
+                result['c_bun_shebang'] = {'shebang':shebang.strip(), 'shebang_bytes':len(shebang.encode()), 'exec':command([str(script)])}
+            else:
+                result['c_bun_shebang'] = {'error':'bun not found on PATH'}
+    except OSError as error:
+        result['a_tmpdir']['error'] = str(error)
+        result['c_bun_shebang'].setdefault('error', 'cannot create shebang script in TMPDIR: ' + str(error))
+    a = result['a_tmpdir']
+    result['checks'] = {
+        'a_tmpdir_hardlink_exec': a.get('hardlink', {}).get('same_inode') is True and all(succeeded(a.get(key, {}), 'boat-tmp-ok') for key in ('exec', 'link_exec')),
+        'b_bin_sh': succeeded(result['b_bin_sh'], 'boat-sh-ok'),
+        'c_bun_shebang': succeeded(result['c_bun_shebang'].get('exec', {}), 'boat-bun-ok'),
+    }
+    result['failures'] = [name for name, passed in result['checks'].items() if not passed]
+    return result
+'''
+
+JOB = provider.ACCESS_SOURCE + EXEC_PROBE + r'''
 import errno, json, os, pathlib, pwd, subprocess
 cg = pathlib.Path('/sys/fs/cgroup') / pathlib.Path('/proc/self/cgroup').read_text().strip().split('0::',1)[1].lstrip('/')
 shm = pathlib.Path('/dev/shm/boat-host-canary')
@@ -101,6 +162,7 @@ data['process_visibility'] = {'proc':visible, 'ps':{'exit_code':ps.returncode,'r
 status = pathlib.Path('/proc/self/status').read_text()
 data['status_security'] = {key:next(line.split()[1] for line in status.splitlines() if line.startswith(key+':')) for key in ('NoNewPrivs','CapEff','CapBnd')}
 data['proc_mountinfo'] = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == '/proc']
+data['execution_capabilities'] = execution_capabilities()
 print(json.dumps(data))
 '''
 HOST = SOURCE + r'''
@@ -430,6 +492,7 @@ def isolation_checks(job, host):
         "no_provider_job_environment": not any(job["provider_environment"].values()),
         "no_provider_job_access": provider_access_denied(job['provider_access']),
         "no_privilege_gain": job['status_security']['NoNewPrivs'] == '1' and int(job['status_security']['CapEff'],16) == 0 and int(job['status_security']['CapBnd'],16) == 0,
+        **job['execution_capabilities']['checks'],
         **process_visibility_checks(job),
         # This explicit Boat profile does not promise a private PID namespace on systemd 255.
         "boat_pid_profile": job["namespaces"]["pid"] == host["namespaces"]["pid"],

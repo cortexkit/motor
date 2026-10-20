@@ -60,6 +60,8 @@ pub struct Motor {
     spool_root: PathBuf,
     account_tokens: Option<Arc<crate::AccountTokens>>,
     shadows: Arc<crate::shadow::Manager>,
+    #[cfg(test)]
+    shadow_deadline: Option<Duration>,
     windows_slots: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
 }
 #[cfg(test)]
@@ -94,6 +96,8 @@ impl Motor {
             spool_root: storage_root.join("spools"),
             account_tokens: None,
             shadows: Arc::new(crate::shadow::Manager::new(storage_root)),
+            #[cfg(test)]
+            shadow_deadline: None,
             windows_slots,
         })
     }
@@ -1606,10 +1610,10 @@ impl Motor {
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
                     }
-                    terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     if !hosted {
                         self.shadows.terminal(id, &terminal);
                     }
+                    terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     if !self.pending(id)
                         && spill_watch
                             .as_ref()
@@ -2290,7 +2294,8 @@ fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
 }
 
 fn log_refusal(id: Uuid, refusal: &Refusal) {
-    tracing::info!(job_id = %id, reason = ?refusal.reason,
+    let detail = refusal.detail.as_deref().map(crate::shadow::detail_tail);
+    tracing::warn!(job_id = %id, reason = ?refusal.reason, refusal_detail = ?detail,
         retry_after_ms = refusal.retry_after_ms, "runner admission refused");
 }
 

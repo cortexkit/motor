@@ -1124,7 +1124,8 @@ async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
         .lines()
         .find(|line| line.contains("runner admission refused"))
         .unwrap();
-    assert!(line.contains("INFO") && line.contains(&format!("job_id={}", terminal.job_id)));
+    assert!(line.contains("WARN") && line.contains(&format!("job_id={}", terminal.job_id)));
+    assert!(line.contains("refusal_detail="));
     let hint: u64 = line
         .split("retry_after_ms=")
         .nth(1)

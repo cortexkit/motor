@@ -3,6 +3,7 @@
 pub(crate) mod account;
 pub(crate) mod check;
 mod finish;
+pub(crate) use finish::SHADOW_CLEANUP_BOUND;
 pub(crate) mod placement;
 mod ssh;
 #[cfg(test)]
@@ -413,6 +414,7 @@ pub(crate) struct Client {
     /// The `error` code of the broker's last refusal, when it was a valid
     /// name. A direct hosted test shows it to the operator.
     broker_code: std::sync::Mutex<Option<String>>,
+    broker_failure: std::sync::Mutex<Option<String>>,
 }
 impl Client {
     pub(crate) fn new(route: HostedJobState) -> Self {
@@ -425,6 +427,7 @@ impl Client {
             route,
             account_tokens: None,
             broker_code: std::sync::Mutex::new(None),
+            broker_failure: std::sync::Mutex::new(None),
         }
     }
     /// The `error` code of the broker's last refusal seen by this client.
@@ -443,7 +446,11 @@ impl Client {
         path: &str,
         body: &T,
     ) -> Result<R, Error> {
-        let bearer = self.bearer().await?;
+        *self.broker_failure.lock().unwrap() = Some("bearer acquisition pending".into());
+        let bearer = self.bearer().await.inspect_err(|error| {
+            *self.broker_failure.lock().unwrap() =
+                Some(format!("bearer acquisition failed: {}", error.code()));
+        })?;
         self.post_authorized(path, body, bearer).await
     }
     async fn bearer(&self) -> Result<String, Error> {
@@ -466,6 +473,7 @@ impl Client {
         body: &T,
         bearer: String,
     ) -> Result<R, Error> {
+        *self.broker_failure.lock().unwrap() = Some("broker HTTP request pending".into());
         let reply = self
             .http
             .post(format!(
@@ -477,6 +485,7 @@ impl Client {
             .send()
             .await
             .map_err(|error| {
+                *self.broker_failure.lock().unwrap() = Some(format!("transport: {error}"));
                 tracing::info!(
                     path,
                     connect = error.is_connect(),
@@ -513,6 +522,8 @@ impl Client {
                 "hosted broker refused"
             );
             *self.broker_code.lock().unwrap() = broker_code.map(str::to_owned);
+            *self.broker_failure.lock().unwrap() =
+                Some(format!("HTTP {status}, broker_code={broker_code:?}"));
             if matches!(status, 401 | 403) {
                 return Err(Error::Auth);
             }
@@ -546,7 +557,11 @@ impl Client {
                 },
             );
         }
-        reply.json().await.map_err(|_| Error::Broker)
+        reply.json().await.map_err(|error| {
+            *self.broker_failure.lock().unwrap() =
+                Some(format!("invalid broker response: {error}"));
+            Error::Broker
+        })
     }
     pub(crate) async fn release(&self, id: Uuid) -> Result<(), Error> {
         if self

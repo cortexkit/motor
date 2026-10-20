@@ -265,6 +265,82 @@ fn isolated_host_backend_launch_runs_in_motor_job_service_with_022_umask() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn hosted_jobs_bypass_shared_compile_cache_but_build_server_keeps_it() {
+    let scratch = ScratchDir::new("motor-hosted-cache-env");
+    fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+    for (boat, tenant) in [(false, false), (true, false), (false, true), (true, true)] {
+        for supervisor in [false, true] {
+            for writer in [false, true] {
+                let mut config = Config::new(scratch.join("state"), "main");
+                config.isolate_jobs = true;
+                config.boat_profile = boat;
+                config.tenant_vm = tenant;
+                let mut setup = setup(scratch.path());
+                setup.base = writer;
+                let prepared = Prepared {
+                    cwd: scratch.path().into(),
+                    target: scratch.join("target"),
+                    wrapper: supervisor.then(|| "/motor-tools/prefrontal-build-slot".into()),
+                    sandbox: None,
+                    windows: None,
+                };
+                let mut env = BTreeMap::from([(
+                    "CARGO_TARGET_DIR".into(),
+                    prepared.target.to_string_lossy().into_owned(),
+                )]);
+                compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+                let mut read_only = Vec::new();
+                let mut read_write = Vec::new();
+                let mut destinations = Vec::new();
+                crate::isolation::compile_cache_mounts(
+                    &config.state_dir(),
+                    &prepared.target,
+                    writer,
+                    config.shared_compile_cache(),
+                    &mut read_only,
+                    &mut read_write,
+                    &mut destinations,
+                )
+                .unwrap();
+                if boat || tenant {
+                    assert!(!env.contains_key("RUSTC_WRAPPER"), "{env:?}");
+                    assert!(
+                        !env.keys().any(|key| key.starts_with("SCCACHE_")),
+                        "{env:?}"
+                    );
+                    assert_eq!(env["CARGO_TARGET_DIR"], prepared.target.to_string_lossy());
+                    assert!(
+                        read_only.is_empty() && read_write.is_empty() && destinations.is_empty()
+                    );
+                } else {
+                    assert_eq!(
+                        env["RUSTC_WRAPPER"],
+                        if supervisor {
+                            "/motor-tools/prefrontal-build-slot"
+                        } else {
+                            "sccache"
+                        }
+                    );
+                    assert_eq!(env["SCCACHE_DIR"], "/motor-cache");
+                    assert_eq!(
+                        env["SCCACHE_LOCAL_RW_MODE"],
+                        if writer { "READ_WRITE" } else { "READ_ONLY" }
+                    );
+                    assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target");
+                    let mounts = if writer { &read_write } else { &read_only };
+                    assert!(
+                        mounts.iter().any(|mount| mount.ends_with(":/motor-cache")),
+                        "{mounts:?}"
+                    );
+                    assert!(destinations.contains(&PathBuf::from("/motor-cache")));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
     for rust in [false, true] {
         for supervisor in [false, true] {

@@ -258,6 +258,54 @@ async fn shadow_hanging_or_refused_never_changes_callers_stream_or_exit() {
 }
 
 #[tokio::test]
+async fn shadow_runner_refusal_reason_and_detail_survive_admission_and_terminal_frames() {
+    for after_accept in [false, true] {
+        let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+        *boat.run_refusal.lock().unwrap() = Some(crate::hosted::boat_tests::RunRefusal {
+            reason: RefusalReason::WorkspaceSetupFailed,
+            detail: "workspace setup: C cache is read-only".into(),
+            after_accept,
+        });
+        let dir = ScratchDir::new("shadow-runner-refusal");
+        let repo = repo(&dir);
+        let motor = Motor::with_connector(
+            config(boat.config.broker_url.as_ref().unwrap()),
+            &dir.join("state"),
+            Arc::new(PrimaryPeer {
+                shadow_requested: None,
+            }),
+        )
+        .unwrap();
+        let path = repo.to_str().unwrap();
+        let mut stream = motor
+            .run(RunRequest::new(path, path, path, "exit 17").with_timeout(30))
+            .unwrap();
+        consume(&mut stream).await;
+        tokio::time::timeout(Duration::from_secs(15), motor.shadows.join_for_test())
+            .await
+            .unwrap();
+        assert_eq!(boat.runs.load(Ordering::SeqCst), 1);
+        let records = motor.shadow_report(0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].shadow.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::WorkspaceSetupFailed
+            }
+        );
+        assert_eq!(
+            records[0].shadow.refusal_detail.as_deref(),
+            Some("workspace setup: C cache is read-only")
+        );
+        let recorded = crate::shadow::records(&dir.join("state"), 0).unwrap();
+        assert_eq!(
+            recorded[0].shadow.refusal_detail,
+            records[0].shadow.refusal_detail
+        );
+    }
+}
+
+#[tokio::test]
 async fn shadow_reuses_pinned_boat_path_and_records_both_tails() {
     let _ = crate::logging::init();
     let boat = crate::hosted::boat_tests::Boat::new(1, false).await;
@@ -333,6 +381,55 @@ async fn shadow_reuses_pinned_boat_path_and_records_both_tails() {
 }
 
 #[tokio::test]
+async fn shadow_deadline_after_booking_finishes_lost_with_zero_runtime() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    boat.hang_run.store(true, Ordering::SeqCst);
+    let dir = ScratchDir::new("shadow-deadline-booked");
+    let repo = repo(&dir);
+    let mut motor = Motor::with_connector(
+        config(boat.config.broker_url.as_ref().unwrap()),
+        &dir.join("state"),
+        Arc::new(PrimaryPeer {
+            shadow_requested: None,
+        }),
+    )
+    .unwrap();
+    // Expire only the outer deadline. Advancing through the reader's 60-second
+    // inactivity window would make the winning error depend on poll order.
+    motor.shadow_deadline = Some(Duration::from_secs(30));
+    let path = repo.to_str().unwrap();
+    let mut stream = motor
+        .run(RunRequest::new(path, path, path, "exit 17").with_timeout(30))
+        .unwrap();
+    consume(&mut stream).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boat.runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), motor.shadows.join_for_test())
+        .await
+        .unwrap();
+    let requests = boat.requests.lock().unwrap();
+    let finish = requests
+        .iter()
+        .find(|(path, _)| path.ends_with("/finish"))
+        .expect("a booked shadow must be settled after its deadline");
+    assert_eq!(finish.1, serde_json::json!({"outcome":"lost", "run_ms":0}));
+    let records = motor.shadow_report(0).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].shadow_failure.as_deref(),
+        Some("shadow deadline exceeded")
+    );
+}
+
+#[tokio::test]
 async fn restart_cancels_running_shadow_finishes_lease_and_never_resumes_it() {
     let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
     boat.hang_run.store(true, Ordering::SeqCst);
@@ -369,6 +466,16 @@ async fn restart_cancels_running_shadow_finishes_lease_and_never_resumes_it() {
         .unwrap()
         .iter()
         .any(|(p, _)| p.ends_with("/finish")));
+    let finish = boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path.ends_with("/finish"))
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(finish, serde_json::json!({"outcome":"lost", "run_ms":0}));
     drop(stream);
     drop(motor);
     let reopened = Motor::with_connector(

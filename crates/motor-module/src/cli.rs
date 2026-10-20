@@ -1695,33 +1695,7 @@ pub async fn shadow_report_main(args: &[String]) -> u8 {
             .map_err(|e| e.to_string())?;
         let records: Vec<crate::shadow::Record> =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        for record in &records {
-            println!(
-                "{} job={} mismatch={} shadow_failure={:?}",
-                record.timestamp_s,
-                record.job_id,
-                record.mismatch.join(","),
-                record.shadow_failure
-            );
-            for (name, side) in [
-                ("build_server", &record.build_server),
-                ("shadow", &record.shadow),
-            ] {
-                println!(
-                    "{name}: outcome={:?} exit={:?} run_ms={}",
-                    side.outcome, side.exit_code, side.run_ms
-                );
-                for (stream, summary) in [("stdout", &side.stdout), ("stderr", &side.stderr)] {
-                    println!(
-                        "--- {name} {stream} ({} bytes, sha256 {}) ---\n{}",
-                        summary.bytes,
-                        summary.sha256,
-                        summary.tail.as_deref().unwrap_or_default()
-                    );
-                }
-            }
-        }
-        println!("{} shadow mismatches (bounded retained log)", records.len());
+        write_shadow_report(&mut std::io::stdout().lock(), &records).map_err(|e| e.to_string())?;
         Ok::<_, String>(())
     }
     .await;
@@ -1734,9 +1708,156 @@ pub async fn shadow_report_main(args: &[String]) -> u8 {
     }
 }
 
+fn write_shadow_report(
+    out: &mut impl Write,
+    records: &[crate::shadow::Record],
+) -> std::io::Result<()> {
+    for record in records {
+        writeln!(
+            out,
+            "{} job={} mismatch={} shadow_failure={:?}",
+            record.timestamp_s,
+            record.job_id,
+            record.mismatch.join(","),
+            record.shadow_failure
+        )?;
+        for (name, side) in [
+            ("build_server", &record.build_server),
+            ("shadow", &record.shadow),
+        ] {
+            writeln!(
+                out,
+                "{name}: outcome={:?} exit={:?} run_ms={}",
+                side.outcome, side.exit_code, side.run_ms
+            )?;
+            if let Some(detail) = &side.refusal_detail {
+                writeln!(out, "{name}: refusal_detail={detail}")?;
+            }
+            for (stream, summary) in [("stdout", &side.stdout), ("stderr", &side.stderr)] {
+                if let Some(head) = &summary.head {
+                    if summary.bytes > head.len() as u64 {
+                        writeln!(out, "--- {name} {stream} head ---\n{head}")?;
+                    }
+                }
+                writeln!(
+                    out,
+                    "--- {name} {stream} ({} bytes, sha256 {}) ---\n{}",
+                    summary.bytes,
+                    summary.sha256,
+                    summary.tail.as_deref().unwrap_or_default()
+                )?;
+            }
+        }
+    }
+    writeln!(
+        out,
+        "{} shadow mismatches (bounded retained log)",
+        records.len()
+    )
+}
+
 #[cfg(test)]
 mod shadow_report_cli_tests {
     use super::*;
+    #[test]
+    fn refused_shadow_details_reach_record_and_report_on_both_sides() {
+        use crate::shadow::{Capture, Manager, Record};
+        let scratch = cortexkit_test_support::ScratchDir::new("shadow-refusal-report");
+        let manager = Manager::new(&scratch);
+        let id = Uuid::now_v7();
+        let refused = |reason, detail: String| {
+            Capture::default().finish(
+                &TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
+                    .with_refusal_detail(detail),
+            )
+        };
+        let detail = format!(
+            "{}shadow workspace setup: filesystem is read-only",
+            "é".repeat(17000)
+        );
+        let record = Record::compare(
+            id,
+            &RunRequest::new("/repo", "/repo", "/repo", "true"),
+            refused(
+                motor_protocol::RefusalReason::RequestRejected,
+                "build server request detail".into(),
+            ),
+            refused(motor_protocol::RefusalReason::WorkspaceSetupFailed, detail),
+            None,
+        );
+        assert_eq!(
+            record.build_server.refusal_detail.as_deref(),
+            Some("build server request detail")
+        );
+        let retained = record.shadow.refusal_detail.as_deref().unwrap();
+        assert!(retained.len() <= 16 * 1024);
+        assert!(retained.ends_with("shadow workspace setup: filesystem is read-only"));
+        manager.append(&record).unwrap();
+        let records = manager.report(0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].shadow.refusal_detail,
+            record.shadow.refusal_detail
+        );
+        assert_eq!(
+            records[0].build_server.refusal_detail,
+            record.build_server.refusal_detail
+        );
+        let mut report = Vec::new();
+        write_shadow_report(&mut report, &records).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        for expected in [
+            "RequestRejected",
+            "WorkspaceSetupFailed",
+            "build_server: refusal_detail=build server request detail",
+            "shadow workspace setup: filesystem is read-only",
+        ] {
+            assert!(report.contains(expected), "missing {expected}");
+        }
+        let mut old = serde_json::to_value(&record).unwrap();
+        for side in ["build_server", "shadow"] {
+            old[side].as_object_mut().unwrap().remove("refusal_detail");
+            for stream in ["stdout", "stderr"] {
+                old[side][stream].as_object_mut().unwrap().remove("head");
+            }
+        }
+        let old: Record = serde_json::from_value(old).unwrap();
+        assert!(old.shadow.refusal_detail.is_none());
+        assert!(old.build_server.stdout.head.is_none());
+    }
+
+    #[test]
+    fn shadow_report_keeps_first_failure_and_final_summary_of_large_streams() {
+        use crate::shadow::{Capture, Record};
+        let mut capture = Capture::default();
+        for bytes in [
+            b"first failing test: hard-linked script could not execute\n".to_vec(),
+            vec![b'x'; 350 * 1024],
+            b"\nfinal test summary\n".to_vec(),
+        ] {
+            capture.output(&motor_protocol::Output::new(
+                0,
+                OutputStream::Stderr,
+                motor_protocol::BytePayload(bytes),
+            ));
+        }
+        let id = Uuid::now_v7();
+        let record = Record::compare(
+            id,
+            &RunRequest::new("/repo", "/repo", "/repo", "test"),
+            Capture::default().finish(&TerminalRecord::new(id, Outcome::Exit { code: 0 }, 0, 0, 0)),
+            capture.finish(&TerminalRecord::new(id, Outcome::Exit { code: 1 }, 0, 0, 0)),
+            None,
+        );
+        assert_eq!(record.shadow.stderr.head.as_ref().unwrap().len(), 16 * 1024);
+        assert_eq!(record.shadow.stderr.tail.as_ref().unwrap().len(), 16 * 1024);
+        let mut report = Vec::new();
+        write_shadow_report(&mut report, &[record]).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("first failing test: hard-linked script could not execute"));
+        assert!(report.contains("final test summary"));
+    }
+
     #[test]
     fn shadow_since_accepts_epoch_and_bounded_durations_and_rejects_unknown_flags() {
         let words = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();

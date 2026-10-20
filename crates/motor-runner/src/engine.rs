@@ -311,6 +311,13 @@ impl Config {
     pub fn sccache_dir(&self) -> PathBuf {
         self.state_dir().join("sccache/fleet")
     }
+
+    pub(crate) fn shared_compile_cache(&self) -> bool {
+        // Hosted runners have no cache writer to populate a shared reader.
+        // Even in read-only mode, sccache's C preprocessor tries to create a
+        // directory in an empty cache, which fails on the read-only mount.
+        !self.boat_profile && !self.tenant_vm
+    }
     /// Endpoint for one trusted Linux build that populates the compiler cache,
     /// independent of the runner's state paths.
     #[cfg(target_os = "linux")]

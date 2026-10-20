@@ -41,14 +41,25 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+pub(crate) fn detail_tail(detail: &str) -> String {
+    let mut start = detail.len().saturating_sub(TAIL_BYTES);
+    while !detail.is_char_boundary(start) {
+        start += 1;
+    }
+    detail[start..].to_owned()
+}
+
 #[derive(Default)]
 struct Stream {
     hash: Sha256,
     bytes: u64,
+    head: Vec<u8>,
     tail: Vec<u8>,
 }
 impl Stream {
     fn push(&mut self, bytes: &[u8]) {
+        let keep = (TAIL_BYTES - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..keep]);
         self.hash.update(bytes);
         self.bytes = self.bytes.saturating_add(bytes.len() as u64);
         if bytes.len() >= TAIL_BYTES {
@@ -65,6 +76,7 @@ impl Stream {
         StreamSummary {
             sha256: format!("{:x}", self.hash.finalize()),
             bytes: self.bytes,
+            head: Some(String::from_utf8_lossy(&self.head).into_owned()),
             tail: Some(String::from_utf8_lossy(&self.tail).into_owned()),
         }
     }
@@ -90,6 +102,7 @@ impl Capture {
                 _ => None,
             },
             run_ms: terminal.wall_ms,
+            refusal_detail: terminal.refusal_detail.as_deref().map(detail_tail),
             stdout: self.stdout.finish(),
             stderr: self.stderr.finish(),
         }
@@ -99,6 +112,8 @@ impl Capture {
 pub(crate) struct StreamSummary {
     pub sha256: String,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail: Option<String>,
 }
@@ -107,6 +122,8 @@ pub(crate) struct Side {
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub run_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_detail: Option<String>,
     pub stdout: StreamSummary,
     pub stderr: StreamSummary,
 }
@@ -165,7 +182,20 @@ impl Record {
             mismatch,
             shadow_failure: failure,
         };
+        for (side, result) in [
+            ("build_server", &record.build_server),
+            ("shadow", &record.shadow),
+        ] {
+            if let Outcome::RefusedBeforeStart { reason } = &result.outcome {
+                tracing::warn!(job_id = %id, side, ?reason, refusal_detail = ?result.refusal_detail,
+                    "shadow comparison runner refused");
+            }
+        }
         if record.mismatch.is_empty() {
+            record.build_server.stdout.head = None;
+            record.build_server.stderr.head = None;
+            record.shadow.stdout.head = None;
+            record.shadow.stderr.head = None;
             record.build_server.stdout.tail = None;
             record.build_server.stderr.tail = None;
             record.shadow.stdout.tail = None;
@@ -287,11 +317,11 @@ impl Manager {
     pub(crate) async fn shutdown(&self) {
         self.stop.send_replace(true);
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        let deadline = tokio::time::Instant::now()
+            + crate::hosted::SHADOW_CLEANUP_BOUND
+            + std::time::Duration::from_secs(3);
         for mut task in tasks {
-            if tokio::time::timeout(std::time::Duration::from_secs(8), &mut task)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
                 tracing::warn!("shadow cleanup exceeded shutdown deadline");
