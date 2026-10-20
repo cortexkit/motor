@@ -39,9 +39,13 @@ cleanup() {
   result=$?
   trap - EXIT
   if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-    # A failed swap/start restores the old executable before reopening it.
-    if cp -p "$rollback" "$live" && systemctl --user start "$unit"; then
+    # Stop the failed candidate, including a daemon that started but failed its
+    # job canary. Replace by rename, never write a running executable's inode.
+    if systemctl --user stop "$unit" && cp -p "$rollback" "$live.new" &&
+       mv "$live.new" "$live" && systemctl --user start "$unit" &&
+       systemctl --user is-active "$unit"; then
       stopped=false
+      echo "Deployment failed; restored rollback executable $rollback" >&2
     else
       echo "Rollback failed; manually restore $rollback and start $unit" >&2
     fi
@@ -92,6 +96,22 @@ stopped=true
 mv "$live.new" "$live"
 systemctl --user start "$unit"
 systemctl --user is-active "$unit"
+if [ "$instance" = windows ]; then
+  echo 'Post-swap isolated canary explicitly skipped for windows (requires a qualified Windows VM).' >&2
+else
+  if python3 "$script_dir/deploy_canary.py" --state-root "$state_root" --instance "$instance" \
+      --timeout-s "${RUNNER_CANARY_TIMEOUT_S:-120}"; then
+    :
+  else
+    canary_status=$?
+    if [ "$canary_status" -eq 75 ]; then
+      echo 'canary inconclusive: no free permit; keeping the new runner (isolation not verified).' >&2
+    else
+      echo 'Post-swap isolated canary failed; rolling back the runner.' >&2
+      exit 1
+    fi
+  fi
+fi
 stopped=false
 admission_held=false
 "$live" --version

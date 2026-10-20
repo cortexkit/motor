@@ -914,7 +914,17 @@ async fn drain_refuses_new_and_queued_jobs_without_starting_queued_commands() {
 async fn drain_completes_promptly_with_a_started_unit_backed_job() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
-    let id = start_long_running_job(&f, &runner).await;
+    let (request, bytes) = f.run("while :; do sleep 1; done");
+    let id = request.job_id;
+    f.submit(&runner, &request, &bytes);
+    wait_for(|| {
+        runner
+            .status()
+            .running_jobs
+            .iter()
+            .any(|job| job.job_id == id)
+    })
+    .await;
     let process = {
         // Model an isolated job's persisted unit identity without requiring
         // systemd privileges. The operator restart test covers real reattach.
@@ -931,7 +941,12 @@ async fn drain_completes_promptly_with_a_started_unit_backed_job() {
     assert_eq!(persisted.process.unwrap().unit, Some(id));
     let (socket, server) = listener(&f, &runner);
     let mut channel = open_drain(&socket, 1200, false).await;
-    let reply = tokio::time::timeout(Duration::from_secs(2), read_next(&mut channel)).await;
+    // The command cannot exit before cancellation, so a reply proves drain did
+    // not wait for its exit. Use the transport helper's hang bound rather than
+    // a latency assertion that also measures host scheduling delays.
+    // Join the reader so its hang-bound panic cannot skip restoring the real
+    // process identity below, which cleanup needs in order to cancel the job.
+    let reply = tokio::spawn(async move { read_next(&mut channel).await }).await;
     server.abort();
     {
         let mut inner = runner.core.inner.lock().unwrap();
@@ -4702,7 +4717,9 @@ async fn engine_routes_all_five_operations_through_the_backend() {
         runner.core.inner.lock().unwrap().jobs[&interrupted.id].state,
         JobState::Lost
     );
-    let (request, bytes) = f.run("touch backend-ready; sleep 1");
+    // Keep the process alive until cancel even if the test is descheduled after
+    // observing the marker; a fixed sleep can finish before cancel is delivered.
+    let (request, bytes) = f.run("touch backend-ready; while :; do sleep 1; done");
     f.submit(&runner, &request, &bytes);
     until(|| Path::new(&f.key).join("backend-ready").exists()).await;
     runner.cancel(request.job_id).unwrap();
