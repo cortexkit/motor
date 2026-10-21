@@ -689,3 +689,58 @@ async fn stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wai
     assert!((297..300).contains(&limit), "{limit}");
     assert_eq!(log.lock().unwrap().runs, vec![(id, limit)]);
 }
+
+/// CLOUD's pinned `no_host_fits` reply, byte for byte and without
+/// Retry-After, goes through ck-motor's real broker response parser: the
+/// routed 16-vCPU job asks once and then runs on the build server.
+#[tokio::test]
+async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-host-fits-lease.json"
+    ))
+    .unwrap();
+    let reply = &vector["reply"];
+    assert_eq!(reply["headers"]["Retry-After"], serde_json::Value::Null);
+    // The harness writes the stubbed body with serde_json, so these are the
+    // exact bytes CLOUD recorded.
+    assert_eq!(
+        serde_json::to_string(&reply["body"]).unwrap(),
+        reply["body_bytes"]
+    );
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.lease_replies.lock().unwrap().push_back((
+        reply["status"].as_u64().unwrap() as u16,
+        reply["body"].clone(),
+        "",
+    ));
+    let (scratch, repo) = committed_repo();
+    let peer = super::queue_tests::ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor =
+        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
+    let mut large = request(&repo);
+    large.weight_hint = Some(vector["request"]["body"]["vcpus"].as_u64().unwrap() as u32);
+    let stream = motor.run(large).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["vcpus"], vector["request"]["body"]["vcpus"]);
+    assert_eq!(
+        bodies[0]["allow_spill"],
+        vector["request"]["body"]["allow_spill"]
+    );
+    assert_eq!(*h.requests.lock().unwrap(), vec!["/v1/leases".to_owned()]);
+    assert_eq!(log.lock().unwrap().runs, vec![(id, 300)]);
+    assert_eq!(
+        motor
+            .storage
+            .job(id)
+            .unwrap()
+            .routed_direct_reason
+            .as_deref(),
+        Some("no_host_fits")
+    );
+    assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
+}

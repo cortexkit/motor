@@ -319,3 +319,51 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     unexpected["mem_mib"] = json!(16384);
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
 }
+
+/// CLOUD's `no-host-fits-lease.json` is a no-spill 16-vCPU lease against a
+/// single registered host whose per-job ceiling is 8 vCPUs. The fake broker,
+/// limited to that ceiling, answers the same request with the same status and
+/// the same reply bytes, and books nothing.
+#[test]
+fn cloud_no_host_fits_reply_bytes_match_fake() {
+    let v = vector("no-host-fits-lease.json");
+    let tokens = vector("job-tokens.json");
+    let host = &v["host_registry"];
+    let mut broker = FakeBroker::new(
+        "cloud-vector",
+        FakeConfig {
+            worker_bearer: BEARER.into(),
+            subject: format!("acct:{}", v["account"].as_str().unwrap()),
+            placement: serde_json::from_value(json!({"host": host["host_id"], "vm": null}))
+                .unwrap(),
+            endpoint: "127.0.0.1:4443".into(),
+            endpoint_spki_sha256: base64url(&[8; 32]),
+            kid: v["key_id"].as_str().unwrap().into(),
+            signing_key: seed(tokens["seed_hex"].as_str().unwrap()),
+            announced_keys: vec![],
+        },
+    )
+    .unwrap();
+    broker.knobs.max_vcpus = Some(host["max_job_vcpus"].as_u64().unwrap() as u32);
+    let request: LeaseRequest = serde_json::from_value(v["request"]["body"].clone()).unwrap();
+    assert_eq!(request.allow_spill, Some(false));
+    // Send CLOUD's recorded request bytes, not a re-serialization of them.
+    let reply = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: v["request"]["method"].as_str().unwrap(),
+            path: v["request"]["pathname"].as_str().unwrap(),
+            bearer: Some(BEARER),
+            host_headers: None,
+            body: v["request"]["body_bytes"].as_str().unwrap().as_bytes(),
+        },
+        v["clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(reply.status, v["reply"]["status"].as_u64().unwrap() as u16);
+    assert_eq!(
+        serde_json::to_string(&reply.body).unwrap(),
+        v["reply"]["body_bytes"].as_str().unwrap()
+    );
+    assert_eq!(v["reply"]["headers"]["Retry-After"], Value::Null);
+    assert!(broker.settlement(&request.job_id).is_none());
+}

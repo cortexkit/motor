@@ -497,6 +497,11 @@ and `stored_allow_spill_presence_and_value_survive_lease_re_requests` check its
 hash projection, capacity reply, and stable re-request policy. Requester keys are
 excluded from the lease hash; an absent `allow_spill` and either explicit boolean
 have distinct hashes, so the stored request preserves presence as well as value.
+CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
+beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
+sends its exact 422 reply bytes through ck-motor's broker client, and
+`cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker gives the
+same answer.
 `python3 scripts/mixed-version.py` checks the default Config against the pinned
 older client.
 

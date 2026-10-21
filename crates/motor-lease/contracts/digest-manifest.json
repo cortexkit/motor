@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "95fd2d1372801900d6a116f965f140868433077e",
+    "revision": "916347ef26048a0c6aeb7d39dd2c81d8ae5257e7",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "e91e698c1b819225f06a54d2a3869d32c0de36edc380aba177a669810567f08b",
+      "sha256": "6bdd60e0c282ef767539521c9e3c7b2b1ff7c58c222796da4160bf6befb0caa1",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "95fd2d1372801900d6a116f965f140868433077e",
+      "source_commit": "916347ef26048a0c6aeb7d39dd2c81d8ae5257e7",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -21,6 +21,14 @@
       "source_repository": "cortexkit-cloud",
       "source_commit": "95fd2d1372801900d6a116f965f140868433077e",
       "source_path": "test-vectors/runners/no-spill-lease.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/no-host-fits-lease.json",
+      "sha256": "a9b710bf74e5e5b385cbeff3119fbeb17e58ff1a314389bf3f29edc34e1f1c2c",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "916347ef26048a0c6aeb7d39dd2c81d8ae5257e7",
+      "source_path": "test-vectors/runners/no-host-fits-lease.json",
       "canonical": true
     },
     {
