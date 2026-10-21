@@ -1006,8 +1006,8 @@ where
         armed: true,
     };
     drop(prelude_guard);
-    // Set once job frames start flowing to the client (relay or stored
-    // replay); from then on the connection ends with a graceful drain.
+    // Set once the connection enters the relay or a stored replay; from then
+    // on it ends with a graceful drain.
     let streamed = AtomicBool::new(false);
     // Set once this connection has written the job's final frames to the
     // client. Delivery is only recorded after the client then closes cleanly.
@@ -1271,13 +1271,14 @@ async fn serve_stored(
 /// How long a connection that has finished sending waits for its client to
 /// read the rest and close. Everything still in flight at that point fits in
 /// the two ends' socket buffers: Linux and macOS autotune each to a few MiB at
-/// most, so under 16 MiB in all. Two minutes covers that at about 130 KiB/s,
+/// most, so under 16 MiB in all. Two minutes covers that at about 140 KiB/s,
 /// well below the slowest rate seen from a real client (about 320 KiB/s). A
 /// client that has everything closes at once; this bound only limits how long
 /// a stalled one holds the connection open.
 pub const CLIENT_DRAIN_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Ends a client connection that carried job frames without losing any of them.
+/// Ends a client connection that carried job frames so that frames already
+/// written still reach the client.
 ///
 /// Dropping a TCP socket while the client's heartbeats sit unread in its
 /// receive queue, or arrive after the drop, makes the kernel answer with a
@@ -1286,8 +1287,11 @@ pub const CLIENT_DRAIN_DEADLINE: Duration = Duration::from_secs(120);
 /// its output and the terminal record. Instead, finish the write side (TLS
 /// close_notify, then FIN after all queued data), then read and discard client
 /// input until the client closes, bounded by [`CLIENT_DRAIN_DEADLINE`]. Returns
-/// whether the client closed cleanly. That is the host's evidence the client
-/// read every frame: a client that closes with frames unread resets instead.
+/// true when the client closed its side within the deadline, and false when
+/// shutdown or a read failed or the deadline passed. The caller uses true as
+/// its delivery signal: a client that closes with frames still unread in its
+/// socket resets the connection rather than closing it, though the host cannot
+/// see whether the client program itself handled them.
 async fn close_client(client: &mut (impl AsyncRead + AsyncWrite + Unpin), jti: &str) -> bool {
     let started = tokio::time::Instant::now();
     let deadline = started + CLIENT_DRAIN_DEADLINE;
@@ -1310,8 +1314,8 @@ async fn close_client(client: &mut (impl AsyncRead + AsyncWrite + Unpin), jti: &
         match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
             Ok(Ok(0)) => break None,
             Ok(Ok(_)) => {}
-            // A TLS client that closes its socket without close_notify has
-            // still read everything up to our FIN before closing.
+            // A TLS client that closes its socket without sending close_notify
+            // shows up as UnexpectedEof; count it as a close, like a plain EOF.
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break None,
             Ok(Err(error)) => break Some(format!("{:?}: {error}", error.kind())),
             Err(_) => break Some("timed out".to_owned()),

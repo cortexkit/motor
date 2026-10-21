@@ -331,8 +331,10 @@ reading and discarding the client's heartbeats until the client closes, for at
 most two minutes (`CLIENT_DRAIN_DEADLINE`). Dropping the socket instead, with a
 heartbeat unread or arriving after the drop, made the kernel reset the
 connection and discard the frames still in flight. The host records the terminal
-as delivered, which sends its usage report at once, only when the client closes
-cleanly; otherwise the report waits for the 60-second delivery grace. Billed
+as delivered, which queues its usage report at once, only when the client closes
+its side within that bound (a TLS close without close_notify counts); otherwise
+the report is queued when the 60-second delivery grace after the job's end
+expires. Billed
 time is measured from the runner's start and end events, so the drain never
 changes it. Tests:
 `slow_client_heartbeating_past_job_end_receives_every_frame_through_the_terminal`,
