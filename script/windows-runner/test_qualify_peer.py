@@ -19,9 +19,8 @@ class PeerQualificationTests(unittest.TestCase):
         self.assertIn("$actual -ne $VmId", self.helper)
         self.assertIn("$utc -lt $Since.AddSeconds(-2)", self.helper)
         self.assertIn("$Timeline.boot_observed_ms + 20000", self.helper)
-        self.assertIn("Parse($Timeline.boot_observed_utc).AddSeconds(20)", self.helper)
         boot = self.control.index("$boot = Wait-RunnerPeerBoot $victimVm")
-        margin = self.control.index("Start-Sleep -Seconds 20", boot)
+        margin = self.control.index("Wait-RunnerQualificationWindow $peerClock $timeline.boot_observed_ms 20000", boot)
         attack = self.control.index("$timeline.attacker_start_ms", margin)
         self.assertLess(boot, margin)
         self.assertLess(margin, attack)
@@ -40,7 +39,7 @@ class PeerQualificationTests(unittest.TestCase):
 
     def test_production_validates_current_peer_evidence_after_settle(self):
         hello = self.control.index("$hello = Receive-RunnerPeerHello")
-        settle = self.control.index("Start-Sleep -Seconds 60", hello)
+        settle = self.control.index("$timeline.settled_ms = Wait-RunnerQualificationWindow $peerClock $timeline.hello_ms 60000", hello)
         harvest = self.control.index("-Operation Harvest -Root $Root -Job $victim", settle)
         verify = self.control.index("$timeline.result = Assert-RunnerPeerEvidence $timeline.victim_nonce $victimVm $attackerVm $proof $timeline $nativeLog")
         self.assertLess(hello, settle)
@@ -144,11 +143,26 @@ class PeerQualificationTests(unittest.TestCase):
             "peer-monitor-unreaped-preserves-disks",
             "peer-cleanup-preserves-primary-boot-gate-error",
             "peer-run-monitor-catch-retains-original-error-and-writes-reason",
+            "peer-settle-production-window-is-anchored-to-recorded-hello",
         ):
             self.assertIn(name, fixtures)
         self.assertIn("Get-RunnerPeerBootMatch $bootXml $victimVm $since", fixtures)
         self.assertIn("Wait-RunnerPeerBoot $victimVm $since $eventPath", fixtures)
         self.assertIn("Stop-RunnerPeerMonitor (New-MonitorFixture", fixtures)
+
+    def test_minimum_windows_use_one_monotonic_deadline(self):
+        window = self.helper.split("function Wait-RunnerQualificationWindow(", 1)[1].split("function Assert-RunnerPeerEvidence(", 1)[0]
+        self.assertIn("$deadline = $StartedMs + $MinimumMs", window)
+        self.assertIn("while ($Clock.ElapsedMilliseconds -lt $deadline)", window)
+        self.assertIn("return [long]$Clock.ElapsedMilliseconds", window)
+        peer = self.control.split("$peerClock = [Diagnostics.Stopwatch]::StartNew()", 1)[1].split("Assert-RunnerPeerCleanup", 1)[0]
+        self.assertNotIn("Start-Sleep -Seconds", peer)
+        self.assertIn("Wait-RunnerQualificationWindow $peerClock $timeline.boot_observed_ms 20000", peer)
+        self.assertIn("Wait-RunnerQualificationWindow $peerClock $timeline.attacker_boot_observed_ms 60000", peer)
+        self.assertNotIn("Parse($Timeline.boot_observed_utc).AddSeconds(20)", self.helper)
+        hello = peer.index("$hello = Receive-RunnerPeerHello")
+        capture = peer.index("$timeline.hello_ms = $peerClock.ElapsedMilliseconds", hello)
+        self.assertLess(capture, peer.index("$timeline.hello_utc", hello))
 
 
 if __name__ == "__main__":

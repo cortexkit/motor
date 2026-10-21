@@ -101,7 +101,7 @@ try {
         # A host readiness connection would consume the guest's single listener.
         # Instead use a VM-matched host OS-boot event plus a fixed service-start margin.
         $peerPhase = 'victim-service-margin'
-        Start-Sleep -Seconds 20
+        $null = Wait-RunnerQualificationWindow $peerClock $timeline.boot_observed_ms 20000
         $attackerStart = [DateTime]::UtcNow
         $timeline.attacker_start_utc = $attackerStart.ToString('o')
         $timeline.attacker_start_ms = $peerClock.ElapsedMilliseconds
@@ -111,14 +111,14 @@ try {
         $monitors += $monitor
         $peerPhase = 'attacker-boot-event'
         $attackerBoot = Wait-RunnerPeerBoot $attackerVm $attackerStart "$Evidence\peer-attacker-boot.xml"
+        $timeline.attacker_boot_observed_ms = $peerClock.ElapsedMilliseconds
         $timeline.attacker_boot_utc = $attackerBoot.utc
         $timeline.attacker_boot_record_id = $attackerBoot.record_id
         # Retain a full qualification-only write-back window for the attacker
         # too. Its completed, synced proof is still mandatory after power-off;
         # elapsed time alone is never treated as probe completion.
         $peerPhase = 'attacker-proof-window'
-        Start-Sleep -Seconds 60
-        $timeline.attacker_settled_ms = $peerClock.ElapsedMilliseconds
+        $timeline.attacker_settled_ms = Wait-RunnerQualificationWindow $peerClock $timeline.attacker_boot_observed_ms 60000
         # Read completion only from the stopped attacker child; never mount a
         # running disk. The victim stays running and has had no host connection.
         $peerPhase = 'attacker-proof-harvest'
@@ -134,16 +134,15 @@ try {
         $timeline.host_connect_ms = $peerClock.ElapsedMilliseconds
         $peerPhase = 'victim-final-hello'
         $hello = Receive-RunnerPeerHello $victimVm $timeline.victim_nonce "$Evidence\peer-host-hello.json"
-        $timeline.hello_utc = [DateTime]::UtcNow.ToString('o')
         $timeline.hello_ms = $peerClock.ElapsedMilliseconds
+        $timeline.hello_utc = [DateTime]::UtcNow.ToString('o')
         $timeline.hello_nonce = $hello.nonce
         $timeline.hello_validated = $true
         # Qualification only: as with the disconnect oracle, retain the full
         # window for guest log write-back before victim power-off. This is not
         # a durability guarantee and production never waits on persisted logs.
         $peerPhase = 'victim-log-settle'
-        Start-Sleep -Seconds 60
-        $timeline.settled_ms = $peerClock.ElapsedMilliseconds
+        $timeline.settled_ms = Wait-RunnerQualificationWindow $peerClock $timeline.hello_ms 60000
         $peerPhase = 'victim-harvest'
         & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $victim
         $nativeLog = [IO.File]::ReadAllText("$Root\evidence\$victim-guest\hyperv-agent.log")

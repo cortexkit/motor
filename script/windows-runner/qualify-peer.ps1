@@ -12,13 +12,24 @@ function Convert-RunnerPeerHello([byte[]]$Bytes, [string]$Nonce) {
     return $hello
 }
 
+function Wait-RunnerQualificationWindow($Clock, [long]$StartedMs, [int]$MinimumMs) {
+    # A requested sleep can wake early. Use the evidence clock's absolute
+    # deadline, rechecking it after every wake rather than assuming time passed.
+    $deadline = $StartedMs + $MinimumMs
+    while ($Clock.ElapsedMilliseconds -lt $deadline) {
+        $remaining = $deadline - $Clock.ElapsedMilliseconds
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(1000, $remaining)) }
+    }
+    return [long]$Clock.ElapsedMilliseconds
+}
+
 function Assert-RunnerPeerEvidence([string]$Nonce, [Guid]$VictimVm, [Guid]$AttackerVm, $Proof, [Collections.IDictionary]$Timeline, [string]$Log) {
     if (-not $Timeline.Contains('hello_validated') -or $Timeline.hello_validated -ne $true) { throw 'Victim unavailable; isolation not proven' }
     foreach ($key in @('victim_start_ms','boot_observed_ms','attacker_start_ms','proof_observed_ms','host_connect_ms','hello_ms','settled_ms','victim_start_utc','boot_utc','boot_observed_utc','attacker_start_utc','proof_observed_utc','host_connect_utc','hello_utc')) {
         if (-not $Timeline.Contains($key)) { throw "Missing host peer ordering evidence: $key" }
     }
     if ($Timeline.boot_event_id -ne 18601 -or $Timeline.boot_record_id -le 0 -or $Timeline.boot_vm_id -cne $VictimVm.ToString('D')) { throw 'Missing VM-matched host OS-boot event' }
-    if ($Timeline.boot_observed_ms -lt $Timeline.victim_start_ms -or $Timeline.attacker_start_ms -lt $Timeline.boot_observed_ms + 20000 -or [DateTimeOffset]::Parse($Timeline.boot_utc) -lt [DateTimeOffset]::Parse($Timeline.victim_start_utc).AddSeconds(-2) -or [DateTimeOffset]::Parse($Timeline.boot_observed_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_utc) -or [DateTimeOffset]::Parse($Timeline.attacker_start_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_observed_utc).AddSeconds(20)) { throw 'Attacker started before victim boot event plus 20-second margin' }
+    if ($Timeline.boot_observed_ms -lt $Timeline.victim_start_ms -or $Timeline.attacker_start_ms -lt $Timeline.boot_observed_ms + 20000 -or [DateTimeOffset]::Parse($Timeline.boot_utc) -lt [DateTimeOffset]::Parse($Timeline.victim_start_utc).AddSeconds(-2) -or [DateTimeOffset]::Parse($Timeline.boot_observed_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_utc)) { throw 'Attacker started before victim boot event plus 20-second margin' }
     $ordered = @('attacker_start','proof_observed','host_connect','hello')
     for ($i = 1; $i -lt $ordered.Count; $i++) {
         if ($Timeline[($ordered[$i] + '_ms')] -lt $Timeline[($ordered[$i-1] + '_ms')] -or [DateTimeOffset]::Parse($Timeline[($ordered[$i] + '_utc')]) -lt [DateTimeOffset]::Parse($Timeline[($ordered[$i-1] + '_utc')])) { throw 'Invalid host peer attempt/Hello ordering' }

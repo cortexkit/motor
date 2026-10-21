@@ -125,6 +125,10 @@ boot margin assumes normal service startup; restarted/multiple listeners fail.
 `peer-timeline.json`, boot-event XML and `peer-host-hello.json` retain host-side
 ordering and the actual received frame; guest clocks are never subtracted from
 host clocks. Production jobs acquire no new delay and the sealed image is unchanged.
+The boot/service margin and both peer log-settle windows use absolute deadlines
+on the same monotonic Stopwatch that records their evidence. The Hello timestamp
+is captured immediately after validation, and its settle deadline is anchored to
+that recorded value; a sleep request or early timer wake is not elapsed-time proof.
 The OS-boot matcher reads the Chipset event's namespaced `UserData/VmlEventLog/VmId`
 as a GUID, allowing uppercase spelling and event timestamps up to two seconds
 before the recorded host start. Poll queries and candidate XML are retained even on timeout. Peer

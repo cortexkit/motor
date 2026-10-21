@@ -236,6 +236,34 @@ $count++
         Write-Host 'PASS peer-run-monitor-catch-retains-original-error-and-writes-reason'; $script:count++
     }
 
+    & {
+        $tokens = $null; $errors = $null
+        $qualifier = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\qualify.ps1", [ref]$tokens, [ref]$errors)
+        $capture = @($qualifier.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$timeline.hello_ms' }, $true))
+        $wait = @($qualifier.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$timeline.settled_ms' }, $true))
+        if ($errors.Count -or $capture.Count -ne 1 -or $wait.Count -ne 1) { throw 'FAIL peer-settle-production-window-is-anchored-to-recorded-hello' }
+        $peerClock = [pscustomobject]@{ElapsedMilliseconds=[long]100974}
+        $timeline = @{attacker_settled_ms=[long]100000; boot_observed_ms=[long]100000}
+        $script:RunnerWindowFixture = @{clock=$peerClock; sleeps=0}
+        function Start-Sleep([int]$Milliseconds) {
+            $script:RunnerWindowFixture.sleeps++
+            # Model an early wake that advances no time, followed by a real wait.
+            if ($script:RunnerWindowFixture.sleeps -gt 1) { $script:RunnerWindowFixture.clock.ElapsedMilliseconds += $Milliseconds }
+        }
+        try {
+            # Execute the actual call-site assignments, not a test-only start
+            # value. An earlier timeline field must not shorten the Hello window.
+            . ([scriptblock]::Create($capture[0].Extent.Text))
+            $peerClock.ElapsedMilliseconds = [long]160969
+            . ([scriptblock]::Create($wait[0].Extent.Text))
+            if ($timeline.hello_ms -ne 100974 -or $timeline.settled_ms - $timeline.hello_ms -lt 60000 -or $script:RunnerWindowFixture.sleeps -ne 2) { throw 'FAIL peer-settle-production-window-is-anchored-to-recorded-hello' }
+            Write-Host 'PASS peer-settle-production-window-is-anchored-to-recorded-hello'; $script:count++
+        } finally {
+            Remove-Item Function:\Start-Sleep
+            Remove-Variable -Name RunnerWindowFixture -Scope Script -ErrorAction SilentlyContinue
+        }
+    }
+
     # The fixed header independently pins the big-endian Hello wire format.
     $payload = [Text.Encoding]::UTF8.GetBytes('{"kind":"hello","version":4,"nonce":"0123456789abcdef0123456789abcdef"}')
     if ($payload.Length -ne 71) { throw 'Hello wire fixture length changed' }
