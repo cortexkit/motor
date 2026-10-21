@@ -198,9 +198,9 @@ pub(crate) fn return_record(
 
 /// The caller-facing form of the runner's manifest: each entry carries the
 /// path exactly as the caller requested it. The runner lists the absolute
-/// paths it was sent, in request order, so entries map by position. Without
-/// the stored request (a job record written before it existed), entries keep
-/// the runner's paths.
+/// paths it was sent, in request order, so entries map by position. When the
+/// job has no stored list of requested paths, or one of a different length,
+/// entries keep the runner's paths.
 pub(crate) fn caller_manifest(
     mut manifest: shared::ReturnManifest,
     requested: Option<&[String]>,

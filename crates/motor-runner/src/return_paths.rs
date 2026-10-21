@@ -294,10 +294,10 @@ enum Read {
 /// Every path is opened through the same no-follow walk as `collect`, and its
 /// size decides, in request order, whether it fits under the cap, before any
 /// file is read. A file that does not fit is `over_cap` and none of its bytes
-/// are read. A file then reads at most its admitted size plus one byte, so
-/// growth is seen without reading past what was admitted; growth, shrinking,
-/// or its path naming a different file once read (for example replaced by a
-/// symlink) make it `read_error`, and its chunks are dropped.
+/// are read. Reading a file consumes at most one byte beyond its admitted size,
+/// to detect growth. Growth, shrinking, or its path naming a different file
+/// once read (for example after being replaced by a symlink) make it
+/// `read_error`, and its chunks are dropped.
 pub(crate) fn collect_chunked(request: &Run, job_directory: &Path) -> ChunkedCollection {
     collect_chunked_before_read(request, job_directory, |_| {})
 }

@@ -156,7 +156,8 @@ fn shared_vectors() -> std::path::PathBuf {
             "--manifest-path",
         ])
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-        // Nested Cargo must not pick up a compile wrapper the sandbox blocks.
+        // Clear inherited compiler-wrapper settings: a wrapper such as sccache
+        // may be unusable where the tests run, and metadata needs none.
         .env("RUSTC_WRAPPER", "")
         .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .output()

@@ -25,7 +25,7 @@ components. They do not ship in this repository.
   nonce. `PATH` must reach `ssh` and `git`. `HOME` and `XDG_DATA_HOME` locate the
   development storage fallback. No runner secret is passed in the environment.
 - The manifest's `capabilities.provides` is `["exec-remote/v1", "flow-scopes/v1",
-  "exec-remote-return/v1"]`, plus `exec-remote-windows/v1` when a Windows runner
+  "exec-remote-return/v1", "exec-remote-return/v2"]`, plus `exec-remote-windows/v1` when a Windows runner
   is configured and `exec-remote-net/v1` when `network_routing` is on.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
@@ -281,7 +281,7 @@ orphaned SSH master before reusing a crashed installation's storage root.
 ## Agent runs: hosted usage and returned files
 
 These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
-`cortexkit-exec-remote-types` 0.2.9. Source: `crates/motor-module/src/agent_route.rs`.
+`cortexkit-exec-remote-types` 0.2.10. Source: `crates/motor-module/src/agent_route.rs`.
 
 **Hosted usage.** A job whose Run frame went to a hosted runner (first-party or
 Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
@@ -314,8 +314,49 @@ its capabilities, and a caller sends paths only to a module that lists it.
 Callers built before 0.2.9 cannot send the field, so they never receive the
 record.
 
+**Chunked returned files.** A request that also sets `return_chunked` gets up
+to 10 MiB of files (64 paths at most) instead of 256 KiB. `return_max_bytes`
+then defaults to, and may be at most, 10,485,760; above 262,144 bytes it is
+allowed only with `return_chunked`. Instead of `return_result`, the stream
+carries `return_chunk` records (at most 512 KiB of one file each, all of one
+file's chunks before the next file's, in request order) and then one
+`return_manifest` immediately before the terminal record. The manifest lists
+every requested path exactly as the caller sent it, with its size and SHA-256,
+or a failure: `missing`, `not_regular`, `escape`, `over_cap` (with the file's
+size; it would have passed the cap, which the runner decides before reading any
+file, so it has no chunks) or `read_error` (the file changed size, or its path
+named a different file, while it was read; its bytes are not sent). Paths are
+collected through the same no-follow walk as `return_result`.
+
+The runner keeps returned bytes for one hour after the job ends, in their own
+directory beside the job record, written and synced before the record that
+names them, like replayed output. Within that hour a reattach replays the same
+chunks and manifest at the same seqs. After it, a replay sends no chunks and
+the manifest at its original seq, with each returned entry turned into
+`expired` (keeping its size) and `total_bytes` 0. That leaves a seq gap just
+before the manifest; callers that set `return_chunked` accept it. The job
+record itself still lives for the usual 24 hours.
+
+ck-motor lists `exec-remote-return/v2` next to v1, and a caller sets
+`return_chunked` only for a module that lists it. The runner advertises
+support with `return_chunked` in its Hello. A runner without it (an older
+build-server, tenant or Boat image, or a Windows runner, which refuses returned
+files altogether) gets no Run: the job is refused before start as
+`request_rejected` with `return_chunked_unsupported`. Callers that do not set
+the flag get exactly the `return_result` behaviour above. `ck motor run` does
+not offer chunked return.
+
 Tests: `agent_route::tests` in `crates/motor-module/src/agent_route_tests.rs`
-(hosted usage, settled and pending billing, a hosted return result), and in
+(hosted usage, settled and pending billing, a hosted return result, the chunked
+cap and path echo), `crates/motor-module/tests/it/return_paths.rs`
+(`return_chunked_agent_caller_gets_a_verified_430_kb_file`,
+`return_paths_agent_v1_caller_gets_only_return_result`,
+`return_chunked_runner_without_capability_refuses_before_run`),
+`crates/motor-runner/src/tests/return_paths.rs`
+(`return_chunked_430_kb_file_round_trips_through_replay_and_restart`,
+`return_chunked_replay_after_one_hour_skips_chunks_and_leaves_a_seq_gap`),
+`crates/motor-runner/src/return_paths.rs` (the 10 MiB cap, growth and a file
+swapped for a symlink), and in
 `crates/motor-module/tests/it/operator_cli.rs`
 `agent_return_paths_send_return_result_immediately_before_the_terminal`,
 `agent_without_return_paths_never_receives_a_return_result`,
