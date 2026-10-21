@@ -39,12 +39,14 @@ the host.
   disks: the boot/system OS disk at LUN 0 and a non-system cache at LUN 1, with
   the cache's device serial captured and rechecked. Dirty caches are discarded;
   restarting the native runner service conservatively discards all old caches.
-- Service startup hashes the sealed parent once and atomically records its file
-  identity in SYSTEM/Administrators-only state. Prepare and Run compare that
-  identity (including NTFS ChangeTime) and hold read-sharing, write/delete-denying
-  handles during setup and execution. Any difference requires restarting the
-  service to re-verify. SYSTEM and Administrators remain trusted to change the
-  parent, scripts, configuration and record.
+- Service and qualification startup reuse the SYSTEM/Administrators-only parent
+  record when its full file identity matches. Only a missing, unreadable or
+  changed record triggers hashing, with a separate 15-minute validation deadline
+  and hash-duration evidence. Prepare and Run compare the same identity
+  (including NTFS ChangeTime) and hold read-sharing, write/delete-denying handles
+  during setup and execution; they never refresh a mismatch. Restart to re-verify
+  a changed parent. Startup and per-job checks trust the record equally; SYSTEM
+  and Administrators can change the parent, scripts, configuration and record.
 - No job NIC, COM mapping, optional integration service or Enhanced Session.
   Host isolation is checked before boot, every 250 ms while running, and at
   shutdown. The creation-time VM configuration checks and later samples are

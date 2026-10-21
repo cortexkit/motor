@@ -41,17 +41,50 @@ pub(super) fn control(
     cmd.args(extra).stdin(Stdio::null());
     Ok(cmd)
 }
-pub(super) fn checked(mut command: Command) -> io::Result<std::process::Output> {
-    check_output(crate::native_process::output(&mut command, || false)?)
+pub(super) fn checked(command: Command) -> io::Result<std::process::Output> {
+    checked_control(command, None, || false)
 }
-fn checked_setup(
-    config: &Config,
+pub(super) fn checked_validation(command: Command) -> io::Result<std::process::Output> {
+    // Only startup validation may hash a multi-gigabyte baseline. Leave ordinary
+    // native controls on their shorter deadline, with the same Job Object cleanup.
+    let output = checked_control(
+        command,
+        Some(std::time::Duration::from_secs(15 * 60)),
+        || false,
+    )?;
+    tracing::info!(validation = %String::from_utf8_lossy(&output.stdout).trim(), "Hyper-V startup validation completed");
+    Ok(output)
+}
+fn checked_setup(config: &Config, command: Command, id: Uuid) -> io::Result<std::process::Output> {
+    checked_control(command, None, || config.windows_runtime.setup_aborted(id))
+}
+fn checked_control(
     mut command: Command,
-    id: Uuid,
+    timeout: Option<std::time::Duration>,
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<std::process::Output> {
-    check_output(crate::native_process::output(&mut command, || {
-        config.windows_runtime.setup_aborted(id)
-    })?)
+    let operation = command
+        .get_args()
+        .skip_while(|arg| *arg != std::ffi::OsStr::new("-Operation"))
+        .nth(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let started = std::time::Instant::now();
+    let output = match timeout {
+        Some(timeout) => {
+            crate::native_process::output_with_timeout(&mut command, timeout, cancelled)
+        }
+        None => crate::native_process::output(&mut command, cancelled),
+    }
+    .and_then(check_output)
+    .map_err(|error| {
+        invalid(format!(
+            "Hyper-V {operation} control failed after {:.1}s: {error}",
+            started.elapsed().as_secs_f64()
+        ))
+    })?;
+    tracing::info!(%operation, elapsed_ms = started.elapsed().as_millis() as u64, "Hyper-V control completed");
+    Ok(output)
 }
 fn check_output(output: std::process::Output) -> io::Result<std::process::Output> {
     if !output.status.success() {

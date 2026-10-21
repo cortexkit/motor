@@ -27,8 +27,8 @@ pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
             "Hyper-V parent must be a sealed read-only regular file",
         ));
     }
-    // The hyperv.ps1 Validate operation hashes the parent and records its identity
-    // through one locked handle. Configuration loading does not read its contents.
+    // The hyperv.ps1 Validate operation checks the protected identity record and
+    // hashes only when it needs refreshing. Configuration loading reads no bytes.
     Ok(vm)
 }
 pub(super) fn validate(config: &Config) -> io::Result<()> {
@@ -39,7 +39,7 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
     {
         return Err(invalid("native Windows runner requires instance ally, windows-vm backend and the installed state root"));
     }
-    super::vm::checked(super::vm::control(
+    super::vm::checked_validation(super::vm::control(
         config,
         "Validate",
         None,

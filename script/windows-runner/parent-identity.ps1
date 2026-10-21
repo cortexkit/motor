@@ -113,11 +113,11 @@ function Assert-RunnerFileAcl([IO.FileStream]$Guard, [switch]$ParentFile) {
     }
 }
 
-function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record) {
+function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record, [string]$HashEvidence) {
     $temporary = "$Record.$([Guid]::NewGuid()).tmp"
     $guard = $null
     try {
-        # Invalidate a previous service start before attempting a new verification.
+        # A failed digest must not leave a stale identity record usable.
         if (Test-Path -LiteralPath $Record) { Remove-Item -LiteralPath $Record -Force }
         if ($ParentSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid configured parent SHA-256' }
         $guard = [Motor.ParentFile]::Open($Parent)
@@ -125,7 +125,14 @@ function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, 
         $identity = Get-RunnerParentIdentity $guard
         if ($identity.read_only -cne 'True') { throw 'Parent must be sealed read-only' }
         $sha = [Security.Cryptography.SHA256]::Create()
-        try { $hash = -join ($sha.ComputeHash($guard) | ForEach-Object { $_.ToString('x2') }) } finally { $sha.Dispose() }
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $hash = $null
+        try { $hash = -join ($sha.ComputeHash($guard) | ForEach-Object { $_.ToString('x2') }) } finally {
+            $timer.Stop(); $sha.Dispose()
+            if ($HashEvidence) {
+                @{utc=[DateTime]::UtcNow.ToString('o'); event='parent-sha256'; hash_duration_ms=$timer.Elapsed.TotalMilliseconds; hash_matches_configuration=($hash -ieq $ParentSha256)} | ConvertTo-Json -Compress | Add-Content -LiteralPath $HashEvidence -Encoding UTF8
+            }
+        }
         if ($hash -ine $ParentSha256) { throw 'Hyper-V parent SHA-256 mismatch' }
         $recordData = [ordered]@{schema=1; parent=[IO.Path]::GetFullPath($Parent); sha256=$hash; identity=$identity}
         # Create the temporary file with its final protected DACL, before publishing.
@@ -138,6 +145,7 @@ function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, 
             $output.Flush($true)
         } finally { $output.Dispose() }
         [IO.File]::Move($temporary, $Record)
+        return @{cache_hit=$false; hash_duration_ms=$timer.Elapsed.TotalMilliseconds}
     } finally {
         if ($guard) { $guard.Dispose() }
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
@@ -161,10 +169,12 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
             if ($identity[$key] -cne $verified.identity.$key) { throw "Parent identity differs: $key" }
         }
         # Skipping the digest is safe only with the sealed parent ACL and protected
-        # record. SYSTEM and Administrators remain trusted: they can change the
+        # record. Startup trusts this record exactly as the per-job check does.
+        # SYSTEM and Administrators remain trusted: they can change the
         # scripts, configuration and record too. ChangeTime catches other changes
         # and accidents even when a same-size rewrite restores LastWriteTime.
-        # Keep this read-sharing, write/delete-denying guard until the VM is off.
+        # Per-job callers keep this read-sharing, write/delete-denying guard until
+        # the VM is off; startup reuses the same identity and trust checks.
         return $guard
     } catch {
         if ($guard) { $guard.Dispose() }
@@ -172,4 +182,18 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
     } finally {
         if ($recordGuard) { $recordGuard.Dispose() }
     }
+}
+
+function Confirm-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record, [string]$HashEvidence) {
+    $guard = $null
+    try {
+        $guard = Open-RunnerVerifiedParent $Parent $ParentSha256 $Record
+        return @{cache_hit=$true; hash_duration_ms=0}
+    } catch {
+        # Only startup can refresh a missing or changed record. Prepare and Run
+        # still fail closed instead of accepting a changed parent between jobs.
+    } finally {
+        if ($guard) { $guard.Dispose() }
+    }
+    return Write-RunnerParentVerification $Parent $ParentSha256 $Record $HashEvidence
 }

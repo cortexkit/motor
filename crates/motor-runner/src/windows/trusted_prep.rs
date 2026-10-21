@@ -386,7 +386,13 @@ pub(super) fn qualify(config: &Config) -> io::Result<()> {
                 .arg(&output)
                 .env_clear()
                 .env("SYSTEMROOT", r"C:\Windows");
+            let started = Instant::now();
+            eprintln!("prep qualification batch probe mode={mode} starting");
             run_as_batch(config, &mut command, &stage, restricted)?;
+            eprintln!(
+                "prep qualification batch probe mode={mode} completed elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             let bytes = fs::read(&output)?;
             fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
             let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;

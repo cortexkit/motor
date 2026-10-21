@@ -123,12 +123,19 @@ fn capture(mut reader: impl Read) -> Vec<u8> {
     result
 }
 pub(crate) fn output(command: &mut Command, cancelled: impl Fn() -> bool) -> io::Result<Output> {
+    output_with_timeout(command, Duration::from_secs(120), cancelled)
+}
+pub(crate) fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Output> {
     let mut child = Child::spawn(command.stdout(Stdio::piped()).stderr(Stdio::piped()))?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let out = std::thread::spawn(move || capture(stdout));
     let err = std::thread::spawn(move || capture(stderr));
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -138,9 +145,10 @@ pub(crate) fn output(command: &mut Command, cancelled: impl Fn() -> bool) -> io:
             let _ = child.wait();
             let _ = out.join();
             let _ = err.join();
-            return Err(io::Error::other(
-                "native control process cancelled or exceeded 120 seconds",
-            ));
+            return Err(io::Error::other(format!(
+                "native control process cancelled or exceeded {} seconds",
+                timeout.as_secs()
+            )));
         }
         std::thread::sleep(Duration::from_millis(10));
     };

@@ -98,9 +98,23 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $lastWrite = [DateTime]::UtcNow.AddDays(-1)
         Set-FixtureParent 'original' $lastWrite
         $ParentSha256 = (Get-FileHash -LiteralPath $Parent -Algorithm SHA256).Hash
-        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        $hashLog = Join-Path $fixture 'parent-hash.jsonl'
+        $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record $hashLog
+        if ($verification.cache_hit) { throw 'FAIL parent-identity-record-written: missing record did not require verification' }
         if (-not (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-record-written' }
         Write-Host 'PASS parent-identity-record-written'
+        $count++
+        $hashEvent = Get-Content -LiteralPath $hashLog -Raw | ConvertFrom-Json
+        if ($hashEvent.event -ne 'parent-sha256' -or -not $hashEvent.hash_matches_configuration -or $hashEvent.hash_duration_ms -lt 0) { throw 'FAIL parent-identity-startup-hash-duration-logged' }
+        Write-Host 'PASS parent-identity-startup-hash-duration-logged'
+        $count++
+        $savedWriter = (Get-Item Function:\Write-RunnerParentVerification).ScriptBlock
+        Set-Item Function:\Write-RunnerParentVerification -Value { throw 'FAIL parent-identity-startup-cache-hit-without-hashing: unexpected digest' }
+        try {
+            $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record
+            if (-not $verification.cache_hit -or $verification.hash_duration_ms -ne 0) { throw 'FAIL parent-identity-startup-cache-hit-without-hashing' }
+        } finally { Set-Item Function:\Write-RunnerParentVerification -Value $savedWriter }
+        Write-Host 'PASS parent-identity-startup-cache-hit-without-hashing'
         $count++
         # Run the exact assignment from Prepare against the tiny sealed file.
         . ([scriptblock]::Create($guards[0].Extent.Text))
@@ -132,18 +146,32 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         if (-not $denied) { throw 'FAIL parent-identity-run-rejects-change-before-boot' }
         Write-Host 'PASS parent-identity-run-rejects-change-before-boot'
         $count++
+        $denied = $false
+        try { $null = Confirm-RunnerParentVerification $Parent $ParentSha256 $record } catch {
+            if ([string]$_ -notlike '*parent SHA-256 mismatch*') { throw }
+            $denied = $true
+        }
+        if (-not $denied -or (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-startup-rejects-changed-content' }
+        Write-Host 'PASS parent-identity-startup-rejects-changed-content'
+        $count++
 
         Set-FixtureParent 'original' $lastWrite
-        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        $null = Write-RunnerParentVerification $Parent $ParentSha256 $record
         Set-Acl -LiteralPath $Parent -AclObject $writeAcl
         [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::Normal)
         [IO.File]::SetLastWriteTimeUtc($Parent, $lastWrite.AddHours(1))
         [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::ReadOnly)
         Set-Acl -LiteralPath $Parent -AclObject $readAcl
         Assert-FixtureRejected 'parent-identity-rejects-timestamp-change'
+        $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record
+        if ($verification.cache_hit) { throw 'FAIL parent-identity-startup-refreshes-changed-identity' }
+        $parentGuard = Open-RunnerVerifiedParent $Parent $ParentSha256 $record
+        $parentGuard.Dispose(); $parentGuard = $null
+        Write-Host 'PASS parent-identity-startup-refreshes-changed-identity'
+        $count++
 
         Set-FixtureParent 'original' $lastWrite
-        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        $null = Write-RunnerParentVerification $Parent $ParentSha256 $record
         $metadata = @{parent=$Parent; sha256=$ParentSha256}
         . ([scriptblock]::Create($guards[1].Extent.Text))
         $parentGuard.Dispose(); $parentGuard = $null
@@ -151,9 +179,13 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $count++
         Remove-Item -LiteralPath $record -Force
         Assert-FixtureRejected 'parent-identity-rejects-missing-record'
-        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        $null = Write-RunnerParentVerification $Parent $ParentSha256 $record
         Set-Content -LiteralPath $record -Value '{broken json' -Encoding ascii
         Assert-FixtureRejected 'parent-identity-rejects-unreadable-record'
+        $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record
+        if ($verification.cache_hit) { throw 'FAIL parent-identity-startup-refreshes-unreadable-record' }
+        Write-Host 'PASS parent-identity-startup-refreshes-unreadable-record'
+        $count++
         $failed = $false
         try { Write-RunnerParentVerification $Parent ('0' * 64) $record } catch { $failed = $true }
         if (-not $failed -or (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-failed-validation-invalidates-record' }

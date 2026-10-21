@@ -61,8 +61,6 @@ if ($Operation -in @('Prepare','Id','Run','Remove','Harvest')) {
 }
 switch ($Operation) {
     'Validate' {
-        # A failed startup must not leave an earlier verification usable.
-        if (Test-Path -LiteralPath $parentRecord) { Remove-Item -LiteralPath $parentRecord -Force }
         if ((Get-Service vmms).Status -ne 'Running') { throw 'Hyper-V service unavailable' }
         if ((Get-VMHost).EnableEnhancedSessionMode) { throw 'Enhanced Session mode enabled' }
         $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\92c268b0-cddd-40a4-a664-f32e50ad35ea'
@@ -98,8 +96,13 @@ switch ($Operation) {
             }
         }
         if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
-        Write-RunnerParentVerification $Parent $ParentSha256 $parentRecord
-        Write-Output 'PASS native-host-validation'
+        $started = [Diagnostics.Stopwatch]::StartNew()
+        try { $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $parentRecord "$Root\evidence\parent-verification.jsonl" } catch {
+            Evidence 'parent-verification' 'startup-parent-verification-failed' @{elapsed_ms=$started.Elapsed.TotalMilliseconds; error=[string]$_}
+            throw
+        } finally { $started.Stop() }
+        Evidence 'parent-verification' 'startup-parent-verification' $verification
+        Write-Output "PASS native-host-validation cache_hit=$($verification.cache_hit) hash_duration_ms=$($verification.hash_duration_ms)"
     }
     { $_ -in @('GrantPrep','RevokePrep') } {
         $parentStage = [IO.Path]::GetFullPath("$Root\staging")
