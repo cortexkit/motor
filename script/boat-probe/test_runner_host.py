@@ -75,6 +75,19 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.parity_passed(dict(report, manifest_sha256='old image manifest')))
         self.assertFalse(host.parity_passed({}))
 
+    def test_git_pushurl_job_passes_only_on_a_clean_single_url_report(self):
+        passing = {'passed': True, 'observed': ['https://example.invalid/refused-push.git']}
+        self.assertEqual((True, passing), host.git_pushurl_check({'code': 0, 'stdout': json.dumps(passing)}))
+        # Ubuntu 24.04's git 2.43 keeps the inherited URL and the empty value.
+        old = {'passed': False, 'observed': ['https://example.invalid/inherited-push.git', '',
+                                             'https://example.invalid/refused-push.git']}
+        self.assertEqual((False, old), host.git_pushurl_check({'code': 1, 'stdout': json.dumps(old)}))
+        self.assertFalse(host.git_pushurl_check({'code': 0, 'stdout': json.dumps(dict(passing, passed=False))})[0])
+        crashed = {'code': 1, 'stdout': ''}
+        self.assertEqual((False, crashed), host.git_pushurl_check(crashed))
+        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        self.assertIn("('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text()))", phase)
+
     def test_parity_checker_remeasures_live_files_and_uses_operator_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp, 'wasm32-unknown-unknown')

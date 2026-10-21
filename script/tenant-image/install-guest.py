@@ -121,6 +121,9 @@ def install_tools(pins):
         f"npm@{pins['npm']}", f"pnpm@{pins['pnpm']}")
     run("bash", str(BUILD / "script/runner/install-tools.sh"), "tenant")
     run("sh", str(BUILD / "script/runner/build-sccache.sh"))
+    # Debian trixie's git (2.47) is older than the build server's; build the
+    # server's release into /usr/local, ahead of Debian's git on job PATH.
+    run("bash", str(BUILD / "script/runner/build-git.sh"))
 
     PREFIX.mkdir(parents=True)
     (PREFIX / "cargo").mkdir()
@@ -290,6 +293,21 @@ def configure(pins):
     run("systemctl", "set-default", "multi-user.target")
 
 
+def verify_git(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=shutil.which):
+    """The git that the guest runner and its jobs find first on the agent
+    unit's PATH is the build server's release, not Debian's older package."""
+    spec = manifest["tools"]["git"]
+    search = next(line.removeprefix("Environment=PATH=") for line in Path(unit).read_text().splitlines()
+                  if line.startswith("Environment=PATH="))
+    path = which("git", path=search)
+    if path != spec["path_by_role"]["boat"]:
+        raise ValueError(f"git resolves to {path}, not the pinned build")
+    actual = run(path, "--version", capture=True)
+    if actual != spec["version"]:
+        raise ValueError(f"git version differs: {actual}")
+    return actual
+
+
 def verify(pins):
     systemd = run("/usr/lib/systemd/systemd", "--version", capture=True)
     if int(systemd.split()[1]) < 257:
@@ -308,6 +326,7 @@ def verify(pins):
             raise ValueError(f"Rust targets differ: {toolchain}")
         inventory["rust_toolchains"][toolchain] = actual
     inventory["runner"] = run("motor-runner", "--version", capture=True)
+    inventory["git"] = verify_git(json.loads((BUILD / "script/runner/toolchain.json").read_text()))
     # Both errors occur during parsing, before a listener or runner can be opened.
     refuse_probe(["tenant-agent", "image-capability-probe"], "tenant-agent takes no arguments")
     refuse_probe(["image-capability-probe", "--tenant-vm", "--backend", "vm"],
@@ -328,7 +347,7 @@ def verify(pins):
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
     print(f"guest inventory: {len(pins['packages'])} packages; {len(pins['rust_toolchains'])} Rust toolchains; "
-          "4 JS tools; runner tenant-agent, sccache, nextest and Python executed")
+          "4 JS tools; runner tenant-agent, git, sccache, nextest and Python executed")
 
 
 def main():

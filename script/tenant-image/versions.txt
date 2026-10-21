@@ -14,7 +14,8 @@
     "sqlite3", "libsqlite3-dev", "git", "rsync", "curl", "jq",
     "ca-certificates", "unzip", "xz-utils", "unattended-upgrades", "ufw",
     "binaryen", "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
-    "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch"
+    "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch",
+    "gettext", "libcurl4-gnutls-dev", "libexpat1-dev", "libpcre2-dev", "zlib1g-dev"
   ],
   "runner_inputs_sha256": {
     "script/runner/tools.txt": "971d6fc20abb8d76c5397803e90e7f58f0edb916c254a5b3ba4427dbc29213a1",
@@ -22,7 +23,8 @@
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/motor-net.nft": "b0e1dddc368a7fca09b1c6df87b4c917319eebf75bd14be9ce9dc8193a1eb2bb",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
-    "script/runner/toolchain.json": "2aa50642f5934face8118a46116481a1c4fa190d69b74725e0c0a2971725e8ab"
+    "script/runner/toolchain.json": "8d57708a915718c82fec3e0e9188d31bbf6510260cfaae2be9d1220931e9bcfa",
+    "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",
   "rust_default": "1.99.0",

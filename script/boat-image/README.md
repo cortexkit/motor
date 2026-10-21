@@ -215,6 +215,29 @@ Cargo versions/default aliases are exact, while Boat's patched sccache is checke
 using its build-input marker, recorded output hashes and a distinct stock binary. The server's sccache
 hashes are checked directly. Inventory never starts either sccache executable.
 
+Git is not an accepted difference. Ubuntu 24.04's git is 2.43, and git's
+behaviour changes between that and the server's 2.53: from 2.46 an empty
+`remote.<name>.pushurl` or `remote.<name>.url` value clears the URLs set by
+earlier config, where 2.43 keeps them and adds the empty string as another URL.
+`script/runner/build-git.sh` builds the server's release from the kernel.org
+source pinned in `toolchain.json` (`tools.git`: URL, SHA-256, install
+directory), with libcurl (GnuTLS) for https, expat for http push, PCRE2 and
+gettext as in Ubuntu's package, into `/usr/local/lib/git/<version>`, and links
+`git`, `scalar` and the server-side commands from `/usr/local/bin`. Ubuntu's
+git package stays installed at `/usr/bin/git` for packages that depend on it;
+the runner's unit PATH and the job PATH both search `/usr/local/bin` before
+`/usr/bin`.
+Parity checks Boat's `git` path, resolved executable and exact `git --version`
+against the server's capture. A server git upgrade refreshes the manifest's
+version through `--from-capture`; `validate` then refuses the manifest until
+the source URL and install paths name the new release, and a SHA-256 left from
+the old release fails `build-git.sh`'s download check.
+
+Each qualification phase also runs `script/runner/git-pushurl-probe.py` inside
+a real job: it resets an inherited pushurl at `--worktree` scope with an empty
+value, adds one URL, and requires `git remote get-url --push --all` to print
+exactly that URL. It fails with git before 2.46.
+
 ## Filesystem choice
 
 Boat's measured ext4 root rejects FICLONE (`EOPNOTSUPP`). Use a **64 GiB sparse,

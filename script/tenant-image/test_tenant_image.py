@@ -80,6 +80,34 @@ class ImageTests(unittest.TestCase):
         self.assertIn("python3", pins["packages"])
         self.assertIn("systemd-sysv", pins["packages"])
 
+    def test_debootstrap_includes_the_pinned_git_build_dependencies(self):
+        pins = image.load_versions(self.versions)
+        manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
+        missing = set(manifest["tools"]["git"]["source"]["build_packages"]) - set(pins["packages"])
+        self.assertEqual(set(), missing)
+        self.assertIn("script/runner/build-git.sh", image.RUNNER_INPUTS)
+        installer = (HERE / "install-guest.py").read_text()
+        self.assertIn('run("bash", str(BUILD / "script/runner/build-git.sh"))', installer)
+
+    def test_guest_git_must_be_the_pinned_build_first_on_the_agent_path(self):
+        manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
+        unit = HERE / "guest/motor-tenant-agent.service"
+        searched = []
+
+        def which(name, path):
+            searched.append(path)
+            return "/usr/local/bin/git"
+        with mock.patch.object(guest, "run", return_value="git version 2.53.0") as run:
+            self.assertEqual("git version 2.53.0", guest.verify_git(manifest, unit, which))
+        run.assert_called_once_with("/usr/local/bin/git", "--version", capture=True)
+        self.assertEqual(["/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"], searched)
+        with mock.patch.object(guest, "run", return_value="git version 2.47.3"):
+            with self.assertRaisesRegex(ValueError, "git version differs"):
+                guest.verify_git(manifest, unit, which)
+        with mock.patch.object(guest, "run", return_value="git version 2.53.0"):
+            with self.assertRaisesRegex(ValueError, "not the pinned build"):
+                guest.verify_git(manifest, unit, lambda name, path: "/usr/bin/git")
+
     def test_unpinned_inputs_are_rejected(self):
         for key, value in (("node", "latest"), ("pnpm", "11.2.0"), ("rust_default", "stable"),
                            ("debian_snapshot", "latest"), ("rootfs_gib", 0), ("packages", ["bad; package"]),
