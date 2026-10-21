@@ -37,7 +37,8 @@
           "kty": "OKP",
           "crv": "Ed25519",
           "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
-        }
+        },
+        "allow_spill": true
       }
     },
     "reply": {
