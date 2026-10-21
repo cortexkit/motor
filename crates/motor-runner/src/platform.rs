@@ -211,7 +211,7 @@ fn descriptor_limit() -> u32 {
         .min(DEFAULT_NR_OPEN)
 }
 
-/// Close every descriptor in `ranges` in a freshly forked launch child.
+/// Close the descriptors in `ranges` in a freshly forked launch child.
 ///
 /// The child waits at the gate until the job's Started record is durable, which
 /// can take a long time under load, and until it execs it holds a copy of every
@@ -219,12 +219,14 @@ fn descriptor_limit() -> u32 {
 /// An flock belongs to the open file all those copies share, and a socket or
 /// pipe end stays open while any copy exists. Without this, a lock the runner
 /// has released by closing its descriptor (the runner state lock, cache locks,
-/// store locks) stays held, a closed listener keeps accepting, and a reader
-/// waits for EOF on another command's output pipe until the job starts.
+/// store locks) stays held, a listening socket the runner closed stays open and
+/// still completes connections, and a reader waits for EOF on another command's
+/// output pipe until the job starts.
 ///
 /// Only async-signal-safe system calls: another thread may have held the
-/// allocator lock at the fork. `close_range` needs Linux 5.9; older kernels
-/// (ENOSYS) close one descriptor at a time below `fallback_end`.
+/// allocator lock at the fork. `close_range` needs Linux 5.9; when it fails
+/// (ENOSYS on older kernels), the range is closed one descriptor at a time,
+/// but only below `fallback_end`.
 #[cfg(target_os = "linux")]
 unsafe fn close_inherited_descriptors(ranges: &[(u32, u32)], fallback_end: u32) {
     for &(first, last) in ranges {
