@@ -7,6 +7,9 @@ mod writer;
 #[path = "privilege.rs"]
 mod privilege;
 
+#[path = "command_golden_tests.rs"]
+mod command_golden;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.
