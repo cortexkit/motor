@@ -2065,9 +2065,10 @@ impl Sandbox {
         }
         compile_cache_mounts(
             state,
+            workspace,
             target,
             writer,
-            cached_rust,
+            shared_compile_cache,
             &mut read_only,
             &mut read_write,
             &mut mount_destinations,
@@ -2332,7 +2333,12 @@ impl Sandbox {
             cmd.args(tenant_unit_properties());
         }
         if self.boat_profile {
-            cmd.arg("--property=ProcSubset=pid");
+            // No ProcSubset=pid: like build-server jobs, Boat jobs see /proc/stat,
+            // /proc/meminfo and the other non-process entries, which tools such
+            // as ps read. A Boat sandbox VM admits one job, so those entries
+            // describe only that job's machine. ProtectProc=invisible below still
+            // hides other accounts' processes, and ProtectKernelTunables keeps
+            // /proc/sys read-only.
             let names = crate::systemd::provider_names(
                 "",
                 self.provider_unset_env
@@ -2596,20 +2602,28 @@ impl Sandbox {
 #[cfg(test)]
 mod tests;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_cache_mounts(
     state: &Path,
+    workspace: &Path,
     target: &Path,
     writer: bool,
-    enabled: bool,
+    shared_compile_cache: bool,
     read_only: &mut Vec<String>,
     read_write: &mut Vec<String>,
     destinations: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
-    if !enabled {
+    if !workspace.join("Cargo.toml").is_file() {
         return Ok(());
     }
+    // Every Rust job builds in this fixed folder, bound to its own target
+    // folder, whether or not the runner has a shared compile cache. Boat and
+    // tenant jobs thus see the same build paths as build-server jobs.
     read_write.push(bind(target, Path::new(crate::compile_cache::TARGET))?);
     destinations.push(PathBuf::from(crate::compile_cache::TARGET));
+    if !shared_compile_cache {
+        return Ok(());
+    }
     // Eviction may remove this root between setup and unit launch. An
     // optional bind lets the job start and compile misses locally.
     let cache = state.join("sccache/fleet");

@@ -898,6 +898,16 @@ fn compile_cache_environment(
 ) -> io::Result<()> {
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
+        // Without the shared cache an isolated Rust job still builds in the same fixed
+        // folder as on the build server; the sandbox binds it to the job's own
+        // target folder (`compile_cache_mounts`).
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && rust_job(setup) {
+            env.insert(
+                "CARGO_TARGET_DIR".into(),
+                crate::compile_cache::TARGET.into(),
+            );
+        }
         return Ok(());
     }
     if let Some(wrapper) = &prepared.wrapper {
@@ -909,12 +919,7 @@ fn compile_cache_environment(
         env.remove("RUSTC_WRAPPER");
     }
     #[cfg(target_os = "linux")]
-    if config.isolate_jobs
-        && (setup.base
-            || Path::new(&setup.request.workspace_key)
-                .join("Cargo.toml")
-                .is_file())
-    {
+    if config.isolate_jobs && rust_job(setup) {
         crate::compile_cache::reader_environment(env, config.sccache_size_gib);
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
@@ -937,6 +942,15 @@ fn compile_cache_environment(
     #[cfg(not(target_os = "linux"))]
     let _ = setup;
     Ok(())
+}
+
+/// A cache fill, or a job whose workspace root is a Cargo workspace.
+#[cfg(target_os = "linux")]
+fn rust_job(setup: &Setup) -> bool {
+    setup.base
+        || Path::new(&setup.request.workspace_key)
+            .join("Cargo.toml")
+            .is_file()
 }
 
 // Preserve only the daemon context toolchains need. Request values are filtered

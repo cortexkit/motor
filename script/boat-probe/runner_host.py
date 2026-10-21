@@ -161,7 +161,35 @@ data['process_visibility'] = {'proc':visible, 'ps':{'exit_code':ps.returncode,'r
     'protected_pids':PROTECTED_PIDS, 'runner_signal_probe':signal_probe, 'self_pid':os.getpid()}
 status = pathlib.Path('/proc/self/status').read_text()
 data['status_security'] = {key:next(line.split()[1] for line in status.splitlines() if line.startswith(key+':')) for key in ('NoNewPrivs','CapEff','CapBnd')}
-data['proc_mountinfo'] = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == '/proc']
+data['proc_mountinfo'] = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] in ('/proc', '/proc/sys')]
+def global_proc():
+    # Build-server jobs read these non-process entries (ps needs btime from
+    # /proc/stat); /proc/sys must stay read-only and the kernel command line
+    # must not carry provider credentials. Record booleans, not the contents.
+    out = {}
+    for path, prefix in (('/proc/stat', 'btime '), ('/proc/meminfo', 'MemTotal:')):
+        name = path.rsplit('/', 1)[1]
+        try:
+            lines = pathlib.Path(path).read_text().splitlines()
+            out[name] = {'readable': True, 'has_line': any(line.startswith(prefix) for line in lines)}
+        except OSError as error:
+            out[name] = {'readable': False, 'error': type(error).__name__}
+    try:
+        out['sys_read_only'] = bool(os.statvfs('/proc/sys').f_flag & os.ST_RDONLY)
+    except OSError as error:
+        out['sys_read_only'], out['sys_error'] = False, type(error).__name__
+    try:
+        cmdline = pathlib.Path('/proc/cmdline').read_text()
+        out['cmdline'] = {'readable': True, 'provider_names': 'ASCII_TOKEN' in cmdline or 'BOAT_' in cmdline}
+    except OSError as error:
+        out['cmdline'] = {'readable': False, 'error': type(error).__name__}
+    return out
+data['proc_global'] = global_proc()
+try:
+    same_target = os.path.samefile('target', '/run/motor/target')
+    data['cargo_target'] = {'env': os.environ.get('CARGO_TARGET_DIR'), 'same_directory': same_target}
+except OSError as error:
+    data['cargo_target'] = {'env': os.environ.get('CARGO_TARGET_DIR'), 'same_directory': None, 'error': type(error).__name__}
 data['execution_capabilities'] = execution_capabilities()
 print(json.dumps(data))
 '''
@@ -494,6 +522,9 @@ def isolation_checks(job, host):
         "no_privilege_gain": job['status_security']['NoNewPrivs'] == '1' and int(job['status_security']['CapEff'],16) == 0 and int(job['status_security']['CapBnd'],16) == 0,
         **job['execution_capabilities']['checks'],
         **process_visibility_checks(job),
+        **proc_checks(job),
+        # Rust jobs build in the build server's fixed folder, bound to ./target.
+        "fixed_cargo_target_dir": job['cargo_target'].get('env') == '/run/motor/target' and job['cargo_target'].get('same_directory') is True,
         # This explicit Boat profile does not promise a private PID namespace on systemd 255.
         "boat_pid_profile": job["namespaces"]["pid"] == host["namespaces"]["pid"],
     }
@@ -512,7 +543,22 @@ def process_visibility_checks(job):
             any(row['pid'] == visibility['self_pid'] for row in ps['rows']) and
             all(row['uid'] == job['uid'] and row['pid'] not in protected for row in ps['rows']),
         'cannot_signal_runner': signal['pid'] in protected and signal.get('allowed') is False and signal.get('errno') == errno.EPERM,
-        'pid_only_proc_mount': any('subset=pid' in line and ('hidepid=invisible' in line or 'hidepid=2' in line) for line in job['proc_mountinfo']),
+    }
+
+
+def proc_checks(job):
+    proc = job['proc_global']
+    options = [line.split(' - ', 1)[1].split()[2].split(',') for line in job['proc_mountinfo']
+               if ' - ' in line and line.split()[4] == '/proc']
+    return {
+        # Other accounts' processes stay hidden, but the mount is not limited to
+        # process entries: ProcSubset=pid (subset=pid) hides /proc/stat from ps.
+        'proc_hides_other_users': bool(options) and all(
+            ('hidepid=invisible' in mount or 'hidepid=2' in mount) and 'subset=pid' not in mount for mount in options),
+        'proc_stat_has_btime': proc['stat'].get('readable') is True and proc['stat'].get('has_line') is True,
+        'proc_meminfo_readable': proc['meminfo'].get('readable') is True and proc['meminfo'].get('has_line') is True,
+        'proc_sys_read_only': proc['sys_read_only'] is True,
+        'proc_cmdline_no_provider_names': proc['cmdline'].get('readable') is True and proc['cmdline'].get('provider_names') is False,
     }
 
 

@@ -80,6 +80,15 @@ The complete mount list is not covered by one test; the
 properties. A Rust job also gets `CARGO_TARGET_DIR=/run/motor/target` and
 `SCCACHE_DIR=/motor-cache`.
 
+Boat sandboxes and tenant VMs have no shared compile cache: their jobs get
+no `/motor-cache` mount, no `RUSTC_WRAPPER` and no `SCCACHE_*` variables. A Rust
+job there still builds in the same fixed folder as on the build server:
+`CARGO_TARGET_DIR=/run/motor/target`, bound to the workspace's own `target/`, so
+build paths and `./target` behave identically everywhere. Tests:
+`hosted_jobs_bypass_shared_compile_cache_but_keep_the_fixed_target_folder`,
+`tenant_rust_launch_builds_in_fixed_target_without_compile_cache`
+(`crates/motor-runner/src/backend_tests.rs`).
+
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
 `isolated_jobs_receive_private_shm_that_disappears_after_they_end` (operator-only).
@@ -130,6 +139,20 @@ sources. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trust
 
 4.1. A job has a private PID namespace (`PrivatePIDs=yes`) and cannot see or
 signal other accounts' processes. Test: `isolated_job_cannot_see_another_accounts_process`.
+
+4.1.1. What a job sees in `/proc`: its own processes only
+(`ProtectProc=invisible` hides other accounts'), plus the machine-wide entries
+such as `/proc/stat`, `/proc/meminfo`, `/proc/cpuinfo`, `/proc/loadavg` and
+`/proc/uptime`. `ps`, test harnesses and system-information libraries read
+those (`ps` needs the boot time in `/proc/stat`). `ProtectKernelTunables=yes`
+keeps `/proc/sys` and the other kernel-setting files read-only. Boat jobs see
+exactly the same: the Boat profile does not set `ProcSubset=pid`, which would
+hide every non-process entry and make `ps` fail. On Boat those entries describe
+only the sandbox VM, which admits one job; on the build server they describe the
+shared host, as they always have. Test:
+`boat_command_preserves_isolation_and_limits_without_private_pids`
+(`crates/motor-runner/src/isolation/tests.rs`); the live Boat probe checks the
+mount and the entries from inside a job (`script/boat-image/README.md`).
 
 4.2. The command starts only after the runner has written the job's durable
 record: the service waits on a one-byte gate on its stdin, and end-of-file runs

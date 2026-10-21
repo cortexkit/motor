@@ -135,6 +135,7 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             "PrivateNetwork=yes",
             "PrivateDevices=yes",
             "ProtectProc=invisible",
+            "ProtectKernelTunables=yes",
             "NoNewPrivileges=yes",
             "KillMode=control-group",
             "User=motor-job",
@@ -146,7 +147,10 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             .any(|a| a.starts_with("--property=TemporaryFileSystem=/dev/shm:")));
         assert_eq!(args.contains(&"--property=CPUQuota=200%"), boat);
         assert_eq!(args.contains(&"--property=TasksMax=4096"), boat);
-        assert_eq!(args.contains(&"--property=ProcSubset=pid"), boat);
+        // Boat jobs see the same non-process /proc entries as build-server
+        // jobs (/proc/stat, /proc/meminfo, ...): the sandbox VM runs one job,
+        // so those entries describe nothing but that job's own machine.
+        assert!(!args.iter().any(|a| a.contains("ProcSubset")), "{args:?}");
         assert_eq!(
             args.contains(
                 &"--property=UnsetEnvironment=ASCII_TOKEN BOAT_CURRENT_ID_FILE BOAT_FUTURE BOAT_ID"
