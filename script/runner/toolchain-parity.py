@@ -111,7 +111,7 @@ def capture(manifest=None, job=False):
         if path.is_file():
             metadata[str(root)] = json.loads(path.read_text())
     tools = {}
-    names = {"node", "npm", "bun", "pnpm", "nats-server", "wasm-opt", "esbuild",
+    names = {"node", "npm", "bun", "pnpm", "nats-server", "wasm-opt", "esbuild", "git",
              "x86_64-w64-mingw32-gcc", "x86_64-w64-mingw32-g++"}
     names.update(paths.get("tools", {}))
     names.update(paths.get("gnu_coreutils", {}))
@@ -234,6 +234,9 @@ def validate(manifest):
             raise ValueError("invalid Bun archive binary: " + name)
         if name == "node22" and archive.get("strip_components") != 1:
             raise ValueError("invalid Node archive root: " + name)
+    git = manifest["tools"].get("git")
+    if git is not None:
+        validate_git(git)
     for name, spec in manifest["tools"].items():
         source = spec.get("version_from")
         if source and (source not in manifest["tools"]
@@ -257,6 +260,28 @@ def validate(manifest):
                 raise ValueError("Cargo install and binary versions disagree: " + name)
     if not re.fullmatch(r'[a-f0-9]{64}', manifest['compile_wrapper']['sccache_sha256']):
         raise ValueError('invalid trusted compiler cache wrapper hash')
+
+
+def validate_git(spec):
+    """Boat and tenant images build the server's git release from source. Tie
+    the source URL, install directory and Boat paths to the measured version,
+    so refreshing the server's version without new source pins fails here."""
+    match = re.fullmatch(r"git version (\d+\.\d+\.\d+)", spec.get("version", ""))
+    if not match:
+        raise ValueError("unpinned version: git")
+    release = match.group(1)
+    source = spec.get("source", {})
+    install_dir = "/usr/local/lib/git/" + release
+    if (source.get("url") != f"https://www.kernel.org/pub/software/scm/git/git-{release}.tar.xz"
+            or not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", ""))):
+        raise ValueError("invalid pinned git source: " + release)
+    if (source.get("install_dir") != install_dir
+            or spec.get("path_by_role") != {"boat": "/usr/local/bin/git"}
+            or spec.get("realpath_suffix_by_role", {}).get("boat") != install_dir + "/bin/git"):
+        raise ValueError("invalid git install layout: " + release)
+    packages = source.get("build_packages")
+    if not packages or not all(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) for name in packages):
+        raise ValueError("invalid git build packages")
 
 
 def readonly_mount(path, mountinfo):
@@ -306,7 +331,9 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
     tools = actual.get("tools", {})
     for name, expected in manifest["tools"].items():
         observed = tools.get(name) or {}
-        equal(name + " path", expected["path"], observed.get("path"))
+        # A tool the image installs beside a distribution copy, like git,
+        # resolves from another directory there; its version is still exact.
+        equal(name + " path", expected.get("path_by_role", {}).get(role, expected["path"]), observed.get("path"))
         equal(name + " --version exit", 0, observed.get("exit_code"))
         version = first_line(observed.get("version"))
         if "version" in expected:

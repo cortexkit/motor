@@ -91,6 +91,19 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('Environment=HOME=/home/ubuntu\n', unit)
         self.assertIn('Environment=PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:', unit)
 
+    def test_pinned_git_is_built_and_precedes_ubuntu_git_for_runner_and_jobs(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        link_dir = manifest['tools']['git']['path_by_role']['boat'].rsplit('/', 1)[0]
+        unit = (HERE / 'motor-boat.service').read_text()
+        runner_path = next(line.split('=', 2)[2] for line in unit.splitlines() if line.startswith('Environment=PATH='))
+        job_path = manifest['job_environment_by_role']['boat']['PATH']
+        for path in (runner_path, job_path):
+            entries = path.split(':')
+            self.assertLess(entries.index(link_dir), entries.index('/usr/bin'), path)
+        source = (HERE / 'install.py').read_text()
+        self.assertIn('run("bash", str(ROOT / "script/runner/build-git.sh"))', source)
+        self.assertIn('manifest["tools"]["git"]["source"]["build_packages"]', source)
+
     def test_recipe_passes_exact_rustup_component_and_target_argv(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
         with patch.object(install, 'run', return_value='') as run:

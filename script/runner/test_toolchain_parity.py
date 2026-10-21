@@ -100,6 +100,8 @@ class CaptureTests(unittest.TestCase):
             self.assertIn('wasm32-unknown-unknown', incomplete['rust_toolchains'][name]['targets'])
             self.assertFalse(incomplete['rust_target_payloads'][name]['wasm32-unknown-unknown'])
             self.assertNotIn('wasm32-unknown-unknown', after['rust_toolchains'][name]['targets'])
+            # A plain --capture, without a manifest, measures git too.
+            self.assertIn('git', before['tools'])
 
 
 class ParityTests(unittest.TestCase):
@@ -124,7 +126,7 @@ class ParityTests(unittest.TestCase):
         for name, expected in manifest['cargo_binaries'].items():
             if 'matches' in expected:
                 bins[name]['sha256'] = bins[expected['matches']]['sha256']
-        tools = {name: {'path': spec['path'],
+        tools = {name: {'path': spec.get('path_by_role', {}).get(role, spec['path']),
                         'realpath': spec['path'] + spec.get('realpath_suffix',
                                                              spec.get('realpath_suffix_by_role', {}).get(role, '')),
                         'version': spec.get('version', spec.get('observed_build_server_version')), 'exit_code': 0}
@@ -323,6 +325,42 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(parity.main(), 1)
         self.assertFalse(json.loads(out.getvalue())['passed'])
 
+    def test_check_cli_fails_when_git_version_differs_from_the_server(self):
+        actual = self.observed()
+        actual['tools']['git']['version'] = 'git version 2.43.0'
+        with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--check']), \
+             patch.object(parity, 'capture', return_value=actual), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(parity.main(), 1)
+        self.assertEqual(["git version: expected 'git version 2.53.0', observed 'git version 2.43.0'"],
+                         json.loads(out.getvalue())['errors'])
+
+    def test_boat_git_is_the_servers_release_ahead_of_the_distribution_git(self):
+        self.assertEqual([], self.report(self.observed('boat'), job=True, role='boat')['errors'])
+        actual = self.observed('boat')
+        actual['tools']['git'].update(version='git version 2.43.0')
+        self.assertEqual(["git version: expected 'git version 2.53.0', observed 'git version 2.43.0'"],
+                         self.report(actual, job=True, role='boat')['errors'])
+        # Ubuntu's own git found first: wrong directory and not the pinned build.
+        actual = self.observed('boat')
+        actual['tools']['git'].update(path='/usr/bin/git', realpath='/usr/bin/git', version='git version 2.43.0')
+        errors = self.report(actual, job=True, role='boat')['errors']
+        self.assertIn("git path: expected '/usr/local/bin/git', observed '/usr/bin/git'", errors)
+        self.assertIn('git: wrong resolved executable path', errors)
+
+    def test_git_source_pin_follows_the_measured_version(self):
+        parity.validate(self.manifest)
+        for change in ({'version': 'git version 2.54.0'}, {'version': 'git version 2.53'},
+                       {'source': dict(self.manifest['tools']['git']['source'], sha256='latest')},
+                       {'source': dict(self.manifest['tools']['git']['source'], install_dir='/usr/local')},
+                       {'source': dict(self.manifest['tools']['git']['source'], build_packages=[])},
+                       {'path_by_role': {'boat': '/usr/bin/git'}}):
+            with self.subTest(change=change):
+                manifest = copy.deepcopy(self.manifest)
+                manifest['tools']['git'].update(change)
+                with self.assertRaisesRegex(ValueError, 'git'):
+                    parity.validate(manifest)
+
 
 class InstallerTests(unittest.TestCase):
     def test_cargo_installer_consumes_manifest_and_places_pinned_defaults(self):
@@ -426,6 +464,109 @@ class InstallerTests(unittest.TestCase):
                                     PATH=str(fake_bin) + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotEqual((cargo_home / 'bin/sccache').read_bytes(), (cargo_home / 'bin/sccache-0.18.0-stock').read_bytes())
+
+
+FAKE_GIT = '''#!/bin/sh
+case "$*" in
+  --version) echo 'git version 2.53.0' ;;
+  '--version --build-options') printf 'git version 2.53.0\\nlibcurl: 8.18.0\\n' ;;
+  grep*) grep -q motor pcre.txt ;;
+  *) exit 2 ;;
+esac
+'''
+
+# Stands in for git's own Makefile: records each target and installs the fake
+# git under the prefix and DESTDIR that build-git.sh passes.
+FAKE_GIT_MAKEFILE = '''all:
+\techo all >> $(TEST_MAKE_LOG)
+install:
+\techo install $(prefix) $(sysconfdir) $(USE_LIBPCRE2) >> $(TEST_MAKE_LOG)
+\tmkdir -p $(DESTDIR)$(prefix)/bin $(DESTDIR)$(prefix)/libexec/git-core
+\tfor name in git git-receive-pack git-upload-pack git-upload-archive git-shell scalar; do cp fake-git $(DESTDIR)$(prefix)/bin/$$name; done
+\tcp fake-git $(DESTDIR)$(prefix)/libexec/git-core/git-remote-https
+\tcp fake-git $(DESTDIR)$(prefix)/libexec/git-core/git-http-push
+'''
+
+
+class GitBuildTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.source = self.root / 'git-2.53.0.tar.xz'
+        with tarfile.open(self.source, 'w:xz') as archive:
+            for name, text, mode in (('Makefile', FAKE_GIT_MAKEFILE, 0o644), ('fake-git', FAKE_GIT, 0o755)):
+                entry = tarfile.TarInfo('git-2.53.0/' + name)
+                payload = text.encode()
+                entry.size, entry.mode = len(payload), mode
+                archive.addfile(entry, io.BytesIO(payload))
+        self.manifest = json.loads(parity.MANIFEST.read_text())
+        self.manifest['tools']['git']['source']['sha256'] = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        fake_bin = self.root / 'fake-bin'
+        fake_bin.mkdir()
+        curl = fake_bin / 'curl'
+        curl.write_text('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\ncp "$TEST_SOURCE" "$2"\n')
+        curl.chmod(0o755)
+        self.env = dict(os.environ, TEST_SOURCE=str(self.source), TEST_MAKE_LOG=str(self.root / 'make.log'),
+                        GIT_INSTALL_ROOT=str(self.root / 'sysroot'), TMPDIR=str(self.root),
+                        PATH=str(fake_bin) + os.pathsep + os.environ['PATH'])
+
+    def build(self):
+        scripts = self.root / 'runner'
+        scripts.mkdir(exist_ok=True)
+        (scripts / 'toolchain.json').write_text(json.dumps(self.manifest))
+        (scripts / 'build-git.sh').write_text((parity.HERE / 'build-git.sh').read_text())
+        return subprocess.run(['bash', str(scripts / 'build-git.sh')], env=self.env, capture_output=True, text=True)
+
+    def test_pinned_source_is_built_once_and_linked_ahead_of_the_distribution_git(self):
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        install_dir = self.manifest['tools']['git']['source']['install_dir']
+        self.assertEqual(['all', f'install {install_dir} /etc 1'],
+                         (self.root / 'make.log').read_text().splitlines())
+        sysroot = self.root / 'sysroot'
+        for name in ('git', 'git-receive-pack', 'git-upload-pack', 'git-upload-archive', 'git-shell', 'scalar'):
+            self.assertEqual(install_dir + '/bin/' + name, os.readlink(sysroot / 'usr/local/bin' / name))
+            self.assertTrue((sysroot / install_dir.lstrip('/') / 'bin' / name).is_file())
+        # Reapplying the recipe with unchanged inputs reuses the build.
+        again = self.build()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn('already built from the pinned source', again.stdout)
+        self.assertEqual(2, len((self.root / 'make.log').read_text().splitlines()))
+
+    def test_source_with_another_digest_is_refused_before_building(self):
+        self.manifest['tools']['git']['source']['sha256'] = '0' * 64
+        result = self.build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('source SHA-256 mismatch', result.stderr)
+        self.assertFalse((self.root / 'make.log').exists())
+        self.assertFalse((self.root / 'sysroot/usr/local/bin/git').exists())
+
+
+PUSHURL_SPEC = importlib.util.spec_from_file_location('git_pushurl_probe', parity.HERE / 'git-pushurl-probe.py')
+assert PUSHURL_SPEC is not None and PUSHURL_SPEC.loader is not None
+pushurl_probe = importlib.util.module_from_spec(PUSHURL_SPEC)
+PUSHURL_SPEC.loader.exec_module(pushurl_probe)
+
+
+class GitPushurlProbeTests(unittest.TestCase):
+    def test_only_the_single_worktree_url_passes(self):
+        refused, inherited = pushurl_probe.REFUSED, pushurl_probe.INHERITED
+        self.assertTrue(pushurl_probe.evaluate(refused + '\n')['passed'])
+        # Git before 2.46 keeps the inherited URL and the empty reset value.
+        old = pushurl_probe.evaluate('\n'.join((inherited, '', refused)) + '\n')
+        self.assertFalse(old['passed'])
+        self.assertEqual([inherited, '', refused], old['observed'])
+
+    def test_probe_passes_with_a_git_that_resets_on_an_empty_value(self):
+        version = subprocess.run(['git', '--version'], capture_output=True, text=True, check=True).stdout
+        release = tuple(int(part) for part in version.split()[2].split('.')[:2])
+        if release < (2, 46):
+            self.skipTest('this host has git before 2.46, which keeps the inherited push URL: ' + version)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(0, pushurl_probe.run_probe())
+        report = json.loads(out.getvalue())
+        self.assertEqual([pushurl_probe.REFUSED], report['observed'])
 
 
 if __name__ == "__main__":

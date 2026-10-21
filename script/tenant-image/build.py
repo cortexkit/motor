@@ -24,6 +24,7 @@ RUNNER_INPUTS = (
     "script/runner/toolchain.json",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
+    "script/runner/build-git.sh",
 )
 
 

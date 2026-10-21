@@ -43,6 +43,13 @@ The other inputs are:
   is installed by the existing installer, which uses locked release versions
   or full Git revisions. Sccache is built by the patched builder, not replaced
   by stock `cargo install sccache`.
+- Git built from the build server's release (`toolchain.json`'s `tools.git`:
+  kernel.org source with a pinned SHA-256) by the pinned `build-git.sh`, into
+  `/usr/local/lib/git/<version>` and linked from `/usr/local/bin`, ahead of
+  Debian's older git on the agent's and jobs' PATH. Debian's git package stays
+  installed; the build dependencies (libcurl GnuTLS, expat, PCRE2, zlib,
+  gettext) are in the package list. Image verification runs the git the agent's
+  PATH finds and requires the server's exact `git --version`.
 - An explicitly supplied Linux `motor-runner` binary. Its SHA-256 is recorded
   in the manifest. Use a binary built from the intended reviewed Motor commit
   and record that commit in the operator's release record. The build executes

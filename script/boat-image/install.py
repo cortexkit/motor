@@ -46,6 +46,7 @@ RUNNER_INPUTS = (
     'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
     'script/runner/cargo-seed.py',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
+    'script/runner/build-git.sh',
 )
 # motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
 TOOL_HOME = Path("/home/ubuntu")
@@ -360,6 +361,10 @@ def tools(manifest):
         run("update-alternatives", "--set", "x86_64-w64-mingw32-" + name,
             "/usr/bin/x86_64-w64-mingw32-" + name + "-win32")
     gnu_aliases(manifest)
+    # Ubuntu 24.04's git is older than the build server's and behaves
+    # differently; build the server's release ahead of it on PATH. The
+    # anonymous ls-remote below then also exercises the build's https support.
+    run("bash", str(ROOT / "script/runner/build-git.sh"))
     # Fail anonymously instead of forwarding an operator's repository credentials.
     run("git", "-c", "credential.helper=", "ls-remote", "https://github.com/cortexkit/commons", "HEAD")
     run("bash", str(ROOT / "script/runner/install-tools.sh"), "boat")
@@ -522,7 +527,8 @@ def main():
     releases = release_manifest()
     # Keep provider-managed init and SSH binaries; only our SSH drop-in is installed.
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
-    packages = manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["boat"]
+    packages = (manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["boat"]
+                + manifest["tools"]["git"]["source"]["build_packages"])
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
     target_directories()
     accounts()
@@ -551,7 +557,7 @@ def main():
     inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],
         "node": ["node", "--version"], "bun": ["bun", "--version"],
-        "pnpm": ["pnpm", "--version"],
+        "pnpm": ["pnpm", "--version"], "git": ["git", "--version"],
         "nats": ["nats-server", "--version"], "python": ["python3", "--version"],
         "systemd": ["systemctl", "--version"],
     }.items()}

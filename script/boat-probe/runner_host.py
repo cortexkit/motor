@@ -34,6 +34,7 @@ PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
 PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
+GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
 ROOT_PATHS_SCRIPT = ROOT / 'script/tenant-image/guest/root_paths.py'
 
 
@@ -533,6 +534,16 @@ def job_repository(repository, cargo_seed_manifest=None):
         subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)
 
 
+def git_pushurl_check(parsed):
+    """(passed, evidence) for the job that resets a pushurl at worktree scope.
+    The probe prints its JSON report whether or not the job's git passes."""
+    try:
+        report = json.loads(parsed['stdout'])
+    except ValueError:
+        return False, parsed
+    return parsed['code'] == 0 and report.get('passed') is True, report
+
+
 def marker_matches(read, sid):
     return read.get('exit_code') == 0 and read.get('stdout') in (sid, sid + '\n')
 
@@ -1008,6 +1019,7 @@ class RunnerHost:
                                          ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
                                             job=True, gnu_test_sha256=gnu_test_hash, cargo_seed_sha256=self.probe.cargo_seed_sha256))),
                                          ('offline_cargo_seed', 'python3 -c ' + shlex.quote(CARGO_OFFLINE_PROBE.read_text())),
+                                         ('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text())),
                                         ("isolation", "python3 -c " + shlex.quote(job_script)),
                                         ('sigkill_job', 'kill -KILL $$'),
                                         ('job_stdin_eof', "python3 -c 'import os; print(\"boat-stdin-eof\" if os.read(0, 1) == b\"\" else \"unexpected-input\")'"),
@@ -1034,6 +1046,8 @@ class RunnerHost:
                     elif name == 'offline_cargo_seed':
                         report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
                         self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
+                    elif name == 'git_worktree_pushurl_reset':
+                        self.check(label + '.' + name, *git_pushurl_check(parsed))
                     elif name == "isolation":
                         checks = isolation_result_checks(parsed, host)
                         isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}

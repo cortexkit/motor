@@ -36,7 +36,7 @@
     "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation."
   },
   "accepted_os_differences": [
-    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions.",
+    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: Boat builds the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of Ubuntu's git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
     "wasm-opt is supplied by apt binaryen (/usr/bin/wasm-opt), version 120 on the captured build server. Boat's distro version is recorded in fresh qualification evidence, not forced to 120; WebAssembly optimizer output may differ.",
     "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
@@ -562,6 +562,29 @@
       "path": "/usr/local/bin/corepack",
       "realpath_suffix": "/lib/node_modules/corepack/dist/corepack.js",
       "version": "0.36.0"
+    },
+    "git": {
+      "path": "/usr/bin/git",
+      "path_by_role": {
+        "boat": "/usr/local/bin/git"
+      },
+      "realpath_suffix_by_role": {
+        "boat": "/usr/local/lib/git/2.53.0/bin/git",
+        "build-server": "/usr/bin/git"
+      },
+      "source": {
+        "build_packages": [
+          "gettext",
+          "libcurl4-gnutls-dev",
+          "libexpat1-dev",
+          "libpcre2-dev",
+          "zlib1g-dev"
+        ],
+        "install_dir": "/usr/local/lib/git/2.53.0",
+        "sha256": "5818bd7d80b061bbbdfec8a433d609dc8818a05991f731ffc4a561e2ca18c653",
+        "url": "https://www.kernel.org/pub/software/scm/git/git-2.53.0.tar.xz"
+      },
+      "version": "git version 2.53.0"
     },
     "nats-server": {
       "path": "/usr/local/bin/nats-server",
