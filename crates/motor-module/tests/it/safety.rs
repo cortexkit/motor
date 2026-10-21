@@ -1235,7 +1235,7 @@ fn manifest_advertises_exact_capability_and_all_operations() {
     let value = serde_json::to_value(crate::module::manifest("ck-motor")).unwrap();
     assert_eq!(
         value["capabilities"]["provides"],
-        serde_json::json!(["exec-remote/v1", "flow-scopes/v1"])
+        serde_json::json!(["exec-remote/v1", "flow-scopes/v1", "exec-remote-return/v1"])
     );
     let bytes = serde_json::to_string(&value).unwrap();
     for name in crate::module::OPERATIONS {

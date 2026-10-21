@@ -64,6 +64,7 @@ pub struct Motor {
     shadow_deadline: Option<Duration>,
     windows_slots: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
 }
+mod agent_run;
 #[cfg(test)]
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;

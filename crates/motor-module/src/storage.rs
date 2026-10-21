@@ -46,6 +46,12 @@ pub(crate) struct Job {
     pub hosted: Option<crate::hosted::HostedJobState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_result: Option<ReturnResult>,
+    /// The `cwd` of an `exec-remote/v1` request that asked for returned files.
+    /// Only such requests set it. It marks the stored return result as one the
+    /// agent route forwards, and turns the absolute paths the runner reports
+    /// back into the cwd-relative paths the caller asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -82,6 +88,7 @@ impl Job {
     fn lacks_newer_fields(&self) -> bool {
         self.hosted.is_none()
             && self.return_result.is_none()
+            && self.return_cwd.is_none()
             && self.direct_secret_hash.is_none()
             && !self.gate_job
             && self.runner_instance.is_none()
@@ -335,6 +342,11 @@ impl Storage {
         let id = result.job_id;
         self.update(|state| {
             state.jobs.entry(id).or_default().return_result = Some(result);
+        })
+    }
+    pub(crate) fn return_cwd(&self, id: Uuid, cwd: String) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_cwd = Some(cwd);
         })
     }
     pub(crate) fn hosted_update(

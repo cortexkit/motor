@@ -173,9 +173,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-exec-remote-types"
-version = "0.2.8"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ac425c8e182f47d091c7d7264417b57ceda28d2446c3f88af14f282928f317"
+checksum = "88d70c0a2c126eda1cee3db445b4b80c3843549a99e851042ea842e2d2d0619b"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -954,6 +954,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "cortexkit-claustrum-client",
+ "cortexkit-exec-remote-types",
  "cortexkit-store-types",
  "cortexkit-test-support",
  "ed25519-dalek",

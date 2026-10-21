@@ -113,13 +113,21 @@ fn is_health_flow(scope: Option<&ScopeStamp>) -> bool {
 /// module's HELLO unless every capability is spelled `<name>/v<N>`.
 pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
 pub(crate) const NETWORK_CAPABILITY: &str = "exec-remote-net/v1";
+/// Always advertised: an `exec.run` request may carry `return_paths`, and the
+/// job's stream then has a `return_result` record before its terminal record.
+/// Callers send non-empty `return_paths` only to a module that lists it.
+pub(crate) const RETURN_CAPABILITY: &str = "exec-remote-return/v1";
 
 pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_config(module_id, &Config::default())
 }
 
 pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest {
-    let mut provides = vec![CAPABILITY.into(), FLOW_SCOPES_CAPABILITY.into()];
+    let mut provides = vec![
+        CAPABILITY.into(),
+        FLOW_SCOPES_CAPABILITY.into(),
+        RETURN_CAPABILITY.into(),
+    ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
     {
@@ -1002,28 +1010,48 @@ impl ModuleHandler for Handler {
                     let _permit = match RunPermit::acquire(&self.run_count) {
                         Some(permit) => permit,
                         None => {
-                            pump(&ctx, motor.refuse_capacity()?).await?;
+                            pump(&ctx, motor.refuse_capacity()?, 0).await?;
+                            return Ok(HandlerOutcome::Streamed);
+                        }
+                    };
+                    let mut request: RunRequest = parse(envelope.params)?;
+                    let returns = match crate::agent_route::take_return_request(&mut request) {
+                        Ok(returns) => returns,
+                        Err(crate::agent_route::ReturnRequestError::InvalidParams(message)) => {
+                            return Ok(HandlerOutcome::Error {
+                                code: "invalid_params".into(),
+                                message,
+                            });
+                        }
+                        Err(crate::agent_route::ReturnRequestError::Rejected(code)) => {
+                            let stream = motor.refuse_before_start(
+                                RefusalReason::RequestRejected,
+                                Some(code.into()),
+                            )?;
+                            pump(&ctx, stream, 0).await?;
                             return Ok(HandlerOutcome::Streamed);
                         }
                     };
                     pump(
                         &ctx,
-                        motor.run_attributed(
-                            parse(envelope.params)?,
+                        motor.run_agent(
+                            request,
                             self.attribution(ctx.route_handle(), envelope.preset),
+                            returns,
                         )?,
+                        0,
                     )
                     .await
                     .map(|()| HandlerOutcome::Streamed)
                 }
-                "exec.attach" => pump(
-                    &ctx,
-                    motor.attach(
-                        serde_json::from_value(envelope.params).map_err(io::Error::other)?,
-                    )?,
-                )
-                .await
-                .map(|()| HandlerOutcome::Streamed),
+                "exec.attach" => {
+                    let request: AttachRequest =
+                        serde_json::from_value(envelope.params).map_err(io::Error::other)?;
+                    let from_seq = request.from_seq;
+                    pump(&ctx, motor.attach(request)?, from_seq)
+                        .await
+                        .map(|()| HandlerOutcome::Streamed)
+                }
                 "exec.cancel" => response(
                     motor
                         .cancel(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
@@ -1074,11 +1102,14 @@ pub(crate) async fn status_reply(
 ) -> io::Result<HandlerOutcome> {
     let platform = optional_platform(params)?;
     if let Some(id) = params.get("job_id") {
-        response(
-            motor
-                .job_status(serde_json::from_value(id.clone()).map_err(io::Error::other)?)
-                .await?,
-        )
+        let id = serde_json::from_value(id.clone()).map_err(io::Error::other)?;
+        let reply = motor.job_status(id).await?;
+        // Billing may have settled after the job's terminal record was
+        // streamed; the status reply carries the figure as it stands now.
+        response(crate::agent_route::status_with_hosted(
+            reply,
+            motor.hosted_state(id).as_ref(),
+        ))
     } else if !matches!(platform, None | Some(motor_protocol::Platform::Linux)) {
         let reply = motor.runner_status_for(platform.as_ref()).await?;
         if params.get("disk").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -1126,8 +1157,9 @@ async fn reply(ctx: &RequestCtx, value: impl serde::Serialize) -> io::Result<()>
         .await
         .map_err(io::Error::other)
 }
-async fn pump(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
-    forward(ctx.cancelled(), stream, |record| reply(ctx, record)).await
+/// Forward a job to an agent caller, whose resume cursor is `from_seq`.
+async fn pump(ctx: &RequestCtx, stream: JobStream, from_seq: u64) -> io::Result<()> {
+    crate::agent_route::pump(ctx, stream, from_seq).await
 }
 
 /// `pump` for a direct caller, writing each direct job's acceptance and

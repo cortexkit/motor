@@ -1009,6 +1009,7 @@ fn manifest_advertises_windows_only_with_both_routing_keys() {
                 network_routing
             );
             assert!(provides.contains(&json!(crate::module::CAPABILITY)));
+            assert!(provides.contains(&json!(crate::module::RETURN_CAPABILITY)));
             // The daemon refuses the module's HELLO if any capability breaks its
             // grammar, which would take down every runon, Linux included.
             for capability in provides {

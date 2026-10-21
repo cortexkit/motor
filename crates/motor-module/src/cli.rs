@@ -790,9 +790,13 @@ async fn consume<C: ExecClient + ?Sized>(
                 }
             }
         }
+        // The direct route adds its own `hosted` object (the stored hosted
+        // route) beside the record's fields. Take it out before decoding:
+        // the shared terminal record has a `hosted` field of a different
+        // shape, and the record would otherwise fail to decode.
         let hosted = value
-            .get("hosted")
-            .cloned()
+            .as_object_mut()
+            .and_then(|record| record.remove("hosted"))
             .and_then(|v| serde_json::from_value::<crate::HostedJobState>(v).ok());
         let record: StreamRecord = match serde_json::from_value(value) {
             Ok(record) => record,
