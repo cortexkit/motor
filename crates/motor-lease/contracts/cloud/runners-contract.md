@@ -114,6 +114,7 @@ Every error body is exactly `{"error":"<code>"}`, with no other member.
 | 400 | `bad_request`, `platform_unsupported` |
 | 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
 | 402 | `budget_exhausted` |
+| 403 | `shadow_not_allowed` |
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 500 | `internal` |
@@ -138,6 +139,25 @@ The exact body fields, in canonical order, are:
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
  placement_hint, avoid_host, timeout_s, requester_jwk}
 ```
+
+plus optional boolean members `shadow` and `allow_spill`, described under "Shadow leases" and
+"Per-lease spill policy" below. No other members are accepted.
+
+The canonical lease hash uses this exact member order:
+
+```text
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill?, shadow? }
+```
+
+It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` and before the
+optional `shadow`; it is included only when the request has the key, with its exact boolean
+value (both `true` and `false` are hashed when present). `shadow` stays last and is included
+only when true. `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`,
+the exact canonical JSON string hashed, for clients to byte-compare. Omitting
+`allow_spill` leaves every existing request's hash byte-for-byte unchanged; explicitly sending
+`true` or `false` changes the hash. A re-request must repeat both its presence and value or
+receive 409 `job_conflict` wherever a differing lease hash conflicts. In particular, absent and
+`true` have identical spill behavior but different request identities.
 
 `vcpus` is 1–64 and `timeout_s` 10–7200. `net` is boolean. There is no client `mem_mib` field:
 the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
@@ -169,8 +189,8 @@ After authentication and schema validation, checks proceed in this order:
 3. Ask for placement. If no active host has the requested platform, return 400
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
    `no_capacity`. Before returning a refusal, repeat the existing-job check so a concurrent
-   successful lease wins over that refusal. When Boat spill is enabled and the platform equals
-   `BOAT_PLATFORM`, either refusal is replaced by the spill path in
+   successful lease wins over that refusal. When `allow_spill` is not `false`, Boat spill is
+   enabled and the platform equals `BOAT_PLATFORM`, either refusal is replaced by the spill path in
    [Boat placements](#boat-placements).
 4. Compute the budget candidate from current totals. For finite allowances,
    `remaining = max(0, allowance − settled_total − reserved_total)` and
@@ -429,6 +449,18 @@ is configured; with it off no lease spills, while sandboxes that already exist a
 and cleaned up. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
 serves at most one live lease**. Placement hints never select a sandbox.
 
+**Per-lease spill policy.** The optional `allow_spill` member is strictly a JSON boolean; any
+other value is 400 `bad_request`. `false` requires a registered host: when placement refuses,
+the broker returns that refusal unchanged (including its status, body and Retry-After), never
+claims or creates a Boat sandbox, makes no Boat calls and leaves no spill record for that lease.
+For example, a full registered fleet returns 503 `no_capacity` with Retry-After `5`.
+`true` or omission preserves ordinary spill behavior. This is per lease, not per tenant, so
+callers sharing a fleet account can choose independently. The field is optional during the
+cutover; once ck-motor always sends it, the broker will make it required in a later change.
+It does not override the Boat enablement, platform, size or budget gates. `shadow: true` with
+`allow_spill: false` is contradictory and returns 400 `bad_request` during schema validation,
+before shadow permission or any job claim is checked.
+
 **Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), and `BOAT_SIZES`
 (the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
 `vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
@@ -514,6 +546,27 @@ file cannot be written, the job settles with reason `lost`, and lease re-request
 finish answer 409 `sandbox_lost`. Boat settlements update the tenant's budget totals but are
 **never counted** in the `runners` / `vcpu_ms` usage aggregate; their facts (and Boat's own
 machine-time meter per run window) are recorded in D1 only, until a billing rule exists.
+
+**Shadow leases.** A shadow lease runs a copy of a job on Boat purely to compare its result with
+the same job on the build server; its caller is served elsewhere. The lease body may carry
+`shadow: true`. Absent and `false` mean an ordinary lease and canonicalize identically: the
+canonical lease hash omits the member then, so ordinary leases hash exactly as before, and appends
+`"shadow":true` as the last member when it is true (after `allow_spill`, if present).
+A re-request must repeat it. Any other value is 400 `bad_request`.
+
+- Only accounts with the operator-set shadow permission in D1 `allowances` may send it; any other
+  account gets 403 `shadow_not_allowed`, checked right after schema validation.
+- A shadow is placed on Boat only, never on a registered host, and only while `BOAT_SHADOW_ENABLED`
+  is `"true"`, independently of `BOAT_ENABLED` (which governs ordinary spill). With shadows off,
+  Boat unavailable, or the tenant at `BOAT_MAX_SHADOWS` concurrent shadows (default 2), the answer
+  is 503 `no_capacity`; the client skips that shadow and never falls back.
+- A shadow counts toward the pool's sandbox cap, the hourly and daily Boat start limits and the
+  daily start count, like any Boat lease.
+- A shadow is never charged to the tenant's allowance and never counted in the account usage
+  ledger. Its job is still recorded in D1 `provider_jobs` with a shadow flag and Boat's own
+  machine-time meter, so the cost of shadow-running stays visible.
+- Re-request, reattach, release, finish and settlement otherwise behave exactly as for an ordinary
+  Boat lease.
 
 **Image obligations** (the tenant sandbox image):
 

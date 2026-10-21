@@ -416,6 +416,14 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
 `shadow_lease_explicitly_allows_spill`, and
 `hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
+`crates/motor-lease/contracts/cloud/`. Tests
+`cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash`,
+`stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored_request`,
+and `stored_allow_spill_presence_and_value_survive_lease_re_requests` check its
+hash projection, capacity reply, and stable re-request policy. Requester keys are
+excluded from the lease hash; an absent `allow_spill` and either explicit boolean
+have distinct hashes, so the stored request preserves presence as well as value.
 `python3 scripts/mixed-version.py` checks the default Config against the pinned
 older client.
 

@@ -436,3 +436,55 @@ async fn unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true(
     assert_eq!(bodies[0]["avoid_host"], "test-host");
     assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
 }
+
+#[tokio::test]
+async fn stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored_request() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-spill-lease.json"
+    ))
+    .unwrap();
+    let delay = vector["reply"]["headers"]["Retry-After"].as_str().unwrap();
+    assert_eq!(delay, "5");
+    assert_eq!(
+        serde_json::to_string(&vector["reply"]["body"]).unwrap(),
+        vector["reply"]["body_bytes"]
+    );
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.lease_replies.lock().unwrap().extend([
+        (
+            vector["reply"]["status"].as_u64().unwrap() as u16,
+            vector["reply"]["body"].clone(),
+            "5",
+        ),
+        (
+            202,
+            serde_json::json!({"status":"provisioning", "retry_after_ms":1000}),
+            "",
+        ),
+    ]);
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let start = tokio::time::Instant::now();
+    let stream = motor.run(request(&repo)).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(
+        start.elapsed() >= Duration::from_secs(delay.parse::<u64>().unwrap() + 1),
+        "The 503 Retry-After and subsequent provisioning delay must both be honored"
+    );
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+    let sent: motor_lease::LeaseRequest = serde_json::from_slice(&bodies[0]).unwrap();
+    let saved = motor.hosted_state(id).unwrap().lease_request.unwrap();
+    assert_eq!(saved.allow_spill, Some(false));
+    assert_eq!(saved.avoid_host, None);
+    assert_eq!(
+        crate::hosted::tests::canonical_lease_bytes(&saved),
+        crate::hosted::tests::canonical_lease_bytes(&sent)
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}

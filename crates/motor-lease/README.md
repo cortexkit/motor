@@ -19,13 +19,21 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors all six canonical files
-verbatim: the contract, `lease.json` and `boat-lease.json` at commit `3d70bcf`,
-the other vectors at `00e688e`. `contracts/digest-manifest.json` records source paths,
+`test-vectors/runners/`. `contracts/cloud/` mirrors seven canonical files
+verbatim: the contract and `no-spill-lease.json` at commit `95fd2d1`,
+`lease.json` and `boat-lease.json` at `3d70bcf`, and the other vectors at
+`00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
 and settlement replies directly to these external vectors; they never regenerate
 or rewrite the canonical bytes.
+
+`no-spill-lease.json` pins the ordinary lease-hash projection, excluding
+`requester_jwk` and including an explicitly false `allow_spill` after `timeout_s`.
+It also records the real broker's `503 no_capacity` and `Retry-After` when only a
+full registered host is selectable, even with Boat enabled. Existing vectors
+retain their bytes and digests; absence of `allow_spill` is distinct from either
+boolean in a lease hash, so re-requests preserve both presence and value.
 
 ## Fake broker test executable
 
