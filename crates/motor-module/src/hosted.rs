@@ -70,6 +70,10 @@ pub struct HostedJobState {
     /// retried for capacity and the job never falls back to the build server.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) hosted_test: bool,
+    /// Selected by hosted_repositories, rather than a spill or manual test.
+    /// Persist the decision so retries and restarts cannot enable local fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) repository_routed: bool,
     /// Set durably just before ck-motor sends the Run frame to a hosted
     /// runner. Until then no runner holds the command, so whatever happened to
     /// the lease, the job provably never ran; afterwards it may have.
@@ -149,6 +153,7 @@ pub(crate) enum Error {
     BrokerRefused,
     HostFull,
     Capacity,
+    NoCapacity(u64),
     InternalFailure,
     Connect,
     Broker,
@@ -195,7 +200,7 @@ impl Error {
             Self::SandboxLost => "hosted_sandbox_lost",
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull => "hosted_host_full",
-            Self::Capacity => "hosted_capacity",
+            Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
             Self::InternalFailure => "hosted_internal_failure",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
@@ -226,7 +231,7 @@ impl Error {
             | Self::AccountAuthRequired
             | Self::AccountPermanent
             | Self::AccountInvalid => RefusalReason::RunnerAuthenticationFailed,
-            Self::HostFull | Self::Capacity => RefusalReason::RunnerFull,
+            Self::HostFull | Self::Capacity | Self::NoCapacity(_) => RefusalReason::RunnerFull,
             Self::Connect | Self::Broker | Self::AccountTransient(_) | Self::Provisioning(_) => {
                 RefusalReason::Unreachable
             }
@@ -252,7 +257,7 @@ impl Error {
     pub(crate) fn retry_after_ms(self) -> Option<u64> {
         match self {
             Self::AccountTransient(delay) => delay,
-            Self::Provisioning(delay) => Some(delay),
+            Self::Provisioning(delay) | Self::NoCapacity(delay) => Some(delay),
             _ => None,
         }
     }
@@ -379,6 +384,7 @@ fn lease_body(
     hint: Option<Placement>,
     avoid_host: Option<String>,
     requester_jwk: RequesterJwk,
+    allow_spill: Option<bool>,
 ) -> Result<LeaseRequest, Error> {
     Ok(LeaseRequest {
         job_id: id.to_string(),
@@ -391,6 +397,7 @@ fn lease_body(
         avoid_host,
         timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
         requester_jwk,
+        allow_spill,
     })
 }
 fn reattach_body(key: &SigningKey) -> ReattachRequest {
@@ -509,6 +516,13 @@ impl Client {
         }
         if !reply.status().is_success() {
             let status = reply.status().as_u16();
+            let retry_after_ms = reply
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|seconds| seconds.saturating_mul(1000))
+                .unwrap_or(MIN_PROVISIONING_RETRY_MS);
             let code = reply.json::<serde_json::Value>().await.ok();
             let broker_code = code
                 .as_ref()
@@ -535,6 +549,13 @@ impl Client {
                 {
                     Some("job_admitted") => Error::Admitted,
                     Some("job_finished") => Error::Finished,
+                    Some("no_capacity")
+                        if status == 503
+                            && path == "/v1/leases"
+                            && self.route.repository_routed =>
+                    {
+                        Error::NoCapacity(bounded_provisioning_retry_ms(retry_after_ms))
+                    }
                     Some("capacity" | "no_capacity") => Error::Capacity,
                     Some("host_full") => Error::HostFull,
                     Some("job_released") => Error::Released,
@@ -629,6 +650,10 @@ impl Client {
             .hosted
             .as_ref()
             .and_then(|state| state.avoid_host.clone());
+        let allow_spill = !job
+            .hosted
+            .as_ref()
+            .is_some_and(|state| state.repository_routed);
         let mut body = match job.hosted.and_then(|state| state.lease_request) {
             Some(request) => request,
             None => lease_body(
@@ -643,6 +668,7 @@ impl Client {
                 storage.hosted_placement(&request.workspace_key),
                 avoid_host,
                 RequesterJwk::from_key(&requester()?.verifying_key()),
+                Some(allow_spill),
             )?,
         };
         storage
@@ -773,6 +799,7 @@ impl Client {
             None,
             self.route.avoid_host.clone(),
             RequesterJwk::from_key(&key.verifying_key()),
+            Some(true),
         )?;
         // Extend only this request: older brokers may reject shadows, but normal
         // leases must retain their closed wire schema.
@@ -814,23 +841,28 @@ impl Client {
         mut bearer: String,
         deadline: tokio::time::Instant,
     ) -> Result<R, Error> {
-        let mut retry_after_ms = MIN_PROVISIONING_RETRY_MS;
+        let mut pending = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
         loop {
             match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await
             {
-                Err(_) => return Err(Error::Provisioning(retry_after_ms)),
-                Ok(Err(Error::Provisioning(ms))) => {
-                    retry_after_ms = bounded_provisioning_retry_ms(ms);
+                Err(_) => return Err(pending),
+                Ok(Err(error @ (Error::Provisioning(_) | Error::NoCapacity(_)))) => {
+                    let retry_after_ms =
+                        bounded_provisioning_retry_ms(error.retry_after_ms().unwrap());
+                    pending = match error {
+                        Error::NoCapacity(_) => Error::NoCapacity(retry_after_ms),
+                        _ => Error::Provisioning(retry_after_ms),
+                    };
                     let retry_at =
                         tokio::time::Instant::now() + Duration::from_millis(retry_after_ms);
                     if retry_at >= deadline {
                         tokio::time::sleep_until(deadline).await;
-                        return Err(Error::Provisioning(retry_after_ms));
+                        return Err(pending);
                     }
                     tokio::time::sleep_until(retry_at).await;
                     bearer = match tokio::time::timeout_at(deadline, self.bearer()).await {
                         Ok(result) => result?,
-                        Err(_) => return Err(Error::Provisioning(retry_after_ms)),
+                        Err(_) => return Err(pending),
                     };
                 }
                 Ok(result) => return result,
@@ -887,6 +919,38 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod shadow_wire_tests {
     use super::*;
+    #[tokio::test]
+    async fn shadow_lease_explicitly_allows_spill() {
+        let http = test_http::Http::new(|path, body| {
+            if path == "/v1/leases" {
+                assert_eq!(body["allow_spill"], true);
+                assert_eq!(body["shadow"], true);
+                (402, serde_json::json!({"error":"budget_exhausted"}))
+            } else {
+                panic!("unexpected path: {path}")
+            }
+        })
+        .await;
+        std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+        let client = Client::new(HostedJobState {
+            broker_url: http.url.clone(),
+            token_source: BrokerTokenSource::Fake,
+            ..HostedJobState::default()
+        });
+        let (_scratch, repo) = boat_tests::committed_repo();
+        let path = repo.to_str().unwrap();
+        let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+        let mut booked = None;
+        assert_eq!(
+            client
+                .shadow_run(Uuid::now_v7(), &request, &[1; 32], &mut booked)
+                .await
+                .err(),
+            Some(Error::Budget)
+        );
+        assert!(booked.is_none());
+        assert_eq!(http.requests.lock().unwrap().len(), 1);
+    }
     #[test]
     fn shadow_wire_omits_false_appends_true_and_preserves_ordinary_fields() {
         let request =
@@ -898,6 +962,7 @@ mod shadow_wire_tests {
             None,
             Some("build-server".into()),
             RequesterJwk::from_key(&SigningKey::from_bytes(&[1; 32]).verifying_key()),
+            Some(true),
         )
         .unwrap();
         let absent = serde_json::to_string(&ordinary).unwrap();

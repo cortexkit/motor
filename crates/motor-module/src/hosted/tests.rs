@@ -6,6 +6,7 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
     let json = serde_json::to_value(&config).unwrap();
     for key in [
         "hosted_runners",
+        "hosted_repositories",
         "broker_url",
         "broker_token_source",
         "spill_to_hosted",
@@ -286,6 +287,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 avoid_host: None,
                 timeout_s: 30,
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
+                allow_spill: Some(true),
             },
         )
         .await
@@ -860,6 +862,7 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
         serde_json::from_value(v["request"]["body"]["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
+        None,
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);

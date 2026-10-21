@@ -114,7 +114,22 @@ pub struct LeaseRequest {
     #[serde(deserialize_with = "required_nullable")]
     pub avoid_host: Option<String>,
     pub timeout_s: u64,
+    /// False restricts placement to registered hosts. Requests that omit
+    /// allow_spill retain their previous lease hashes; new clients explicitly
+    /// choose a policy.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_boolean"
+    )]
+    pub allow_spill: Option<bool>,
     pub requester_jwk: RequesterJwk,
+}
+
+fn optional_boolean<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

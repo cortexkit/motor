@@ -7,6 +7,7 @@ use motor_lease::{
 use motor_protocol::*;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::{
@@ -50,6 +51,7 @@ impl Connector for NoSsh {
 #[derive(Clone, Copy)]
 pub enum Behavior {
     Normal,
+    CompleteRun,
     ConnectFailure,
     DropHave,
     Refuse(&'static str),
@@ -61,10 +63,14 @@ pub enum Behavior {
     ReturnCapFailure,
 }
 
+type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
+
 pub struct Harness {
     pub route: HostedJobState,
     pub broker: Arc<Mutex<FakeBroker>>,
     pub requests: Arc<Mutex<Vec<String>>>,
+    pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub lease_replies: LeaseReplies,
     pub tokens: Arc<AtomicUsize>,
     pub iats: Arc<Mutex<Vec<u64>>>,
     pub runs: Arc<AtomicUsize>,
@@ -274,7 +280,9 @@ impl Harness {
                                             repositories: repositories
                                                 .into_iter()
                                                 .map(|mut r| {
-                                                    r.commits.clear();
+                                                    if !matches!(behavior, Behavior::CompleteRun) {
+                                                        r.commits.clear();
+                                                    }
                                                     r
                                                 })
                                                 .collect(),
@@ -284,9 +292,34 @@ impl Harness {
                                     .await
                                     .unwrap();
                                 }
-                                Frame::Run(_) => {
+                                Frame::Run(run) => {
                                     runs.fetch_add(1, Ordering::SeqCst);
                                     if matches!(behavior, Behavior::DropRunAck) {
+                                        return;
+                                    }
+                                    if matches!(behavior, Behavior::CompleteRun) {
+                                        let mut accepted = Accepted::new(id, 0);
+                                        accepted.network = run.network;
+                                        for frame in [
+                                            Frame::Accepted(accepted),
+                                            Frame::Terminal(TerminalRecord::new(
+                                                id,
+                                                Outcome::Exit { code: 23 },
+                                                0,
+                                                0,
+                                                0,
+                                            )),
+                                            Frame::HostedTerminal(HostedTerminal {
+                                                job_id: id,
+                                                placement: "first_party/test-host".into(),
+                                                billed_vcpu_ms: 6001,
+                                                max_runtime_s: claims.max_s,
+                                            }),
+                                        ] {
+                                            motor_protocol::write_frame_async(&mut tls, &frame)
+                                                .await
+                                                .unwrap();
+                                        }
                                         return;
                                     }
                                 }
@@ -359,12 +392,18 @@ impl Harness {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let broker_url = format!("http://{}", http.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let lease_bodies = Arc::new(Mutex::new(Vec::new()));
+        let lease_replies = Arc::new(Mutex::new(
+            VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
+        ));
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let http_task = tokio::spawn({
             let broker = broker.clone();
             let requests = requests.clone();
+            let lease_bodies = lease_bodies.clone();
+            let lease_replies = lease_replies.clone();
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
@@ -406,29 +445,39 @@ impl Harness {
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
                     requests.lock().unwrap().push(path.clone());
-                    let reply =
-                        if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release") {
-                            motor_lease::fake::BrokerReply::error(409, "job_admitted")
-                        } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
-                            motor_lease::fake::BrokerReply::error(409, "job_finished")
-                        } else {
-                            broker.lock().unwrap().handle(
-                                BrokerRequest {
-                                    content_type: Some("application/json"),
-                                    method: "POST",
-                                    path: &path,
-                                    bearer: bearer.as_deref(),
-                                    host_headers: None,
-                                    body: &body,
-                                },
-                                now_s() * 1000,
-                            )
-                        };
+                    let stub = if path == "/v1/leases" {
+                        lease_bodies.lock().unwrap().push(body.clone());
+                        lease_replies.lock().unwrap().pop_front()
+                    } else {
+                        None
+                    };
+                    let mut retry_after = "";
+                    let reply = if let Some((status, body, delay)) = stub {
+                        retry_after = delay;
+                        motor_lease::fake::BrokerReply { status, body }
+                    } else if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release")
+                    {
+                        motor_lease::fake::BrokerReply::error(409, "job_admitted")
+                    } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
+                        motor_lease::fake::BrokerReply::error(409, "job_finished")
+                    } else {
+                        broker.lock().unwrap().handle(
+                            BrokerRequest {
+                                content_type: Some("application/json"),
+                                method: "POST",
+                                path: &path,
+                                bearer: bearer.as_deref(),
+                                host_headers: None,
+                                body: &body,
+                            },
+                            now_s() * 1000,
+                        )
+                    };
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
                     let body = serde_json::to_vec(&reply.body).unwrap();
-                    let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.status, body.len());
+                    let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n", reply.status, body.len());
                     socket.write_all(head.as_bytes()).await.unwrap();
                     socket.write_all(&body).await.unwrap();
                 }
@@ -442,6 +491,8 @@ impl Harness {
             },
             broker,
             requests,
+            lease_bodies,
+            lease_replies,
             tokens,
             iats,
             runs,

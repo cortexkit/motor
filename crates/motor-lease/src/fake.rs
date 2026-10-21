@@ -230,9 +230,7 @@ impl FakeBroker {
             if job.release.is_some() {
                 return BrokerReply::error(409, "job_released");
             }
-            let mut comparable = request.clone();
-            comparable.requester_jwk = job.request.requester_jwk.clone();
-            if comparable != job.request {
+            if lease_identity(&request) != lease_identity(&job.request) {
                 return BrokerReply::error(409, "job_conflict");
             }
         } else {
@@ -553,4 +551,25 @@ fn valid_keyed_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// The ordinary lease-hash projection: requester keys can rotate on a re-request,
+/// but placement and resource choices (including an explicitly false allow_spill)
+/// cannot. The fake serves registered hosts only and does not accept shadow leases.
+fn lease_identity(request: &LeaseRequest) -> Value {
+    let mut identity = json!({
+        "job_id": request.job_id,
+        "vcpus": request.vcpus,
+        "platform": request.platform,
+        "net": request.net,
+        "workspace_key_hash": request.workspace_key_hash,
+        "repo_hash": request.repo_hash,
+        "placement_hint": request.placement_hint,
+        "avoid_host": request.avoid_host,
+        "timeout_s": request.timeout_s,
+    });
+    if let Some(allow_spill) = request.allow_spill {
+        identity["allow_spill"] = json!(allow_spill);
+    }
+    identity
 }
