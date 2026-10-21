@@ -9,13 +9,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . "$PSScriptRoot\common.ps1"
+. "$PSScriptRoot\parent-identity.ps1"
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or -not (Test-Path -LiteralPath "$Root\.motor-runner-root")) { throw 'Unowned runner root' }
-foreach ($path in @('C:\ProgramData', $Root)) {
+foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state")) {
     if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse root refused: $path" }
 }
 Import-Module Hyper-V
 $prefix = 'motor-ally-'
 $owner = "MotorRunner:$Root"
+$parentRecord = "$Root\state\parent-verified.json"
 function Job-Path([string]$Id) { return Join-Path "$Root\vm\jobs" $Id }
 function Owned-VM([string]$Id) {
     $vm = Get-VM -Name "$prefix$Id" -ErrorAction SilentlyContinue
@@ -59,6 +61,8 @@ if ($Operation -in @('Prepare','Id','Run','Remove','Harvest')) {
 }
 switch ($Operation) {
     'Validate' {
+        # A failed startup must not leave an earlier verification usable.
+        if (Test-Path -LiteralPath $parentRecord) { Remove-Item -LiteralPath $parentRecord -Force }
         if ((Get-Service vmms).Status -ne 'Running') { throw 'Hyper-V service unavailable' }
         if ((Get-VMHost).EnableEnhancedSessionMode) { throw 'Enhanced Session mode enabled' }
         $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\92c268b0-cddd-40a4-a664-f32e50ad35ea'
@@ -93,6 +97,8 @@ switch ($Operation) {
                 }
             }
         }
+        if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
+        Write-RunnerParentVerification $Parent $ParentSha256 $parentRecord
         Write-Output 'PASS native-host-validation'
     }
     { $_ -in @('GrantPrep','RevokePrep') } {
@@ -117,41 +123,47 @@ switch ($Operation) {
     }
     'Prepare' {
         if ($Nonce -notmatch '^[0-9a-f-]{36}$') { throw 'Invalid nonce' }
-        if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines" -or -not (Get-Item -LiteralPath $Parent).IsReadOnly) { throw 'Parent must be an owned sealed baseline' }
+        if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
         if ([IO.Path]::GetDirectoryName($Cache) -cne "$Root\vm\caches" -or [IO.Path]::GetFileName($Cache) -notmatch '^[0-9a-f]{64}\.vhdx$') { throw 'Invalid cache disk' }
-        if ((Get-FileHash -LiteralPath $Parent -Algorithm SHA256).Hash -ne $ParentSha256) { throw 'Parent hash changed before job' }
-        $directory = Job-Path $Job
-        if ((Test-Path -LiteralPath $directory) -or (Owned-VM $Job)) { throw 'Job resources already exist' }
-        New-Item -ItemType Directory -Path "$directory\nonce" | Out-Null
-        [IO.File]::WriteAllText("$directory\nonce\nonce.txt", $Nonce, [Text.UTF8Encoding]::new($false))
-        if ($PeerTargetsJson) {
-            $targets = @($PeerTargetsJson | ConvertFrom-Json)
-            foreach ($target in $targets) { [void][Guid]::Parse([string]$target) }
-            [IO.File]::WriteAllText("$directory\nonce\peer-targets.json", (ConvertTo-Json -InputObject $targets -Compress), [Text.UTF8Encoding]::new($false))
-        }
-        New-SpikeIso "$directory\nonce" "$directory\nonce.iso" 'MOTORNONCE'
-        Remove-Item "$directory\nonce" -Recurse -Force
-        New-VHD -Path "$directory\os.vhdx" -ParentPath $Parent -Differencing | Out-Null
-        if (-not (Test-Path -LiteralPath $Cache)) { New-VHD -Path $Cache -Dynamic -SizeBytes 40GB | Out-Null }
-        @{parent=$Parent; sha256=$ParentSha256; quota=$OverlayQuotaBytes} | ConvertTo-Json | Set-Content "$directory\job.json" -Encoding ascii
-        $vm = New-VM -Name "$prefix$Job" -Generation 2 -MemoryStartupBytes 8GB -VHDPath "$directory\os.vhdx" -Path "$directory\config"
-        Set-VM -VM $vm -Notes "$owner`:$Job" -ProcessorCount 4 -AutomaticCheckpointsEnabled $false -CheckpointType Disabled -AutomaticStartAction Nothing -AutomaticStopAction TurnOff
-        Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
-        Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
-        Get-VMIntegrationService -VM $vm | Disable-VMIntegrationService
-        Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows -FirstBootDevice (Get-VMHardDiskDrive -VM $vm)
-        Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 1 -Path $Cache
-        Add-VMDvdDrive -VM $vm -Path "$directory\nonce.iso"
-        Assert-Isolated $vm
-        Evidence $Job 'created-offline' @{vm_id=$vm.Id.Guid; adapters=0; com_ports=0; integration_services=0; enhanced_session=$false; parent_sha256=$ParentSha256; nonce_delivery='read-only-dvd'; cache=$Cache}
+        $parentGuard = Open-RunnerVerifiedParent $Parent $ParentSha256 $parentRecord
+        try {
+            $directory = Job-Path $Job
+            if ((Test-Path -LiteralPath $directory) -or (Owned-VM $Job)) { throw 'Job resources already exist' }
+            New-Item -ItemType Directory -Path "$directory\nonce" | Out-Null
+            [IO.File]::WriteAllText("$directory\nonce\nonce.txt", $Nonce, [Text.UTF8Encoding]::new($false))
+            if ($PeerTargetsJson) {
+                $targets = @($PeerTargetsJson | ConvertFrom-Json)
+                foreach ($target in $targets) { [void][Guid]::Parse([string]$target) }
+                [IO.File]::WriteAllText("$directory\nonce\peer-targets.json", (ConvertTo-Json -InputObject $targets -Compress), [Text.UTF8Encoding]::new($false))
+            }
+            New-SpikeIso "$directory\nonce" "$directory\nonce.iso" 'MOTORNONCE'
+            Remove-Item "$directory\nonce" -Recurse -Force
+            New-VHD -Path "$directory\os.vhdx" -ParentPath $Parent -Differencing | Out-Null
+            if (-not (Test-Path -LiteralPath $Cache)) { New-VHD -Path $Cache -Dynamic -SizeBytes 40GB | Out-Null }
+            @{parent=$Parent; sha256=$ParentSha256; quota=$OverlayQuotaBytes} | ConvertTo-Json | Set-Content "$directory\job.json" -Encoding ascii
+            $vm = New-VM -Name "$prefix$Job" -Generation 2 -MemoryStartupBytes 8GB -VHDPath "$directory\os.vhdx" -Path "$directory\config"
+            Set-VM -VM $vm -Notes "$owner`:$Job" -ProcessorCount 4 -AutomaticCheckpointsEnabled $false -CheckpointType Disabled -AutomaticStartAction Nothing -AutomaticStopAction TurnOff
+            Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+            Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
+            Get-VMIntegrationService -VM $vm | Disable-VMIntegrationService
+            Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows -FirstBootDevice (Get-VMHardDiskDrive -VM $vm)
+            Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 1 -Path $Cache
+            Add-VMDvdDrive -VM $vm -Path "$directory\nonce.iso"
+            Assert-Isolated $vm
+            Evidence $Job 'created-offline' @{vm_id=$vm.Id.Guid; adapters=0; com_ports=0; integration_services=0; enhanced_session=$false; parent_sha256=$ParentSha256; nonce_delivery='read-only-dvd'; cache=$Cache}
+        } finally { $parentGuard.Dispose() }
     }
     'Id' { (Owned-VM $Job).Id.Guid }
     'Run' {
         $vm = Owned-VM $Job
         $directory = Job-Path $Job
         $metadata = Get-Content "$directory\job.json" -Raw | ConvertFrom-Json
-        Assert-Isolated $vm
+        $parentGuard = $null
         try {
+            # Prepare and Run are separate processes; recheck before any VM boot.
+            $parentGuard = Open-RunnerVerifiedParent $metadata.parent $metadata.sha256 $parentRecord
+            $parentIdentity = Get-RunnerParentIdentity $parentGuard
+            Assert-Isolated $vm
             Start-VM -VM $vm
             do {
                 $vm = Owned-VM $Job
@@ -161,13 +173,16 @@ switch ($Operation) {
                 Start-Sleep -Milliseconds 250
             } while ($vm.State -ne 'Off')
             Assert-Isolated $vm
-            if ((Get-FileHash -LiteralPath $metadata.parent -Algorithm SHA256).Hash -ne $metadata.sha256) { throw 'Parent hash changed after job' }
+            $identity = Get-RunnerParentIdentity $parentGuard
+            foreach ($key in $identity.Keys) {
+                if ($identity[$key] -cne $parentIdentity[$key]) { throw 'parent changed since verification; restart the service to re-verify' }
+            }
             Evidence $Job 'normal-off' @{parent_unchanged=$true; parent_sha256=$metadata.sha256}
         } catch {
             if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
             Evidence $Job 'host-isolation-failed' ([string]$_)
             throw
-        }
+        } finally { if ($parentGuard) { $parentGuard.Dispose() } }
     }
     'Harvest' {
         $vm = Owned-VM $Job

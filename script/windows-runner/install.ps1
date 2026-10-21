@@ -41,13 +41,15 @@ Save-Installation
 foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks','staging','state\ally','evidence','service-home')) { New-Item "$Root\$directory" -ItemType Directory -Force | Out-Null }
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
-foreach ($name in @('hyperv.ps1','accounts.ps1','qualify.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
+foreach ($name in @('hyperv.ps1','parent-identity.ps1','accounts.ps1','qualify.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
 foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\hyperv-spike\$name" "$Root\bin" }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
 (Get-Item -LiteralPath $parent).IsReadOnly = $true
 & icacls.exe $parent /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:R' '*S-1-5-83-0:R' /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot seal parent ACL for Hyper-V workers' }
+& icacls.exe $parent /setowner '*S-1-5-32-544' /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted parent owner' }
 $parentHash = (Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash
 if ($AdoptProvisioningRoot) {
     $installation.provision_root = 'C:\motor-spike\hyperv-ally'

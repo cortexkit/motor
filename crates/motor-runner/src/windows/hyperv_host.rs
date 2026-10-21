@@ -1,5 +1,4 @@
 use super::*;
-use sha2::{Digest, Sha256};
 
 pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
     let vm: VmConfig = toml::from_str(&fs::read_to_string(path)?).map_err(invalid)?;
@@ -28,12 +27,8 @@ pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
             "Hyper-V parent must be a sealed read-only regular file",
         ));
     }
-    let mut file = fs::File::open(&baseline)?;
-    let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest)?;
-    if format!("{:x}", digest.finalize()) != vm.parent_sha256.to_ascii_lowercase() {
-        return Err(invalid("Hyper-V parent SHA-256 mismatch"));
-    }
+    // The hyperv.ps1 Validate operation hashes the parent and records its identity
+    // through one locked handle. Configuration loading does not read its contents.
     Ok(vm)
 }
 pub(super) fn validate(config: &Config) -> io::Result<()> {
@@ -44,7 +39,17 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
     {
         return Err(invalid("native Windows runner requires instance ally, windows-vm backend and the installed state root"));
     }
-    super::vm::checked(super::vm::control(config, "Validate", None, &[])?)?;
+    super::vm::checked(super::vm::control(
+        config,
+        "Validate",
+        None,
+        &[
+            "-Parent".into(),
+            vm.baseline_path().to_string_lossy().into(),
+            "-ParentSha256".into(),
+            vm.parent_sha256.clone(),
+        ],
+    )?)?;
     Ok(())
 }
 pub(super) fn grant_mirrors(_config: &Config) -> io::Result<()> {

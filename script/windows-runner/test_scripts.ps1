@@ -51,4 +51,144 @@ try {
     Remove-Item Function:\secedit.exe
     Remove-Item $root -Recurse -Force
 }
-Write-Host "PASS Windows runner portable PowerShell tests: $count checks; PowerShell=$($PSVersionTable.PSVersion)"
+# Parse the actual Prepare/Run guard assignment, not a test-only approximation.
+$tokens = $null; $errors = $null
+$control = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\hyperv.ps1", [ref]$tokens, [ref]$errors)
+$guards = @($control.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$parentGuard' -and $node.Right.Extent.Text -match '^Open-RunnerVerifiedParent ' }, $true))
+if ($guards.Count -ne 2) { throw 'FAIL parent-identity-production-guards: Prepare and Run must both acquire the verified guard' }
+Write-Host 'PASS parent-identity-production-guards'
+$count++
+
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    . "$PSScriptRoot\parent-identity.ps1"
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-parent-tests-' + [Guid]::NewGuid())
+    New-Item $fixture -ItemType Directory | Out-Null
+    $Parent = Join-Path $fixture 'parent.vhdx'
+    $record = Join-Path $fixture 'parent-verified.json'
+    $parentRecord = $record
+    $parentGuard = $null
+    $readAcl = [Security.AccessControl.FileSecurity]::new()
+    $readAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FR;;;SY)(A;;FR;;;BA)(A;;FR;;;S-1-5-83-0)')
+    $writeAcl = [Security.AccessControl.FileSecurity]::new()
+    $writeAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
+    function Set-FixtureParent([string]$Contents, [DateTime]$LastWrite) {
+        if (Test-Path -LiteralPath $Parent) {
+            Set-Acl -LiteralPath $Parent -AclObject $writeAcl
+            [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::Normal)
+        }
+        [IO.File]::WriteAllText($Parent, $Contents, [Text.UTF8Encoding]::new($false))
+        [IO.File]::SetLastWriteTimeUtc($Parent, $LastWrite)
+        [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::ReadOnly)
+        Set-Acl -LiteralPath $Parent -AclObject $readAcl
+    }
+    function Assert-FixtureRejected([string]$Name) {
+        $rejected = $false
+        try {
+            $unexpected = Open-RunnerVerifiedParent $Parent $ParentSha256 $record
+            $unexpected.Dispose()
+        } catch {
+            if ([string]$_ -notlike '*parent changed since verification; restart the service to re-verify*') { throw }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw "FAIL $Name : changed parent was accepted" }
+        Write-Host "PASS $Name"
+        $script:count++
+    }
+    try {
+        $lastWrite = [DateTime]::UtcNow.AddDays(-1)
+        Set-FixtureParent 'original' $lastWrite
+        $ParentSha256 = (Get-FileHash -LiteralPath $Parent -Algorithm SHA256).Hash
+        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        if (-not (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-record-written' }
+        Write-Host 'PASS parent-identity-record-written'
+        $count++
+        # Run the exact assignment from Prepare against the tiny sealed file.
+        . ([scriptblock]::Create($guards[0].Extent.Text))
+        $before = Get-RunnerParentIdentity $parentGuard
+        $reader = [Motor.ParentFile]::Open($Parent)
+        $reader.Dispose()
+        $parentGuard.Dispose(); $parentGuard = $null
+        Write-Host 'PASS parent-identity-unchanged-and-concurrent-reader'
+        $count++
+
+        # Use equal-length bytes, then restore every compared field except ChangeTime.
+        Set-FixtureParent 'modified' $lastWrite
+        $probe = [Motor.ParentFile]::Open($Parent)
+        try { $after = Get-RunnerParentIdentity $probe } finally { $probe.Dispose() }
+        foreach ($key in $before.Keys) {
+            if ($key -ne 'change_time_utc' -and $before[$key] -cne $after[$key]) { throw "FAIL same-size fixture unexpectedly changed $key" }
+        }
+        if ($before.change_time_utc -ceq $after.change_time_utc) { throw 'FAIL same-size fixture did not advance ChangeTime' }
+        Assert-FixtureRejected 'parent-identity-rejects-same-size-rewrite-with-restored-lastwrite'
+        $metadata = @{parent=$Parent; sha256=$ParentSha256}
+        $denied = $false
+        try {
+            . ([scriptblock]::Create($guards[1].Extent.Text))
+            $parentGuard.Dispose(); $parentGuard = $null
+        } catch {
+            if ([string]$_ -notlike '*parent changed since verification; restart the service to re-verify*') { throw }
+            $denied = $true
+        }
+        if (-not $denied) { throw 'FAIL parent-identity-run-rejects-change-before-boot' }
+        Write-Host 'PASS parent-identity-run-rejects-change-before-boot'
+        $count++
+
+        Set-FixtureParent 'original' $lastWrite
+        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        Set-Acl -LiteralPath $Parent -AclObject $writeAcl
+        [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::Normal)
+        [IO.File]::SetLastWriteTimeUtc($Parent, $lastWrite.AddHours(1))
+        [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::ReadOnly)
+        Set-Acl -LiteralPath $Parent -AclObject $readAcl
+        Assert-FixtureRejected 'parent-identity-rejects-timestamp-change'
+
+        Set-FixtureParent 'original' $lastWrite
+        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        $metadata = @{parent=$Parent; sha256=$ParentSha256}
+        . ([scriptblock]::Create($guards[1].Extent.Text))
+        $parentGuard.Dispose(); $parentGuard = $null
+        Write-Host 'PASS parent-identity-run-rechecks-before-boot'
+        $count++
+        Remove-Item -LiteralPath $record -Force
+        Assert-FixtureRejected 'parent-identity-rejects-missing-record'
+        Write-RunnerParentVerification $Parent $ParentSha256 $record
+        Set-Content -LiteralPath $record -Value '{broken json' -Encoding ascii
+        Assert-FixtureRejected 'parent-identity-rejects-unreadable-record'
+        $failed = $false
+        try { Write-RunnerParentVerification $Parent ('0' * 64) $record } catch { $failed = $true }
+        if (-not $failed -or (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-failed-validation-invalidates-record' }
+        Write-Host 'PASS parent-identity-failed-validation-invalidates-record'
+        $count++
+
+        # Use a writable file so a denied write proves sharing, not the sealed ACL.
+        $sharingFile = Join-Path $fixture 'sharing.bin'
+        [IO.File]::WriteAllText($sharingFile, 'sharing')
+        $parentGuard = [Motor.ParentFile]::Open($sharingFile)
+        foreach ($access in @([IO.FileAccess]::ReadWrite, [IO.FileAccess]::Write)) {
+            $denied = $false
+            try {
+                $writer = [IO.File]::Open($sharingFile, [IO.FileMode]::Open, $access, [IO.FileShare]::ReadWrite)
+                $writer.Dispose()
+            } catch { $denied = $true }
+            if (-not $denied) { throw 'FAIL parent-guard-denies-write-and-delete: write admitted' }
+        }
+        $denied = $false
+        try { [IO.File]::Delete($sharingFile) } catch { $denied = $true }
+        if (-not $denied) { throw 'FAIL parent-guard-denies-write-and-delete: delete admitted' }
+        $parentGuard.Dispose(); $parentGuard = $null
+        $writer = [IO.File]::Open($sharingFile, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+        $denied = $false
+        try { $unexpected = [Motor.ParentFile]::Open($sharingFile); $unexpected.Dispose() } catch { $denied = $true } finally { $writer.Dispose() }
+        if (-not $denied) { throw 'FAIL parent-guard-refuses-existing-writer' }
+        [IO.File]::Delete($sharingFile)
+        Write-Host 'PASS parent-guard-denies-write-and-delete-and-refuses-existing-writer'
+        $count++
+    } finally {
+        if ($parentGuard) { $parentGuard.Dispose() }
+        if (Test-Path -LiteralPath $Parent) { Set-Acl -LiteralPath $Parent -AclObject $writeAcl }
+        Remove-Item -LiteralPath $fixture -Recurse -Force
+    }
+} else {
+    Write-Host 'SKIP native parent-identity fixtures: Windows and an elevated token are required'
+}
+Write-Host "PASS Windows runner PowerShell tests: $count checks; PowerShell=$($PSVersionTable.PSVersion)"
