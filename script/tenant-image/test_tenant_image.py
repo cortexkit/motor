@@ -635,6 +635,39 @@ class RootPathTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, rf"2 path\(s\) root executes from .*usr/local/bin: uid={FOREIGN_UID}"):
                 root_paths.require(root_paths.TENANT_ROOTS, self.image, self.owner)
 
+    def test_a_provider_restored_file_passes_only_at_its_exact_path_owner_and_mode(self):
+        (self.image / "usr/local/sbin").mkdir()
+        tool = self.image / "usr/local/sbin/ascii-idle-reclaim"
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+        self.own_by_foreign("usr/local/sbin/ascii-idle-reclaim")
+        allowed = {"/usr/local/sbin/ascii-idle-reclaim": FOREIGN_UID}
+
+        def check(provider_files):
+            with self.simulated_owners():
+                return root_paths.check(root_paths.TENANT_ROOTS, self.image, self.owner,
+                                        provider_files=provider_files)
+
+        # Without the allowance the strict rule names it; with it, it passes.
+        self.assertEqual(check(None)["offender_count"], 1)
+        report = check(allowed)
+        self.assertEqual(report["offenders"], [])
+        self.assertEqual(report["provider_restored"], [f"{tool}: uid={FOREIGN_UID} (provider-restored)"])
+        # The allowance is for that exact owner: another uid still fails.
+        self.assertEqual(check({"/usr/local/sbin/ascii-idle-reclaim": FOREIGN_UID + 1})["offender_count"], 1)
+        # And never for group or other write.
+        tool.chmod(0o775)
+        self.assertEqual(check(allowed)["offender_count"], 1)
+        tool.chmod(0o755)
+        # A different file the provider owns beside it still fails.
+        other = self.image / "usr/local/sbin/other"
+        other.write_text("#!/bin/sh\n")
+        other.chmod(0o755)
+        self.own_by_foreign("usr/local/sbin/other")
+        self.assertEqual(check(allowed)["offender_count"], 1)
+        # The live Boat probe names exactly this one path.
+        self.assertEqual(root_paths.BOAT_PROVIDER_RESTORED, {"/usr/local/sbin/ascii-idle-reclaim": 1000})
+
     def test_a_foreign_symlink_fails_but_its_mode_bits_are_ignored(self):
         self.assertEqual(self.check()["offenders"], [])
         self.own_by_foreign("usr/local/bin/corepack")

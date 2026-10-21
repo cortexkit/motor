@@ -112,14 +112,18 @@ class RunnerHostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checker = Path(tmp, 'root_paths.py')
             checker.write_text('BOAT_ROOTS = ("/fixture",)\n'
-                               'def check(roots):\n'
-                               '    return {"roots": list(roots), "entries": 7, "offender_count": 0, "offenders": []}\n')
+                               'BOAT_PROVIDER_RESTORED = {"/fixture/tool": 1000}\n'
+                               'def check(roots, provider_files=None):\n'
+                               '    return {"roots": list(roots), "entries": 7, "offender_count": 0, "offenders": [],\n'
+                               '            "provider_files": provider_files}\n')
             with patch.object(host, 'ROOT_PATHS_SCRIPT', checker):
                 source = host.root_paths_source()
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 exec(source, {})
         report = json.loads(output.getvalue())
         self.assertEqual(report['roots'], ['/fixture'])
+        # The live check passes exactly the provider-restored allowance.
+        self.assertEqual(report['provider_files'], {'/fixture/tool': 1000})
         self.assertTrue(host.root_paths_passed(report))
         self.assertIn('BOAT_ROOTS', host.ROOT_PATHS_SCRIPT.read_text())
         for bad in (dict(report, offender_count=1, offenders=['/usr/local/bin: uid=1001 gid=1001']),

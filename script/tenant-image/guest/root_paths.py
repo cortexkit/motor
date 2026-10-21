@@ -27,6 +27,14 @@ TENANT_ROOTS = ("/usr/local", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # and RUSTUP_HOME=/home/ubuntu/.rustup, whose toolchains the Cargo proxies run.
 BOAT_ROOTS = (*TENANT_ROOTS, "/srv/build/cargo-home/bin", "/home/ubuntu/.bun/bin", "/home/ubuntu/.rustup")
+# Files Boat's own agent writes into a sandbox each time it restores a
+# snapshot, owned by its sandbox account (uid 1000), so no image recipe can make
+# them root's: the idle-reclaim helper that stops idle sandboxes. That account
+# already has passwordless sudo through Boat's exec API, so owning a file root
+# could run gives it nothing it lacks, and jobs run as a separate account that
+# can't become it. The live Boat check accepts exactly these paths with exactly
+# this owner and no group or other write; anything else still fails.
+BOAT_PROVIDER_RESTORED = {"/usr/local/sbin/ascii-idle-reclaim": 1000}
 # How many offending paths a report names; the count covers all of them.
 REPORTED = 20
 
@@ -55,16 +63,19 @@ def unsafe(path, metadata, owner=0):
     return None
 
 
-def check(roots, image=Path("/"), owner=0, limit=REPORTED):
+def check(roots, image=Path("/"), owner=0, limit=REPORTED, provider_files=None):
     """Check every entry under each root, each root itself and every directory
     from `image` down to it. `roots` are absolute paths inside the image at
     `image` ("/" for a live system or a chroot; a fixture directory in tests).
     A root that is a symlink is checked as a link; its target is walked when it
     exists inside the image and reported as a violation when it resolves
     outside. Missing roots and dangling links are listed as missing, not as
-    violations; their existing ancestors are still checked."""
+    violations; their existing ancestors are still checked. `provider_files`
+    maps exact paths to the one uid allowed to own them (a regular file with
+    no group or other write); see BOAT_PROVIDER_RESTORED."""
     image = Path(os.path.realpath(image))
-    seen, walked, offenders, missing = set(), [], [], []
+    provided = {image / name.lstrip("/"): uid for name, uid in (provider_files or {}).items()}
+    seen, walked, offenders, missing, accepted = set(), [], [], [], []
     entries = 0
 
     def visit(path):
@@ -78,6 +89,10 @@ def check(roots, image=Path("/"), owner=0, limit=REPORTED):
             return False
         seen.add(path)
         entries += 1
+        if (path in provided and stat.S_ISREG(metadata.st_mode)
+                and unsafe(path, metadata, provided[path]) is None):
+            accepted.append(f"{path}: uid={metadata.st_uid} (provider-restored)")
+            return True
         reason = unsafe(path, metadata, owner)
         if reason:
             offenders.append(reason)
@@ -113,7 +128,7 @@ def check(roots, image=Path("/"), owner=0, limit=REPORTED):
         for path in tree_entries(real):
             visit(path)
     return dict(roots=list(roots), entries=entries, offender_count=len(offenders),
-                offenders=offenders[:limit], missing=missing)
+                offenders=offenders[:limit], missing=missing, provider_restored=accepted)
 
 
 def require(roots, image=Path("/"), owner=0):

@@ -680,7 +680,8 @@ def root_paths_source():
     # recipes enforce at build time) against the live filesystem in every phase.
     return ("import json\nscope = {'__name__': 'root_paths'}\n"
             f"exec({ROOT_PATHS_SCRIPT.read_text()!r}, scope)\n"
-            "print(json.dumps(scope['check'](scope['BOAT_ROOTS'])))\n")
+            "print(json.dumps(scope['check'](scope['BOAT_ROOTS'], "
+            "provider_files=scope['BOAT_PROVIDER_RESTORED'])))\n")
 
 
 def root_paths_passed(report):
