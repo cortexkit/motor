@@ -18,6 +18,11 @@ pub(crate) mod dependencies;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
 
+/// A file in each JavaScript install and manager cache entry naming the
+/// mirror (`name` of the repository root) whose installs created it, so the
+/// entry can be retired with that repository.
+pub(crate) const JAVASCRIPT_CACHE_OWNER: &str = "motor-repository";
+
 pub(crate) fn name(path: &str) -> String {
     format!("{:x}", Sha256::digest(path.as_bytes()))
 }

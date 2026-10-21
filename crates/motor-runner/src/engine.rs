@@ -36,6 +36,8 @@ mod disk;
 mod health;
 #[path = "migration.rs"]
 mod migration;
+#[path = "retirement.rs"]
+mod retirement;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -3559,7 +3561,8 @@ impl Runner {
         });
         self.catalog(&inner)?;
         drop(inner);
-        self.prune_refs()
+        self.prune_refs()?;
+        self.retire_unused_repositories()
     }
 
     /// Check the mirrors a failed bundle fetch targeted and remove refs git

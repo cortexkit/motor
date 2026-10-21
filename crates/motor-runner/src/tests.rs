@@ -37,6 +37,8 @@ mod nested_workspaces;
 mod platform_refusal;
 #[path = "tests/refusals.rs"]
 mod refusals;
+#[path = "tests/repository_retirement.rs"]
+mod repository_retirement;
 #[path = "tests/return_paths.rs"]
 mod return_paths;
 #[path = "tests/started.rs"]

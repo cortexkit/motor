@@ -1,6 +1,6 @@
 use super::*;
 
-fn javascript_entry_lock(
+pub(super) fn javascript_entry_lock(
     state: &Path,
     path: &Path,
 ) -> io::Result<Option<platform::JavascriptCacheLock>> {
