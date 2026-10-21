@@ -84,7 +84,7 @@ impl Fixture {
             "job_id":JOB,"vcpus":1,"platform":"linux-x64","net":false,
             "workspace_key_hash":motor_lease::base64url(&[1;32]),
             "repo_hash":motor_lease::base64url(&[2;32]),"placement_hint":null,"avoid_host":null,
-            "timeout_s":30,"requester_jwk":RequesterJwk::from_key(&self.requester.verifying_key())
+            "timeout_s":30,"allow_spill":true,"requester_jwk":RequesterJwk::from_key(&self.requester.verifying_key())
         }))
         .unwrap();
         let reply = self.broker.handle(
