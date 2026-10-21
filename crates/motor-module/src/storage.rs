@@ -1445,7 +1445,10 @@ mod lease_release_tests {
             // Keep the pipe out of processes other tests exec meanwhile, so
             // only this child can hold its read end open.
             for fd in fds {
-                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
             }
             let [read, write] = fds;
             let pid = unsafe { libc::fork() };
