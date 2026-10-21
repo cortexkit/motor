@@ -978,6 +978,7 @@ fn cache_javascript_install(
     manager_lock.lock_exclusive()?;
     let manager_cache = state.join("js-manager-caches").join(&manager_key);
     fs::create_dir_all(manager_cache.join("home"))?;
+    record_javascript_cache_owner(&manager_cache, repository)?;
     File::open(&manager_cache)?
         .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
     javascript_manager_cache_command(command, manager, &manager_cache);
@@ -1006,8 +1007,20 @@ fn cache_javascript_install(
     }
     let temporary = TemporaryEntry(cache.join(format!("{key}.{}.tmp", Uuid::now_v7())));
     fs::create_dir(&temporary.0)?;
+    record_javascript_cache_owner(&temporary.0, repository)?;
     platform::clone_target(&modules, &temporary.0.join("node_modules"))?;
     fs::rename(&temporary.0, &entry)?;
+    Ok(())
+}
+
+/// Names the repository whose install created a cache entry, so the entry is
+/// retired with that repository's mirror. Entries made before this marker
+/// existed carry none and are left to disk-pressure eviction.
+fn record_javascript_cache_owner(entry: &Path, repository: &str) -> io::Result<()> {
+    let marker = entry.join(workspace::JAVASCRIPT_CACHE_OWNER);
+    if !marker.exists() {
+        fs::write(marker, workspace::name(repository))?;
+    }
     Ok(())
 }
 

@@ -426,6 +426,11 @@ pub(crate) struct Catalog {
     pub sibling_commits: BTreeMap<String, String>,
     #[serde(default)]
     pub transferred: BTreeMap<Uuid, RetainedTransfer>,
+    /// When each repository mirror was last used, by mirror directory name
+    /// (the hash of its repository root). Unused mirrors are retired; see
+    /// the runner's `retire_unused_repositories`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mirror_used_ms: BTreeMap<String, u64>,
 }
 
 impl Default for Catalog {
@@ -438,6 +443,7 @@ impl Default for Catalog {
             generation_migration_complete: false,
             sibling_commits: BTreeMap::new(),
             transferred: BTreeMap::new(),
+            mirror_used_ms: BTreeMap::new(),
         }
     }
 }

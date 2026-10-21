@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import socket
+import stat
 import struct
 import tempfile
 import threading
@@ -18,6 +19,8 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 # Kept before setUp replaces it, for the one test that reads a fake /proc.
 REAL_RUNNER_PROCESSES = p.runner_processes
+# The real host paths, kept before setUp points them into a scratch directory.
+LIVE_PATHS = dict(ROOT=p.ROOT, REGISTRY=p.REGISTRY, PROVISION=p.PROVISION, BINDINGS=p.BINDINGS)
 # The hosted-host renderer whose output install.sh requires the installed
 # provisioning record to match byte for byte.
 hosted_spec = importlib.util.spec_from_file_location(
@@ -84,6 +87,112 @@ class ProvisionTests(unittest.TestCase):
     def tearDown(self):
         self.patch.stop()
         self.tmp.cleanup()
+
+    def removal_records(self):
+        """Two provisioned tenants, a (tap 1) and b (tap 2), with disks,
+        suspend snapshots, a set-aside stale snapshot and bindings."""
+        bindings = {}
+        for tenant, tap in (("a", 1), ("b", 2)):
+            c = p.checked({**config(), "tenant": tenant, "vm": f"vm-{tenant}", "tap_index": tap})
+            (p.PROVISION / f"{tenant}.json").write_text(json.dumps(c, indent=2) + "\n")
+            home = p.ROOT / "tenants" / tenant
+            record = {key: value for key, value in c.items() if key not in p.PROVISION_ONLY}
+            record.update({name: str(home / leaf) for name, leaf in p.REGISTRY_PATHS.items()})
+            (p.REGISTRY / f"{tenant}.json").write_text(json.dumps(record, indent=2) + "\n")
+            (home / "suspend").mkdir(parents=True)
+            (home / "suspend.stale-v0-1").mkdir()
+            (home / "disk.img").write_bytes(tenant.encode())
+            (home / "generation").write_text("3\n")
+            (home / "suspend/suspend.memory").write_bytes(b"memory")
+            (home / "suspend/key.json").write_text("{}")
+            bindings[f"vm-{tenant}"] = {"tenant": tenant, "sub": c["sub"]}
+        p.BINDINGS.write_text(json.dumps(bindings, indent=2) + "\n")
+        p.BINDINGS.chmod(0o644)
+
+    def snapshot_tree(self):
+        return {str(path.relative_to(self.root)): path.read_bytes() if path.is_file() else None
+                for path in sorted(self.root.rglob("*")) if path.name != "provision.lock"}
+
+    def test_removal_layout_is_the_one_the_helper_removes(self):
+        pinned = json.loads(Path(__file__).with_name("removal-layout.json").read_text())
+        with mock.patch.multiple(p, **LIVE_PATHS):
+            self.assertEqual(p.removal_layout(), pinned)
+
+    def test_remove_tenant_refuses_while_either_service_is_running(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        for active in ("motor-host.service", "motor-vm-helper.service"):
+            with self.subTest(active=active):
+                states = {"motor-host.service": "inactive", "motor-vm-helper.service": "inactive", active: "active"}
+                execute = mock.Mock()
+                with self.assertRaisesRegex(ValueError, "must be stopped") as refused:
+                    p.remove_tenant("a", check_service=states.get, execute=execute, has_tap=lambda _tap: True,
+                                    output=lambda _line: None)
+                self.assertIn(p.STOP_COMMAND, str(refused.exception))
+                execute.assert_not_called()
+                self.assertEqual(self.snapshot_tree(), before)
+
+    def test_remove_tenant_dry_run_lists_everything_and_deletes_nothing(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        lines = []
+        execute = mock.Mock()
+        p.remove_tenant("a", dry_run=True, check_service=lambda _unit: "inactive", execute=execute,
+                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append)
+        execute.assert_not_called()
+        self.assertEqual(self.snapshot_tree(), before)
+        listed = "\n".join(lines)
+        home = p.ROOT / "tenants/a"
+        for path in (home / "disk.img", home / "generation", home / "suspend/suspend.memory",
+                     home / "suspend/key.json", home / "suspend.stale-v0-1", p.REGISTRY / "a.json", p.PROVISION / "a.json"):
+            self.assertIn(f"{path}\n", listed + "\n")
+        self.assertIn(f"binding vm-a in {p.BINDINGS}", listed)
+        self.assertIn("delete: tap mtap1", listed)
+        self.assertIn("ufw route motor-tenant-mtap1", listed)
+        self.assertTrue(all(line.startswith("would ") for line in lines), lines)
+        self.assertNotIn("tenants/b", listed)
+        self.assertNotIn("mtap2", listed)
+
+    def test_remove_tenant_quarantines_one_tenant_and_the_second_survives(self):
+        self.removal_records()
+        b_before = {path: data for path, data in self.snapshot_tree().items()
+                    if path.startswith("tenants/b") or path.endswith("b.json")}
+        execute = mock.Mock()
+        messages = []
+        p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
+                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append)
+        execute.assert_called_once_with("ip", "link", "delete", "dev", "mtap1")
+        quarantine = p.ROOT / "removed/a-1000"
+        self.assertFalse((p.ROOT / "tenants/a").exists())
+        self.assertFalse((p.REGISTRY / "a.json").exists())
+        self.assertFalse((p.PROVISION / "a.json").exists())
+        self.assertEqual((quarantine / "home/disk.img").read_bytes(), b"a")
+        self.assertTrue((quarantine / "home/suspend/suspend.memory").exists())
+        self.assertTrue((quarantine / "home/suspend.stale-v0-1").is_dir())
+        self.assertEqual(json.loads((quarantine / "records/registry.json").read_text())["tap_index"], 1)
+        self.assertEqual(json.loads((quarantine / "records/provision.json").read_text())["tenant"], "a")
+        self.assertEqual(json.loads((quarantine / "records/binding.json").read_text()),
+                         {"vm-a": {"tenant": "a", "sub": SUB}})
+        self.assertEqual(stat.S_IMODE(quarantine.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((p.ROOT / "removed").stat().st_mode), 0o700)
+        self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-b": {"tenant": "b", "sub": SUB}})
+        self.assertEqual(stat.S_IMODE(p.BINDINGS.stat().st_mode), 0o644)
+        b_after = {path: data for path, data in self.snapshot_tree().items()
+                   if path.startswith("tenants/b") or path.endswith("b.json")}
+        self.assertEqual(b_after, b_before)
+        self.assertTrue(any("quarantined" in line for line in messages), messages)
+        # The tenant is gone: a second removal finds nothing to remove.
+        with self.assertRaisesRegex(ValueError, "no helper registry entry"):
+            p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
+                            has_tap=lambda _tap: False, output=lambda _line: None)
+
+    def test_remove_tenant_purge_now_deletes_instead_of_quarantining(self):
+        self.removal_records()
+        p.remove_tenant("a", purge_now=True, check_service=lambda _unit: "inactive", execute=mock.Mock(),
+                        has_tap=lambda _tap: False, now=lambda: 1000, output=lambda _line: None)
+        self.assertFalse((p.ROOT / "tenants/a").exists())
+        self.assertEqual(list((p.ROOT / "removed").iterdir()), [])
+        self.assertEqual((p.ROOT / "tenants/b/disk.img").read_bytes(), b"b")
 
     def test_switch_image_refuses_when_either_service_is_running(self):
         _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()

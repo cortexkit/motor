@@ -69,6 +69,9 @@ pub struct Snapshot {
     pub counter: u64,
     #[serde(default)]
     pub last_alive: u64,
+    /// Tenants whose accounts the broker reported closed, by tenant name.
+    #[serde(default)]
+    pub closed: BTreeMap<String, crate::closure::ClosedTenant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -169,6 +172,8 @@ pub struct Host {
     pub(crate) restart_ms: u64,
     pub(crate) prior_alive_ms: u64,
     pub(crate) provider_managed: bool,
+    /// When the next billing-record retention pass is due; see `retention_tick`.
+    pub(crate) retention_due_ms: u64,
 }
 impl Host {
     pub fn new(
@@ -187,6 +192,7 @@ impl Host {
             restart_ms: 0,
             prior_alive_ms: 0,
             provider_managed: false,
+            retention_due_ms: 0,
         }
     }
     pub(crate) fn sandbox(ceiling: u32, snapshot: Snapshot, journal: Box<dyn Journal>) -> Self {
@@ -401,6 +407,11 @@ impl Host {
             .any(|c| c.job == claims.jti && c.purpose == claims.purpose);
         let mut next = self.snapshot.clone();
         let mut admission = Admission::Ready;
+        if claims.purpose == Purpose::Run && self.is_closed(&tenant.tenant) {
+            // A closed account starts no new job. Attach stays open so a
+            // client can still collect a result already running or finished.
+            return refuse(Refusal::Auth);
+        }
         if claims.purpose == Purpose::Attach {
             if live || old.is_none() {
                 return refuse(Refusal::Auth);
@@ -772,6 +783,16 @@ impl Host {
         } else {
             live.preludes = live.preludes.saturating_sub(1);
         }
+    }
+    /// A relay or a connection setup for one of the tenant's jobs is open.
+    pub(crate) fn tenant_busy(&self, tenant: &str) -> bool {
+        self.live.get(tenant).is_some_and(|v| v.preludes > 0)
+            || self.connections.iter().any(|connection| {
+                self.snapshot
+                    .leases
+                    .get(&connection.job)
+                    .is_some_and(|lease| lease.tenant == tenant)
+            })
     }
     fn tenant_idle(&self, tenant: &str) -> bool {
         let Some(live) = self.live.get(tenant) else {

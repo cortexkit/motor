@@ -1808,3 +1808,25 @@ fn javascript_manager_cache_reuses_registry_inputs_but_scopes_local_content() {
         );
     }
 }
+
+#[test]
+fn javascript_cache_entries_name_the_repository_that_owns_them() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "package-lock.json");
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    manager.prepare(&f, &tree).unwrap();
+    let owner = workspace::name(&f.workspace.to_string_lossy());
+    for root in ["js-installs", "js-manager-caches"] {
+        let entries: Vec<_> = fs::read_dir(f.state.join(root))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1, "{root}: {entries:?}");
+        assert_eq!(
+            fs::read_to_string(entries[0].join(workspace::JAVASCRIPT_CACHE_OWNER)).unwrap(),
+            owner,
+            "{root}"
+        );
+    }
+}

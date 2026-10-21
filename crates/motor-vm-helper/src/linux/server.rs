@@ -67,6 +67,19 @@ pub fn serve(
         std::thread::park_timeout(Duration::from_millis(100));
         maintenance.lock().unwrap().maintain();
     });
+    // Removed tenants' quarantined data is deleted here once it is old
+    // enough. Only removal writes that folder, so this needs no helper lock
+    // and a long deletion never holds up tenant operations.
+    std::thread::spawn(|| loop {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Err(e) = crate::removal::purge(&crate::removal::Paths::live(), now_s) {
+            eprintln!("removed-tenant purge failed: {e}");
+        }
+        std::thread::sleep(Duration::from_secs(3600));
+    });
     let stopping = helper.clone();
     std::thread::spawn(move || {
         // A tenant that did not stop cleanly is already recorded as unclean,

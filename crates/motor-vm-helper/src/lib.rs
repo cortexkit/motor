@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod removal;
 pub mod signals;
 pub mod tenant;
 
@@ -102,6 +103,12 @@ pub enum Request {
     RecoveryComplete {
         tenant: String,
     },
+    /// Quarantines a stopped tenant's data and removes its records and
+    /// network setup; see `removal`. Names the tenant only.
+    #[serde(alias = "remove-tenant")]
+    RemoveTenant {
+        tenant: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -187,6 +194,9 @@ pub enum Reply {
     TenantMetrics {
         memory_bytes: u64,
         egress_bytes: u64,
+    },
+    Removed {
+        quarantine: String,
     },
 }
 pub struct Response {
@@ -405,6 +415,7 @@ impl<M: Machine> Helper<M> {
             Request::RecoveryComplete { tenant } => {
                 self.tenant(&tenant, tenant::Operation::RecoveryComplete)
             }
+            Request::RemoveTenant { tenant } => self.tenant(&tenant, tenant::Operation::Remove),
         }
     }
     fn tenant(&mut self, name: &str, op: tenant::Operation) -> Result<Response> {

@@ -383,6 +383,152 @@ def repair_from_registry(tenant, validate_image=None, check_trusted=None, output
         return True
 
 
+# How long a removed tenant's data waits in the quarantine folder before it is
+# deleted. motor-vm-helper's purge (crates/motor-vm-helper/src/removal.rs,
+# QUARANTINE_S) deletes such folders at this age, so a removal made here is
+# purged on the same schedule as one the host made. The public privacy page
+# promises a departed customer's disk is deleted within 30 days; 7 days of
+# quarantine (time to undo a mistake) stays well inside that.
+QUARANTINE_S = 7 * 24 * 60 * 60
+
+
+def removal_layout():
+    """What a tenant removal touches, with {tenant}, {unix_s} and {tap}
+    placeholders. removal-layout.json pins this, and the helper's own removal
+    (motor-vm-helper's removal::layout) is pinned to the same file, so the
+    command and the host's automatic removal delete the same set."""
+    return {
+        "lock": str(ROOT / "provision.lock"),
+        "quarantine": str(ROOT / "removed" / "{tenant}-{unix_s}"),
+        "moved": {str(ROOT / "tenants" / "{tenant}"): "home"},
+        "records": {
+            str(REGISTRY / "{tenant}.json"): "records/registry.json",
+            str(PROVISION / "{tenant}.json"): "records/provision.json",
+        },
+        "binding": {"file": str(BINDINGS), "saved_as": "records/binding.json"},
+        "network": [
+            "tap mtap{tap}",
+            "nft chain tenant_mtap{tap}_input",
+            "nft chain tenant_mtap{tap}_forward",
+            "nft chain tenant_mtap{tap}_nat",
+            "nft counter tenant_mtap{tap}_egress",
+            "ufw route motor-tenant-mtap{tap}",
+        ],
+        "purge_age_s": QUARANTINE_S,
+    }
+
+
+def tap_exists(tap):
+    return subprocess.run(["ip", "link", "show", "dev", tap], capture_output=True).returncode == 0
+
+
+def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, execute=run, has_tap=None,
+                  now=time.time, output=print):
+    """Remove a departed customer's tenant from this host.
+
+    Refuses unless motor-host.service and motor-vm-helper.service are both
+    stopped, exactly as switch-image does: with the helper stopped no tenant VM
+    runs, and with motor-host stopped no lease or session exists. Then, under
+    the provision lock, it saves the tenant's records into a root-only
+    quarantine folder, deletes the tap, drops the binding, provisioning record
+    and registry entry, and moves the tenant's home (disk, generation, suspend
+    snapshots, set-aside stale snapshots and stop markers) into the folder.
+    The helper deletes the folder after QUARANTINE_S; --purge-now deletes it
+    at once. The firewall exemption and UFW route grant are dropped by the
+    helper's startup reconciliation, which keeps only registered tenants.
+    The shared size base under the image is not per tenant and is kept.
+    A dry run lists everything it would remove and changes nothing.
+    """
+    tenant = component(tenant)
+    check_service = systemd_active_state if check_service is None else check_service
+    has_tap = tap_exists if has_tap is None else has_tap
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for unit in ("motor-host.service", "motor-vm-helper.service"):
+            state = check_service(unit)
+            if state != "inactive":
+                raise ValueError(f"{unit} must be stopped before removing a tenant (ActiveState={state}). "
+                                 f"Stop both with: {STOP_COMMAND} "
+                                 "(the helper stops each running tenant VM cleanly before it exits)")
+        registry_path = REGISTRY / f"{tenant}.json"
+        provision_path = PROVISION / f"{tenant}.json"
+        if not registry_path.exists():
+            raise ValueError(f"no helper registry entry for tenant {tenant}: {registry_path}")
+        record = json.loads(registry_path.read_text())
+        tap_index = record.get("tap_index") if isinstance(record, dict) else None
+        if type(tap_index) is not int or not 0 < tap_index < 255:
+            raise ValueError("helper registry entry has no valid tap_index")
+        if provision_path.exists():
+            current = checked(json.loads(provision_path.read_text()))
+            if current["tenant"] != tenant or current["tap_index"] != tap_index:
+                raise ValueError("provisioning record and helper registry disagree; inspect them before removing")
+        bindings = json.loads(BINDINGS.read_text()) if BINDINGS.exists() else {}
+        binding = {vm: entry for vm, entry in bindings.items() if entry.get("tenant") == tenant}
+        home = ROOT / "tenants" / tenant
+        if home.is_symlink() or (home.exists() and not home.is_dir()):
+            raise ValueError(f"tenant home is not a directory: {home}")
+        unix_s = int(now())
+        quarantine = ROOT / "removed" / f"{tenant}-{unix_s}"
+        tap = f"mtap{tap_index}"
+        destination = "delete" if purge_now else f"quarantine in {quarantine} until the helper purges it"
+        plan = []
+        if home.exists():
+            plan += [f"{destination}: {path}" for path in [home, *sorted(home.rglob("*"))]]
+        plan += [f"{destination}: {path}" for path in (registry_path, provision_path) if path.exists()]
+        plan += [f"{destination}: binding {vm} in {BINDINGS}" for vm in sorted(binding)]
+        if has_tap(tap):
+            plan.append(f"delete: tap {tap}")
+        plan += [f"dropped at the next helper start: {name}" for name in (
+            f"nft chain tenant_{tap}_input", f"nft chain tenant_{tap}_forward", f"nft chain tenant_{tap}_nat",
+            f"nft counter tenant_{tap}_egress", f"ufw route motor-tenant-{tap}")]
+        if dry_run:
+            for line in plan:
+                output(f"would {line}")
+            return plan
+        if unclean_stop_evidence(tenant):
+            output(f"note: {tenant}'s last VM did not stop cleanly ({RUNNING_MARKER} is present); removing it anyway")
+
+        removed = ROOT / "removed"
+        if removed.is_symlink() or (removed.exists() and not removed.is_dir()):
+            raise ValueError(f"removed-tenant folder is not a directory: {removed}")
+        if not removed.exists():
+            removed.mkdir(mode=0o700)
+            sync_dir(ROOT)
+        quarantine.mkdir(mode=0o700)
+        (quarantine / "records").mkdir(mode=0o700)
+        for source, saved in ((registry_path, "registry.json"), (provision_path, "provision.json")):
+            if source.exists():
+                atomic(quarantine / "records" / saved, source.read_text())
+        if binding:
+            atomic(quarantine / "records" / "binding.json", json.dumps(binding, indent=2))
+        sync_dir(removed)
+        if has_tap(tap):
+            execute("ip", "link", "delete", "dev", tap)
+        if binding:
+            kept = {vm: entry for vm, entry in bindings.items() if vm not in binding}
+            atomic(BINDINGS, json.dumps(kept, indent=2) + "\n")
+            BINDINGS.chmod(0o644)
+        # The registry entry goes before the home moves, as in the helper: a
+        # registry entry naming a missing disk would stop the helper starting.
+        for path in (provision_path, registry_path):
+            if path.exists():
+                path.unlink()
+                sync_dir(path.parent)
+        if home.exists():
+            os.rename(home, quarantine / "home")
+            sync_dir(home.parent)
+            sync_dir(quarantine)
+        if purge_now:
+            shutil.rmtree(quarantine)
+            sync_dir(removed)
+            output(f"{tenant}: removed and deleted")
+        else:
+            output(f"{tenant}: removed; data quarantined in {quarantine} and deleted by the helper "
+                   f"{QUARANTINE_S // 86400} days after {unix_s}")
+        output("start the services again; the helper's startup reconciliation drops the tenant's firewall rules")
+        return plan
+
+
 def trusted(path):
     for p in [path, *path.parents]:
         st = p.lstat()
@@ -859,6 +1005,13 @@ def main():
         "repair-from-registry",
         help="set the provisioning record's image_version to the helper registry's, when nothing else differs")
     repair.add_argument("tenant")
+    remove = commands.add_parser(
+        "remove-tenant",
+        help="remove a departed customer's tenant: quarantine its disk, snapshots and records for "
+        f"{QUARANTINE_S // 86400} days, drop its network setup; stop both services first: {STOP_COMMAND}")
+    remove.add_argument("tenant")
+    remove.add_argument("--dry-run", action="store_true", help="list everything that would be removed; change nothing")
+    remove.add_argument("--purge-now", action="store_true", help="delete at once instead of quarantining")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
@@ -871,6 +1024,20 @@ def main():
         trusted(PROVISION / f"{tenant}.json")
         trusted(REGISTRY / f"{tenant}.json")
         repair_from_registry(tenant)
+        return
+    if args.command == "remove-tenant":
+        if args.config is not None:
+            parser.error("remove-tenant takes a tenant, not --config")
+        if args.dry_run and args.purge_now:
+            parser.error("--dry-run and --purge-now are exclusive")
+        tenant = component(args.tenant)
+        for directory in (ROOT, REGISTRY, ROOT / "tenants"):
+            trusted(directory)
+        trusted(REGISTRY / f"{tenant}.json")
+        for path in (PROVISION / f"{tenant}.json", ROOT / "tenants" / tenant, ROOT / "removed", BINDINGS):
+            if path.exists() or path.is_symlink():
+                trusted(path)
+        remove_tenant(tenant, dry_run=args.dry_run, purge_now=args.purge_now)
         return
     if args.command == "switch-image":
         if args.config is not None:
