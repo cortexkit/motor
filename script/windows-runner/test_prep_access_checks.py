@@ -96,7 +96,7 @@ class PrepAccessScreenTests(unittest.TestCase):
         self.code('(Split-Path -Parent $prior.fixture) -eq $staging', self.fixture)
         self.code('$state.leftovers = @(Remove-RunnerAccessLeftovers $Root (Split-Path -Parent $Evidence))', self.fixture)
         fixtures = (HERE / 'test_scripts.ps1').read_text()
-        for name in ('prep-acl-fixture-leftovers-removed', 'prep-acl-fixture-cleanup-recovers-unlistable-tree', 'FAIL prep-acl-fixture-cleanup:', 'prep-creation-descriptor-matches-production-create-then-grant'):
+        for name in ('prep-acl-fixture-leftovers-removed', 'prep-acl-fixture-cleanup-recovers-unlistable-tree', "'prep-acl-fixture-cleanup' {", 'prep-creation-descriptor-matches-icacls-and-production-create-then-grant'):
             self.assertIn(name, fixtures)
         self.code("if ($null -eq $failure) { throw }", fixtures)
         self.code("-Filter 'motor-prep-acl-*'", fixtures)
@@ -105,11 +105,26 @@ class PrepAccessScreenTests(unittest.TestCase):
         self.code('CreateDirectoryW(path, ref attributes)', self.acl)
         self.code('throw new Win32Exception(Marshal.GetLastWin32Error())', self.acl)
         fixtures = (HERE / 'test_scripts.ps1').read_text()
-        self.assertIn('prep-shared-descriptor-and-inheritance-match-independent-icacls', fixtures)
+        self.assertIn('prep-creation-descriptor-matches-icacls-and-production-create-then-grant', fixtures)
+        self.assertIn('prep-acl-rule-builds-in-memory-for-every-role', fixtures)
         self.assertIn('prep-creation-only-fixture-never-rewrites-an-existing-acl', fixtures)
         self.code("@('Stage','(X)'),@('Read','(OI)(CI)RX'),@('Modify','(OI)(CI)M')", fixtures)
         self.code('icacls.exe $oracle /grant:r', fixtures)
         self.code('Grant-RunnerPrepPath $production $sid $row[0]', fixtures)
+
+    def test_byte_enum_flags_avoid_powershell_enum_arithmetic_and_checks_name_themselves(self):
+        # AceFlags is byte-backed; the Ally's PowerShell 5.1 run threw a bare
+        # InvalidCastException in this area, so no -bor/-band or [int] cast on it.
+        for source in (self.acl, (HERE / 'test_scripts.ps1').read_text()):
+            code = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#') and 'INFO prep-acl-legacy' not in line)
+            self.assertNotRegex(code, r'AceFlags\]::\w+\s*-b(or|and)')
+            self.assertNotIn('[int]$_.AceFlags', code)
+        self.code('[Enum]::ToObject([Security.AccessControl.AceFlags], 3)', self.acl)
+        fixtures = (HERE / 'test_scripts.ps1').read_text()
+        self.code('Write-Host "RUN $Name"', fixtures)
+        self.code('throw "FAIL ${Name}:', fixtures)
+        self.code('$Ace.AceFlags.value__.ToString(\'x2\')', fixtures)
+        self.assertIn('trap { Write-Host "FAILED at', fixtures)
 
     def test_read_only_lane_skips_loader_flags_and_runtime_reconciliation(self):
         control = (HERE / 'qualify.ps1').read_text()

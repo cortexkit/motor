@@ -1,10 +1,14 @@
 # One descriptor builder for production prep grants and creation-only fixtures.
 # Raw ACE masks preserve icacls semantics, including stage X without SYNCHRONIZE.
 function Get-RunnerPrepRule([ValidateSet('Stage','Read','Modify')][string]$Role) {
+    # AceFlags is a byte-backed enum. Build it with Enum.ToObject from an int
+    # rather than PowerShell's -bor or an [int] cast, so no PowerShell enum
+    # arithmetic or unboxing is involved. 3 = ObjectInherit | ContainerInherit.
+    $inherit = [Enum]::ToObject([Security.AccessControl.AceFlags], 3)
     switch ($Role) {
-        'Stage' { return @{mask=0x00000020; flags=[Security.AccessControl.AceFlags]::None} }
-        'Read' { return @{mask=0x001200a9; flags=([Security.AccessControl.AceFlags]::ObjectInherit -bor [Security.AccessControl.AceFlags]::ContainerInherit)} }
-        'Modify' { return @{mask=0x001301bf; flags=([Security.AccessControl.AceFlags]::ObjectInherit -bor [Security.AccessControl.AceFlags]::ContainerInherit)} }
+        'Stage' { return @{mask=0x00000020; flags=[Enum]::ToObject([Security.AccessControl.AceFlags], 0)} }
+        'Read' { return @{mask=0x001200a9; flags=$inherit} }
+        'Modify' { return @{mask=0x001301bf; flags=$inherit} }
     }
 }
 function New-RunnerPrepAcl($BaseAcl, [string]$Sid, [ValidateSet('Stage','Read','Modify')][string]$Role) {
