@@ -413,6 +413,46 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     fs::write(&temp_probe, b"staging temp write")?;
     fs::remove_file(&temp_probe)?;
     let mut proof = match mode {
+        "diagnostic-writes" => {
+            // Record allowed writes as evidence too; diagnostic completion is
+            // never a permission-boundary pass. Remove every controlled canary.
+            fn attempt(path: &Path) -> io::Result<&'static str> {
+                match fs::write(path, b"diagnostic controlled write") {
+                    Ok(()) => {
+                        fs::remove_file(path)?;
+                        Ok("allowed")
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok("denied"),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("directory-absent"),
+                    Err(error) => Err(error),
+                }
+            }
+            let root = credential
+                .parent()
+                .ok_or_else(|| invalid("diagnostic credential root missing"))?;
+            let stage = write_root
+                .parent()
+                .ok_or_else(|| invalid("diagnostic stage missing"))?;
+            let mut surfaces = serde_json::Map::new();
+            for (name, directory) in [
+                ("persistent_prep_cache", root.join("state/ally/prep-cargo")),
+                ("service_home", root.join("service-home")),
+                ("fetch_manifests", stage.join("fetch-manifests")),
+                ("prep_toolchain", root.join("prep-toolchain/bin")),
+                (
+                    "profile_local_temp",
+                    profile.parent().unwrap().join("AppData/Local/Temp"),
+                ),
+            ] {
+                let path = directory.join(format!("motor-write-diag-{}.txt", Uuid::now_v7()));
+                let outcome = attempt(&path)?;
+                surfaces.insert(
+                    name.into(),
+                    serde_json::json!({"path":path,"write":outcome}),
+                );
+            }
+            serde_json::json!({"outside_write":attempt(outside)?,"profile_write":attempt(&profile)?,"allowed_write":"allowed", "temp_tmp_inside_staging":true, "write_surfaces":surfaces})
+        }
         "base-control" => {
             fs::write(outside, b"unrestricted batch write control")?;
             fs::remove_file(outside)?;
@@ -497,6 +537,17 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
     fs::create_dir_all(config.state_dir().join("prep-cargo"))?;
     let probe = stage.join("fetch-manifests/probe.exe");
     fs::copy(std::env::current_exe()?, &probe)?;
+    let fixture = stage.join("fetch-manifests/matrix-fixture");
+    fs::create_dir_all(fixture.join("src"))?;
+    fs::write(
+        fixture.join("Cargo.toml"),
+        "[package]\nname=\"trusted-fetch-matrix\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )?;
+    fs::write(
+        fixture.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"trusted-fetch-matrix\"\nversion = \"0.1.0\"\n",
+    )?;
+    fs::write(fixture.join("src/lib.rs"), "")?;
     let cargo = root.join("prep-toolchain/bin/cargo.exe");
     if format!("{:x}", Sha256::digest(fs::read(&cargo)?))
         != vm.prep_cargo_sha256.to_ascii_lowercase()
@@ -517,7 +568,10 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
             None,
             &["-Staging".into(), stage.to_string_lossy().into()],
         )?)?;
-        use launch::DiagnosticPolicy::{Everyone, ExplicitDesktopWrites, None as Production};
+        use launch::DiagnosticPolicy::{
+            DefaultDacl, DefaultDaclRestrictedCode, Everyone, ExplicitDesktopWrites,
+            FetchDefaultDaclRestrictedCode, None as Production, RestrictedCode,
+        };
         for (index, name, program, restricted, policy) in [
             (1, "probe-base", &probe, false, Production),
             (2, "probe-write-restricted", &probe, true, Production),
@@ -550,12 +604,41 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 true,
                 ExplicitDesktopWrites,
             ),
+            (
+                8,
+                "cargo-version-logon-default-dacl-diagnostic-only",
+                &cargo,
+                true,
+                DefaultDacl,
+            ),
+            (
+                9,
+                "cargo-version-logon-and-restricted-code-diagnostic-only",
+                &cargo,
+                true,
+                RestrictedCode,
+            ),
+            (
+                10,
+                "cargo-version-logon-restricted-code-default-dacl-diagnostic-only",
+                &cargo,
+                true,
+                DefaultDaclRestrictedCode,
+            ),
+            (
+                11,
+                "cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only",
+                &cargo,
+                true,
+                FetchDefaultDaclRestrictedCode,
+            ),
         ] {
             let mut command = Command::new(program);
             command.env_clear().env("SYSTEMROOT", r"C:\Windows").env(
                 "CARGO_HOME",
                 stage.join(format!("fetch-temp/cargo-{index}")),
             );
+            command.env("RUSTC", &rustc);
             if index <= 2 {
                 command
                     .arg("prep-probe")
@@ -567,6 +650,10 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                     .arg(root.join("prep-secret.dpapi"))
                     .arg(&outside)
                     .arg(stage.join(format!("fetch-temp/matrix-probe-{index}.json")));
+            } else if index == 11 {
+                command
+                    .args(["fetch", "--locked", "--offline", "--manifest-path"])
+                    .arg(fixture.join("Cargo.toml"));
             } else {
                 command.arg("--version");
             }
@@ -584,7 +671,29 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 report["launch"]["lp_desktop"]
             );
             let deferred = report.get("cleanup_deferred").is_some();
+            let boundary = report["write_probe"]["proof"].as_object().map(|proof| {
+                report["write_probe"]["exit_code"] == 0
+                    && proof
+                        .get("outside_write")
+                        .is_some_and(|value| value == "denied")
+                    && proof
+                        .get("profile_write")
+                        .is_some_and(|value| value == "denied")
+                    && proof
+                        .get("allowed_write")
+                        .is_some_and(|value| value == "allowed")
+                    && proof
+                        .get("write_surfaces")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|surfaces| {
+                            surfaces.values().all(|surface| {
+                                surface["write"] == "denied"
+                                    || surface["write"] == "directory-absent"
+                            })
+                        })
+            });
             cells.push(serde_json::json!({"cell":index,"name":name,"diagnostic_policy":policy,"report":report,
+                "staging_write_probe_passed":boundary,
                 "note":if index == 7 { "Production already grants logon SID GENERIC_ALL; this repeats with explicit full write masks to test mapping, not a new principal" } else { "" }}));
             launch::write_diagnostic_update(
                 &report_path,

@@ -118,12 +118,17 @@ qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
-This stops MotorRunner and runs seven probe/Cargo/rustc token comparisons without
+This stops MotorRunner and runs eleven probe/Cargo/rustc token comparisons without
 VM qualification. It records requested token flags separately from actual
 `IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
 The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
 restricted to pinned `cargo --version`; production continues to use flags `0x9`
-and only the logon SID. Matrix completion is evidence collection, not a pass or
+and only the logon SID. Additional diagnostic cells compare token-default-DACL
+updates and the RESTRICTED SID (`S-1-5-12`); they do not change the production
+token. The fixed offline Cargo-fetch cell and follow-up controlled write probes
+reuse one created token/profile/desktop per cell. Readbacks retain default DACLs
+before/after and actual writes to selected staging/outside/profile/cache paths.
+Matrix completion is evidence collection, not a pass or
 permission to enable fleet routing. Leave the service stopped for evidence review.
 
 Peer qualification starts the victim alone and records its VM-matched Hyper-V

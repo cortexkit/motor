@@ -21,6 +21,31 @@ pub(super) enum DiagnosticPolicy {
     None,
     Everyone,
     ExplicitDesktopWrites,
+    DefaultDacl,
+    RestrictedCode,
+    DefaultDaclRestrictedCode,
+    FetchDefaultDaclRestrictedCode,
+}
+impl DiagnosticPolicy {
+    pub(super) fn changes_default_dacl(self) -> bool {
+        matches!(
+            self,
+            Self::DefaultDacl
+                | Self::DefaultDaclRestrictedCode
+                | Self::FetchDefaultDaclRestrictedCode
+        )
+    }
+    pub(super) fn adds_restricted_code(self) -> bool {
+        matches!(
+            self,
+            Self::RestrictedCode
+                | Self::DefaultDaclRestrictedCode
+                | Self::FetchDefaultDaclRestrictedCode
+        )
+    }
+    fn checks_writes(self) -> bool {
+        self.changes_default_dacl() || self.adds_restricted_code()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -213,16 +238,30 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         ));
     }
     session::no_reparse(&plan.root, &plan.cwd)?;
-    // Broader restricting-SID and explicit-rights controls are diagnostic-only
-    // and can run only the pinned Cargo executable's harmless version command.
+    // Token controls cannot be used by production fetch. Only the fixed offline
+    // diagnostic fixture may use the fetch variant; all other controls are --version.
     if plan.diagnostic_policy != DiagnosticPolicy::None
         && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
-            || plan.args != ["--version"]
+            || (if plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode {
+                plan.args
+                    != [
+                        "fetch",
+                        "--locked",
+                        "--offline",
+                        "--manifest-path",
+                        plan.cwd
+                            .join("fetch-manifests/matrix-fixture/Cargo.toml")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ]
+            } else {
+                plan.args != ["--version"]
+            })
             || !plan.restricted)
     {
         return Err(step(
             "diagnostic-policy",
-            "controls are limited to restricted cargo --version",
+            "controls are limited to restricted Cargo version or the fixed offline fixture",
         ));
     }
     let mut report = json!({"phase":"session-setup", "program":plan.program, "arguments":plan.args,
@@ -266,6 +305,24 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         report["exit_status"] = json!(process_status::describe(code));
         report["stdout"] = json!(bounded_text(&plan.stdout)?);
         report["stderr"] = json!(bounded_text(&plan.stderr)?);
+        if plan.diagnostic_policy.checks_writes() {
+            // Reuse the exact created token, profile and desktop: relogging the
+            // account here would invalidate the write-boundary comparison.
+            let mut probe_released = true;
+            let write_probe = diagnostic_write_probe(&plan, &context, &mut probe_released);
+            if !probe_released {
+                std::mem::forget(context);
+                report["cleanup_deferred"] = json!("unreaped diagnostic write probe");
+                return Err(step(
+                    "unreaped-write-probe",
+                    "preserve matrix and launch reports",
+                ));
+            }
+            report["write_probe"] = match write_probe {
+                Ok(proof) => proof,
+                Err(error) => json!({"error":error.to_string()}),
+            };
+        }
         report["phase"] = json!("cleanup");
         save(&report)?;
         let cleanup = context.finish();
@@ -329,4 +386,58 @@ pub(super) fn write_diagnostic_update(path: &Path, value: &Value) -> io::Result<
 }
 pub(super) fn require_system() -> io::Result<()> {
     session::require_system()
+}
+
+fn diagnostic_write_probe(
+    plan: &Plan,
+    context: &session::Session,
+    released: &mut bool,
+) -> io::Result<Value> {
+    use sha2::{Digest, Sha256};
+    let program = plan.cwd.join("fetch-manifests/probe.exe");
+    session::no_reparse(&plan.root, &program)?;
+    if Sha256::digest(fs::read(&program)?) != Sha256::digest(fs::read(std::env::current_exe()?)?) {
+        return Err(step(
+            "diagnostic-write-probe",
+            "probe does not match the trusted runner",
+        ));
+    }
+    let outside = PathBuf::from(r"C:\Windows\Temp")
+        .join(format!("motor-prep-diag-{}.txt", uuid::Uuid::now_v7()));
+    let output = plan.stdout.with_extension("write-proof.json");
+    let probe = Plan {
+        root: plan.root.clone(),
+        cwd: plan.cwd.clone(),
+        program: program.to_string_lossy().into_owned(),
+        args: vec![
+            "prep-probe".into(),
+            "diagnostic-writes".into(),
+            plan.root
+                .join("prep-secret.dpapi")
+                .to_string_lossy()
+                .into_owned(),
+            outside.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+        ],
+        env: BTreeMap::new(),
+        restricted: true,
+        report: plan.report.clone(),
+        stdout: plan.stdout.with_extension("write-probe.stdout"),
+        stderr: plan.stderr.with_extension("write-probe.stderr"),
+        diagnostic_policy: DiagnosticPolicy::None,
+    };
+    let result = process::run(&probe, context, released);
+    let code = result?;
+    let proof = if output.exists() {
+        Some(serde_json::from_slice::<Value>(&fs::read(&output)?).map_err(io::Error::other)?)
+    } else {
+        None
+    };
+    if outside.exists() {
+        fs::remove_file(&outside)?;
+    }
+    Ok(
+        json!({"same_token_as_primary":true,"exit_code":code,"exit_status":process_status::describe(code),
+        "stdout":bounded_text(&probe.stdout)?,"stderr":bounded_text(&probe.stderr)?,"proof":proof}),
+    )
 }

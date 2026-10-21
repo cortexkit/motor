@@ -580,6 +580,7 @@ pub(super) struct Session {
     grant: StagingGrant,
     desktop: Desktop,
     restricted: Option<Handle>,
+    _diagnostic_default_dacl: Option<Local>,
     profile: Profile,
     pub(super) environment: Vec<u16>,
     pub(super) info: Value,
@@ -600,6 +601,13 @@ impl Session {
             })?;
         }
         let everyone = Local(everyone);
+        let mut restricted_code = null_mut();
+        if plan.diagnostic_policy.adds_restricted_code() {
+            check("diagnostic-restricted-code-sid", unsafe {
+                ConvertStringSidToSidW(wide("S-1-5-12").as_ptr(), &mut restricted_code)
+            })?;
+        }
+        let restricted_code = Local(restricted_code);
         let restricted = if plan.restricted {
             let mut restrictions = vec![SID_AND_ATTRIBUTES {
                 Sid: sid.0,
@@ -608,6 +616,12 @@ impl Session {
             if !everyone.0.is_null() {
                 restrictions.push(SID_AND_ATTRIBUTES {
                     Sid: everyone.0,
+                    Attributes: 0,
+                });
+            }
+            if !restricted_code.0.is_null() {
+                restrictions.push(SID_AND_ATTRIBUTES {
+                    Sid: restricted_code.0,
                     Attributes: 0,
                 });
             }
@@ -628,6 +642,17 @@ impl Session {
                 )
             })?;
             Some(Handle(result))
+        } else {
+            None
+        };
+        let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
+        let default_dacl_before = token_default_dacl(actual_token)?;
+        let diagnostic_default_dacl = if plan.diagnostic_policy.changes_default_dacl() {
+            Some(set_diagnostic_default_dacl(
+                actual_token,
+                &user_sid,
+                &logon_sid,
+            )?)
         } else {
             None
         };
@@ -711,6 +736,7 @@ impl Session {
         env.insert("CARGO_BUILD_RUSTC_WRAPPER".into(), String::new());
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let info = json!({"user_sid":user_sid, "logon_sid":logon_sid, "restricting_sid":if plan.restricted { Some(logon_sid.clone()) } else { None },
+            "token_default_dacl_before":default_dacl_before,
             "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else { 0 })?,
             "window_station_readback":{"name":object_name(desktop.station)?, "dacl":object_dacl(desktop.station)?},
             "desktop_readback":{"name":object_name(desktop.desktop)?, "dacl":object_dacl(desktop.desktop)?},
@@ -723,6 +749,7 @@ impl Session {
             grant,
             desktop,
             restricted,
+            _diagnostic_default_dacl: diagnostic_default_dacl,
             profile,
             environment,
             info,
@@ -975,7 +1002,7 @@ fn token_details(token: HANDLE, requested_flags: u32) -> io::Result<Value> {
         json!({"requested_flags":requested_flags, "requested_flags_hex":format!("0x{requested_flags:08X}"),
         "write_restricted_requested":requested_flags & WRITE_RESTRICTED != 0,
         "is_token_restricted":unsafe { IsTokenRestricted(token) } != 0,
-        "restricting_sids":sids, "restricted_sid_entries":entries,
+        "restricting_sids":sids, "restricted_sid_entries":entries, "default_dacl":token_default_dacl(token)?,
         "integrity_sid":integrity, "integrity_level":name, "session_id":unsafe { *session.as_ptr().cast::<u32>() }}),
     )
 }
@@ -996,6 +1023,10 @@ fn object_dacl(object: HANDLE) -> io::Result<Value> {
         )
     })?;
     let _security = Local(security);
+    acl_details(dacl)
+}
+
+fn acl_details(dacl: *mut ACL) -> io::Result<Value> {
     if dacl.is_null() {
         return Ok(json!({"null_dacl":true}));
     }
@@ -1015,4 +1046,45 @@ fn object_dacl(object: HANDLE) -> io::Result<Value> {
         }
     }
     Ok(json!({"null_dacl":false, "entries":entries}))
+}
+
+fn token_default_dacl(token: HANDLE) -> io::Result<Value> {
+    let bytes = token_info(token, TokenDefaultDacl)?;
+    let dacl = unsafe { (*(bytes.as_ptr().cast::<TOKEN_DEFAULT_DACL>())).DefaultDacl };
+    acl_details(dacl)
+}
+
+fn set_diagnostic_default_dacl(
+    token: HANDLE,
+    user_sid: &str,
+    logon_sid: &str,
+) -> io::Result<Local> {
+    // Only the diagnostic token is changed. Existing filesystem/registry/UI
+    // object DACLs are untouched. New objects created using this token use this
+    // default when no explicit or inherited DACL overrides it.
+    let security = descriptor(&format!(
+        "D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GA;;;{logon_sid})"
+    ))?;
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = null_mut();
+    check("diagnostic-default-dacl", unsafe {
+        GetSecurityDescriptorDacl(security.0, &mut present, &mut dacl, &mut defaulted)
+    })?;
+    if present == 0 || dacl.is_null() {
+        return Err(step(
+            "diagnostic-default-dacl",
+            "missing explicit token default DACL",
+        ));
+    }
+    let info = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+    check("SetTokenInformation-TokenDefaultDacl", unsafe {
+        SetTokenInformation(
+            token,
+            TokenDefaultDacl,
+            (&raw const info).cast(),
+            size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        )
+    })?;
+    Ok(security)
 }

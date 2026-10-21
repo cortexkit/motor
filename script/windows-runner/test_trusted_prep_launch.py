@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Portable source checks for the Windows trusted-fetch broker boundaries."""
 from pathlib import Path
+import re
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -10,7 +11,9 @@ WINDOWS = ROOT / "crates/motor-runner/src/windows"
 
 class TrustedPrepLaunchTests(unittest.TestCase):
     def assertCodeIn(self, fragment, source):
-        unittest.TestCase.assertIn(self, "".join(fragment.split()), "".join(source.split()))
+        def normalize(text):
+            return re.sub(r",(?=[)\]])", "", "".join(text.split()))
+        unittest.TestCase.assertIn(self, normalize(fragment), normalize(source))
 
     def setUp(self):
         self.prep = (WINDOWS / "trusted_prep.rs").read_text()
@@ -105,7 +108,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn('"profile_loaded"', self.launch)
         self.assertCodeIn('"exit_status"', self.launch)
 
-    def test_matrix_variants_are_opt_in_and_only_allow_cargo_version(self):
+    def test_matrix_variants_are_opt_in_and_limited_to_fixed_commands(self):
         self.assertCodeIn("DiagnosticPolicy::None, false", self.launch)
         self.assertCodeIn('plan.args != ["--version"]', self.launch)
         self.assertCodeIn('plan.root.join("prep-toolchain/bin/cargo.exe")', self.launch)
@@ -140,6 +143,41 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("Copy-QualificationEvidence", matrix)
         self.assertCodeIn("return", matrix)
         self.assertNotIn("Get-FileHash", matrix)
+
+    def test_default_dacl_change_is_diagnostic_only_with_actual_readbacks(self):
+        self.assertCodeIn("if plan.diagnostic_policy.changes_default_dacl()", self.session)
+        self.assertCodeIn("set_diagnostic_default_dacl(actual_token, &user_sid, &logon_sid)", self.session)
+        self.assertCodeIn('D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GA;;;{logon_sid})', self.session)
+        self.assertCodeIn("SetTokenInformation(token, TokenDefaultDacl", self.session)
+        self.assertCodeIn('"token_default_dacl_before":default_dacl_before', self.session)
+        self.assertCodeIn('"default_dacl":token_default_dacl(token)?', self.session)
+        self.assertCodeIn("acl_details(dacl)", self.session)
+        self.assertCodeIn('wide("S-1-5-12")', self.session)
+        self.assertCodeIn("plan.diagnostic_policy.adds_restricted_code()", self.session)
+
+    def test_fetch_matrix_cell_is_fixed_offline_fixture_not_arbitrary_fetch(self):
+        for name in ("cargo-version-logon-default-dacl-diagnostic-only", "cargo-version-logon-and-restricted-code-diagnostic-only", "cargo-version-logon-restricted-code-default-dacl-diagnostic-only", "cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only"):
+            self.assertCodeIn(name, self.prep)
+        self.assertCodeIn("plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode", self.launch)
+        self.assertCodeIn('["fetch", "--locked", "--offline", "--manifest-path",', self.launch)
+        self.assertCodeIn('plan.cwd.join("fetch-manifests/matrix-fixture/Cargo.toml")', self.launch)
+        self.assertCodeIn('command.args(["fetch", "--locked", "--offline", "--manifest-path"])', self.prep)
+        self.assertCodeIn('command.env("RUSTC", &rustc)', self.prep)
+
+    def test_write_probe_uses_the_same_session_and_records_allowed_writes_too(self):
+        self.assertCodeIn("diagnostic_write_probe(&plan, &context", self.launch)
+        self.assertCodeIn("process::run(&probe, context, released)", self.launch)
+        self.assertCodeIn('"diagnostic-writes"', self.launch)
+        self.assertCodeIn('"same_token_as_primary":true', self.launch)
+        self.assertCodeIn("Sha256::digest(fs::read(std::env::current_exe()?)?)", self.launch)
+        self.assertCodeIn('"diagnostic-writes" =>', self.prep)
+        self.assertCodeIn('Ok(()) => { fs::remove_file(path)?; Ok("allowed") }', self.prep)
+        self.assertCodeIn('"outside_write":attempt(outside)?', self.prep)
+        self.assertCodeIn('"profile_write":attempt(&profile)?', self.prep)
+        self.assertCodeIn('"write_surfaces":surfaces', self.prep)
+        self.assertCodeIn("let outcome = attempt(&path)?", self.prep)
+        self.assertNotIn("directory.exists()", self.prep)
+        self.assertCodeIn('"staging_write_probe_passed":boundary', self.prep)
 
 
 if __name__ == "__main__":
