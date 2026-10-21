@@ -59,6 +59,98 @@ if ($guards.Count -ne 2) { throw 'FAIL parent-identity-production-guards: Prepar
 Write-Host 'PASS parent-identity-production-guards'
 $count++
 
+$switch = $control.Find({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true)
+$prepare = @($switch.Clauses | Where-Object { $_.Item1 -is [Management.Automation.Language.StringConstantExpressionAst] -and $_.Item1.Value -eq 'Prepare' })
+if ($prepare.Count -ne 1) { throw 'FAIL boot-nonce-production-contract: Prepare clause missing' }
+$prepareBody = $prepare[0].Item2
+$nonceRules = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if ($Nonce -notmatch') }, $false))
+$nonceWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\nonce.txt"' }, $false))
+$peerTargets = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$targets' }, $false))
+$peerWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\peer-targets.json"' }, $false))
+if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or $peerTargets.Count -ne 1 -or $peerWrites.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements[0] -isnot [Management.Automation.Language.ThrowStatementAst]) { throw 'FAIL boot-nonce-production-contract: unsafe or missing validation/write fixture' }
+& {
+    param($rule, $writer, $targetAssignment, $targetWriter)
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('motor-nonce-tests-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path "$directory\nonce" -Force | Out-Null
+        $Nonce = '0123456789abcdef0123456789abcdef'
+        . ([scriptblock]::Create($rule))
+        . ([scriptblock]::Create($writer))
+        $bytes = [IO.File]::ReadAllBytes("$directory\nonce\nonce.txt")
+        if ($bytes.Length -ne 32 -or [Text.Encoding]::ASCII.GetString($bytes) -cne $Nonce) { throw 'FAIL boot-nonce-production-contract: media bytes differ from the compact nonce' }
+        $PeerTargetsJson = '["01234567-89ab-cdef-0123-456789abcdef"]'
+        . ([scriptblock]::Create($targetAssignment))
+        . ([scriptblock]::Create($targetWriter))
+        $peerBytes = [IO.File]::ReadAllBytes("$directory\nonce\peer-targets.json")
+        if ([Text.Encoding]::UTF8.GetString($peerBytes) -cne $PeerTargetsJson) { throw 'FAIL boot-nonce-production-contract: peer metadata is not an independent BOM-free UUID array' }
+        foreach ($bad in @([Guid]::NewGuid().ToString(), '', ($Nonce + "`n"), ([string][char]0xfeff + $Nonce), ('z' * 32))) {
+            $Nonce = $bad
+            $rejected = $false
+            try { . ([scriptblock]::Create($rule)) } catch { $rejected = $true }
+            if (-not $rejected) { throw 'FAIL boot-nonce-production-contract: incompatible nonce accepted' }
+        }
+        Write-Host 'PASS boot-nonce-production-contract'
+        $script:count++
+    } finally { if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force } }
+} $nonceRules[0].Extent.Text $nonceWrites[0].Extent.Text $peerTargets[0].Extent.Text $peerWrites[0].Extent.Text
+
+$remover = $control.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-Job' }, $true)
+if (-not $remover) { throw 'FAIL removal-harvest-order: production function missing' }
+& {
+    param($source)
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ('motor-remove-tests-' + [Guid]::NewGuid().ToString('N'))
+    function Job-Path([string]$Id) { Join-Path $script:RunnerRemovalFixture.root $Id }
+    function Owned-VM([string]$Id) { $script:RunnerRemovalFixture.vm }
+    function Stop-VM($VM, [switch]$TurnOff, [switch]$Force) {
+        $script:RunnerRemovalFixture.calls.Add('stop')
+        $script:RunnerRemovalFixture.vm.State = 'Off'
+    }
+    function Harvest-Job([string]$Id, [switch]$Lightweight) {
+        if ($script:RunnerRemovalFixture.vm.State -ne 'Off') { throw 'Fixture attempted a live-disk harvest' }
+        if (-not (Test-Path -LiteralPath (Job-Path $Id))) { throw 'Fixture directory was deleted before harvest' }
+        $script:RunnerRemovalFixture.calls.Add('harvest')
+        if ($Lightweight) { $script:RunnerRemovalFixture.calls.Add('lightweight') }
+        else { $script:RunnerRemovalFixture.calls.Add('full'); throw 'Fixture collection error must not skip removal' }
+    }
+    function Remove-VM($VM, [switch]$Force) {
+        $script:RunnerRemovalFixture.calls.Add('remove-vm')
+        $script:RunnerRemovalFixture.vm = $null
+    }
+    function Evidence([string]$Id, [string]$Event, $Detail) { $script:RunnerRemovalFixture.calls.Add($Event) }
+    foreach ($name in @('Stop-VM','Remove-VM')) {
+        if ((Get-Command $name).CommandType -ne 'Function') { throw 'Removal fixture mock is missing; refusing real Hyper-V control' }
+    }
+    . ([scriptblock]::Create($source))
+    try {
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        $script:RunnerRemovalFixture = [pscustomobject]@{root=$Root; vm=$null; calls=[Collections.Generic.List[string]]::new()}
+        foreach ($lightweight in @($false, $true)) {
+            $id = [Guid]::NewGuid().ToString()
+            $script:RunnerRemovalFixture.vm = [pscustomobject]@{State='Running'}
+            $script:RunnerRemovalFixture.calls.Clear()
+            New-Item -ItemType Directory -Path (Job-Path $id) | Out-Null
+            Remove-Job $id -LightweightHarvest:$lightweight 3>$null
+            $calls = $script:RunnerRemovalFixture.calls.ToArray()
+            $stopIndex = [array]::IndexOf($calls, 'stop')
+            $harvestIndex = [array]::IndexOf($calls, 'harvest')
+            $removeIndex = [array]::IndexOf($calls, 'remove-vm')
+            if ($stopIndex -lt 0 -or $removeIndex -lt 0 -or (Test-Path -LiteralPath (Job-Path $id))) { throw 'FAIL removal-harvest-order: cleanup did not complete' }
+            if ($harvestIndex -le $stopIndex -or $removeIndex -le $harvestIndex) { throw 'FAIL removal-harvest-order: evidence was not attempted before VM destruction' }
+            if ($lightweight) {
+                if ($calls -notcontains 'lightweight' -or $calls -contains 'full') { throw 'FAIL known-clean-removal-collects-lightweight-logs' }
+                Write-Host 'PASS known-clean-removal-collects-lightweight-logs'
+            } else {
+                if ($calls -notcontains 'full') { throw 'FAIL failed-removal-requires-full-diagnostics' }
+                Write-Host 'PASS failed-removal-harvests-before-destruction-even-if-collection-fails'
+            }
+            $script:count++
+        }
+    } finally {
+        if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }
+        Remove-Variable -Name RunnerRemovalFixture -Scope Script -ErrorAction SilentlyContinue
+    }
+} $remover.Extent.Text
+
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     . "$PSScriptRoot\parent-identity.ps1"
     $fixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-parent-tests-' + [Guid]::NewGuid())

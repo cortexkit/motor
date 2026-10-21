@@ -7,6 +7,23 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_failed_job_removal_harvests_before_vm_and_disk_destruction(self):
+        script = (HERE / "hyperv.ps1").read_text()
+        remove = script.split("function Remove-Job(", 1)[1].split("function Grant(", 1)[0]
+        self.assertIn("Harvest-Job $Id -Lightweight:$LightweightHarvest", remove)
+        self.assertLess(remove.index("Harvest-Job $Id"), remove.index("Remove-VM"))
+        self.assertLess(remove.index("Harvest-Job $Id"), remove.index("Remove-Item"))
+        control = (HERE.parents[1] / "crates/motor-runner/src/windows/hyperv.rs").read_text()
+        cleanup = control.split("fn cleanup(&mut self, known: bool)", 1)[1].split("pub(super) fn finalize", 1)[0]
+        self.assertLess(cleanup.index("child.kill()"), cleanup.index('"Remove"'))
+        self.assertIn('let extra = if known {', cleanup)
+        self.assertIn('vec!["-LightweightHarvest".into()]', cleanup)
+
+    def test_qualification_exports_evidence_on_failure_without_weakening_success(self):
+        script = (HERE / "qualify.ps1").read_text()
+        self.assertIn("Copy-QualificationEvidence", script.rsplit("} finally {", 1)[1])
+        self.assertLess(script.index("Copy-QualificationEvidence\n    $evidenceCopied = $true"), script.index("QUALIFIED-SINGLE-SLOT.txt"))
+
     def test_process_parent_guard_is_held_across_control_calls(self):
         windows = HERE.parents[1] / "crates/motor-runner/src/windows"
         host = (windows / "hyperv_host.rs").read_text()
@@ -50,6 +67,7 @@ class ParentVerificationTests(unittest.TestCase):
 
     def test_installer_deploys_identity_helper(self):
         self.assertIn("'parent-identity.ps1'", (HERE / "install.ps1").read_text())
+        self.assertIn("'guest-evidence.ps1'", (HERE / "install.ps1").read_text())
 
 
 if __name__ == "__main__":

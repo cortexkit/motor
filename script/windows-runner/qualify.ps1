@@ -17,10 +17,16 @@ function Runner-Check([string]$Operation) {
     if ($result.exitCode -ne 0) { throw "$Operation failed exit=$($result.exitCode)" }
     return $result.stdout
 }
+function Copy-QualificationEvidence {
+    New-Item -ItemType Directory -Path "$Evidence\host-evidence" -Force | Out-Null
+    Get-ChildItem -LiteralPath "$Root\evidence" -Force | Copy-Item -Destination "$Evidence\host-evidence" -Recurse -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "$Root\vm.toml" -Destination "$Evidence\vm.toml" -Force -ErrorAction Stop
+}
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 $parentHash = (Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash
 $service = Get-Service MotorRunner
 if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
+$evidenceCopied = $false
 try {
     $null = Runner-Check 'qualify-prep'
     $disconnect = Runner-Check 'qualify-disconnect'
@@ -45,7 +51,8 @@ try {
             $caches += $cache
             $target = if ($id -eq $victim) { 'e0e16197-dd56-4a10-9195-5ee7a155a838' } else { (Get-VM -Name "motor-ally-$victim").Id.Guid }
             $targets = ConvertTo-Json -InputObject @($target) -Compress
-            & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $id -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $id -PeerTargetsJson $targets
+            $bootNonce = ([Guid]$id).ToString('N')
+            & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $id -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $bootNonce -PeerTargetsJson $targets
             if ($id -eq $attacker) { Set-VM -Name "motor-ally-$id" -ProcessorCount 2; Set-VMMemory -VMName "motor-ally-$id" -StartupBytes 2GB }
         }
         foreach ($id in $ids) {
@@ -66,6 +73,14 @@ try {
         }
         Write-Host 'PASS native-loopback-refused native-foreign-vm-refused no-agent-bytes-disclosed'
     } finally {
+        # A late-starting monitor must not boot a VM during offline collection.
+        # Normal monitors have already exited after the explicit Harvest above.
+        foreach ($monitor in $monitors) {
+            if (-not $monitor.process.WaitForExit(5000)) {
+                $monitor.process.Kill()
+                if (-not $monitor.process.WaitForExit(5000)) { throw 'Peer monitor did not terminate; preserving VM disks rather than inspecting a live guest' }
+            }
+        }
         foreach ($id in $ids) { & "$Root\bin\hyperv.ps1" -Operation Remove -Root $Root -Job $id }
         foreach ($monitor in $monitors) {
             if (-not $monitor.process.WaitForExit(120000)) { $monitor.process.Kill(); throw 'Peer VM monitor did not exit' }
@@ -80,10 +95,20 @@ try {
     if (@(Get-VM -Name 'motor-ally-*' -ErrorAction SilentlyContinue).Count -or @(Get-ChildItem "$Root\vm\jobs" -Force).Count -or @(Get-ChildItem "$Root\vm\caches" -Filter '*.attached').Count) { throw 'Qualification left a job VM, disk directory or attachment marker' }
     if ((Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash -ne $parentHash) { throw 'Sealed parent changed during qualification' }
     Write-Host "PASS final-nothing-left-behind parent-sha256=$parentHash"
-    Copy-Item "$Root\evidence" "$Evidence\host-evidence" -Recurse
-    Copy-Item "$Root\vm.toml" "$Evidence\vm.toml"
+    Copy-QualificationEvidence
+    $evidenceCopied = $true
     Set-Content "$Evidence\QUALIFIED-SINGLE-SLOT.txt" "Single slot only; parent SHA256=$parentHash; review raw evidence before enabling fleet routing" -Encoding ascii
 } catch {
     Stop-Service MotorRunner -ErrorAction SilentlyContinue
     throw
+} finally {
+    # Failed checks need the same external guest/host evidence as a passing run.
+    if (-not $evidenceCopied) {
+        try { Copy-QualificationEvidence } catch {
+            # Evidence storage may itself be unavailable; preserve the check's
+            # original exception even if recording the copy failure also fails.
+            try { $_ | Out-String | Set-Content -LiteralPath "$Evidence\host-evidence-copy-error.txt" -Encoding UTF8 } catch {}
+            Write-Warning 'Host evidence copy failed; inspect the installed runner evidence directory' -WarningAction Continue
+        }
+    }
 }

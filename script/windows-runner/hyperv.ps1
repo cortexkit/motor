@@ -3,13 +3,15 @@ param(
     [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','GrantPrep','RevokePrep','Harvest')][string]$Operation,
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
-    [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960, [string]$Staging
+    [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960, [string]$Staging,
+    [switch]$LightweightHarvest
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\parent-identity.ps1"
+. "$PSScriptRoot\guest-evidence.ps1"
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or -not (Test-Path -LiteralPath "$Root\.motor-runner-root")) { throw 'Unowned runner root' }
 foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state")) {
     if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse root refused: $path" }
@@ -40,12 +42,42 @@ function Assert-Isolated($VM) {
     if ((Get-VMHost).EnableEnhancedSessionMode) { throw 'Enhanced Session mode must remain disabled' }
     if ($VM.Generation -ne 2) { throw 'Job VM is not Generation 2' }
 }
-function Remove-Job([string]$Id) {
-    $vm = Owned-VM $Id
-    if ($vm) {
-        if ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-        Remove-VM -VM $vm -Force
+function Harvest-Job([string]$Id, [switch]$Lightweight) {
+    $destination = "$Root\evidence\$Id-guest"
+    New-Item -ItemType Directory -Path $destination -Force | Out-Null
+    try {
+        $vm = Owned-VM $Id
+        if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
+        $vm = Owned-VM $Id
+        if ($vm -and $vm.State -ne 'Off') { throw 'VM is not Off; refusing to mount a running guest disk' }
+        $disk = "$(Job-Path $Id)\os.vhdx"
+        if (Test-Path -LiteralPath $disk) {
+            Save-DiagnosticGuestEvidence $disk $destination -Lightweight:$Lightweight
+            # Qualification consumers already use these flat names; preserve
+            # them alongside the full path/absence manifest and event exports.
+            foreach ($name in @('hyperv-agent.log','peer-proof.json')) {
+                $source = "$destination\files\ProgramData\Motor\$name"
+                if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination "$destination\$name" -Force }
+            }
+            Evidence $Id 'guest-evidence-harvested' @{destination=$destination; read_only=$true; lightweight=[bool]$Lightweight}
+        } else {
+            Save-Json "$destination\guest-disk-state.json" @{present=$false; reason='No disposable OS disk was created'}
+            Evidence $Id 'guest-evidence-skipped' @{reason='no-job-disk'}
+        }
+    } catch {
+        $_ | Out-String | Set-Content -LiteralPath "$destination\harvest-error.txt" -Encoding UTF8
+        Evidence $Id 'guest-evidence-failed' ([string]$_)
+        throw
     }
+}
+function Remove-Job([string]$Id, [switch]$LightweightHarvest) {
+    $vm = Owned-VM $Id
+    if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
+    # Every path collects logs before destruction. Only protocol-complete jobs
+    # use the lightweight log copy; failures and recovery include full diagnostics.
+    try { Harvest-Job $Id -Lightweight:$LightweightHarvest } catch { Write-Warning "Guest harvest failed before removal; inspect $Root\evidence\$Id-guest: $_" }
+    $vm = Owned-VM $Id
+    if ($vm) { Remove-VM -VM $vm -Force }
     $directory = Job-Path $Id
     if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
     if ((Owned-VM $Id) -or (Test-Path -LiteralPath $directory)) { throw 'Job VM or disk remains after removal' }
@@ -125,7 +157,7 @@ switch ($Operation) {
         Grant "$Root\prep-toolchain" '(OI)(CI)RX' $sid
     }
     'Prepare' {
-        if ($Nonce -notmatch '^[0-9a-f-]{36}$') { throw 'Invalid nonce' }
+        if ($Nonce -notmatch '\A[0-9a-f]{32}\z') { throw 'Nonce must be exactly 32 hexadecimal characters, without hyphens, BOM or newline' }
         if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
         if ([IO.Path]::GetDirectoryName($Cache) -cne "$Root\vm\caches" -or [IO.Path]::GetFileName($Cache) -notmatch '^[0-9a-f]{64}\.vhdx$') { throw 'Invalid cache disk' }
         $parentGuard = Open-RunnerVerifiedParent $Parent $ParentSha256 $parentRecord
@@ -187,20 +219,8 @@ switch ($Operation) {
             throw
         } finally { if ($parentGuard) { $parentGuard.Dispose() } }
     }
-    'Harvest' {
-        $vm = Owned-VM $Job
-        if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-        $destination = "$Root\evidence\$Job-guest"
-        New-Item $destination -ItemType Directory -Force | Out-Null
-        Use-SpikeWindowsDisk "$(Job-Path $Job)\os.vhdx" {
-            param($volume)
-            foreach ($file in @('hyperv-agent.log','peer-proof.json')) {
-                $source = Join-Path $volume "ProgramData\Motor\$file"
-                if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $destination }
-            }
-        } -ReadOnly
-    }
-    'Remove' { Remove-Job $Job }
+    'Harvest' { Harvest-Job $Job }
+    'Remove' { Remove-Job $Job -LightweightHarvest:$LightweightHarvest }
     'Reconcile' {
         foreach ($vm in @(Get-VM -Name "$prefix*" -ErrorAction SilentlyContinue)) {
             $id = $vm.Name.Substring($prefix.Length)

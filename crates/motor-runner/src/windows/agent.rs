@@ -102,6 +102,12 @@ impl Runtime {
             .is_some_and(|c| c.cancel.load(Ordering::Acquire) > 0)
     }
 }
+#[cfg(any(windows, test))]
+pub(super) fn fresh_hyperv_nonce() -> String {
+    // The baked guest's DVD reader accepts exactly 32 hexadecimal bytes. Keep
+    // this value unchanged in both the media and the host protocol expectation.
+    Uuid::now_v7().simple().to_string()
+}
 struct Registration {
     runtime: Arc<Runtime>,
     id: Uuid,
@@ -558,6 +564,9 @@ fn materialize_attempt(
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
     }
+    #[cfg(windows)]
+    let nonce = fresh_hyperv_nonce();
+    #[cfg(not(windows))]
     let nonce = Uuid::now_v7().to_string();
     let clock = Clock::new(config);
     #[cfg(unix)]
@@ -795,6 +804,17 @@ fn materialize_attempt(
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, os::fd::AsRawFd};
+
+    #[test]
+    fn hyperv_boot_nonce_matches_baked_guest_reader() {
+        let nonce = fresh_hyperv_nonce();
+        assert_eq!(nonce.len(), 32);
+        assert_eq!(
+            motor_winagent::transport::hyperv_nonce(&nonce).unwrap(),
+            nonce
+        );
+        assert!(motor_winagent::transport::hyperv_nonce(&Uuid::now_v7().to_string()).is_err());
+    }
 
     fn running_transport(stream: UnixStream, control: Arc<Control>) -> Transport {
         let mut protocol = Protocol::new("nonce").unwrap();

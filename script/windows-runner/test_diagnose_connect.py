@@ -13,9 +13,15 @@ class ConnectDiagnosticTests(unittest.TestCase):
 
     def test_diagnostic_uses_installed_production_prepare(self):
         self.assertIn('"$Root\\bin\\hyperv.ps1" -Operation Prepare', self.script)
-        self.assertIn('-Cache $cache -Nonce $job', self.script)
+        self.assertIn('-Cache $cache -Nonce $nonce', self.script)
+        self.assertIn("$nonce = ([Guid]$job).ToString('N')", self.script)
         self.assertNotIn("New-VM ", self.script)
         self.assertNotIn("New-VHD ", self.script)
+
+    def test_shared_guest_collector_matches_standalone_snapshot(self):
+        embedded = self.script.split("function Save-Json(", 1)[1].split("function Save-HostVmEvents(", 1)[0]
+        shared = (HERE / "guest-evidence.ps1").read_text().split("function Save-Json(", 1)[1]
+        self.assertEqual(embedded.strip(), shared.strip())
 
     def test_diagnostic_harvests_stopped_child_before_remove(self):
         cleanup = self.script.split("# Harvest the stopped child before Remove", 1)[1]
@@ -38,6 +44,7 @@ class ConnectDiagnosticTests(unittest.TestCase):
         self.assertIn("setsockopt(handle, 1, 1, ref timeoutMs, 4)", self.script)
         self.assertIn("$clock.Elapsed.TotalSeconds -lt 120", self.script)
         self.assertNotIn("extern int send(", self.script)
+        self.assertNotIn("BitConverter.ToUInt32", self.script)
 
     def test_guest_event_export_is_service_filtered_and_preserves_xml(self):
         self.assertIn("motor-winagent(?:\\.exe)?|Motor Windows job agent", self.script)

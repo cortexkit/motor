@@ -39,6 +39,10 @@ the host.
   disks: the boot/system OS disk at LUN 0 and a non-system cache at LUN 1, with
   the cache's device serial captured and rechecked. Dirty caches are discarded;
   restarting the native runner service conservatively discards all old caches.
+  The `MOTORNONCE` DVD contains root `nonce.txt`: exactly 32 hexadecimal bytes,
+  UTF-8 without BOM or newline. The host protocol expects the identical compact
+  value; job/VM UUIDs remain hyphenated. Optional `peer-targets.json` is a separate
+  UUID array consumed by the image's peer-qualification startup task.
 - Service and qualification startup reuse the SYSTEM/Administrators-only parent
   record when its full file identity matches. Only a missing, unreadable or
   changed record triggers hashing, with a separate 15-minute validation deadline
@@ -72,6 +76,13 @@ the host.
 A passing portable suite is **not** native qualification. Leave fleet routing
 disabled until the complete operator evidence has been reviewed, including the
 real loopback/foreign-VM refusal logs and mid-frame disconnect byte counts.
+
+Native removal always attempts a stopped, read-only guest-log harvest before
+deleting the VM or child disk. Protocol-complete jobs use a lightweight agent/peer
+log copy; failures, disconnect qualification and orphan recovery collect the full
+known log/marker set and agent-filtered System/Application events. Collection
+errors and absent disks/logs are explicit evidence, not a reason to skip cleanup.
+Qualification copies that host evidence to its external folder on failure too.
 
 ## Build on Linux, not on the Windows host
 
@@ -186,7 +197,8 @@ directory, plus provisioning logs and `sealed.json`, before enabling routing.
 
 Copy `script/windows-runner/diagnose-connect.ps1` to the installed host and run it
 from elevated Windows PowerShell 5.1; no new runner binary or source checkout is
-needed. It uses the installed `Prepare` operation, probes the agent's hvsock
+needed. Use the diagnostic and control scripts from the same release so their
+nonce-media contracts match. It uses the installed `Prepare` operation, probes the agent's hvsock
 endpoint for 120 seconds without sending commands, then stops the VM and harvests
 the read-only child **before** removing its VM, job directory and private cache.
 It refuses to overlap existing runner VM/job resources, and restores a service it

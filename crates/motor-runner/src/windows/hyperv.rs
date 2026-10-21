@@ -208,13 +208,21 @@ impl Resources {
         if self.cleaned {
             return Ok(());
         }
-        checked(control(&self.config, "Remove", Some(self.id), &[])?)?;
+        // Remove collects logs from the stopped guest before deleting its disk.
+        // Finish or terminate the monitor first so a late Start-VM cannot race
+        // that offline disk inspection.
         if let Some(mut child) = self.child.0.take() {
             if child.try_wait()?.is_none() {
                 child.kill()?;
             }
             child.wait()?;
         }
+        let extra = if known {
+            vec!["-LightweightHarvest".into()]
+        } else {
+            Vec::new()
+        };
+        checked(control(&self.config, "Remove", Some(self.id), &extra)?)?;
         if self.attached {
             self.config.windows.as_ref().unwrap().caches().complete(
                 &self.workspace,
@@ -280,7 +288,7 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
         .join("staging")
         .join(id.to_string());
     let mut resources = Resources::prepare(config, staging, id, workspace)?;
-    let nonce = Uuid::now_v7().to_string();
+    let nonce = super::agent::fresh_hyperv_nonce();
     resources.boot(config, &nonce)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut stream = loop {
@@ -344,7 +352,6 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
     }
     drop(stream);
     std::thread::sleep(Duration::from_secs(3));
-    checked(control(config, "Harvest", Some(id), &[])?)?;
     resources.finalize()?;
     let cache = config.windows.as_ref().unwrap().caches().disk(workspace);
     if cache.exists() || cache.with_extension("attached").exists() {

@@ -107,8 +107,10 @@ namespace Motor {
                         if (count == 0) break;
                         bytes.Write(buffer, 0, count);
                         if (bytes.Length >= 4) {
-                            uint length = BitConverter.ToUInt32(bytes.GetBuffer(), 0);
-                            if (length > 65532 || bytes.Length >= length + 4) break;
+                            var header = bytes.GetBuffer();
+                            uint length = ((uint)header[0] << 24) | ((uint)header[1] << 16) | ((uint)header[2] << 8) | header[3];
+                            if (length > 65532) break;
+                            if (bytes.Length >= length + 4) { bytes.SetLength(length + 4); break; }
                         }
                     }
                     result.Hello = bytes.ToArray();
@@ -215,7 +217,7 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action) {
         } finally { if ($mounted) { Dismount-VHD -Path $Path } }
     }
 }
-function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination) {
+function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [switch]$Lightweight) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     Use-DiagnosticWindowsDisk $Disk {
         param($volume)
@@ -236,6 +238,12 @@ function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination) {
             'build\provision\pwsh-host-trace.log' = 'PowerShell host startup trace from provisioning.'
             'build\provision\pwsh-startup-diagnostics.log' = 'PowerShell startup diagnostic details from provisioning.'
         }
+        if ($Lightweight) {
+            $known = [ordered]@{
+                'ProgramData\Motor\hyperv-agent.log' = $known['ProgramData\Motor\hyperv-agent.log']
+                'ProgramData\Motor\peer-proof.json' = $known['ProgramData\Motor\peer-proof.json']
+            }
+        }
         $manifest = [Collections.Generic.List[object]]::new()
         foreach ($relative in $known.Keys) {
             $entry = [ordered]@{path=$relative; expected=$known[$relative]; present=$false}
@@ -254,6 +262,7 @@ function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination) {
             $manifest.Add($entry)
         }
         Save-Json "$Destination\guest-paths.json" $manifest.ToArray()
+        if ($Lightweight) { return }
         try {
             $agent = Get-PlainGuestItem $volume 'ProgramData\Motor\motor-winagent.exe'
             if ($agent -and -not $agent.PSIsContainer) {
@@ -283,6 +292,7 @@ function Save-HostVmEvents([string]$VmId, [DateTime]$Started) {
 }
 
 $job = [Guid]::NewGuid().ToString()
+$nonce = ([Guid]$job).ToString('N')
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 $serviceId = [Guid]'92c268b0-cddd-40a4-a664-f32e50ad35ea'
 $sha = [Security.Cryptography.SHA256]::Create()
@@ -346,11 +356,11 @@ No guest password/DPAPI files, registry hives, memory dumps or complete disk are
     if (-not $hashMatch.Success) { throw 'Cannot read the configured parent SHA-256' }
     $parentHash = $hashMatch.Groups[1].Value
     $parentGuard = Open-RunnerVerifiedParent $parent $parentHash "$Root\state\parent-verified.json"
-    Save-Json "$Evidence\diagnostic.json" @{job=$job; vm_name=$vmName; parent=$parent; parent_sha256=$parentHash; nonce=$job; cache=$cache; service_id=$serviceId.ToString(); connect_attempt_ms=250; boot_deadline_seconds=120; started_utc=$startedUtc.ToString('o')}
+    Save-Json "$Evidence\diagnostic.json" @{job=$job; vm_name=$vmName; parent=$parent; parent_sha256=$parentHash; nonce=$nonce; cache=$cache; service_id=$serviceId.ToString(); connect_attempt_ms=250; boot_deadline_seconds=120; started_utc=$startedUtc.ToString('o')}
     Save-Json "$Evidence\host-agent-binary.json" @{path="$Root\bin\motor-winagent.exe"; sha256=(Get-FileHash -LiteralPath "$Root\bin\motor-winagent.exe" -Algorithm SHA256).Hash}
     # Use installed production setup rather than duplicating its isolation settings.
     $prepared = $true
-    & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $job -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $job
+    & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $job -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $nonce
     $vm = Get-VM -Name $vmName
     $vmId = $vm.Id.ToString()
     Save-Json "$Evidence\vm-settings.json" @{
