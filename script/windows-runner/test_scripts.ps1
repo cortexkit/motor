@@ -19,9 +19,12 @@ foreach ($file in $files) {
 $root = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-script-tests-' + [Guid]::NewGuid())
 New-Item $root -ItemType Directory | Out-Null
 $script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = *S-1-5-32-544','SeDenyInteractiveLogonRight = *S-1-5-32-546')
+# Like the real secedit, the export names a resolvable local account instead of
+# listing its SID, so the policy code must resolve names before comparing.
+$script:RunnerResolveTrusteeName = { param($name) if ($name -eq 'motor-prep') { 'S-1-5-21-111-222-333-1001' } else { throw "unknown account $name" } }
 function global:secedit.exe {
     $cfg = $args[[array]::IndexOf($args,'/cfg') + 1]
-    if ($args -contains '/export') { $script:effective | Set-Content -LiteralPath $cfg -Encoding Unicode }
+    if ($args -contains '/export') { $script:effective | ForEach-Object { $_ -replace '\*S-1-5-21-111-222-333-1001','motor-prep' } | Set-Content -LiteralPath $cfg -Encoding Unicode }
     elseif ($args -contains '/configure') { $script:effective = @(Get-Content -LiteralPath $cfg) }
     else { throw 'Unexpected secedit operation in fixture' }
     $global:LASTEXITCODE = 0
@@ -35,7 +38,7 @@ try {
     }
     if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544,\*S-1-5-21-111-222-333-1001') { throw 'Existing administrator trustee was lost' }
     Set-RunnerBatchRights $root $sid -Remove
-    if (($script:effective -join "`n") -match [regex]::Escape($sid)) { throw 'Uninstall retained owned SID rights' }
+    if (($script:effective -join "`n") -match ([regex]::Escape($sid) + '|motor-prep')) { throw 'Uninstall retained owned SID rights' }
     if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544') { throw 'Uninstall lost unrelated administrator rights' }
     Write-Host 'PASS rights-add-remove-preserves-unrelated-trustees'
     $count++
