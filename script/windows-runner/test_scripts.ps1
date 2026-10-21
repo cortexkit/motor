@@ -65,11 +65,11 @@ if ($prepare.Count -ne 1) { throw 'FAIL boot-nonce-production-contract: Prepare 
 $prepareBody = $prepare[0].Item2
 $nonceRules = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if ($Nonce -notmatch') }, $false))
 $nonceWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\nonce.txt"' }, $false))
-$peerTargets = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$targets' }, $false))
+$peerFormatter = $control.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Convert-RunnerPeerTargets' }, $true)
 $peerWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\peer-targets.json"' }, $false))
-if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or $peerTargets.Count -ne 1 -or $peerWrites.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements[0] -isnot [Management.Automation.Language.ThrowStatementAst]) { throw 'FAIL boot-nonce-production-contract: unsafe or missing validation/write fixture' }
+if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or -not $peerFormatter -or $peerWrites.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements[0] -isnot [Management.Automation.Language.ThrowStatementAst]) { throw 'FAIL boot-nonce-production-contract: unsafe or missing validation/write fixture' }
 & {
-    param($rule, $writer, $targetAssignment, $targetWriter)
+    param($rule, $writer, $formatter, $targetWriter)
     $directory = Join-Path ([IO.Path]::GetTempPath()) ('motor-nonce-tests-' + [Guid]::NewGuid().ToString('N'))
     try {
         New-Item -ItemType Directory -Path "$directory\nonce" -Force | Out-Null
@@ -78,11 +78,24 @@ if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or $peerTargets.Count 
         . ([scriptblock]::Create($writer))
         $bytes = [IO.File]::ReadAllBytes("$directory\nonce\nonce.txt")
         if ($bytes.Length -ne 32 -or [Text.Encoding]::ASCII.GetString($bytes) -cne $Nonce) { throw 'FAIL boot-nonce-production-contract: media bytes differ from the compact nonce' }
-        $PeerTargetsJson = '["01234567-89ab-cdef-0123-456789abcdef"]'
-        . ([scriptblock]::Create($targetAssignment))
-        . ([scriptblock]::Create($targetWriter))
-        $peerBytes = [IO.File]::ReadAllBytes("$directory\nonce\peer-targets.json")
-        if ([Text.Encoding]::UTF8.GetString($peerBytes) -cne $PeerTargetsJson) { throw 'FAIL boot-nonce-production-contract: peer metadata is not an independent BOM-free UUID array' }
+        . ([scriptblock]::Create($formatter))
+        foreach ($case in @(
+            @{Json='["01234567-89ab-cdef-0123-456789abcdef"]'; Expected='["01234567-89ab-cdef-0123-456789abcdef"]'},
+            @{Json='[]'; Expected='[]'},
+            @{Json='["01234567-89ab-cdef-0123-456789abcdef","ABCDEF01-2345-4789-ABCD-EF0123456789"]'; Expected='["01234567-89ab-cdef-0123-456789abcdef","abcdef01-2345-4789-abcd-ef0123456789"]'}
+        )) {
+            $PeerTargetsJson = $case.Json
+            . ([scriptblock]::Create($targetWriter))
+            $peerBytes = [IO.File]::ReadAllBytes("$directory\nonce\peer-targets.json")
+            $actual = [Text.Encoding]::UTF8.GetString($peerBytes)
+            if ($actual -cne $case.Expected) { throw "FAIL boot-nonce-production-contract: peer metadata differs; actual=$actual hex=$([BitConverter]::ToString($peerBytes))" }
+        }
+        foreach ($badPeer in @('"01234567-89ab-cdef-0123-456789abcdef"','[["01234567-89ab-cdef-0123-456789abcdef"]]','[1]','["not-a-guid"]','{"value":["01234567-89ab-cdef-0123-456789abcdef"],"Count":1}')) {
+            $PeerTargetsJson = $badPeer
+            $rejected = $false
+            try { . ([scriptblock]::Create($targetWriter)) } catch { $rejected = $true }
+            if (-not $rejected) { throw 'FAIL boot-nonce-production-contract: incompatible peer schema accepted' }
+        }
         foreach ($bad in @([Guid]::NewGuid().ToString(), '', ($Nonce + "`n"), ([string][char]0xfeff + $Nonce), ('z' * 32))) {
             $Nonce = $bad
             $rejected = $false
@@ -92,7 +105,7 @@ if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or $peerTargets.Count 
         Write-Host 'PASS boot-nonce-production-contract'
         $script:count++
     } finally { if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force } }
-} $nonceRules[0].Extent.Text $nonceWrites[0].Extent.Text $peerTargets[0].Extent.Text $peerWrites[0].Extent.Text
+} $nonceRules[0].Extent.Text $nonceWrites[0].Extent.Text $peerFormatter.Extent.Text $peerWrites[0].Extent.Text
 
 $remover = $control.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-Job' }, $true)
 if (-not $remover) { throw 'FAIL removal-harvest-order: production function missing' }

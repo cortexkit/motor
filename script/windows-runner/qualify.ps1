@@ -50,7 +50,7 @@ try {
             $cache = "$Root\vm\caches\$key.vhdx"
             $caches += $cache
             $target = if ($id -eq $victim) { 'e0e16197-dd56-4a10-9195-5ee7a155a838' } else { (Get-VM -Name "motor-ally-$victim").Id.Guid }
-            $targets = ConvertTo-Json -InputObject @($target) -Compress
+            $targets = '["' + ([Guid]::Parse([string]$target)).ToString('D') + '"]'
             $bootNonce = ([Guid]$id).ToString('N')
             & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $id -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $bootNonce -PeerTargetsJson $targets
             if ($id -eq $attacker) { Set-VM -Name "motor-ally-$id" -ProcessorCount 2; Set-VMMemory -VMName "motor-ally-$id" -StartupBytes 2GB }

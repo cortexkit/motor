@@ -20,6 +20,19 @@ Import-Module Hyper-V
 $prefix = 'motor-ally-'
 $owner = "MotorRunner:$Root"
 $parentRecord = "$Root\state\parent-verified.json"
+function Convert-RunnerPeerTargets([string]$Json) {
+    if (-not $Json.TrimStart().StartsWith('[') -or -not $Json.TrimEnd().EndsWith(']')) { throw 'Peer targets must be a JSON array of UUID strings' }
+    $decoded = ConvertFrom-Json -InputObject $Json
+    $quoted = [Collections.Generic.List[string]]::new()
+    foreach ($value in $decoded) {
+        if ($value -isnot [string]) { throw 'Peer targets must be a flat JSON array of UUID strings' }
+        $quoted.Add('"' + ([Guid]::Parse($value)).ToString('D') + '"')
+    }
+    # PowerShell 5.1 decorates Object[] passed to ConvertTo-Json with value/Count
+    # and @(... ConvertFrom-Json) can nest arrays. Canonical UUIDs need no JSON
+    # escaping, so join their quoted strings explicitly instead of serializing.
+    return '[' + ($quoted -join ',') + ']'
+}
 function Job-Path([string]$Id) { return Join-Path "$Root\vm\jobs" $Id }
 function Owned-VM([string]$Id) {
     $vm = Get-VM -Name "$prefix$Id" -ErrorAction SilentlyContinue
@@ -167,9 +180,7 @@ switch ($Operation) {
             New-Item -ItemType Directory -Path "$directory\nonce" | Out-Null
             [IO.File]::WriteAllText("$directory\nonce\nonce.txt", $Nonce, [Text.UTF8Encoding]::new($false))
             if ($PeerTargetsJson) {
-                $targets = @($PeerTargetsJson | ConvertFrom-Json)
-                foreach ($target in $targets) { [void][Guid]::Parse([string]$target) }
-                [IO.File]::WriteAllText("$directory\nonce\peer-targets.json", (ConvertTo-Json -InputObject $targets -Compress), [Text.UTF8Encoding]::new($false))
+                [IO.File]::WriteAllText("$directory\nonce\peer-targets.json", (Convert-RunnerPeerTargets $PeerTargetsJson), [Text.UTF8Encoding]::new($false))
             }
             New-SpikeIso "$directory\nonce" "$directory\nonce.iso" 'MOTORNONCE'
             Remove-Item "$directory\nonce" -Recurse -Force

@@ -42,7 +42,9 @@ the host.
   The `MOTORNONCE` DVD contains root `nonce.txt`: exactly 32 hexadecimal bytes,
   UTF-8 without BOM or newline. The host protocol expects the identical compact
   value; job/VM UUIDs remain hyphenated. Optional `peer-targets.json` is a separate
-  UUID array consumed by the image's peer-qualification startup task.
+  UUID array consumed by the image's peer-qualification startup task. Its canonical
+  UUID strings are joined into a flat JSON array explicitly: PowerShell 5.1 can
+  otherwise nest/decorate arrays with `value`/`Count` during JSON conversion.
 - Service and qualification startup reuse the SYSTEM/Administrators-only parent
   record when its full file identity matches. Only a missing, unreadable or
   changed record triggers hashing, with a separate 15-minute validation deadline

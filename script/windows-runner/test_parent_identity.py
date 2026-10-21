@@ -7,6 +7,19 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_peer_targets_avoid_powershell_51_array_serialization(self):
+        script = (HERE / "hyperv.ps1").read_text()
+        formatter = script.split("function Convert-RunnerPeerTargets(", 1)[1].split("function Job-Path(", 1)[0]
+        code = "\n".join(line for line in formatter.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("ConvertFrom-Json -InputObject $Json", code)
+        self.assertIn("[Guid]::Parse($value)", code)
+        self.assertIn(".ToString('D')", code)
+        self.assertIn("return '[' + ($quoted -join ',') + ']'", code)
+        self.assertNotIn("ConvertTo-Json", code)
+        self.assertIn("(Convert-RunnerPeerTargets $PeerTargetsJson)", script)
+        qualify = (HERE / "qualify.ps1").read_text()
+        self.assertNotIn("ConvertTo-Json -InputObject @($target)", qualify)
+
     def test_failed_job_removal_harvests_before_vm_and_disk_destruction(self):
         script = (HERE / "hyperv.ps1").read_text()
         remove = script.split("function Remove-Job(", 1)[1].split("function Grant(", 1)[0]
