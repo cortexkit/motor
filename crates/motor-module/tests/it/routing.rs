@@ -29,6 +29,7 @@ struct Visit {
     id: Uuid,
     instance: String,
     root: Option<String>,
+    at: tokio::time::Instant,
 }
 
 struct RoutingPeer {
@@ -121,6 +122,7 @@ impl Connector for RoutingPeer {
             id,
             instance: instance.into(),
             root: root.map(str::to_owned),
+            at: tokio::time::Instant::now(),
         });
         let ally_behavior = if instance == "ally-windows" {
             self.ally_behavior.load(Ordering::SeqCst)
@@ -400,13 +402,16 @@ async fn ordered_windows_unreachable_handshake_falls_through_within_three_second
     let motor = peer.motor(ordered(f.config.clone()));
     let mut request = f.request("true");
     request.platform = Some(Platform::Windows);
-    let start = tokio::time::Instant::now();
     collect(motor.run(request).unwrap()).await;
-    assert!(start.elapsed() >= Duration::from_secs(3));
-    assert!(start.elapsed() < Duration::from_secs(6));
     let visits = peer.visits.lock().unwrap();
     assert_eq!(visits[0].instance, "ally-windows");
     assert!(visits.iter().skip(1).all(|v| v.instance == "windows"));
+    // Time only the gap between the Ally attempt and the fallback connect.
+    // Snapshot capture before the first connect slows down on a loaded host
+    // and is not what this test is about.
+    let fallback = visits[1].at.duration_since(visits[0].at);
+    assert!(fallback >= Duration::from_secs(3), "{fallback:?}");
+    assert!(fallback < Duration::from_secs(6), "{fallback:?}");
 }
 
 #[tokio::test]
