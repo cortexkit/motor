@@ -788,17 +788,61 @@ fn runner_full_counts_64_awaiting_uploads_and_tombstone_is_durable() {
     assert_eq!(runner.status().queue_depth, 0);
 }
 
-fn reopen(config: Config) -> Runner {
+fn reopen_with(open: impl FnMut() -> io::Result<Runner>) -> Runner {
+    reopen_with_message(open, "reopen")
+}
+
+fn reopen_with_message(mut open: impl FnMut() -> io::Result<Runner>, context: &str) -> Runner {
     let end = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match Runner::open(config.clone()) {
+        match open() {
             Ok(r) => return r,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock && std::time::Instant::now() < end => {
                 std::thread::park_timeout(Duration::from_millis(5))
             }
-            Err(e) => panic!("reopen: {e}"),
+            Err(e) => panic!("{context}: {e}"),
         }
     }
+}
+
+fn reopen(config: Config) -> Runner {
+    reopen_with(|| Runner::open(config.clone()))
+}
+
+#[test]
+fn reopening_waits_for_the_previous_daemon_lock_owner() {
+    use fs2::FileExt;
+
+    let f = Fixture::new();
+    let config = f.config();
+    fs::create_dir_all(config.state_dir()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.state_dir().join("daemon.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let (contended, observed) = std::sync::mpsc::channel();
+    let unlocker = std::thread::spawn(move || {
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reopen must observe the held daemon lock");
+        FileExt::unlock(&lock).unwrap();
+    });
+    let runner = reopen_with(|| {
+        let result = Runner::open(config.clone());
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        {
+            let _ = contended.send(());
+        }
+        result
+    });
+    unlocker.join().unwrap();
+    drop(runner);
 }
 
 #[test]

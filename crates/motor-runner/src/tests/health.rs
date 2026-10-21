@@ -343,7 +343,7 @@ fn repository_usage_rebuilds_from_retained_records_after_restart() {
     atomic_json(&record, &job).unwrap();
     drop(runner);
 
-    let runner = Runner::open(config).unwrap();
+    let runner = reopen(config);
     let usage = runner.runner_status().health.unwrap().repository_usage;
     assert_eq!(
         usage["prefrontal"],

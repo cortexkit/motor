@@ -514,9 +514,11 @@ pub(super) async fn isolated_graph_fixture() {
         "[build]\nrustc-wrapper='./hostile.sh'\n",
     )
     .unwrap();
-    fs::write(f.main.join("hostile.sh"), "#!/bin/bash\nif touch /motor-cache/wrapper-poison 2>/dev/null; then exit 77; fi\nexec \"$@\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(f.main.join("hostile.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_helpers::write_test_executable(
+        &f.main.join("hostile.sh"),
+        b"#!/bin/bash\nif touch /motor-cache/wrapper-poison 2>/dev/null; then exit 77; fi\nexec \"$@\"\n",
+    )
+    .unwrap();
     commit(&f.main, "unmerged hostile branch\n");
     let count = writer_count(&runner);
     let (mut branch, mut bytes) = job_at(

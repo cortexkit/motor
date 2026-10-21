@@ -655,26 +655,31 @@ struct FakeJavascriptManager {
 }
 impl FakeJavascriptManager {
     fn new(f: &Fixture) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let bin = f.scratch.join("fake-bin");
         fs::create_dir(&bin).unwrap();
         let executable = bin.join("npm");
-        fs::write(
+        crate::test_helpers::write_test_executable(
             &executable,
             r#"#!/bin/sh
 if [ "$1" = --version ]; then /bin/cat "$JS_VERSION"; exit; fi
 printf 'install\n' >> "$JS_CALLS"
 if [ -f "$JS_INTERRUPTED" ]; then kill -TERM $$; fi
 /bin/mkdir -p node_modules/.bin
-printf '#!/bin/sh\nprintf fixture' > node_modules/.bin/fixture-tool
-/bin/chmod +x node_modules/.bin/fixture-tool
+# Publish the executable only after its contents and mode are complete.
+temporary="node_modules/.bin/.fixture-tool.$$.tmp"
+printf '#!/bin/sh\nprintf fixture' > "$temporary"
+/bin/chmod +x "$temporary"
+/bin/mv -f "$temporary" node_modules/.bin/fixture-tool
 if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir -p "$m/node_modules/member-dep"; done; fi
-"#,
+"#
+        .as_bytes(),
         )
         .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(bin.join("node"), "#!/bin/sh\nprintf 'node-fixture-v1\\n'\n").unwrap();
-        fs::set_permissions(bin.join("node"), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_test_executable(
+            &bin.join("node"),
+            b"#!/bin/sh\nprintf 'node-fixture-v1\\n'\n",
+        )
+        .unwrap();
         let version = f.scratch.join("fake-version");
         fs::write(&version, "manager-v1\n").unwrap();
         Self {

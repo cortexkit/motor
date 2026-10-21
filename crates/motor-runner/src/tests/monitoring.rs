@@ -479,18 +479,7 @@ async fn corrupt_job_record_is_quarantined_without_losing_identity_or_safe_histo
             .is_err()
     );
     drop(runner);
-    let mut reopened = None;
-    assert!(poll(Duration::from_secs(5), || {
-        match Runner::open(config.clone()) {
-            Ok(runner) => {
-                reopened = Some(runner);
-                true
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("quarantine restart failed: {error}"),
-        }
-    }));
-    let reopened = reopened.unwrap();
+    let reopened = reopen_with_message(|| Runner::open(config.clone()), "quarantine restart");
     assert_eq!(
         reopened.job_status(request.job_id).unwrap().state,
         "quarantined"
@@ -635,18 +624,7 @@ fn missing_job_record_retains_a_durable_fence_across_repeated_startup() {
     assert!(serde_json::from_slice::<Job>(&placeholder).is_err());
     drop(runner);
     fs::remove_dir_all(&directory).unwrap();
-    let mut reopened = None;
-    assert!(poll(Duration::from_secs(5), || {
-        match Runner::open(config.clone()) {
-            Ok(runner) => {
-                reopened = Some(runner);
-                true
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("quarantine restart failed: {error}"),
-        }
-    }));
-    let reopened = reopened.unwrap();
+    let reopened = reopen_with_message(|| Runner::open(config.clone()), "quarantine restart");
     assert_eq!(
         reopened.job_status(request.job_id).unwrap().state,
         "quarantined"
