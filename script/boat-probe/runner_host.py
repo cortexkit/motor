@@ -20,7 +20,7 @@ import tempfile
 import time
 
 from credential_audit import SOURCE
-from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_checks, outside_control_passes, pid_checks, reference_command, teardown_checks, teardown_job
+from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -696,9 +696,16 @@ class RunnerHost:
         self.data = {"checks": [], "phases": [], "all_passed": False}
         probe.data["runner_host"] = self.data
 
-    def check(self, name, passed, evidence, status=None):
-        self.data["checks"].append({"name": name, "status": status or ("PASS" if passed else "FAIL"), "evidence": evidence})
+    def check(self, name, passed, evidence, status=None, reason=None):
+        row = {"name": name, "status": status or ("PASS" if passed else "FAIL"), "evidence": evidence}
+        if row['status'] == 'FAIL':
+            row['reason'] = reason or f"required check {name} did not meet its acceptance criteria; observed values are attached as evidence"
+        self.data["checks"].append(row)
         self.probe.checkpoint()
+
+    def check_job(self, name, result, expected, *, signal=None, marker=None, exact_stdout=None):
+        failure = lifecycle_failure(result, expected, signal=signal, marker=marker, exact_stdout=exact_stdout)
+        self.check(name, failure is None, result, reason=failure)
 
     def execute(self, sid, command, timeout=120):
         result = self.probe.execute(sid, command, poll_seconds=timeout)
@@ -951,20 +958,22 @@ class RunnerHost:
                         report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
                         self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
                     elif name == "isolation":
-                        for key, passed in isolation_result_checks(parsed, host).items():
-                            self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
+                        checks = isolation_result_checks(parsed, host)
+                        isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}
+                        for key, passed in checks.items():
+                            reason = None if passed else (pid_failure_reason(key, isolation, host) if parsed['code'] == 0
+                                                         else f"expected isolation job code 0; observed {parsed['code']}")
+                            self.check(label + "." + key, parsed["code"] == 0 and passed, parsed, reason=reason)
                     elif name == 'sigkill_job':
-                        self.check(label + '.sigkill_job_exit_137', lifecycle_checks(parsed, 137), parsed)
+                        self.check_job(label + '.sigkill_job_exit_137', parsed, 137)
                     elif name == 'pid1_ignores_job_sigkill':
-                        self.check(label + '.pid1_ignores_job_sigkill', lifecycle_checks(parsed, 0)
-                                   and 'boat-pid1-alive' in parsed['stdout'], parsed)
+                        self.check_job(label + '.pid1_ignores_job_sigkill', parsed, 0, marker='boat-pid1-alive')
                     elif name == 'job_stdin_eof':
-                        self.check(label + '.job_stdin_eof', lifecycle_checks(parsed, 0)
-                                   and parsed['stdout'].strip() == 'boat-stdin-eof', parsed)
+                        self.check_job(label + '.job_stdin_eof', parsed, 0, exact_stdout='boat-stdin-eof')
                     else:
                         expected = 23 if name == "exit" else 0
                         marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
-                        self.check(label + "." + name, lifecycle_checks(parsed, expected) and marker in parsed["stdout"], parsed)
+                        self.check_job(label + "." + name, parsed, expected, marker=marker)
                     state = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
                     record.setdefault('storage_after_jobs', {})[name] = state
                     for key, passed in storage_checks(state).items():
@@ -983,7 +992,8 @@ class RunnerHost:
                     parsed = job_result(completed['stdout']) if completed.get('exit_code') == 0 else {}
                     record['setsid_' + action] = {'host':observed, 'client':completed, 'result':parsed}
                     self.check(label + '.setsid_' + action + '_reaped', teardown_checks(observed), observed)
-                    self.check(label + '.setsid_' + action + '_exit_' + str(expected), lifecycle_checks(parsed, expected), parsed)
+                    self.check_job(label + '.setsid_' + action + '_exit_' + str(expected), parsed, expected,
+                                   signal=9 if action == 'kill' else None)
                     if host['systemd_version'] < 257:
                         for key, passed in bootstrap_checks(observed, host['job_security_reference']).items():
                             self.check(label + '.setsid_' + action + '.' + key, passed, observed)

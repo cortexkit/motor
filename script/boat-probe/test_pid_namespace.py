@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
@@ -14,6 +15,50 @@ finally:
 
 
 class PidNamespaceTests(unittest.TestCase):
+    def live_fixture(self):
+        return json.loads(Path(__file__).with_name('fixtures').joinpath('pid-live-initial.json').read_text())
+
+    def test_live_initial_exit_terminals_match_the_wire_protocol(self):
+        jobs = self.live_fixture()['jobs']
+        for name, expected in [('node_modules_first', 0), ('node_modules_reuse', 0), ('exit', 23),
+                               ('rust', 0), ('sigkill_job', 137), ('job_stdin_eof', 0),
+                               ('pid1_ignores_job_sigkill', 0), ('setsid_stop', 143)]:
+            self.assertTrue(pid.lifecycle_checks(jobs[name], expected), name)
+
+    def test_live_initial_linux_errnos_do_not_depend_on_the_operator_os(self):
+        live = self.live_fixture()
+        # The operator ran this probe on macOS, where ENOSYS is 78; the
+        # measured syscall ran on Linux and returned Linux ENOSYS, which is 38.
+        with patch.object(pid.errno, 'ENOSYS', 78):
+            checks = pid.pid_checks(live['pid_job'], live['host'])
+        self.assertTrue(checks['job_clone3_pid_denied'])
+        self.assertTrue(checks['job_namespace_filter'])
+
+    def test_live_signal_terminal_is_distinct_from_wrapper_exit_137(self):
+        jobs = self.live_fixture()['jobs']
+        self.assertTrue(pid.lifecycle_checks(jobs['setsid_kill'], 137, signal=9))
+        self.assertFalse(pid.lifecycle_checks(jobs['setsid_kill'], 137))
+        self.assertTrue(pid.lifecycle_checks(jobs['sigkill_job'], 137))
+        self.assertFalse(pid.lifecycle_checks(jobs['sigkill_job'], 137, signal=9))
+
+    def test_namespace_failures_describe_linux_errno_and_filter_mismatches(self):
+        live = self.live_fixture()
+        job, host = live['pid_job'], live['host']
+        self.assertIsNone(pid.pid_failure_reason('job_namespace_filter', job, host))
+        job['pid_namespace']['security']['namespace_attempts']['clone3_pid']['errno'] = 78
+        checks = pid.pid_checks(job, host)
+        self.assertFalse(checks['job_clone3_pid_denied'])
+        self.assertFalse(checks['job_namespace_filter'])
+        for name in ('job_clone3_pid_denied', 'job_namespace_filter'):
+            reason = pid.pid_failure_reason(name, job, host)
+            assert reason is not None
+            self.assertIn('38', reason)
+            self.assertIn('78', reason)
+        job['pid_namespace']['security']['status']['Seccomp_filters'] = host['job_security_reference']['status']['Seccomp_filters']
+        reason = pid.pid_failure_reason('job_namespace_filter', job, host)
+        assert reason is not None
+        self.assertIn('expected more seccomp filters', reason)
+
     def fixture(self):
         fixture = json.loads(Path(__file__).with_name('fixtures').joinpath('pid-namespace.json').read_text())
         job = {'uid':997, 'namespaces':{'pid':'pid:[2]'}, 'pid_namespace':fixture['pid_namespace'],
@@ -85,11 +130,12 @@ class PidNamespaceTests(unittest.TestCase):
 
     def test_lifecycle_status_checks_do_not_accept_a_proxy_client_success(self):
         for code in (0, 23, 137, 143):
-            good = {'code':code, 'terminal':{'outcome':{'kind':'exit', 'code':code}}}
+            good = {'code':code, 'terminal':{'outcome':{'type':'exit', 'code':code}}}
             self.assertTrue(pid.lifecycle_checks(good, code))
             self.assertFalse(pid.lifecycle_checks(dict(good, code=1), code))
-            self.assertFalse(pid.lifecycle_checks(dict(good, terminal={'outcome':{'kind':'outcome_unknown'}}), code))
-            self.assertFalse(pid.lifecycle_checks(dict(good, terminal={'outcome':{'kind':'exit', 'code':1}}), code))
+            self.assertFalse(pid.lifecycle_checks(dict(good, terminal={'outcome':{'type':'outcome_unknown'}}), code))
+            self.assertFalse(pid.lifecycle_checks(dict(good, terminal={'outcome':{'type':'exit', 'code':1}}), code))
+            self.assertFalse(pid.lifecycle_checks(dict(good, terminal={'outcome':{'kind':'exit', 'code':code}}), code))
         self.assertFalse(pid.lifecycle_checks({}, 0))
 
     def test_aliases_require_job_identity_and_different_host_starttime(self):

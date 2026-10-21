@@ -688,6 +688,16 @@ class RunnerHostRenderTests(unittest.TestCase):
         self.assertIn('Reasons: ["runner_host checks did not all pass"].', text)
         self.assertIn("Exit status: 1", text)
 
+    def test_failed_check_reason_is_rendered_without_reclassifying_old_evidence(self):
+        data = self.runner_data(status='FAIL')
+        data['runner_host']['checks'][1]['reason'] = 'expected Linux ENOSYS=38; observed errno=78'
+        text = self.rendered(data)
+        self.assertIn('## Failed check reasons', text)
+        self.assertIn('expected Linux ENOSYS=38; observed errno=78', text)
+        self.assertIn('**FAILED**', text)
+        del data['runner_host']['checks'][1]['reason']
+        self.assertIn('not recorded in this report', self.rendered(data))
+
     def test_inconclusive_reclaim_is_visible_and_does_not_mask_required_failures(self):
         data = self.runner_data()
         data['runner_host']['all_passed'] = False
