@@ -171,7 +171,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
 
     def test_write_probe_uses_the_same_session_and_records_allowed_writes_too(self):
         self.assertCodeIn("diagnostic_write_probe(&plan, &context", self.launch)
-        self.assertCodeIn("process::run(&probe, context, released)", self.launch)
+        self.assertCodeIn("process::run(&probe, context, released, &mut probe_created, &mut probe_started)", self.launch)
         self.assertCodeIn('"diagnostic-writes"', self.launch)
         self.assertCodeIn('"same_token_as_primary":true', self.launch)
         self.assertCodeIn("Sha256::digest(fs::read(std::env::current_exe()?)?)", self.launch)
@@ -223,7 +223,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("safe.diagnostic_safe_cwd = true", self.launch)
         self.assertCodeIn("process::run(&safe, &context", self.launch)
         self.assertCodeIn("diagnostic_rng_call(&plan, &context", self.launch)
-        self.assertCodeIn("process::run(&rng, context, released)", self.launch)
+        self.assertCodeIn("process::run(&rng, context, released, &mut rng_created, &mut rng_started)", self.launch)
         self.assertCodeIn('"same_token_as_safe_cwd_cargo":true', self.launch)
         self.assertCodeIn("DefaultDaclSafeCwdPair", self.prep)
 

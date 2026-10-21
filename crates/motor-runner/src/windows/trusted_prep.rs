@@ -14,9 +14,18 @@ use windows_sys::Win32::{
 mod launch;
 mod lowbox;
 struct Handle(HANDLE);
+impl Handle {
+    fn close(&mut self) -> io::Result<()> {
+        if !self.0.is_null() {
+            checked(unsafe { CloseHandle(self.0) })?;
+            self.0 = null_mut();
+        }
+        Ok(())
+    }
+}
 impl Drop for Handle {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
+        let _ = self.close();
     }
 }
 fn checked(ok: i32) -> io::Result<()> {

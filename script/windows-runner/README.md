@@ -154,6 +154,36 @@ or production launches. An interrupted step/unwound call aborts collection with
 an explicit instrumentation error instead of assigning a later return to it.
 Production launches do not enable loader snaps or debugger creation flags.
 
+For the AppContainer launch failure, collect the separate lowbox-only diagnostic
+with `run-system.ps1 -PrepLaunchMatrix -LowboxLaunch`. It first records (without
+asserting) the SYSTEM session's AppContainer object directory and package child,
+the `motor-prep` profile hive and mapping key, and the batch token's session ID.
+Then it runs four probe variants: the existing LPAC process-attribute path, a
+self-created named-object directory plus `NtCreateLowBoxToken` with no process
+security-capabilities attribute, and LPAC/plain-AppContainer process-attribute
+launches after creating the AppContainer profile while impersonating `motor-prep`.
+The self-created-token cell uses native object-manager calls and an explicit
+SYSTEM/package-SID DACL; those calls are diagnostic evidence, not a production
+implementation recommendation. Every probe screens fetch-temp, runner and user
+profile paths, the AppContainer data folder and its registry key. After the first
+probe child actually resumes, the same policy variant also runs an online,
+locked `cargo fetch` for the pinned fixture, exercising TLS. Each cell records
+its failing API/Win32 error, profile/object-directory cleanup and exact leftovers.
+Persistent package grants are reverted and compared; staging is removed unless
+cleanup is deferred for an unreaped child. The complete report remains diagnostic
+evidence, not qualification.
+
+Run the operator-only lowbox lane from an elevated PowerShell 5.1 prompt after
+installing a bundle built from the reviewed source commit:
+
+```powershell
+$python = (Get-Command python.exe -ErrorAction Stop).Source
+$evidence = 'C:\motor-runner-evidence\lowbox-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
+  -Python $python -Evidence $evidence -PrepLaunchMatrix -LowboxLaunch
+if ($LASTEXITCODE -ne 0) { throw "Lowbox diagnostic failed; preserve $evidence" }
+```
+
 Peer qualification starts the victim alone and records its VM-matched Hyper-V
 Worker/Admin OS-boot event 18601, then waits at least 20 seconds before starting
 the attacker. There is deliberately no readiness dial: the unchanged guest agent

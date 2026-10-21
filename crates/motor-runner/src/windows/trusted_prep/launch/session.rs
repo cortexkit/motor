@@ -136,6 +136,19 @@ fn identity(token: HANDLE) -> io::Result<(String, String)> {
     }
     Ok((user_sid, logon))
 }
+pub(super) fn lowbox_prechecks(token: HANDLE) -> io::Result<Value> {
+    let (user_sid, _) = identity(token)?;
+    let session = token_info(token, TokenSessionId)?;
+    let session_id = unsafe { std::ptr::read_unaligned(session.as_ptr().cast::<u32>()) };
+    let (_, package_sid) = appcontainer::package_sid()?;
+    Ok(json!({
+        "session_id":session_id,
+        "batch_token_session_id":session_id,
+        "named_object_directories":appcontainer::precheck_directories(session_id, &package_sid),
+        "motor_prep_profile":appcontainer::precheck_profile_registry(&user_sid, &package_sid),
+        "package_sid":package_sid
+    }))
+}
 pub(super) fn require_system() -> io::Result<()> {
     let mut token = null_mut();
     check("broker-auth", unsafe {
@@ -211,7 +224,7 @@ impl Profile {
             })?;
             self.handle = null_mut();
         }
-        Ok(())
+        self.token.close()
     }
     fn environment(&self) -> io::Result<BTreeMap<String, String>> {
         struct Block(*mut c_void);
@@ -601,6 +614,10 @@ pub(super) struct Session {
     /// Diagnostic lowbox cells only: the child starts as an AppContainer
     /// process from the privilege-filtered token in `restricted`.
     pub(super) lowbox: Option<appcontainer::Launch>,
+    lowbox_self_token: bool,
+    object_directory: Option<appcontainer::ObjectDirectory>,
+    user_sid: String,
+    cleanup_report: Value,
     _diagnostic_default_dacl: Option<Local>,
     profile: Profile,
     pub(super) environment: Vec<u16>,
@@ -629,7 +646,7 @@ impl Session {
             })?;
         }
         let restricted_code = Local(restricted_code);
-        let restricted = if plan.restricted {
+        let mut restricted = if plan.restricted {
             let mut restrictions = vec![SID_AND_ATTRIBUTES {
                 Sid: sid.0,
                 Attributes: 0,
@@ -686,11 +703,48 @@ impl Session {
         } else {
             None
         };
+        let session_id_bytes = token_info(profile.token.0, TokenSessionId)?;
+        let session_id =
+            unsafe { std::ptr::read_unaligned(session_id_bytes.as_ptr().cast::<u32>()) };
         let lowbox = plan
             .diagnostic_policy
             .lowbox()
-            .map(appcontainer::Launch::new)
+            .map(|lpac| {
+                if plan.diagnostic_policy.lowbox_profile() {
+                    appcontainer::Launch::with_profile(lpac, profile.token.0)
+                } else {
+                    appcontainer::Launch::new(lpac)
+                }
+            })
             .transpose()?;
+        let lowbox_self_token = plan.diagnostic_policy.lowbox_self_token();
+        let mut object_directory = None;
+        if lowbox_self_token {
+            let launch = lowbox
+                .as_ref()
+                .ok_or_else(|| step("lowbox-token", "missing AppContainer capability data"))?;
+            let directory =
+                appcontainer::ObjectDirectory::create(session_id, &launch.package_text)?;
+            let base = restricted
+                .as_ref()
+                .ok_or_else(|| step("lowbox-token", "missing privilege-filtered token"))?;
+            let token = match launch.create_token(base.0, directory.handle()) {
+                Ok(token) => token,
+                Err(error) => {
+                    let mut directory = directory;
+                    let cleanup = directory
+                        .close()
+                        .map(|report| report.to_string())
+                        .unwrap_or_else(|cleanup| cleanup.to_string());
+                    return Err(step(
+                        "NtCreateLowBoxToken",
+                        format!("{error}; object-directory-cleanup={cleanup}"),
+                    ));
+                }
+            };
+            restricted = Some(token);
+            object_directory = Some(directory);
+        }
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let default_dacl_before = token_default_dacl(actual_token)?;
         let diagnostic_default_dacl = if plan.diagnostic_policy.changes_default_dacl() {
@@ -798,6 +852,10 @@ impl Session {
             grant,
             desktop,
             restricted,
+            user_sid: user_sid.clone(),
+            cleanup_report: json!({"profile_loaded":true,"restricted_token_closed":false,"prep_profile_token_closed":false,"object_directory":null,"appcontainer_profile_deleted":false,"prep_profile_unloaded":false}),
+            lowbox_self_token,
+            object_directory,
             lowbox,
             _diagnostic_default_dacl: diagnostic_default_dacl,
             profile,
@@ -810,25 +868,72 @@ impl Session {
             .as_ref()
             .map_or(self.profile.token.0, |token| token.0)
     }
+    pub(super) fn attributes(&self) -> Vec<(usize, *const c_void, usize)> {
+        if self.lowbox_self_token {
+            self.lowbox
+                .as_ref()
+                .map_or_else(Vec::new, |launch| launch.policy_attribute())
+        } else {
+            self.lowbox
+                .as_ref()
+                .map_or_else(Vec::new, |launch| launch.attributes())
+        }
+    }
     pub(super) fn desktop(&self) -> Vec<u16> {
         wide(&self.desktop.name)
     }
     pub(super) fn finish(&mut self) -> io::Result<()> {
         let mut errors = Vec::new();
-        for result in [
-            self.grant.close(),
-            self.desktop.close(),
-            self.profile.close(),
-        ] {
+        if let Some(token) = &mut self.restricted {
+            match token.close() {
+                Ok(()) => self.cleanup_report["restricted_token_closed"] = json!(true),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Some(launch) = &mut self.lowbox {
+            if let Some(name) = launch.info["profile_name"].as_str() {
+                self.cleanup_report["appcontainer_profile_name"] = json!(name);
+                self.cleanup_report["appcontainer_profile_folder"] =
+                    launch.info["profile_folder"].clone();
+                self.cleanup_report["appcontainer_profile_folder_error"] =
+                    launch.info["profile_folder_error"].clone();
+                match launch.delete_profile() {
+                    Ok(deleted) => {
+                        self.cleanup_report["appcontainer_profile_deleted"] = json!(deleted)
+                    }
+                    Err(error) => errors.push(error.to_string()),
+                }
+                self.cleanup_report["profile_registry_after_delete"] =
+                    appcontainer::precheck_profile_registry(&self.user_sid, &launch.package_text);
+            }
+        }
+        if let Some(directory) = &mut self.object_directory {
+            match directory.close() {
+                Ok(report) => self.cleanup_report["object_directory"] = report,
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        for result in [self.grant.close(), self.desktop.close()] {
             if let Err(error) = result {
                 errors.push(error.to_string());
             }
         }
-        if errors.is_empty() {
+        let profile_cleanup = self.profile.close();
+        self.cleanup_report["prep_profile_unloaded"] = json!(self.profile.handle.is_null());
+        self.cleanup_report["prep_profile_token_closed"] = json!(self.profile.token.0.is_null());
+        if let Err(error) = profile_cleanup {
+            errors.push(error.to_string());
+        }
+        let failed = !errors.is_empty();
+        self.cleanup_report["errors"] = json!(errors);
+        if !failed {
             Ok(())
         } else {
-            Err(step("cleanup", errors.join("; ")))
+            Err(step("cleanup", self.cleanup_report["errors"].to_string()))
         }
+    }
+    pub(super) fn cleanup_report(&self) -> &Value {
+        &self.cleanup_report
     }
 }
 
@@ -837,6 +942,15 @@ pub(super) fn appcontainer_context() -> Value {
 }
 pub(super) fn appcontainer_package_sid() -> io::Result<String> {
     appcontainer::package_sid().map(|(_, text)| text)
+}
+pub(super) fn appcontainer_profile_folder(package_sid: &str) -> io::Result<String> {
+    appcontainer::profile_folder(package_sid)
+}
+pub(super) fn appcontainer_registry_probe(package_sid: &str, leaf: &str) -> Value {
+    appcontainer::profile_registry_probe(package_sid, leaf)
+}
+pub(super) fn current_appcontainer_package_sid() -> io::Result<String> {
+    appcontainer::current_package_sid()
 }
 /// A path's DACL as SDDL, read through a handle that does not follow reparse
 /// points, so grant/revoke round trips can be compared exactly.

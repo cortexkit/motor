@@ -179,9 +179,12 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('const ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;', self.appcontainer)
         self.code('lpac_policy: lpac.then(|| Box::new(ALL_APPLICATION_PACKAGES_OPT_OUT))', self.appcontainer)
         self.code('let attributes = Attributes::new(&mut handles, &extra)?;', self.process)
-        self.code('.map(appcontainer::Launch::new)', self.session)
+        self.code('appcontainer::Launch::with_profile(lpac, profile.token.0)', self.session)
+        self.code('appcontainer::Launch::new(lpac)', self.session)
+        self.code('launch.attributes()', self.session)
         self.code('CreateRestrictedToken(profile.token.0, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut result)', self.session)
-        self.assertNotIn('CreateAppContainerProfile', self.appcontainer)
+        self.code('CreateAppContainerProfile(', self.appcontainer)
+        self.code('if plan.diagnostic_policy.lowbox_profile()', self.session)
 
     def test_lowbox_plans_are_fixed_and_unrestricted(self):
         body = self.launch.split('fn lowbox_plan_allowed(', 1)[1].split('\n}\n', 1)[0]
@@ -212,6 +215,56 @@ class LowboxLaunchCellTests(unittest.TestCase):
         branch = control.split('} elseif ($LowboxLaunch) {', 1)[1].split('} else {', 1)[0]
         self.code("$null = Runner-Check 'qualify-prep-lowbox'", branch)
         self.code('"qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config)', (SRC.parent / 'main.rs').read_text())
+
+
+    def test_lowbox_matrix_has_prechecks_four_launch_variants_and_first_success_fetch(self):
+        source = flat(self.cells)
+        for cell in (
+            '(1, "baseline-attribute-lpac", LowboxLpac)',
+            '(2, "self-made-token-no-profile", LowboxSelfToken)',
+            '(3, "profile-attribute-lpac", LowboxProfileLpac)',
+            '(4, "profile-attribute-appcontainer", LowboxProfileAppContainer)',
+        ):
+            self.code(cell, source)
+        self.code('let prechecks = launch::lowbox_prechecks(config)?;', source)
+        self.code('if child_started && !fetch_attempted', source)
+        self.code('"fetch", "--locked", "--target", "x86_64-pc-windows-msvc", "--manifest-path"', source)
+        self.code('"real_cargo_fetch_skipped"', source)
+        self.code('"cell_5"', source)
+        self.code('"prechecks_cell"', source)
+        self.code('"persistent_grants_reverted_exactly"', source)
+        self.code('"staging_removed"', source)
+        for call in ('InitializeProcThreadAttributeList', 'UpdateProcThreadAttribute', 'CreateProcessAsUserW'):
+            self.code(call, self.process)
+        self.code('"failure_details"', source)
+
+    def test_lowbox_cells_create_and_report_the_required_token_profile_and_cleanup_paths(self):
+        source = flat(self.cells + self.launch + self.appcontainer + self.process + self.session)
+        for fragment in (
+            'CreateAppContainerProfile(',
+            'ImpersonateLoggedOnUser(token)',
+            'DeleteAppContainerProfile(',
+            'NtCreateDirectoryObjectEx',
+            'NtCreateLowBoxToken',
+            '"profile_hive_loaded"',
+            '"mapping_path"',
+            'GetAppContainerFolderPath',
+            'GetAppContainerRegistryLocation',
+            '"appcontainer_profile_folder"',
+            '"appcontainer_registry"',
+            '"session_cleanup"',
+            '"process_created"',
+        ):
+            self.code(fragment, source)
+        self.code('"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;{package_sid})"', self.appcontainer)
+        self.code('"handles_closed"', self.appcontainer)
+        self.code('"directory_removed"', self.appcontainer)
+    def test_self_created_lowbox_uses_lpac_policy_without_security_capabilities_attribute(self):
+        method = self.appcontainer.split('fn policy_attribute(', 1)[1].split('\n    }', 1)[0]
+        self.code('ALL_APPLICATION_PACKAGES_POLICY_ATTRIBUTE', method)
+        self.assertNotIn('SECURITY_CAPABILITIES_ATTRIBUTE', method)
+        self.code('launch.policy_attribute()', self.session)
+        self.code('NtCreateLowBoxToken', self.appcontainer)
 
 
 if __name__ == '__main__':

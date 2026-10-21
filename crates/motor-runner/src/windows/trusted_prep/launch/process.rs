@@ -31,24 +31,31 @@ impl Attributes {
         handles: &mut [HANDLE],
         extra: &[(usize, *const std::ffi::c_void, usize)],
     ) -> io::Result<Self> {
+        fn win32_failure(call: &str) -> io::Error {
+            let error = io::Error::last_os_error();
+            let code = error.raw_os_error().unwrap_or(0) as u32;
+            step(call, format!("{error}; Win32 {code} (0x{code:08X})"))
+        }
         let count = 1 + extra.len() as u32;
         let mut size = 0;
         unsafe {
             InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size);
         }
         if size == 0 {
-            return Err(step("handle-allow-list", io::Error::last_os_error()));
+            return Err(win32_failure(
+                "InitializeProcThreadAttributeList(size query)",
+            ));
         }
         let mut storage = vec![0u128; size.div_ceil(16)];
         let pointer = storage.as_mut_ptr().cast();
-        check("handle-allow-list", unsafe {
-            InitializeProcThreadAttributeList(pointer, count, 0, &mut size)
-        })?;
+        if unsafe { InitializeProcThreadAttributeList(pointer, count, 0, &mut size) } == 0 {
+            return Err(win32_failure("InitializeProcThreadAttributeList"));
+        }
         let result = Self {
             _storage: storage,
             pointer,
         };
-        check("handle-allow-list", unsafe {
+        if unsafe {
             UpdateProcThreadAttribute(
                 pointer,
                 0,
@@ -58,9 +65,12 @@ impl Attributes {
                 null_mut(),
                 null_mut(),
             )
-        })?;
+        } == 0
+        {
+            return Err(win32_failure("UpdateProcThreadAttribute(handle-list)"));
+        }
         for (attribute, value, size) in extra {
-            check("process-attribute", unsafe {
+            if unsafe {
                 UpdateProcThreadAttribute(
                     pointer,
                     0,
@@ -70,7 +80,12 @@ impl Attributes {
                     null_mut(),
                     null_mut(),
                 )
-            })?;
+            } == 0
+            {
+                return Err(win32_failure(&format!(
+                    "UpdateProcThreadAttribute(0x{attribute:08X})"
+                )));
+            }
         }
         Ok(result)
     }
@@ -160,15 +175,18 @@ impl Drop for Tree<'_> {
     }
 }
 
-pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Result<u32> {
+pub(super) fn run(
+    plan: &Plan,
+    session: &Session,
+    released: &mut bool,
+    process_created: &mut bool,
+    child_started: &mut bool,
+) -> io::Result<u32> {
     let input = stdio("NUL", true)?;
     let output = stdio(&plan.stdout.to_string_lossy(), false)?;
     let error = stdio(&plan.stderr.to_string_lossy(), false)?;
     let mut handles = [input.0, output.0, error.0];
-    let extra = session
-        .lowbox
-        .as_ref()
-        .map_or_else(Vec::new, |launch| launch.attributes());
+    let extra = session.attributes();
     let attributes = Attributes::new(&mut handles, &extra)?;
     let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
     if job.0.is_null() {
@@ -234,16 +252,17 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
         // ntdll recorded for this thread narrows it (for example an object
         // directory path versus a file name).
         let error = io::Error::last_os_error();
+        let code = error.raw_os_error().unwrap_or(0) as u32;
         let status = unsafe { RtlGetLastNtStatus() };
         return Err(step(
-            "CreateProcessAsUser",
+            "CreateProcessAsUserW",
             format!(
-                "{error} (Win32 0x{:08X}; last NTSTATUS 0x{:08X})",
-                error.raw_os_error().unwrap_or(0) as u32,
+                "{error}; Win32 {code} (0x{code:08X}); last NTSTATUS 0x{:08X}",
                 status as u32
             ),
         ));
     }
+    *process_created = true;
     let process = Handle(info.hProcess);
     let thread = Handle(info.hThread);
     *released = false;
@@ -286,6 +305,7 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
         return Err(step("resume-prep-child", io::Error::last_os_error()));
     }
+    *child_started = true;
     let deadline = Instant::now() + Duration::from_secs(600);
     if plan.diagnostic_loader_trace {
         let code = trace::wait(plan, tree.process.0, deadline)?;

@@ -36,15 +36,30 @@ pub(super) enum DiagnosticPolicy {
     LowboxLpac,
     /// Plain AppContainer child with internetClient; the fallback design.
     LowboxAppContainer,
+    /// LPAC token built with NtCreateLowBoxToken and a caller-created object directory.
+    LowboxSelfToken,
+    /// LPAC profile created under the prep user's loaded hive before attribute launch.
+    LowboxProfileLpac,
+    /// Plain AppContainer profile created under the prep user's loaded hive.
+    LowboxProfileAppContainer,
 }
 impl DiagnosticPolicy {
     /// Some(true) for LPAC, Some(false) for plain AppContainer, None otherwise.
     pub(super) fn lowbox(self) -> Option<bool> {
         match self {
-            Self::LowboxLpac => Some(true),
-            Self::LowboxAppContainer => Some(false),
+            Self::LowboxAppContainer | Self::LowboxProfileAppContainer => Some(false),
+            Self::LowboxLpac | Self::LowboxSelfToken | Self::LowboxProfileLpac => Some(true),
             _ => None,
         }
+    }
+    pub(super) fn lowbox_self_token(self) -> bool {
+        self == Self::LowboxSelfToken
+    }
+    pub(super) fn lowbox_profile(self) -> bool {
+        matches!(
+            self,
+            Self::LowboxProfileLpac | Self::LowboxProfileAppContainer
+        )
     }
     pub(super) fn changes_default_dacl(self) -> bool {
         matches!(
@@ -196,13 +211,11 @@ fn run_plan(
             .collect(),
         restricted,
         diagnostic_policy: policy,
-        diagnostic_loader_trace: retain_failure,
-        // The lowbox probe runs from fetch-temp so that a cwd denial on the
-        // traverse-only job directory, if any, shows up only in the Cargo cells,
-        // which keep the production working directory.
-        diagnostic_safe_cwd: policy.rng_mode().is_some()
-            || (policy.lowbox().is_some()
-                && command.get_args().next() == Some(std::ffi::OsStr::new("prep-probe"))),
+        // Preserve failure reports without adding debugger creation flags to the lowbox cells.
+        diagnostic_loader_trace: retain_failure && policy.lowbox().is_none(),
+        // Keep the lowbox variants on the production staging working directory so
+        // the baseline cell does not hide a cwd-related CreateProcessAsUserW failure.
+        diagnostic_safe_cwd: policy.rng_mode().is_some(),
         diagnostic_native_calls: retain_failure
             && matches!(
                 policy,
@@ -341,6 +354,7 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         ));
     }
     let mut report = json!({"phase":"session-setup", "program":plan.program, "arguments":plan.args,
+        "stdout_path":plan.stdout,"stderr_path":plan.stderr,
         "restricted":plan.restricted, "cwd":plan.cwd, "profile_loaded":false,
         "inherit_handles":"explicit stdin/stdout/stderr allow-list only", "active_process_limit":32,
         "creation_flags":format!("0x{:08X}", process::CREATION_FLAGS | if plan.diagnostic_loader_trace { windows_sys::Win32::System::Threading::DEBUG_ONLY_THIS_PROCESS } else { 0 }),
@@ -377,7 +391,18 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             save(&report)?;
         }
         let mut released = true;
-        let child = process::run(&plan, &context, &mut released);
+        let mut process_created = false;
+        let mut child_started = false;
+        let child = process::run(
+            &plan,
+            &context,
+            &mut released,
+            &mut process_created,
+            &mut child_started,
+        );
+        report["process_created"] = json!(process_created);
+        report["child_started"] = json!(child_started);
+        save(&report)?;
         if !released {
             // Never unload a hive or close UI objects while a child is alive.
             // Broker exit and the outer kill-on-close job quarantine this
@@ -393,7 +418,18 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
                     .unwrap_or_default(),
             ));
         }
-        let code = child?;
+        let code = match child {
+            Ok(code) => code,
+            Err(error) => {
+                let cleanup = context.finish();
+                report["session_cleanup"] = context.cleanup_report().clone();
+                if let Err(cleanup_error) = cleanup {
+                    report["cleanup_error"] = json!(cleanup_error.to_string());
+                }
+                save(&report)?;
+                return Err(error);
+            }
+        };
         report["exit_code"] = json!(code);
         report["exit_status"] = json!(process_status::describe(code));
         report["stdout"] = json!(bounded_text(&plan.stdout)?);
@@ -411,7 +447,15 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             retry.stdout = plan.stdout.with_extension("retry.stdout");
             retry.stderr = plan.stderr.with_extension("retry.stderr");
             let mut released = true;
-            let outcome = process::run(&retry, &context, &mut released);
+            let mut retry_created = false;
+            let mut retry_started = false;
+            let outcome = process::run(
+                &retry,
+                &context,
+                &mut released,
+                &mut retry_created,
+                &mut retry_started,
+            );
             if !released {
                 std::mem::forget(context);
                 report["cleanup_deferred"] = json!("unreaped second Cargo");
@@ -430,7 +474,15 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             safe.stdout = plan.stdout.with_extension("safe-cwd.stdout");
             safe.stderr = plan.stderr.with_extension("safe-cwd.stderr");
             let mut released = true;
-            let outcome = process::run(&safe, &context, &mut released);
+            let mut safe_created = false;
+            let mut safe_started = false;
+            let outcome = process::run(
+                &safe,
+                &context,
+                &mut released,
+                &mut safe_created,
+                &mut safe_started,
+            );
             if !released {
                 std::mem::forget(context);
                 report["cleanup_deferred"] = json!("unreaped safe-cwd Cargo");
@@ -479,10 +531,12 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         report["phase"] = json!("cleanup");
         save(&report)?;
         let cleanup = context.finish();
+        report["session_cleanup"] = context.cleanup_report().clone();
         if code != 0 {
             if let Err(error) = cleanup {
                 report["cleanup_error"] = json!(error.to_string());
             }
+            save(&report)?;
             return Err(step(
                 "child-exit",
                 format!(
@@ -497,7 +551,11 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
                 ),
             ));
         }
-        cleanup?;
+        if let Err(error) = cleanup {
+            report["cleanup_error"] = json!(error.to_string());
+            save(&report)?;
+            return Err(error);
+        }
         report["phase"] = json!("complete");
         Ok(())
     })();
@@ -561,6 +619,20 @@ pub(super) fn appcontainer_context() -> Value {
 }
 pub(super) fn appcontainer_package_sid() -> io::Result<String> {
     session::appcontainer_package_sid()
+}
+pub(super) fn lowbox_prechecks(config: &Config) -> io::Result<Value> {
+    let root = &config.windows.as_ref().unwrap().layout_root;
+    let token = token(root)?;
+    session::lowbox_prechecks(token.0)
+}
+pub(super) fn appcontainer_profile_folder(package_sid: &str) -> io::Result<String> {
+    session::appcontainer_profile_folder(package_sid)
+}
+pub(super) fn appcontainer_registry_probe(package_sid: &str, leaf: &str) -> Value {
+    session::appcontainer_registry_probe(package_sid, leaf)
+}
+pub(super) fn current_appcontainer_package_sid() -> io::Result<String> {
+    session::current_appcontainer_package_sid()
 }
 pub(super) fn path_dacl_sddl(path: &Path) -> io::Result<String> {
     session::path_dacl_sddl(path)
@@ -664,7 +736,15 @@ fn diagnostic_write_probe(
         diagnostic_safe_cwd: plan.diagnostic_safe_cwd,
         diagnostic_native_calls: plan.diagnostic_native_calls,
     };
-    let result = process::run(&probe, context, released);
+    let mut probe_created = false;
+    let mut probe_started = false;
+    let result = process::run(
+        &probe,
+        context,
+        released,
+        &mut probe_created,
+        &mut probe_started,
+    );
     let code = result?;
     let proof = if output.exists() {
         Some(serde_json::from_slice::<Value>(&fs::read(&output)?).map_err(io::Error::other)?)
@@ -725,7 +805,9 @@ fn diagnostic_rng_call(
         "unused".into(),
         output.to_string_lossy().into_owned(),
     ];
-    let code = process::run(&rng, context, released)?;
+    let mut rng_created = false;
+    let mut rng_started = false;
+    let code = process::run(&rng, context, released, &mut rng_created, &mut rng_started)?;
     let proof = fs::read(&output)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());

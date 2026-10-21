@@ -1,9 +1,7 @@
 //! Diagnostic-only AppContainer launch cells for the trusted prep fetch. They
-//! run the trusted probe and a real online `cargo fetch` as lowbox processes
-//! (LPAC first, plain AppContainer as the fallback) and report what the
-//! read-only descriptor screen could not: named-object directory creation
-//! without a profile, LSA and DNS reachability, network isolation, TLS through
-//! a real fetch, and live write attempts inside and outside staging.
+//! run four setup variants and a real online `cargo fetch` after the first
+//! successful launch. This reports object-directory, profile-hive, LSA, network,
+//! TLS and live filesystem/registry write behavior without changing production.
 //!
 //! Grants: GrantPrep adds the package SID with the production roles (Stage on
 //! the job directory, Read on its inputs, Modify on fetch-temp, Read on the
@@ -18,6 +16,62 @@ use std::io::ErrorKind;
 const FIXTURE_MANIFEST: &str = "[package]\nname = \"motor-lowbox-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"=1.0.4\"\n";
 /// cfg-if 1.0.4 has no dependencies; its checksum is the one crates.io serves.
 const FIXTURE_LOCK: &str = "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"motor-lowbox-fixture\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
+
+fn failure_details(report: &Value) -> Value {
+    let error = report["error"]
+        .as_str()
+        .or_else(|| report["broker_stderr"].as_str())
+        .unwrap_or("");
+    let text = error.split("trusted fetch ").nth(1).unwrap_or(error).trim();
+    let call = text.split(':').next().filter(|part| !part.is_empty());
+    let win32 = text
+        .split("Win32 ")
+        .nth(1)
+        .and_then(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        })
+        .or_else(|| {
+            text.split("HRESULT 0x")
+                .nth(1)
+                .and_then(|tail| {
+                    u32::from_str_radix(tail.chars().take(8).collect::<String>().as_str(), 16).ok()
+                })
+                .filter(|hresult| hresult >> 16 == 0x8007)
+                .map(|hresult| hresult & 0xffff)
+        })
+        .or_else(|| {
+            text.split("os error ").nth(1).and_then(|tail| {
+                tail.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            })
+        });
+    json!({"call":call,"win32_error":win32,"raw":error})
+}
+
+fn probe_leftover_paths(proof: &Value) -> Vec<String> {
+    let Some(writes) = proof["write_attempts"].as_object() else {
+        return Vec::new();
+    };
+    writes
+        .values()
+        .filter_map(|result| {
+            let file_remains = result["write"] == "allowed" && result["removed"] != json!(true);
+            let registry_key_remains = result["cleanup"]["key_removed"] == json!(false);
+            if file_remains || registry_key_remains {
+                result["path"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 /// Child side: every outcome is recorded rather than asserted, so one denial
 /// never hides the rest. The proof is printed to stdout (always captured by
@@ -69,6 +123,39 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
         writes.insert(
             name.into(),
             attempt(&directory.join(format!("motor-lowbox-{id}.txt"))),
+        );
+    }
+    let package_sid = launch::current_appcontainer_package_sid();
+    let mut profile_paths = json!({});
+    if let Ok(package_sid) = &package_sid {
+        match launch::appcontainer_profile_folder(package_sid) {
+            Ok(path) => {
+                let path = PathBuf::from(path);
+                writes.insert(
+                    "appcontainer_profile_folder".into(),
+                    attempt(&path.join(format!("motor-lowbox-{id}.txt"))),
+                );
+                profile_paths["folder"] = json!(path);
+            }
+            Err(error) => {
+                writes.insert(
+                    "appcontainer_profile_folder".into(),
+                    json!({"write":"unavailable","error":error.to_string()}),
+                );
+            }
+        }
+        let registry_leaf = format!("MotorRunner.LowboxProbe.{id}");
+        let registry = launch::appcontainer_registry_probe(package_sid, &registry_leaf);
+        profile_paths["registry"] = json!(registry["path"]);
+        writes.insert("appcontainer_registry".into(), registry);
+    } else {
+        writes.insert(
+            "appcontainer_profile_folder".into(),
+            json!({"write":"unavailable","error":package_sid.err().map(|error| error.to_string())}),
+        );
+        writes.insert(
+            "appcontainer_registry".into(),
+            json!({"write":"unavailable","error":"AppContainer package SID unavailable"}),
         );
     }
     let credential_read = match fs::File::open(credential) {
@@ -133,7 +220,7 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
     }
     let proof = json!({"mode": "lowbox", "token": launch::appcontainer_context(),
         "process_context": launch::probe_context().map_err(|error| error.to_string()),
-        "write_attempts": writes, "credential_read": credential_read,
+        "write_attempts": writes, "appcontainer_profile_paths":profile_paths, "credential_read": credential_read,
         "named_object_local_namespace": named_object, "lsa": lsa, "rng": rng, "network": network,
         "temp": std::env::var_os("TEMP").map(PathBuf::from), "write_root": write_root});
     let text = serde_json::to_string(&proof).map_err(invalid)?;
@@ -144,10 +231,10 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
     Ok(())
 }
 
-/// SYSTEM side: one fresh staging job, the package-SID grants, four cells, then
-/// revocation, an exact before/after comparison of the persistent grants, and
-/// staging removal. This gathers diagnostic evidence only; it never marks the
-/// runner as qualified.
+/// SYSTEM side: record the no-launch prechecks, run four launch variants and one
+/// real fetch after the first resumed probe, then revoke grants and remove staging
+/// unless an unreaped child defers staging removal. This gathers diagnostic evidence only;
+/// it never marks the runner as qualified.
 pub(super) fn entry(config: Config) -> io::Result<()> {
     use fs2::FileExt;
     use windows_service::{
@@ -177,6 +264,8 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
         .write(true)
         .open(root.join("prep.lock"))?;
     lock.lock_exclusive()?;
+    // Record the existing session state without using it as a pass/fail gate.
+    let prechecks = launch::lowbox_prechecks(config)?;
     let id = Uuid::now_v7();
     let stage = root.join("staging").join(id.to_string());
     fs::create_dir_all(stage.join("fetch-manifests"))?;
@@ -201,6 +290,10 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
         .join("evidence")
         .join(format!("prep-lowbox-launch-{id}.json"));
     let mut report = json!({"diagnostic_only": true, "production_policy_unchanged": true,
+        "prechecks":prechecks,
+        "prechecks_cell":{"cell":0,"name":"pre-checks","launched":false},
+        "cell_2_native_apis": ["NtOpenDirectoryObject", "NtCreateDirectoryObjectEx", "NtCreateLowBoxToken", "NtClose"],
+        "cell_2_directory_dacl":format!("O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;{package})"),
         "package_sid": package, "staging": stage, "fixture_dependency": "cfg-if 1.0.4 from crates.io",
         "grants": {"code_path": "hyperv.ps1 GrantPrep -PackageSid (Grant-RunnerPrepPath, the production prep grant builder)",
             "staging": {"job_directory": "Stage", "fetch-manifests": "Read", "fetch-temp": "Modify (the only package-SID write grant)"},
@@ -223,33 +316,83 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
         )?)?;
         report["persistent_dacl_granted"] =
             json!(persistent.iter().map(|path| dacl(path)).collect::<Vec<_>>());
-        use launch::DiagnosticPolicy::{LowboxAppContainer, LowboxLpac};
+        use launch::DiagnosticPolicy::{
+            LowboxLpac, LowboxProfileAppContainer, LowboxProfileLpac, LowboxSelfToken,
+        };
         let mut cells = Vec::new();
-        for (index, name, program, policy) in [
-            (1, "probe-lpac", &probe, LowboxLpac),
-            (2, "cargo-fetch-lpac", &cargo, LowboxLpac),
-            (3, "probe-appcontainer", &probe, LowboxAppContainer),
-            (4, "cargo-fetch-appcontainer", &cargo, LowboxAppContainer),
+        let mut fetch_attempted = false;
+        for (index, name, policy) in [
+            (1, "baseline-attribute-lpac", LowboxLpac),
+            (2, "self-made-token-no-profile", LowboxSelfToken),
+            (3, "profile-attribute-lpac", LowboxProfileLpac),
+            (
+                4,
+                "profile-attribute-appcontainer",
+                LowboxProfileAppContainer,
+            ),
         ] {
             let cargo_home = stage.join(format!("fetch-temp/cargo-{index}"));
-            let mut command = Command::new(program);
+            let output = stage.join(format!("fetch-temp/lowbox-probe-{index}.json"));
+            let outside = PathBuf::from(r"C:\Windows\Temp")
+                .join(format!("motor-prep-lowbox-{id}-{index}.txt"));
+            let mut command = Command::new(&probe);
             command
                 .env_clear()
                 .env("SYSTEMROOT", r"C:\Windows")
                 .env("CARGO_HOME", &cargo_home)
-                .env("RUSTC", &rustc);
-            let output = stage.join(format!("fetch-temp/lowbox-probe-{index}.json"));
-            if program == &probe {
-                let outside = PathBuf::from(r"C:\Windows\Temp")
-                    .join(format!("motor-prep-lowbox-{id}-{index}.txt"));
-                command
-                    .args(["prep-probe", "lowbox"])
-                    .arg(root.join("prep-secret.dpapi"))
-                    .arg(&outside)
-                    .arg(&output);
-                outside_files.push(outside);
-            } else {
-                command
+                .env("RUSTC", &rustc)
+                .args(["prep-probe", "lowbox"])
+                .arg(root.join("prep-secret.dpapi"))
+                .arg(&outside)
+                .arg(&output);
+            outside_files.push(outside);
+            let mut cell = match launch::diagnostic(config, &command, &stage, false, policy) {
+                Ok(report) => report,
+                Err(error) => json!({"phase":"diagnostic-launch-error","error":error.to_string()}),
+            };
+            cell["probe_proof"] = cell["stdout"]
+                .as_str()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                })
+                .unwrap_or(Value::Null);
+            cell["probe_leftover_paths"] = json!(probe_leftover_paths(&cell["probe_proof"]));
+            let mut staged_artifacts = vec![
+                output.to_string_lossy().into_owned(),
+                cargo_home.to_string_lossy().into_owned(),
+                output
+                    .with_extension("rng-process-prng.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                output
+                    .with_extension("rng-bcrypt-gen-random.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+            for key in ["stdout_path", "stderr_path"] {
+                if let Some(path) = cell[key].as_str() {
+                    staged_artifacts.push(path.to_owned());
+                }
+            }
+            cell["staging_artifacts"] = json!(staged_artifacts);
+            cell["staging_artifacts_retained_until_stage_cleanup"] = json!(true);
+            let mut evidence_artifacts = vec![report_path.to_string_lossy().into_owned()];
+            if let Some(path) = cell["launch_report"].as_str() {
+                evidence_artifacts.push(path.to_owned());
+            }
+            cell["evidence_artifact_paths"] = json!(evidence_artifacts);
+            cell["failure_details"] = failure_details(&cell);
+            let process_created = cell["process_created"] == json!(true);
+            let child_started = cell["child_started"] == json!(true);
+            if child_started && !fetch_attempted {
+                fetch_attempted = true;
+                let mut fetch = Command::new(&cargo);
+                fetch
+                    .env_clear()
+                    .env("SYSTEMROOT", r"C:\Windows")
+                    .env("CARGO_HOME", &cargo_home)
+                    .env("RUSTC", &rustc)
                     .args([
                         "fetch",
                         "--locked",
@@ -258,40 +401,47 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
                         "--manifest-path",
                     ])
                     .arg(fixture.join("Cargo.toml"));
-            }
-            let mut cell = match launch::diagnostic(config, &command, &stage, false, policy) {
-                Ok(report) => report,
-                Err(error) => {
-                    json!({"phase": "diagnostic-launch-error", "error": error.to_string()})
-                }
-            };
-            let deferred = cell.get("cleanup_deferred").is_some();
-            let crate_downloaded = fs::read_dir(cargo_home.join("registry/cache"))
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .any(|entry| entry.path().join("cfg-if-1.0.4.crate").is_file())
-                })
-                .unwrap_or(false);
-            if program == &probe {
-                cell["probe_proof"] = cell["stdout"]
-                    .as_str()
-                    .and_then(|text| {
-                        text.lines()
-                            .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                let mut fetch_report =
+                    match launch::diagnostic(config, &fetch, &stage, false, policy) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            json!({"phase":"diagnostic-launch-error","error":error.to_string()})
+                        }
+                    };
+                let crate_downloaded = fs::read_dir(cargo_home.join("registry/cache"))
+                    .map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .any(|entry| entry.path().join("cfg-if-1.0.4.crate").is_file())
                     })
-                    .unwrap_or(Value::Null);
-            } else {
-                cell["crate_downloaded"] = json!(crate_downloaded);
+                    .unwrap_or(false);
+                fetch_report["crate_downloaded"] = json!(crate_downloaded);
+                fetch_report["cargo_home"] = json!(cargo_home);
+                let fetch_artifacts = ["stdout_path", "stderr_path"]
+                    .iter()
+                    .filter_map(|key| fetch_report[*key].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>();
+                fetch_report["staging_artifacts"] = json!(fetch_artifacts);
+                fetch_report["staging_artifacts_retained_until_stage_cleanup"] = json!(true);
+                let mut fetch_evidence = vec![report_path.to_string_lossy().into_owned()];
+                if let Some(path) = fetch_report["launch_report"].as_str() {
+                    fetch_evidence.push(path.to_owned());
+                }
+                fetch_report["evidence_artifact_paths"] = json!(fetch_evidence);
+                fetch_report["failure_details"] = failure_details(&fetch_report);
+                cell["real_cargo_fetch"] = fetch_report.clone();
+                report["cell_5"] = json!({"cell":5,"name":"real-cargo-fetch","trigger_cell":index,"report":fetch_report});
             }
+            let deferred = cell.get("cleanup_deferred").is_some()
+                || cell["real_cargo_fetch"].get("cleanup_deferred").is_some();
             eprintln!(
-                "DIAG lowbox-launch cell={index} name={name} exit={} crate_downloaded={crate_downloaded}",
+                "DIAG lowbox-launch cell={index} name={name} created={process_created} started={child_started} exit={}",
                 cell["exit_status"].as_str().unwrap_or("not-created")
             );
-            cells.push(
-                json!({"cell": index, "name": name, "diagnostic_policy": policy, "report": cell}),
-            );
+            cells.push(json!({"cell":index,"name":name,"diagnostic_policy":policy,
+                "process_created":process_created,"child_started":child_started,"report":cell}));
             report["cells"] = json!(cells);
+            report["real_cargo_fetch_attempted"] = json!(fetch_attempted);
             launch::write_diagnostic_update(&report_path, &report)?;
             if deferred {
                 deferred_cleanup = true;
@@ -299,6 +449,11 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
                     "lowbox cells stopped after an unreaped child; preserve launch reports",
                 ));
             }
+        }
+        if !fetch_attempted {
+            let reason = "none of the four launch cells reached a resumed child";
+            report["real_cargo_fetch_skipped"] = json!(reason);
+            report["cell_5"] = json!({"cell":5,"name":"real-cargo-fetch","launched":false,"skipped_reason":reason});
         }
         Ok(())
     })();
@@ -320,9 +475,13 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
     report["persistent_grants_reverted_exactly"] =
         json!(before.iter().all(Result::is_ok) && before == after);
     report["revoke_error"] = json!(revoke.as_ref().err().map(ToString::to_string));
+    let mut outside_leftovers = Vec::new();
     for outside in &outside_files {
         if outside.exists() {
             let _ = fs::remove_file(outside);
+        }
+        if outside.exists() {
+            outside_leftovers.push(outside.to_string_lossy().into_owned());
         }
     }
     let cleanup = if deferred_cleanup {
@@ -331,6 +490,13 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
         remove_staging(config, &stage)
     };
     report["staging_removed"] = json!(cleanup.is_ok() && !stage.exists());
+    report["staging_path"] = json!(stage);
+    report["staging_leftover_path"] = if stage.exists() {
+        json!(stage.to_string_lossy())
+    } else {
+        Value::Null
+    };
+    report["outside_file_leftovers"] = json!(outside_leftovers);
     if let Err(error) = &result {
         report["error"] = json!(error.to_string());
     }
