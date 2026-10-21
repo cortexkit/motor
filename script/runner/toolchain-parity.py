@@ -2,6 +2,7 @@
 """Read-only inventory of the Linux runner's job-visible toolchain."""
 
 import argparse
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -14,6 +15,8 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "toolchain.json"
+LOCAL_BIN = Path("/usr/local/bin")
+HOST_ONLY_LOCAL_BIN_PATTERNS = ("motor-host*", "firecracker-*", "jailer-*")
 if 'seed' not in globals():
     seed_spec = importlib.util.spec_from_file_location('cargo_seed', HERE / 'cargo-seed.py')
     if seed_spec is None or seed_spec.loader is None:
@@ -34,6 +37,18 @@ def optional_text(path):
         return None
 
 
+def local_bin_entries(directory=LOCAL_BIN):
+    try:
+        return sorted(path.name for path in directory.iterdir()
+                      if path.is_file() and os.access(path, os.X_OK))
+    except FileNotFoundError:
+        return []
+
+
+def host_only_local_bin(name):
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in HOST_ONLY_LOCAL_BIN_PATTERNS)
+
+
 def binary_version(path, env):
     # sccache may contact a long-lived daemon even for informational commands.
     # Inventory must never start or depend on a cache server.
@@ -52,6 +67,13 @@ def binary_version(path, env):
         return {"version": None, "error": "timeout"}
     except OSError as error:
         return {"version": None, "error": str(error)}
+
+
+def tool_version(path, env, observed, version_from=None):
+    if version_from:
+        source = observed.get(version_from) or {}
+        return {"version": source.get("version"), "exit_code": source.get("exit_code", 1)}
+    return binary_version(path, env)
 
 
 def capture(manifest=None, job=False):
@@ -91,6 +113,7 @@ def capture(manifest=None, job=False):
     tools = {}
     names = {"node", "npm", "bun", "pnpm", "nats-server", "wasm-opt", "esbuild",
              "x86_64-w64-mingw32-gcc", "x86_64-w64-mingw32-g++"}
+    names.update(paths.get("tools", {}))
     names.update(paths.get("gnu_coreutils", {}))
     for directory in env["PATH"].split(":"):
         if directory:
@@ -104,8 +127,10 @@ def capture(manifest=None, job=False):
             owner = "" if job else subprocess.run(
                 ["dpkg-query", "-S", str(Path(path).resolve())], text=True,
                 capture_output=True, timeout=30).stdout.strip()
+            version = tool_version(path, env, tools,
+                                   paths.get("tools", {}).get(name, {}).get("version_from"))
             tools[name] = {"path": path, "realpath": str(Path(path).resolve()),
-                           **binary_version(path, env), "package": owner}
+                           **version, "package": owner}
             if name == 'gnutest':
                 tools[name]['sha256'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         else:
@@ -144,6 +169,7 @@ def capture(manifest=None, job=False):
         "cargo_home": str(cargo_home), "rustup_home": str(rustup_home),
         "cargo_binaries": binaries, "cargo_metadata": metadata,
         "tools": tools, "apt_packages": packages,
+        "local_bin_entries": [] if job else local_bin_entries(),
         "environment": {name: env.get(name) for name in (
             "PATH", "CC", "CXX", "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN",
             "RUSTFLAGS", "CARGO_BUILD_TARGET", "PKG_CONFIG_PATH")},
@@ -174,11 +200,45 @@ def validate(manifest):
         std = sorted(component.removeprefix("rust-std-") for component in spec["components"] if component.startswith("rust-std-"))
         if std != spec["targets"]:
             raise ValueError("Rust targets and components disagree: " + name)
-    for name, pattern in {"node": r"v\d+\.\d+\.\d+", "npm": r"\d+\.\d+\.\d+",
-                          "bun": r"\d+\.\d+\.\d+", "pnpm": r"\d+\.\d+\.\d+",
+    for name, pattern in {"node": r"v\d+\.\d+\.\d+", "node22": r"v\d+\.\d+\.\d+",
+                          "npm": r"\d+\.\d+\.\d+", "npx": r"\d+\.\d+\.\d+",
+                          "corepack": r"\d+\.\d+\.\d+", "bun": r"\d+\.\d+\.\d+",
+                          "bun-1.3.14": r"\d+\.\d+\.\d+", "pnpm": r"\d+\.\d+\.\d+",
+                          "pnpx": r"\d+\.\d+\.\d+", "pnx": r"\d+\.\d+\.\d+",
                           "nats-server": r"nats-server: v\d+\.\d+\.\d+"}.items():
-        if not re.fullmatch(pattern, manifest["tools"][name]["version"]):
+        if name in manifest["tools"] and not re.fullmatch(pattern, manifest["tools"][name]["version"]):
             raise ValueError("unpinned version: " + name)
+    archive_urls = {
+        "bun-1.3.14": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip",
+        "node22": "https://nodejs.org/dist/v22.22.1/node-v22.22.1-linux-x64.tar.xz",
+    }
+    archive_layouts = {
+        "bun-1.3.14": ("1.3.14", "zip", "/usr/local/lib/bun/1.3.14", "bin/bun",
+                        "/usr/local/bin/bun-1.3.14"),
+        "node22": ("v22.22.1", "tar.xz", "/usr/local/lib/nodejs/22.22.1", "bin/node",
+                   "/usr/local/bin/node22"),
+    }
+    for name, url in archive_urls.items():
+        if name not in manifest["tools"]:
+            continue
+        spec = manifest["tools"][name]
+        archive = spec.get("archive", {})
+        if archive.get("url") != url or not re.fullmatch(r"[a-f0-9]{64}", archive.get("sha256", "")):
+            raise ValueError("invalid pinned archive: " + name)
+        version, archive_format, install_dir, install_path, link = archive_layouts[name]
+        if (spec["version"] != version or archive.get("format") != archive_format
+                or archive.get("install_dir") != install_dir or archive.get("install_path") != install_path
+                or spec["path"] != link):
+            raise ValueError("invalid archive install layout: " + name)
+        if name == "bun-1.3.14" and archive.get("archive_path") != "bun-linux-x64/bun":
+            raise ValueError("invalid Bun archive binary: " + name)
+        if name == "node22" and archive.get("strip_components") != 1:
+            raise ValueError("invalid Node archive root: " + name)
+    for name, spec in manifest["tools"].items():
+        source = spec.get("version_from")
+        if source and (source not in manifest["tools"]
+                       or manifest["tools"][source].get("version") != spec.get("version")):
+            raise ValueError("invalid version source: " + name)
     defaults = set()
     for tool in manifest["cargo_installs"]:
         if "git" in tool:
@@ -253,8 +313,16 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
             equal(name + " version", expected["version"], version)
         elif not re.fullmatch(expected["version_pattern"], version):
             errors.append(name + ": unexpected distro tool version " + repr(version))
-        if "realpath_suffix" in expected and not observed.get("realpath", "").endswith(expected["realpath_suffix"]):
-            errors.append(name + ": wrong compiler thread model")
+        realpath_suffix = expected.get("realpath_suffix_by_role", {}).get(role, expected.get("realpath_suffix"))
+        if realpath_suffix and not observed.get("realpath", "").endswith(realpath_suffix):
+            errors.append(name + ": wrong resolved executable path")
+    if role == "build-server" and not job:
+        catalogued = {name for name, spec in manifest["tools"].items()
+                      if spec["path"].startswith(str(LOCAL_BIN) + "/")}
+        uncatalogued = sorted(name for name in actual.get("local_bin_entries", [])
+                              if name not in catalogued and not host_only_local_bin(name))
+        if uncatalogued:
+            errors.append("uncatalogued job-visible /usr/local/bin entries: " + ", ".join(uncatalogued))
     for name in manifest["gnu_coreutils"]:
         observed = tools.get(name) or {}
         equal(name + " path", manifest["gnu_coreutils"][name], observed.get("path"))

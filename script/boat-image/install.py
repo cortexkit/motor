@@ -288,7 +288,7 @@ def tools(manifest):
     gnu_aliases(manifest)
     # Fail anonymously instead of forwarding an operator's repository credentials.
     run("git", "-c", "credential.helper=", "ls-remote", "https://github.com/cortexkit/commons", "HEAD")
-    run("bash", str(ROOT / "script/runner/install-tools.sh"))
+    run("bash", str(ROOT / "script/runner/install-tools.sh"), "boat")
     marker = BUILD / "sccache-inputs.sha256"
     artifacts_path = BUILD / 'sccache-artifacts.json'
     inputs = digest(ROOT / "script/runner/build-sccache.sh") + digest(
