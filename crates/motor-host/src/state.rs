@@ -169,6 +169,8 @@ pub struct Host {
     pub(crate) restart_ms: u64,
     pub(crate) prior_alive_ms: u64,
     pub(crate) provider_managed: bool,
+    /// When the next billing-record retention pass is due; see `retention_tick`.
+    pub(crate) retention_due_ms: u64,
 }
 impl Host {
     pub fn new(
@@ -187,6 +189,7 @@ impl Host {
             restart_ms: 0,
             prior_alive_ms: 0,
             provider_managed: false,
+            retention_due_ms: 0,
         }
     }
     pub(crate) fn sandbox(ceiling: u32, snapshot: Snapshot, journal: Box<dyn Journal>) -> Self {

@@ -8,6 +8,18 @@ pub const DELIVERY_GRACE_MS: u64 = 60_000;
 pub const OUTBOX_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How many rejected requests the journal keeps for diagnosis; older ones are dropped.
 pub const REJECTED_OUTBOX_LIMIT: usize = 32;
+/// How long a finished job's billing and lease records are kept: 13 months,
+/// counted as 395 days (365 + 30). The public privacy page promises that host
+/// billing records are deleted 13 months after the job finished; a full year
+/// of history plus one month leaves the last billing period of that year time
+/// to close and be disputed before its evidence goes.
+pub const BILLING_RETENTION_MS: u64 = 395 * 24 * 60 * 60 * 1000;
+/// At most this many jobs are deleted per retention pass, so one pass after a
+/// long outage never holds the host-state mutex (and with it admission) for a
+/// large rewrite. Later passes delete the rest.
+pub const RETENTION_BATCH: usize = 256;
+/// How often the host tick runs a retention pass while nothing is left over.
+pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -476,6 +488,148 @@ impl Host {
         }
         self.save(next)?;
         Ok(true)
+    }
+    /// Runs a retention pass when one is due: every `RETENTION_INTERVAL_MS`,
+    /// or again on the next tick while a full batch was deleted, so a backlog
+    /// drains in bounded steps.
+    pub fn retention_tick(&mut self, now_ms: u64) -> Result<usize, Error> {
+        if now_ms < self.retention_due_ms {
+            return Ok(0);
+        }
+        let pruned = self.prune_retention(now_ms)?;
+        self.retention_due_ms = if pruned >= RETENTION_BATCH {
+            now_ms
+        } else {
+            now_ms.saturating_add(RETENTION_INTERVAL_MS)
+        };
+        Ok(pruned)
+    }
+    /// Deletes the billing and lease records of up to `RETENTION_BATCH` jobs
+    /// that finished more than `BILLING_RETENTION_MS` ago, and returns how
+    /// many jobs it deleted. A job's records are its lease (which carries the
+    /// account identifier), billing state, no-start report, pending cancel,
+    /// and every outbox, set-aside or rejected usage request naming it.
+    /// Expired replay nonces and job-less set-aside requests (heartbeats)
+    /// older than the retention period go in the same pass.
+    ///
+    /// A job is kept, whatever its age, while it is unsettled: its lease has
+    /// not ended, its usage report is computed but not yet queued, or a queued
+    /// report is still inside its `OUTBOX_MAX_AGE_MS` retry window. It is also
+    /// kept while its job token has not expired, because the lease record is
+    /// what refuses a replay of that token.
+    ///
+    /// The deletion is one ordinary snapshot save, so it is exactly as
+    /// crash-safe as every other state change: the journal publishes the
+    /// whole pruned snapshot with a synced write and rename, or nothing.
+    pub fn prune_retention(&mut self, now_ms: u64) -> Result<usize, Error> {
+        // Finished strictly before this instant means more than the
+        // retention period ago. Before the epoch plus one period nothing is
+        // old enough, and the saturated zero matches no finish time.
+        let cutoff = now_ms.saturating_sub(BILLING_RETENTION_MS);
+        let snapshot = &self.snapshot;
+        let retrying: std::collections::BTreeSet<&str> = snapshot
+            .outbox
+            .iter()
+            .filter(|r| now_ms.saturating_sub(r.created_ms) < OUTBOX_MAX_AGE_MS)
+            .filter_map(|r| r.job.as_deref())
+            .collect();
+        let finished_at = |job: &str| -> Option<u64> {
+            let lease = snapshot.leases.get(job);
+            if let Some(lease) = lease {
+                if lease.state != LeaseState::Ended
+                    || lease.claims.exp.saturating_mul(1000) > now_ms
+                {
+                    return None;
+                }
+            }
+            let billing = snapshot.billing.get(job);
+            if retrying.contains(job) || billing.is_some_and(|b| b.usage.is_some() && !b.enqueued) {
+                return None;
+            }
+            [
+                lease.and_then(|l| l.ended_at_ms),
+                billing.and_then(|b| b.ended_observed_ms),
+                billing.and_then(|b| b.terminal_received_ms),
+                snapshot.zero_usage.get(job).map(|u| u.ended_at_ms),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut expired = std::collections::BTreeSet::new();
+        for job in snapshot
+            .leases
+            .keys()
+            .chain(snapshot.billing.keys())
+            .chain(snapshot.zero_usage.keys())
+        {
+            if expired.len() >= RETENTION_BATCH {
+                break;
+            }
+            if seen.insert(job.as_str()) && finished_at(job).is_some_and(|end| end < cutoff) {
+                expired.insert(job.clone());
+            }
+        }
+        // A set-aside request goes with its job, or on its own age once no
+        // record of its job is left (a heartbeat, or a job pruned earlier).
+        let orphaned = |r: &Request| {
+            r.job.as_ref().map_or(true, |job| {
+                !snapshot.leases.contains_key(job)
+                    && !snapshot.billing.contains_key(job)
+                    && !snapshot.zero_usage.contains_key(job)
+            })
+        };
+        let keep = |r: &Request| {
+            !r.job.as_ref().is_some_and(|job| expired.contains(job))
+                && !(orphaned(r) && r.created_ms < cutoff)
+        };
+        let now_s = now_ms / 1000;
+        let mut next = Snapshot {
+            leases: snapshot.leases.clone(),
+            nonces: snapshot.nonces.clone(),
+            vms: snapshot.vms.clone(),
+            zero_usage: snapshot.zero_usage.clone(),
+            pending_cancels: snapshot.pending_cancels.clone(),
+            billing: snapshot.billing.clone(),
+            outbox: snapshot
+                .outbox
+                .iter()
+                .filter(|r| !r.job.as_ref().is_some_and(|job| expired.contains(job)))
+                .cloned()
+                .collect(),
+            expired_outbox: snapshot
+                .expired_outbox
+                .iter()
+                .filter(|r| keep(r))
+                .cloned()
+                .collect(),
+            rejected_outbox: snapshot
+                .rejected_outbox
+                .iter()
+                .filter(|r| keep(r))
+                .cloned()
+                .collect(),
+            counter: snapshot.counter,
+            last_alive: snapshot.last_alive,
+        };
+        next.nonces.retain(|_, until| *until >= now_s);
+        for job in &expired {
+            next.leases.remove(job);
+            next.billing.remove(job);
+            next.zero_usage.remove(job);
+            next.pending_cancels.remove(job);
+        }
+        let changed = !expired.is_empty()
+            || next.nonces.len() != snapshot.nonces.len()
+            || next.outbox.len() != snapshot.outbox.len()
+            || next.expired_outbox.len() != snapshot.expired_outbox.len()
+            || next.rejected_outbox.len() != snapshot.rejected_outbox.len();
+        if changed {
+            self.save(next)?;
+            tracing::info!(jobs = expired.len(), "billing_records_pruned");
+        }
+        Ok(expired.len())
     }
     /// Moves a request the broker can never accept out of the outbox into
     /// `rejected_outbox`, so it is kept for diagnosis but never resent.

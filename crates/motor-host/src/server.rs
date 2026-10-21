@@ -566,6 +566,7 @@ impl Runtime {
             let mut host = self.host.lock().expect("host lock");
             host.billing_tick(now_ms)?;
             let cancels = host.expire(now_ms)?;
+            host.retention_tick(now_ms)?;
             let mut quotas = Vec::new();
             let mut candidates = Vec::new();
             for tenant in self.tenant_operations.keys() {
