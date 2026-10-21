@@ -96,6 +96,166 @@ fn check_output(output: std::process::Output) -> io::Result<std::process::Output
     Ok(output)
 }
 
+fn qualification_event(
+    config: &Config,
+    id: Uuid,
+    event: &str,
+    detail: serde_json::Value,
+) -> io::Result<()> {
+    use std::io::Write;
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_millis() as u64;
+    let path = config
+        .windows
+        .as_ref()
+        .unwrap()
+        .layout_root
+        .join(format!("evidence/{id}-qualification.jsonl"));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({"unix_ms":unix_ms,"event":event,"detail":detail}),
+    )
+    .map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_data()
+}
+
+fn qualification_settle(
+    config: &Config,
+    id: Uuid,
+    worker_pid: u32,
+    dropped: std::time::Instant,
+) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIoCounters, OpenProcess, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // Qualification-only timing heuristic: production never depends on guest
+    // logs surviving power-off. Process I/O is not a disk durability barrier;
+    // the nonce-bound offline guest EOF/count assertion remains mandatory.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, worker_pid) };
+    let open_error = raw
+        .is_null()
+        .then(|| io::Error::last_os_error().to_string());
+    let process = if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+    };
+    let mut previous = None;
+    let mut last_activity = Instant::now();
+    let mut last_record = dropped;
+    let mut quiet = false;
+    let mut available = false;
+    qualification_event(
+        config,
+        id,
+        "host-io-settle-start",
+        serde_json::json!({
+            "source":"vmwp-process-io-not-per-disk", "worker_pid":worker_pid,
+            "open_error":open_error,"minimum_ms":15000,"quiet_window_ms":5000,"maximum_ms":60000,
+            "qualification_only":true,"production_log_durability_dependency":false
+        }),
+    )?;
+    while dropped.elapsed() < Duration::from_secs(60) {
+        let mut sample = None;
+        if let Some(process) = &process {
+            let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+            if unsafe { GetProcessIoCounters(process.as_raw_handle(), &mut counters) } != 0 {
+                sample = Some((counters.ReadTransferCount, counters.WriteTransferCount));
+            }
+        }
+        available = sample.is_some();
+        if sample != previous {
+            last_activity = Instant::now();
+        }
+        previous = sample;
+        let elapsed_ms = dropped.elapsed().as_millis() as u64;
+        let quiet_ms = last_activity.elapsed().as_millis() as u64;
+        if last_record.elapsed() >= Duration::from_secs(1) {
+            qualification_event(
+                config,
+                id,
+                "host-io-settle-sample",
+                serde_json::json!({
+                    "source":"vmwp-process-io-not-per-disk", "worker_pid":worker_pid,
+                    "since_drop_ms":elapsed_ms,"quiet_ms":quiet_ms,"available":available,
+                    "read_bytes":sample.map(|s|s.0),"write_bytes":sample.map(|s|s.1)
+                }),
+            )?;
+            last_record = Instant::now();
+        }
+        if super::agent::qualification_io_is_quiet(elapsed_ms, quiet_ms, available) {
+            quiet = true;
+            break;
+        }
+        std::thread::sleep(
+            Duration::from_millis(250)
+                .min(Duration::from_secs(60).saturating_sub(dropped.elapsed())),
+        );
+    }
+    qualification_event(
+        config,
+        id,
+        "host-io-settle-finished",
+        serde_json::json!({
+            "since_drop_ms":dropped.elapsed().as_millis() as u64,"available":available,
+            "io_quiet":quiet,"reason":if quiet {"observed-process-io-quiet"} else {"bounded-window-ended-unverified"},
+            "agent_log_live_observation":null
+        }),
+    )
+}
+
+fn verify_qualification_guest(
+    config: &Config,
+    id: Uuid,
+    nonce: &str,
+    written: usize,
+    dropped: std::time::Instant,
+) -> io::Result<()> {
+    let evidence = config
+        .windows
+        .as_ref()
+        .unwrap()
+        .layout_root
+        .join(format!("evidence/{id}-guest"));
+    let log = fs::read_to_string(evidence.join("hyperv-agent.log"));
+    let matches = log
+        .as_ref()
+        .is_ok_and(|text| super::agent::qualification_eof_matches(text, nonce, written));
+    qualification_event(
+        config,
+        id,
+        "offline-agent-log-observed",
+        serde_json::json!({
+            "since_drop_ms":dropped.elapsed().as_millis() as u64,"present":log.is_ok(),"current_nonce_eof_count_matches":matches,
+            "observation":"first-safe-host-observation-after-power-off-not-guest-write-time",
+            "error":log.as_ref().err().map(ToString::to_string)
+        }),
+    )?;
+    for name in ["job-disk-binding.json", "mounted-disk-identity.json"] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(evidence.join(name))?).map_err(io::Error::other)?;
+        if value["matched"] != true || value.get("error").is_some() {
+            return Err(invalid(format!(
+                "Guest disk identity assertion failed; inspect {}",
+                evidence.join(name).display()
+            )));
+        }
+    }
+    if !matches {
+        return Err(invalid("Guest EOF/read-count proof missing after bounded qualification settle; inspect guest evidence"));
+    }
+    Ok(())
+}
+
 pub(crate) struct Resources {
     config: Config,
     pub(super) id: Uuid,
@@ -289,7 +449,14 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
         .join(id.to_string());
     let mut resources = Resources::prepare(config, staging, id, workspace)?;
     let nonce = super::agent::fresh_hyperv_nonce();
+    qualification_event(config, id, "vm-prepare-start", serde_json::json!({}))?;
     resources.boot(config, &nonce)?;
+    qualification_event(
+        config,
+        id,
+        "vm-run-requested",
+        serde_json::json!({"vm_id":resources.vm_id}),
+    )?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut stream = loop {
         match resources.connect_agent() {
@@ -298,6 +465,7 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     };
+    qualification_event(config, id, "agent-connected", serde_json::json!({}))?;
     stream.set_nonblocking(true)?;
     let mut received = Vec::new();
     let hello = loop {
@@ -327,8 +495,22 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             }
         }
     };
-    let mut protocol = motor_winagent::Protocol::new(nonce)?;
+    let mut protocol = motor_winagent::Protocol::new(nonce.clone())?;
     protocol.accept(motor_winagent::Peer::Agent, &hello)?;
+    qualification_event(
+        config,
+        id,
+        "hello-validated",
+        serde_json::json!({"version":motor_winagent::PROTOCOL_VERSION}),
+    )?;
+    let inspect = checked(control(config, "QualifyInspect", Some(id), &[])?)?;
+    let inspect: serde_json::Value =
+        serde_json::from_slice(&inspect.stdout).map_err(io::Error::other)?;
+    let worker_pid = inspect["worker_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| invalid("Qualification VM worker PID unavailable"))?;
+    qualification_event(config, id, "runtime-child-identity-checked", inspect)?;
     let mut frame = Vec::new();
     motor_winagent::write_frame(
         &mut frame,
@@ -350,9 +532,18 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    qualification_event(
+        config,
+        id,
+        "partial-frame-written",
+        serde_json::json!({"announced":frame.len(),"written":written}),
+    )?;
+    let dropped = Instant::now();
     drop(stream);
-    std::thread::sleep(Duration::from_secs(3));
+    qualification_event(config, id, "stream-dropped", serde_json::json!({}))?;
+    qualification_settle(config, id, worker_pid, dropped)?;
     resources.finalize()?;
+    verify_qualification_guest(config, id, &nonce, written, dropped)?;
     let cache = config.windows.as_ref().unwrap().caches().disk(workspace);
     if cache.exists() || cache.with_extension("attached").exists() {
         return Err(invalid("disconnect left a dirty cache"));

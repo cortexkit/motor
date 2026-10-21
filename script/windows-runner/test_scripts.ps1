@@ -114,6 +114,7 @@ if (-not $remover) { throw 'FAIL removal-harvest-order: production function miss
     $Root = Join-Path ([IO.Path]::GetTempPath()) ('motor-remove-tests-' + [Guid]::NewGuid().ToString('N'))
     function Job-Path([string]$Id) { Join-Path $script:RunnerRemovalFixture.root $Id }
     function Owned-VM([string]$Id) { $script:RunnerRemovalFixture.vm }
+    function Assert-JobDiskBinding([string]$Id) { $script:RunnerRemovalFixture.calls.Add('binding') }
     function Stop-VM($VM, [switch]$TurnOff, [switch]$Force) {
         $script:RunnerRemovalFixture.calls.Add('stop')
         $script:RunnerRemovalFixture.vm.State = 'Off'

@@ -108,6 +108,26 @@ pub(super) fn fresh_hyperv_nonce() -> String {
     // this value unchanged in both the media and the host protocol expectation.
     Uuid::now_v7().simple().to_string()
 }
+#[cfg(any(windows, test))]
+pub(super) fn qualification_io_is_quiet(elapsed_ms: u64, quiet_ms: u64, available: bool) -> bool {
+    available && elapsed_ms >= 15_000 && quiet_ms >= 5_000
+}
+#[cfg(any(windows, test))]
+pub(super) fn qualification_eof_matches(log: &str, nonce: &str, written: usize) -> bool {
+    let Some((_, episode)) = log.rsplit_once(&format!("boot nonce={nonce}")) else {
+        return false;
+    };
+    episode.lines().any(|line| {
+        let Some((_, total)) = line.split_once("io read done bytes=0 total=") else {
+            return false;
+        };
+        total
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            == Some(written)
+    })
+}
 struct Registration {
     runtime: Arc<Runtime>,
     id: Uuid,
@@ -814,6 +834,25 @@ mod tests {
             nonce
         );
         assert!(motor_winagent::transport::hyperv_nonce(&Uuid::now_v7().to_string()).is_err());
+    }
+
+    #[test]
+    fn qualification_settle_requires_a_source_minimum_and_quiet_window() {
+        assert!(!qualification_io_is_quiet(14_999, 14_999, true));
+        assert!(!qualification_io_is_quiet(15_000, 4_999, true));
+        assert!(!qualification_io_is_quiet(60_000, 60_000, false));
+        assert!(qualification_io_is_quiet(15_000, 5_000, true));
+    }
+
+    #[test]
+    fn qualification_eof_proof_belongs_to_current_nonce_and_exact_count() {
+        let old = "boot nonce=old\nio read done bytes=0 total=98322\n";
+        assert!(!qualification_eof_matches(old, "current", 98322));
+        let current = format!("{old}boot nonce=current\nio read done bytes=0 total=983220\n");
+        assert!(!qualification_eof_matches(&current, "current", 98322));
+        let good = format!("{current}io read done bytes=0 total=98322\n");
+        assert!(qualification_eof_matches(&good, "current", 98322));
+        assert!(!qualification_eof_matches(&good, "current", 98323));
     }
 
     fn running_transport(stream: UnixStream, control: Arc<Control>) -> Transport {

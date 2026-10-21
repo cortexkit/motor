@@ -1,6 +1,6 @@
 # Trusted control plane. Only installed, ACL-protected copies run as SYSTEM.
 param(
-    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','GrantPrep','RevokePrep','Harvest')][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','GrantPrep','RevokePrep','Harvest','QualifyInspect')][string]$Operation,
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
     [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960, [string]$Staging,
@@ -55,10 +55,46 @@ function Assert-Isolated($VM) {
     if ((Get-VMHost).EnableEnhancedSessionMode) { throw 'Enhanced Session mode must remain disabled' }
     if ($VM.Generation -ne 2) { throw 'Job VM is not Generation 2' }
 }
+function Assert-JobDiskBinding([string]$Id) {
+    $destination = "$Root\evidence\$Id-guest"
+    New-Item -ItemType Directory -Path $destination -Force | Out-Null
+    $expected = [IO.Path]::GetFullPath("$(Job-Path $Id)\os.vhdx")
+    $binding = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); requested_child=$expected; vm_present=$false; disk_present=(Test-Path -LiteralPath $expected); matched=$false}
+    try {
+        $vm = Owned-VM $Id
+        if ($vm) {
+            $binding['vm_present'] = $true
+            $binding['vm_id'] = $vm.Id.ToString()
+            $binding['vm_state'] = [string]$vm.State
+            $os = @(Get-VMHardDiskDrive -VM $vm | Where-Object { $_.ControllerNumber -eq 0 -and $_.ControllerLocation -eq 0 })
+            if ($os.Count -ne 1) { throw 'Expected exactly one attached OS disk at controller 0/location 0' }
+            $actual = [IO.Path]::GetFullPath($os[0].Path)
+            $binding['attached_os_path'] = $actual
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expected, $actual)) { throw 'Attached OS disk does not match the owned job child; preserving resources' }
+        }
+        if ($binding.disk_present) {
+            $vhd = Get-VHD -Path $expected
+            $binding['vhd_path'] = $vhd.Path
+            $binding['parent_path'] = $vhd.ParentPath
+            $binding['vhd_type'] = [string]$vhd.VhdType
+            $binding['disk_identifier'] = [string]$vhd.DiskIdentifier
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expected, [IO.Path]::GetFullPath($vhd.Path)) -or [string]$vhd.VhdType -ne 'Differencing') { throw 'Requested evidence disk is not the owned differencing child' }
+        }
+        $binding['matched'] = $true
+        Save-Json "$destination\job-disk-binding.json" $binding
+        Evidence $Id 'job-disk-binding' $binding
+    } catch {
+        $binding['error'] = [string]$_
+        Save-Json "$destination\job-disk-binding.json" $binding
+        Evidence $Id 'job-disk-binding-failed' $binding
+        throw
+    }
+}
 function Harvest-Job([string]$Id, [switch]$Lightweight) {
     $destination = "$Root\evidence\$Id-guest"
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
     try {
+        Assert-JobDiskBinding $Id
         $vm = Owned-VM $Id
         if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
         $vm = Owned-VM $Id
@@ -84,6 +120,9 @@ function Harvest-Job([string]$Id, [switch]$Lightweight) {
     }
 }
 function Remove-Job([string]$Id, [switch]$LightweightHarvest) {
+    # A binding mismatch is not an ordinary collection failure: never delete a
+    # different attached disk after silently inspecting the expected path.
+    Assert-JobDiskBinding $Id
     $vm = Owned-VM $Id
     if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
     # Every path collects logs before destruction. Only protocol-complete jobs
@@ -101,7 +140,7 @@ function Grant([string]$Path, [string]$Permission, [string]$Sid) {
     & icacls.exe $Path /grant:r "*${Sid}:$Permission" /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Prep ACL failed at $Path" }
 }
-if ($Operation -in @('Prepare','Id','Run','Remove','Harvest')) {
+if ($Operation -in @('Prepare','Id','Run','Remove','Harvest','QualifyInspect')) {
     if ($Job -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Invalid job UUID' }
 }
 switch ($Operation) {
@@ -200,6 +239,17 @@ switch ($Operation) {
         } finally { $parentGuard.Dispose() }
     }
     'Id' { (Owned-VM $Job).Id.Guid }
+    'QualifyInspect' {
+        Assert-JobDiskBinding $Job
+        $vm = Owned-VM $Job
+        if (-not $vm -or $vm.State -ne 'Running') { throw 'Qualification VM is not Running' }
+        $inspection = @{worker_pid=0; vm_id=$vm.Id.ToString(); requested_child="$(Job-Path $Job)\os.vhdx"}
+        try {
+            $worker = Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -Filter "Name='$($vm.Id)'" -OperationTimeoutSec 2
+            $inspection.worker_pid = [uint32]$worker.ProcessID
+        } catch { $inspection['worker_pid_error'] = [string]$_ }
+        $inspection | ConvertTo-Json -Compress
+    }
     'Run' {
         $vm = Owned-VM $Job
         $directory = Job-Path $Job

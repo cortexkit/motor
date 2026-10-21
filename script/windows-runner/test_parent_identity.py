@@ -7,6 +7,29 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_guest_collection_asserts_child_attachment_and_mounted_volume(self):
+        script = (HERE / "hyperv.ps1").read_text()
+        binding = script.split("function Assert-JobDiskBinding(", 1)[1].split("function Harvest-Job(", 1)[0]
+        self.assertIn("Get-VMHardDiskDrive -VM $vm", binding)
+        self.assertIn("OrdinalIgnoreCase.Equals($expected, $actual)", binding)
+        remove = script.split("function Remove-Job(", 1)[1].split("function Grant(", 1)[0]
+        self.assertLess(remove.index("Assert-JobDiskBinding $Id"), remove.index("Remove-VM"))
+        collector = (HERE / "guest-evidence.ps1").read_text()
+        self.assertIn("Get-VHD -DiskNumber $disk.Number", collector)
+        self.assertIn("Get-Partition -DriveLetter $partition.DriveLetter", collector)
+        self.assertIn("$reverse[0].DiskNumber -ne $disk.Number", collector)
+        self.assertIn("mounted-disk-identity.json", collector)
+        self.assertNotIn("New-VHD", collector)
+
+    def test_qualification_settle_is_bounded_and_offline_proof_remains_required(self):
+        native = (HERE.parents[1] / "crates/motor-runner/src/windows/hyperv.rs").read_text()
+        self.assertIn("Qualification-only timing heuristic", native)
+        self.assertIn("while dropped.elapsed() < Duration::from_secs(60)", native)
+        self.assertIn("GetProcessIoCounters", native)
+        self.assertLess(native.index("qualification_settle(config, id, worker_pid, dropped)?"), native.index("verify_qualification_guest(config, id, &nonce, written, dropped)?"))
+        self.assertIn("super::agent::qualification_eof_matches", native)
+        self.assertIn("first-safe-host-observation-after-power-off-not-guest-write-time", native)
+
     def test_peer_targets_avoid_powershell_51_array_serialization(self):
         script = (HERE / "hyperv.ps1").read_text()
         formatter = script.split("function Convert-RunnerPeerTargets(", 1)[1].split("function Job-Path(", 1)[0]

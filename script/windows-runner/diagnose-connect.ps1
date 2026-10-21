@@ -140,8 +140,10 @@ function Get-PlainGuestItem([string]$Volume, [string]$Relative) {
     foreach ($part in $Relative.Split('\')) {
         if (-not $part -or $part -in @('.','..') -or $part.Contains(':')) { throw 'Unsafe guest diagnostic path' }
         $path = Join-Path $path $part
-        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-        if (-not $item) { return $null }
+        try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch {
+            if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return $null }
+            throw "Guest diagnostic lookup failed at $path : $_"
+        }
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Guest reparse path refused: $path" }
     }
     return $item
@@ -190,7 +192,8 @@ function Save-GuestAgentEvents([string]$Source, [string]$Channel, [string]$Desti
         } catch { Set-Content -LiteralPath "$Destination\guest-boot-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8 }
     }
 }
-function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action) {
+function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory) {
+    $identity = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); requested_path=[IO.Path]::GetFullPath($Path); read_only=$true; matched=$false}
     $mounted = $false
     $assigned = $false
     $partition = $null
@@ -198,7 +201,15 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action) {
         # Mark the mount before Get-Disk, so a failed disk query still dismounts.
         $image = Mount-VHD -Path $Path -ReadOnly -Passthru
         $mounted = $true
+        $identity['mount_returned_path'] = $image.Path
         $disk = $image | Get-Disk
+        $identity['disk_number'] = $disk.Number
+        $identity['disk_unique_id'] = [string]$disk.UniqueId
+        $identity['disk_location'] = [string]$disk.Location
+        $mapped = @(Get-VHD -DiskNumber $disk.Number)
+        $identity['mapped_vhd_paths'] = @($mapped | ForEach-Object Path)
+        if ($mapped.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($mapped[0].Path)) -or -not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($image.Path))) { throw 'Mounted disk does not map back to the requested job child' }
+        $identity['parent_path'] = $mapped[0].ParentPath
         $partitions = @(Get-Partition -DiskNumber $disk.Number | Where-Object { $_.GptType -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' })
         if ($partitions.Count -ne 1) { throw 'Expected one Windows basic-data partition' }
         $partition = $partitions[0]
@@ -208,9 +219,23 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action) {
             $partition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber
         }
         $volume = "$($partition.DriveLetter):\"
+        $reverse = @(Get-Partition -DriveLetter $partition.DriveLetter)
+        if ($reverse.Count -ne 1 -or $reverse[0].DiskNumber -ne $disk.Number -or $reverse[0].PartitionNumber -ne $partition.PartitionNumber) { throw 'Guest drive letter resolves to a different disk or partition' }
+        $volumeInfo = Get-Volume -DriveLetter $partition.DriveLetter
+        $identity['partition_number'] = $partition.PartitionNumber
+        $identity['partition_guid'] = [string]$partition.Guid
+        $identity['volume_path'] = $volume
+        $identity['volume_unique_id'] = [string]$volumeInfo.UniqueId
+        $identity['volume_label'] = [string]$volumeInfo.FileSystemLabel
+        $identity['matched'] = $true
+        if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
         $windows = Get-PlainGuestItem $volume 'Windows'
         if (-not $windows -or -not $windows.PSIsContainer) { throw 'Mounted partition is not a Windows volume' }
         & $Action $volume
+    } catch {
+        $identity['error'] = [string]$_
+        if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
+        throw
     } finally {
         try {
             if ($assigned -and $partition -and $partition.DriveLetter) { $partition | Remove-PartitionAccessPath -AccessPath "$($partition.DriveLetter):\" }
@@ -219,7 +244,7 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action) {
 }
 function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [switch]$Lightweight) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    Use-DiagnosticWindowsDisk $Disk {
+    Use-DiagnosticWindowsDisk -Path $Disk -EvidenceDirectory $Destination -Action {
         param($volume)
         $known = [ordered]@{
             'ProgramData\Motor\hyperv-agent.log' = 'Agent executable SHA/build feature, service startup, nonce/DVD wait, hvsock bind/accept/peer refusal and I/O byte counters. An EOF after this passive probe closes is expected.'
@@ -327,6 +352,8 @@ vm-settings.json: exact production Prepare configuration and attached disk/DVD p
 host-vm-events.json: this VM's Worker/VMMS lifecycle events since the diagnostic began.
 guest/guest-paths.json: explicit log/marker paths, presence, expected meaning and any
   refused reparse or copy error. An absent agent log is evidence, not silently skipped.
+guest/mounted-disk-identity.json: requested/mapped VHD paths, disk number and reverse
+  partition/drive-letter/volume identities; a mismatch refuses guest inspection.
 guest/guest-agent-binary.json: actual baked agent digest, never executed on the host.
 host-agent-binary.json: installed release's agent digest for comparison.
 guest/files/ProgramData/Motor/hyperv-agent.log: earliest agent identity and startup,
