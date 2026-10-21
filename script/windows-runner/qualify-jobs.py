@@ -237,12 +237,24 @@ fn real_gate_standard_account_cache_boundary_and_large_collection() {
     return git(path, "rev-parse", "HEAD"), git(path, "rev-parse", "HEAD^{tree}")
 
 
+def fixture_bundle(repo, bundle, commit):
+    # Match Snapshots::bundle's temporary transport refs. The runner rejects
+    # ordinary branch names and HEAD; this fixture's snapshot and tip are the
+    # same commit, so one snapshot ref supplies both required request fields.
+    bundle_ref = f"refs/ck-motor/{uuid.uuid4()}/snapshot"
+    git(repo, "update-ref", bundle_ref, commit)
+    try:
+        git(repo, "bundle", "create", str(bundle), bundle_ref)
+    finally:
+        git(repo, "update-ref", "-d", bundle_ref)
+
+
 def run(root, runner, evidence, gate):
     require_runner_service()
     repo = evidence / "fixture"
     commit, tree = fixture(repo)
     bundle = evidence / "fixture.bundle"
-    git(repo, "bundle", "create", str(bundle), "--all")
+    fixture_bundle(repo, bundle, commit)
     data = bundle.read_bytes()
     if len(data) <= 65536:
         raise RuntimeError("fixture did not produce a multi-frame bundle")

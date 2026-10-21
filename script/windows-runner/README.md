@@ -141,6 +141,11 @@ bridge errors and the successful Hello observation. Stopped services, invalid pi
 ownership and wrong Hello data fail explicitly; missing pipes during startup are
 retried within the readiness limit. Any qualification error still intentionally
 stops the service, so a post-failure `Stopped` observation is not itself a crash.
+The real-job fixture bundle advertises only a temporary
+`refs/ck-motor/<uuid>/snapshot`, matching the production snapshot transport.
+It never uses `--all`, which would also advertise forbidden branch/HEAD refs.
+The fixture uses the same commit for its snapshot and integration tip; its
+temporary ref is deleted after bundle creation, including on failure.
 
 ## Build on Linux, not on the Windows host
 

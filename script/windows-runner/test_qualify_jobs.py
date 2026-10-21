@@ -250,6 +250,46 @@ class QualificationReadinessTests(unittest.TestCase):
         ready.assert_called_once_with(self.root, self.runner, evidence)
         real_jobs.assert_not_called()
 
+    def test_fixture_bundle_refs_match_snapshot_transport_and_import_commits(self):
+        def git(repo, *args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()
+
+        repo = self.root / "fixture"
+        bundle = self.root / "fixture.bundle"
+        with patch.object(JOBS, "git", side_effect=git):
+            commit, tree = JOBS.fixture(repo)
+            JOBS.fixture_bundle(repo, bundle, commit)
+        heads = git(repo, "bundle", "list-heads", str(bundle)).splitlines()
+        self.assertEqual(len(heads), 1, heads)
+        oid, ref = heads[0].split(" ", 1)
+        self.assertEqual(oid, commit)
+        self.assertRegex(ref, r"^refs/ck-motor/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/snapshot$")
+        self.assertEqual(git(repo, "for-each-ref", "--format=%(refname)", "refs/ck-motor/"), "")
+        self.assertGreater(bundle.stat().st_size, 65536)
+        git(repo, "bundle", "verify", str(bundle))
+        mirror = self.root / "mirror.git"
+        mirror.mkdir()
+        git(mirror, "init", "--bare")
+        git(mirror, "fetch", "--no-tags", "--no-write-fetch-head", str(bundle), ref)
+        # Both request commit fields equal commit; verify it and its tree from
+        # an empty mirror, not from the source repository that already had them.
+        self.assertEqual(git(mirror, "cat-file", "-t", commit), "commit")
+        self.assertEqual(git(mirror, "rev-parse", commit + "^{tree}"), tree)
+        print("PASS fixture-bundle-list-heads " + heads[0], flush=True)
+
+    def test_fixture_bundle_cleans_temporary_ref_after_creation_failure(self):
+        def git(repo, *args):
+            if args[:2] == ("bundle", "create"):
+                raise RuntimeError("fixture bundle creation failed")
+            return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()
+
+        repo = self.root / "fixture"
+        with patch.object(JOBS, "git", side_effect=git):
+            commit, _ = JOBS.fixture(repo)
+            with self.assertRaisesRegex(RuntimeError, "fixture bundle creation failed"):
+                JOBS.fixture_bundle(repo, self.root / "fixture.bundle", commit)
+        self.assertEqual(git(repo, "for-each-ref", "--format=%(refname)", "refs/ck-motor/"), "")
+
 
 if __name__ == "__main__":
     unittest.main()
