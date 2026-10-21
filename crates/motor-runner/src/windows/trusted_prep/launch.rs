@@ -25,6 +25,8 @@ pub(super) enum DiagnosticPolicy {
     RestrictedCode,
     DefaultDaclRestrictedCode,
     FetchDefaultDaclRestrictedCode,
+    DefaultDaclProbeFirst,
+    DefaultDaclCargoTwice,
 }
 impl DiagnosticPolicy {
     pub(super) fn changes_default_dacl(self) -> bool {
@@ -33,6 +35,8 @@ impl DiagnosticPolicy {
             Self::DefaultDacl
                 | Self::DefaultDaclRestrictedCode
                 | Self::FetchDefaultDaclRestrictedCode
+                | Self::DefaultDaclProbeFirst
+                | Self::DefaultDaclCargoTwice
         )
     }
     pub(super) fn adds_restricted_code(self) -> bool {
@@ -48,7 +52,7 @@ impl DiagnosticPolicy {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
     root: PathBuf,
@@ -62,6 +66,8 @@ struct Plan {
     stderr: PathBuf,
     #[serde(default)]
     diagnostic_policy: DiagnosticPolicy,
+    #[serde(default)]
+    diagnostic_loader_trace: bool,
 }
 
 fn step(name: &str, error: impl std::fmt::Display) -> io::Error {
@@ -159,6 +165,7 @@ fn run_plan(
             .collect(),
         restricted,
         diagnostic_policy: policy,
+        diagnostic_loader_trace: retain_failure,
         report: root.join("evidence").join(format!("prep-launch-{id}.json")),
         stdout: cwd.join("fetch-temp").join(format!("{id}.stdout")),
         stderr: cwd.join("fetch-temp").join(format!("{id}.stderr")),
@@ -243,17 +250,13 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
     if plan.diagnostic_policy != DiagnosticPolicy::None
         && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
             || (if plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode {
-                plan.args
-                    != [
-                        "fetch",
-                        "--locked",
-                        "--offline",
-                        "--manifest-path",
-                        plan.cwd
-                            .join("fetch-manifests/matrix-fixture/Cargo.toml")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ]
+                plan.args.len() != 5
+                    || plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]
+                    || Path::new(&plan.args[4])
+                        != plan
+                            .cwd
+                            .join("fetch-manifests/matrix-fixture")
+                            .join("Cargo.toml")
             } else {
                 plan.args != ["--version"]
             })
@@ -261,13 +264,14 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
     {
         return Err(step(
             "diagnostic-policy",
-            "controls are limited to restricted Cargo version or the fixed offline fixture",
+            format!("controls are limited to restricted Cargo version or the fixed offline fixture; actual_args={:?}; expected_manifest={:?}",plan.args,plan.cwd.join("fetch-manifests/matrix-fixture").join("Cargo.toml")),
         ));
     }
     let mut report = json!({"phase":"session-setup", "program":plan.program, "arguments":plan.args,
         "restricted":plan.restricted, "cwd":plan.cwd, "profile_loaded":false,
         "inherit_handles":"explicit stdin/stdout/stderr allow-list only", "active_process_limit":32,
-        "creation_flags":format!("0x{:08X}", process::CREATION_FLAGS)});
+        "creation_flags":format!("0x{:08X}", process::CREATION_FLAGS | if plan.diagnostic_loader_trace { windows_sys::Win32::System::Threading::DEBUG_ONLY_THIS_PROCESS } else { 0 }),
+        "diagnostic_loader_trace":plan.diagnostic_loader_trace});
     let save = |report: &Value| -> io::Result<()> {
         session::write_private(
             &plan.report,
@@ -283,6 +287,22 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         report["profile_loaded"] = json!(true);
         report["phase"] = json!("create-process");
         save(&report)?;
+        if plan.diagnostic_policy == DiagnosticPolicy::DefaultDaclProbeFirst {
+            let mut preflight_plan = plan.clone();
+            preflight_plan.stdout = plan.stdout.with_extension("preflight.stdout");
+            let mut released = true;
+            let preflight = diagnostic_write_probe(&preflight_plan, &context, &mut released);
+            if !released {
+                std::mem::forget(context);
+                report["cleanup_deferred"] = json!("unreaped preflight probe");
+                return Err(step("preflight-probe", "child not reaped"));
+            }
+            report["preflight_probe"] = match preflight {
+                Ok(proof) => proof,
+                Err(error) => json!({"error":error.to_string()}),
+            };
+            save(&report)?;
+        }
         let mut released = true;
         let child = process::run(&plan, &context, &mut released);
         if !released {
@@ -305,6 +325,27 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         report["exit_status"] = json!(process_status::describe(code));
         report["stdout"] = json!(bounded_text(&plan.stdout)?);
         report["stderr"] = json!(bounded_text(&plan.stderr)?);
+        if plan.diagnostic_loader_trace {
+            report["process_diagnostics"] = diagnostic_process_report(&plan);
+        }
+        if plan.diagnostic_policy == DiagnosticPolicy::DefaultDaclCargoTwice {
+            let mut retry = plan.clone();
+            retry.stdout = plan.stdout.with_extension("retry.stdout");
+            retry.stderr = plan.stderr.with_extension("retry.stderr");
+            let mut released = true;
+            let outcome = process::run(&retry, &context, &mut released);
+            if !released {
+                std::mem::forget(context);
+                report["cleanup_deferred"] = json!("unreaped second Cargo");
+                return Err(step("retry-cargo", "child not reaped"));
+            }
+            report["second_cargo"] = match outcome {
+                Ok(exit) => {
+                    json!({"exit_code":exit,"exit_status":process_status::describe(exit),"process_diagnostics":diagnostic_process_report(&retry),"stdout":bounded_text(&retry.stdout)?,"stderr":bounded_text(&retry.stderr)?})
+                }
+                Err(error) => json!({"error":error.to_string()}),
+            };
+        }
         if plan.diagnostic_policy.checks_writes() {
             // Reuse the exact created token, profile and desktop: relogging the
             // account here would invalidate the write-boundary comparison.
@@ -425,6 +466,7 @@ fn diagnostic_write_probe(
         stdout: plan.stdout.with_extension("write-probe.stdout"),
         stderr: plan.stderr.with_extension("write-probe.stderr"),
         diagnostic_policy: DiagnosticPolicy::None,
+        diagnostic_loader_trace: plan.diagnostic_loader_trace,
     };
     let result = process::run(&probe, context, released);
     let code = result?;
@@ -438,6 +480,23 @@ fn diagnostic_write_probe(
     }
     Ok(
         json!({"same_token_as_primary":true,"exit_code":code,"exit_status":process_status::describe(code),
-        "stdout":bounded_text(&probe.stdout)?,"stderr":bounded_text(&probe.stderr)?,"proof":proof}),
+        "stdout":bounded_text(&probe.stdout)?,"stderr":bounded_text(&probe.stderr)?,"proof":proof,
+        "process_diagnostics":if plan.diagnostic_loader_trace { Some(diagnostic_process_report(&probe)) } else { None }}),
+    )
+}
+
+fn diagnostic_process_report(plan: &Plan) -> Value {
+    let path = plan.stdout.with_extension("process.json");
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({"error":"missing process diagnostics","path":path}))
+}
+
+fn save_process_report(plan: &Plan, value: &Value) -> io::Result<()> {
+    session::write_private(
+        &plan.stdout.with_extension("process.json"),
+        &serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
+        false,
     )
 }

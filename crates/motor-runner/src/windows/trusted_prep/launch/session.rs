@@ -743,7 +743,8 @@ impl Session {
             "diagnostic_policy":plan.diagnostic_policy,
             "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":"medium",
             "desktop_dacl":format!("D:P(A;;GA;;;{logon_sid})"), "profile_loaded":true, "user_environment_block":true,
-            "environment_keys":env.keys().collect::<Vec<_>>(), "temp":env["TEMP"], "tmp":env["TMP"], "userprofile":env["USERPROFILE"]});
+            "environment_keys":env.keys().collect::<Vec<_>>(), "temp":env["TEMP"], "tmp":env["TMP"], "userprofile":env["USERPROFILE"],
+            "diagnostic_environment":if plan.diagnostic_loader_trace { Some(json!({"CARGO_HOME":env.get("CARGO_HOME"),"RUSTUP_HOME":env.get("RUSTUP_HOME"),"RUSTC":env.get("RUSTC")})) } else { None }});
         let environment = motor_winagent::environment::encode_block(&env)?;
         Ok(Self {
             grant,
@@ -1087,4 +1088,24 @@ fn set_diagnostic_default_dacl(
         )
     })?;
     Ok(security)
+}
+
+pub(super) fn kernel_object_details(object: HANDLE) -> io::Result<Value> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut security = null_mut();
+    win32_code("diagnostic-process-thread-sd", unsafe {
+        GetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut security,
+        )
+    })?;
+    let _security = Local(security);
+    Ok(json!({"owner":sid_string(owner)?, "dacl":acl_details(dacl)?}))
 }

@@ -159,8 +159,8 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         for name in ("cargo-version-logon-default-dacl-diagnostic-only", "cargo-version-logon-and-restricted-code-diagnostic-only", "cargo-version-logon-restricted-code-default-dacl-diagnostic-only", "cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only"):
             self.assertCodeIn(name, self.prep)
         self.assertCodeIn("plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode", self.launch)
-        self.assertCodeIn('["fetch", "--locked", "--offline", "--manifest-path",', self.launch)
-        self.assertCodeIn('plan.cwd.join("fetch-manifests/matrix-fixture/Cargo.toml")', self.launch)
+        self.assertCodeIn('plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]', self.launch)
+        self.assertCodeIn('Path::new(&plan.args[4]) != plan.cwd.join("fetch-manifests/matrix-fixture").join("Cargo.toml")', self.launch)
         self.assertCodeIn('command.args(["fetch", "--locked", "--offline", "--manifest-path"])', self.prep)
         self.assertCodeIn('command.env("RUSTC", &rustc)', self.prep)
 
@@ -178,6 +178,38 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("let outcome = attempt(&path)?", self.prep)
         self.assertNotIn("directory.exists()", self.prep)
         self.assertCodeIn('"staging_write_probe_passed":boundary', self.prep)
+
+    def test_loader_debugging_is_diagnostic_only_and_reads_native_messages(self):
+        process = self.process
+        trace = (WINDOWS / "trusted_prep/launch/process/trace.rs").read_text()
+        self.assertCodeIn("diagnostic_loader_trace: retain_failure", self.launch)
+        self.assertCodeIn("if plan.diagnostic_loader_trace { DEBUG_ONLY_THIS_PROCESS } else { 0 }", process)
+        self.assertCodeIn("if plan.diagnostic_loader_trace {", process)
+        self.assertCodeIn("trace::wait(plan, tree.process.0, deadline)", process)
+        for api in ("WaitForDebugEventEx", "ContinueDebugEvent", "ReadProcessMemory", "OUTPUT_DEBUG_STRING_EVENT", "LOAD_DLL_DEBUG_EVENT", "EXCEPTION_DEBUG_EVENT"):
+            self.assertCodeIn(api, trace)
+        self.assertCodeIn("super::session::kernel_object_details(handle)", process)
+        self.assertCodeIn("inspect(tree.process.0)", process)
+        self.assertCodeIn("inspect(thread.0)", process)
+        self.assertCodeIn('"CARGO_HOME":env.get("CARGO_HOME")', self.session)
+        self.assertCodeIn('"RUSTUP_HOME":env.get("RUSTUP_HOME")', self.session)
+        self.assertCodeIn("DefaultDaclProbeFirst", self.launch)
+        self.assertCodeIn("DefaultDaclCargoTwice", self.launch)
+
+    def test_loader_snap_flags_are_reverted_and_no_external_debugger_is_needed(self):
+        flags = (HERE / "loader-snaps.ps1").read_text()
+        self.assertCodeIn("@('cargo.exe','rustc.exe')", flags)
+        self.assertCodeIn("$flags -bor 2", flags)
+        self.assertLess(flags.index("Save-RunnerLoaderState $snapshot $state"), flags.index("$key.SetValue('GlobalFlag', $entry.applied_value"))
+        self.assertCodeIn("Restore-RunnerLoaderState $Registry $state.entries", flags)
+        self.assertCodeIn("$key.SetValue('GlobalFlag', $entry.original, $kind)", flags)
+        self.assertCodeIn("$key.DeleteValue('GlobalFlag', $false)", flags)
+        self.assertCodeIn("$Registry.DeleteSubKey($path, $false)", flags)
+        self.assertCodeIn("Invoke-RunnerLoaderSnaps $Evidence", (HERE / "qualify.ps1").read_text())
+        fixtures = (HERE / "test_scripts.ps1").read_text()
+        self.assertCodeIn("loader-snaps-restores-original-type-and-missing-key", fixtures)
+        self.assertCodeIn("loader-snaps-restores-after-failed-native-action", fixtures)
+        self.assertCodeIn("'loader-snaps.ps1'", (HERE / "install.ps1").read_text())
 
 
 if __name__ == "__main__":

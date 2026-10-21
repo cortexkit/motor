@@ -118,7 +118,7 @@ qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
-This stops MotorRunner and runs eleven probe/Cargo/rustc token comparisons without
+This stops MotorRunner and runs thirteen probe/Cargo/rustc token comparisons without
 VM qualification. It records requested token flags separately from actual
 `IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
 The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
@@ -130,6 +130,18 @@ reuse one created token/profile/desktop per cell. Readbacks retain default DACLs
 before/after and actual writes to selected staging/outside/profile/cache paths.
 Matrix completion is evidence collection, not a pass or
 permission to enable fleet routing. Leave the service stopped for evidence review.
+This diagnostic lane temporarily ORs `FLG_SHOW_LDR_SNAPS` (`0x2`) into the
+64-bit Image File Execution Options (IFEO) `GlobalFlag` values for `cargo.exe`
+and `rustc.exe`, and restores the
+exact original value kinds/contents (or absence) in `finally`. It records the
+snapshot and verified restoration in `loader-snaps-registry.json`; do not kill
+the wrapper while it is restoring these settings. The release includes its own
+native debug-event collector, so no gflags, WinDbg or new host installation is
+required. Protected `*.loader.jsonl` evidence contains Windows DLL-load events,
+loader debug strings and exceptions. Process/thread security-descriptor readbacks
+and actual Cargo/Rustup-home values accompany each diagnostic launch. The last
+two cells isolate runner-before-Cargo and repeated-Cargo ordering on one token.
+Production launches do not enable loader snaps or debugger creation flags.
 
 Peer qualification starts the victim alone and records its VM-matched Hyper-V
 Worker/Admin OS-boot event 18601, then waits at least 20 seconds before starting

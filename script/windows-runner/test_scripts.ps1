@@ -264,6 +264,59 @@ $count++
         }
     }
 
+    & {
+        . "$PSScriptRoot\loader-snaps.ps1"
+        if (-not ('Motor.LoaderRegistryFixture' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using Microsoft.Win32;
+namespace Motor {
+    public sealed class LoaderKeyFixture {
+        public readonly Dictionary<string, object> Values = new Dictionary<string, object>();
+        public readonly Dictionary<string, RegistryValueKind> Kinds = new Dictionary<string, RegistryValueKind>();
+        public string[] GetValueNames() { var names = new string[Values.Count]; Values.Keys.CopyTo(names, 0); return names; }
+        public string[] GetSubKeyNames() { return new string[0]; }
+        public object GetValue(string name) { return Values.ContainsKey(name) ? Values[name] : null; }
+        public object GetValue(string name, object fallback, RegistryValueOptions options) { return Values.ContainsKey(name) ? Values[name] : fallback; }
+        public RegistryValueKind GetValueKind(string name) { return Kinds[name]; }
+        public void SetValue(string name, object value, RegistryValueKind kind) { Values[name] = value; Kinds[name] = kind; }
+        public void DeleteValue(string name, bool missing) { Values.Remove(name); Kinds.Remove(name); }
+        public void Dispose() { }
+    }
+    public sealed class LoaderRegistryFixture {
+        public readonly Dictionary<string, LoaderKeyFixture> Keys = new Dictionary<string, LoaderKeyFixture>();
+        public LoaderKeyFixture OpenSubKey(string path, bool writable) { return Keys.ContainsKey(path) ? Keys[path] : null; }
+        public LoaderKeyFixture CreateSubKey(string path) { if (!Keys.ContainsKey(path)) Keys[path] = new LoaderKeyFixture(); return Keys[path]; }
+        public void DeleteSubKey(string path, bool missing) { Keys.Remove(path); }
+    }
+}
+'@
+        }
+        $directory = Join-Path ([IO.Path]::GetTempPath()) ('motor-loader-registry-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $directory | Out-Null
+        $prefix = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\'
+        $fake = [Motor.LoaderRegistryFixture]::new()
+        $cargoKey = $fake.CreateSubKey($prefix + 'cargo.exe')
+        $cargoKey.SetValue('GlobalFlag', 256, [Microsoft.Win32.RegistryValueKind]::DWord)
+        try {
+            Invoke-RunnerLoaderSnaps $directory {
+                if ($fake.OpenSubKey($prefix + 'cargo.exe',$true).GetValue('GlobalFlag') -cne '00000102' -or $fake.OpenSubKey($prefix + 'rustc.exe',$true).GetValue('GlobalFlag') -cne '00000002') { throw 'Fixture did not enable exactly the loader-snaps bit' }
+            } $fake
+            $saved = [IO.File]::ReadAllText((Join-Path $directory 'loader-snaps-registry.json')) | ConvertFrom-Json
+            if ($cargoKey.GetValue('GlobalFlag') -ne 256 -or $cargoKey.GetValueKind('GlobalFlag') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $null -ne $fake.OpenSubKey($prefix + 'rustc.exe',$true) -or $saved.restore_errors.Count -ne 0 -or @($saved.entries | Where-Object { -not $_.restored }).Count) { throw 'FAIL loader-snaps-restores-original-type-and-missing-key' }
+            Write-Host 'PASS loader-snaps-restores-original-type-and-missing-key'; $script:count++
+            Remove-Item -LiteralPath (Join-Path $directory 'loader-snaps-registry.json')
+            $cargoKey.SetValue('GlobalFlag','00000400',[Microsoft.Win32.RegistryValueKind]::String)
+            $rustcKey = $fake.CreateSubKey($prefix + 'rustc.exe')
+            $rustcKey.SetValue('OtherValue','preserve',[Microsoft.Win32.RegistryValueKind]::String)
+            $denied = $false
+            try { Invoke-RunnerLoaderSnaps $directory { throw 'Fixture loader trace action failed' } $fake } catch { if ([string]$_ -notlike '*Fixture loader trace action failed*') { throw }; $denied = $true }
+            if (-not $denied -or $cargoKey.GetValue('GlobalFlag') -cne '00000400' -or $cargoKey.GetValueKind('GlobalFlag') -ne [Microsoft.Win32.RegistryValueKind]::String -or $rustcKey.GetValueNames() -contains 'GlobalFlag' -or $rustcKey.GetValue('OtherValue') -cne 'preserve') { throw 'FAIL loader-snaps-restores-after-failed-native-action' }
+            Write-Host 'PASS loader-snaps-restores-after-failed-native-action'; $script:count++
+        } finally { Remove-Item -LiteralPath $directory -Recurse -Force }
+    }
+
     # The fixed header independently pins the big-endian Hello wire format.
     $payload = [Text.Encoding]::UTF8.GetBytes('{"kind":"hello","version":4,"nonce":"0123456789abcdef0123456789abcdef"}')
     if ($payload.Length -ne 71) { throw 'Hello wire fixture length changed' }

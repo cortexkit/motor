@@ -12,6 +12,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::*,
     System::{JobObjects::*, Threading::*},
 };
+mod trace;
 pub(super) const CREATION_FLAGS: u32 =
     CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
 
@@ -175,6 +176,12 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
     );
     let mut command = wide(&arguments.join(" "));
     let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    let flags = CREATION_FLAGS
+        | if plan.diagnostic_loader_trace {
+            DEBUG_ONLY_THIS_PROCESS
+        } else {
+            0
+        };
     check("CreateProcessAsUser", unsafe {
         CreateProcessAsUserW(
             session.token(),
@@ -183,7 +190,7 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
             null(),
             null(),
             1,
-            CREATION_FLAGS,
+            flags,
             session.environment.as_ptr().cast(),
             wide(&plan.cwd.to_string_lossy()).as_ptr(),
             &startup.StartupInfo,
@@ -214,10 +221,30 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
         reaped: false,
         released,
     };
+    if plan.diagnostic_loader_trace {
+        check("DebugSetProcessKillOnExit", unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::DebugSetProcessKillOnExit(1)
+        })?;
+        let inspect = |handle| {
+            super::session::kernel_object_details(handle)
+                .unwrap_or_else(|error| serde_json::json!({"error":error.to_string()}))
+        };
+        super::save_process_report(
+            plan,
+            &serde_json::json!({"pid":info.dwProcessId,"tid":info.dwThreadId,
+            "creation_flags":format!("0x{flags:08X}"),"process_security":inspect(tree.process.0),"thread_security":inspect(thread.0),
+            "loader_trace":trace::path(plan),"native_debugger":"DEBUG_ONLY_THIS_PROCESS; Windows loader snaps from temporary IFEO flags"}),
+        )?;
+    }
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
         return Err(step("resume-prep-child", io::Error::last_os_error()));
     }
     let deadline = Instant::now() + Duration::from_secs(600);
+    if plan.diagnostic_loader_trace {
+        let code = trace::wait(plan, tree.process.0, deadline)?;
+        tree.reap()?;
+        return Ok(code);
+    }
     loop {
         match unsafe { WaitForSingleObject(tree.process.0, 50) } {
             WAIT_OBJECT_0 => break,

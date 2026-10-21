@@ -41,7 +41,8 @@ function Copy-QualificationEvidence {
 if ($PrepLaunchMatrix) {
     $service = Get-Service MotorRunner
     if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
-    try { $null = Runner-Check 'qualify-prep-matrix' } finally {
+    . "$PSScriptRoot\loader-snaps.ps1"
+    try { Invoke-RunnerLoaderSnaps $Evidence { $null = Runner-Check 'qualify-prep-matrix' } } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Matrix evidence copy failed: $_" -WarningAction Continue }
     }
     return

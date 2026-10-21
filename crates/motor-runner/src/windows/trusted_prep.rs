@@ -549,12 +549,14 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
     )?;
     fs::write(fixture.join("src/lib.rs"), "")?;
     let cargo = root.join("prep-toolchain/bin/cargo.exe");
-    if format!("{:x}", Sha256::digest(fs::read(&cargo)?))
-        != vm.prep_cargo_sha256.to_ascii_lowercase()
-    {
+    let cargo_sha256 = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
+    if cargo_sha256 != vm.prep_cargo_sha256.to_ascii_lowercase() {
         return Err(invalid("matrix cargo SHA-256 mismatch"));
     }
     let rustc = root.join("prep-toolchain/bin/rustc.exe");
+    let toolchain_identity = serde_json::json!({"cargo_sha256":cargo_sha256,"cargo_pin":vm.prep_cargo_sha256,
+        "rustc_sha256":format!("{:x}",Sha256::digest(fs::read(&rustc)?)),"source":"official prebuilt Rust components, not rustup proxies",
+        "rustup_executable_present":root.join("prep-toolchain/bin/rustup.exe").exists()});
     let outside = PathBuf::from(r"C:\Windows\Temp").join(format!("motor-prep-matrix-{id}.txt"));
     let report_path = root
         .join("evidence")
@@ -569,8 +571,9 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
             &["-Staging".into(), stage.to_string_lossy().into()],
         )?)?;
         use launch::DiagnosticPolicy::{
-            DefaultDacl, DefaultDaclRestrictedCode, Everyone, ExplicitDesktopWrites,
-            FetchDefaultDaclRestrictedCode, None as Production, RestrictedCode,
+            DefaultDacl, DefaultDaclCargoTwice, DefaultDaclProbeFirst, DefaultDaclRestrictedCode,
+            Everyone, ExplicitDesktopWrites, FetchDefaultDaclRestrictedCode, None as Production,
+            RestrictedCode,
         };
         for (index, name, program, restricted, policy) in [
             (1, "probe-base", &probe, false, Production),
@@ -631,6 +634,20 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 &cargo,
                 true,
                 FetchDefaultDaclRestrictedCode,
+            ),
+            (
+                12,
+                "default-dacl-runner-first-then-cargo",
+                &cargo,
+                true,
+                DefaultDaclProbeFirst,
+            ),
+            (
+                13,
+                "default-dacl-cargo-twice-same-token",
+                &cargo,
+                true,
+                DefaultDaclCargoTwice,
             ),
         ] {
             let mut command = Command::new(program);
@@ -697,7 +714,8 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 "note":if index == 7 { "Production already grants logon SID GENERIC_ALL; this repeats with explicit full write masks to test mapping, not a new principal" } else { "" }}));
             launch::write_diagnostic_update(
                 &report_path,
-                &serde_json::json!({"diagnostic_only":true,"production_policy_unchanged":true,"cells":cells}),
+                &serde_json::json!({"diagnostic_only":true,"production_policy_unchanged":true,"cells":cells,
+                    "toolchain_identity":toolchain_identity}),
             )?;
             if deferred {
                 deferred_cleanup = true;
