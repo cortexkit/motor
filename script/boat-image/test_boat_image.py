@@ -393,22 +393,196 @@ class RecipeTests(unittest.TestCase):
             start.storage_identity()
         users.samefile.assert_called_once_with(state / 'state/workspaces')
 
-    def test_storage_watch_withdraws_readiness_and_stays_failed_closed(self):
+    @contextlib.contextmanager
+    def storage_watch_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
-            evidence, marker = Path(tmp, 'evidence'), Path(tmp, 'ready')
+            evidence, marker, health, lock = (Path(tmp, name) for name in ('evidence', 'ready', 'health.json', 'lock'))
             evidence.write_text(json.dumps({'identity': [1792, 128, 131]}))
             marker.touch()
-            observations = []
-            def pause(_):
-                observations.append(marker.exists())
-                marker.touch()  # A restarting endpoint cannot restore admission.
-                if len(observations) == 3:
-                    raise InterruptedError('stop watcher')
             with patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'ENDPOINT_READY', marker), \
-                 patch.object(start, 'storage_identity', side_effect=[(1792, 128, 131), RuntimeError('view lost'), (1792, 128, 131)]), \
-                 self.assertRaises(InterruptedError):
+                 patch.object(start, 'STORAGE_HEALTH', health), patch.object(start, 'STORAGE_LOCK', lock), \
+                 patch.object(start, 'storage_identity', return_value=(1792, 128, 131)), \
+                 patch.object(start, 'notify_systemd'):
+                yield evidence, marker, health
+
+    def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def read_evidence():
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+                raise ValueError('bad evidence')
+            with patch.object(start, 'STORAGE_EVIDENCE', Mock(read_text=read_evidence)), \
+                 self.assertRaisesRegex(ValueError, 'bad evidence'):
+                start.watch_storage()
+            self.assertFalse(marker.exists())
+
+    def test_storage_watch_withdraws_before_logging_even_when_logging_fails(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def pause(_):
+                marker.touch()
+            def log(*args, **kwargs):
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+                raise BrokenPipeError('journal unavailable')
+            with patch.object(start, 'storage_identity', side_effect=[(1792, 128, 131), RuntimeError('view lost')]), \
+                 patch('builtins.print', side_effect=log), self.assertRaises(BrokenPipeError):
                 start.watch_storage(pause=pause)
-            self.assertEqual(observations, [True, False, False])
+            self.assertFalse(marker.exists())
+
+    def test_storage_watch_all_loop_exceptions_withdraw_and_escape(self):
+        for source in ('evidence_json', 'evidence_missing', 'identity', 'pause', 'notify', 'health_write'):
+            with self.subTest(source=source), self.storage_watch_paths() as (evidence, marker, health), contextlib.ExitStack() as stack:
+                if source == 'evidence_json':
+                    evidence.write_text('{')
+                elif source == 'evidence_missing':
+                    evidence.unlink()
+                elif source == 'identity':
+                    stack.enter_context(patch.object(start, 'storage_identity', side_effect=ValueError('stat failed')))
+                elif source == 'notify':
+                    stack.enter_context(patch.object(start, 'notify_systemd', side_effect=OSError('notify failed')))
+                elif source == 'health_write':
+                    original = start.write_storage_health
+                    def write(status, identity=None):
+                        if status == 'healthy':
+                            raise OSError('health write failed')
+                        original(status, identity)
+                    stack.enter_context(patch.object(start, 'write_storage_health', side_effect=write))
+                def pause(_):
+                    marker.touch()
+                    raise InterruptedError('pause failed')
+                with self.assertRaises((OSError, ValueError)):
+                    start.watch_storage(pause=pause)
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_unlink_failure_is_fatal_and_cleanup_retries(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            unlink, attempts = Path.unlink, []
+            def remove(path, **kwargs):
+                if path == marker:
+                    attempts.append(path)
+                    if len(attempts) == 1:
+                        raise PermissionError('unlink failed')
+                return unlink(path, **kwargs)
+            with patch.object(Path, 'unlink', remove), self.assertRaises(PermissionError):
+                start.watch_storage()
+            self.assertGreaterEqual(len(attempts), 2)
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_failed_revocation_write_cannot_leave_healthy_lease(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            original, revocations = start.write_storage_health, []
+            def write(status, identity=None):
+                if status == 'unhealthy':
+                    revocations.append(status)
+                    if len(revocations) > 1:
+                        raise OSError('cannot write unhealthy state')
+                original(status, identity)
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                marker.touch()
+                raise InterruptedError('stop watcher')
+            with patch.object(start, 'write_storage_health', side_effect=write), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertFalse(marker.exists())
+            self.assertFalse(health.exists(), 'failed revocation must invalidate the old healthy lease')
+
+    def test_storage_watch_heartbeats_only_after_completed_polls_and_never_publishes(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            notifications, pauses = [], []
+            def notify(message):
+                notifications.append(message)
+                self.assertFalse(marker.exists())
+                status = 'unhealthy' if message == 'READY=1' else 'healthy'
+                self.assertEqual(json.loads(health.read_text())['status'], status)
+            def pause(seconds):
+                pauses.append(seconds)
+                self.assertFalse(marker.exists())
+                state = json.loads(health.read_text())
+                self.assertEqual(state['status'], 'healthy')
+                self.assertEqual(state['identity'], [1792, 128, 131])
+                self.assertGreater(state['expires_monotonic_ns'], start.time.monotonic_ns())
+                self.assertLessEqual(state['expires_monotonic_ns'], start.time.monotonic_ns() + 5_000_000_000)
+                self.assertEqual(health.stat().st_mode & 0o777, 0o600)
+                if len(pauses) == 2:
+                    raise InterruptedError('stop watcher')
+            with self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause, notify=notify)
+            self.assertEqual(notifications, ['READY=1', 'WATCHDOG=1'])
+            self.assertEqual(pauses, [1, 1])
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_restart_requires_matching_identity_before_healthy(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            for identity in ((1792, 128, 999), (1792, 128, 999)):
+                marker.touch()
+                with patch.object(start, 'storage_identity', return_value=identity), self.assertRaises(RuntimeError):
+                    start.watch_storage()
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                self.assertFalse(marker.exists())
+                raise InterruptedError('stop recovered watcher')
+            with self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_storage_watch_clean_exit_in_poll_is_still_a_failure(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def pause(_):
+                marker.touch()
+                raise SystemExit(0)
+            with self.assertRaisesRegex(RuntimeError, 'exited during a poll'):
+                start.watch_storage(pause=pause)
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_health_lease_expires_without_further_polls(self):
+        with self.storage_watch_paths() as (_, _, health), patch.object(start.time, 'monotonic_ns', return_value=100):
+            start.write_storage_health('healthy', (1792, 128, 131))
+            self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 5_000_000_100)
+            start.withdraw_storage()
+            self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 0)
+
+    def test_storage_watch_unit_has_watchdog_cleanup_and_explicit_crash_limit(self):
+        unit = (HERE / 'motor-boat-storage-watch.service').read_text()
+        for setting in ('Type=notify', 'NotifyAccess=main', 'WatchdogSec=5', 'Restart=on-failure',
+                        'RestartSec=1', 'StartLimitIntervalSec=60', 'StartLimitBurst=5',
+                        'RuntimeDirectory=motor-boat-storage', 'RuntimeDirectoryMode=0700',
+                        'RuntimeDirectoryPreserve=yes',
+                        'ExecStopPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --withdraw-storage'):
+            self.assertIn(setting, unit)
+
+    def test_image_config_gates_the_endpoint_marker_writer_on_watcher_health(self):
+        writes = {}
+        with patch.object(install, 'target_directories'), patch.object(install, 'accounts'), \
+             patch.object(install, 'install_units'), patch.object(install, 'state'), \
+             patch.object(install, 'run', return_value='8'), patch.object(Path, 'mkdir'), patch.object(Path, 'unlink'), \
+             patch.object(Path, 'read_text', return_value='Include /etc/ssh/sshd_config.d/*.conf\n'), \
+             patch.object(Path, 'write_text', lambda path, text: writes.__setitem__(str(path), text)):
+            install.configure(self.pins, 'revision')
+        config = json.loads(writes['/etc/motor/sandbox.json'])
+        self.assertEqual(config['ready_marker'], str(start.ENDPOINT_READY))
+        self.assertEqual(config['storage_health'], {'state_file': str(start.STORAGE_HEALTH),
+            'lock_file': str(start.STORAGE_LOCK), 'identity_paths': [str(start.STATE), str(start.USERS)]})
+
+    def test_storage_watch_notify_uses_systemd_datagram_socket(self):
+        with tempfile.TemporaryDirectory() as tmp, start.socket.socket(start.socket.AF_UNIX, start.socket.SOCK_DGRAM) as receiver:
+            address = str(Path(tmp, 'notify'))
+            receiver.bind(address)
+            receiver.settimeout(1)
+            with patch.dict(start.os.environ, {'NOTIFY_SOCKET': address}):
+                start.notify_systemd('WATCHDOG=1')
+            self.assertEqual(receiver.recv(128), b'WATCHDOG=1')
+
+    def test_storage_withdraw_entry_point_only_revokes(self):
+        with self.storage_watch_paths() as (_, marker, health), \
+             patch.object(sys, 'argv', ['start', '--withdraw-storage']):
+            start.main()
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
 
     def test_runner_refuses_unmounted_storage_before_spawning(self):
         with patch.object(sys, 'argv', ['start', 'serve']), \

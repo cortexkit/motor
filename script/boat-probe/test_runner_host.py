@@ -110,25 +110,30 @@ class RunnerHostTests(unittest.TestCase):
 
     def test_cleanup_replay_requires_visible_workspace_and_withdrawn_admission(self):
         result = {'workspace_visible': True, 'users_mounts': [], 'endpoint_ready': False,
-                  'endpoint_ready_before': True, 'withdrawal_latency_seconds': 1.1}
+                  'endpoint_ready_before': True, 'withdrawal_latency_seconds': 1.1,
+                  'endpoint_ready_reappeared': False, 'post_withdrawal_observation_seconds': 10}
         self.assertTrue(host.cleanup_replay_checks(result))
         self.assertFalse(host.cleanup_replay_checks(dict(result, workspace_visible=False)))
         self.assertFalse(host.cleanup_replay_checks(dict(result, users_mounts=['overmount'])))
         self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready=True)))
         self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready_before=False)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready_reappeared=True)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, post_withdrawal_observation_seconds=9.9)))
         self.assertTrue(host.cleanup_replay_checks(dict(result, withdrawal_latency_seconds=3)))
         for latency in ('never', None, True, -1, 3.001, float('nan'), float('inf')):
             with self.subTest(latency=latency):
                 self.assertFalse(host.cleanup_replay_checks(dict(result, withdrawal_latency_seconds=latency)))
 
-    def cleanup_replay(self, withdraw_after, activation_seconds=0, diagnostics_timeout=False, activation_timeout=False):
+    def cleanup_replay(self, withdraw_after, activation_seconds=0, diagnostics_timeout=False, activation_timeout=False,
+                       reappear_after=None):
         with tempfile.TemporaryDirectory() as tmp:
             users, ready, mountinfo = (Path(tmp, name) for name in ('Users', 'ready', 'mountinfo'))
             users.mkdir()
             ready.touch()
             mountinfo.write_text('')
             now, pauses, commands = [100.0], [], []
-            properties = 'ActiveState=active\nSubState=running\nNRestarts=2\nExecMainStartTimestamp=Mon 2026-01-12 10:00:00 UTC\n'
+            did_reappear = [False]
+            properties = Path(__file__).with_name('fixtures').joinpath('storage-watch-systemctl-show.txt').read_text()
             def command(argv, **kwargs):
                 commands.append(argv)
                 if argv[0] == 'umount':
@@ -141,8 +146,12 @@ class RunnerHostTests(unittest.TestCase):
             def pause(seconds):
                 pauses.append(seconds)
                 now[0] = round(now[0] + seconds, 9)
-                if withdraw_after is not None and now[0] - 100 >= withdraw_after:
+                elapsed = round(now[0] - 100, 9)
+                if withdraw_after is not None and elapsed >= withdraw_after:
                     ready.unlink(missing_ok=True)
+                    if reappear_after is not None and not did_reappear[0] and elapsed >= withdraw_after + reappear_after:
+                        ready.touch()
+                        did_reappear[0] = True
             def communicate(timeout=None):
                 if activation_timeout and timeout is not None:
                     raise __import__('subprocess').TimeoutExpired('systemctl', timeout)
@@ -165,18 +174,30 @@ class RunnerHostTests(unittest.TestCase):
         self.assertTrue(host.cleanup_replay_checks(data))
         self.assertAlmostEqual(data['withdrawal_latency_seconds'], .7)
         self.assertTrue(pauses)
-        self.assertTrue(all(seconds == .1 for seconds in pauses))
+        self.assertTrue(all(0 < seconds <= .1 for seconds in pauses))
+        self.assertAlmostEqual(data['post_withdrawal_observation_seconds'], 10)
+        self.assertFalse(data['endpoint_ready_reappeared'])
         self.assertEqual(data['activation_code'], 0)
         self.assertFalse(data['activation_timed_out'])
         for phase in ('before', 'after'):
             state = data['storage_watch_' + phase]
             self.assertEqual(state['returncode'], 0)
             self.assertEqual(state['properties'], {'ActiveState': 'active', 'SubState': 'running',
-                'NRestarts': '2', 'ExecMainStartTimestamp': 'Mon 2026-01-12 10:00:00 UTC'})
+                'NRestarts': '0', 'ExecMainStartTimestamp': 'Wed 2026-10-21 12:55:08 UTC'})
+            self.assertEqual(state['stdout'], 'NRestarts=0\nExecMainStartTimestamp=Wed 2026-10-21 12:55:08 UTC\nActiveState=active\nSubState=running\n')
         self.assertEqual(commands[-1], ['journalctl', '--boot=0', '--unit=motor-boat-storage-watch.service',
                                        '--no-pager', '--output=short-monotonic'])
         self.assertIn('Boat storage unhealthy', data['storage_watch_journal']['stdout'])
         self.assertEqual([command[0] for command in commands], ['systemctl', 'umount', 'systemctl', 'journalctl'])
+
+    def test_cleanup_replay_rejects_transient_republication_after_withdrawal(self):
+        data, _, pauses, _ = self.cleanup_replay(.5, reappear_after=.3)
+        self.assertFalse(data['endpoint_ready'])
+        self.assertTrue(data['endpoint_ready_reappeared'])
+        self.assertAlmostEqual(data['reappearance_latency_seconds'], .3)
+        self.assertAlmostEqual(data['post_withdrawal_observation_seconds'], 10)
+        self.assertAlmostEqual(sum(pauses), 10.5)
+        self.assertFalse(host.cleanup_replay_checks(data))
 
     def test_cleanup_replay_records_late_withdrawal_without_relaxing_deadline(self):
         data, _, _, _ = self.cleanup_replay(4.2)

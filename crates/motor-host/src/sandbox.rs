@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,100 @@ pub struct Config {
     /// after this file exists and holds the sandbox id; absent means no marker.
     #[serde(default)]
     pub ready_marker: Option<PathBuf>,
+    /// Optional external storage-health authority for readiness publication.
+    #[serde(default)]
+    pub storage_health: Option<StorageHealthConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageHealthConfig {
+    pub state_file: PathBuf,
+    pub lock_file: PathBuf,
+    /// State mount and workspace bind, in that order. Captured once at startup;
+    /// only the storage watcher decides whether this identity remains healthy.
+    pub identity_paths: [PathBuf; 2],
+}
+
+pub(crate) struct StorageHealthGate {
+    config: StorageHealthConfig,
+    identity: [u64; 3],
+    owner: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageHealthState {
+    status: String,
+    identity: Option<[u64; 3]>,
+    expires_monotonic_ns: u64,
+}
+
+fn monotonic_ns() -> std::io::Result<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64)
+}
+
+impl StorageHealthGate {
+    fn new(config: StorageHealthConfig, owner: u32) -> std::io::Result<Self> {
+        let state = std::fs::metadata(&config.identity_paths[0])?;
+        let users = std::fs::metadata(&config.identity_paths[1])?;
+        if state.dev() != users.dev() {
+            return Err(std::io::Error::other("workspace and state devices differ"));
+        }
+        Ok(Self {
+            config,
+            identity: [state.dev(), state.ino(), users.ino()],
+            owner,
+        })
+    }
+
+    fn private_file(&self, path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != self.owner || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(std::io::Error::other(
+                "storage health files must be root-owned 0600 regular files",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn lock(&self) -> std::io::Result<std::fs::File> {
+        let file = self.private_file(&self.config.lock_file, true)?;
+        // Each call opens a separate file description. Closing the returned file
+        // releases the same exclusive flock used by the storage watcher.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+
+    fn healthy(&self) -> std::io::Result<bool> {
+        let file = self.private_file(&self.config.state_file, false)?;
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Err(std::io::Error::other("storage health state too large"));
+        }
+        let state: StorageHealthState = serde_json::from_slice(&bytes)?;
+        // A lease also fails closed if systemd cannot run crash cleanup (for
+        // example, the interpreter itself is unavailable during restoration).
+        Ok(state.status == "healthy"
+            && state.identity == Some(self.identity)
+            && monotonic_ns()? < state.expires_monotonic_ns)
+    }
 }
 fn default_identity() -> PathBuf {
     ID_FILE.into()
@@ -162,11 +257,17 @@ pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 const KEY_RETRY_S: u64 = 5;
 
 /// Make the readiness marker agree with the endpoint's current state: the
-/// sandbox id when broker keys are loaded and the identity file is valid,
-/// otherwise no file. Called only once the loopback listener is bound. The
+/// sandbox id when broker keys and identity are valid and any configured storage
+/// watcher reports the startup identity healthy, otherwise no file. Called only
+/// once the loopback listener is bound. Publication and storage withdrawal share
+/// an exclusive lock so an old health read cannot recreate a withdrawn marker. The
 /// marker is replaced by rename, so a reader never sees a partial id.
-pub(crate) fn publish_readiness(runtime: &Runtime, marker: &Path) -> std::io::Result<()> {
-    let wanted = if runtime.keys.read().expect("keys lock").is_empty() {
+pub(crate) fn publish_readiness(
+    runtime: &Runtime,
+    marker: &Path,
+    storage: Option<&StorageHealthGate>,
+) -> std::io::Result<()> {
+    let mut wanted = if runtime.keys.read().expect("keys lock").is_empty() {
         None
     } else {
         runtime
@@ -174,6 +275,30 @@ pub(crate) fn publish_readiness(runtime: &Runtime, marker: &Path) -> std::io::Re
             .as_ref()
             .and_then(|identity| identity.read().ok())
     };
+    let _lock = if let Some(gate) = storage {
+        match gate.lock() {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                withdraw_readiness(marker)?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(gate) = storage {
+        match gate.healthy() {
+            Ok(true) => {}
+            Ok(false) => wanted = None,
+            Err(error) => {
+                withdraw_readiness(marker)?;
+                return Err(error);
+            }
+        }
+    }
+    if wanted.is_none() {
+        return withdraw_readiness(marker);
+    }
     let current = std::fs::read_to_string(marker).ok();
     if wanted == current {
         return Ok(());
@@ -197,9 +322,17 @@ pub(crate) fn publish_readiness(runtime: &Runtime, marker: &Path) -> std::io::Re
             tracing::info!("endpoint_ready_marker_written");
         }
         None => {
-            std::fs::remove_file(marker)?;
-            tracing::info!("endpoint_ready_marker_removed");
+            unreachable!("missing readiness was withdrawn before publication");
         }
+    }
+    Ok(())
+}
+
+fn withdraw_readiness(marker: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => tracing::info!("endpoint_ready_marker_removed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -207,6 +340,11 @@ pub(crate) fn publish_readiness(runtime: &Runtime, marker: &Path) -> std::io::Re
 pub async fn run(config: Config) -> Result<()> {
     let port = config.port;
     let marker = config.ready_marker.clone();
+    let storage = config
+        .storage_health
+        .as_ref()
+        .map(|health| StorageHealthGate::new(health.clone(), 0))
+        .transpose()?;
     let runtime = runtime(config)?;
     runtime.fetch_keys.store(true, Ordering::Relaxed);
     let startup = runtime.clone();
@@ -236,7 +374,7 @@ pub async fn run(config: Config) -> Result<()> {
             if ready.keys.read().expect("keys lock").is_empty() {
                 ready.refresh_keys(KEY_RETRY_S);
             }
-            if publish_readiness(&ready, &marker).is_err() {
+            if publish_readiness(&ready, &marker, storage.as_ref()).is_err() {
                 tracing::warn!("endpoint_ready_marker_failed");
             }
             std::thread::sleep(Duration::from_secs(1));

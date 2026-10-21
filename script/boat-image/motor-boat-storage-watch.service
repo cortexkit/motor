@@ -2,11 +2,22 @@
 Description=Withdraw Boat endpoint readiness if storage changes
 Requires=motor-boat-storage.service
 After=motor-boat-storage.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=5
+TimeoutStartSec=10
+TimeoutStopSec=5
 User=root
 Group=root
 UnsetEnvironment=ASCII_TOKEN BOAT_ID BOAT_CLI_TOKEN BOAT_CURRENT_ID_FILE
+RuntimeDirectory=motor-boat-storage
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --watch-storage
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --withdraw-storage
 Restart=on-failure
 RestartSec=1

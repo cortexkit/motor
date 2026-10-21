@@ -365,8 +365,8 @@ print(json.dumps({'seconds':elapsed, 'started':started, 'before':before, 'seeded
 # Run only in a disposable probe clone, after its real-job and resume phases.
 # Reproduce Boat removing /Users after readiness, then directly start Users.mount
 # as a job dependency could, over a newly created root-disk workspace directory.
-# Allow three one-second watcher polls, but retain observations for ten seconds
-# so a late withdrawal is distinguishable from no withdrawal.
+# Allow three nominal watcher polls, observe late withdrawal for up to ten
+# seconds, then watch ten more seconds for an endpoint republishing readiness.
 STORAGE_WITHDRAWAL_MAX_S = 3
 DEFERRED_CLEANUP_REPLAY = r'''
 import json, pathlib, subprocess, time, uuid
@@ -400,6 +400,19 @@ while True:
     if elapsed >= 10:
         break
     time.sleep(min(.1, 10 - elapsed))
+reappeared = False
+reappearance_latency = 'never'
+observed_after_withdrawal = 0
+if latency != 'never':
+    withdrawn_at = time.monotonic()
+    while True:
+        observed_after_withdrawal = time.monotonic() - withdrawn_at
+        if ready.exists() and not reappeared:
+            reappeared = True
+            reappearance_latency = observed_after_withdrawal
+        if observed_after_withdrawal >= 10:
+            break
+        time.sleep(min(.1, 10 - observed_after_withdrawal))
 activation_timed_out = False
 try:
     _, activation_stderr = activation.communicate(timeout=10)
@@ -416,6 +429,8 @@ print(json.dumps({'activation_code':activation.returncode, 'activation_stderr':a
     'workspace_visible':(sentinel / 'materialized-workspace').exists(), 'users_mounts':rows,
     'endpoint_ready_before':ready_before, 'endpoint_ready':endpoint_ready,
     'withdrawal_latency_seconds':latency,
+    'endpoint_ready_reappeared':reappeared, 'reappearance_latency_seconds':reappearance_latency,
+    'post_withdrawal_observation_seconds':observed_after_withdrawal,
     'storage_watch_before':watch_before, 'storage_watch_after':watch_after, 'storage_watch_journal':watch_journal}))
 '''
 
@@ -424,7 +439,9 @@ def cleanup_replay_checks(data):
     latency = data.get('withdrawal_latency_seconds')
     return (data['workspace_visible'] and not data['users_mounts'] and not data['endpoint_ready']
             and data.get('endpoint_ready_before') is True
-            and type(latency) in (int, float) and 0 <= latency <= STORAGE_WITHDRAWAL_MAX_S)
+            and type(latency) in (int, float) and 0 <= latency <= STORAGE_WITHDRAWAL_MAX_S
+            and data.get('endpoint_ready_reappeared') is False
+            and data.get('post_withdrawal_observation_seconds', 0) >= 10)
 
 
 def idle_reclaim_checks(data):
