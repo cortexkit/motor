@@ -73,7 +73,7 @@ def run(probe):
         record = {'size': size, 'create': creation}
         measurements.append(record)
         probe.checkpoint()
-        record['guest'] = parse(probe.execute(resource['id'], 'sudo -n python3 -c ' + shlex.quote(GUEST), poll_seconds=60))
+        record['guest'] = parse(probe.execute(resource['id'], 'sudo -n /usr/bin/python3 -c ' + shlex.quote(GUEST), poll_seconds=60))
         probe.checkpoint()
         subset = {'resources': [resource], 'pending_creates': [], 'cleanup': probe.data['cleanup']}
         cleanup(probe.client, subset, probe.checkpoint)

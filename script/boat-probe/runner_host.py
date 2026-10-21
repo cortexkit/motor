@@ -797,7 +797,7 @@ class RunnerHost:
             failure = {'command': command, 'result': result}
             self.data.setdefault('guest_failures', []).append(failure)
             try:
-                diagnostics = self.probe.execute(sid, 'sudo -n python3 -c ' + shlex.quote(DIAGNOSTICS), poll_seconds=100)
+                diagnostics = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DIAGNOSTICS), poll_seconds=100)
                 failure['diagnostic_command'] = diagnostics
                 if diagnostics.get('exitCode') == 0 and not diagnostics.get('stdoutTruncated'):
                     failure['unit_diagnostics'] = json.loads(diagnostics['stdout'])
@@ -819,11 +819,11 @@ class RunnerHost:
         if not audit['clean']:
             raise ValueError('refusing to snapshot credentials or incomplete evidence')
         self.execute(sid, 'sudo -n systemctl stop motor-boat-identity motor-boat-host motor-boat-bridge motor-boat motor-boat-storage-watch')
-        hygiene = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
+        hygiene = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(SNAPSHOT_HYGIENE) + ' ' + shlex.quote(public))['stdout'])
         self.check(label + '.identity_and_probe_keys_absent', all(hygiene[k] is True for k in ('identity_absent','boat_cli_configs_absent','probe_authorizations_absent')), hygiene)
         self.execute(sid, "sudo -n sync && sudo -n systemctl stop Users.mount 'var-lib-motor\\x2dboat.mount' motor-boat-storage && "
                           'sudo -n sync && '
-                          'sudo -n python3 /usr/local/libexec/motor-boat-start.py --check-mountpoints')
+                          'sudo -n /usr/bin/python3 /usr/local/libexec/motor-boat-start.py --check-mountpoints')
         return hygiene
 
     def save_snapshot(self, sid, name, retained=False):
@@ -885,7 +885,7 @@ class RunnerHost:
         return record
 
     def endpoint_state(self, sid):
-        return json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(ENDPOINT_STATE))['stdout'])
+        return json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(ENDPOINT_STATE))['stdout'])
 
     def read_marker(self, sid):
         result = self.probe.execute(sid, MARKER_READ)
@@ -970,10 +970,10 @@ class RunnerHost:
             self.existing_then_reinstall(sid, label, record, hydrated_at)
         else:
             self.arm_then_install(sid, label, record)
-        record['storage'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+        record['storage'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
         for key, passed in storage_checks(record['storage']).items():
             self.check(label + '.' + key, passed, record['storage'])
-        record['storage_timeline'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_TIMELINE))['stdout'])
+        record['storage_timeline'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_TIMELINE))['stdout'])
         self.check(label + '.no_deferred_cleanup_after_readiness', storage_timeline_checks(record['storage_timeline']), record['storage_timeline'])
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
@@ -981,9 +981,9 @@ class RunnerHost:
         host['job_security_reference'] = json.loads(self.execute(
             sid, 'sudo -n ' + reference_command())['stdout'])
         record['toolchain_parity'] = json.loads(self.execute(
-            sid, "sudo -n python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
+            sid, "sudo -n /usr/bin/python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
         self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
-        record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
+        record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
         self.check(label + '.root_owned_paths', root_paths_passed(record['root_owned_paths']), record['root_owned_paths'],
                    reason=f"{record['root_owned_paths'].get('offender_count')} path(s) root executes from are not root-owned "
                           f"without group/other write; first: {record['root_owned_paths'].get('offenders')}")
@@ -1028,7 +1028,7 @@ class RunnerHost:
                     jobs.append(('after_idle', NODE_CHECK))
                 for name, command in jobs:
                     if name == 'after_idle':
-                        idle = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
+                        idle = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
                         record['idle_reclaim'] = idle
                         status = idle_reclaim_status(idle)
                         self.check(label + '.idle_reclaim_observed', status == 'PASS', idle, status=status)
@@ -1065,7 +1065,7 @@ class RunnerHost:
                         expected = 23 if name == "exit" else 0
                         marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
                         self.check_job(label + "." + name, parsed, expected, marker=marker)
-                    state = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+                    state = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
                     record.setdefault('storage_after_jobs', {})[name] = state
                     for key, passed in storage_checks(state).items():
                         self.check(label + '.' + name + '.' + key, passed, state)
@@ -1077,7 +1077,7 @@ class RunnerHost:
                     command = teardown_job(marker)
                     with ThreadPoolExecutor(max_workers=1) as executor:
                         pending = executor.submit(process, [str(client), address, str(repository), storage, command], timeout=90)
-                        observed = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
+                        observed = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
                                                           + ' ' + shlex.quote(marker) + ' ' + action, timeout=60)['stdout'])
                         completed = pending.result()
                     parsed = job_result(completed['stdout']) if completed.get('exit_code') == 0 else {}
@@ -1128,7 +1128,7 @@ class RunnerHost:
         self.probe.checkpoint()
 
     def replay_cleanup(self, sid):
-        result = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout'])
+        result = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout'])
         self.data['deferred_cleanup_replay'] = result
         self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
 
@@ -1187,7 +1187,7 @@ class RunnerHost:
                        f"sudo -n git -C /srv/build/source checkout --detach {revision}")
             started = time.monotonic()
             self.data["source_upload"] = self.execute(sid, install)
-            self.data["apt_preflight"] = json.loads(self.execute(sid, "sudo -n python3 /srv/build/source/script/boat-image/install.py --apt-preflight-only", timeout=180)["stdout"])
+            self.data["apt_preflight"] = json.loads(self.execute(sid, "sudo -n /usr/bin/python3 /srv/build/source/script/boat-image/install.py --apt-preflight-only", timeout=180)["stdout"])
             self.probe.checkpoint()
             upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed.json')
             upload_seed_input(argv, self.probe.cargo_seed_archive, 'cargo-seed.tar.gz')
@@ -1195,7 +1195,7 @@ class RunnerHost:
                          ' --cargo-seed-archive /home/user/cargo-seed.tar.gz'
                          ' --cargo-seed-sha256 ' + shlex.quote(self.probe.cargo_seed_sha256)
                          + ' --acknowledge-tenant-one-private-cache')
-            self.data["install"] = self.execute(sid, f"sudo -n python3 /srv/build/source/script/boat-image/install.py --revision {revision}" + seed_args, timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
+            self.data["install"] = self.execute(sid, f"sudo -n /usr/bin/python3 /srv/build/source/script/boat-image/install.py --revision {revision}" + seed_args, timeout=max(1, int(self.probe.deadline-time.monotonic())-120))
             self.execute(sid, 'rm -f /home/user/cargo-seed.tar.gz /home/user/cargo-seed.json')
             self.data["install_seconds"] = time.monotonic() - started
             if getattr(self.probe, 'retain_prepared_image', False):

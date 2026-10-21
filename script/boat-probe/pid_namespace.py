@@ -108,7 +108,7 @@ def control_identity_command(pids):
     source += 'for pid in ' + repr(sorted(set(pids))) + ':\n'
     source += '    try:\n        live.append(process_identity(pid))\n    except OSError as error:\n        missing.append({"pid":pid,"errno":error.errno})\n'
     source += 'print(json.dumps({"live":live,"missing":missing}))\n'
-    return 'sudo -n python3 -c ' + shlex.quote(source)
+    return 'sudo -n /usr/bin/python3 -c ' + shlex.quote(source)
 
 
 def outside_control_passes(row, uid, cgroup):
