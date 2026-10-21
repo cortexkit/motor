@@ -389,8 +389,11 @@ async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() 
         let id = stream.job_id;
         let (_, terminal) = records(stream).await;
         assert!(started.elapsed() >= Duration::from_secs(2));
+        // Both second replies ask for a 30 s wait (after clamping), so a retry
+        // that restarted or ignored the 2 s budget would take at least 30 s.
+        // The bound leaves room for a loaded test machine.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(20),
             "Neither retry can restart the queue-wait budget"
         );
         let reason = if provisioning {
