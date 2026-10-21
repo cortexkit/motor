@@ -20,8 +20,10 @@ impl Motor {
         };
         let stream =
             self.run_classified(request, (attribution, None), false, false, false, returns)?;
-        // The runner sends its return result only after the command ends, long
-        // after this write, so the pump always finds the cwd beside the result.
+        // The job ID is minted inside run_classified, so the cwd is stored
+        // just after the job task starts. A return result exists only once
+        // that task has snapshotted, uploaded and run the command remotely,
+        // so in practice the cwd is stored long before the pump looks for it.
         self.storage.return_cwd(stream.job_id, cwd)?;
         Ok(stream)
     }

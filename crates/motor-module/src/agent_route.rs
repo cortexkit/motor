@@ -79,9 +79,11 @@ pub(crate) fn take_return_request(
 /// Only a job whose Run frame was sent to a hosted runner ran hosted. A job
 /// whose lease never reached that point, or a spill sent back to the build
 /// server, reports nothing. Billing is reported once settled; while it is
-/// pending, or if settlement failed, `billed_vcpu_ms` is absent. The terminal
-/// record is never held back for billing: a later `exec.attach` or
-/// `exec.status` reads the settled figure.
+/// pending, or if settlement failed, `billed_vcpu_ms` is absent. Nothing here
+/// waits for billing. The job stream already holds a first-party hosted
+/// terminal up to five seconds for the host's settlement record, and settles a
+/// Boat job with the broker first. A later `exec.attach` or `exec.status`
+/// reads whatever figure has settled by then.
 pub(crate) fn hosted_usage(state: Option<&HostedJobState>) -> Option<HostedUsage> {
     let state = state.filter(|state| state.run_sent)?;
     let usage = HostedUsage::new(state.placement.as_ref()?.host.clone());

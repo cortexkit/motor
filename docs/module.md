@@ -286,10 +286,11 @@ These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
 Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
 host (for example `ovh-1` or `boat:<sandbox_id>`), and `billed_vcpu_ms` once
 billing has settled. Build-server jobs omit `hosted`, and so do spills that went
-back to the build server. The terminal record never waits for billing: a
-first-party hosted terminal is already held up to five seconds for the host's
-settlement record, and a Boat job is settled with the broker before its terminal
-record is sent. If billing is still pending then, `billed_vcpu_ms` is absent. A
+back to the build server. ck-motor adds no wait for billing. The job stream
+already holds a first-party hosted terminal up to five seconds for the host's
+settlement record, and settles a Boat job with the broker before sending its
+terminal record. If billing is still pending after that, `billed_vcpu_ms` is
+absent. A
 later `exec.attach` re-sends the terminal record and `exec.status` returns it,
 both with the figure as it stands at that moment.
 
@@ -305,9 +306,9 @@ immediately before the terminal record, with cwd-relative paths. Collection
 failures (`over_cap`, `missing`, `escape`, `not_regular`, `frame_limit`) do not
 change the job's outcome. A reattach from before the record's `seq` replays it.
 
-Only a request with non-empty `return_paths` receives the record. AFT has no
-Hello on this route: `started` is sent to every caller, and older callers skip
-it as an unknown record. ck-motor instead lists `exec-remote-return/v1` among
+Only a request with non-empty `return_paths` receives the record. This route
+has no per-caller capability handshake: `started` goes to every caller, and
+older callers skip it as an unknown record. ck-motor instead lists `exec-remote-return/v1` among
 its capabilities, and a caller sends paths only to a module that lists it.
 Callers built before 0.2.9 cannot send the field, so they never receive the
 record.
