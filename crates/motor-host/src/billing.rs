@@ -575,7 +575,7 @@ impl Host {
         // A set-aside request goes with its job, or on its own age once no
         // record of its job is left (a heartbeat, or a job pruned earlier).
         let orphaned = |r: &Request| {
-            r.job.as_ref().map_or(true, |job| {
+            r.job.as_ref().is_none_or(|job| {
                 !snapshot.leases.contains_key(job)
                     && !snapshot.billing.contains_key(job)
                     && !snapshot.zero_usage.contains_key(job)

@@ -14,10 +14,11 @@ use serde_json::Value;
 /// removing it: the runner keeps a finished job's record and output this long
 /// (motor-runner's `RETENTION_MS`), so a client can still fetch its result.
 pub const RUNNER_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
-/// A removal still pending this long after the account closed is logged as an
-/// error on every check. The public privacy page promises the tenant disk is
-/// deleted within 30 days of closure; the helper deletes quarantined data 7
-/// days after removal, so removal must happen well before day 23.
+/// A removal still pending this long after the account closed is logged once
+/// as an overdue error, and every failed attempt after it as an error too.
+/// The public privacy page promises the tenant disk is deleted within 30 days
+/// of closure; the helper deletes quarantined data 7 days after removal, so
+/// removal must happen well before day 23.
 pub const REMOVAL_OVERDUE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// The first retry of a failed removal waits this long; each further failure
 /// doubles the wait up to `REMOVAL_RETRY_MAX_MS`.

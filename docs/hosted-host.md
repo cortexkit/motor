@@ -282,9 +282,10 @@ own registry entry, refuses an unknown tenant or a VM that is still running,
 reconciles the firewall over the remaining tenants (dropping the tenant's nft
 chains, counter and UFW route grant), deletes its tap, drops its binding,
 provisioning record and registry entry, and moves its home into quarantine.
-A failed removal is retried with backoff from one minute to six hours; from 7
-days after the closure, `tenant_removal_overdue` and
-`tenant_removal_failed_overdue` are logged as errors until the disk is gone.
+A failed removal is retried with backoff from one minute to six hours. Once 7
+days have passed since the closure with the tenant still present,
+`tenant_removal_overdue` is logged once as an error, and each later failed
+attempt logs `tenant_removal_failed_overdue` as an error.
 Logs: `tenant_account_closed`, `tenant_removed` (with the quarantine folder).
 
 **By hand.** With both services stopped, as for `switch-image`:

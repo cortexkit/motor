@@ -32,10 +32,12 @@ impl Runner {
     /// the catalog) up to date for the rest.
     ///
     /// Use is read from the dependents' own timestamps (job acceptance and
-    /// finish, workspace use, transfer finish, warm-build finish), never from
-    /// the time this pass runs, so a runner restart neither resets the clock
-    /// nor counts as use. Only a mirror first seen with no stamp at all (one
-    /// fetched before this clock existed) is stamped with the current time.
+    /// finish, workspace use, transfer finish, warm-build finish). Only work
+    /// in flight right now (a prepare, a workspace setup, an admission) counts
+    /// as use at the current time, and none of it survives a restart, so a
+    /// restart neither resets the clock nor counts as use. A mirror first seen
+    /// with no stamp at all (one fetched before this clock existed) is
+    /// stamped with the current time.
     ///
     /// The whole pass holds `ref_mutation` and then the state lock, the order
     /// `prune_refs` uses. Admission, transfers, prepares and have-replies all
