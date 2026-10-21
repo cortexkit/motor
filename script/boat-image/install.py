@@ -386,6 +386,11 @@ def configure(pins, revision):
         'admin_socket': '/run/motor-tenant/admin.sock',
         'vcpu_ceiling': cpus,
         'ready_marker': '/run/motor/endpoint-ready',
+        'storage_health': {
+            'state_file': '/run/motor-boat-storage/health.json',
+            'lock_file': '/run/motor-boat-storage/lock',
+            'identity_paths': ['/var/lib/motor-boat', '/Users'],
+        },
     }, indent=2) + '\n')
     Path('/etc/motor/image-revision').write_text(revision + '\n')
     Path("/etc/motor/tenant").mkdir(parents=True, exist_ok=True)

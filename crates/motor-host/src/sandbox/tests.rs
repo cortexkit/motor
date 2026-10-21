@@ -34,6 +34,7 @@ impl Fixture {
             id_file,
             port: 0,
             ready_marker: None,
+            storage_health: None,
         };
         let jobs = tokio::net::UnixListener::bind(&config.job_socket).unwrap();
         let mut runtime = runtime(config).unwrap();
@@ -539,25 +540,195 @@ async fn sandbox_ready_marker_tracks_keys_and_identity() {
     let marker = f.dir.path().join("endpoint-ready");
     let id = f.dir.path().join("id");
     let keys = std::mem::take(&mut *f.runtime.keys.write().unwrap());
-    publish_readiness(&f.runtime, &marker).unwrap();
+    publish_readiness(&f.runtime, &marker, None).unwrap();
     assert!(!marker.exists(), "no marker before a JWKS is loaded");
     *f.runtime.keys.write().unwrap() = keys;
-    publish_readiness(&f.runtime, &marker).unwrap();
+    publish_readiness(&f.runtime, &marker, None).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
     let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o644);
     std::fs::remove_file(&id).unwrap();
-    publish_readiness(&f.runtime, &marker).unwrap();
+    publish_readiness(&f.runtime, &marker, None).unwrap();
     assert!(!marker.exists(), "a missing identity withdraws readiness");
     std::fs::write(&id, "bx_other").unwrap();
     std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o644)).unwrap();
-    publish_readiness(&f.runtime, &marker).unwrap();
+    publish_readiness(&f.runtime, &marker, None).unwrap();
     assert!(
         !marker.exists(),
         "an identity file with the wrong mode is not ready"
     );
     std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o444)).unwrap();
-    publish_readiness(&f.runtime, &marker).unwrap();
+    publish_readiness(&f.runtime, &marker, None).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "bx_other");
     assert!(!marker.with_extension("tmp").exists());
+}
+
+fn storage_gate(f: &Fixture) -> StorageHealthGate {
+    let state = f.dir.path().join("storage-state");
+    let users = f.dir.path().join("storage-users");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(&users).unwrap();
+    let config = StorageHealthConfig {
+        state_file: f.dir.path().join("storage-health.json"),
+        lock_file: f.dir.path().join("storage-health.lock"),
+        identity_paths: [state, users],
+    };
+    std::fs::write(&config.lock_file, "").unwrap();
+    std::fs::set_permissions(&config.lock_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let gate = StorageHealthGate::new(config, unsafe { libc::geteuid() }).unwrap();
+    write_storage_health(&gate, "healthy", Some(gate.identity));
+    gate
+}
+
+fn write_storage_health(gate: &StorageHealthGate, status: &str, identity: Option<[u64; 3]>) {
+    std::fs::write(
+        &gate.config.state_file,
+        serde_json::to_vec(&serde_json::json!({"status": status, "identity": identity,
+            "expires_monotonic_ns": monotonic_ns().unwrap() + 5_000_000_000_u64}))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &gate.config.state_file,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sandbox_storage_withdrawal_prevents_endpoint_republication() {
+    let f = Fixture::new();
+    let gate = storage_gate(&f);
+    let marker = f.dir.path().join("endpoint-ready");
+    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+    {
+        let _lock = gate.lock().unwrap();
+        write_storage_health(&gate, "unhealthy", None);
+        std::fs::remove_file(&marker).unwrap();
+    }
+    for _ in 0..3 {
+        publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+        assert!(
+            !marker.exists(),
+            "valid endpoint keys cannot override storage withdrawal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_storage_missing_health_withdraws_instead_of_publishing() {
+    let f = Fixture::new();
+    let gate = storage_gate(&f);
+    let marker = f.dir.path().join("endpoint-ready");
+    std::fs::write(&marker, ID).unwrap();
+    std::fs::remove_file(&gate.config.state_file).unwrap();
+    assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+    assert!(!marker.exists(), "missing watcher state is not healthy");
+}
+
+#[tokio::test]
+async fn sandbox_storage_identity_must_match_endpoint_startup() {
+    let f = Fixture::new();
+    let gate = storage_gate(&f);
+    let marker = f.dir.path().join("endpoint-ready");
+    let mut changed = gate.identity;
+    changed[2] += 1;
+    write_storage_health(&gate, "healthy", Some(changed));
+    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    assert!(
+        !marker.exists(),
+        "health for another workspace identity cannot admit this endpoint"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_storage_expired_health_cannot_recreate_readiness() {
+    let f = Fixture::new();
+    let gate = storage_gate(&f);
+    let marker = f.dir.path().join("endpoint-ready");
+    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&gate.config.state_file).unwrap()).unwrap();
+    state["expires_monotonic_ns"] = serde_json::json!(0);
+    std::fs::write(&gate.config.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    assert!(
+        !marker.exists(),
+        "stale health cannot outlive a dead storage watcher"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_storage_withdrawal_serializes_with_concurrent_publication() {
+    let f = Fixture::new();
+    let gate = Arc::new(storage_gate(&f));
+    let marker = f.dir.path().join("endpoint-ready");
+    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    let lock = gate.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer_gate = gate.clone();
+    let writer_marker = marker.clone();
+    let runtime = f.runtime.clone();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(publish_readiness(
+                &runtime,
+                &writer_marker,
+                Some(&writer_gate),
+            ))
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "publisher must wait for the storage lock"
+    );
+    write_storage_health(&gate, "unhealthy", None);
+    std::fs::remove_file(&marker).unwrap();
+    drop(lock);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    writer.join().unwrap();
+    assert!(
+        !marker.exists(),
+        "a queued publisher must read health after acquiring the lock"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_storage_unsafe_or_malformed_health_is_not_ready() {
+    let f = Fixture::new();
+    let gate = storage_gate(&f);
+    let marker = f.dir.path().join("endpoint-ready");
+    for malformed in [false, true] {
+        std::fs::write(&marker, ID).unwrap();
+        if malformed {
+            std::fs::write(&gate.config.state_file, "not json").unwrap();
+            std::fs::set_permissions(
+                &gate.config.state_file,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        } else {
+            std::fs::set_permissions(
+                &gate.config.state_file,
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+        assert!(!marker.exists());
+    }
+    std::fs::remove_file(&gate.config.lock_file).unwrap();
+    assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+    assert!(
+        !marker.exists(),
+        "the endpoint never creates a missing watcher lock"
+    );
+    assert!(!gate.config.lock_file.exists());
 }

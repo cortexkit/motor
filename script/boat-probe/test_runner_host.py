@@ -109,11 +109,123 @@ class RunnerHostTests(unittest.TestCase):
             self.assertFalse(host.idle_reclaim_checks(data))
 
     def test_cleanup_replay_requires_visible_workspace_and_withdrawn_admission(self):
-        result = {'workspace_visible': True, 'users_mounts': [], 'endpoint_ready': False}
+        result = {'workspace_visible': True, 'users_mounts': [], 'endpoint_ready': False,
+                  'endpoint_ready_before': True, 'withdrawal_latency_seconds': 1.1,
+                  'endpoint_ready_reappeared': False, 'post_withdrawal_observation_seconds': 10}
         self.assertTrue(host.cleanup_replay_checks(result))
         self.assertFalse(host.cleanup_replay_checks(dict(result, workspace_visible=False)))
         self.assertFalse(host.cleanup_replay_checks(dict(result, users_mounts=['overmount'])))
         self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready=True)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready_before=False)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, endpoint_ready_reappeared=True)))
+        self.assertFalse(host.cleanup_replay_checks(dict(result, post_withdrawal_observation_seconds=9.9)))
+        self.assertTrue(host.cleanup_replay_checks(dict(result, withdrawal_latency_seconds=3)))
+        for latency in ('never', None, True, -1, 3.001, float('nan'), float('inf')):
+            with self.subTest(latency=latency):
+                self.assertFalse(host.cleanup_replay_checks(dict(result, withdrawal_latency_seconds=latency)))
+
+    def cleanup_replay(self, withdraw_after, activation_seconds=0, diagnostics_timeout=False, activation_timeout=False,
+                       reappear_after=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            users, ready, mountinfo = (Path(tmp, name) for name in ('Users', 'ready', 'mountinfo'))
+            users.mkdir()
+            ready.touch()
+            mountinfo.write_text('')
+            now, pauses, commands = [100.0], [], []
+            did_reappear = [False]
+            properties = Path(__file__).with_name('fixtures').joinpath('storage-watch-systemctl-show.txt').read_text()
+            def command(argv, **kwargs):
+                commands.append(argv)
+                if argv[0] == 'umount':
+                    self.assertEqual(argv, ['umount', '--', str(users)])
+                    return Mock(returncode=0)
+                if diagnostics_timeout:
+                    raise __import__('subprocess').TimeoutExpired(argv, 10)
+                return Mock(returncode=0, stdout=properties if argv[0] == 'systemctl' else
+                            '[ 12.000000] Boat storage unhealthy; withdrawing endpoint readiness: view lost\n', stderr='')
+            def pause(seconds):
+                pauses.append(seconds)
+                now[0] = round(now[0] + seconds, 9)
+                elapsed = round(now[0] - 100, 9)
+                if withdraw_after is not None and elapsed >= withdraw_after:
+                    ready.unlink(missing_ok=True)
+                    if reappear_after is not None and not did_reappear[0] and elapsed >= withdraw_after + reappear_after:
+                        ready.touch()
+                        did_reappear[0] = True
+            def communicate(timeout=None):
+                if activation_timeout and timeout is not None:
+                    raise __import__('subprocess').TimeoutExpired('systemctl', timeout)
+                now[0] += activation_seconds
+                return '', ''
+            activation = Mock(returncode=0)
+            activation.communicate.side_effect = communicate
+            script = host.DEFERRED_CLEANUP_REPLAY.replace('/Users', str(users)).replace(
+                '/run/motor/endpoint-ready', str(ready)).replace('/proc/self/mountinfo', str(mountinfo))
+            output = io.StringIO()
+            with patch('time.monotonic', side_effect=lambda: now[0]), patch('time.sleep', side_effect=pause), \
+                 patch('subprocess.run', side_effect=command), patch('subprocess.Popen', return_value=activation) as popen, \
+                 contextlib.redirect_stdout(output):
+                exec(script, {})
+            self.assertEqual(popen.call_args.args[0], ['systemctl', 'start', 'Users.mount'])
+            return json.loads(output.getvalue()), commands, pauses, activation
+
+    def test_cleanup_replay_polls_during_activation_and_captures_watcher_diagnostics(self):
+        data, commands, pauses, _ = self.cleanup_replay(.7, activation_seconds=4)
+        self.assertTrue(host.cleanup_replay_checks(data))
+        self.assertAlmostEqual(data['withdrawal_latency_seconds'], .7)
+        self.assertTrue(pauses)
+        self.assertTrue(all(0 < seconds <= .1 for seconds in pauses))
+        self.assertAlmostEqual(data['post_withdrawal_observation_seconds'], 10)
+        self.assertFalse(data['endpoint_ready_reappeared'])
+        self.assertEqual(data['activation_code'], 0)
+        self.assertFalse(data['activation_timed_out'])
+        for phase in ('before', 'after'):
+            state = data['storage_watch_' + phase]
+            self.assertEqual(state['returncode'], 0)
+            self.assertEqual(state['properties'], {'ActiveState': 'active', 'SubState': 'running',
+                'NRestarts': '0', 'ExecMainStartTimestamp': 'Wed 2026-10-21 12:55:08 UTC'})
+            self.assertEqual(state['stdout'], 'NRestarts=0\nExecMainStartTimestamp=Wed 2026-10-21 12:55:08 UTC\nActiveState=active\nSubState=running\n')
+        self.assertEqual(commands[-1], ['journalctl', '--boot=0', '--unit=motor-boat-storage-watch.service',
+                                       '--no-pager', '--output=short-monotonic'])
+        self.assertIn('Boat storage unhealthy', data['storage_watch_journal']['stdout'])
+        self.assertEqual([command[0] for command in commands], ['systemctl', 'umount', 'systemctl', 'journalctl'])
+
+    def test_cleanup_replay_rejects_transient_republication_after_withdrawal(self):
+        data, _, pauses, _ = self.cleanup_replay(.5, reappear_after=.3)
+        self.assertFalse(data['endpoint_ready'])
+        self.assertTrue(data['endpoint_ready_reappeared'])
+        self.assertAlmostEqual(data['reappearance_latency_seconds'], .3)
+        self.assertAlmostEqual(data['post_withdrawal_observation_seconds'], 10)
+        self.assertAlmostEqual(sum(pauses), 10.5)
+        self.assertFalse(host.cleanup_replay_checks(data))
+
+    def test_cleanup_replay_records_late_withdrawal_without_relaxing_deadline(self):
+        data, _, _, _ = self.cleanup_replay(4.2)
+        self.assertFalse(data['endpoint_ready'])
+        self.assertAlmostEqual(data['withdrawal_latency_seconds'], 4.2)
+        self.assertFalse(host.cleanup_replay_checks(data))
+
+    def test_cleanup_replay_records_never_after_ten_seconds(self):
+        data, _, pauses, _ = self.cleanup_replay(None)
+        self.assertEqual(data['withdrawal_latency_seconds'], 'never')
+        self.assertAlmostEqual(sum(pauses), 10)
+        self.assertTrue(all(0 < seconds <= .1 for seconds in pauses))
+        self.assertTrue(data['endpoint_ready'])
+        self.assertFalse(host.cleanup_replay_checks(data))
+
+    def test_cleanup_replay_keeps_observations_when_diagnostics_time_out(self):
+        data, _, _, _ = self.cleanup_replay(.5, diagnostics_timeout=True)
+        self.assertTrue(host.cleanup_replay_checks(data))
+        for name in ('storage_watch_before', 'storage_watch_after', 'storage_watch_journal'):
+            self.assertIsNone(data[name]['returncode'])
+            self.assertIn('timed out', data[name]['stderr'])
+
+    def test_cleanup_replay_reaps_timed_out_mount_activation(self):
+        data, _, _, activation = self.cleanup_replay(.5, activation_timeout=True)
+        self.assertTrue(data['activation_timed_out'])
+        activation.kill.assert_called_once_with()
+        self.assertEqual(activation.communicate.call_count, 2)
+        self.assertTrue(host.cleanup_replay_checks(data))
 
     def test_storage_timeline_detects_deferred_cleanup_after_readiness(self):
         first = {'mounts': ['1 0 7:0 / /var/lib/motor-boat rw - xfs /dev/loop0 rw',

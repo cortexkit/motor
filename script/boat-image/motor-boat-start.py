@@ -3,11 +3,13 @@
 the sandbox's single job, wait for Boat's file restore, watch for the
 broker's identity file, and check service readiness."""
 import json
+from contextlib import contextmanager
 import fcntl
 import os
 from pathlib import Path
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -38,6 +40,9 @@ USERS = Path('/Users')
 IMAGE = Path('/var/lib/motor-boat.xfs')
 STORAGE_EVIDENCE = Path('/run/motor-boat-storage.json')
 ENDPOINT_READY = Path('/run/motor/endpoint-ready')
+STORAGE_HEALTH = Path('/run/motor-boat-storage/health.json')
+STORAGE_LOCK = Path('/run/motor-boat-storage/lock')
+STORAGE_HEALTH_TTL_NS = 5_000_000_000
 
 
 def budget(available, overhead, margin=MARGIN):
@@ -239,22 +244,83 @@ def storage_identity():
     return state.st_dev, state.st_ino, users.st_ino
 
 
-def watch_storage(pause=time.sleep):
-    expected = tuple(json.loads(STORAGE_EVIDENCE.read_text())['identity'])
-    broken = False
-    while True:
+@contextmanager
+def storage_lock():
+    # This inode must survive both services' restarts so all writers serialize
+    # on the same lock, rather than locking different files at the same path.
+    with os.fdopen(os.open(STORAGE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), 'r+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def write_storage_health(status, identity=None):
+    temporary = STORAGE_HEALTH.with_suffix('.tmp')
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), 'w') as output:
+        os.fchmod(output.fileno(), 0o600)
+        expires = time.monotonic_ns() + STORAGE_HEALTH_TTL_NS if status == 'healthy' else 0
+        json.dump({'status': status, 'identity': identity, 'expires_monotonic_ns': expires}, output)
+    temporary.replace(STORAGE_HEALTH)
+
+
+def withdraw_storage():
+    with storage_lock():
+        # Withdraw before disk writes or logging; the lock prevents the endpoint
+        # from publishing against the old health state during this transition.
         try:
+            ENDPOINT_READY.unlink(missing_ok=True)
+        finally:
+            # Removing the old lease needs no new file allocation. A failed
+            # unhealthy-state write must not leave a valid healthy lease behind.
+            STORAGE_HEALTH.unlink(missing_ok=True)
+            write_storage_health('unhealthy')
+
+
+def notify_systemd(message):
+    address = os.environ.get('NOTIFY_SOCKET')
+    if address:
+        if address.startswith('@'):
+            address = '\0' + address[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as connection:
+            connection.settimeout(1)
+            connection.connect(address)
+            connection.sendall(message.encode())
+
+
+def watch_storage(pause=time.sleep, notify=None):
+    notify = notify or notify_systemd
+    try:
+        withdraw_storage()
+        # READY starts systemd's watchdog even if the first evidence read or
+        # identity check hangs. It describes monitor liveness, not storage health.
+        notify('READY=1')
+        expected = tuple(json.loads(STORAGE_EVIDENCE.read_text())['identity'])
+        if len(expected) != 3 or any(type(value) is not int or value < 0 for value in expected):
+            raise ValueError('invalid Boat storage identity evidence')
+        while True:
             if storage_identity() != expected:
                 raise RuntimeError('Boat runner state disk identity changed')
-        except (OSError, RuntimeError) as error:
-            if not broken:
-                print(f'Boat storage unhealthy; withdrawing endpoint readiness: {error}', flush=True)
-            broken = True
-        # Keep removing endpoint-ready on every later poll after a failed check,
-        # even if a restarting endpoint writes the file again.
-        if broken:
-            ENDPOINT_READY.unlink(missing_ok=True)
-        pause(1)
+            with storage_lock():
+                write_storage_health('healthy', expected)
+            pause(1)
+            notify('WATCHDOG=1')
+    except BaseException as error:
+        # Attempt withdrawal before logging even for malformed evidence, failed
+        # notification, or an interrupted sleep. ExecStopPost repeats cleanup for
+        # uncatchable exits; the health lease expires if cleanup cannot complete.
+        try:
+            withdraw_storage()
+        except BaseException:
+            try:
+                ENDPOINT_READY.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            print(f'Boat storage unhealthy; withdrawing endpoint readiness: {error}', file=sys.stderr, flush=True)
+        except SystemExit as log_error:
+            raise RuntimeError('Boat storage watcher logging exited') from log_error
+        if isinstance(error, SystemExit):
+            raise RuntimeError('Boat storage watcher exited during a poll') from error
+        raise
 
 
 def identity_present(path=IDENTITY):
@@ -283,6 +349,8 @@ def main():
         return prepare_storage()
     if sys.argv[1:] == ['--watch-storage']:
         return watch_storage()
+    if sys.argv[1:] == ['--withdraw-storage']:
+        return withdraw_storage()
     if sys.argv[1:] == ['--check-mountpoints']:
         for path in (STATE, USERS):
             empty_mountpoint(path)

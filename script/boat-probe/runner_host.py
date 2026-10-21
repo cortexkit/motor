@@ -365,23 +365,83 @@ print(json.dumps({'seconds':elapsed, 'started':started, 'before':before, 'seeded
 # Run only in a disposable probe clone, after its real-job and resume phases.
 # Reproduce Boat removing /Users after readiness, then directly start Users.mount
 # as a job dependency could, over a newly created root-disk workspace directory.
+# Allow three nominal watcher polls, observe late withdrawal for up to ten
+# seconds, then watch ten more seconds for an endpoint republishing readiness.
+STORAGE_WITHDRAWAL_MAX_S = 3
 DEFERRED_CLEANUP_REPLAY = r'''
 import json, pathlib, subprocess, time, uuid
-subprocess.run(['umount','--','/Users'],check=True)
+def capture(command):
+    try:
+        result = subprocess.run(command,capture_output=True,text=True,timeout=10)
+        return {'returncode':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
+    except subprocess.TimeoutExpired:
+        return {'returncode':None, 'stdout':'', 'stderr':'timed out after 10 seconds'}
+def watch_state():
+    result = capture(['systemctl','show','motor-boat-storage-watch.service',
+        '-p','ActiveState','-p','SubState','-p','NRestarts','-p','ExecMainStartTimestamp'])
+    result['properties'] = dict(line.split('=',1) for line in result['stdout'].splitlines() if '=' in line)
+    return result
+watch_before = watch_state()
+ready = pathlib.Path('/run/motor/endpoint-ready')
+ready_before = ready.exists()
+started = time.monotonic()
+subprocess.run(['umount','--','/Users'],check=True,timeout=10)
 sentinel = pathlib.Path('/Users') / ('motor-mount-replay-' + uuid.uuid4().hex)
 sentinel.mkdir()
 (sentinel / 'materialized-workspace').touch()
-activation = subprocess.run(['systemctl','start','Users.mount'],capture_output=True,text=True)
-time.sleep(2)
+# Do not let a slow mount-unit activation hide the time of readiness withdrawal.
+activation = subprocess.Popen(['systemctl','start','Users.mount'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+latency = 'never'
+while True:
+    elapsed = time.monotonic() - started
+    if not ready.exists():
+        latency = elapsed
+        break
+    if elapsed >= 10:
+        break
+    time.sleep(min(.1, 10 - elapsed))
+reappeared = False
+reappearance_latency = 'never'
+observed_after_withdrawal = 0
+if latency != 'never':
+    withdrawn_at = time.monotonic()
+    while True:
+        observed_after_withdrawal = time.monotonic() - withdrawn_at
+        if ready.exists() and not reappeared:
+            reappeared = True
+            reappearance_latency = observed_after_withdrawal
+        if observed_after_withdrawal >= 10:
+            break
+        time.sleep(min(.1, 10 - observed_after_withdrawal))
+activation_timed_out = False
+try:
+    _, activation_stderr = activation.communicate(timeout=10)
+except subprocess.TimeoutExpired:
+    activation_timed_out = True
+    activation.kill()
+    _, activation_stderr = activation.communicate()
 rows = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == '/Users']
-print(json.dumps({'activation_code':activation.returncode, 'activation_stderr':activation.stderr,
+endpoint_ready = ready.exists()
+watch_after = watch_state()
+watch_journal = capture(['journalctl','--boot=0','--unit=motor-boat-storage-watch.service','--no-pager','--output=short-monotonic'])
+print(json.dumps({'activation_code':activation.returncode, 'activation_stderr':activation_stderr,
+    'activation_timed_out':activation_timed_out,
     'workspace_visible':(sentinel / 'materialized-workspace').exists(), 'users_mounts':rows,
-    'endpoint_ready':pathlib.Path('/run/motor/endpoint-ready').exists()}))
+    'endpoint_ready_before':ready_before, 'endpoint_ready':endpoint_ready,
+    'withdrawal_latency_seconds':latency,
+    'endpoint_ready_reappeared':reappeared, 'reappearance_latency_seconds':reappearance_latency,
+    'post_withdrawal_observation_seconds':observed_after_withdrawal,
+    'storage_watch_before':watch_before, 'storage_watch_after':watch_after, 'storage_watch_journal':watch_journal}))
 '''
 
 
 def cleanup_replay_checks(data):
-    return data['workspace_visible'] and not data['users_mounts'] and not data['endpoint_ready']
+    latency = data.get('withdrawal_latency_seconds')
+    return (data['workspace_visible'] and not data['users_mounts'] and not data['endpoint_ready']
+            and data.get('endpoint_ready_before') is True
+            and type(latency) in (int, float) and 0 <= latency <= STORAGE_WITHDRAWAL_MAX_S
+            and data.get('endpoint_ready_reappeared') is False
+            and data.get('post_withdrawal_observation_seconds', 0) >= 10)
 
 
 def idle_reclaim_checks(data):

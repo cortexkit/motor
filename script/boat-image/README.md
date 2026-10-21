@@ -231,10 +231,39 @@ bind identity, `reflink=1`, and a real cross-path FICLONE. An active mount unit
 alone is not evidence of usable storage.
 
 Before each Boat job launch the runner also checks the workspace exists on the
-same non-root device as `/Users` and runner state. The storage watcher polls
-device and directory identities once a second and withdraws the endpoint-ready
-marker for the remainder of the watcher's current run if a view changes. It does not
-repair mounts beneath a running daemon. Portable tests cover delayed public-bind
+same non-root device as `/Users` and runner state. The storage watcher checks
+device and directory identities immediately, then sleeps one second after each
+check. Filesystem operations and scheduling can extend that interval; it is not
+a hard real-time deadline. Before reading evidence or checking storage, every
+watcher instance attempts to withdraw readiness. Any unhealthy result or exception
+attempts to revoke health and remove the marker before logging, then exits nonzero.
+A failed unlink is fatal, with best-effort cleanup retried on exit. If cleanup
+cannot complete, the endpoint rejects the health lease after it expires.
+Only a new watcher instance that
+re-verifies the prepared identity can report healthy again; the watcher never
+creates endpoint readiness or repairs mounts beneath a running daemon.
+
+The endpoint is the sole readiness publisher. Its key/identity checks alone used
+to recreate a marker removed by the watcher on the next endpoint poll. Both now
+take an exclusive `flock` on `/run/motor-boat-storage/lock` across publication or
+withdrawal. The watcher alone writes root-owned 0600 `health.json` in that root-only
+directory, containing status, the verified identity tuple and a five-second
+monotonic lease. The endpoint publishes only for a healthy, unexpired lease whose
+tuple matches the state/workspace identity it captured at startup. Missing,
+unreadable, malformed or unsafe health files fail closed. A queued publisher reads
+health after taking the lock, so it cannot resurrect a withdrawn marker.
+
+The notify service uses `WatchdogSec=5`, with heartbeats only after completed
+polls. `READY=1` starts the watchdog before evidence reads; it reports monitor
+liveness, not permission to publish readiness. `ExecStopPost` also revokes health
+and withdraws readiness after uncatchable exits. The health lease expires even
+if crash cleanup cannot execute. The lock directory survives service restarts
+and endpoint runtime-directory removal, preventing replacement of the shared
+lock inode. Restart attempts are limited to five starts per 60 seconds; repeated
+failure ends in a failed unit, not an unlimited loop. Cleanup withdraws readiness;
+if cleanup itself fails, the endpoint withdraws on its next poll after lease expiry.
+
+Portable tests cover delayed public-bind
 cleanup, systemd-only activation, live-consumer refusal, and readiness withdrawal;
 the real runner-host probe additionally observes the first twelve seconds after
 readiness, sequential jobs, a seven-minute idle/reclaim interval, and stop/resume.
@@ -245,8 +274,33 @@ job parity qualification; parity and storage failures remain blocking.
 At the end, on the disposable clone only, it unmounts `/Users` as deferred cleanup
 would, creates a root-disk workspace sentinel, and requests `Users.mount` again.
 The sentinel must remain visible without an overmount, and endpoint readiness
-must disappear. This deterministic replay fails on images that remount over
+must disappear within **three seconds**, allowing three nominal watcher polls.
+The replay samples every 100 ms for up to ten seconds, recording
+`withdrawal_latency_seconds` as the first observed absence, or `"never"`.
+Timing starts immediately before `umount`, so the reported latency includes
+the unmount command and is an upper bound on detection latency. Mount-unit
+activation runs concurrently with sampling, not ahead of the timing window.
+Readiness must have been present before replay and must still be absent after
+activation completes; a late withdrawal remains a failure. After the first
+withdrawal, sampling continues for ten seconds. Any observed reappearance is
+latched in `endpoint_ready_reappeared` and fails the replay even if the watcher
+removes the marker again before the final sample. The probe also records
+`reappearance_latency_seconds` and `post_withdrawal_observation_seconds`.
+This deterministic replay fails on images that remount over
 populated `/Users`, even when the original restore timing race does not occur.
+
+Replay diagnostics include `storage_watch_before` and `storage_watch_after`
+(`systemctl show` fields `ActiveState`, `SubState`, `NRestarts`, and
+`ExecMainStartTimestamp`, nested under `properties`), plus `storage_watch_journal` from the clone's current
+boot in monotonic journal time. Each capture retains its return code, stdout,
+and stderr, including diagnostic-command timeouts. A latency over three seconds
+but under ten fails the withdrawal gate; because it includes `umount`, it does
+not by itself establish that the watcher was slow. A `"never"` result with an inactive
+or restarting watcher points to service failure; the journal can show its cause.
+A running watcher with no unhealthy-storage message narrows the candidates to
+a stalled loop or a storage view that did not change in its context, not proof
+of either. An unhealthy-storage message without marker withdrawal instead
+points to unlink failure or another process recreating the marker.
 
 This keeps the server's reflink contract and cache behavior unchanged; a copy
 fallback would broaden runner semantics and hide unsupported storage. The live
