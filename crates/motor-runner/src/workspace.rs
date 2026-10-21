@@ -283,6 +283,129 @@ const HELD_REPORT_LIMIT: usize = 32;
 /// The runner prunes them once the offer's lifetime has passed.
 pub(crate) const HELD_REFS: &str = "refs/held/";
 
+/// Prerequisite commits a bundle file declares: the `-<oid>` lines of its
+/// header, which ends at the first empty line, before the pack data.
+pub(crate) fn bundle_prerequisites(path: &Path) -> io::Result<Vec<String>> {
+    use std::io::{BufRead, Read};
+    // A header lists every ref and prerequisite; a megabyte is far more than
+    // any real bundle needs, and the bound keeps a corrupt file from being
+    // read whole.
+    let mut reader = io::BufReader::new(fs::File::open(path)?).take(1 << 20);
+    let mut prerequisites = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || line == b"\n" {
+            return Ok(prerequisites);
+        }
+        if let Some(rest) = line.strip_prefix(b"-") {
+            let oid: String = String::from_utf8_lossy(rest)
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            if !oid.is_empty() {
+                prerequisites.push(oid);
+            }
+        }
+    }
+}
+
+/// A loose ref file holds an object id or a `ref: ` symbolic target. After an
+/// unclean stop a ref file can be empty or partly written; git then fails
+/// every fetch's connectivity check while `for-each-ref` only warns about it.
+fn valid_loose_ref(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let text = text.trim_end_matches('\n');
+    text.starts_with("ref: ")
+        || (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Remove the refs of a mirror that git cannot use, and return each removed
+/// ref with the reason. A ref is unusable when its file is unreadable, its
+/// commit or that commit's root tree is missing, or it points at one of
+/// `commits` (a failed bundle's prerequisites) whose root tree is missing.
+/// One such ref makes every later bundle fetch into the mirror fail, and a
+/// have reply would keep reporting what it points at. Objects are never
+/// deleted: checkouts borrow them through alternates. The check reads only
+/// the ref files, one `for-each-ref` and one `cat-file --batch-check`, so it
+/// does not walk history. Callers hold the runner's ref mutation lock.
+pub(crate) fn repair_mirror(mirror: &Path, commits: &[String]) -> io::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut pending = vec![mirror.join("refs")];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_none_or(|e| e != "lock")
+                && !valid_loose_ref(&fs::read(&path).unwrap_or_default())
+            {
+                fs::remove_file(&path)?;
+                let name = path.strip_prefix(mirror).unwrap_or(&path);
+                removed.push(format!("{} (unreadable ref file)", name.display()));
+            }
+        }
+    }
+    let listed = git(
+        mirror,
+        &["for-each-ref", "--format=%(objectname) %(refname)"],
+    )?;
+    let refs: Vec<(&str, &str)> = listed.lines().filter_map(|l| l.split_once(' ')).collect();
+    let mut input = String::new();
+    for (oid, _) in &refs {
+        input.push_str(&format!("{oid}\n{oid}^{{tree}}\n"));
+    }
+    for commit in commits {
+        input.push_str(&format!("{commit}^{{tree}}\n"));
+    }
+    let mut command = git_command(mirror);
+    command.args(["cat-file", "--batch-check=%(objecttype)"]);
+    let output = git_input(command, input.as_bytes())?;
+    if !output.status.success() {
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+    }
+    let types = String::from_utf8_lossy(&output.stdout);
+    let types: Vec<&str> = types.lines().collect();
+    if types.len() != refs.len() * 2 + commits.len() {
+        return Err(invalid("cat-file --batch-check answered a different count"));
+    }
+    let broken_commits: BTreeSet<&str> = commits
+        .iter()
+        .zip(&types[refs.len() * 2..])
+        .filter(|(_, kind)| **kind != "tree")
+        .map(|(commit, _)| commit.as_str())
+        .collect();
+    let mut stale = Vec::new();
+    for (i, (oid, name)) in refs.iter().enumerate() {
+        let reason = if types[2 * i] != "commit" {
+            "commit missing"
+        } else if types[2 * i + 1] != "tree" {
+            "tree missing"
+        } else if broken_commits.contains(oid) {
+            "prerequisite tree missing"
+        } else {
+            continue;
+        };
+        stale.push((name.to_string(), reason));
+    }
+    let names: Vec<String> = stale.iter().map(|(name, _)| name.clone()).collect();
+    if delete_refs(mirror, &names).is_err() {
+        // One ref the transaction cannot lock must not keep the others.
+        stale.retain(|(name, _)| git(mirror, &["update-ref", "-d", name]).is_ok());
+    }
+    removed.extend(
+        stale
+            .into_iter()
+            .map(|(name, reason)| format!("{name} ({reason})")),
+    );
+    Ok(removed)
+}
+
 /// A mirror is compacted once it holds more than this many ordinary packs.
 const MAX_MIRROR_PACKS: usize = 3;
 

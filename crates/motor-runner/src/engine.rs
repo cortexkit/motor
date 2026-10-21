@@ -180,10 +180,31 @@ pub(crate) async fn net_operator_case(mode: &str) {
 }
 
 pub(crate) fn transfer_refusal(error: &io::Error) -> RefusalReason {
-    if error.kind() == io::ErrorKind::TimedOut {
+    if error.kind() == io::ErrorKind::TimedOut || MirrorRepaired::is(error) {
         RefusalReason::TransferInterrupted
     } else {
         RefusalReason::BundleRejected
+    }
+}
+
+/// A bundle fetch failed and the runner then removed unusable refs from the
+/// mirror. The job did not run. The next attempt's have reply no longer
+/// reports what those refs pointed at, so a retry can send that history.
+/// Refused as an interrupted transfer, which callers may retry, with this as
+/// the detail.
+#[derive(Debug)]
+pub(crate) struct MirrorRepaired(pub String);
+impl std::fmt::Display for MirrorRepaired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for MirrorRepaired {}
+impl MirrorRepaired {
+    fn is(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<Self>().is_some())
     }
 }
 
@@ -1311,6 +1332,7 @@ impl Runner {
             runner.discard(&scratch)?;
         }
         runner.refresh_quarantine_admission(true);
+        runner.check_mirrors();
         runner.maintenance()?;
         for (id, process) in lost {
             runner.recovery_diagnostic(id, process, false)?;
@@ -2264,6 +2286,8 @@ impl Runner {
                 &request.siblings,
             )
         });
+        let fetched = fetched
+            .map_err(|error| self.repair_after_failed_fetch(error, directory, &request.bundles));
         let mut inner = self.core.inner.lock().unwrap();
         // A cancel or withdraw during the fetch already wrote the terminal.
         if !awaiting(&inner) {
@@ -2313,14 +2337,17 @@ impl Runner {
         self.core
             .trees
             .validate_dependency_bundles(directory, &request.git_dependencies)?;
-        self.core.trees.fetch(
+        if let Err(error) = self.core.trees.fetch(
             directory,
             &request.bundles,
             &request.repository_root,
             &request.base_commit,
             &request.integration_tip,
             &request.siblings,
-        )?;
+        ) {
+            let _refs = self.core.ref_mutation.lock().unwrap();
+            return Err(self.repair_after_failed_fetch(error, directory, &request.bundles));
+        }
         self.core
             .trees
             .import_dependencies(directory, &request.git_dependencies)?;
@@ -3533,6 +3560,104 @@ impl Runner {
         self.catalog(&inner)?;
         drop(inner);
         self.prune_refs()
+    }
+
+    /// Check the mirrors a failed bundle fetch targeted and remove refs git
+    /// cannot use (see `workspace::repair_mirror`), including refs at the
+    /// bundles' prerequisites when those are damaged. One such ref fails every
+    /// later fetch into that mirror, so leaving it would refuse every job for
+    /// the repository. Returns `MirrorRepaired` when something was removed,
+    /// otherwise the original error. Callers hold `ref_mutation`.
+    fn repair_after_failed_fetch(
+        &self,
+        error: io::Error,
+        directory: &Path,
+        bundles: &[BundleManifest],
+    ) -> io::Error {
+        // A stalled transfer says nothing about the mirror.
+        if error.kind() == io::ErrorKind::TimedOut {
+            return error;
+        }
+        let mut repositories = BTreeMap::<&str, Vec<String>>::new();
+        for bundle in bundles {
+            let prerequisites =
+                workspace::bundle_prerequisites(&directory.join(bundle.index.to_string()))
+                    .unwrap_or_default();
+            repositories
+                .entry(&bundle.repository)
+                .or_default()
+                .extend(prerequisites);
+        }
+        let mut repaired = Vec::new();
+        for (repository, prerequisites) in repositories {
+            let removed = self.repair_mirror(repository, &prerequisites);
+            if !removed.is_empty() {
+                repaired.push(format!("{repository}: {}", removed.join(", ")));
+            }
+        }
+        if repaired.is_empty() {
+            return error;
+        }
+        io::Error::other(MirrorRepaired(format!(
+            "mirror_repaired: the bundle fetch failed ({error}); removed unusable refs: {}; retry the job and the runner will ask for the history they pinned",
+            repaired.join("; ")
+        )))
+    }
+
+    /// Remove one mirror's unusable refs and forget the have-reply offers among
+    /// them, logging what was found. Returns the removed refs with reasons.
+    fn repair_mirror(&self, repository: &str, commits: &[String]) -> Vec<String> {
+        let mirror = self.core.trees.mirror(repository);
+        if !mirror.is_dir() {
+            return Vec::new();
+        }
+        let removed = match workspace::repair_mirror(&mirror, commits) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::error!(mirror = %mirror.display(), %error, "mirror ref check failed");
+                return Vec::new();
+            }
+        };
+        if removed.is_empty() {
+            return removed;
+        }
+        tracing::warn!(mirror = %mirror.display(), removed = ?removed, "removed unusable mirror refs");
+        if let Some(offers) = self.core.held_offers.lock().unwrap().get_mut(&mirror) {
+            offers.retain(|commit, _| {
+                let held = format!("{}{commit}", workspace::HELD_REFS);
+                !removed
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("{held} ")))
+            });
+        }
+        removed
+    }
+
+    /// Startup check of every mirror: an unclean stop can leave a ref file
+    /// empty or a ref pointing at an object that was never written to disk,
+    /// and either one fails every bundle fetch into that mirror. Only ref
+    /// targets and their root trees are read, so this stays cheap however
+    /// long a mirror's history is.
+    fn check_mirrors(&self) {
+        let _refs = self.core.ref_mutation.lock().unwrap();
+        let Ok(entries) = fs::read_dir(&self.core.trees.mirrors) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let mirror = entry.path();
+            if !mirror.is_dir() {
+                continue;
+            }
+            match workspace::repair_mirror(&mirror, &[]) {
+                Ok(removed) if removed.is_empty() => {}
+                Ok(removed) => {
+                    tracing::warn!(mirror = %mirror.display(), removed = ?removed, "startup removed unusable mirror refs")
+                }
+                Err(error) => {
+                    tracing::error!(mirror = %mirror.display(), %error, "startup mirror ref check failed")
+                }
+            }
+        }
     }
 
     fn prune_refs(&self) -> io::Result<()> {

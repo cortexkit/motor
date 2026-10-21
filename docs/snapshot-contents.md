@@ -198,6 +198,21 @@ not themselves a reason to report a commit again. Tests:
 `held_refs_expire_and_unreferenced_commits_are_not_reported`
 (`crates/motor-runner/src/tests/held_prerequisites.rs`).
 
+7.1.2. One unusable ref in a mirror fails every later bundle fetch into it,
+because Git's connectivity check reads every ref. A ref is unusable when its
+file is empty or unreadable, or when its commit or that commit's root tree is
+missing; an unclean stop can leave any of these. When a bundle fetch fails,
+the runner checks the ref files, each ref's commit and root tree, and the
+failed bundle's prerequisites, without walking history, and removes the
+unusable refs. It never deletes objects, because checkouts borrow them. If it
+removed anything, the job is refused before start as `transfer_interrupted`
+with a detail starting `mirror_repaired:` that names the refs. The next
+attempt's have reply no longer reports them, so the sender bundles what they
+pinned. The runner runs the same check on every mirror when it starts.
+Tests: `an_empty_mirror_ref_file_is_removed_after_the_fetch_it_breaks`,
+`a_mirror_ref_at_a_missing_commit_is_removed_after_the_fetch_it_breaks`,
+`startup_removes_unusable_mirror_refs` (same file).
+
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
 the runner advertises support; older runners receive none. Tests:
 `run_and_prepare_lockfile_source_is_commit_not_worktree`,
