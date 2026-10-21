@@ -192,10 +192,9 @@ fn qualification_settle(
             )?;
             last_record = Instant::now();
         }
-        if super::agent::qualification_io_is_quiet(elapsed_ms, quiet_ms, available) {
-            quiet = true;
-            break;
-        }
+        // A quiet vmwp process does not prove guest storage is quiet. Keep the
+        // full diagnostic window instead of ending early on this weak signal.
+        quiet = super::agent::qualification_io_is_quiet(elapsed_ms, quiet_ms, available);
         std::thread::sleep(
             Duration::from_millis(250)
                 .min(Duration::from_secs(60).saturating_sub(dropped.elapsed())),
@@ -207,7 +206,7 @@ fn qualification_settle(
         "host-io-settle-finished",
         serde_json::json!({
             "since_drop_ms":dropped.elapsed().as_millis() as u64,"available":available,
-            "io_quiet":quiet,"reason":if quiet {"observed-process-io-quiet"} else {"bounded-window-ended-unverified"},
+            "io_quiet":quiet,"reason":"full-diagnostic-window-ended-process-io-not-a-guest-storage-barrier",
             "agent_log_live_observation":null
         }),
     )
@@ -241,8 +240,14 @@ fn verify_qualification_guest(
         }),
     )?;
     for name in ["job-disk-binding.json", "mounted-disk-identity.json"] {
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(evidence.join(name))?).map_err(io::Error::other)?;
+        let path = evidence.join(name);
+        let bytes = fs::read(&path).map_err(|error| {
+            invalid(format!(
+                "Cannot read qualification identity {}: {error}",
+                path.display()
+            ))
+        })?;
+        let value = super::agent::qualification_json(&bytes, &path.display().to_string())?;
         if value["matched"] != true || value.get("error").is_some() {
             return Err(invalid(format!(
                 "Guest disk identity assertion failed; inspect {}",
@@ -504,8 +509,7 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
         serde_json::json!({"version":motor_winagent::PROTOCOL_VERSION}),
     )?;
     let inspect = checked(control(config, "QualifyInspect", Some(id), &[])?)?;
-    let inspect: serde_json::Value =
-        serde_json::from_slice(&inspect.stdout).map_err(io::Error::other)?;
+    let inspect = super::agent::qualification_json(&inspect.stdout, "QualifyInspect stdout")?;
     let worker_pid = inspect["worker_pid"]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())

@@ -22,6 +22,9 @@ class ConnectDiagnosticTests(unittest.TestCase):
         embedded = self.script.split("function Save-Json(", 1)[1].split("function Save-HostVmEvents(", 1)[0]
         shared = (HERE / "guest-evidence.ps1").read_text().split("function Save-Json(", 1)[1]
         self.assertEqual(embedded.strip(), shared.strip())
+        writer = shared.split("function Get-PlainGuestItem(", 1)[0]
+        self.assertIn("[Text.UTF8Encoding]::new($false)", writer)
+        self.assertNotIn("Set-Content", writer)
 
     def test_diagnostic_harvests_stopped_child_before_remove(self):
         cleanup = self.script.split("# Harvest the stopped child before Remove", 1)[1]

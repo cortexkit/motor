@@ -91,13 +91,17 @@ disk number and reverse partition/drive-letter association. The resulting
 volume identities; lookup failures are distinct from an absent guest file.
 
 The disconnect qualification alone records prepare/connect/Hello/write/drop
-milestones and allows at most a 60-second host-I/O settle before forced power-off.
-The VM worker's process counters are a timing heuristic, not per-disk durability:
-an unavailable source uses the bounded window without claiming quiescence. No
+milestones and observes a bounded 60-second diagnostic window before forced power-off.
+The VM worker's process counters are not per-disk durability and do not shorten
+that window: a quiet process can still have guest/kernel storage work pending. No
 running guest filesystem is mounted. The first safe log observation is recorded
 after power-off relative to stream drop, not claimed as the guest's write time.
 The exact EOF/read-count assertion remains required and is bound to the current
 nonce. Production does not wait on or depend on guest log persistence.
+The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enables
+`hyperv-hvsock` and `hyperv-spike`); that profile logs on every boot, not only when
+a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;
+qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
 ## Build on Linux, not on the Windows host
 

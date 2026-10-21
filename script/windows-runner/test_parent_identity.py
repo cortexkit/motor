@@ -26,6 +26,8 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("Qualification-only timing heuristic", native)
         self.assertIn("while dropped.elapsed() < Duration::from_secs(60)", native)
         self.assertIn("GetProcessIoCounters", native)
+        settle = native.split("fn qualification_settle(", 1)[1].split("fn verify_qualification_guest(", 1)[0]
+        self.assertNotIn("break;", settle)
         self.assertLess(native.index("qualification_settle(config, id, worker_pid, dropped)?"), native.index("verify_qualification_guest(config, id, &nonce, written, dropped)?"))
         self.assertIn("super::agent::qualification_eof_matches", native)
         self.assertIn("first-safe-host-observation-after-power-off-not-guest-write-time", native)

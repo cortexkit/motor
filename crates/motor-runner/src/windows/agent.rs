@@ -113,6 +113,13 @@ pub(super) fn qualification_io_is_quiet(elapsed_ms: u64, quiet_ms: u64, availabl
     available && elapsed_ms >= 15_000 && quiet_ms >= 5_000
 }
 #[cfg(any(windows, test))]
+pub(super) fn qualification_json(bytes: &[u8], source: &str) -> io::Result<serde_json::Value> {
+    let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    serde_json::from_slice(payload).map_err(|error| {
+        io::Error::other(format!("Invalid qualification JSON from {source}: {error}"))
+    })
+}
+#[cfg(any(windows, test))]
 pub(super) fn qualification_eof_matches(log: &str, nonce: &str, written: usize) -> bool {
     let Some((_, episode)) = log.rsplit_once(&format!("boot nonce={nonce}")) else {
         return false;
@@ -842,6 +849,23 @@ mod tests {
         assert!(!qualification_io_is_quiet(15_000, 4_999, true));
         assert!(!qualification_io_is_quiet(60_000, 60_000, false));
         assert!(qualification_io_is_quiet(15_000, 5_000, true));
+    }
+
+    #[test]
+    fn qualification_json_accepts_ps51_bom_and_names_bad_inputs() {
+        for bytes in [
+            b"{\"matched\":true}".as_slice(),
+            b"\xef\xbb\xbf{\r\n\"matched\":true}",
+        ] {
+            assert_eq!(
+                qualification_json(bytes, "job-disk-binding.json").unwrap()["matched"],
+                true
+            );
+        }
+        for bytes in [b"".as_slice(), b"\xef\xbb\xbf", b"not JSON"] {
+            let error = qualification_json(bytes, "mounted-disk-identity.json").unwrap_err();
+            assert!(error.to_string().contains("mounted-disk-identity.json"));
+        }
     }
 
     #[test]

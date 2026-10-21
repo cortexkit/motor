@@ -59,6 +59,20 @@ if ($guards.Count -ne 2) { throw 'FAIL parent-identity-production-guards: Prepar
 Write-Host 'PASS parent-identity-production-guards'
 $count++
 
+& {
+    . "$PSScriptRoot\guest-evidence.ps1"
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('motor-identity-json-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Save-Json $path @{matched=$true}
+        $bytes = [IO.File]::ReadAllBytes($path)
+        if ($bytes.Length -lt 2 -or ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) { throw 'FAIL qualification-identity-json-is-bom-free' }
+        $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if (-not $value.matched) { throw 'FAIL qualification-identity-json-is-bom-free' }
+        Write-Host 'PASS qualification-identity-json-is-bom-free'
+        $script:count++
+    } finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+}
+
 $switch = $control.Find({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true)
 $prepare = @($switch.Clauses | Where-Object { $_.Item1 -is [Management.Automation.Language.StringConstantExpressionAst] -and $_.Item1.Value -eq 'Prepare' })
 if ($prepare.Count -ne 1) { throw 'FAIL boot-nonce-production-contract: Prepare clause missing' }

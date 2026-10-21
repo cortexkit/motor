@@ -2,7 +2,8 @@
 # diagnose-connect.ps1 embeds these functions so its collector
 # needs no sidecar file; source-level tests keep the function bodies aligned.
 function Save-Json([string]$Path, $Value) {
-    ConvertTo-Json -InputObject $Value -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
+    $json = ConvertTo-Json -InputObject $Value -Depth 10
+    [IO.File]::WriteAllText($Path, $json, [Text.UTF8Encoding]::new($false))
 }
 function Get-PlainGuestItem([string]$Volume, [string]$Relative) {
     $path = $Volume
