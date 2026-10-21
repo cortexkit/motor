@@ -536,6 +536,12 @@ def unit_paths(unit):
     return paths
 
 
+# The account that owns fixtures the tests mark as foreign. Node's release
+# tarball records uid 1001, but GitHub's Ubuntu runners also run tests as uid
+# 1001, so a foreign owner must differ from the test's own uid.
+FOREIGN_UID = 1001 if os.getuid() != 1001 else 1002
+
+
 class RootPathTests(unittest.TestCase):
     """The invariant that everything root executes from is root-owned with no
     group or other write. Fixtures are owned by the test's own uid, so `owner`
@@ -560,10 +566,10 @@ class RootPathTests(unittest.TestCase):
         self.owner = os.getuid()
         self.foreign = set()
 
-    def own_by_1001(self, relative):
+    def own_by_foreign(self, relative):
         path = self.image / relative
         if os.geteuid() == 0:
-            os.lchown(path, 1001, 1001)
+            os.lchown(path, FOREIGN_UID, FOREIGN_UID)
         else:
             self.foreign.add(path)
 
@@ -573,7 +579,7 @@ class RootPathTests(unittest.TestCase):
         def lstat(path):
             metadata = real(path)
             if path in self.foreign:
-                return mock.Mock(st_uid=1001, st_gid=1001, st_mode=metadata.st_mode)
+                return mock.Mock(st_uid=FOREIGN_UID, st_gid=FOREIGN_UID, st_mode=metadata.st_mode)
             return metadata
 
         return mock.patch.object(Path, "lstat", lstat)
@@ -590,21 +596,21 @@ class RootPathTests(unittest.TestCase):
         # file, usr/sbin and its file, and the /bin and /sbin links themselves.
         self.assertEqual(report["entries"], 19)
 
-    def test_a_uid_1001_usr_local_bin_fails_naming_the_directory(self):
+    def test_a_foreign_usr_local_bin_fails_naming_the_directory(self):
         # What extracting Node's release tarball as root used to leave behind.
-        self.own_by_1001("usr/local/bin")
-        self.own_by_1001("usr/local/bin/node")
+        self.own_by_foreign("usr/local/bin")
+        self.own_by_foreign("usr/local/bin/node")
         report = self.check()
         self.assertEqual(report["offender_count"], 2)
-        self.assertEqual(report["offenders"][0], f"{self.image}/usr/local/bin: uid=1001 gid=1001")
+        self.assertEqual(report["offenders"][0], f"{self.image}/usr/local/bin: uid={FOREIGN_UID} gid={FOREIGN_UID}")
         with self.simulated_owners():
-            with self.assertRaisesRegex(ValueError, r"2 path\(s\) root executes from .*usr/local/bin: uid=1001"):
+            with self.assertRaisesRegex(ValueError, rf"2 path\(s\) root executes from .*usr/local/bin: uid={FOREIGN_UID}"):
                 root_paths.require(root_paths.TENANT_ROOTS, self.image, self.owner)
 
     def test_a_foreign_symlink_fails_but_its_mode_bits_are_ignored(self):
         self.assertEqual(self.check()["offenders"], [])
-        self.own_by_1001("usr/local/bin/corepack")
-        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/local/bin/corepack: uid=1001 gid=1001"])
+        self.own_by_foreign("usr/local/bin/corepack")
+        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/local/bin/corepack: uid={FOREIGN_UID} gid={FOREIGN_UID}"])
 
     def test_group_or_other_write_fails_on_entries_and_on_ancestors(self):
         for relative in ("usr/local/share", "usr/local/bin/node", "usr", ""):
@@ -618,8 +624,8 @@ class RootPathTests(unittest.TestCase):
             path.chmod(mode)
 
     def test_link_targets_and_path_roots_outside_usr_local_are_checked(self):
-        self.own_by_1001("usr/sbin/init")
-        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/sbin/init: uid=1001 gid=1001"])
+        self.own_by_foreign("usr/sbin/init")
+        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/sbin/init: uid={FOREIGN_UID} gid={FOREIGN_UID}"])
 
     def test_missing_roots_are_listed_and_escaping_links_fail(self):
         report = self.check((*root_paths.TENANT_ROOTS, "/home/ubuntu/.bun/bin"))
