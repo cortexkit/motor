@@ -120,7 +120,8 @@ fn write_test_executable_with(
     hook_result
 }
 
-#[cfg(test)]
+// The race it proves needs Linux's ETXTBSY behaviour, so the module is Linux-only.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::{
@@ -130,7 +131,6 @@ mod tests {
         thread,
     };
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn concurrent_fork_during_executable_write_cannot_inherit_its_writer_fd() {
         let scratch = cortexkit_test_support::ScratchDir::new("concurrent-executable-publication");

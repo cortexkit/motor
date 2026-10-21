@@ -199,6 +199,9 @@ def freeze_stable(manifest, toolchain, spec, host):
 
 def install_rust(manifest, installer):
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
+    # rustup replaces itself with the newest release during `toolchain install`
+    # unless told not to, which would drift from the pinned build-server version.
+    run("rustup", "set", "auto-self-update", "disable")
     for line in run('rustup', 'toolchain', 'list', capture=True).splitlines():
         if line.strip() == 'no installed toolchains':
             continue

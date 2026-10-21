@@ -73,6 +73,17 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn('x86_64-unknown-linux-musl', targets)
             self.assertIn('clippy', components)
 
+    def test_recipe_disables_rustup_self_update_before_installing_toolchains(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init')
+        calls = [call.args for call in run.call_args_list]
+        disable = calls.index(('rustup', 'set', 'auto-self-update', 'disable'))
+        installs = [i for i, args in enumerate(calls) if args[:3] == ('rustup', 'toolchain', 'install')]
+        self.assertTrue(installs and disable < min(installs))
+        self.assertEqual(calls[0][0], '/rustup-init')
+        self.assertLess(0, disable)
+
     def test_recipe_uses_server_bun_home_and_preserves_job_path_order(self):
         unit = (HERE / 'motor-boat.service').read_text()
         self.assertIn('Environment=HOME=/home/ubuntu\n', unit)

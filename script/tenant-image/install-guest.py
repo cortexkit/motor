@@ -69,6 +69,9 @@ def install_tools(pins):
     (BUILD / "rustup-init").chmod(0o755)
     run(str(BUILD / "rustup-init"), "-y", "--no-modify-path", "--profile", "minimal",
         "--default-toolchain", pins["rust_default"])
+    # rustup replaces itself with the newest release during `toolchain install`
+    # unless told not to, which would drift from the pinned version.
+    run("rustup", "set", "auto-self-update", "disable")
     for toolchain, targets in pins["rust_toolchains"].items():
         run("rustup", "toolchain", "install", toolchain, "--profile", "minimal",
             "--component", "clippy", "--component", "rustfmt")
