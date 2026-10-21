@@ -42,7 +42,7 @@ fn configure(
     args: &[String],
 ) -> Result<(FakeBroker, std::net::SocketAddr), Box<dyn std::error::Error>> {
     if !args.len().is_multiple_of(2) {
-        return Err("usage: motor-fake-broker --runner-instance NAME --config FILE [--listen IP:PORT] [--refuse CODE] [--max-s SECONDS]".into());
+        return Err("usage: motor-fake-broker --runner-instance NAME --config FILE [--listen IP:PORT] [--refuse CODE] [--max-s SECONDS] [--max-vcpus N]".into());
     }
     let mut options = BTreeMap::new();
     for pair in args.as_chunks::<2>().0 {
@@ -52,6 +52,7 @@ fn configure(
             "--listen",
             "--refuse",
             "--max-s",
+            "--max-vcpus",
         ]
         .contains(&pair[0].as_str())
             || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
@@ -98,6 +99,9 @@ fn configure(
             return Err("--max-s must be positive".into());
         }
         broker.knobs.max_s = Some(max_s);
+    }
+    if let Some(max_vcpus) = options.get("--max-vcpus") {
+        broker.knobs.max_vcpus = Some(max_vcpus.parse::<u32>()?);
     }
     let listen = options.get("--listen").copied().unwrap_or("127.0.0.1:0");
     let address: std::net::SocketAddr = listen.parse()?;

@@ -801,6 +801,35 @@ fn refusal_and_budget_shortening_knobs_leave_reservations_correct() {
     }
 }
 
+/// A lease for more vCPUs than any host holds is refused with 422
+/// `no_host_fits` naming the largest count, and books nothing: once the limit
+/// allows it, the same job ID gets a fresh lease rather than a conflict.
+#[test]
+fn max_vcpus_knob_answers_no_host_fits_without_reserving() {
+    let mut b = broker();
+    b.knobs.max_vcpus = Some(8);
+    let mut req = lease_request();
+    req.vcpus = 16;
+    let refusal = post(&mut b, "/v1/leases", &req, NOW);
+    assert_eq!(
+        (refusal.status, refusal.body),
+        (422, json!({"error":"no_host_fits","max_vcpus":8}))
+    );
+    assert!(b.settlement(&req.job_id).is_none());
+    let mut fitting = lease_request();
+    fitting.job_id = "019e4567-89ab-7cde-8012-000000000008".into();
+    fitting.vcpus = 8;
+    assert_eq!(
+        issued(&mut b, &fitting, NOW).reserved_vcpu_ms,
+        8 * fitting.timeout_s * 1000
+    );
+    b.knobs.max_vcpus = None;
+    assert_eq!(
+        issued(&mut b, &req, NOW).reserved_vcpu_ms,
+        16 * req.timeout_s * 1000
+    );
+}
+
 #[test]
 fn invalid_usage_and_resource_overflow_do_not_settle_or_panic() {
     let mut b = broker();

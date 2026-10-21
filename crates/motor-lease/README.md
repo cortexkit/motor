@@ -61,6 +61,9 @@ The first stdout line gives its bound address; credentials are never printed.
 
 `--refuse CODE` refuses leases with HTTP 403 before creating a reservation.
 `--max-s SECONDS` simulates a budget-shortened runtime (including below 10 s).
+`--max-vcpus N` simulates a fleet whose largest host holds N vCPUs: a new lease
+asking for more is answered HTTP 422 `{"error":"no_host_fits","max_vcpus":N}`
+before any reservation is made.
 The reservation is `vcpus * granted max_s * 1000`. Model tests can set a finite
 allowance to exercise budget shortening and the below-10 refusal; `--max-s` can
 also deliberately issue a below-10 cap as a hostile-client test control.

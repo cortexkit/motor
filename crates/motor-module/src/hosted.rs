@@ -154,6 +154,11 @@ pub(crate) enum Error {
     HostFull,
     Capacity,
     NoCapacity(u64),
+    /// The broker answered a lease request with `no_host_fits`: no host it
+    /// could ever place the job on has that many vCPUs, so asking again cannot
+    /// succeed. Carries the broker's `max_vcpus`, the largest count it could
+    /// place, when the reply included a valid one.
+    NoHostFits(Option<u64>),
     InternalFailure,
     Connect,
     Broker,
@@ -201,6 +206,7 @@ impl Error {
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull => "hosted_host_full",
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
+            Self::NoHostFits(_) => "hosted_no_host_fits",
             Self::InternalFailure => "hosted_internal_failure",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
@@ -557,6 +563,15 @@ impl Client {
                         Error::NoCapacity(bounded_provisioning_retry_ms(retry_after_ms))
                     }
                     Some("capacity" | "no_capacity") => Error::Capacity,
+                    // Keyed on the error code alone: the broker sends it with
+                    // HTTP 422, but no status makes it worth retrying. The
+                    // `max_vcpus` count is informational; a missing or
+                    // malformed one is recorded as unknown.
+                    Some("no_host_fits") if path == "/v1/leases" => Error::NoHostFits(
+                        code.as_ref()
+                            .and_then(|v| v.get("max_vcpus"))
+                            .and_then(serde_json::Value::as_u64),
+                    ),
                     Some("host_full") => Error::HostFull,
                     Some("job_released") => Error::Released,
                     // A refused lease has no granted lease for release to cancel.
@@ -721,6 +736,10 @@ impl Client {
                 Err(error) => {
                     tracing::info!(job_id = %id, attempt, code = error.code(), "hosted lease not granted");
                     match error {
+                        // No host can ever hold this many vCPUs, so the same
+                        // request would be refused again. The caller decides
+                        // where the job goes instead.
+                        Error::NoHostFits(_) => return Err(error),
                         // A broker without capacity for a spilled job will not
                         // gain it within seconds (its Boat start cap is hourly);
                         // the build server is the better place to retry.
@@ -950,6 +969,55 @@ mod shadow_wire_tests {
         );
         assert!(booked.is_none());
         assert_eq!(http.requests.lock().unwrap().len(), 1);
+    }
+    /// A shadow lease answered `no_host_fits` is skipped after one request:
+    /// nothing is booked and the broker is not asked again. The broker's
+    /// `max_vcpus` is kept when it is a number and read as unknown otherwise.
+    #[tokio::test]
+    async fn shadow_no_host_fits_is_one_request_with_or_without_max_vcpus() {
+        for (reply, expected) in [
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":8}),
+                Some(8),
+            ),
+            (serde_json::json!({"error":"no_host_fits"}), None),
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":"eight"}),
+                None,
+            ),
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":-1}),
+                None,
+            ),
+        ] {
+            let http = test_http::Http::new(move |path, _| {
+                assert_eq!(path, "/v1/leases");
+                (422, reply.clone())
+            })
+            .await;
+            std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+            let client = Client::new(HostedJobState {
+                broker_url: http.url.clone(),
+                token_source: BrokerTokenSource::Fake,
+                ..HostedJobState::default()
+            });
+            let (_scratch, repo) = boat_tests::committed_repo();
+            let path = repo.to_str().unwrap();
+            let request = RunRequest::new(path, path, path, "true")
+                .with_timeout(30)
+                .with_weight_hint(16);
+            let mut booked = None;
+            assert_eq!(
+                client
+                    .shadow_run(Uuid::now_v7(), &request, &[1; 32], &mut booked)
+                    .await
+                    .err(),
+                Some(Error::NoHostFits(expected))
+            );
+            assert!(booked.is_none());
+            assert_eq!(http.requests.lock().unwrap().len(), 1);
+            assert_eq!(client.broker_code().as_deref(), Some("no_host_fits"));
+        }
     }
     #[test]
     fn shadow_wire_omits_false_appends_true_and_preserves_ordinary_fields() {

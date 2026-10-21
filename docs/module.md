@@ -433,7 +433,8 @@ Both agent and direct jobs for a listed repository request a lease before any
 direct-runner submission. The lease sends `avoid_host: null` (ignoring
 `spill_avoid_host`) and `allow_spill: false`, restricting placement to registered
 hosts rather than Boat. These jobs never enter the spill path or fall back to the
-direct runner. Windows stays on its direct runner. Outbound-network jobs can use
+direct runner after a hosted failure; a `no_host_fits` answer, described below,
+is a routing correction, not a failure. Windows stays on its direct runner. Outbound-network jobs can use
 hosted leases: the request's `net` flag must match the signed lease claim, and
 `network_routing` must still be enabled. Unlisted jobs retain their existing
 direct and spill behavior; spilled leases and shadow leases send `allow_spill:
@@ -447,10 +448,31 @@ a typed retryable refusal, never local execution. Before the durable `run_sent`
 marker, refusals identify repository-selected routing with the exact detail text
 `hosted stage-1 routing (hosted_repositories)`.
 After that marker the existing hosted reattach/finish path governs an ambiguous
-submission. Each selected job logs one INFO event, `routed to hosted
+submission.
+
+A broker answer of `no_host_fits` (HTTP 422, `{"error":"no_host_fits",
+"max_vcpus":N}`) means no host it could ever use holds the job's vCPUs, so a
+retry cannot succeed. For a repository-routed job that has not sent its Run
+frame, this undoes the routing choice rather than failing the job: ck-motor
+removes the job's hosted route, stores `routed_direct_reason: "no_host_fits"`
+on the job, logs one INFO event `hosted no_host_fits; routing to build server`
+with `job_id`, `vcpus` and `max_vcpus` (`unknown` when the broker omitted it),
+and submits the job to the build server like any unlisted job. The lease is not
+retried, and nothing is released or finished because nothing was booked. The
+stored decision survives restart, so a later attach reads the job from the build
+server. Time already spent waiting on the broker is taken off the job's
+queue-wait limit once, in whole seconds, and the reduced limit is both what the
+Run frame carries and what ck-motor enforces; a positive limit never drops below
+one second. The job does not spill. For spilled and shadow leases
+`no_host_fits` is an ordinary refusal: a spill goes back to the build server
+and a shadow is skipped, each after one lease request. The error code decides;
+a missing or non-numeric `max_vcpus` is read as unknown. Each selected job logs one INFO event, `routed to hosted
 (hosted_repositories)`, with `job_id` and `repo` fields. Hosted health metrics
 include `hosted_routed_jobs_1h`, counting repository-selected jobs (including
-refusals) in the last hour; stored route decisions survive restart.
+refusals) in the last hour, and `hosted_no_host_fits_1h`, counting
+repository-selected jobs sent to the build server after `no_host_fits` in the
+last hour (these are not in `hosted_routed_jobs_1h`); stored route decisions
+survive restart.
 
 Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding_a_host`,
 `unlisted_and_windows_jobs_keep_the_direct_path`,
@@ -458,6 +480,12 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_lost_run_ack_reattaches_without_direct_fallback`,
 `stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host`,
 `stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline`,
+`stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted`,
+`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
+`stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,
+`spill_no_host_fits_resubmits_to_the_build_server_without_retrying`,
+`shadow_no_host_fits_is_one_request_with_or_without_max_vcpus`,
+`no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour`,
 `unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
 `shadow_lease_explicitly_allows_spill`, and
 `hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.

@@ -25,6 +25,10 @@ pub struct Knobs {
     pub refusal: Option<(u16, String)>,
     /// Shorten the granted runtime; the reservation follows the granted cap.
     pub max_s: Option<u64>,
+    /// The most vCPUs any host behind this broker could ever hold. A new
+    /// lease asking for more is answered 422 `no_host_fits` with this number
+    /// as `max_vcpus`, before any reservation is made.
+    pub max_vcpus: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +240,12 @@ impl FakeBroker {
         } else {
             if let Some((status, code)) = &self.knobs.refusal {
                 return BrokerReply::error(*status, code);
+            }
+            if let Some(max_vcpus) = self.knobs.max_vcpus.filter(|max| request.vcpus > *max) {
+                return BrokerReply::json(
+                    422,
+                    json!({"error": "no_host_fits", "max_vcpus": max_vcpus}),
+                );
             }
             // The fake serves a single host. When the lease avoids it, nothing
             // else is selectable, which the contract answers as no capacity.
