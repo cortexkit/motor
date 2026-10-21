@@ -13,6 +13,10 @@ use windows_sys::Win32::{
     System::{JobObjects::*, Threading::*},
 };
 mod trace;
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlGetLastNtStatus() -> i32;
+}
 pub(super) const CREATION_FLAGS: u32 =
     CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
 
@@ -210,7 +214,7 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
         } else {
             0
         };
-    check("CreateProcessAsUser", unsafe {
+    let created = unsafe {
         CreateProcessAsUserW(
             session.token(),
             wide(&plan.program).as_ptr(),
@@ -224,7 +228,22 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
             &startup.StartupInfo,
             &mut info,
         )
-    })?;
+    };
+    if created == 0 {
+        // The Win32 code alone can hide which object was missing; the NTSTATUS
+        // ntdll recorded for this thread narrows it (for example an object
+        // directory path versus a file name).
+        let error = io::Error::last_os_error();
+        let status = unsafe { RtlGetLastNtStatus() };
+        return Err(step(
+            "CreateProcessAsUser",
+            format!(
+                "{error} (Win32 0x{:08X}; last NTSTATUS 0x{:08X})",
+                error.raw_os_error().unwrap_or(0) as u32,
+                status as u32
+            ),
+        ));
+    }
     let process = Handle(info.hProcess);
     let thread = Handle(info.hThread);
     *released = false;
