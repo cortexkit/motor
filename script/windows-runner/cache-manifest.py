@@ -16,12 +16,23 @@ def manifest(root, subdirectory=None):
             raise ValueError("SDK subtree must be a real directory")
     files = []
     for path in sorted(scan.rglob("*")):
+        relative = path.relative_to(root).as_posix()
         if path.is_symlink():
-            files.append({"path": path.relative_to(root).as_posix(), "symlink": str(path.readlink())})
+            files.append({"path": relative, "type": "symlink", "symlink": str(path.readlink())})
         elif path.is_file():
-            with path.open("rb") as source:
-                digest = hashlib.file_digest(source, "sha256").hexdigest()
-            files.append({"path": path.relative_to(root).as_posix(), "sha256": digest, "bytes": path.stat().st_size})
+            entry = {"path": relative, "type": "file", "bytes": path.stat().st_size}
+            if relative == "xwin/DONE":
+                # cargo-xwin writes this marker from a HashSet; only its line order
+                # is unstable. Preserve each line's bytes and multiplicity, and
+                # hash every other file byte-exactly.
+                contents = b"\n".join(sorted(path.read_bytes().split(b"\n")))
+                digest = hashlib.sha256(contents).hexdigest()
+                entry["normalization"] = "sorted-lf-lines"
+            else:
+                with path.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+            entry["sha256"] = digest
+            files.append(entry)
     if not files:
         raise ValueError("SDK cache is empty")
     encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()

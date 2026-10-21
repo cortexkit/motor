@@ -39,6 +39,12 @@ the host.
   disks: the boot/system OS disk at LUN 0 and a non-system cache at LUN 1, with
   the cache's device serial captured and rechecked. Dirty caches are discarded;
   restarting the native runner service conservatively discards all old caches.
+- Service startup hashes the sealed parent once and atomically records its file
+  identity in SYSTEM/Administrators-only state. Prepare and Run compare that
+  identity (including NTFS ChangeTime) and hold read-sharing, write/delete-denying
+  handles during setup and execution. Any difference requires restarting the
+  service to re-verify. SYSTEM and Administrators remain trusted to change the
+  parent, scripts, configuration and record.
 - No job NIC, COM mapping, optional integration service or Enhanced Session.
   Host isolation is checked before boot, every 250 ms while running, and at
   shutdown. The creation-time VM configuration checks and later samples are
@@ -74,6 +80,9 @@ python3 script/windows-runner/bundle.py
 manifest content, exact CRT/SDK components and the private Microsoft payload
 subtree hash (`cache/xwin`, retaining `xwin/` in relative names). Generated
 `clang-cl`/CMake host wrappers outside that subtree are not SDK payload.
+Only the generated `xwin/DONE` marker is normalized: its LF-separated lines are
+sorted before hashing because cargo-xwin writes an unordered payload set. Line
+content and multiplicity still matter; every other file and symlink is exact.
 The cross tool/cache install stays under the source checkout's
 `target/windows-cross`, with no host-global installation. xwin downloads Microsoft's MSVC CRT
 and Windows SDK headers/import libraries under Microsoft's Build Tools/SDK
@@ -92,7 +101,7 @@ these unsigned binaries; scripts do not change Smart App Control or WDAC.
 ## Operator sequence (elevated Windows PowerShell 5.1)
 
 First compare the ZIP's SHA-256 with the checksum supplied with the release,
-then extract it to a fresh source directory, and run the non-privileged parser/policy fixtures **before any
+then extract it to a fresh source directory, and run the parser/policy and native parent-identity fixtures **before any
 installation or VM mutation**:
 
 ```powershell

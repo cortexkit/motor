@@ -15,9 +15,9 @@
       "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base": "14.44.35226",
       "Win11SDK_10.0.26100": "10.0.26100.15"
     },
-    "cache_tree_sha256": "3c8ae4a1113c0d056b443311753a5d4fcaab0baf4d208bc9885ef5cd324d406f",
+    "cache_tree_sha256": "7463ca5bdb3be96b45a3a4a4ee5304d9b92d19e72930acc1d806e1eb3e8bf7cb",
     "sdk_subdir": "xwin",
-    "cache_scope_note": "The unchanged tree hash covers Microsoft's xwin/ payload subtree, with xwin/ in each relative path. cargo-xwin creates a host clang-cl symlink and cmake/ wrappers outside it while building; those are generated tool configuration, not SDK/CRT inputs.",
+    "cache_scope_note": "The tree hash covers the xwin/ subtree with relative paths and explicit file/symlink types. Only generated xwin/DONE hashes sorted LF-separated lines; content and multiplicity remain significant. Every other file byte and symlink target is exact. cargo-xwin creates host clang-cl and cmake/ wrappers outside this subtree; those are generated tool configuration, not SDK/CRT inputs.",
     "prep_toolchain": {
       "version": "1.99.0",
       "target": "x86_64-pc-windows-msvc",
