@@ -273,15 +273,33 @@ visibility boundary is lost: jobs using the same `motor-job` UID can see and
 signal each other's processes. The daemon also inhabits that namespace, but
 **ProtectProc=invisible and its different UID remain in force**; shared namespace
 does not grant permission to signal the daemon or override that `/proc` filter.
-The Boat job unit sets `ProtectProc=invisible`, `ProcSubset=pid`,
-`User=motor-job`, `Group=motor-job`, `NoNewPrivileges=yes`, an empty
-`CapabilityBoundingSet`, `RestrictNamespaces=yes` and `MountAPIVFS=yes`.
-`ProtectProc` hides other users' process directories; `ProcSubset` hides non-PID
-procfs entries; the UID/capability rules deny signals to root and provider-user
-processes. These are not a replacement PID namespace against another process
-with the same UID. The live job must record only its own UID/cgroup in `/proc`,
-only its own UID in `ps`, the actual proc mount options and zero capabilities,
-and get **EPERM**, not ESRCH, for `kill -0` on the known live runner PID.
+The Boat job unit sets `ProtectProc=invisible`, `User=motor-job`,
+`Group=motor-job`, `NoNewPrivileges=yes`, an empty `CapabilityBoundingSet`,
+`RestrictNamespaces=yes`, `ProtectKernelTunables=yes` and `MountAPIVFS=yes`.
+`ProtectProc` hides other users' process directories; the UID/capability rules
+deny signals to root and provider-user processes. These are not a replacement
+PID namespace against another process with the same UID.
+
+**What a Boat job sees in `/proc`.** The same as a build-server job: its own
+process directories (other accounts' are hidden), plus the non-process entries
+`/proc/stat`, `/proc/meminfo`, `/proc/cpuinfo`, `/proc/loadavg`,
+`/proc/uptime`, `/proc/cmdline` and the rest. `ps` reads the boot time from
+`/proc/stat`, and test harnesses and system-information crates read the others.
+The unit does **not** set `ProcSubset=pid`: that hid all of these, so `ps`
+failed with "Unable to get system boot time" and tools that work on the build
+server failed only on Boat. Showing them costs no isolation. A Boat sandbox is
+its own VM and admits exactly one job, so these entries describe only that
+job's VM; on the build server jobs already see the shared host's entries.
+`ProtectKernelTunables=yes` keeps `/proc/sys` and the other kernel-setting files
+read-only, and the root-only entries (`/proc/kcore`, `/proc/kmsg`,
+`/proc/sysrq-trigger`, ...) stay closed to the unprivileged job account.
+
+The live job must record only its own UID/cgroup in `/proc`, only its own UID in
+`ps`, a `/proc` mount with `hidepid=invisible` and without `subset=pid`, a
+`btime` line in `/proc/stat` and a readable `/proc/meminfo`, a read-only
+`/proc/sys`, no provider credential names in `/proc/cmdline`, zero
+capabilities, and **EPERM**, not ESRCH, for `kill -0` on the known live runner
+PID.
 The host records runner, endpoint, sshd and provider-process PIDs as visibility
 negative controls. **Exactly one job may be admitted per sandbox**: these
 controls do not restore a same-UID PID-namespace boundary. Do not mix tenants. Nested Firecracker using the existing
@@ -294,6 +312,12 @@ root/mount restrictions, capability dropping, memory ceiling, CPU placement and
 KillMode=control-group teardown. Boat units additionally set CPUQuota per
 requested vCPU and TasksMax=4096. No pressure workload is used to test limits:
 the live job reads its own `memory.max`, `cpu.max` and `pids.max`.
+
+Boat jobs have no shared compile cache (no sccache, no `/motor-cache`), but a
+Rust job builds in the same fixed folder as on the build server:
+`CARGO_TARGET_DIR=/run/motor/target`, bound to the workspace's own `target/`, so
+`./target` and `/run/motor/target` are one directory. The live Rust job runs its
+binary from `$CARGO_TARGET_DIR`, and the isolation job checks both facts.
 
 The daemon's weight and rustc slots use `nproc`. Its `--job-network veth` allows
 network **only for explicit outbound requests**, through the existing private
@@ -671,7 +695,8 @@ hygiene checks and `sshd.dropin_survives_resume`.
 - **Isolation, read by the job itself:** user `motor-job`, interfaces `["lo"]`, a
   network and mount namespace different from the host's, private writable
   `/dev/shm`, NoNewPrivs with zero effective and bounding capabilities, `/proc`
-  mounted `subset=pid` with hidden other-user processes, `ps` showing only its
+  mounted `subset=pid` with hidden other-user processes (this run predates
+  dropping `ProcSubset=pid`; see the isolation profile), `ps` showing only its
   own processes, EPERM signalling the runner, and no Boat token in its
   environment or readable files.
 - **PID namespace: not private.** The job's `pid` namespace equals the host's

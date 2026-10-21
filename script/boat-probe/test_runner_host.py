@@ -140,18 +140,25 @@ class RunnerHostTests(unittest.TestCase):
                 "limits": {"memory.max": "15569256448", "cpu.max": "800000 100000", "pids.max": "4096"},
                 "provider_environment": {"ASCII_TOKEN": False, "BOAT_ID": False, "BOAT_CLI_TOKEN": False},
                 "status_security": {'NoNewPrivs':'1','CapEff':'0000000000000000','CapBnd':'0000000000000000'},
-                "proc_mountinfo": ['proc /proc rw - proc proc rw,hidepid=invisible,subset=pid'],
+                "proc_mountinfo": ['25 20 0:22 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible',
+                                   '26 25 0:22 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible'],
+                "proc_global": {'stat': {'readable': True, 'has_line': True}, 'meminfo': {'readable': True, 'has_line': True},
+                                'sys_read_only': True, 'cmdline': {'readable': True, 'provider_names': False}},
+                "cargo_target": {'env': '/run/motor/target', 'same_directory': True},
                 "process_visibility": {'self_pid':10,'protected_pids':[1,2], 'proc':[{'pid':10,'uid':997,'same_cgroup':True}],
                     'ps':{'exit_code':0,'rows':[{'pid':10,'uid':997,'comm':'python3'}]},
                     'runner_signal_probe':{'pid':1,'allowed':False,'errno':1}},
                 "provider_access": {'inherited_names': [], 'files': {'/home/user/.config/ascii/boat/config.json': {'readable':False}},
                                     'processes': {'1': {'readable':False}}}}
 
+    def baseline(self):
+        return {"namespaces": {"net": "net:[1]", "pid": "pid:[1]"},
+                "memory_budget": {"mem_available_bytes": 16*(1<<30), "runner_idle_bytes": 1<<30,
+                                  "margin_bytes": 512*(1<<20), "memory_max_bytes": 15569256448}}
+
     def test_real_job_limit_and_namespace_parser(self):
         job = self.fixture()
-        baseline = {"namespaces": {"net": "net:[1]", "pid": "pid:[1]"},
-                    "memory_budget": {"mem_available_bytes": 16*(1<<30), "runner_idle_bytes": 1<<30,
-                                      "margin_bytes": 512*(1<<20), "memory_max_bytes": 15569256448}}
+        baseline = self.baseline()
         self.assertTrue(all(host.isolation_checks(job, baseline).values()))
         for key, value in (("memory.max", "max"), ("cpu.max", "max 100000"), ("pids.max", "max")):
             job = self.fixture()
@@ -175,6 +182,8 @@ class RunnerHostTests(unittest.TestCase):
         compile(host.JOB, "job", "exec")
         compile(host.HOST, "host", "exec")
         self.assertIn("memory.max", host.JOB)
+        for measured in ("/proc/stat", "/proc/meminfo", "/proc/sys", "/proc/cmdline", "/run/motor/target"):
+            self.assertIn(measured, host.JOB)
         self.assertNotEqual(host.PORT, 9443)
         compile(host.SNAPSHOT_HYGIENE, 'snapshot-hygiene', 'exec')
         compile(host.STORAGE_STATE, 'storage-state', 'exec')
@@ -275,6 +284,54 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.process_visibility_checks(job)['ps_only_job_processes'])
         job['process_visibility']['runner_signal_probe']['errno'] = 3
         self.assertFalse(host.process_visibility_checks(job)['cannot_signal_runner'])
+
+    def test_job_reads_global_proc_entries_but_kernel_tunables_stay_read_only(self):
+        job = self.fixture()
+        self.assertTrue(all(host.proc_checks(job).values()))
+        for entry, check in (('stat', 'proc_stat_has_btime'), ('meminfo', 'proc_meminfo_readable')):
+            with self.subTest(entry=entry):
+                job = self.fixture()
+                job['proc_global'][entry] = {'readable': False, 'error': 'FileNotFoundError'}
+                self.assertFalse(host.proc_checks(job)[check])
+        job = self.fixture()
+        job['proc_global']['stat']['has_line'] = False
+        self.assertFalse(host.proc_checks(job)['proc_stat_has_btime'])
+        job = self.fixture()
+        job['proc_global']['sys_read_only'] = False
+        self.assertFalse(host.proc_checks(job)['proc_sys_read_only'])
+        job = self.fixture()
+        job['proc_global']['cmdline']['provider_names'] = True
+        self.assertFalse(host.proc_checks(job)['proc_cmdline_no_provider_names'])
+        job = self.fixture()
+        job['proc_mountinfo'][0] = job['proc_mountinfo'][0].replace('hidepid=invisible', 'hidepid=0')
+        self.assertFalse(host.proc_checks(job)['proc_hides_other_users'])
+
+    def test_pid_only_proc_mount_fails_the_parity_checks(self):
+        # ProcSubset=pid mounts /proc with subset=pid, which hides /proc/stat and
+        # /proc/meminfo. Boat jobs must see those entries as build-server jobs do.
+        job = self.fixture()
+        job['proc_mountinfo'] = [line + ',subset=pid' for line in job['proc_mountinfo']]
+        job['proc_global'] = {'stat': {'readable': False, 'error': 'FileNotFoundError'},
+                              'meminfo': {'readable': False, 'error': 'FileNotFoundError'},
+                              'sys_read_only': False, 'sys_error': 'FileNotFoundError',
+                              'cmdline': {'readable': False, 'error': 'FileNotFoundError'}}
+        checks = host.proc_checks(job)
+        for name in ('proc_hides_other_users', 'proc_stat_has_btime', 'proc_meminfo_readable'):
+            self.assertFalse(checks[name], name)
+        job = self.fixture()
+        job['proc_mountinfo'] = [line + ',subset=pid' for line in job['proc_mountinfo']]
+        self.assertFalse(host.proc_checks(job)['proc_hides_other_users'])
+        self.assertNotIn('pid_only_proc_mount', host.isolation_checks(job, self.baseline()))
+
+    def test_job_builds_in_the_fixed_target_folder(self):
+        job = self.fixture()
+        self.assertTrue(host.isolation_checks(job, self.baseline())['fixed_cargo_target_dir'])
+        for target in ({'env': '/workspace/target', 'same_directory': False},
+                       {'env': '/run/motor/target', 'same_directory': False},
+                       {'env': None, 'same_directory': None, 'error': 'FileNotFoundError'}):
+            with self.subTest(target=target):
+                job['cargo_target'] = target
+                self.assertFalse(host.isolation_checks(job, self.baseline())['fixed_cargo_target_dir'])
 
     def test_failure_diagnostics_capture_each_unit_even_when_status_is_nonzero(self):
         output = io.StringIO()
