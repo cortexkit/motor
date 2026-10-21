@@ -184,6 +184,23 @@ extra rule.
    command never starts the host; run the existing `install.sh --start` only
    after `install.sh --check` and a review of its results.
 
+   If `switch-image` refuses with `provisioning record and helper registry
+   image versions differ`, the image was changed outside `switch-image`. The
+   registry is what the helper boots. When every other field agrees, adopt its
+   image into the provisioning record, then switch:
+
+   ```sh
+   sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py repair-from-registry tenant-1
+   ```
+
+   It prints `<record>: image_version <old> -> <registry image> (from
+   <registry>); no other field changed`, or that nothing changed. It refuses,
+   changing nothing, if the registry's image is missing or fails the inventory
+   check, or if any other field differs. A hand edit of the record is not a
+   substitute: `install.sh --check` requires the record to be byte-identical to
+   its own rendering (`hosted_host.py tenant`), so reformatting the file or
+   changing its mode fails the check.
+
 6. Verify without changing anything. `--check`, `--start` and `--stop` read
    the host id, subject, port and disk size from the installed configs:
 

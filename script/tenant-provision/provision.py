@@ -295,6 +295,69 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         return moved
 
 
+# Registry fields provision() derives from the tenant's home directory rather
+# than copying from the provisioning record.
+REGISTRY_PATHS = {"disk": "disk.img", "generation": "generation", "suspend": "suspend"}
+# Provisioning fields provision() leaves out of the helper registry.
+PROVISION_ONLY = {"tenant", "sub", "vm", "resolvers"}
+
+
+def repair_from_registry(tenant, validate_image=None, check_trusted=None, output=print):
+    """Adopt the helper registry's image_version into the provisioning record.
+
+    The registry is what the VM helper boots. An image swapped by hand, before
+    switch-image existed, left the provisioning record naming the old image,
+    and switch-image refuses records that disagree. This repairs only that one
+    disagreement: the registry's image must exist and validate, and every other
+    registry field must be exactly what provision() would have written from
+    the provisioning record. The record is replaced atomically with its mode
+    kept and its key order unchanged, so it stays byte-identical to what
+    hosted-host/install.sh renders for the adopted image.
+    """
+    tenant = component(tenant)
+    validate_image = inventory_image if validate_image is None else validate_image
+    check_trusted = trusted if check_trusted is None else check_trusted
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        provision_path = PROVISION / f"{tenant}.json"
+        registry_path = REGISTRY / f"{tenant}.json"
+        original_config = json.loads(provision_path.read_text())
+        current = checked(original_config)
+        if current["tenant"] != tenant:
+            raise ValueError(f"provisioning record tenant does not match {tenant}")
+        record = json.loads(registry_path.read_text())
+        if not isinstance(record, dict) or "image_version" not in record:
+            raise ValueError("helper registry has no image_version")
+        adopted = component(record["image_version"])
+        expected = {name: value for name, value in current.items() if name not in PROVISION_ONLY}
+        home = ROOT / "tenants" / tenant
+        expected.update({name: str(home / leaf) for name, leaf in REGISTRY_PATHS.items()})
+        for name in sorted((set(record) | set(expected)) - {"image_version"}):
+            if name not in record or name not in expected or record[name] != expected[name]:
+                raise ValueError(f"provisioning record and helper registry differ at {name}; "
+                                 "only image_version can be repaired from the registry")
+
+        image = ROOT / "tenant-images" / adopted
+        if not image.is_dir():
+            raise ValueError(f"registry image does not exist: {image}")
+        for path in (image / "manifest.json", image / "vmlinux", image / "rootfs"):
+            check_trusted(path)
+        validate_image(image)
+        if json.loads((image / "manifest.json").read_text()).get("version") != adopted:
+            raise ValueError("registry image manifest version mismatch")
+
+        old_version = current["image_version"]
+        if old_version == adopted:
+            output(f"{provision_path}: already names the registry image {adopted}; nothing changed")
+            return False
+        updated_config = dict(original_config)
+        updated_config["image_version"] = adopted
+        checked(updated_config)
+        atomic_pair([(provision_path, json.dumps(updated_config, indent=2) + "\n")])
+        output(f"{provision_path}: image_version {old_version} -> {adopted} (from {registry_path}); no other field changed")
+        return True
+
+
 def trusted(path):
     for p in [path, *path.parents]:
         st = p.lstat()
@@ -766,9 +829,23 @@ def main():
     switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image")
     switch.add_argument("tenant")
     switch.add_argument("image_version")
+    repair = commands.add_parser(
+        "repair-from-registry",
+        help="set the provisioning record's image_version to the helper registry's, when nothing else differs")
+    repair.add_argument("tenant")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
+    if args.command == "repair-from-registry":
+        if args.config is not None:
+            parser.error("repair-from-registry takes a tenant, not --config")
+        tenant = component(args.tenant)
+        for directory in (ROOT, REGISTRY, PROVISION, ROOT / "tenants", ROOT / "tenants" / tenant):
+            trusted(directory)
+        trusted(PROVISION / f"{tenant}.json")
+        trusted(REGISTRY / f"{tenant}.json")
+        repair_from_registry(tenant)
+        return
     if args.command == "switch-image":
         if args.config is not None:
             parser.error("switch-image takes a tenant and image version, not --config")

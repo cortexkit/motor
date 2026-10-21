@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import socket
 import struct
 import tempfile
@@ -17,6 +18,18 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 # Kept before setUp replaces it, for the one test that reads a fake /proc.
 REAL_RUNNER_PROCESSES = p.runner_processes
+# The hosted-host renderer whose output install.sh requires the installed
+# provisioning record to match byte for byte.
+hosted_spec = importlib.util.spec_from_file_location(
+    "hosted_host", Path(__file__).resolve().parents[1] / "hosted-host" / "hosted_host.py")
+assert hosted_spec is not None and hosted_spec.loader is not None
+hosted = importlib.util.module_from_spec(hosted_spec)
+hosted_spec.loader.exec_module(hosted)
+# The host's two records as found: the provisioning record still names the
+# image from before a hand swap; the helper registry names the image running.
+RECORD_IMAGE = "tenant-20261020-main-806a6d3-20261020T021255Z"
+REGISTRY_IMAGE = "tenant-20261020-net-bb3e7fd-20261020T163144Z"
+SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 
 def config():
@@ -171,6 +184,122 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual((suspend / "suspend.vmstate").read_bytes(), b"old-state")
         self.assertEqual(len(list(suspend.parent.glob("suspend.stale-*"))), 0)
         self.assertEqual(list(p.PROVISION.glob("*.pending")), [])
+
+    def installer_render(self, image_version):
+        """The bytes install.sh installs, and compares, for tenant-1's record."""
+        return json.dumps(hosted.tenant_config(SUB, 100, image_version), indent=2) + "\n"
+
+    def add_image(self, version):
+        image = self.root / "tenant-images" / version
+        image.mkdir(parents=True)
+        (image / "vmlinux").write_bytes(b"kernel-" + version.encode())
+        (image / "rootfs").write_bytes(b"root-" + version.encode())
+        (image / "manifest.json").write_text(json.dumps(dict(
+            version=version, kernel_sha256=hashlib.sha256(b"kernel-" + version.encode()).hexdigest(),
+            rootfs_sha256=hashlib.sha256(b"root-" + version.encode()).hexdigest())))
+        return image
+
+    def mismatched_tenant_1(self):
+        """Records of the live mismatch, each written the way its writer writes it."""
+        provision_path = p.PROVISION / "tenant-1.json"
+        provision_path.write_text(self.installer_render(RECORD_IMAGE))
+        provision_path.chmod(0o644)
+        c = p.checked(json.loads(provision_path.read_text()))
+        record = {key: value for key, value in c.items() if key not in {"tenant", "sub", "vm", "resolvers"}}
+        home = p.ROOT / "tenants/tenant-1"
+        record.update(disk=str(home / "disk.img"), generation=str(home / "generation"), suspend=str(home / "suspend"),
+                      image_version=REGISTRY_IMAGE)
+        registry_path = p.REGISTRY / "tenant-1.json"
+        registry_path.write_text(json.dumps(record, indent=2) + "\n")
+        (home / "suspend").mkdir(parents=True)
+        self.add_image(RECORD_IMAGE)
+        self.add_image(REGISTRY_IMAGE)
+        return provision_path, registry_path
+
+    def repair(self, validate_image=lambda _image: None, output=None):
+        return p.repair_from_registry("tenant-1", validate_image=validate_image, check_trusted=lambda _path: None,
+                                      output=(lambda _line: None) if output is None else output)
+
+    def test_switch_image_refuses_the_live_mismatch_until_it_is_repaired(self):
+        provision_path, registry_path = self.mismatched_tenant_1()
+        target = "tenant-20261021-main-0000000-20261021T120000Z"
+        self.add_image(target)
+        switch = lambda: p.switch_image("tenant-1", target, make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                                        validate_image=lambda _image: None, output=lambda _line: None)
+        with self.assertRaisesRegex(ValueError, "image versions differ"):
+            switch()
+        registry_before = registry_path.read_bytes()
+        validated = []
+        messages = []
+        self.assertTrue(self.repair(validate_image=validated.append, output=messages.append))
+
+        # Exactly image_version changed, to the registry's, and nothing else.
+        self.assertEqual(validated, [self.root / "tenant-images" / REGISTRY_IMAGE])
+        self.assertEqual(registry_path.read_bytes(), registry_before)
+        self.assertEqual(json.loads(provision_path.read_text()),
+                         {**json.loads(self.installer_render(RECORD_IMAGE)), "image_version": REGISTRY_IMAGE})
+        self.assertEqual(messages, [f"{provision_path}: image_version {RECORD_IMAGE} -> {REGISTRY_IMAGE} "
+                                    f"(from {registry_path}); no other field changed"])
+        # install.sh --check accepts it: the bytes equal its render for the
+        # installed image, the mode is unchanged and the images now agree.
+        self.assertEqual(provision_path.read_text(), self.installer_render(REGISTRY_IMAGE))
+        self.assertEqual(provision_path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"],
+                         json.loads(provision_path.read_text())["image_version"])
+        self.assertEqual(list(p.PROVISION.glob("*.pending")), [])
+
+        # Repairing again changes nothing; the switch now proceeds.
+        messages.clear()
+        self.assertFalse(self.repair(output=messages.append))
+        self.assertIn("nothing changed", messages[0])
+        switch()
+        self.assertEqual(json.loads(provision_path.read_text())["image_version"], target)
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"], target)
+
+    def test_repair_refuses_without_changing_anything_unless_only_the_image_differs(self):
+        def drop(record, name):
+            del record[name]
+        cases = {
+            "registry image missing": (None, "registry image does not exist"),
+            "registry image fails validation": (None, "inventory failed"),
+            "registry manifest names another version": (None, "manifest version mismatch"),
+            "other field differs": (lambda record: record.update(vcpu_ceiling=7), "differ at vcpu_ceiling"),
+            "disk path differs": (lambda record: record.update(disk="/elsewhere/disk.img"), "differ at disk"),
+            "registry field missing": (lambda record: drop(record, "io_weight"), "differ at io_weight"),
+            "registry field extra": (lambda record: record.update(capture_console=True), "differ at capture_console"),
+            "registry image not a name": (lambda record: record.update(image_version="../x"), "path component"),
+        }
+        for case, (edit, message) in cases.items():
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                provision_path, registry_path = self.mismatched_tenant_1()
+                if edit is not None:
+                    record = json.loads(registry_path.read_text())
+                    edit(record)
+                    registry_path.write_text(json.dumps(record, indent=2) + "\n")
+                validate = lambda _image: None
+                if case == "registry image missing":
+                    shutil.rmtree(self.root / "tenant-images" / REGISTRY_IMAGE)
+                elif case == "registry image fails validation":
+                    def validate(_image):
+                        raise ValueError("inventory failed")
+                elif case == "registry manifest names another version":
+                    (self.root / "tenant-images" / REGISTRY_IMAGE / "manifest.json").write_text(json.dumps(dict(version=RECORD_IMAGE)))
+                provision_before, registry_before = provision_path.read_bytes(), registry_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, message):
+                    self.repair(validate_image=validate)
+                self.assertEqual(provision_path.read_bytes(), provision_before)
+                self.assertEqual(registry_path.read_bytes(), registry_before)
+
+    def test_repair_keeps_the_old_record_if_the_replace_fails(self):
+        provision_path, _registry_path = self.mismatched_tenant_1()
+        before = provision_path.read_bytes()
+        with mock.patch.object(p.os, "replace", side_effect=OSError("injected replace failure")), \
+                self.assertRaisesRegex(OSError, "injected"):
+            self.repair()
+        self.assertEqual(provision_path.read_bytes(), before)
+        self.assertEqual(list(p.PROVISION.glob("*.pending")) + list(p.PROVISION.glob(".*.pending")), [])
 
     def test_invalid_names_and_unknown_options(self):
         for name in ["", ".", "..", "foo/bar", "a\0b"]:
