@@ -114,6 +114,39 @@ fn explicit_sandbox_reservation_admits_one_through_eight_vcpus() {
     assert!(runner.cpu_refusal(9).unwrap().1.contains("1..=8"));
 }
 
+/// A tenant VM is sized for its tenant's largest job, so an 8-vCPU tenant
+/// runner must admit an 8-vCPU lease without any flag; the build server's
+/// default still keeps one core for the daemon on the same topology.
+#[test]
+fn tenant_mode_never_reserves_a_daemon_core() {
+    let eight = || CpuTopology::new((0..8).map(|cpu| vec![cpu]).collect()).unwrap();
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.tenant_vm = true;
+    assert!(config.reserve_daemon_core, "the flag keeps its default");
+    config.cpu_topology = Some(eight());
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 8);
+    for claim in 1..=8 {
+        assert!(runner.cpu_refusal(claim).is_none(), "vcpu {claim}");
+    }
+    let detail = runner.cpu_refusal(9).unwrap().1;
+    assert!(detail.contains("1..=8"), "{detail}");
+    assert!(detail.contains("disabled in tenant mode"), "{detail}");
+
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.cpu_topology = Some(eight());
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 7);
+    let detail = runner.cpu_refusal(8).unwrap().1;
+    assert!(
+        detail.contains("vcpu request 8 is outside the supported range 1..=7")
+            && detail.contains("daemon core reservation enabled"),
+        "{detail}"
+    );
+}
+
 #[tokio::test]
 async fn internal_warm_build_shrinks_to_a_small_host() {
     let f = Fixture::new();

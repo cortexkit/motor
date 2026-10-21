@@ -61,6 +61,20 @@ entry under `/etc/motor-vm-helper/tenants`, and the host-readable
 bindings are refused. Failure intentionally retains partially created disk
 data; inspect it manually, never delete a tenant disk as automatic rollback.
 
+`provision.py repair-from-registry <tenant>` fixes one known drift: an image
+swapped by hand, before `switch-image` existed, left the provisioning record
+(`/etc/motor-host/provision/<tenant>.json`) naming the old image while the
+helper registry names the image that actually boots, and `switch-image` refuses
+such records. The repair copies the registry's `image_version` into the
+provisioning record only when that image exists, its files are root-owned, it
+passes the image inventory check and its manifest names it, and every other
+registry field is exactly what provisioning would have written from the
+record. It replaces the record atomically, keeping its mode and key order, so
+`install.sh --check` accepts it, and prints the one change it made. Records
+that already agree are left alone. Tests:
+`test_switch_image_refuses_the_live_mismatch_until_it_is_repaired`,
+`test_repair_refuses_without_changing_anything_unless_only_the_image_differs`.
+
 Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

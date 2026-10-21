@@ -174,6 +174,34 @@ fn namespace(pid: u32, path: &str, args: &[&str]) -> io::Result<()> {
     sudo("/usr/bin/nsenter", &command).map(|_| ())
 }
 
+const SYSCTL: &str = "/usr/sbin/sysctl";
+const TEST: &str = "/usr/bin/test";
+const DISABLE_ETH0_IPV6: [&str; 3] = ["-q", "-w", "net.ipv6.conf.eth0.disable_ipv6=1"];
+/// Succeeds only when the network namespace it runs in has no IPv6 sysctl
+/// tree. The kernel shows each process the `/proc/sys/net` of its own network
+/// namespace, so running it under `nsenter --net` checks the job's namespace.
+const IPV6_ABSENT: [&str; 3] = ["!", "-e", "/proc/sys/net/ipv6"];
+
+/// Turn off IPv6 on the job's `eth0`, which the job firewall and routes only
+/// cover for IPv4. A kernel booted with `ipv6.disable=1` (the tenant VM image)
+/// or built without IPv6 has no `/proc/sys/net/ipv6` in any namespace: IPv6
+/// cannot be enabled there, so a failed write is accepted only when
+/// `ipv6_absent` proves that. Every other failure, including a failed write
+/// while IPv6 exists, still fails the attach with the write's own error.
+fn disable_eth0_ipv6(
+    disable: impl FnOnce() -> io::Result<()>,
+    ipv6_absent: impl FnOnce() -> bool,
+) -> io::Result<()> {
+    let Err(error) = disable() else {
+        return Ok(());
+    };
+    if ipv6_absent() {
+        tracing::debug!(%error, "job namespace has no IPv6 support; skipping the eth0 IPv6 disable");
+        return Ok(());
+    }
+    Err(error)
+}
+
 pub(crate) fn attach(id: Uuid) -> io::Result<()> {
     let started = Instant::now();
     // Recheck inet motor_net and IPv4 forwarding in case an operator removed
@@ -260,10 +288,12 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
             &["link", "set", "dev", &peer, "netns", &pid.to_string()],
         )?;
         namespace(pid, IP, &["link", "set", "dev", &peer, "name", "eth0"])?;
-        namespace(
-            pid,
-            "/usr/sbin/sysctl",
-            &["-q", "-w", "net.ipv6.conf.eth0.disable_ipv6=1"],
+        disable_eth0_ipv6(
+            || namespace(pid, SYSCTL, &DISABLE_ETH0_IPV6),
+            // Only a root runner may run this check. A sudo runner has no
+            // grant for it, and attempting an ungranted command would only add
+            // a sudo policy failure to an attach that is failing anyway.
+            || !crate::privilege::uses_sudo() && namespace(pid, TEST, &IPV6_ABSENT).is_ok(),
         )?;
         namespace(pid, IP, &["addr", "add", &job, "dev", "eth0"])?;
         namespace(pid, IP, &["link", "set", "dev", "eth0", "up"])?;
@@ -296,5 +326,43 @@ mod tests {
         }
         let name = interface(Uuid::now_v7());
         assert_eq!(name.len(), 15);
+    }
+
+    #[test]
+    fn eth0_ipv6_disable_is_skipped_only_when_the_namespace_has_no_ipv6() {
+        use std::cell::Cell;
+        // IPv6 present and the write succeeds (the build server): no check runs.
+        let checked = Cell::new(false);
+        disable_eth0_ipv6(
+            || Ok(()),
+            || {
+                checked.set(true);
+                false
+            },
+        )
+        .unwrap();
+        assert!(!checked.get());
+
+        let missing = || {
+            Err(io::Error::other(
+                "sysctl: cannot stat /proc/sys/net/ipv6/conf/eth0/disable_ipv6: No such file or directory",
+            ))
+        };
+        // The tenant kernel: no IPv6 in the namespace, so the step is skipped.
+        disable_eth0_ipv6(missing, || true).unwrap();
+        // IPv6 exists (or its absence is unproven) but the write failed: the
+        // attach still fails closed with the write's error.
+        let error = disable_eth0_ipv6(missing, || false).unwrap_err();
+        assert!(error.to_string().contains("disable_ipv6"), "{error}");
+    }
+
+    #[test]
+    fn ipv6_absence_check_proves_absence_by_succeeding() {
+        assert_eq!(IPV6_ABSENT, ["!", "-e", "/proc/sys/net/ipv6"]);
+        let status = Command::new(TEST).args(IPV6_ABSENT).status().unwrap();
+        assert_eq!(
+            status.success(),
+            !std::path::Path::new("/proc/sys/net/ipv6").exists()
+        );
     }
 }

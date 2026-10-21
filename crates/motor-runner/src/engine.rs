@@ -318,6 +318,27 @@ impl Config {
         self.state_dir().join("sccache/fleet")
     }
 
+    /// Whether one core is kept back for the daemon itself. A tenant VM (a
+    /// hosted tenant or a Boat sandbox) is sized exactly for its tenant's jobs,
+    /// and the broker places jobs up to that full size, so a tenant runner never
+    /// reserves a core. Tenant mode implies this rather than relying on a flag:
+    /// a provisioned tenant's runner arguments cannot carry
+    /// `--reserve-daemon-core`.
+    pub(crate) fn reserves_daemon_core(&self) -> bool {
+        self.reserve_daemon_core && !self.tenant_vm
+    }
+
+    /// The reservation state named in a vCPU refusal.
+    fn daemon_core_reservation(&self) -> &'static str {
+        if self.reserves_daemon_core() {
+            "enabled"
+        } else if self.tenant_vm {
+            "disabled in tenant mode"
+        } else {
+            "explicitly disabled"
+        }
+    }
+
     pub(crate) fn shared_compile_cache(&self) -> bool {
         // Hosted runners have no cache writer to populate a shared reader.
         // Even in read-only mode, sccache's C preprocessor tries to create a
@@ -810,7 +831,7 @@ impl Runner {
             .unwrap_or_else(CpuTopology::read)?;
         #[cfg(not(test))]
         let cpus = CpuTopology::read()?;
-        let cpus = if config.reserve_daemon_core {
+        let cpus = if config.reserves_daemon_core() {
             cpus
         } else {
             cpus.without_daemon_reservation()
@@ -1893,7 +1914,7 @@ impl Runner {
         if claim == 0 || claim > self.core.cpus.capacity() {
             Some((RefusalReason::RunnerFull, format!(
                 "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; daemon core reservation {})",
-                self.core.cpus.capacity(), if self.core.config.reserve_daemon_core { "enabled" } else { "explicitly disabled" }
+                self.core.cpus.capacity(), self.core.config.daemon_core_reservation()
             )))
         } else {
             None

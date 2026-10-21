@@ -250,6 +250,12 @@ before upload with
 
 6.3. A job granted outbound access gets a veth pair into its namespace (its
 side is `eth0`, IPv4 only) and reaches the internet through NAT. The runner
+turns IPv6 off on `eth0`; on a kernel with no IPv6 at all (the tenant VM image
+boots with `ipv6.disable=1`, so its namespaces have no `/proc/sys/net/ipv6`)
+there is nothing to turn off and the step is skipped. Any other failure of that
+step, including a failed write while IPv6 exists, fails the attach. Test:
+`eth0_ipv6_disable_is_skipped_only_when_the_namespace_has_no_ipv6`
+(`crates/motor-runner/src/network_linux.rs`). The runner
 checks at startup that the `motor_net` nftables table is present; the operator
 installs it (see [runner-install.md](runner-install.md#6-optional-job-networking)). The table
 (`script/runner/motor-net.nft`) lets the job open connections only to public
