@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Root qualification payload, staged only on a disposable tenant disk."""
 import os
+import importlib.util
 import json
 from pathlib import Path
 import socket
@@ -24,6 +25,7 @@ READY_S = 10.0
 ATTACH_WAIT_S = 90.0
 TOOL_ROOTS = (Path("/usr/local/lib/motor/rustup"), Path("/usr/local/lib/motor/cargo"))
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
+ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
 SAMPLE_BYTES = 32 * 1024 * 1024
 
 
@@ -153,6 +155,22 @@ def tool_tree_probe():
     print(TOOL_TREES, flush=True)
 
 
+def root_path_probe(image=Path("/"), owner=0):
+    # The host stages root_paths.py beside this file from its own checkout, so
+    # a booted image that drifted from the build-time rule is caught here.
+    spec = importlib.util.spec_from_file_location("root_paths", Path(__file__).with_name("root_paths.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the staged root-owned path check")
+    rule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rule)
+    report = rule.check(rule.TENANT_ROOTS, image, owner)
+    print("GUEST_ROOT_PATHS " + json.dumps(report, sort_keys=True), flush=True)
+    if report["offender_count"]:
+        raise RuntimeError(f"{report['offender_count']} path(s) root executes from are not root-owned "
+                           f"without group/other write: {report['offenders']}")
+    print(ROOT_PATHS, flush=True)
+
+
 def runner_diagnostics():
     state: dict[str, Any] = {}
     for name, args in (
@@ -274,6 +292,7 @@ def main():
     run("/usr/local/libexec/hosted_image_check.py", "--tenant")
     name_service_probe()
     tool_tree_probe()
+    root_path_probe()
     root = Path("/tenant/qualification")
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)

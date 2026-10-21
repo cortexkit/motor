@@ -43,10 +43,11 @@ TENANT = "hosted image tenant inventory: 3 checks passed (XFS, FICLONE to /Users
 NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files, "
                 "sudo and lookup fast with an unreachable resolver, runner ready within 10 s")
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
+ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-         "tool trees", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+         "tool trees", "root paths", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
          "guest units", "teardown")
 
 
@@ -498,6 +499,8 @@ class Harness:
             dest = mount / "qualification"
             dest.mkdir(mode=0o700)
             shutil.copyfile(HERE / "guest/hosted_qualify.py", dest / "run.py")
+            # The guest checks ownership with this checkout's rule, not the image's copy.
+            shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")
             shutil.copyfile(self.args.runner_test_binary.resolve(), dest / "runner-tests")
             (dest / "runner-tests").chmod(0o700)
 
@@ -799,6 +802,7 @@ class Harness:
             self.step("tenant inventory", lambda: self.expect_console(TENANT))
             self.step("name service", lambda: self.expect_console(NAME_SERVICE))
             self.step("tool trees", lambda: self.expect_console(TOOL_TREES))
+            self.step("root paths", lambda: self.expect_console(ROOT_PATHS))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,

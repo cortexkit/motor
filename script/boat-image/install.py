@@ -9,8 +9,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,13 @@ if parity_spec is None or parity_spec.loader is None:
     raise ImportError("cannot load toolchain parity checker")
 parity = importlib.util.module_from_spec(parity_spec)
 parity_spec.loader.exec_module(parity)
+# The tenant image recipe owns the shared root-owned path check; Boat loads the
+# same file from the source checkout so both images enforce one invariant.
+root_paths_spec = importlib.util.spec_from_file_location("root_paths", ROOT / "script/tenant-image/guest/root_paths.py")
+if root_paths_spec is None or root_paths_spec.loader is None:
+    raise ImportError("cannot load the root-owned path check")
+root_paths = importlib.util.module_from_spec(root_paths_spec)
+root_paths_spec.loader.exec_module(root_paths)
 BUILD = Path("/srv/build")
 STATE = Path("/var/lib/motor-boat")
 APT_LISTS = Path('/var/lib/apt/lists/motor-boat')
@@ -38,6 +47,8 @@ RUNNER_INPUTS = (
     'script/runner/cargo-seed.py',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
 )
+# motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
+TOOL_HOME = Path("/home/ubuntu")
 
 
 def run(*args, capture=False):
@@ -59,6 +70,65 @@ def checksum(text, filename):
     if len(matches) != 1 or not re.fullmatch(r"[a-f0-9]{64}", matches[0]):
         raise ValueError(f"missing or ambiguous published SHA-256: {filename}")
     return matches[0]
+
+
+def extract(archive, destination, *options):
+    # Release archives record their creator's owner (Node's stores uid 1001)
+    # and modes, and tar run as root restores both. Extract as root-owned files
+    # instead, with modes masked by a fixed 022 umask, so no other account can
+    # write where root later executes from.
+    previous = os.umask(0o022)
+    try:
+        run("tar", "--no-same-owner", "--no-same-permissions", *options, "-xf", str(archive),
+            "-C", str(destination))
+    finally:
+        os.umask(previous)
+
+
+def account_processes(uid, proc=Path("/proc")):
+    """PIDs whose real, effective, saved or filesystem uid is `uid`."""
+    pids = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        uids = next((line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")), [])
+        if str(uid) in uids:
+            pids.append(int(entry.name))
+    return sorted(pids)
+
+
+def tool_home(home=TOOL_HOME, proc=Path("/proc")):
+    """The runner's PATH and RUSTUP_HOME live under /home/ubuntu, so root
+    executes from it and it must be root's. Create it root:root 0755 when
+    absent. Refuse one another account owns rather than take over a provider
+    account's home without anyone deciding to."""
+    try:
+        metadata = home.lstat()
+    except FileNotFoundError:
+        run("install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(home))
+        return {"path": str(home), "created": True}
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{home} must be a physical directory; root executes tools from beneath it")
+    if metadata.st_uid != 0:
+        try:
+            account = pwd.getpwuid(metadata.st_uid)
+            entry = ":".join(str(field) for field in (account.pw_name, "x", account.pw_uid, account.pw_gid,
+                                                     account.pw_gecos, account.pw_dir, account.pw_shell))
+        except KeyError:
+            entry = "no passwd entry"
+        processes = account_processes(metadata.st_uid, proc)
+        raise ValueError(
+            f"{home} is owned by uid {metadata.st_uid} ({entry}); running processes: {processes or 'none'}. "
+            "Root executes the runner's Bun and Rust toolchains from beneath it, so it must be root-owned; "
+            "decide whether that account may be retired before reinstalling")
+    if metadata.st_mode & 0o022:
+        raise ValueError(f"{home} has mode {stat.S_IMODE(metadata.st_mode):04o}; group or other may write "
+                         "where root executes the runner's tools")
+    return {"path": str(home), "created": False}
 
 
 def download(url, destination, expected):
@@ -264,7 +334,7 @@ def tools(manifest):
     path.chmod(0o755)
     install_rust(manifest, path)
     node = published(f"https://nodejs.org/dist/v{pins['node']}/", f"node-v{pins['node']}-linux-x64.tar.xz")
-    run("tar", "-xJf", str(node), "--strip-components=1", "-C", "/usr/local")
+    extract(node, "/usr/local", "-J", "--strip-components=1")
     metadata = json.loads(urllib.request.urlopen(f"https://registry.npmjs.org/pnpm/{pins['pnpm']}", timeout=60).read())
     algorithm, encoded = metadata["dist"]["integrity"].split("-", 1)
     if algorithm != "sha512":
@@ -282,7 +352,7 @@ def tools(manifest):
     bun_path.chmod(0o755)
     nats = published(f"https://github.com/nats-io/nats-server/releases/download/v{pins['nats']}/",
                      f"nats-server-v{pins['nats']}-linux-amd64.tar.gz", "SHA256SUMS")
-    run("tar", "-xzf", str(nats), "-C", str(BUILD / "downloads"))
+    extract(nats, BUILD / "downloads", "-z")
     run("install", "-m", "0755", str(BUILD / f"downloads/nats-server-v{pins['nats']}-linux-amd64/nats-server"),
         "/usr/local/bin/nats-server")
     for name in ("gcc", "g++"):
@@ -455,6 +525,7 @@ def main():
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
     target_directories()
     accounts()
+    home = tool_home()
     run('/usr/bin/python3', str(HERE / 'motor-boat-credentials.py'), '--output', '/srv/build/boat-provider-audit.json')
     # Check the administrative path and firewall transaction before long tool builds.
     run('/usr/bin/python3', str(HERE / 'motor-boat-network'), '--check', '--template', str(ROOT / 'script/runner/motor-net.nft'))
@@ -474,6 +545,8 @@ def main():
     configure(pins, args.revision)
     # Starting motor-boat.service checks its configured flags and socket readiness without a job.
     service_preflight()
+    # Last, after every installer and the service preflight could have added files.
+    owned = root_paths.require(root_paths.BOAT_ROOTS)
     inventory: dict[str, object] = {name: run(*command, capture=True) for name, command in {
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],
         "node": ["node", "--version"], "bun": ["bun", "--version"],
@@ -482,7 +555,7 @@ def main():
         "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
-                      cargo_seed=seed_inventory,
+                      cargo_seed=seed_inventory, tool_home=home, root_owned_paths=owned,
                      packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
                       parity=parity_result,
                       provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))

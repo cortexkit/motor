@@ -34,6 +34,7 @@ PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
 PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
+ROOT_PATHS_SCRIPT = ROOT / 'script/tenant-image/guest/root_paths.py'
 
 
 def upload_seed_input(argv, source, name):
@@ -663,6 +664,18 @@ def parity_passed(report):
     return report.get('passed') is True and report.get('errors') == [] and report.get('manifest_sha256') == expected
 
 
+def root_paths_source():
+    # Like the parity check, run the operator checkout's rule (the one the image
+    # recipes enforce at build time) against the live filesystem in every phase.
+    return ("import json\nscope = {'__name__': 'root_paths'}\n"
+            f"exec({ROOT_PATHS_SCRIPT.read_text()!r}, scope)\n"
+            "print(json.dumps(scope['check'](scope['BOAT_ROOTS'])))\n")
+
+
+def root_paths_passed(report):
+    return report.get('offender_count') == 0 and report.get('offenders') == [] and report.get('entries', 0) > 0
+
+
 def snapshot_metadata(snapshot):
     if snapshot.get('status') != 'ready' or not isinstance(snapshot.get('snapshotId'), str) or type(snapshot.get('sizeBytes')) is not int:
         raise ValueError('ready named snapshot lacks documented artifact id/size')
@@ -959,6 +972,10 @@ class RunnerHost:
         record['toolchain_parity'] = json.loads(self.execute(
             sid, "sudo -n python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
         self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
+        record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
+        self.check(label + '.root_owned_paths', root_paths_passed(record['root_owned_paths']), record['root_owned_paths'],
+                   reason=f"{record['root_owned_paths'].get('offender_count')} path(s) root executes from are not root-owned "
+                          f"without group/other write; first: {record['root_owned_paths'].get('offenders')}")
         listeners = host["listeners"]["stdout"]
         self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
                    not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])

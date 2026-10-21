@@ -351,6 +351,19 @@ overlay metacopy setting, and a timed `setfacl` over a 32 MiB sample of the
 toolchain, extrapolated by bytes to the whole tree. The step passes only on the
 exact `TOOL_TREES` line.
 
+The root-path step checks that everything root executes from is root-owned
+with no group or other write: every entry under `/usr/local`, `/usr/bin`,
+`/usr/sbin`, `/bin` and `/sbin`, plus each directory above them. Symlinks must
+be root-owned too. The list follows the PATH of the guest units. The harness
+stages `guest/root_paths.py` from the operator checkout beside `run.py`, so a
+booted image that drifted from the current rule fails. The image build enforces
+the same rule last, recorded as `root_owned_paths` in `tools.json`. The guest
+prints `GUEST_ROOT_PATHS` evidence (entry count and the first offending paths),
+and the step passes only on the exact `ROOT_PATHS` line. Release archives are
+extracted with `--no-same-owner --no-same-permissions` under umask 022, because
+Node's tarball records uid 1001 and tar run as root would otherwise hand
+`/usr/local/bin` to that uid.
+
 The harness copies `motor-vm-helper`, `motor-host` and `motor-fake-broker` into
 a fresh root-owned mode-0755 bin directory before invoking them. Its helper config is root-owned mode 0600.
 The legacy job-slot configuration still requires a loader even though this lane
