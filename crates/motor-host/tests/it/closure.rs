@@ -88,6 +88,12 @@ fn closed_tenant_is_removed_only_after_its_last_lease_ends_and_the_runner_retent
         .unwrap()
         .is_empty());
     end(&mut h, JOB, 3, MS + 3_000, terminal(JOB, "exit"));
+    // While the job's client connection is still open, nothing is removed.
+    assert!(h
+        .removals_due(MS + 3_000 + RUNNER_RETENTION_MS)
+        .unwrap()
+        .is_empty());
+    h.close(1).unwrap();
     // Ended, but the runner still keeps the result for a day.
     assert!(h
         .removals_due(MS + 3_000 + RUNNER_RETENTION_MS - 1)

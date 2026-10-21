@@ -329,3 +329,47 @@ fn an_outbox_entry_breaking_the_contract_grammar_is_set_aside_unsent() {
     assert_eq!(h.snapshot.rejected_outbox.len(), 1);
     assert_eq!(h.snapshot.rejected_outbox[0].body, invalid.body);
 }
+
+/// The broker lists closed accounts in its heartbeat reply. Malformed replies
+/// change nothing and fail no heartbeat; a well-formed one closes only the
+/// tenant bound to a listed subject.
+#[test]
+fn heartbeat_replies_close_bound_accounts_and_malformed_replies_are_harmless() {
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime.host.lock().unwrap().start_billing(ms).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let sub = claims(JOB).sub;
+    let replies = [
+        "not json".to_owned(),
+        json!({"closed_subjects": 5}).to_string(),
+        json!({"closed_subjects": [{"tenant": "tenant"}, "tenant"]}).to_string(),
+        json!({"closed_subjects": ["acct:01BX5ZZKBKACTAV9WEVGEMMVRZ", sub]}).to_string(),
+    ];
+    let broker = std::thread::spawn(move || {
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (path, _) = read_request(&stream);
+            assert!(path.ends_with("/heartbeat"), "{path}");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let mut sender = Sender::new(
+        runtime.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    sender.test_endpoint(endpoint);
+    for n in 0..4 {
+        sender.step(ms + n * 15_000).unwrap();
+        let h = runtime.host.lock().unwrap();
+        assert!(h.snapshot.outbox.is_empty(), "heartbeat {n} not confirmed");
+        assert!(h.snapshot.rejected_outbox.is_empty());
+        assert_eq!(h.is_closed("tenant"), n == 3, "after heartbeat {n}");
+    }
+    broker.join().unwrap();
+    let h = runtime.host.lock().unwrap();
+    assert_eq!(h.snapshot.closed.len(), 1);
+    assert_eq!(h.snapshot.closed["tenant"].sub, sub);
+}
