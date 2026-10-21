@@ -32,7 +32,16 @@ function Grant-RunnerPrepPath([string]$Path, [string]$Sid, [ValidateSet('Stage',
     $acl = New-RunnerPrepAcl (Get-Acl -LiteralPath $Path -ErrorAction Stop) $Sid $Role
     Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
 }
-function New-RunnerPrepDirectory([string]$Path, $BaseAcl, [string]$Sid, [ValidateSet('Stage','Read','Modify')][string]$Role) {
+function Get-RunnerInheritedDirectoryAcl([string]$Path) {
+    # The probe is a throwaway sibling created without a descriptor, so Windows
+    # applies the parent's inheritable rules exactly as for a production job
+    # directory. Its name marks it as removable by leftover sweeps.
+    $probe = Join-Path (Split-Path -Parent $Path) ('.motor-acl-probe-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $probe -ErrorAction Stop | Out-Null
+    try { return Get-Acl -LiteralPath $probe -ErrorAction Stop }
+    finally { Remove-Item -LiteralPath $probe -Force -ErrorAction Stop }
+}
+function New-RunnerPrepDirectory([string]$Path, [string]$Sid, [ValidateSet('Stage','Read','Modify')][string]$Role) {
     if (-not ('Motor.PrepDirectoryCreation' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -55,16 +64,15 @@ namespace Motor {
 }
 '@
     }
-    # Let Windows inherit the real parent's rules once, just as the production
-    # create-then-grant path does. Copying the parent's already inherited ACEs
-    # into the creation descriptor would duplicate them or copy non-inheritable rules.
-    $creation = [Security.AccessControl.RawSecurityDescriptor]::new($BaseAcl.GetSecurityDescriptorBinaryForm(),0)
-    $creation.DiscretionaryAcl = [Security.AccessControl.RawAcl]::new(2,0)
-    $creation.SetFlags(($creation.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)) -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent)
-    $bytes = [byte[]]::new($creation.BinaryLength)
-    $creation.GetBinaryForm($bytes,0)
-    $BaseAcl.SetSecurityDescriptorBinaryForm($bytes,[Security.AccessControl.AccessControlSections]::Access)
-    $acl = New-RunnerPrepAcl $BaseAcl $Sid $Role
+    # A descriptor passed to CreateDirectoryW replaces the rules the directory
+    # would inherit from its parent (the Ally fixture run showed a directory
+    # holding only the prep rule, unreadable even to SYSTEM). Production instead
+    # creates the directory normally, so it inherits, and then adds the prep
+    # rule. To build that same final descriptor up front, start from what an
+    # ordinarily created sibling actually received: its owner, group and
+    # inherited rules. New-RunnerPrepAcl then adds the explicit prep rule ahead
+    # of the inherited ones, as Set-Acl would leave it.
+    $acl = New-RunnerPrepAcl (Get-RunnerInheritedDirectoryAcl $Path) $Sid $Role
     $sddl = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
     [Motor.PrepDirectoryCreation]::Create($Path, $acl.GetSecurityDescriptorBinaryForm())
     return $sddl

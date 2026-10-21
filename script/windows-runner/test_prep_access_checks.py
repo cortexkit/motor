@@ -67,16 +67,39 @@ class PrepAccessScreenTests(unittest.TestCase):
         control = (HERE / 'hyperv.ps1').read_text()
         self.code('Grant-RunnerPrepPath $Path $Sid $Role', control)
         self.code('New-RunnerPrepAcl (Get-Acl -LiteralPath $Path -ErrorAction Stop) $Sid $Role', self.acl)
-        self.code('New-RunnerPrepAcl $BaseAcl $Sid $Role', self.acl)
+        self.code('New-RunnerPrepAcl (Get-RunnerInheritedDirectoryAcl $Path) $Sid $Role', self.acl)
         self.code('SetSecurityDescriptorBinaryForm($bytes, [Security.AccessControl.AccessControlSections]::Access)', self.acl)
-        self.code('New-RunnerPrepDirectory $fixture $base $sid Stage', self.fixture)
-        self.code('New-RunnerPrepDirectory $manifests (Get-Acl -LiteralPath $fixture) $sid Read', self.fixture)
+        self.code('New-RunnerPrepDirectory $fixture $sid Stage', self.fixture)
+        self.code('New-RunnerPrepDirectory $manifests $sid Read', self.fixture)
         self.assertNotIn('Set-Acl', '\n'.join(line for line in self.fixture.splitlines() if not line.lstrip().startswith('#')))
         self.code('requested_sddl=$requested', self.fixture)
         self.code('actual_sddl=', self.fixture)
         self.code('finally {', self.fixture)
-        self.code('Remove-Item -LiteralPath $fixture -Recurse -Force', self.fixture)
+        self.code('$state.cleanup_method = Remove-RunnerAccessFixture $fixture', self.fixture)
         self.code('$state.removed = -not (Test-Path -LiteralPath $fixture)', self.fixture)
+
+    def test_inherited_rules_come_from_an_ordinarily_created_probe(self):
+        # A descriptor passed at creation replaces inheritance, so the base must
+        # be what a normally created sibling received, then that probe is removed.
+        self.code("New-Item -ItemType Directory -Path $probe -ErrorAction Stop", self.acl)
+        self.code('try { return Get-Acl -LiteralPath $probe -ErrorAction Stop }', self.acl)
+        self.code('finally { Remove-Item -LiteralPath $probe -Force -ErrorAction Stop }', self.acl)
+        self.assertNotIn('RawAcl]::new(2,0)', self.acl)
+
+    def test_cleanup_recovers_and_sweeps_leftovers_without_masking_failures(self):
+        self.code("try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return 'removed' }", self.fixture)
+        self.code('Reset-RunnerAccessFixtureAcl $Path 0', self.fixture)
+        self.code("& takeown.exe /F $Path /A | Out-Null", self.fixture)
+        self.code('ReparsePoint', self.fixture)
+        self.code("-Filter '.motor-acl-probe-*'", self.fixture)
+        self.code("[Guid]::TryParse((Split-Path -Leaf $prior.fixture), [ref]$guid)", self.fixture)
+        self.code('(Split-Path -Parent $prior.fixture) -eq $staging', self.fixture)
+        self.code('$state.leftovers = @(Remove-RunnerAccessLeftovers $Root (Split-Path -Parent $Evidence))', self.fixture)
+        fixtures = (HERE / 'test_scripts.ps1').read_text()
+        for name in ('prep-acl-fixture-leftovers-removed', 'prep-acl-fixture-cleanup-recovers-unlistable-tree', 'FAIL prep-acl-fixture-cleanup:', 'prep-creation-descriptor-matches-production-create-then-grant'):
+            self.assertIn(name, fixtures)
+        self.code("if ($null -eq $failure) { throw }", fixtures)
+        self.code("-Filter 'motor-prep-acl-*'", fixtures)
 
     def test_creation_only_uses_native_create_and_has_independent_icacls_oracle(self):
         self.code('CreateDirectoryW(path, ref attributes)', self.acl)

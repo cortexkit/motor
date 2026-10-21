@@ -52,21 +52,34 @@ try {
     Remove-Item $root -Recurse -Force
 }
 & {
-    . "$PSScriptRoot\prep-acl.ps1"
+    . "$PSScriptRoot\prep-access-check.ps1"
+    # Earlier runs may have left fixtures whose descriptor denies the caller
+    # access; remove them first so every run starts clean.
+    $leftovers = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Force -Filter 'motor-prep-acl-*' | ForEach-Object { Remove-RunnerAccessFixture $_.FullName })
+    Write-Host "PASS prep-acl-fixture-leftovers-removed: $($leftovers.Count) ($($leftovers -join ','))"; $script:count++
     $aclRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-prep-acl-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $aclRoot | Out-Null
     $sid = 'S-1-5-11'
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     function Get-FixtureTrusteeAces([string]$Path, [bool]$ExplicitOnly) {
         $raw = [Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $Path).GetSecurityDescriptorBinaryForm(),0)
         return @($raw.DiscretionaryAcl | Where-Object { $_ -is [Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -eq $sid -and $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and (-not $ExplicitOnly -or -not $_.IsInherited) } | ForEach-Object { '{0:x8}/{1:x2}' -f $_.AccessMask,[int]$_.AceFlags } | Sort-Object)
     }
+    # Owner plus every ACE in stored order, inherited ones included: the whole
+    # descriptor a later access check would evaluate.
+    function Get-FixtureDescriptor([string]$Path) {
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $Path).GetSecurityDescriptorBinaryForm(),0)
+        $aces = @($raw.DiscretionaryAcl | ForEach-Object { if ($_ -is [Security.AccessControl.CommonAce]) { '{0}/{1}/{2:x8}/{3:x2}' -f $_.AceQualifier,$_.SecurityIdentifier.Value,$_.AccessMask,[int]$_.AceFlags } else { "other/$($_.AceType)" } })
+        return "owner=$($raw.Owner.Value);" + ($aces -join ';')
+    }
+    $failure = $null
     try {
         # The independent oracle is the former production icacls command, not
         # masks computed from the new builder's expected values.
         foreach ($row in @(@('Stage','(X)'),@('Read','(OI)(CI)RX'),@('Modify','(OI)(CI)M'))) {
             $created = Join-Path $aclRoot ('created-' + $row[0])
             $oracle = Join-Path $aclRoot ('oracle-' + $row[0])
-            $null = New-RunnerPrepDirectory $created (Get-Acl -LiteralPath $aclRoot) $sid $row[0]
+            $null = New-RunnerPrepDirectory $created $sid $row[0]
             New-Item -ItemType Directory -Path $oracle | Out-Null
             [IO.File]::WriteAllText((Join-Path $created 'child.txt'),'fixture')
             [IO.File]::WriteAllText((Join-Path $oracle 'child.txt'),'fixture')
@@ -79,16 +92,38 @@ try {
             [IO.File]::WriteAllText((Join-Path $production 'child.txt'),'fixture')
             Grant-RunnerPrepPath $production $sid $row[0]
             if (((Get-FixtureTrusteeAces $production $true) -join ',') -cne ((Get-FixtureTrusteeAces $oracle $true) -join ',') -or ((Get-FixtureTrusteeAces (Join-Path $production 'child.txt') $false) -join ',') -cne ((Get-FixtureTrusteeAces (Join-Path $oracle 'child.txt') $false) -join ',')) { throw "FAIL prep-production-shares-the-fixture-descriptor-path: $($row[0])" }
+            # Not just the prep trustee: the creation-time descriptor must equal
+            # what production's create-then-grant leaves, inherited rules included.
+            foreach ($pair in @(@($created,$production), @((Join-Path $created 'child.txt'),(Join-Path $production 'child.txt')))) {
+                $got = Get-FixtureDescriptor $pair[0]; $want = Get-FixtureDescriptor $pair[1]
+                if ($got -cne $want) { throw "FAIL prep-creation-descriptor-matches-production-create-then-grant: $($pair[0]) created=[$got] production=[$want]" }
+            }
         }
         Write-Host 'PASS prep-shared-descriptor-and-inheritance-match-independent-icacls'; $script:count++
+        Write-Host 'PASS prep-creation-descriptor-matches-production-create-then-grant'; $script:count++
         $path = Join-Path $aclRoot 'created-Stage'
         $before = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
         $denied = $false
-        try { $null = New-RunnerPrepDirectory $path (Get-Acl -LiteralPath $aclRoot) $sid Modify } catch { if (($_.Exception.GetBaseException().NativeErrorCode) -ne 183) { throw }; $denied = $true }
+        try { $null = New-RunnerPrepDirectory $path $sid Modify } catch { if (($_.Exception.GetBaseException().NativeErrorCode) -ne 183) { throw }; $denied = $true }
         $after = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
         if (-not $denied -or $before -cne $after) { throw 'FAIL prep-creation-only-fixture-never-rewrites-an-existing-acl' }
         Write-Host 'PASS prep-creation-only-fixture-never-rewrites-an-existing-acl'; $script:count++
-    } finally { Remove-Item -LiteralPath $aclRoot -Recurse -Force }
+        # Reproduce the tree that once broke cleanup: the caller may add entries
+        # but not list or delete them, so a plain recursive delete fails.
+        $locked = Join-Path $aclRoot 'locked'
+        foreach ($item in @(@($locked, "O:${me}G:${me}D:P(A;;0x20;;;AU)(A;;0x6;;;$me)"), @((Join-Path $locked 'inner'), "O:${me}G:${me}D:P(A;;0x20;;;AU)"))) {
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($item[1])
+            $bytes = [byte[]]::new($raw.BinaryLength); $raw.GetBinaryForm($bytes,0)
+            [Motor.PrepDirectoryCreation]::Create($item[0], $bytes)
+        }
+        $method = Remove-RunnerAccessFixture $locked
+        if ($method -ne 'removed-after-acl-reset' -or (Test-Path -LiteralPath $locked)) { throw "FAIL prep-acl-fixture-cleanup-recovers-unlistable-tree: $method" }
+        Write-Host 'PASS prep-acl-fixture-cleanup-recovers-unlistable-tree'; $script:count++
+    } catch { $failure = $_; throw } finally {
+        # Reported as its own result, and never allowed to hide an earlier failure.
+        try { $method = Remove-RunnerAccessFixture $aclRoot; Write-Host "PASS prep-acl-fixture-cleanup: $method"; $script:count++ }
+        catch { Write-Host "FAIL prep-acl-fixture-cleanup: $_"; if ($null -eq $failure) { throw } }
+    }
 }
 
 # Parse the actual Prepare/Run guard assignment, not a test-only approximation.
