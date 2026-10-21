@@ -861,28 +861,54 @@ class RecipeTests(unittest.TestCase):
 
 
 class BoatBaseLayoutTests(unittest.TestCase):
-    """Boat's base image ships /usr/local owned by its sandbox account. The
-    fixture reproduces that layout; ownership is simulated through a table that
-    Path.lstat reports and the injected chown updates, so the tests need not
-    run as root and every re-own call is observable."""
+    """Boat's base image ships /usr/local owned by its sandbox account, with
+    the provider's Go, rustup, Cargo and Ruby installs inside Ubuntu's skeleton
+    directories. The fixture reproduces that layout; ownership is simulated
+    through a table that Path.lstat reports and the injected chown updates, so
+    the tests need not run as root and every re-own call is observable."""
     # A stand-in for Boat's uid 1000; any non-root uid shows the same.
     PROVIDER = install.BOAT_BASE_UID
+    SKELETON = ("usr/local", "usr/local/bin", "usr/local/etc", "usr/local/games", "usr/local/include",
+                "usr/local/lib", "usr/local/sbin", "usr/local/share", "usr/local/share/man", "usr/local/src",
+                "usr/local/share/ca-certificates")
+    # Every entry at or beneath these belongs to the provider unless ROOT_INSIDE names it.
+    PROVIDER_TREES = ("usr/local/go", "usr/local/rustup", "usr/local/cargo", "usr/local/include/ruby-4.0.0",
+                      "usr/local/lib/ruby", "usr/local/share/doc/ruby", "opt/provider")
+    PROVIDER_ENTRIES = ("usr/local/man", "usr/local/bin/go", "usr/local/bin/cargo", "usr/local/bin/ruby",
+                        "usr/local/lib/libruby.so.4.0", "usr/local/lib/provider-opt",
+                        "usr/local/share/ca-certificates/provider.crt")
+    # A root-owned file inside a provider tree goes with the tree.
+    ROOT_INSIDE = ("usr/local/include/ruby-4.0.0/ruby/config.h",)
+    # What the layout step removes, grouped as the inventory records it.
+    REMOVED = {
+        "/usr/local/bin/cargo": 1, "/usr/local/bin/go": 1, "/usr/local/bin/ruby": 1,
+        "/usr/local/cargo": 3, "/usr/local/go": 5,
+        "/usr/local/include/ruby-4.0.0": 5,
+        "/usr/local/lib/libruby.so.4.0": 1, "/usr/local/lib/provider-opt": 1, "/usr/local/lib/ruby": 7,
+        "/usr/local/rustup": 5,
+        "/usr/local/share/ca-certificates": 1, "/usr/local/share/doc": 2,
+    }
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.image = Path(os.path.realpath(temp.name), "image")
-        provider = ("usr/local", "usr/local/bin", "usr/local/etc", "usr/local/games", "usr/local/include",
-                    "usr/local/lib", "usr/local/sbin", "usr/local/share", "usr/local/share/man", "usr/local/src",
-                    "usr/local/share/ca-certificates", "usr/local/go/bin", "usr/local/go/src",
-                    "usr/local/rustup/toolchains/stable/bin", "usr/local/cargo/bin")
-        ours = ("usr/bin", "usr/local/lib/git/2.53.0/bin", "home/ubuntu/.bun/bin", "home/ubuntu/.rustup",
-                "srv/build/cargo-home/bin")
-        for relative in provider + ours:
+        directories = ("usr/local/go/bin", "usr/local/go/src", "usr/local/rustup/toolchains/stable/bin",
+                       "usr/local/cargo/bin", "usr/local/include/ruby-4.0.0/ruby",
+                       "usr/local/lib/ruby/4.0.0/x86_64-linux", "usr/local/share/doc/ruby", "opt/provider",
+                       # Ours, root-owned, already present before the step.
+                       "usr/bin", "usr/local/lib/git/2.53.0/bin", "home/ubuntu/.bun/bin", "home/ubuntu/.rustup",
+                       "srv/build/cargo-home/bin")
+        for relative in self.SKELETON + directories:
             (self.image / relative).mkdir(parents=True, exist_ok=True)
         for relative in ("usr/local/go/bin/go", "usr/local/go/src/main.go", "usr/local/cargo/bin/cargo",
-                         "usr/local/rustup/toolchains/stable/bin/rustc", "usr/local/bin/motor-runner",
-                         "usr/local/lib/git/2.53.0/bin/git", "usr/bin/python3"):
+                         "usr/local/rustup/toolchains/stable/bin/rustc", "usr/local/include/ruby-4.0.0/ruby.h",
+                         "usr/local/include/ruby-4.0.0/ruby/version.h", "usr/local/include/ruby-4.0.0/ruby/config.h",
+                         "usr/local/lib/ruby/4.0.0/set.rb", "usr/local/lib/ruby/4.0.0/x86_64-linux/rbconfig.rb",
+                         "usr/local/lib/ruby/4.0.0/ruby", "usr/local/lib/ruby/4.0.0/gem",
+                         "usr/local/lib/libruby.so.4.0", "usr/local/share/ca-certificates/provider.crt",
+                         "usr/local/share/doc/ruby/README", "opt/provider/tool",
+                         "usr/local/bin/motor-runner", "usr/local/lib/git/2.53.0/bin/git", "usr/bin/python3"):
             (self.image / relative).write_text("#!/bin/sh\n")
             (self.image / relative).chmod(0o755)
         (self.image / "usr/local/man").symlink_to("share/man")
@@ -890,30 +916,53 @@ class BoatBaseLayoutTests(unittest.TestCase):
         # Provider command links into its trees, absolute and relative.
         (self.image / "usr/local/bin/go").symlink_to("/usr/local/go/bin/go")
         (self.image / "usr/local/bin/cargo").symlink_to("../cargo/bin/cargo")
+        (self.image / "usr/local/bin/ruby").symlink_to("../lib/ruby/4.0.0/ruby")
+        # Root-owned links into provider trees, in and outside /usr/local.
+        (self.image / "usr/local/bin/gem").symlink_to("../lib/ruby/4.0.0/gem")
+        (self.image / "usr/bin/go").symlink_to("/usr/local/go/bin/go")
+        # Links out of /usr/local to a provider directory elsewhere: the
+        # provider's own link is removed as a link, root's stays, and neither
+        # leads the walk to opt/provider.
+        (self.image / "usr/local/lib/provider-opt").symlink_to("../../../opt/provider")
+        (self.image / "usr/local/share/opt-view").symlink_to("../../../opt/provider")
         (self.image / "bin").symlink_to("usr/bin")
         # Boat's /usr/local/share is also group-writable in this fixture.
         (self.image / "usr/local/share").chmod(0o775)
         self.owners = {}
+        for path in self.entries():
+            relative = str(path.relative_to(self.image))
+            provider = (relative in self.SKELETON + self.PROVIDER_ENTRIES or any(
+                relative == tree or relative.startswith(tree + "/") for tree in self.PROVIDER_TREES))
+            self.owners[path] = (self.PROVIDER, self.PROVIDER) if provider and relative not in self.ROOT_INSIDE else (0, 0)
+        self.chowned = []
+
+    def entries(self):
+        """Every path in the fixture, without following symlinks."""
         for directory, directories, files in os.walk(self.image):
             for name in ["", *directories, *files]:
-                path = Path(directory, name) if name else Path(directory)
-                relative = str(path.relative_to(self.image))
-                foreign = any(relative == tree or relative.startswith(tree + "/") for tree in
-                              ("usr/local/go", "usr/local/rustup", "usr/local/cargo")) or relative in provider + (
-                    "usr/local/man", "usr/local/bin/go", "usr/local/bin/cargo")
-                self.owners[path] = (self.PROVIDER, self.PROVIDER) if foreign else (0, 0)
-        self.chowned = []
+                yield Path(directory, name) if name else Path(directory)
+
+    def snapshot(self):
+        return {path: path.lstat().st_mode for path in self.entries()}
+
+    @staticmethod
+    def inode(path):
+        """The key lstat and lchown act on: every directory above the last
+        component resolved, the last component itself not, so a path reached
+        through a symlinked directory reports the owner of what it reaches."""
+        path = Path(path)
+        return Path(os.path.realpath(path.parent), path.name)
 
     def chown(self, path, uid, gid):
         self.chowned.append(Path(path))
-        self.owners[Path(path)] = (uid, gid)
+        self.owners[self.inode(path)] = (uid, gid)
 
     def simulated(self):
         real = Path.lstat
 
         def lstat(path):
             metadata = real(path)
-            uid, gid = self.owners.get(Path(path), (0, 0))
+            uid, gid = self.owners.get(self.inode(path), (0, 0))
             return Mock(st_uid=uid, st_gid=gid, st_mode=metadata.st_mode)
 
         return patch.object(Path, "lstat", lstat)
@@ -922,14 +971,15 @@ class BoatBaseLayoutTests(unittest.TestCase):
         with self.simulated():
             return install.root_paths.check(install.root_paths.BOAT_ROOTS, self.image, 0)
 
-    def apply(self):
+    def apply(self, **options):
         with self.simulated():
-            return install.boat_base_layout(self.image, chown=self.chown)
+            return install.boat_base_layout(self.image, chown=self.chown, **options)
 
     def test_build_refuses_before_the_layout_step_and_passes_after_it(self):
         before = self.check()
         self.assertGreater(before["offender_count"], 0)
-        self.assertIn(f"{self.image}/usr/local/go: uid={self.PROVIDER} gid={self.PROVIDER}", before["offenders"])
+        for offender in ("usr/local/go", "usr/local/include/ruby-4.0.0", "usr/local/bin/ruby"):
+            self.assertIn(f"{self.image}/{offender}: uid={self.PROVIDER} gid={self.PROVIDER}", before["offenders"])
         with self.simulated(), self.assertRaisesRegex(ValueError, "root executes from are not owned by uid 0"):
             install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
         report = self.apply()
@@ -937,18 +987,24 @@ class BoatBaseLayoutTests(unittest.TestCase):
         self.assertEqual((after["offender_count"], after["offenders"]), (0, []))
         with self.simulated():
             install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
-        self.assertEqual([row["path"] for row in report["removed"]], list(install.BOAT_BASE_USR_LOCAL["remove"]))
-        for tree in install.BOAT_BASE_USR_LOCAL["remove"]:
-            self.assertFalse(os.path.lexists(self.image / tree.lstrip("/")), tree)
-        self.assertEqual(sorted(row["path"] for row in report["unlinked"]), ["/usr/local/bin/cargo", "/usr/local/bin/go"])
+        self.assertEqual(report["removed"], self.REMOVED)
+        self.assertEqual(report["removed_entries"], sum(self.REMOVED.values()))
+        for tree in self.PROVIDER_TREES[:-1] + self.PROVIDER_ENTRIES[1:]:
+            self.assertFalse(os.path.lexists(self.image / tree), tree)
+        self.assertFalse(os.path.lexists(self.image / self.ROOT_INSIDE[0]))
+        # Root's links into removed entries go too; the provider's own links
+        # were removed as entries and are not listed twice.
+        self.assertEqual([(row["path"], row["uid"]) for row in report["unlinked"]],
+                         [("/usr/local/bin/gem", 0), ("/usr/bin/go", 0)])
         # Our own installs beside the provider's survive untouched.
-        for kept in ("usr/local/bin/motor-runner", "usr/local/bin/git", "usr/local/lib/git/2.53.0/bin/git"):
+        for kept in ("usr/local/bin/motor-runner", "usr/local/bin/git", "usr/local/lib/git/2.53.0/bin/git",
+                     "usr/local/share/doc", "usr/local/man", "usr/bin/python3"):
             self.assertTrue(os.path.lexists(self.image / kept), kept)
         self.assertEqual(stat.S_IMODE((self.image / "usr/local/share").lstat().st_mode), 0o755)
 
-    def test_only_the_named_list_is_re_owned(self):
+    def test_only_the_skeleton_is_re_owned(self):
         report = self.apply()
-        named = {self.image / name.lstrip("/") for name in install.BOAT_BASE_USR_LOCAL["reown"]}
+        named = {self.image / name.lstrip("/") for name in install.BOAT_BASE_USR_LOCAL["skeleton"]}
         self.assertTrue(set(self.chowned) <= named)
         self.assertEqual(len(self.chowned), len(set(self.chowned)))
         present = {path for path in named if os.path.lexists(path)}
@@ -956,27 +1012,67 @@ class BoatBaseLayoutTests(unittest.TestCase):
         self.assertEqual({self.image / row["path"].lstrip("/") for row in report["reowned"]}, present)
         self.assertEqual(sorted(report["absent"]), ["/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages"])
 
-    def test_a_provider_path_the_list_does_not_name_still_fails_the_check(self):
-        extra = self.image / "usr/local/share/provider-extra"
-        extra.mkdir()
-        self.owners[extra] = (self.PROVIDER, self.PROVIDER)
+    def test_provider_entries_go_at_any_depth_while_unsafe_root_entries_still_fail_the_check(self):
+        # The layout step removes what the sandbox account owns, wherever it is
+        # under /usr/local. This root-owned directory is not a skeleton path,
+        # so the step leaves its group-write bit set and the root-owned path
+        # check must still report it by name.
+        deep = self.image / "usr/local/lib/git/2.53.0/bin/provider-extra"
+        deep.write_text("")
+        self.owners[deep] = (self.PROVIDER, self.PROVIDER)
+        writable = self.image / "usr/local/share/root-writable"
+        writable.mkdir()
+        writable.chmod(0o777)
+        report = self.apply()
+        self.assertFalse(os.path.lexists(deep))
+        self.assertEqual(report["removed"]["/usr/local/lib/git"], 1)
+        self.assertNotIn(writable, self.chowned)
+        self.assertEqual(self.check()["offenders"], [f"{writable}: mode=0777 (group or other may write)"])
+
+    def test_the_walk_never_follows_symlinks(self):
         self.apply()
-        self.assertNotIn(extra, self.chowned)
-        self.assertEqual(self.check()["offenders"], [f"{extra}: uid={self.PROVIDER} gid={self.PROVIDER}"])
+        # Both links lead to a provider directory outside /usr/local; the
+        # provider's link is removed as a link and root's stays, while the
+        # directory they point at, and the provider file in it, are untouched.
+        self.assertFalse(os.path.lexists(self.image / "usr/local/lib/provider-opt"))
+        self.assertTrue((self.image / "usr/local/share/opt-view").is_symlink())
+        self.assertTrue((self.image / "opt/provider/tool").is_file())
 
     def test_an_unexpected_owner_refuses_before_anything_changes(self):
-        self.owners[self.image / "usr/local/lib"] = (4321, 4321)
-        with self.assertRaisesRegex(ValueError, "refusing to re-own /usr/local/lib: owned by uid 4321"):
-            self.apply()
-        self.assertEqual(self.chowned, [])
-        self.assertTrue((self.image / "usr/local/go/bin/go").exists())
-        self.assertTrue((self.image / "usr/local/bin/go").is_symlink())
+        cases = (("usr/local/lib", "refusing to re-own /usr/local/lib: owned by uid 4321", 4321),
+                 ("usr/local/lib/ruby/4.0.0/set.rb", "refusing to remove /usr/local/lib/ruby/4.0.0/set.rb: "
+                  "owned by uid 1001", 1001),
+                 ("usr/local/lib/git/2.53.0/bin/git", "refusing to leave in place "
+                  "/usr/local/lib/git/2.53.0/bin/git: owned by uid 1001", 1001))
+        for relative, message, uid in cases:
+            with self.subTest(relative):
+                before = self.snapshot()
+                saved = self.owners[self.image / relative]
+                self.owners[self.image / relative] = (uid, uid)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.apply()
+                self.assertEqual(self.chowned, [])
+                self.assertEqual(self.snapshot(), before)
+                self.owners[self.image / relative] = saved
+
+    def test_a_removal_that_would_take_the_running_recipe_refuses_first(self):
+        # As if the recipe ran on the provider's interpreter, whose standard
+        # library sits in a tree the step would remove.
+        stdlib = self.image / "usr/local/lib/ruby/4.0.0"
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, f"{stdlib} is among them and this recipe runs from it"):
+            self.apply(protected={stdlib})
+        self.assertEqual((self.chowned, self.snapshot()), ([], before))
+        running = install.running_paths()
+        self.assertIn(Path(os.path.realpath(sys.executable)), running)
+        self.assertIn(install.ROOT, running)
 
     def test_reapplying_changes_nothing(self):
         self.apply()
         self.chowned.clear()
         again = self.apply()
-        self.assertEqual((again["removed"], again["unlinked"], again["reowned"], self.chowned), ([], [], [], []))
+        self.assertEqual((again["removed"], again["removed_entries"], again["unlinked"], again["reowned"],
+                          self.chowned), ({}, 0, [], [], []))
 
     def test_the_recipe_settles_the_layout_before_installing_and_checks_after(self):
         main = inspect.getsource(install.main)
