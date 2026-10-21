@@ -323,6 +323,25 @@ replayed `run` returns the same terminal), `lost_upload_e_after_last_byte_runs_o
 stays retrievable for 24 hours. Test: `cancelled_request_detaches_and_the_job_keeps_running`
 (`crates/motor-module/tests/it/detach.rs`).
 
+7.6. On the hosted path, `motor-host` keeps a job connection open after the
+job ends until it has relayed every record through `terminal` and
+`hosted_terminal`, however slowly the client reads. It then ends its side
+gracefully (TLS close_notify, then TCP FIN after the queued data) and keeps
+reading and discarding the client's heartbeats until the client closes, for at
+most two minutes (`CLIENT_DRAIN_DEADLINE`). Dropping the socket instead, with a
+heartbeat unread or arriving after the drop, made the kernel reset the
+connection and discard the frames still in flight. The host records the terminal
+as delivered, which queues its usage report at once, only when the client closes
+its side within that bound (a TLS close without close_notify counts); otherwise
+the report is queued when the 60-second delivery grace after the job's end
+expires. Billed
+time is measured from the runner's start and end events, so the drain never
+changes it. Tests:
+`slow_client_heartbeating_past_job_end_receives_every_frame_through_the_terminal`,
+`host_never_resets_a_client_with_unread_data_at_lease_end`,
+`a_client_that_never_closes_is_released_at_the_drain_deadline_without_delivery`
+(`crates/motor-host/tests/it/transport.rs`).
+
 ## 8. Queue wait and withdrawal
 
 8.1. `heartbeat.queue_wait_ms` is present only while the job is queued,
