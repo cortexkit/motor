@@ -132,6 +132,8 @@ fn closed_tenant_with_an_open_lease_is_never_removed_by_the_runtime() {
     let mut h = host();
     started(&mut h, JOB, 1);
     h.close_subjects(&[sub()], MS).unwrap();
+    // The client detached: no connection is open, but the job still runs.
+    h.close(1).unwrap();
     // Keep the job inside its own runtime cap, so the watchdog leaves it.
     h.snapshot.leases.get_mut(JOB).unwrap().claims.max_s = u64::MAX / 4_000;
     let helper = Arc::new(Helper::default());
