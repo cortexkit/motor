@@ -56,19 +56,8 @@ fn debug_string(process: HANDLE, info: OUTPUT_DEBUG_STRING_INFO) -> Value {
         None
     };
     data.truncate(read.min(data.len()));
-    let text = if info.fUnicode != 0 {
-        String::from_utf16_lossy(
-            &data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        String::from_utf8_lossy(&data).into_owned()
-    };
-    json!({"text":text.trim_end_matches('\0'),"unicode":info.fUnicode != 0,"read_complete":success != 0,
+    let text = crate::windows::debug_text::decode(&data,info.fUnicode != 0);
+    json!({"text":text,"unicode":info.fUnicode != 0,"read_complete":success != 0,
         "read_error":read_error})
 }
 

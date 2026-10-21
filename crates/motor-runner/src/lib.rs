@@ -121,6 +121,11 @@ pub fn hyperv_prep_launch(args: &[String]) -> std::io::Result<()> {
 }
 #[cfg(windows)]
 #[doc(hidden)]
+pub fn hyperv_prep_access_check(args: &[String]) -> std::io::Result<()> {
+    windows::prep_access_check(args)
+}
+#[cfg(windows)]
+#[doc(hidden)]
 pub fn hyperv_qualify_disconnect(config: &Config) -> std::io::Result<()> {
     windows::qualify_disconnect(config)
 }

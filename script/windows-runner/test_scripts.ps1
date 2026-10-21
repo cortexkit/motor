@@ -51,6 +51,46 @@ try {
     Remove-Item Function:\secedit.exe
     Remove-Item $root -Recurse -Force
 }
+& {
+    . "$PSScriptRoot\prep-acl.ps1"
+    $aclRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-prep-acl-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $aclRoot | Out-Null
+    $sid = 'S-1-5-11'
+    function Get-FixtureTrusteeAces([string]$Path, [bool]$ExplicitOnly) {
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $Path).GetSecurityDescriptorBinaryForm(),0)
+        return @($raw.DiscretionaryAcl | Where-Object { $_ -is [Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -eq $sid -and $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and (-not $ExplicitOnly -or -not $_.IsInherited) } | ForEach-Object { '{0:x8}/{1:x2}' -f $_.AccessMask,[int]$_.AceFlags } | Sort-Object)
+    }
+    try {
+        # The independent oracle is the former production icacls command, not
+        # masks computed from the new builder's expected values.
+        foreach ($row in @(@('Stage','(X)'),@('Read','(OI)(CI)RX'),@('Modify','(OI)(CI)M'))) {
+            $created = Join-Path $aclRoot ('created-' + $row[0])
+            $oracle = Join-Path $aclRoot ('oracle-' + $row[0])
+            $null = New-RunnerPrepDirectory $created (Get-Acl -LiteralPath $aclRoot) $sid $row[0]
+            New-Item -ItemType Directory -Path $oracle | Out-Null
+            [IO.File]::WriteAllText((Join-Path $created 'child.txt'),'fixture')
+            [IO.File]::WriteAllText((Join-Path $oracle 'child.txt'),'fixture')
+            & icacls.exe $oracle /grant:r ("*${sid}:" + $row[1]) /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Fixture icacls oracle failed' }
+            if (((Get-FixtureTrusteeAces $created $true) -join ',') -cne ((Get-FixtureTrusteeAces $oracle $true) -join ',')) { throw "FAIL prep-shared-descriptor-matches-legacy-icacls: $($row[0])" }
+            if (((Get-FixtureTrusteeAces (Join-Path $created 'child.txt') $false) -join ',') -cne ((Get-FixtureTrusteeAces (Join-Path $oracle 'child.txt') $false) -join ',')) { throw "FAIL prep-shared-descriptor-inheritance-matches-icacls: $($row[0])" }
+            $production = Join-Path $aclRoot ('production-' + $row[0])
+            New-Item -ItemType Directory -Path $production | Out-Null
+            [IO.File]::WriteAllText((Join-Path $production 'child.txt'),'fixture')
+            Grant-RunnerPrepPath $production $sid $row[0]
+            if (((Get-FixtureTrusteeAces $production $true) -join ',') -cne ((Get-FixtureTrusteeAces $oracle $true) -join ',') -or ((Get-FixtureTrusteeAces (Join-Path $production 'child.txt') $false) -join ',') -cne ((Get-FixtureTrusteeAces (Join-Path $oracle 'child.txt') $false) -join ',')) { throw "FAIL prep-production-shares-the-fixture-descriptor-path: $($row[0])" }
+        }
+        Write-Host 'PASS prep-shared-descriptor-and-inheritance-match-independent-icacls'; $script:count++
+        $path = Join-Path $aclRoot 'created-Stage'
+        $before = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        $denied = $false
+        try { $null = New-RunnerPrepDirectory $path (Get-Acl -LiteralPath $aclRoot) $sid Modify } catch { if (($_.Exception.GetBaseException().NativeErrorCode) -ne 183) { throw }; $denied = $true }
+        $after = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        if (-not $denied -or $before -cne $after) { throw 'FAIL prep-creation-only-fixture-never-rewrites-an-existing-acl' }
+        Write-Host 'PASS prep-creation-only-fixture-never-rewrites-an-existing-acl'; $script:count++
+    } finally { Remove-Item -LiteralPath $aclRoot -Recurse -Force }
+}
+
 # Parse the actual Prepare/Run guard assignment, not a test-only approximation.
 $tokens = $null; $errors = $null
 $control = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\hyperv.ps1", [ref]$tokens, [ref]$errors)

@@ -73,8 +73,8 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("copy_tree(&source, &cache.join(name))", self.prep)
         self.assertCodeIn("launch::check_path(&vm.layout_root, &source)", self.prep)
         control = (HERE / "hyperv.ps1").read_text()
-        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" \'(OI)(CI)RX\' $sid', control)
-        self.assertNotIn('Grant "$Root\\state\\ally\\prep-cargo" \'(OI)(CI)M\' $sid', control)
+        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" Read $sid', control)
+        self.assertNotIn('Grant "$Root\\state\\ally\\prep-cargo" Modify $sid', control)
 
     def test_explicit_stdio_handle_list_and_suspended_job_assignment(self):
         self.assertCodeIn("PROC_THREAD_ATTRIBUTE_HANDLE_LIST", self.process)

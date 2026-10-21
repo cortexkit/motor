@@ -1,7 +1,8 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\qualify-peer.ps1"
@@ -41,8 +42,15 @@ function Copy-QualificationEvidence {
 if ($PrepLaunchMatrix) {
     $service = Get-Service MotorRunner
     if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
-    . "$PSScriptRoot\loader-snaps.ps1"
-    try { Invoke-RunnerLoaderSnaps $Evidence { $null = Runner-Check 'qualify-prep-matrix' } } finally {
+    try {
+        if ($AccessChecksOnly) {
+            . "$PSScriptRoot\prep-access-check.ps1"
+            Invoke-RunnerPrepAccessMatrix $Root $exe $Evidence
+        } else {
+            . "$PSScriptRoot\loader-snaps.ps1"
+            Invoke-RunnerLoaderSnaps $Evidence { $null = Runner-Check 'qualify-prep-matrix' }
+        }
+    } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Matrix evidence copy failed: $_" -WarningAction Continue }
     }
     return

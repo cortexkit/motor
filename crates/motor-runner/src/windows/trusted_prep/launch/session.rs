@@ -26,6 +26,8 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{WINSTA_ALL_ACCESS, WSF_VISIBLE},
     },
 };
+mod access_checks;
+pub(super) fn access_check_run(vm:&crate::windows::VmConfig,fixture:&Path,report:&Path)->io::Result<()> {access_checks::run(vm,fixture,report)}
 
 struct Local(*mut c_void);
 const FETCH_TOKEN_FLAGS: u32 = DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED;

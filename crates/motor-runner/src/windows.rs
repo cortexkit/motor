@@ -29,6 +29,10 @@ mod native_call_trace;
 pub(crate) mod prep;
 #[cfg(any(windows, test))]
 mod process_status;
+#[cfg(any(windows, test))]
+mod access_screen;
+#[cfg(any(windows, test))]
+mod debug_text;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -64,6 +68,8 @@ pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {
 pub(crate) fn prep_launch(args: &[String]) -> io::Result<()> {
     trusted_prep::launch_entry(args)
 }
+#[cfg(windows)]
+pub(crate) fn prep_access_check(args: &[String]) -> io::Result<()> { trusted_prep::access_check_entry(args) }
 #[cfg(windows)]
 pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
     vm::qualify_disconnect(config)

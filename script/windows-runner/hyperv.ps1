@@ -12,6 +12,7 @@ Set-StrictMode -Version Latest
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\parent-identity.ps1"
 . "$PSScriptRoot\guest-evidence.ps1"
+. "$PSScriptRoot\prep-acl.ps1"
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or -not (Test-Path -LiteralPath "$Root\.motor-runner-root")) { throw 'Unowned runner root' }
 foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state")) {
     if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse root refused: $path" }
@@ -135,10 +136,8 @@ function Remove-Job([string]$Id, [switch]$LightweightHarvest) {
     if ((Owned-VM $Id) -or (Test-Path -LiteralPath $directory)) { throw 'Job VM or disk remains after removal' }
     Evidence $Id 'nothing-left-behind' @{vm_absent=$true; job_directory_absent=$true}
 }
-function Grant([string]$Path, [string]$Permission, [string]$Sid) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    & icacls.exe $Path /grant:r "*${Sid}:$Permission" /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Prep ACL failed at $Path" }
+function Grant([string]$Path, [string]$Role, [string]$Sid) {
+    Grant-RunnerPrepPath $Path $Sid $Role
 }
 if ($Operation -in @('Prepare','Id','Run','Remove','Harvest','QualifyInspect')) {
     if ($Job -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Invalid job UUID' }
@@ -202,11 +201,11 @@ switch ($Operation) {
             }
             break
         }
-        Grant $full '(X)' $sid
-        foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" '(OI)(CI)RX' $sid }
-        Grant "$full\fetch-temp" '(OI)(CI)M' $sid
-        Grant "$Root\state\ally\prep-cargo" '(OI)(CI)RX' $sid
-        Grant "$Root\prep-toolchain" '(OI)(CI)RX' $sid
+        Grant $full Stage $sid
+        foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" Read $sid }
+        Grant "$full\fetch-temp" Modify $sid
+        Grant "$Root\state\ally\prep-cargo" Read $sid
+        Grant "$Root\prep-toolchain" Read $sid
     }
     'Prepare' {
         if ($Nonce -notmatch '\A[0-9a-f]{32}\z') { throw 'Nonce must be exactly 32 hexadecimal characters, without hyphens, BOM or newline' }

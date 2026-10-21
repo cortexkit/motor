@@ -518,6 +518,21 @@ pub(super) fn write_diagnostic_update(path: &Path, value: &Value) -> io::Result<
 pub(super) fn require_system() -> io::Result<()> {
     session::require_system()
 }
+pub(super) fn access_check_entry(arguments:&[String])->io::Result<()> {
+    session::require_system()?;
+    if arguments.len()!=3 {return Err(step("access-check-arguments","requires root, owned fixture path and fresh report path"));}
+    let root=PathBuf::from(&arguments[0]); let fixture=PathBuf::from(&arguments[1]); let report=PathBuf::from(&arguments[2]);
+    if root!=Path::new(r"C:\ProgramData\MotorRunner") || fixture.parent()!=Some(root.join("staging").as_path())
+        || fixture.file_name().and_then(|name|name.to_str()).and_then(|name|uuid::Uuid::parse_str(name).ok()).is_none()
+        || report.file_name().and_then(|name|name.to_str())!=Some("ksecdd-access-matrix.json")
+        || report.parent().and_then(Path::parent)!=Some(Path::new(r"C:\motor-runner-evidence")) {
+        return Err(step("access-check-arguments","paths are not the owned diagnostic roots"));
+    }
+    session::no_reparse(&root,&fixture)?;
+    session::no_reparse(Path::new(r"C:\motor-runner-evidence"),report.parent().unwrap())?;
+    let vm=super::super::VmConfig::load(&root.join("vm.toml"))?;
+    session::access_check_run(&vm,&fixture,&report)
+}
 
 fn diagnostic_write_probe(
     plan: &Plan,

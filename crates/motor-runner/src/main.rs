@@ -15,6 +15,10 @@ mod native_service;
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "prep-access-check") {
+        return motor_runner::hyperv_prep_access_check(&args[1..]);
+    }
+    #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "prep-launch") {
         // Station switching is process-global: this one-shot broker must run
         // before creating the service's multithreaded runtime.
