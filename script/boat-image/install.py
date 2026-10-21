@@ -70,6 +70,9 @@ TOOL_HOME = Path("/home/ubuntu")
 # or as a PATH symlink into one, so a remaining root-owned entry that is
 # unsafe fails the root-owned path check by name.
 BOAT_BASE_UID = 1000
+# Packages Boat's base installs that the build server doesn't have and that
+# leave non-root-owned files on root's executable paths.
+BOAT_BASE_PURGE = ("at",)
 BOAT_BASE_USR_LOCAL = {
     # The tree walked: every entry beneath it, at any depth, without following
     # symlinks, so a link never leads the walk (or a removal) outside it.
@@ -694,6 +697,11 @@ def main():
     packages = (manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["boat"]
                 + manifest["tools"]["git"]["source"]["build_packages"])
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
+    # Boat's base ships Ubuntu's `at`, whose /usr/bin/at is setuid and owned by
+    # the daemon account, so the root-owned path check refuses it. The build
+    # server has no `at` and nothing here schedules jobs with it, so the image
+    # drops the package rather than exempting the path.
+    run("apt-get", "purge", *APT_OPTIONS, "-y", *BOAT_BASE_PURGE)
     target_directories()
     accounts()
     # Before the tool installers write under /usr/local, so every entry the
