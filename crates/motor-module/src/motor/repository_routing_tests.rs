@@ -744,3 +744,93 @@ async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
     );
     assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
 }
+
+/// The broker grants a routed job's lease from a stale view of the host, and
+/// the host refuses it as full (or out of capacity) twice before admitting
+/// it. The job waits and asks again with the same job ID and lease body,
+/// then runs once on the host; nothing is released and nothing reaches the
+/// build server.
+#[tokio::test]
+async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
+    for refusals in [["host_full", "host_full"], ["host_full", "capacity"]] {
+        let h = Harness::new(Behavior::CompleteRun).await;
+        h.host_refusals.lock().unwrap().extend(refusals);
+        let (scratch, repo) = committed_repo();
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let stream = motor.run(request(&repo)).unwrap();
+        let id = stream.job_id;
+        let (_, terminal) = records(stream).await;
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 23 }, "{refusals:?}");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "each host refusal waits before asking again"
+        );
+        assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(h.tokens.load(Ordering::SeqCst), 3);
+        assert!(h.host_refusals.lock().unwrap().is_empty());
+        let bodies: Vec<motor_lease::LeaseRequest> = h
+            .lease_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_slice(body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies {
+            assert_eq!(body.job_id, id.to_string());
+            assert_eq!(
+                crate::hosted::tests::canonical_lease_bytes(body),
+                crate::hosted::tests::canonical_lease_bytes(&bodies[0])
+            );
+        }
+        assert!(lease_settlement_requests(&h).is_empty());
+        let state = motor.hosted_state(id).unwrap();
+        assert!(state.repository_routed && state.run_sent);
+        assert_eq!(state.placement_attempts, 1);
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A host that stays full uses up the routed job's queue-wait budget and no
+/// more, then gives the same typed, retryable refusal as broker no_capacity.
+/// The unused reservation is released; nothing reaches the build server.
+#[tokio::test]
+async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity() {
+    let h = Harness::new(Behavior::Refuse("host_full")).await;
+    let (scratch, repo) = committed_repo();
+    let config = Config {
+        queue_wait_limit_s: 3,
+        ..config(&h, &repo)
+    };
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let started = tokio::time::Instant::now();
+    let stream = motor.run(request(&repo)).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    assert_eq!(terminal.retry_after_ms, Some(2000));
+    let detail = terminal.refusal_detail.unwrap();
+    assert!(
+        detail.contains("hosted stage-1 routing (hosted_repositories): hosted_capacity"),
+        "{detail}"
+    );
+    assert!(h.lease_bodies.lock().unwrap().len() >= 2);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(!motor.hosted_state(id).unwrap().run_sent);
+    assert_eq!(
+        lease_settlement_requests(&h),
+        vec![format!("/v1/leases/{id}/release")]
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}

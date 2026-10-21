@@ -444,7 +444,15 @@ For a repository-routed job, broker `503 no_capacity` responses wait for
 `Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one
 second) before retrying the identical request, including its job ID. Capacity
 and `202 provisioning` retries share one queue-wait deadline. Exhaustion yields
-a typed retryable refusal, never local execution. Before the durable `run_sent`
+a typed retryable refusal, never local execution. The broker can grant a lease
+from a stale view of the host, which then refuses the job as full (`host_full`,
+or `capacity`). A routed job waits two seconds and asks again with the same job
+ID and lease body, within the same queue-wait deadline. The contract allows
+this: a re-request before admission returns the same reservation and placement
+with a fresh run token. These waits don't count against the three placement
+attempts. When the deadline passes, the job gets the same refusal as for
+`no_capacity` (`hosted_capacity`, runner full, retry after 2 s), and the unused
+reservation is released. Before the durable `run_sent`
 marker, refusals identify repository-selected routing with the exact detail text
 `hosted stage-1 routing (hosted_repositories)`.
 After that marker the existing hosted reattach/finish path governs an ambiguous
@@ -480,6 +488,8 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_lost_run_ack_reattaches_without_direct_fallback`,
 `stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host`,
 `stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline`,
+`stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job`,
+`stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity`,
 `stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted`,
 `stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
 `stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,

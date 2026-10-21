@@ -185,6 +185,11 @@ pub(crate) enum Error {
 pub(crate) const SHADOW_PROVISIONING_BUDGET: Duration = Duration::from_secs(300);
 const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
 const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
+/// How long a repository-routed job waits before asking again after the
+/// granted host refused it as full. The host sends no Retry-After, and its
+/// slots free as soon as a running job ends, so this is shorter than the
+/// broker's usual 5-second `no_capacity` wait.
+const HOST_FULL_RETRY_MS: u64 = 2_000;
 fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
     ms.clamp(MIN_PROVISIONING_RETRY_MS, MAX_PROVISIONING_RETRY_MS)
 }
@@ -708,6 +713,7 @@ impl Client {
             let attempt = state.placement_attempts;
             let spilled = state.spill_wait_ms.is_some();
             let hosted_test = state.hosted_test;
+            let repository_routed = state.repository_routed;
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -792,6 +798,34 @@ impl Client {
                 Ok(channel) => return Ok((channel, lease)),
                 Err(e) if lease.ssh.is_some() => return Err(e),
                 Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
+                // The broker's view of the host lags its heartbeats, so it can
+                // grant a lease the host then refuses as full. A routed job
+                // would have queued on the build server, so it waits for the
+                // host instead, within its queue-wait budget, the way it waits
+                // out 503 no_capacity. The host stored nothing for the
+                // refused token, and the broker keeps the reservation, so
+                // asking again with the same job ID and body returns the same
+                // placement with a fresh run token, which the host accepts
+                // because its issue time is later. These waits are not failed
+                // placements, so they don't use up the three placement
+                // attempts.
+                Err(e @ (Error::HostFull | Error::Capacity)) if repository_routed => {
+                    let retry_at =
+                        tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
+                    if retry_at >= provisioning_deadline {
+                        tokio::time::sleep_until(provisioning_deadline).await;
+                        return Err(Error::NoCapacity(HOST_FULL_RETRY_MS));
+                    }
+                    storage
+                        .hosted_update(id, |state| {
+                            state.placement_attempts = state.placement_attempts.saturating_sub(1)
+                        })
+                        .map_err(|_| Error::Broker)?;
+                    tracing::info!(job_id = %id, attempt, code = e.code(),
+                        retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
+                    tokio::time::sleep_until(retry_at).await;
+                    continue;
+                }
                 Err(e) if e.replaceable() && attempt < 2 => continue,
                 Err(e) => return Err(e),
             }
