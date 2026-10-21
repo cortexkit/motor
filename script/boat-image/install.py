@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import urllib.error
@@ -54,36 +55,46 @@ TOOL_HOME = Path("/home/ubuntu")
 # which Boat's exec API runs as and which has passwordless sudo. Root runs the
 # runner, the endpoint and the job PID namespace init from /usr/local, so every
 # path there must be root's (root_paths.py). The recipe settles that provider
-# layout here, by name, before the tool installers write under /usr/local; it
-# never re-owns a tree recursively. A listed path that is absent is skipped; one owned by any account
-# other than root or BOAT_BASE_UID refuses the build. Whatever this list does not
-# name stays subject to the root-owned path check, which then fails naming it,
-# so a provider change is decided here rather than absorbed silently.
+# layout before the tool installers write under /usr/local, by one rule rather
+# than a list of the provider's trees: Ubuntu's skeleton directories stay and
+# become root's, and every other entry the sandbox account owns there is
+# removed. Boat's base carries toolchains the image never uses this way (Go,
+# rustup and Cargo trees, a Ruby install under include/, lib/ and bin/); the
+# build server has none of them, and jobs mount /usr read-only, so removing
+# them keeps them out of job view as on the build server. The runner, the
+# endpoint and jobs take Rust from RUSTUP_HOME=/home/ubuntu/.rustup and
+# CARGO_HOME=/srv/build/cargo-home (jobs: /motor-home/cargo), and the
+# toolchain manifest names no Go or Ruby. An entry owned by any account other
+# than root or BOAT_BASE_UID refuses the build before anything changes. Root's
+# own entries stay where they are, except inside a removed provider directory
+# or as a PATH symlink into one, so a remaining root-owned entry that is
+# unsafe fails the root-owned path check by name.
 BOAT_BASE_UID = 1000
 BOAT_BASE_USR_LOCAL = {
-    # Provider toolchains the image never uses. The runner, the endpoint and
-    # jobs take Rust from RUSTUP_HOME=/home/ubuntu/.rustup and
-    # CARGO_HOME=/srv/build/cargo-home (jobs: /motor-home/cargo), the build
-    # server's toolchain manifest names no Go, and no unit or job PATH names
-    # these directories. Jobs mount /usr read-only, so removing the trees also
-    # keeps them out of job view, as on the build server.
-    "remove": ("/usr/local/go", "/usr/local/rustup", "/usr/local/cargo"),
-    # Directories searched for a command name: motor-boat.service's PATH and
-    # systemd's default PATH, which motor-boat-host.service inherits. A symlink
-    # directly in one of them that points into a removed tree (a provider
-    # /usr/local/bin/go, say) is removed with the tree, so nothing root or a
-    # job runs by name still leads there.
-    "search_path": ("/home/ubuntu/.bun/bin", "/srv/build/cargo-home/bin", "/usr/local/sbin", "/usr/local/bin",
-                    "/usr/sbin", "/usr/bin", "/sbin", "/bin"),
+    # The tree walked: every entry beneath it, at any depth, without following
+    # symlinks, so a link never leads the walk (or a removal) outside it.
+    "root": "/usr/local",
     # Directories that stay and receive our installs, each re-owned root:root
     # with group/other write cleared, never recursively: /usr/local and Ubuntu
     # base-files' skeleton beneath it (man is its link to share/man), plus the
     # directories the image's python3 and ca-certificates packages create there.
-    "reown": ("/usr/local", "/usr/local/bin", "/usr/local/etc", "/usr/local/games", "/usr/local/include",
-              "/usr/local/lib", "/usr/local/man", "/usr/local/sbin", "/usr/local/share", "/usr/local/share/man",
-              "/usr/local/src", "/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages",
-              "/usr/local/share/ca-certificates"),
+    # Every other entry the sandbox account owns under "root" is removed.
+    "skeleton": ("/usr/local", "/usr/local/bin", "/usr/local/etc", "/usr/local/games", "/usr/local/include",
+                 "/usr/local/lib", "/usr/local/man", "/usr/local/sbin", "/usr/local/share", "/usr/local/share/man",
+                 "/usr/local/src", "/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages",
+                 "/usr/local/share/ca-certificates"),
+    # Directories searched for a command name: motor-boat.service's PATH and
+    # systemd's default PATH, which motor-boat-host.service inherits. A symlink
+    # directly in one of them that points into a removed entry (a root-owned
+    # /usr/bin/ruby leading to the provider's /usr/local/lib/ruby, say) is
+    # removed too, so nothing root or a job runs by name still leads there.
+    "search_path": ("/home/ubuntu/.bun/bin", "/srv/build/cargo-home/bin", "/usr/local/sbin", "/usr/local/bin",
+                    "/usr/sbin", "/usr/bin", "/sbin", "/bin"),
 }
+# How many path levels below BOAT_BASE_USR_LOCAL["root"] the inventory groups
+# removed entries by: /usr/local/include/ruby-4.0.0 with its entry count, not
+# every file inside it.
+REMOVED_GROUP_LEVELS = 2
 
 
 def run(*args, capture=False):
@@ -167,16 +178,30 @@ def tool_home(home=TOOL_HOME, proc=Path("/proc")):
     return {"path": str(home), "created": False}
 
 
-def boat_base_layout(image=Path("/"), layout=BOAT_BASE_USR_LOCAL, provider_uid=BOAT_BASE_UID, chown=os.lchown):
+def running_paths():
+    """What this recipe runs from: its interpreter, that interpreter's standard
+    library and the source checkout. README runs the recipe with /usr/bin/python3;
+    a bare `sudo python3` could instead find a provider interpreter under
+    /usr/local/bin, which removing the provider's entries would delete mid-run."""
+    return {Path(os.path.realpath(sys.executable)), Path(os.path.realpath(sysconfig.get_paths()["stdlib"])), ROOT}
+
+
+def boat_base_layout(image=Path("/"), layout=BOAT_BASE_USR_LOCAL, provider_uid=BOAT_BASE_UID, chown=os.lchown,
+                     protected=None):
     """Apply BOAT_BASE_USR_LOCAL to the image at `image` ("/" when building, a
-    fixture directory in tests) and return what changed. Every listed path's
-    owner is checked before anything changes, so a refusal leaves the image as
-    it was. Idempotent: a reapplied recipe finds the trees gone and the
-    directories already root's."""
+    fixture directory in tests) and return what changed. The whole tree is
+    walked and every owner checked before anything changes, so a refusal
+    leaves the image as it was. `protected` paths (default: running_paths())
+    must not lie inside anything removed. Idempotent: a reapplied recipe finds
+    the provider's entries gone and the skeleton already root's."""
     image = Path(os.path.realpath(image))
+    protected = running_paths() if protected is None else set(protected)
 
     def inside(name):
         return image / name.lstrip("/")
+
+    def name_of(path):
+        return "/" + str(path.relative_to(image))
 
     def provider_or_root(name, metadata, action):
         if metadata.st_uid not in (0, provider_uid):
@@ -184,19 +209,51 @@ def boat_base_layout(image=Path("/"), layout=BOAT_BASE_USR_LOCAL, provider_uid=B
                              f"neither root nor Boat's base account uid {provider_uid}")
         return {"path": name, "uid": metadata.st_uid, "gid": metadata.st_gid}
 
-    report = {"provider_uid": provider_uid, "removed": [], "unlinked": [], "reowned": [], "absent": []}
-    trees, links, directories = [], [], []
-    for name in layout["remove"]:
-        path = inside(name)
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            report["absent"].append(name)
-            continue
-        trees.append((path, metadata, provider_or_root(name, metadata, "remove")))
+    report = {"provider_uid": provider_uid, "removed": {}, "removed_entries": 0, "unlinked": [], "reowned": [],
+              "absent": []}
+    top = inside(layout["root"])
+    skeleton = {inside(name) for name in layout["skeleton"]}
+    # removals: the topmost removed entries, each with how many entries its
+    # removal takes (itself and everything beneath it).
+    removals, links, directories, seen = [], [], [], set()
+
+    def visit(path, metadata, removed_above):
+        """Classify one entry and walk beneath it; return its entry count.
+        lstat reports a symlink as a link, never as the directory it may point
+        at, so links are counted and never descended."""
+        name = name_of(path)
+        action = "re-own" if path in skeleton else "remove" if removed_above else "leave in place"
+        record = provider_or_root(name, metadata, action)
+        removing = False
+        if path in skeleton:
+            seen.add(path)
+            directories.append((path, metadata, record))
+        elif not removed_above and metadata.st_uid == provider_uid:
+            removing = True
+        count = 1
+        if stat.S_ISDIR(metadata.st_mode):
+            for entry in sorted(path.iterdir()):
+                count += visit(entry, entry.lstat(), removed_above or removing)
+        if removing:
+            removals.append((path, metadata, count))
+        return count
+
+    try:
+        top_metadata = top.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        visit(top, top_metadata, False)
+    report["absent"] = [name for name in layout["skeleton"] if inside(name) not in seen]
+    removed = {path for path, _, _ in removals}
+    for path in sorted(protected):
+        if any(candidate in removed for candidate in (path, *path.parents)):
+            raise ValueError(f"refusing to remove Boat's /usr/local entries: {path} is among them and this recipe "
+                             "runs from it; run the recipe with /usr/bin/python3 from a checkout outside /usr/local")
     # An absolute link target is read beneath `image` and a relative one from
     # the link's directory, both normalized without following any link, so a
-    # fixture's absolute links never reach the running system's files.
+    # fixture's absolute links never reach the running system's files. A link
+    # that is itself removed above is not listed again.
     searched = set()
     for name in layout["search_path"]:
         directory = Path(os.path.realpath(inside(name)))
@@ -204,31 +261,27 @@ def boat_base_layout(image=Path("/"), layout=BOAT_BASE_USR_LOCAL, provider_uid=B
             continue
         searched.add(directory)
         for entry in sorted(directory.iterdir()):
-            if not entry.is_symlink():
+            if not entry.is_symlink() or entry in removed:
                 continue
             target = os.readlink(entry)
             lexical = Path(os.path.normpath(inside(target) if os.path.isabs(target) else entry.parent / target))
-            if any(lexical == tree or tree in lexical.parents for tree, _, _ in trees):
-                record = provider_or_root("/" + str(entry.relative_to(image)), entry.lstat(), "unlink")
+            if any(candidate in removed for candidate in (lexical, *lexical.parents)):
+                record = provider_or_root(name_of(entry), entry.lstat(), "unlink")
                 links.append((entry, dict(record, target=target)))
-    for name in layout["reown"]:
-        path = inside(name)
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            report["absent"].append(name)
-            continue
-        directories.append((path, metadata, provider_or_root(name, metadata, "re-own")))
 
     for entry, record in links:
         entry.unlink()
         report["unlinked"].append(record)
-    for path, metadata, record in trees:
+    groups = {}
+    for path, metadata, count in sorted(removals, key=lambda row: row[0]):
         if stat.S_ISDIR(metadata.st_mode):
             shutil.rmtree(path)
         else:
             path.unlink()
-        report["removed"].append(record)
+        group = name_of(top.joinpath(*path.relative_to(top).parts[:REMOVED_GROUP_LEVELS]))
+        groups[group] = groups.get(group, 0) + count
+        report["removed_entries"] += count
+    report["removed"] = groups
     for path, metadata, record in directories:
         mode = stat.S_IMODE(metadata.st_mode)
         changed = False
@@ -643,8 +696,9 @@ def main():
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
     target_directories()
     accounts()
-    # Before the tool installers write under /usr/local; the root-owned path
-    # check after the service preflight then covers everything the list leaves.
+    # Before the tool installers write under /usr/local, so every entry the
+    # provider's sandbox account owns there is Boat's, never ours; the
+    # root-owned path check after the service preflight then covers the rest.
     base_layout = boat_base_layout()
     home = tool_home()
     run('/usr/bin/python3', str(HERE / 'motor-boat-credentials.py'), '--output', '/srv/build/boat-provider-audit.json')

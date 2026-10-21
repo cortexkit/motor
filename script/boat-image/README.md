@@ -8,7 +8,7 @@ provider's init or sshd binaries. The source checkout must be clean and at the
 exact revision being installed:
 
 ```sh
-sudo python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)" \
+sudo /usr/bin/python3 script/boat-image/install.py --revision "$(git rev-parse HEAD)" \
   --cargo-seed-manifest /secure-input/cargo-seed.json \
   --cargo-seed-archive /secure-input/cargo-seed.tar.gz \
   --cargo-seed-sha256 "$CARGO_SEED_SHA256" --acknowledge-tenant-one-private-cache
@@ -192,17 +192,22 @@ Boat's base image ships `/usr/local` owned by uid 1000, its sandbox account
 (Boat's exec API runs as that account, which has passwordless sudo). Right
 after installing packages, before the tool installers write under `/usr/local`, the recipe
 applies `BOAT_BASE_USR_LOCAL` in `install.py`, recorded as `boat_base_layout` in
-the inventory. It removes Boat's `/usr/local/go`, `/usr/local/rustup` and
-`/usr/local/cargo`, which nothing in the image uses (the runner, endpoint and
-jobs take Rust from `/home/ubuntu/.rustup` and `/srv/build/cargo-home`, the
-build server's manifest names no Go, and no unit or job PATH names those
-directories), together with any symlink directly in a PATH directory that
-points into them. It then re-owns `/usr/local` and the named skeleton directories
-beneath it to root:root with group/other write cleared, one path at a time, never
-recursively. A listed path owned by any uid other than 0 or 1000 refuses the build
-before the step changes any listed path. Anything else a provider image leaves under a root
-executed path is not touched and still fails the root-owned path check by name,
-so extending the list is a deliberate change.
+the inventory. Ubuntu's skeleton (`/usr/local` and the base-files and package
+directories named there) stays and is re-owned to root:root with group/other
+write cleared, one path at a time, never recursively. Every other entry under
+`/usr/local` that uid 1000 owns, at any depth, is removed: Boat's Go, rustup,
+Cargo and Ruby installs, none of which the image uses (the runner, endpoint and
+jobs take Rust from `/home/ubuntu/.rustup` and `/srv/build/cargo-home`, and the
+build server's manifest names no Go or Ruby), together with any symlink directly
+in a PATH directory that points into a removed entry. The walk never follows a
+symlink. The inventory records the removals as counts per path two levels below
+`/usr/local` (`/usr/local/include/ruby-4.0.0: 5`, say). An entry owned by any uid
+other than 0 or 1000 refuses the build before the step changes anything, as does
+a removal that would take the recipe's own interpreter, standard library or
+source checkout, which is why the recipe runs as `/usr/bin/python3`. Root-owned
+entries stay where they are, except inside a removed provider directory or as a
+PATH symlink into one; a remaining root-owned entry that is unsafe still fails
+the root-owned path check by name.
 Before installing the runner toolchains, the recipe creates an absent `/home/ubuntu` as
 root:root 0755. If another account owns it, the recipe refuses and names the
 owner's uid, passwd entry and running processes; it never takes over a
