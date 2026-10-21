@@ -1,4 +1,4 @@
-use super::{check, step, wide, Handle, Plan};
+use super::{check, step, wide, DiagnosticPolicy, Handle, Plan};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -28,6 +28,7 @@ use windows_sys::Win32::{
 };
 
 struct Local(*mut c_void);
+const FETCH_TOKEN_FLAGS: u32 = DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED;
 impl Drop for Local {
     fn drop(&mut self) {
         unsafe {
@@ -398,7 +399,7 @@ struct Desktop {
     name: String,
 }
 impl Desktop {
-    fn new(logon_sid: &str) -> io::Result<Self> {
+    fn new(logon_sid: &str, explicit_writes: bool) -> io::Result<Self> {
         let name = format!("MotorPrep-{}", uuid::Uuid::now_v7().simple());
         let station_name = wide(&name);
         let desktop_name = wide("Fetch");
@@ -469,8 +470,16 @@ impl Desktop {
         }
         // The creator retains its management handles; only this logon session
         // receives access by name. Never grant access to the service's desktop.
-        let final_acl = descriptor(&format!("O:SYG:SYD:P(A;;GA;;;{logon_sid})"))?;
-        for object in [result.station, result.desktop] {
+        for (object, mask) in [
+            (result.station, 0x000f_037fu32),
+            (result.desktop, 0x000f_01ffu32),
+        ] {
+            let extra = if explicit_writes {
+                format!("(A;;0x{mask:08X};;;{logon_sid})")
+            } else {
+                String::new()
+            };
+            let final_acl = descriptor(&format!("O:SYG:SYD:P(A;;GA;;;{logon_sid}){extra}"))?;
             check("private-desktop-dacl", unsafe {
                 SetUserObjectSecurity(object, &DACL_SECURITY_INFORMATION, final_acl.0)
             })?;
@@ -584,24 +593,37 @@ impl Session {
             ConvertStringSidToSidW(wide(&logon_sid).as_ptr(), &mut sid)
         })?;
         let sid = Local(sid);
+        let mut everyone = null_mut();
+        if plan.diagnostic_policy == DiagnosticPolicy::Everyone {
+            check("diagnostic-everyone-sid", unsafe {
+                ConvertStringSidToSidW(wide("S-1-1-0").as_ptr(), &mut everyone)
+            })?;
+        }
+        let everyone = Local(everyone);
         let restricted = if plan.restricted {
-            let restriction = SID_AND_ATTRIBUTES {
+            let mut restrictions = vec![SID_AND_ATTRIBUTES {
                 Sid: sid.0,
                 Attributes: 0,
-            };
+            }];
+            if !everyone.0.is_null() {
+                restrictions.push(SID_AND_ATTRIBUTES {
+                    Sid: everyone.0,
+                    Attributes: 0,
+                });
+            }
             let mut result = null_mut();
             // Unlike the User SID, this logon SID has no write grants on the
             // profile or shared host temp. Only the staging grant below enables it.
             check("CreateRestrictedToken", unsafe {
                 CreateRestrictedToken(
                     profile.token.0,
-                    DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+                    FETCH_TOKEN_FLAGS,
                     0,
                     null(),
                     0,
                     null(),
-                    1,
-                    &restriction,
+                    restrictions.len() as u32,
+                    restrictions.as_ptr(),
                     &mut result,
                 )
             })?;
@@ -609,7 +631,10 @@ impl Session {
         } else {
             None
         };
-        let desktop = Desktop::new(&logon_sid)?;
+        let desktop = Desktop::new(
+            &logon_sid,
+            plan.diagnostic_policy == DiagnosticPolicy::ExplicitDesktopWrites,
+        )?;
         let temp = plan.cwd.join("fetch-temp");
         no_reparse(&plan.root, &temp)?;
         let grant = StagingGrant::new(&temp, sid.0)?;
@@ -684,7 +709,12 @@ impl Session {
         );
         env.insert("RUSTC_WRAPPER".into(), String::new());
         env.insert("CARGO_BUILD_RUSTC_WRAPPER".into(), String::new());
+        let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let info = json!({"user_sid":user_sid, "logon_sid":logon_sid, "restricting_sid":if plan.restricted { Some(logon_sid.clone()) } else { None },
+            "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else { 0 })?,
+            "window_station_readback":{"name":object_name(desktop.station)?, "dacl":object_dacl(desktop.station)?},
+            "desktop_readback":{"name":object_name(desktop.desktop)?, "dacl":object_dacl(desktop.desktop)?},
+            "diagnostic_policy":plan.diagnostic_policy,
             "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":"medium",
             "desktop_dacl":format!("D:P(A;;GA;;;{logon_sid})"), "profile_loaded":true, "user_environment_block":true,
             "environment_keys":env.keys().collect::<Vec<_>>(), "temp":env["TEMP"], "tmp":env["TMP"], "userprofile":env["USERPROFILE"]});
@@ -897,4 +927,92 @@ pub(super) fn read_private_plan(path: &Path) -> io::Result<Vec<u8>> {
         return Err(step("private-plan-path", "launch plan exceeds size limit"));
     }
     Ok(bytes)
+}
+
+fn token_details(token: HANDLE, requested_flags: u32) -> io::Result<Value> {
+    let restrictions = token_info(token, TokenRestrictedSids)?;
+    let count = unsafe { *restrictions.as_ptr().cast::<u32>() } as usize;
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if count > 0 && offset + count * size_of::<SID_AND_ATTRIBUTES>() > restrictions.len() * 8 {
+        return Err(step("diagnostic-token", "invalid restricted SID array"));
+    }
+    let mut sids = Vec::new();
+    let mut entries = Vec::new();
+    for index in 0..count {
+        let group = unsafe {
+            &*restrictions
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<SID_AND_ATTRIBUTES>()
+                .add(index)
+        };
+        let sid = sid_string(group.Sid)?;
+        entries.push(json!({"sid":sid, "attributes_hex":format!("0x{:08X}", group.Attributes)}));
+        sids.push(sid);
+    }
+    let integrity = token_info(token, TokenIntegrityLevel)?;
+    let integrity = sid_string(unsafe {
+        (*(integrity.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()))
+            .Label
+            .Sid
+    })?;
+    let rid = integrity
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let name = match rid {
+        0 => "untrusted",
+        4096 => "low",
+        8192 => "medium",
+        12288 => "high",
+        16384 => "system",
+        _ => "other",
+    };
+    let session = token_info(token, TokenSessionId)?;
+    Ok(
+        json!({"requested_flags":requested_flags, "requested_flags_hex":format!("0x{requested_flags:08X}"),
+        "write_restricted_requested":requested_flags & WRITE_RESTRICTED != 0,
+        "is_token_restricted":unsafe { IsTokenRestricted(token) } != 0,
+        "restricting_sids":sids, "restricted_sid_entries":entries,
+        "integrity_sid":integrity, "integrity_level":name, "session_id":unsafe { *session.as_ptr().cast::<u32>() }}),
+    )
+}
+
+fn object_dacl(object: HANDLE) -> io::Result<Value> {
+    let mut dacl = null_mut();
+    let mut security = null_mut();
+    win32_code("diagnostic-ui-dacl", unsafe {
+        GetSecurityInfo(
+            object,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut security,
+        )
+    })?;
+    let _security = Local(security);
+    if dacl.is_null() {
+        return Ok(json!({"null_dacl":true}));
+    }
+    let mut entries = Vec::new();
+    for index in 0..unsafe { (*dacl).AceCount } {
+        let mut pointer = null_mut();
+        check("diagnostic-ui-dacl", unsafe {
+            GetAce(dacl, index as u32, &mut pointer)
+        })?;
+        let ace = unsafe { &*pointer.cast::<ACCESS_ALLOWED_ACE>() };
+        if ace.Header.AceType <= 1 {
+            entries.push(json!({"ace_type":ace.Header.AceType,
+                "sid":sid_string((&raw const ace.SidStart).cast_mut().cast())?,
+                "rights_hex":format!("0x{:08X}", ace.Mask), "generic_all":ace.Mask & 0x1000_0000 != 0}));
+        } else {
+            entries.push(json!({"ace_type":ace.Header.AceType, "unsupported_ace":true}));
+        }
+    }
+    Ok(json!({"null_dacl":false, "entries":entries}))
 }

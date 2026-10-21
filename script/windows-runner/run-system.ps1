@@ -1,5 +1,6 @@
 # Run qualification as SYSTEM without a Rust toolchain or SYSTEM rustup profile.
 param([string]$Root = 'C:\ProgramData\MotorRunner', [Parameter(Mandatory)][string]$Python,
+      [switch]$PrepLaunchMatrix,
       [string]$Evidence = ('C:\motor-runner-evidence\' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -10,9 +11,10 @@ New-Item -ItemType Directory -Path $Evidence -Force | Out-Null
 & icacls.exe $Evidence /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot protect evidence directory' }
 $wrapper = "$Evidence\run.cmd"
+$diagnosticArgument = if ($PrepLaunchMatrix) { ' -PrepLaunchMatrix' } else { '' }
 @"
 @echo off
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$Root\bin\qualify.ps1" -Python "$Python" -Evidence "$Evidence" > "$Evidence\qualification.log" 2>&1
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$Root\bin\qualify.ps1" -Python "$Python" -Evidence "$Evidence"$diagnosticArgument > "$Evidence\qualification.log" 2>&1
 >"$Evidence\exit.txt" echo %errorlevel%
 "@ | Set-Content $wrapper -Encoding ascii
 $name = 'MotorRunnerQualification-' + [Guid]::NewGuid().ToString()
@@ -29,5 +31,6 @@ try {
     $code = [int](Get-Content "$Evidence\exit.txt" -Raw).Trim()
     Get-Content "$Evidence\qualification.log" | Out-Host
     if ($code -ne 0) { throw "Qualification failed exit=$code; return the complete $Evidence directory" }
-    Write-Host "PASS qualification completed; return the complete $Evidence directory before fleet enablement"
+    if ($PrepLaunchMatrix) { Write-Host "DIAGNOSTIC matrix collected; return $Evidence; this is not a qualification pass" }
+    else { Write-Host "PASS qualification completed; return the complete $Evidence directory before fleet enablement" }
 } finally { Unregister-ScheduledTask $name -Confirm:$false -ErrorAction SilentlyContinue }

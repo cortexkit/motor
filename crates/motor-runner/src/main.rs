@@ -87,6 +87,8 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
         #[cfg(windows)]
+        "qualify-prep-matrix" => motor_runner::hyperv_qualify_prep_matrix(config),
+        #[cfg(windows)]
         "qualify-prep" => {
             let runner = Runner::open(config)?;
             motor_runner::hyperv_qualify_prep(runner.config())?;

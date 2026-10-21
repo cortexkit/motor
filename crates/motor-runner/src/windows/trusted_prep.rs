@@ -457,3 +457,169 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
         .extend(context.as_object().unwrap().clone());
     fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
 }
+
+/// Diagnostic collection only: failed cells are retained, never treated as a
+/// successful preparation or permission-policy qualification.
+pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+    launch::require_system()?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(io::Error::other)?;
+    let status = manager
+        .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
+        .and_then(|service| service.query_status())
+        .map_err(io::Error::other)?;
+    if status.current_state != ServiceState::Stopped {
+        return Err(invalid(
+            "Stop MotorRunner before the trusted-fetch diagnostic matrix",
+        ));
+    }
+    let runner = crate::Runner::open(config)?;
+    let config = runner.config();
+    let vm = config.windows.as_ref().unwrap();
+    let root = &vm.layout_root;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("prep.lock"))?;
+    lock.lock_exclusive()?;
+    let id = Uuid::now_v7();
+    let stage = root.join("staging").join(id.to_string());
+    fs::create_dir_all(stage.join("fetch-manifests"))?;
+    fs::create_dir_all(stage.join("fetch-temp"))?;
+    fs::create_dir_all(config.state_dir().join("prep-cargo"))?;
+    let probe = stage.join("fetch-manifests/probe.exe");
+    fs::copy(std::env::current_exe()?, &probe)?;
+    let cargo = root.join("prep-toolchain/bin/cargo.exe");
+    if format!("{:x}", Sha256::digest(fs::read(&cargo)?))
+        != vm.prep_cargo_sha256.to_ascii_lowercase()
+    {
+        return Err(invalid("matrix cargo SHA-256 mismatch"));
+    }
+    let rustc = root.join("prep-toolchain/bin/rustc.exe");
+    let outside = PathBuf::from(r"C:\Windows\Temp").join(format!("motor-prep-matrix-{id}.txt"));
+    let report_path = root
+        .join("evidence")
+        .join(format!("prep-launch-matrix-{id}.json"));
+    let mut cells = Vec::new();
+    let mut deferred_cleanup = false;
+    let result = (|| {
+        super::vm::checked(super::vm::control(
+            config,
+            "GrantPrep",
+            None,
+            &["-Staging".into(), stage.to_string_lossy().into()],
+        )?)?;
+        use launch::DiagnosticPolicy::{Everyone, ExplicitDesktopWrites, None as Production};
+        for (index, name, program, restricted, policy) in [
+            (1, "probe-base", &probe, false, Production),
+            (2, "probe-write-restricted", &probe, true, Production),
+            (3, "cargo-version-base", &cargo, false, Production),
+            (
+                4,
+                "cargo-version-write-restricted",
+                &cargo,
+                true,
+                Production,
+            ),
+            (
+                5,
+                "rustc-version-write-restricted",
+                &rustc,
+                true,
+                Production,
+            ),
+            (
+                6,
+                "cargo-version-logon-and-everyone-diagnostic-only",
+                &cargo,
+                true,
+                Everyone,
+            ),
+            (
+                7,
+                "cargo-version-explicit-desktop-write-mask-diagnostic-only",
+                &cargo,
+                true,
+                ExplicitDesktopWrites,
+            ),
+        ] {
+            let mut command = Command::new(program);
+            command.env_clear().env("SYSTEMROOT", r"C:\Windows").env(
+                "CARGO_HOME",
+                stage.join(format!("fetch-temp/cargo-{index}")),
+            );
+            if index <= 2 {
+                command
+                    .arg("prep-probe")
+                    .arg(if restricted {
+                        "restricted"
+                    } else {
+                        "base-control"
+                    })
+                    .arg(root.join("prep-secret.dpapi"))
+                    .arg(&outside)
+                    .arg(stage.join(format!("fetch-temp/matrix-probe-{index}.json")));
+            } else {
+                command.arg("--version");
+            }
+            let outcome = launch::diagnostic(config, &command, &stage, restricted, policy);
+            let report = match outcome {
+                Ok(report) => report,
+                Err(error) => {
+                    serde_json::json!({"phase":"diagnostic-launch-error", "error":error.to_string()})
+                }
+            };
+            eprintln!(
+                "DIAG trusted-fetch-matrix cell={index} name={name} exit={} token={} desktop={}",
+                report["exit_status"].as_str().unwrap_or("not-created"),
+                report["launch"]["token"],
+                report["launch"]["lp_desktop"]
+            );
+            let deferred = report.get("cleanup_deferred").is_some();
+            cells.push(serde_json::json!({"cell":index,"name":name,"diagnostic_policy":policy,"report":report,
+                "note":if index == 7 { "Production already grants logon SID GENERIC_ALL; this repeats with explicit full write masks to test mapping, not a new principal" } else { "" }}));
+            launch::write_diagnostic_update(
+                &report_path,
+                &serde_json::json!({"diagnostic_only":true,"production_policy_unchanged":true,"cells":cells}),
+            )?;
+            if deferred {
+                deferred_cleanup = true;
+                return Err(invalid(
+                    "matrix stopped after an unreaped child; preserve launch reports",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    let revoke = super::vm::checked(super::vm::control(
+        config,
+        "RevokePrep",
+        None,
+        &["-Staging".into(), stage.to_string_lossy().into()],
+    )?);
+    if outside.exists() {
+        let _ = fs::remove_file(&outside);
+    }
+    let cleanup = if deferred_cleanup {
+        Ok(())
+    } else {
+        remove_staging(config, &stage)
+    };
+    result?;
+    revoke?;
+    cleanup?;
+    println!(
+        "DIAG trusted-fetch-matrix collected {} cells; report={}; this is not a qualification pass",
+        cells.len(),
+        report_path.display()
+    );
+    Ok(())
+}

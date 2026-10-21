@@ -105,6 +105,42 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn('"profile_loaded"', self.launch)
         self.assertCodeIn('"exit_status"', self.launch)
 
+    def test_matrix_variants_are_opt_in_and_only_allow_cargo_version(self):
+        self.assertCodeIn("DiagnosticPolicy::None, false", self.launch)
+        self.assertCodeIn('plan.args != ["--version"]', self.launch)
+        self.assertCodeIn('plan.root.join("prep-toolchain/bin/cargo.exe")', self.launch)
+        self.assertCodeIn("plan.diagnostic_policy == DiagnosticPolicy::Everyone", self.session)
+        self.assertCodeIn('wide("S-1-1-0")', self.session)
+        self.assertCodeIn("plan.diagnostic_policy == DiagnosticPolicy::ExplicitDesktopWrites", self.session)
+        self.assertCodeIn("<no child stderr>", self.launch)
+
+    def test_matrix_reads_actual_token_and_ui_permissions_for_seven_cells(self):
+        details = self.session.split("fn token_details(", 1)[1].split("fn object_dacl(", 1)[0]
+        for symbol in ("TokenRestrictedSids", "IsTokenRestricted(token)", "TokenIntegrityLevel", "TokenSessionId"):
+            self.assertCodeIn(symbol, details)
+        self.assertCodeIn("token_details(actual_token", self.session)
+        for symbol in ("object_dacl(desktop.station)", "object_dacl(desktop.desktop)"):
+            self.assertCodeIn(symbol, self.session)
+        dacl = self.session.split("fn object_dacl(", 1)[1]
+        self.assertCodeIn("GetSecurityInfo", dacl)
+        self.assertCodeIn("GetAce", dacl)
+        self.assertCodeIn("ace.Mask", dacl)
+        for name in ("probe-base", "probe-write-restricted", "cargo-version-base", "cargo-version-write-restricted", "rustc-version-write-restricted", "cargo-version-logon-and-everyone-diagnostic-only", "cargo-version-explicit-desktop-write-mask-diagnostic-only"):
+            self.assertCodeIn(name, self.prep)
+        self.assertCodeIn("launch::diagnostic(config, &command", self.prep)
+        self.assertCodeIn("production_policy_unchanged", self.prep)
+
+    def test_matrix_system_wrapper_returns_before_full_qualification(self):
+        wrapper = (HERE / "run-system.ps1").read_text()
+        qualify = (HERE / "qualify.ps1").read_text()
+        self.assertCodeIn("[switch]$PrepLaunchMatrix", wrapper)
+        self.assertCodeIn("if ($PrepLaunchMatrix)", qualify)
+        matrix = qualify.split("if ($PrepLaunchMatrix)", 1)[1].split('$parent = "$Root', 1)[0]
+        self.assertCodeIn("Runner-Check 'qualify-prep-matrix'", matrix)
+        self.assertCodeIn("Copy-QualificationEvidence", matrix)
+        self.assertCodeIn("return", matrix)
+        self.assertNotIn("Get-FileHash", matrix)
+
 
 if __name__ == "__main__":
     unittest.main()

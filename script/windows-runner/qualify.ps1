@@ -1,5 +1,5 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = 'C:\ProgramData\MotorRunner'
@@ -37,6 +37,14 @@ function Copy-QualificationEvidence {
     New-Item -ItemType Directory -Path "$Evidence\host-evidence" -Force | Out-Null
     Get-ChildItem -LiteralPath "$Root\evidence" -Force | Copy-Item -Destination "$Evidence\host-evidence" -Recurse -Force -ErrorAction Stop
     Copy-Item -LiteralPath "$Root\vm.toml" -Destination "$Evidence\vm.toml" -Force -ErrorAction Stop
+}
+if ($PrepLaunchMatrix) {
+    $service = Get-Service MotorRunner
+    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
+    try { $null = Runner-Check 'qualify-prep-matrix' } finally {
+        try { Copy-QualificationEvidence } catch { Write-Warning "Matrix evidence copy failed: $_" -WarningAction Continue }
+    }
+    return
 }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 $parentHash = (Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash

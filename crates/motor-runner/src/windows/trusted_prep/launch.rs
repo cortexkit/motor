@@ -14,6 +14,15 @@ use std::{
 mod process;
 mod session;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DiagnosticPolicy {
+    #[default]
+    None,
+    Everyone,
+    ExplicitDesktopWrites,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
@@ -26,6 +35,8 @@ struct Plan {
     report: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
+    #[serde(default)]
+    diagnostic_policy: DiagnosticPolicy,
 }
 
 fn step(name: &str, error: impl std::fmt::Display) -> io::Error {
@@ -63,6 +74,34 @@ pub(super) fn run(
     cwd: &Path,
     restricted: bool,
 ) -> io::Result<Value> {
+    run_plan(
+        config,
+        command,
+        cwd,
+        restricted,
+        DiagnosticPolicy::None,
+        false,
+    )
+}
+
+pub(super) fn diagnostic(
+    config: &Config,
+    command: &Command,
+    cwd: &Path,
+    restricted: bool,
+    policy: DiagnosticPolicy,
+) -> io::Result<Value> {
+    run_plan(config, command, cwd, restricted, policy, true)
+}
+
+fn run_plan(
+    config: &Config,
+    command: &Command,
+    cwd: &Path,
+    restricted: bool,
+    policy: DiagnosticPolicy,
+    retain_failure: bool,
+) -> io::Result<Value> {
     let root = &config.windows.as_ref().unwrap().layout_root;
     let id = uuid::Uuid::now_v7();
     let directory = root.join("state/prep-launch");
@@ -94,6 +133,7 @@ pub(super) fn run(
             })
             .collect(),
         restricted,
+        diagnostic_policy: policy,
         report: root.join("evidence").join(format!("prep-launch-{id}.json")),
         stdout: cwd.join("fetch-temp").join(format!("{id}.stdout")),
         stderr: cwd.join("fetch-temp").join(format!("{id}.stderr")),
@@ -118,6 +158,19 @@ pub(super) fn run(
         crate::native_process::output_with_timeout(&mut broker, Duration::from_secs(720), || {
             false
         })?;
+    if retain_failure {
+        let mut report: Value = fs::read(&plan.report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| json!({"phase":"broker-failed-before-report"}));
+        report["launch_report"] = json!(plan.report);
+        report["broker_exit"] = json!(output
+            .status
+            .code()
+            .map(|code| process_status::describe(code as u32)));
+        report["broker_stderr"] = json!(String::from_utf8_lossy(&output.stderr));
+        return Ok(report);
+    }
     if !output.status.success() {
         return Err(step(
             "broker",
@@ -160,6 +213,18 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         ));
     }
     session::no_reparse(&plan.root, &plan.cwd)?;
+    // Broader restricting-SID and explicit-rights controls are diagnostic-only
+    // and can run only the pinned Cargo executable's harmless version command.
+    if plan.diagnostic_policy != DiagnosticPolicy::None
+        && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
+            || plan.args != ["--version"]
+            || !plan.restricted)
+    {
+        return Err(step(
+            "diagnostic-policy",
+            "controls are limited to restricted cargo --version",
+        ));
+    }
     let mut report = json!({"phase":"session-setup", "program":plan.program, "arguments":plan.args,
         "restricted":plan.restricted, "cwd":plan.cwd, "profile_loaded":false,
         "inherit_handles":"explicit stdin/stdout/stderr allow-list only", "active_process_limit":32,
@@ -211,9 +276,14 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             return Err(step(
                 "child-exit",
                 format!(
-                    "Windows trusted cargo fetch exited {}; diagnostics: {}",
+                    "Windows trusted cargo fetch exited {}; diagnostics: {}; token={} desktop={}",
                     process_status::describe(code),
-                    report["stderr"].as_str().unwrap_or("")
+                    report["stderr"]
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or("<no child stderr>"),
+                    report["launch"]["token"],
+                    report["launch"]["lp_desktop"]
                 ),
             ));
         }
@@ -249,4 +319,14 @@ pub(super) fn check_target(root: &Path, path: &Path) -> io::Result<()> {
             .ok_or_else(|| step("cache-target", "missing ancestor"))?;
     }
     session::no_reparse(root, existing)
+}
+pub(super) fn write_diagnostic_update(path: &Path, value: &Value) -> io::Result<()> {
+    session::write_private(
+        path,
+        &serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
+        false,
+    )
+}
+pub(super) fn require_system() -> io::Result<()> {
+    session::require_system()
 }

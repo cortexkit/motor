@@ -116,6 +116,16 @@ The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enable
 a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;
 qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
+For a pre-main trusted-fetch failure, collect only the launch matrix with
+`run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
+This stops MotorRunner and runs seven probe/Cargo/rustc token comparisons without
+VM qualification. It records requested token flags separately from actual
+`IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
+The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
+restricted to pinned `cargo --version`; production continues to use flags `0x9`
+and only the logon SID. Matrix completion is evidence collection, not a pass or
+permission to enable fleet routing. Leave the service stopped for evidence review.
+
 Peer qualification starts the victim alone and records its VM-matched Hyper-V
 Worker/Admin OS-boot event 18601, then waits at least 20 seconds before starting
 the attacker. There is deliberately no readiness dial: the unchanged guest agent
