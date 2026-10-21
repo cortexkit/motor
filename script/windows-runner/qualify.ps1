@@ -33,9 +33,10 @@ try {
     $match = [regex]::Match($disconnect, 'job=([0-9a-f-]{36}) announced=(\d+) written=(\d+)')
     if (-not $match.Success -or [int]$match.Groups[3].Value -ge [int]$match.Groups[2].Value) { throw 'Disconnect did not stop in the middle of an announced agent frame' }
     $disconnectLog = "$Root\evidence\$($match.Groups[1].Value)-guest\hyperv-agent.log"
-    $written = [regex]::Escape($match.Groups[3].Value)
-    if ((Get-Content $disconnectLog -Raw) -notmatch "io read done bytes=0 total=$written(?:\D|$)") { throw 'Guest did not observe the deliberately truncated frame and EOF with the same byte count' }
-    Write-Host 'PASS mid-frame-guest-observed-EOF-and-exact-partial-byte-count'
+    if (-not (Test-Path -LiteralPath $disconnectLog)) { throw 'Verified guest disconnect log is missing' }
+    $proofs = @(Get-Content "$Root\evidence\$($match.Groups[1].Value)-qualification.jsonl" -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq 'guest-terminal-read-verified')
+    if ($proofs.Count -ne 1 -or $proofs[0].detail.read_total -ne [int]$match.Groups[3].Value -or $proofs[0].detail.written -ne [int]$match.Groups[3].Value -or $proofs[0].detail.announced -ne [int]$match.Groups[2].Value -or $proofs[0].detail.termination -notin @('clean-eof','reader-aborted-10053','reader-reset-10054') -or -not $proofs[0].detail.no_frame_processed -or $proofs[0].detail.successful_reply_bytes_after_partial -ne 0) { throw 'Guest did not prove exact partial read, terminal disconnect and no processed frame/reply' }
+    Write-Host 'PASS mid-frame-guest-observed-terminal-disconnect-and-exact-partial-byte-count-no-frame-processed'
     # Two VMs are used only for peer rejection, not as a two-job throughput claim.
     # The attacker gets 2 GiB; fleet job concurrency remains exactly one.
     $victim = [Guid]::NewGuid().ToString()

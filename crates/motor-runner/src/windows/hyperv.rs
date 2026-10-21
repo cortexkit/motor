@@ -216,6 +216,7 @@ fn verify_qualification_guest(
     config: &Config,
     id: Uuid,
     nonce: &str,
+    announced: usize,
     written: usize,
     dropped: std::time::Instant,
 ) -> io::Result<()> {
@@ -226,15 +227,16 @@ fn verify_qualification_guest(
         .layout_root
         .join(format!("evidence/{id}-guest"));
     let log = fs::read_to_string(evidence.join("hyperv-agent.log"));
-    let matches = log
+    let termination = log
         .as_ref()
-        .is_ok_and(|text| super::agent::qualification_eof_matches(text, nonce, written));
+        .ok()
+        .and_then(|text| super::agent::qualification_disconnect_proof(text, nonce, written));
     qualification_event(
         config,
         id,
         "offline-agent-log-observed",
         serde_json::json!({
-            "since_drop_ms":dropped.elapsed().as_millis() as u64,"present":log.is_ok(),"current_nonce_eof_count_matches":matches,
+            "since_drop_ms":dropped.elapsed().as_millis() as u64,"present":log.is_ok(),"current_nonce_terminal_read_matches":termination.is_some(),"termination":termination,
             "observation":"first-safe-host-observation-after-power-off-not-guest-write-time",
             "error":log.as_ref().err().map(ToString::to_string)
         }),
@@ -255,10 +257,21 @@ fn verify_qualification_guest(
             )));
         }
     }
-    if !matches {
-        return Err(invalid("Guest EOF/read-count proof missing after bounded qualification settle; inspect guest evidence"));
+    let Some(termination) = termination else {
+        return Err(invalid("Guest terminal-read/read-count or no-frame-processing proof missing after bounded qualification window; inspect guest evidence"));
+    };
+    if written == 0 || written >= announced {
+        return Err(invalid("Qualification frame was not partial"));
     }
-    Ok(())
+    qualification_event(
+        config,
+        id,
+        "guest-terminal-read-verified",
+        serde_json::json!({
+            "nonce":nonce,"announced":announced,"written":written,"read_total":written,
+            "termination":termination,"no_frame_processed":true,"successful_reply_bytes_after_partial":0
+        }),
+    )
 }
 
 pub(crate) struct Resources {
@@ -547,7 +560,7 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
     qualification_event(config, id, "stream-dropped", serde_json::json!({}))?;
     qualification_settle(config, id, worker_pid, dropped)?;
     resources.finalize()?;
-    verify_qualification_guest(config, id, &nonce, written, dropped)?;
+    verify_qualification_guest(config, id, &nonce, frame.len(), written, dropped)?;
     let cache = config.windows.as_ref().unwrap().caches().disk(workspace);
     if cache.exists() || cache.with_extension("attached").exists() {
         return Err(invalid("disconnect left a dirty cache"));

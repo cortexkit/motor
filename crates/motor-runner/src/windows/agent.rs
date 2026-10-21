@@ -120,20 +120,86 @@ pub(super) fn qualification_json(bytes: &[u8], source: &str) -> io::Result<serde
     })
 }
 #[cfg(any(windows, test))]
-pub(super) fn qualification_eof_matches(log: &str, nonce: &str, written: usize) -> bool {
-    let Some((_, episode)) = log.rsplit_once(&format!("boot nonce={nonce}")) else {
-        return false;
-    };
-    episode.lines().any(|line| {
-        let Some((_, total)) = line.split_once("io read done bytes=0 total=") else {
-            return false;
-        };
-        total
+pub(super) fn qualification_disconnect_proof(
+    log: &str,
+    nonce: &str,
+    written: usize,
+) -> Option<&'static str> {
+    fn number(line: &str, marker: &str) -> Option<usize> {
+        line.split_once(marker)?
+            .1
             .split_whitespace()
-            .next()
-            .and_then(|n| n.parse::<usize>().ok())
-            == Some(written)
-    })
+            .next()?
+            .parse()
+            .ok()
+    }
+    let (_, episode) = log.rsplit_once(&format!("boot nonce={nonce}"))?;
+    let mut total = 0usize;
+    let mut last_success = None;
+    let mut pending_read = None;
+    let mut inbound_started = false;
+    let mut terminal = None;
+    for line in episode.lines() {
+        if line.contains("reader frame ")
+            || line.contains("reader unexpected host frame")
+            || line.contains("staging ReceiveTree")
+            || line.contains("staging TreeReceived sent")
+        {
+            return None;
+        }
+        if inbound_started
+            && line.contains("io write done bytes=")
+            && number(line, "io write done bytes=")? > 0
+        {
+            return None;
+        }
+        if line.contains("io read start requested=") {
+            let requested = number(line, "io read start requested=")?;
+            if terminal.is_some() || pending_read.is_some() || requested == 0 {
+                return None;
+            }
+            pending_read = Some(requested);
+        } else if line.contains("io read done bytes=") {
+            if terminal.is_some() {
+                return None;
+            }
+            let requested = pending_read.take()?;
+            let bytes = number(line, "io read done bytes=")?;
+            let observed = number(line, " total=")?;
+            if bytes > requested || total.checked_add(bytes)? != observed || observed > written {
+                return None;
+            }
+            total = observed;
+            if bytes == 0 {
+                if last_success != Some(written) || total != written {
+                    return None;
+                }
+                terminal = Some("clean-eof");
+            } else {
+                inbound_started = true;
+                last_success = Some(total);
+            }
+        } else if line.contains("reader error:") {
+            if terminal == Some("clean-eof") {
+                continue;
+            }
+            if terminal.is_some()
+                || pending_read.take().is_none()
+                || last_success != Some(written)
+                || total != written
+            {
+                return None;
+            }
+            terminal = if line.contains("(os error 10053)") {
+                Some("reader-aborted-10053")
+            } else if line.contains("(os error 10054)") {
+                Some("reader-reset-10054")
+            } else {
+                return None;
+            };
+        }
+    }
+    terminal
 }
 struct Registration {
     runtime: Arc<Runtime>,
@@ -869,14 +935,77 @@ mod tests {
     }
 
     #[test]
-    fn qualification_eof_proof_belongs_to_current_nonce_and_exact_count() {
-        let old = "boot nonce=old\nio read done bytes=0 total=98322\n";
-        assert!(!qualification_eof_matches(old, "current", 98322));
-        let current = format!("{old}boot nonce=current\nio read done bytes=0 total=983220\n");
-        assert!(!qualification_eof_matches(&current, "current", 98322));
-        let good = format!("{current}io read done bytes=0 total=98322\n");
-        assert!(qualification_eof_matches(&good, "current", 98322));
-        assert!(!qualification_eof_matches(&good, "current", 98323));
+    fn qualification_disconnect_accepts_clean_eof_and_exact_terminal_reader_errors() {
+        let prefix = "boot nonce=current\nio write done bytes=4 total=4\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        let eof = format!(
+            "{prefix}io read done bytes=0 total=98322\nreader error: failed to fill whole buffer\n"
+        );
+        assert_eq!(
+            qualification_disconnect_proof(&eof, "current", 98322),
+            Some("clean-eof")
+        );
+        let observed = "boot nonce=current\nio read start requested=196645\nio read done bytes=98304 total=98304\nio read start requested=98341\nio read done bytes=18 total=98322\nio read start requested=98323\nreader error: connection aborted (os error 10053)\nio write start requested=4\nio write start requested=4\nservice result: Err(Os { code: 10054 })\n";
+        assert_eq!(
+            qualification_disconnect_proof(observed, "current", 98322),
+            Some("reader-aborted-10053")
+        );
+        for (code, kind) in [
+            (10053, "reader-aborted-10053"),
+            (10054, "reader-reset-10054"),
+        ] {
+            let reset = format!("{prefix}reader error: socket ended (os error {code})\nio write start requested=4\nservice result: Err(Os {{ code: 10054 }})\n");
+            assert_eq!(
+                qualification_disconnect_proof(&reset, "current", 98322),
+                Some(kind)
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_disconnect_rejects_wrong_counts_nonce_or_unobserved_read_end() {
+        let prefix = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        let good = format!("{prefix}reader error: ended (os error 10053)\n");
+        assert!(qualification_disconnect_proof(&good, "old", 98322).is_none());
+        assert!(qualification_disconnect_proof(&good, "current", 98321).is_none());
+        assert!(qualification_disconnect_proof(&good, "current", 98323).is_none());
+        assert!(qualification_disconnect_proof(
+            &format!("{prefix}reader error: ended (os error 10060)\n"),
+            "current",
+            98322
+        )
+        .is_none());
+        assert!(qualification_disconnect_proof(
+            &format!("{prefix}service result: Err(Os {{ code: 10054 }})\n"),
+            "current",
+            98322
+        )
+        .is_none());
+        let no_next = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nreader error: ended (os error 10053)\n";
+        assert!(qualification_disconnect_proof(no_next, "current", 98322).is_none());
+    }
+
+    #[test]
+    fn qualification_disconnect_rejects_partial_frame_processing_or_successful_reply() {
+        let prefix = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        for forbidden in [
+            "reader frame ReceiveTree bytes=65536",
+            "staging ReceiveTree bytes=65536",
+            "staging TreeReceived sent",
+            "io write done bytes=4 total=278",
+        ] {
+            let bad = format!("{prefix}{forbidden}\nreader error: ended (os error 10053)\n");
+            assert!(
+                qualification_disconnect_proof(&bad, "current", 98322).is_none(),
+                "{forbidden}"
+            );
+            let after = format!("{prefix}reader error: ended (os error 10053)\n{forbidden}\n");
+            assert!(
+                qualification_disconnect_proof(&after, "current", 98322).is_none(),
+                "post-terminal {forbidden}"
+            );
+        }
+        let extra_read = format!("{prefix}reader error: ended (os error 10053)\nio read start requested=1\nio read done bytes=1 total=98323\n");
+        assert!(qualification_disconnect_proof(&extra_read, "current", 98322).is_none());
     }
 
     fn running_transport(stream: UnixStream, control: Arc<Control>) -> Transport {

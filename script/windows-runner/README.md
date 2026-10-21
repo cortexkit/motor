@@ -96,8 +96,13 @@ The VM worker's process counters are not per-disk durability and do not shorten
 that window: a quiet process can still have guest/kernel storage work pending. No
 running guest filesystem is mounted. The first safe log observation is recorded
 after power-off relative to stream drop, not claimed as the guest's write time.
-The exact EOF/read-count assertion remains required and is bound to the current
-nonce. Production does not wait on or depend on guest log persistence.
+The exact terminal-read/read-count assertion remains required and is bound to the
+current nonce: the final successful read total must equal the host's partial write,
+and the next read must end as zero-byte EOF or terminal hvsock10053/10054. No partial
+frame may be processed and no successful reply bytes may follow its reception.
+The host deliberately closes both directions rather than promising an SD_SEND
+half-close; failed write attempts after that close are not successful replies.
+Production does not wait on or depend on guest log persistence.
 The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enables
 `hyperv-hvsock` and `hyperv-spike`); that profile logs on every boot, not only when
 a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;

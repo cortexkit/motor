@@ -28,8 +28,9 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("GetProcessIoCounters", native)
         settle = native.split("fn qualification_settle(", 1)[1].split("fn verify_qualification_guest(", 1)[0]
         self.assertNotIn("break;", settle)
-        self.assertLess(native.index("qualification_settle(config, id, worker_pid, dropped)?"), native.index("verify_qualification_guest(config, id, &nonce, written, dropped)?"))
-        self.assertIn("super::agent::qualification_eof_matches", native)
+        self.assertLess(native.index("qualification_settle(config, id, worker_pid, dropped)?"), native.index("verify_qualification_guest(config, id, &nonce, frame.len(), written, dropped)?"))
+        self.assertIn("super::agent::qualification_disconnect_proof", native)
+        self.assertIn("guest-terminal-read-verified", native)
         self.assertIn("first-safe-host-observation-after-power-off-not-guest-write-time", native)
 
     def test_peer_targets_avoid_powershell_51_array_serialization(self):
