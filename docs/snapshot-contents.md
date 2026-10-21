@@ -187,6 +187,17 @@ Not covered by a test in this repository.
 side has (`have` / `have_reply`), and only missing history is bundled. Test:
 `unchanged_random_file_is_excluded_from_second_bundle` (`safety.rs`).
 
+7.1.1. The runner reports a commit only when one of its snapshot or tip refs
+reaches it, and pins every reported commit with a `refs/held/<commit>` ref for
+six hours. The bundle uses the reported commits as prerequisites, and Git
+accepts a prerequisite with no ref only while the history behind it is
+complete, which the runner's mirror does not promise once the job or workspace
+record that pinned it has expired. Held refs are pruned after six hours and are
+not themselves a reason to report a commit again. Tests:
+`reported_commit_stays_a_valid_prerequisite_after_its_record_is_pruned`,
+`held_refs_expire_and_unreferenced_commits_are_not_reported`
+(`crates/motor-runner/src/tests/held_prerequisites.rs`).
+
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
 the runner advertises support; older runners receive none. Tests:
 `run_and_prepare_lockfile_source_is_commit_not_worktree`,

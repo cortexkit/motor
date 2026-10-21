@@ -20,6 +20,14 @@ use std::{
 // Rotation alone lets a stream of new workspaces starve a recently used one.
 const BACKFILL_GRACE_MS: u64 = 60_000;
 
+/// How long the refs a have reply pins (`workspace::HELD_REFS`) outlive the
+/// reply. The bundle built from the reply arrives after the sender builds and
+/// uploads it and, on a tenant, after the lease is admitted; all of that is
+/// minutes. Six hours covers a slow upload with a wide margin, while a held ref
+/// keeps only history the mirror already had, so the cost of waiting is a few
+/// small ref files and objects that stay out of compaction a little longer.
+const HELD_OFFER_MS: u64 = 6 * 60 * 60 * 1000;
+
 #[path = "accounting.rs"]
 mod accounting;
 #[path = "disk.rs"]
@@ -592,6 +600,11 @@ struct Core {
     /// Ref mutations acquire this before the state lock, which is released
     /// before Git runs. Keep pinning and ownership publication in one turn.
     ref_mutation: Mutex<()>,
+    /// Commits each have reply reported, by mirror, with the time (runner
+    /// clock) after which their `refs/held/` refs may be pruned. Memory only:
+    /// after a restart every connection that received a reply is gone, so the
+    /// first prune removes all held refs.
+    held_offers: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>>,
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
@@ -1263,6 +1276,7 @@ impl Runner {
                 }),
                 job_logs: Mutex::new(BTreeMap::new()),
                 ref_mutation: Mutex::new(()),
+                held_offers: Mutex::new(BTreeMap::new()),
                 quarantine_admission: Mutex::new(
                     (!quarantined.is_empty())
                         .then(|| "live unit ownership has not been inspected".into()),
@@ -1654,8 +1668,42 @@ impl Runner {
     pub(crate) fn spool_dir(&self, id: Uuid) -> PathBuf {
         self.core.trees.state.join("spools").join(id.to_string())
     }
+    /// Report which offered commits the mirrors hold, and pin each reported
+    /// commit with a `refs/held/` ref for `HELD_OFFER_MS`. The sender uses the
+    /// reply as its bundle's prerequisites; without the pin, a record expiring
+    /// before the bundle arrives would prune the only ref that reaches them.
+    /// A commit whose ref cannot be written is not reported.
     pub(crate) fn have(&self, r: Vec<RepositoryCandidates>) -> Vec<RepositoryCandidates> {
-        self.core.trees.have(r)
+        // Held across the walk, so no prune can remove a ref the walk relied
+        // on before the held refs exist.
+        let _refs = self.core.ref_mutation.lock().unwrap();
+        let mut held = self.core.trees.have(r);
+        let now = self.now();
+        let mut offers = self.core.held_offers.lock().unwrap();
+        for repository in &mut held {
+            if repository.commits.is_empty() {
+                continue;
+            }
+            let mirror = self.core.trees.mirror(&repository.repository);
+            let refs: Vec<_> = repository
+                .commits
+                .iter()
+                .map(|commit| (format!("{}{commit}", workspace::HELD_REFS), commit.clone()))
+                .collect();
+            match workspace::update_refs(&mirror, &refs) {
+                Ok(()) => {
+                    let offered = offers.entry(mirror).or_default();
+                    for commit in &repository.commits {
+                        offered.insert(commit.clone(), now.saturating_add(HELD_OFFER_MS));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(repository = %repository.repository, %error, "cannot pin held commits; reporting none");
+                    repository.commits.clear();
+                }
+            }
+        }
+        held
     }
 
     pub(crate) fn have_dependencies(
@@ -3610,6 +3658,22 @@ impl Runner {
             })
             .collect();
         drop(inner);
+        // Commits a recent have reply reported stay pinned until their bundle
+        // can have arrived; expired offers are forgotten and their refs pruned.
+        let now = self.now();
+        let mut offers = self.core.held_offers.lock().unwrap();
+        offers.retain(|_, commits| {
+            commits.retain(|_, expires| *expires > now);
+            !commits.is_empty()
+        });
+        for (mirror, commits) in offers.iter() {
+            mirrors.entry(mirror.clone()).or_default().extend(
+                commits
+                    .keys()
+                    .map(|commit| format!("{}{commit}", workspace::HELD_REFS)),
+            );
+        }
+        drop(offers);
         // Expired records may be the last mention of a repository. Enumerate
         // mirrors too, so their unheld refs are pruned after that record expires.
         for entry in fs::read_dir(&self.core.trees.mirrors)? {
@@ -3630,6 +3694,7 @@ impl Runner {
                     "--format=%(refname)",
                     "refs/snapshots",
                     "refs/tips",
+                    workspace::HELD_REFS,
                 ],
             )?;
             let stale: Vec<_> = refs

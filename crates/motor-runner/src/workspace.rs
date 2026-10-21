@@ -76,6 +76,28 @@ pub(crate) fn delete_refs(path: &Path, references: &[String]) -> io::Result<()> 
     }
 }
 
+/// Point each named ref at its commit in one transaction. Git refuses a target
+/// object the repository does not have, so a successful call proves every
+/// commit is present and now a ref target.
+pub(crate) fn update_refs(path: &Path, references: &[(String, String)]) -> io::Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::from("start\n");
+    for (reference, commit) in references {
+        input.push_str(&format!("update {reference} {commit}\n"));
+    }
+    input.push_str("prepare\ncommit\n");
+    let mut command = git_command(path);
+    command.args(["update-ref", "--stdin"]);
+    let output = git_input(command, input.as_bytes())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(invalid(String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
 pub(crate) fn blob(path: &Path, revision: &str) -> io::Result<Vec<u8>> {
     let output = git_command(path).args(["show", revision]).output()?;
     if !output.status.success() {
@@ -251,6 +273,15 @@ pub(crate) struct Trees {
 /// have reply, newest integration tips first. The sender checks each one
 /// locally, so the bound keeps a long-lived runner's reply cheap to use.
 const HELD_REPORT_LIMIT: usize = 32;
+
+/// Namespace of the refs a have reply leaves behind: one per reported commit,
+/// named `refs/held/<commit>`. The sender builds its bundle with the
+/// reported commits as prerequisites, and git accepts a prerequisite only when
+/// it is reachable from a ref or its whole unreferenced history is still
+/// intact. The records that keep snapshot and tip refs alive can expire
+/// between the reply and the bundle's arrival, so the reply pins its own refs.
+/// The runner prunes them once the offer's lifetime has passed.
+pub(crate) const HELD_REFS: &str = "refs/held/";
 
 /// A mirror is compacted once it holds more than this many ordinary packs.
 const MAX_MIRROR_PACKS: usize = 3;
@@ -485,6 +516,8 @@ impl Trees {
     /// up to 32 pinned ref targets as hints for older clients. Offered ancestry
     /// is not capped: a common older branch must remain a bundle prerequisite
     /// even when newer refs belong to snapshots the sender does not possess.
+    /// The answer is only valid while those refs exist; `Runner::have` pins
+    /// it with `HELD_REFS` before replying.
     pub fn have(&self, repositories: Vec<RepositoryCandidates>) -> Vec<RepositoryCandidates> {
         repositories
             .into_iter()
@@ -513,6 +546,9 @@ impl Trees {
                 // every candidate/ref pair. Report the newest common frontier
                 // independently of the fallback ref cap: recent dirty snapshots
                 // can crowd out the old branch tip the sender actually knows.
+                // Held refs (see HELD_REFS) are deliberately not walked:
+                // they exist only to keep an earlier reply valid, and counting
+                // them would let every reply renew the previous one forever.
                 let history = git(
                     &path,
                     &[
