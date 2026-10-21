@@ -182,6 +182,29 @@ host VM-lifecycle samples, parent hashes and guest logs. Any failure stops the
 service and does not count as a skip. Return the complete external evidence
 directory, plus provisioning logs and `sealed.json`, before enabling routing.
 
+## Diagnose an agent connection failure
+
+Copy `script/windows-runner/diagnose-connect.ps1` to the installed host and run it
+from elevated Windows PowerShell 5.1; no new runner binary or source checkout is
+needed. It uses the installed `Prepare` operation, probes the agent's hvsock
+endpoint for 120 seconds without sending commands, then stops the VM and harvests
+the read-only child **before** removing its VM, job directory and private cache.
+It refuses to overlap existing runner VM/job resources, and restores a service it
+stopped only after cleanup succeeds.
+
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\diagnose-connect.ps1 `
+  -Evidence ('C:\motor-runner-evidence\connect-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+```
+
+A nonzero result still leaves the protected evidence folder. Return the complete
+folder: `EXPECTED-LOGS.txt` explains the attempt trace, passive Hello, agent/build
+identity, explicit guest log-path manifest, and agent-filtered System/Application
+events (JSON/XML plus exported EVTX). Missing/reparse-refused logs and collection
+errors are recorded rather than silently omitted. A socket connection alone is
+not protocol qualification; closing the passive probe can produce an expected
+guest EOF. No guest passwords, DPAPI files, registry hives or disk images are copied.
+
 ## One removal
 
 Copy evidence out first. Copy removal scripts outside the root because the root,
