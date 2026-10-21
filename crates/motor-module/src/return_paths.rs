@@ -13,6 +13,12 @@ pub struct ReturnOptions {
         skip_serializing_if = "is_default_cap"
     )]
     pub return_max_bytes: u64,
+    /// Ask the runner for chunked returned files (`Run.return_chunked`). Only
+    /// the agent route sets it, so it is never read from or written to the
+    /// direct interface's JSON: `ck motor run` keeps the single
+    /// `return_result` behaviour.
+    #[serde(skip)]
+    pub return_chunked: bool,
 }
 
 fn is_default_cap(cap: &u64) -> bool {
@@ -24,6 +30,7 @@ impl Default for ReturnOptions {
         Self {
             return_paths: Vec::new(),
             return_max_bytes: RETURN_MAX_BYTES,
+            return_chunked: false,
         }
     }
 }

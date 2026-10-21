@@ -2105,6 +2105,7 @@ async fn runner_rpc(frame: Frame) -> Frame {
         &mut stdin,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
             protocol_version: motor_protocol::PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,

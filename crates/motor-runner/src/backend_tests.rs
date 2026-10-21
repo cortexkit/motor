@@ -72,6 +72,7 @@ fn setup(cwd: &Path) -> Setup {
         request: Run {
             return_paths: Vec::new(),
             return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+            return_chunked: false,
             gate_job: false,
             network: None,
             platform: None,

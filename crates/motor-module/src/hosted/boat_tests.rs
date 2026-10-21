@@ -115,6 +115,7 @@ impl Boat {
                             platforms: vec!["linux".into()],
                             default_branch_tip: false,
                             return_paths: false,
+                            return_chunked: false,
                         },
                     )
                     .await

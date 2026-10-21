@@ -54,6 +54,10 @@ pub(crate) struct Job {
     /// back into the cwd-relative paths the caller asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_cwd: Option<String>,
+    /// The returned-file paths of a chunked `exec-remote/v1` request, exactly
+    /// as the caller sent them, so its `return_manifest` echoes them unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_requested: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -98,6 +102,7 @@ impl Job {
         self.hosted.is_none()
             && self.return_result.is_none()
             && self.return_cwd.is_none()
+            && self.return_requested.is_none()
             && self.direct_secret_hash.is_none()
             && !self.gate_job
             && self.runner_instance.is_none()
@@ -376,6 +381,11 @@ impl Storage {
     pub(crate) fn return_cwd(&self, id: Uuid, cwd: String) -> io::Result<()> {
         self.update(|state| {
             state.jobs.entry(id).or_default().return_cwd = Some(cwd);
+        })
+    }
+    pub(crate) fn return_requested(&self, id: Uuid, paths: Vec<String>) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_requested = Some(paths);
         })
     }
     pub(crate) fn hosted_update(

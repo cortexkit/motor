@@ -24,7 +24,16 @@ fn return_paths_join_cwd_and_the_fields_leave_the_request() {
     let mut request = request()
         .with_return_paths(vec!["out".into(), "nested/file.txt".into()])
         .with_return_max_bytes(shared::RETURN_MAX_BYTES_CAP);
-    let (returns, cwd) = take_return_request(&mut request).unwrap().unwrap();
+    let ReturnRequest {
+        options: returns,
+        cwd,
+        requested,
+    } = take_return_request(&mut request).unwrap().unwrap();
+    assert_eq!(
+        requested, None,
+        "only a chunked request keeps the caller's paths"
+    );
+    assert!(!returns.return_chunked);
     assert_eq!(
         returns.return_paths,
         ["/w/key/sub/out", "/w/key/sub/nested/file.txt"]
@@ -38,11 +47,103 @@ fn return_paths_join_cwd_and_the_fields_leave_the_request() {
 #[test]
 fn absent_cap_defaults_and_empty_paths_request_nothing() {
     let mut with_paths = request().with_return_paths(vec!["out".into()]);
-    let (returns, _) = take_return_request(&mut with_paths).unwrap().unwrap();
+    let returns = take_return_request(&mut with_paths)
+        .unwrap()
+        .unwrap()
+        .options;
     assert_eq!(returns.return_max_bytes, RETURN_MAX_BYTES);
     let mut without = request().with_return_max_bytes(10);
     assert_eq!(take_return_request(&mut without), Ok(None));
     assert_eq!(without.return_max_bytes, None);
+}
+
+#[test]
+fn chunked_request_raises_the_cap_to_ten_mib_and_keeps_the_paths_as_sent() {
+    let mut chunked = request()
+        .with_return_paths(vec!["./out".into(), "nested/file.txt".into()])
+        .with_return_chunked(true);
+    let ReturnRequest {
+        options,
+        cwd,
+        requested,
+    } = take_return_request(&mut chunked).unwrap().unwrap();
+    assert!(options.return_chunked);
+    assert!(!chunked.return_chunked, "the flag leaves the request");
+    assert_eq!(
+        options.return_max_bytes,
+        shared::RETURN_CHUNKED_MAX_BYTES_CAP
+    );
+    assert_eq!(
+        options.return_paths,
+        ["/w/key/sub/./out", "/w/key/sub/nested/file.txt"]
+    );
+    assert_eq!(cwd, "/w/key/sub");
+    assert_eq!(
+        requested.as_deref(),
+        Some(&["./out".to_string(), "nested/file.txt".to_string()][..])
+    );
+    let mut at_cap = request()
+        .with_return_paths(vec!["out".into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(shared::RETURN_CHUNKED_MAX_BYTES_CAP);
+    assert_eq!(
+        take_return_request(&mut at_cap)
+            .unwrap()
+            .unwrap()
+            .options
+            .return_max_bytes,
+        shared::RETURN_CHUNKED_MAX_BYTES_CAP
+    );
+    for paths in [Vec::new(), vec!["out".to_string()]] {
+        let mut over = request()
+            .with_return_paths(paths)
+            .with_return_chunked(true)
+            .with_return_max_bytes(shared::RETURN_CHUNKED_MAX_BYTES_CAP + 1);
+        assert!(matches!(
+            take_return_request(&mut over),
+            Err(ReturnRequestError::InvalidParams(message)) if message.contains("return_max_bytes")
+        ));
+    }
+    // Above 256 KiB is allowed only with the opt-in.
+    let mut unchunked = request()
+        .with_return_paths(vec!["out".into()])
+        .with_return_max_bytes(shared::RETURN_MAX_BYTES_CAP + 1);
+    assert!(matches!(
+        take_return_request(&mut unchunked),
+        Err(ReturnRequestError::InvalidParams(_))
+    ));
+}
+
+#[test]
+fn caller_manifest_echoes_requested_paths_by_position() {
+    let manifest = shared::ReturnManifest::new(
+        Uuid::nil(),
+        7,
+        vec![
+            shared::ReturnManifestEntry::returned("/w/key/sub/./out", 1, "digest"),
+            shared::ReturnManifestEntry::failed(
+                "/w/key/sub/missing",
+                shared::ReturnPathsFailureCause::Missing,
+            ),
+        ],
+        1,
+        10,
+    );
+    let requested = ["./out".to_string(), "missing".to_string()];
+    let caller = caller_manifest(manifest.clone(), Some(&requested));
+    assert_eq!(caller.files[0].path(), "./out");
+    assert_eq!(caller.files[1].path(), "missing");
+    assert_eq!(caller.files[0].sha256(), Some("digest"));
+    assert_eq!(
+        (caller.seq, caller.total_bytes, caller.cap_bytes),
+        (7, 1, 10)
+    );
+    // A stored list that does not match leaves the runner's paths alone.
+    assert_eq!(
+        caller_manifest(manifest.clone(), Some(&requested[..1])),
+        manifest
+    );
+    assert_eq!(caller_manifest(manifest.clone(), None), manifest);
 }
 
 #[test]

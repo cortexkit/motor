@@ -147,6 +147,7 @@ impl Endpoint {
                 default_branch_tip: true,
                 gate_jobs: true,
                 return_paths: false,
+                return_chunked: false,
                 platforms: Vec::new(),
             };
             write_frame(&mut runner, &serde_json::to_value(hello).unwrap())

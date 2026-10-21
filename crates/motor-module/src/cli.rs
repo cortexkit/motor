@@ -1255,6 +1255,7 @@ pub async fn main(args: &[String]) -> u8 {
         return_max_bytes: args
             .return_max_bytes
             .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
+        return_chunked: false,
     };
     client.allow_spill = args.allow_spill;
     client.hosted = args.hosted;
@@ -1634,6 +1635,7 @@ mod tests {
         let params = crate::ReturnOptions {
             return_paths: args.return_paths,
             return_max_bytes: args.return_max_bytes.unwrap(),
+            return_chunked: false,
         }
         .params(&request);
         assert_eq!(params["return_paths"], json!(["/w/one", "/w/two"]));

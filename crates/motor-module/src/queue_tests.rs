@@ -30,6 +30,7 @@ impl Connector for ClockPeer {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -269,6 +270,7 @@ impl Connector for SpillPeer {
                         platforms: vec!["linux".into()],
                         default_branch_tip: false,
                         return_paths: false,
+                        return_chunked: false,
                     },
                 )
                 .await
@@ -646,6 +648,7 @@ impl Connector for ResubmitPeer {
                     platforms: vec!["linux".into()],
                     default_branch_tip: false,
                     return_paths: false,
+                    return_chunked: false,
                 };
                 write_frame_async(&mut peer, &hello).await.unwrap();
                 while let Ok(Some(frame)) = read_frame_async(&mut peer).await {

@@ -186,6 +186,7 @@ async fn forward_socket(
         &mut socket,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -947,6 +948,7 @@ mod tests {
                     &mut socket,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

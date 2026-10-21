@@ -710,6 +710,8 @@ mod windows_command_tests {
 
 pub(crate) struct Channel {
     pub return_paths: bool,
+    /// The runner's Hello advertised chunked returned files.
+    pub return_chunked: bool,
     pub gate_jobs: bool,
     pub platforms: Vec<String>,
     tx: mpsc::Sender<WriteRequest>,
@@ -734,6 +736,7 @@ impl Channel {
             &mut pipe,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -768,12 +771,14 @@ impl Channel {
                     platforms,
                     gate_jobs,
                     return_paths,
+                    return_chunked,
                     ..
                 } => {
                     let mut channel = Self::new(pipe);
                     channel.platforms = platforms;
                     channel.gate_jobs = gate_jobs;
                     channel.return_paths = return_paths;
+                    channel.return_chunked = return_chunked;
                     channel.enable_heartbeats();
                     return Ok(channel);
                 }
@@ -840,7 +845,7 @@ impl Channel {
                     advance(UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION,
+                        .send(Frame::Hello { return_paths: false, return_chunked: false, protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: true,
                         gate_jobs: true,
@@ -853,12 +858,13 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
                             channel.return_paths = return_paths;
+                            channel.return_chunked = return_chunked;
                             channel.enable_heartbeats();
                             tracing::info!(job_or_workspace_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake complete");
                             Ok(channel)
@@ -1008,6 +1014,7 @@ impl Channel {
         Self {
             gate_jobs: false,
             return_paths: false,
+            return_chunked: false,
             platforms: Vec::new(),
             tx,
             rx,
@@ -1087,6 +1094,7 @@ mod hello_tests {
                     default_branch_tip: true,
                     gate_jobs: true,
                     return_paths: false,
+                    return_chunked: false,
                     platforms: vec!["linux".into()],
                 },
             )
@@ -1118,6 +1126,7 @@ mod hello_tests {
                 &mut peer,
                 &Frame::Hello {
                     return_paths: false,
+                    return_chunked: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
                     default_branch_tip: false,
@@ -1149,6 +1158,7 @@ mod hello_tests {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

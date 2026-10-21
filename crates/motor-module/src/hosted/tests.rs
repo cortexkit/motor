@@ -603,18 +603,22 @@ async fn return_paths_hosted_limits_refuse_before_lease_and_keep_no_fallback() {
         crate::ReturnOptions {
             return_paths: vec!["/home/missing/out".into()],
             return_max_bytes: RETURN_MAX_BYTES + 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec!["/home/missing/out".into(); 65],
             return_max_bytes: 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec![format!("/home/missing/{}", "x".repeat(4096))],
             return_max_bytes: 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec!["/home/elsewhere/out".into()],
             return_max_bytes: 1,
+            return_chunked: false,
         },
     ] {
         let stream = motor
