@@ -257,6 +257,67 @@ part of a rollback.
 
 To return to service, run `--check`, then `--start`.
 
+## Remove a departed customer's tenant
+
+The public privacy page promises that a departed customer's tenant VM disk is
+deleted within 30 days of the account closing. Removal is two steps: the
+tenant's data is first moved into a root-only quarantine folder,
+`/var/lib/motor-vm/removed/<tenant>-<unix seconds>/`, and `motor-vm-helper`
+deletes each such folder 7 days after the removal (an hourly purge;
+`QUARANTINE_S` in `crates/motor-vm-helper/src/removal.rs`). The folder holds
+the tenant home (`home/`: disk, generation, suspend snapshot, set-aside
+`suspend.stale-*` snapshots, stop markers) and copies of its records
+(`records/registry.json`, `records/provision.json`, `records/binding.json`).
+The shared size base under the image is not per tenant and is kept.
+
+**Automatic.** The broker lists closed accounts in its heartbeat reply as
+`closed_subjects` (`["acct:<ULID>", ...]`). motor-host maps each subject to a
+tenant only through its binding map (`/etc/motor-host/tenants.json`), ignores
+subjects bound to no tenant, records the closure in its journal and refuses
+new jobs for the tenant (`auth`). Once the tenant has no open lease or
+connection and its last job ended at least 24 hours ago (the runner's result
+retention), motor-host stops the VM cleanly and asks the helper to
+`remove_tenant`. The helper takes the tenant name only: it reads the tenant's
+own registry entry, refuses an unknown tenant or a VM that is still running,
+reconciles the firewall over the remaining tenants (dropping the tenant's nft
+chains, counter and UFW route grant), deletes its tap, drops its binding,
+provisioning record and registry entry, and moves its home into quarantine.
+A failed removal is retried with backoff from one minute to six hours; from 7
+days after the closure, `tenant_removal_overdue` and
+`tenant_removal_failed_overdue` are logged as errors until the disk is gone.
+Logs: `tenant_account_closed`, `tenant_removed` (with the quarantine folder).
+
+**By hand.** With both services stopped, as for `switch-image`:
+
+```sh
+sudo systemctl stop motor-host.service motor-vm-helper.service
+sudo python3 script/tenant-provision/provision.py remove-tenant <tenant> --dry-run
+sudo python3 script/tenant-provision/provision.py remove-tenant <tenant>
+sudo systemctl start motor-vm-helper.service motor-host.service
+```
+
+`--dry-run` lists every file, record, binding and network object it would
+remove and changes nothing. `remove-tenant` refuses while either service is
+active (no VM can run with the helper stopped, and no lease or session exists
+with motor-host stopped), holds the provision lock, quarantines exactly what
+the helper's removal does (`script/tenant-provision/removal-layout.json` pins
+both) and deletes the tap. The helper's startup reconciliation then drops the
+firewall exemption and UFW route grant, because it keeps only registered
+tenants. `--purge-now` deletes at once instead of quarantining. Other tenants
+are untouched.
+
+**Undo, within the 7 days.** With both services stopped, move
+`removed/<tenant>-<time>/home` back to `/var/lib/motor-vm/tenants/<tenant>`,
+copy `records/registry.json` to `/etc/motor-vm-helper/tenants/<tenant>.json`
+(mode 644) and `records/provision.json` to
+`/etc/motor-host/provision/<tenant>.json`, add the entry in
+`records/binding.json` back to `/etc/motor-host/tenants.json`, then start the
+services; the helper recreates the tap and firewall rules on the tenant's next
+start. A tenant whose account is still closed at the broker is removed again,
+so undo only a removal made in error. To re-provision instead, run
+`provision.py --config` with the saved provisioning record after moving the
+old home aside.
+
 ## Upgrading a helper that predates the clean stop
 
 A helper built before the clean service stop dies on SIGTERM and wrote no

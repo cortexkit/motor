@@ -509,8 +509,9 @@ impl Host {
     /// many jobs it deleted. A job's records are its lease (which carries the
     /// account identifier), billing state, no-start report, pending cancel,
     /// and every outbox, set-aside or rejected usage request naming it.
-    /// Expired replay nonces and job-less set-aside requests (heartbeats)
-    /// older than the retention period go in the same pass.
+    /// Expired replay nonces, job-less set-aside requests (heartbeats) and
+    /// closure records of tenants removed longer ago than the retention
+    /// period go in the same pass.
     ///
     /// A job is kept, whatever its age, while it is unsettled: its lease has
     /// not ended, its usage report is computed but not yet queued, or a queued
@@ -612,8 +613,13 @@ impl Host {
                 .collect(),
             counter: snapshot.counter,
             last_alive: snapshot.last_alive,
+            closed: snapshot.closed.clone(),
         };
         next.nonces.retain(|_, until| *until >= now_s);
+        // A removed tenant's closure record names its account; it goes on
+        // the same schedule as that account's billing records.
+        next.closed
+            .retain(|_, c| c.removed_ms.is_none_or(|removed| removed >= cutoff));
         for job in &expired {
             next.leases.remove(job);
             next.billing.remove(job);
@@ -622,6 +628,7 @@ impl Host {
         }
         let changed = !expired.is_empty()
             || next.nonces.len() != snapshot.nonces.len()
+            || next.closed.len() != snapshot.closed.len()
             || next.outbox.len() != snapshot.outbox.len()
             || next.expired_outbox.len() != snapshot.expired_outbox.len()
             || next.rejected_outbox.len() != snapshot.rejected_outbox.len();

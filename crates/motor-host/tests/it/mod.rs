@@ -2,6 +2,7 @@ mod admission;
 mod billing;
 #[cfg(target_os = "linux")]
 mod broker;
+mod closure;
 mod enroll;
 mod helper;
 mod transport;

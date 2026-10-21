@@ -177,6 +177,8 @@ pub struct Runtime {
     event_workers: Mutex<BTreeSet<String>>,
     terminal_workers: Mutex<BTreeSet<String>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
+    /// Closed tenants whose removal is running on its own thread.
+    removal_workers: Mutex<BTreeSet<String>>,
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
@@ -241,6 +243,7 @@ impl Runtime {
             event_workers: Mutex::new(BTreeSet::new()),
             terminal_workers: Mutex::new(BTreeSet::new()),
             tenant_operations,
+            removal_workers: Mutex::new(BTreeSet::new()),
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
             sandbox_identity,
@@ -570,6 +573,9 @@ impl Runtime {
             let mut quotas = Vec::new();
             let mut candidates = Vec::new();
             for tenant in self.tenant_operations.keys() {
+                if host.is_removed(tenant) {
+                    continue;
+                }
                 if let Some(update) = host.quota_update(tenant, now_ms)? {
                     quotas.push(update);
                 }
@@ -614,6 +620,28 @@ impl Runtime {
                 self.host.lock().expect("host lock").stopped(&tenant)?;
             }
         }
+        // A removal stops the VM and waits on the helper, so it runs on its
+        // own thread rather than holding up this tick's cancels and expiry.
+        let due = self.host.lock().expect("host lock").removals_due(now_ms)?;
+        for tenant in due {
+            if !self
+                .removal_workers
+                .lock()
+                .expect("removal workers")
+                .insert(tenant.clone())
+            {
+                continue;
+            }
+            let runtime = self.clone();
+            std::thread::spawn(move || {
+                runtime.remove_closed(&tenant, now_ms);
+                runtime
+                    .removal_workers
+                    .lock()
+                    .expect("removal workers")
+                    .remove(&tenant);
+            });
+        }
         if !candidates.is_empty() {
             match self.control.available_bytes() {
                 Ok(available) => {
@@ -631,6 +659,37 @@ impl Runtime {
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+    /// Removes a closed tenant once it is ready: under the tenant's operation
+    /// lock (so no wake, suspend or relay setup runs meanwhile) it rechecks
+    /// that no lease or connection is open, stops the VM cleanly, and has the
+    /// helper quarantine its data and drop its records and network setup.
+    /// A failure is recorded with a retry time; see `Host::removal_failed`.
+    pub fn remove_closed(&self, tenant: &str, now_ms: u64) {
+        let result = (|| -> Result<Option<String>> {
+            let operations = self.tenant_operations(tenant)?;
+            let _operation = operations.lock().expect("tenant operations lock");
+            if !self
+                .host
+                .lock()
+                .expect("host lock")
+                .removal_ready(tenant, now_ms)
+            {
+                return Ok(None);
+            }
+            self.control.stop(tenant)?;
+            self.host.lock().expect("host lock").stopped(tenant)?;
+            Ok(Some(self.control.remove(tenant)?))
+        })();
+        let mut host = self.host.lock().expect("host lock");
+        let recorded = match result {
+            Ok(Some(quarantine)) => host.tenant_removed(tenant, &quarantine, now_ms),
+            Ok(None) => Ok(()),
+            Err(error) => host.removal_failed(tenant, now_ms, &format!("{error:#}")),
+        };
+        if let Err(error) = recorded {
+            tracing::error!(tenant, %error, "tenant_removal_record_failed");
         }
     }
     fn fetch_detached_terminals(self: &Arc<Self>) {

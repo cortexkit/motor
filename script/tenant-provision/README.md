@@ -86,6 +86,20 @@ in-guest recovery check. The procedure is in `docs/hosted-host.md`. Tests:
 `test_switch_image_refuses_when_either_service_is_running`,
 `test_switch_image_warns_when_the_last_vm_stop_was_unclean`.
 
+`provision.py remove-tenant <tenant> [--dry-run | --purge-now]` removes a
+departed customer's tenant. Like `switch-image` it refuses while
+`motor-host.service` or `motor-vm-helper.service` is active. Under the provision
+lock it copies the tenant's records into
+`/var/lib/motor-vm/removed/<tenant>-<unix seconds>/records/`, deletes its tap,
+drops its binding, provisioning record and registry entry, and moves its home
+(disk, suspend and stale snapshots, markers) to `.../home`; the helper deletes
+the folder 7 days later, and its startup reconciliation drops the tenant's
+firewall rules. `--dry-run` lists everything and changes nothing; `--purge-now`
+deletes at once. `removal-layout.json` pins the same list for the helper's
+automatic `remove_tenant`. The procedure and how to undo a removal are in
+`docs/hosted-host.md`. Tests: `test_remove_tenant_*`,
+`test_removal_layout_is_the_one_the_helper_removes`.
+
 Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

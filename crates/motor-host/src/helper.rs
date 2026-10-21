@@ -16,6 +16,11 @@ pub trait Control: Send + Sync {
     fn stop(&self, _tenant: &str) -> Result<()> {
         anyhow::bail!("tenant stop unavailable")
     }
+    /// Asks the helper to remove a stopped tenant; returns its quarantine
+    /// folder. The helper derives everything it deletes from the name.
+    fn remove(&self, _tenant: &str) -> Result<String> {
+        anyhow::bail!("tenant removal unavailable")
+    }
     fn adopt(&self, tenant: &str) -> Result<bool>;
     fn wake(&self, tenant: &str, initialized_generation: Option<u64>) -> Result<u64>;
     fn quota(&self, tenant: &str, vcpus: u32) -> Result<()>;
@@ -133,6 +138,17 @@ impl Control for Helper {
     fn stop(&self, tenant: &str) -> Result<()> {
         self.request(json!({"op":"stop_tenant", "tenant":tenant}))?;
         Ok(())
+    }
+    fn remove(&self, tenant: &str) -> Result<String> {
+        let (reply, _) = self.request(json!({"op":"remove_tenant", "tenant":tenant}))?;
+        ensure!(
+            reply["result"] == "removed",
+            "unexpected helper removal reply"
+        );
+        Ok(reply["quarantine"]
+            .as_str()
+            .context("helper quarantine folder")?
+            .to_owned())
     }
     fn adopt(&self, tenant: &str) -> Result<bool> {
         Ok(self.request(json!({"op":"adopt", "tenant":tenant}))?.0["running"] == true)
