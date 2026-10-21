@@ -585,27 +585,15 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
         let stream = motor.run(large).unwrap();
         let id = stream.job_id;
         assert_eq!(records(stream).await.1.outcome, Outcome::Exit { code: 7 });
+        motor.close().await;
         id
     };
-    // The job's task drops its handle on the store just after delivering the
-    // terminal record; wait for the store's lock to be released before reopening.
-    let motor = {
-        let mut attempts = 0;
-        loop {
-            match Motor::with_connector(
-                config(&h, &repo),
-                &scratch.0.join("state"),
-                Arc::new(super::queue_tests::ResubmitPeer { log: log.clone() }),
-            ) {
-                Ok(motor) => break motor,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && attempts < 100 => {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => panic!("reopen: {error}"),
-            }
-        }
-    };
+    let motor = Motor::with_connector(
+        config(&h, &repo),
+        &scratch.0.join("state"),
+        Arc::new(super::queue_tests::ResubmitPeer { log: log.clone() }),
+    )
+    .unwrap();
     assert!(motor.hosted_state(id).is_none());
     assert_eq!(
         motor
