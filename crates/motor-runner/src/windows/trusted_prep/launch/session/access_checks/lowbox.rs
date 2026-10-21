@@ -118,8 +118,10 @@ fn capability_sids(name: &str) -> io::Result<Vec<String>> {
     }
 }
 fn lowbox_token(base: HANDLE, package: PSID, capabilities: &[String]) -> io::Result<Handle> {
-    // Same privilege filtering as production, but no restricting SIDs: a
-    // write-restricted lowbox token would fail KsecDD's restricted pass again.
+    // Same privilege filtering as production, but no restricting SIDs. With a
+    // write-restricted token, opening KsecDD for write also has to pass a
+    // second check against the restricting SIDs alone, and the logon SID alone
+    // fails it; the AppContainer check replaces that boundary here.
     let mut filtered = null_mut();
     check("lowbox-base-token", unsafe {
         CreateRestrictedToken(
