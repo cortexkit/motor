@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, MagicMock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("boat_image_install", HERE / "install.py")
@@ -371,6 +371,27 @@ class RecipeTests(unittest.TestCase):
              patch.object(start.RESTORE_ACTIVE.__class__, 'exists', return_value=False):
             start.wait_restored(clock=lambda: now[0], pause=pause)
         self.assertEqual(now[0], 3 + start.RESTORE_STABLE_S)
+
+    def test_storage_identity_rejects_users_reverting_to_root_disk(self):
+        root_device = Path('/').stat().st_dev
+        state, users = Mock(), Mock()
+        state.stat.return_value = Mock(st_dev=root_device + 1, st_ino=128)
+        users.stat.return_value = Mock(st_dev=root_device, st_ino=131)
+        with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+             self.assertRaisesRegex(RuntimeError, 'Boat storage view changed'):
+            start.storage_identity()
+        users.samefile.assert_not_called()
+
+    def test_storage_identity_requires_same_workspace_directory_not_just_device(self):
+        root_device = Path('/').stat().st_dev
+        state, users = MagicMock(), Mock()
+        state.stat.return_value = Mock(st_dev=root_device + 1, st_ino=128)
+        users.stat.return_value = Mock(st_dev=root_device + 1, st_ino=131)
+        users.samefile.return_value = False
+        with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+             self.assertRaisesRegex(RuntimeError, 'Boat storage view changed'):
+            start.storage_identity()
+        users.samefile.assert_called_once_with(state / 'state/workspaces')
 
     def test_storage_watch_withdraws_readiness_and_stays_failed_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
