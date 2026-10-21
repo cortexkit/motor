@@ -539,21 +539,121 @@ fn admitted_and_started_require_reattach_and_settled_jobs_are_finished() {
         assert_eq!(c.purpose, Purpose::Attach);
         assert_eq!(c.cnf.jkt, reattach.requester_jwk.thumbprint().unwrap());
         host_post(&mut b, "usage", &usage(), 2, NOW + 3000);
-        for path in [
-            "/v1/leases",
-            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
-        ] {
-            let reply = if path == "/v1/leases" {
-                post(&mut b, path, &lease_request(), NOW + 3000)
-            } else {
-                post(&mut b, path, &reattach, NOW + 3000)
-            };
-            assert_eq!(
-                (reply.status, reply.body),
-                (409, json!({"error":"job_finished"}))
-            );
-        }
+        // A settled job never gets another run token.
+        let retry = post(&mut b, "/v1/leases", &lease_request(), NOW + 3000);
+        assert_eq!(
+            (retry.status, retry.body),
+            (409, json!({"error":"job_finished"}))
+        );
     }
+}
+
+/// A job its host settled by usage report can be reattached for 86400 s after
+/// the settlement, so the host can replay output the client lost. The attach
+/// reply repeats the lease unchanged and settles nothing; at the end of the
+/// window the reply is 409 `job_finished` again.
+#[test]
+fn usage_settled_job_reattaches_for_a_day_without_changing_its_settlement() {
+    let mut b = broker();
+    let lease = issued(&mut b, &lease_request(), NOW);
+    host_post(
+        &mut b,
+        "heartbeat",
+        &heartbeat(JobState::Started, 1000),
+        1,
+        NOW,
+    );
+    let settled_at = NOW + 3000;
+    let settled = host_post(&mut b, "usage", &usage(), 2, settled_at);
+    assert_eq!(settled.status, 200);
+    let reattach = ReattachRequest {
+        requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+    };
+    let path = "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach";
+    let last = settled_at + motor_lease::fake::SETTLED_REATTACH_WINDOW_MS - 1;
+    for now in [settled_at, settled_at + 600_000, last] {
+        let reply = post(&mut b, path, &reattach, now);
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let attach: LeaseResponse = serde_json::from_value(reply.body).unwrap();
+        assert_eq!(
+            (
+                &attach.lease_id,
+                &attach.placement,
+                &attach.endpoint,
+                &attach.endpoint_spki_sha256,
+                attach.max_s,
+                attach.reserved_vcpu_ms,
+            ),
+            (
+                &lease.lease_id,
+                &lease.placement,
+                &lease.endpoint,
+                &lease.endpoint_spki_sha256,
+                lease.max_s,
+                lease.reserved_vcpu_ms,
+            )
+        );
+        let claims = verified(&b, &attach, Purpose::Attach, now);
+        assert_eq!(claims.iat, now / 1000);
+        assert_eq!(claims.cnf.jkt, reattach.requester_jwk.thumbprint().unwrap());
+        let (reply, reason) = b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap();
+        assert_eq!(
+            (reply, reason),
+            (
+                &serde_json::from_value(settled.body.clone()).unwrap(),
+                "usage"
+            )
+        );
+    }
+    // The host's resent report still answers with the original settlement.
+    assert_eq!(host_post(&mut b, "usage", &usage(), 3, last), settled);
+    let expired = post(&mut b, path, &reattach, last + 1);
+    assert_eq!(
+        (expired.status, expired.body),
+        (409, json!({"error":"job_finished"}))
+    );
+}
+
+/// Only a usage-report settlement opens the reattach window: a job settled
+/// because its host was lost, or a released one, keeps its refusal.
+#[test]
+fn reattach_window_excludes_host_lost_and_released_jobs() {
+    let reattach = ReattachRequest {
+        requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+    };
+    let path = "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach";
+    let mut lost = broker();
+    let lease = issued(&mut lost, &lease_request(), NOW);
+    let deadline = NOW + (lease.max_s + 600) * 1000;
+    lost.settle_due(deadline);
+    assert_eq!(
+        lost.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap()
+            .1,
+        "host_lost"
+    );
+    let reply = post(&mut lost, path, &reattach, deadline);
+    assert_eq!(
+        (reply.status, reply.body),
+        (409, json!({"error":"job_finished"}))
+    );
+    let mut released = broker();
+    issued(&mut released, &lease_request(), NOW);
+    let release = post(
+        &mut released,
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+        &ReleaseRequest {},
+        NOW,
+    );
+    let release_at = release.body["release_at_ms"].as_u64().unwrap();
+    released.settle_due(release_at);
+    let reply = post(&mut released, path, &reattach, release_at);
+    assert_eq!(
+        (reply.status, reply.body),
+        (409, json!({"error":"job_released"}))
+    );
 }
 
 #[test]

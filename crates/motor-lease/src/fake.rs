@@ -71,10 +71,19 @@ struct Reservation {
 }
 
 enum Settlement {
-    Usage { body: Vec<u8>, reply: UsageReply },
+    /// Settled by the placement host's usage report at `settled_at_ms`.
+    Usage {
+        body: Vec<u8>,
+        reply: UsageReply,
+        settled_at_ms: u64,
+    },
     HostLost(UsageReply),
     Released(UsageReply),
 }
+
+/// How long after a usage-report settlement a reattach still gets an `attach`
+/// token instead of 409 `job_finished`: 86400 s, as the runners contract states.
+pub const SETTLED_REATTACH_WINDOW_MS: u64 = 86_400_000;
 
 pub struct FakeBroker {
     config: FakeConfig,
@@ -159,7 +168,7 @@ impl FakeBroker {
                 .and_then(|p| p.strip_suffix("/reattach"))
             {
                 return match serde_json::from_slice::<ReattachRequest>(request.body) {
-                    Ok(body) => self.reattach(job_id, body, now_ms / 1000),
+                    Ok(body) => self.reattach(job_id, body, now_ms),
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 };
             }
@@ -194,7 +203,7 @@ impl FakeBroker {
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 "usage" => match serde_json::from_slice(request.body) {
-                    Ok(body) => self.usage(host_id, body, request.body),
+                    Ok(body) => self.usage(host_id, body, now_ms),
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 _ => BrokerReply::error(404, "not_found"),
@@ -311,7 +320,7 @@ impl FakeBroker {
         )
     }
 
-    fn reattach(&mut self, job_id: &str, request: ReattachRequest, now_s: u64) -> BrokerReply {
+    fn reattach(&mut self, job_id: &str, request: ReattachRequest, now_ms: u64) -> BrokerReply {
         if request.requester_jwk.verifying_key().is_err() {
             return BrokerReply::error(400, "bad_request");
         }
@@ -321,10 +330,24 @@ impl FakeBroker {
         if job.release.is_some() {
             return BrokerReply::error(409, "job_released");
         }
-        if job.settlement.is_some() {
-            return BrokerReply::error(409, "job_finished");
+        match &job.settlement {
+            None => {}
+            // The host keeps a job it settled by usage report, with its output
+            // and terminal record, for a day, so a client that lost the end of
+            // the stream can attach and have it replayed. This fake serves one
+            // registered host and no Boat sandboxes, so every usage-report
+            // settlement here is a registered host's.
+            Some(Settlement::Usage { settled_at_ms, .. })
+                if settled_at_ms.saturating_add(SETTLED_REATTACH_WINDOW_MS) > now_ms => {}
+            Some(_) => return BrokerReply::error(409, "job_finished"),
         }
-        self.issue(job_id, &request.requester_jwk, Purpose::Attach, now_s, 200)
+        self.issue(
+            job_id,
+            &request.requester_jwk,
+            Purpose::Attach,
+            now_ms / 1000,
+            200,
+        )
     }
 
     fn release(&mut self, job_id: &str) -> BrokerReply {
@@ -448,7 +471,7 @@ impl FakeBroker {
         BrokerReply::json(200, json!({"ignored": ignored}))
     }
 
-    fn usage(&mut self, host: &str, usage: Usage, _body: &[u8]) -> BrokerReply {
+    fn usage(&mut self, host: &str, usage: Usage, now_ms: u64) -> BrokerReply {
         if !valid_job_id(&usage.job_id)
             || !(1..=64).contains(&usage.vcpus)
             || usage.started_at_ms > MAX_SAFE_INTEGER
@@ -474,6 +497,7 @@ impl FakeBroker {
             Some(Settlement::Usage {
                 body: original,
                 reply,
+                ..
             }) => {
                 return if original == &body {
                     BrokerReply::json(200, reply)
@@ -497,6 +521,7 @@ impl FakeBroker {
         job.settlement = Some(Settlement::Usage {
             body,
             reply: reply.clone(),
+            settled_at_ms: now_ms,
         });
         BrokerReply::json(200, reply)
     }

@@ -265,13 +265,31 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
         )
     );
     assert_eq!(server.host_post("usage", &u, 4, now_ms()), first);
+    // A job settled by its host's usage report can still be reattached, so the
+    // host can replay output the client lost; the lease comes back unchanged.
+    let (status, body) = server.post(
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        &ReattachRequest {
+            requester_jwk: lease_request().requester_jwk,
+        },
+    );
+    assert_eq!(status, 200, "{body}");
+    let settled_attach: LeaseResponse = serde_json::from_value(body).unwrap();
     assert_eq!(
-        server.post(
-            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
-            &ReattachRequest {
-                requester_jwk: lease_request().requester_jwk
-            }
-        ),
+        (settled_attach.lease_id, settled_attach.reserved_vcpu_ms),
+        (lease.lease_id.clone(), lease.reserved_vcpu_ms)
+    );
+    verify_token(
+        &settled_attach.job_token,
+        &keys,
+        HOST,
+        Some("019e4567-89ab-7cde-8012-3456789abcde"),
+        Purpose::Attach,
+        now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(
+        server.post("/v1/leases", &lease_request()),
         (409, json!({"error":"job_finished"}))
     );
     assert_eq!(
