@@ -95,6 +95,26 @@ class RunnerHostTests(unittest.TestCase):
             self.assertIn("label + '.toolchain_parity'", phase)
             self.assertIn('("job_toolchain_parity", "cargo --version', phase)
 
+    def test_root_owned_path_check_runs_the_operator_rule_on_boat_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp, 'root_paths.py')
+            checker.write_text('BOAT_ROOTS = ("/fixture",)\n'
+                               'def check(roots):\n'
+                               '    return {"roots": list(roots), "entries": 7, "offender_count": 0, "offenders": []}\n')
+            with patch.object(host, 'ROOT_PATHS_SCRIPT', checker):
+                source = host.root_paths_source()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(source, {})
+        report = json.loads(output.getvalue())
+        self.assertEqual(report['roots'], ['/fixture'])
+        self.assertTrue(host.root_paths_passed(report))
+        self.assertIn('BOAT_ROOTS', host.ROOT_PATHS_SCRIPT.read_text())
+        for bad in (dict(report, offender_count=1, offenders=['/usr/local/bin: uid=1001 gid=1001']),
+                    dict(report, entries=0), {}):
+            self.assertFalse(host.root_paths_passed(bad))
+        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        self.assertIn("label + '.root_owned_paths'", phase)
+
     def test_idle_reclaim_seeds_missing_state_via_service_and_observes_reclaim(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp, 'reclaim')

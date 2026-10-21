@@ -3,6 +3,7 @@
 
 import hashlib
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,19 @@ AGENT_VALIDATED_PATHS = (Path("/tenant"), Path("/Users"), Path("/home"), PREFIX 
 TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo")
 
 
+def load_root_paths():
+    # The chroot stages guest/ beside this script, as the source tree does.
+    spec = importlib.util.spec_from_file_location("root_paths", Path(__file__).resolve().parent / "guest/root_paths.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the root-owned path check")
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+root_paths = load_root_paths()
+
+
 def run(*args, capture=False) -> str:
     result = subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE if capture else None)
     return result.stdout.strip() if capture else ""
@@ -34,6 +48,19 @@ def refuse_probe(args, expected):
     result = subprocess.run(["motor-runner", *args], text=True, capture_output=True)
     if result.returncode == 0 or expected not in result.stderr:
         raise ValueError(f"runner capability probe failed: {args}: {result.stderr}")
+
+
+def extract(archive, destination, *options):
+    # Release archives record their creator's owner (Node's stores uid 1001)
+    # and modes, and tar run as root restores both. Extract as root-owned files
+    # instead, with modes masked by a fixed 022 umask, so no other account can
+    # write where root later executes from.
+    previous = os.umask(0o022)
+    try:
+        run("tar", "--no-same-owner", "--no-same-permissions", *options, "-xf", str(archive),
+            "-C", str(destination))
+    finally:
+        os.umask(previous)
 
 
 def download(url, destination, expected):
@@ -82,7 +109,7 @@ def install_tools(pins):
     node_url = f"https://nodejs.org/dist/v{pins['node']}/"
     download(node_url + node_file, BUILD / node_file,
              published_hash(node_url + "SHASUMS256.txt", node_file))
-    run("tar", "-xJf", str(BUILD / node_file), "--strip-components=1", "-C", "/usr/local")
+    extract(BUILD / node_file, "/usr/local", "-J", "--strip-components=1")
     bun_file = "bun-linux-x64.zip"
     bun_url = f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/"
     download(bun_url + bun_file, BUILD / bun_file,
@@ -174,12 +201,7 @@ def verify_agent_paths(root, owner=0):
     return [str(path) for path in AGENT_VALIDATED_PATHS]
 
 
-def tool_tree_entries(root):
-    """Every path under root, including root, without following symlinks."""
-    yield root
-    for directory, directories, files in os.walk(root):
-        for name in directories + files:
-            yield Path(directory, name)
+tool_tree_entries = root_paths.tree_entries
 
 
 def publish_tool_trees(roots=TOOL_TREES, own=os.lchown):
@@ -302,6 +324,7 @@ def verify(pins):
         "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service")
     # Last, after every tool above has run and could have added files.
     inventory["world_readable_tool_trees"] = verify_tool_trees()
+    inventory["root_owned_paths"] = root_paths.require(root_paths.TENANT_ROOTS)
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
     print(f"guest inventory: {len(pins['packages'])} packages; {len(pins['rust_toolchains'])} Rust toolchains; "

@@ -113,11 +113,17 @@ while IFS='|' read -r name version link url sha format install_dir install_path 
       as_root install -m 0755 "$tmp/binary" "$destination/$install_path"
       ;;
     tar.xz)
-      mkdir -p "$tmp/extracted"
-      tar -xJf "$tmp/archive" --strip-components="$strip_components" -C "$tmp/extracted"
+      # Release archives record their creator's owner (Node's stores uid 1001)
+      # and modes, which tar and cp -a restore when run as root. Install the
+      # tree as files root owns, with modes masked by a fixed 022 umask, so no
+      # other account can write where root later executes from. cp -a also
+      # copies the extracted directory's own mode onto the install directory.
+      (umask 022 && mkdir -p "$tmp/extracted" &&
+        tar --no-same-owner --no-same-permissions -xJf "$tmp/archive" \
+          --strip-components="$strip_components" -C "$tmp/extracted")
       [ -x "$tmp/extracted/$install_path" ] || { echo "$name: archive binary is missing" >&2; exit 1; }
       as_root install -d -m 0755 "$destination"
-      as_root cp -a "$tmp/extracted/." "$destination/"
+      as_root cp -a --no-preserve=ownership "$tmp/extracted/." "$destination/"
       ;;
     *) echo "$name: unsupported archive format: $format" >&2; exit 1 ;;
   esac

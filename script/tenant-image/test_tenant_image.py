@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -516,6 +517,204 @@ elif name in ("truncate", "mkfs.ext4"):
         self.assertEqual(len([call for call in calls if call[0] == "umount"]), 7)
         self.assertFalse(any(call[0] == "mkfs.ext4" for call in calls))
         self.assertFalse((stage / "rootfs").exists())
+
+
+root_paths = guest.root_paths
+qualification = module("hosted_qualify", HERE / "guest/hosted_qualify.py")
+BOAT = HERE.parent / "boat-image"
+INSTALL_TOOLS = HERE.parent / "runner/install-tools.sh"
+
+
+def unit_paths(unit):
+    """The PATH directories and RUSTUP_HOME a systemd unit file sets."""
+    paths = []
+    for line in unit.read_text().splitlines():
+        if line.startswith("Environment=PATH="):
+            paths += line.removeprefix("Environment=PATH=").split(":")
+        if line.startswith("Environment=RUSTUP_HOME="):
+            paths.append(line.removeprefix("Environment=RUSTUP_HOME="))
+    return paths
+
+
+class RootPathTests(unittest.TestCase):
+    """The invariant that everything root executes from is root-owned with no
+    group or other write. Fixtures are owned by the test's own uid, so `owner`
+    is that uid; a directory another account owns is simulated through lstat
+    unless the test runs as root, which can create one for real."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.image = Path(os.path.realpath(temp.name), "image")
+        for relative in ("usr/local/bin", "usr/local/lib/motor/cargo/bin", "usr/local/include",
+                         "usr/local/share", "usr/bin", "usr/sbin"):
+            (self.image / relative).mkdir(parents=True)
+        for relative in ("usr/local/bin/motor-runner", "usr/local/bin/node", "usr/bin/python3", "usr/sbin/init"):
+            (self.image / relative).write_text("#!/bin/sh\n")
+            (self.image / relative).chmod(0o755)
+        (self.image / "usr/local/bin/corepack").symlink_to("node")
+        # Merged /usr: /bin and /sbin are relative links into /usr.
+        (self.image / "bin").symlink_to("usr/bin")
+        (self.image / "sbin").symlink_to("usr/sbin")
+        self.image.chmod(0o755)
+        self.owner = os.getuid()
+        self.foreign = set()
+
+    def own_by_1001(self, relative):
+        path = self.image / relative
+        if os.geteuid() == 0:
+            os.lchown(path, 1001, 1001)
+        else:
+            self.foreign.add(path)
+
+    def simulated_owners(self):
+        real = Path.lstat
+
+        def lstat(path):
+            metadata = real(path)
+            if path in self.foreign:
+                return mock.Mock(st_uid=1001, st_gid=1001, st_mode=metadata.st_mode)
+            return metadata
+
+        return mock.patch.object(Path, "lstat", lstat)
+
+    def check(self, roots=root_paths.TENANT_ROOTS):
+        with self.simulated_owners():
+            return root_paths.check(roots, self.image, self.owner)
+
+    def test_clean_tree_passes_and_walks_merged_usr_once(self):
+        report = self.check()
+        self.assertEqual(report["offenders"], [])
+        self.assertEqual(report["offender_count"], 0)
+        # The image root, usr, the 11 entries under usr/local, usr/bin and its
+        # file, usr/sbin and its file, and the /bin and /sbin links themselves.
+        self.assertEqual(report["entries"], 19)
+
+    def test_a_uid_1001_usr_local_bin_fails_naming_the_directory(self):
+        # What extracting Node's release tarball as root used to leave behind.
+        self.own_by_1001("usr/local/bin")
+        self.own_by_1001("usr/local/bin/node")
+        report = self.check()
+        self.assertEqual(report["offender_count"], 2)
+        self.assertEqual(report["offenders"][0], f"{self.image}/usr/local/bin: uid=1001 gid=1001")
+        with self.simulated_owners():
+            with self.assertRaisesRegex(ValueError, r"2 path\(s\) root executes from .*usr/local/bin: uid=1001"):
+                root_paths.require(root_paths.TENANT_ROOTS, self.image, self.owner)
+
+    def test_a_foreign_symlink_fails_but_its_mode_bits_are_ignored(self):
+        self.assertEqual(self.check()["offenders"], [])
+        self.own_by_1001("usr/local/bin/corepack")
+        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/local/bin/corepack: uid=1001 gid=1001"])
+
+    def test_group_or_other_write_fails_on_entries_and_on_ancestors(self):
+        for relative in ("usr/local/share", "usr/local/bin/node", "usr", ""):
+            path = self.image / relative
+            mode = path.lstat().st_mode & 0o7777
+            for extra in (0o020, 0o002):
+                path.chmod(mode | extra)
+                with self.subTest(path=relative or "/", extra=oct(extra)):
+                    self.assertEqual(self.check()["offenders"],
+                                     [f"{path}: mode={mode | extra:04o} (group or other may write)"])
+            path.chmod(mode)
+
+    def test_link_targets_and_path_roots_outside_usr_local_are_checked(self):
+        self.own_by_1001("usr/sbin/init")
+        self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/sbin/init: uid=1001 gid=1001"])
+
+    def test_missing_roots_are_listed_and_escaping_links_fail(self):
+        report = self.check((*root_paths.TENANT_ROOTS, "/home/ubuntu/.bun/bin"))
+        self.assertEqual((report["offenders"], report["missing"]), ([], ["/home/ubuntu/.bun/bin"]))
+        (self.image / "usr/local/sbin").symlink_to("/")
+        report = self.check(("/usr/local/sbin",))
+        self.assertEqual(report["offenders"],
+                         [f"{self.image}/usr/local/sbin: resolves outside the checked image to /"])
+
+    def test_unreadable_directories_raise_instead_of_passing_unseen(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads every directory")
+        closed = self.image / "usr/local/lib/motor"
+        closed.chmod(0)
+        self.addCleanup(closed.chmod, 0o755)
+        with self.assertRaises(PermissionError):
+            self.check()
+
+    def test_roots_cover_every_directory_the_image_units_execute_from(self):
+        def covered(path, roots):
+            return any(path == root or path.startswith(root + "/") for root in roots)
+
+        tenant = [path for name in ("motor-tenant-agent.service", "motor-qualification.service")
+                  for path in unit_paths(HERE / "guest" / name)]
+        boat = unit_paths(BOAT / "motor-boat.service")
+        self.assertIn("/usr/local/lib/motor/cargo/bin", tenant)
+        self.assertIn("/home/ubuntu/.rustup", boat)
+        for name, paths, roots in (("tenant", tenant, root_paths.TENANT_ROOTS), ("boat", boat, root_paths.BOAT_ROOTS)):
+            for path in paths:
+                with self.subTest(image=name, path=path):
+                    self.assertTrue(covered(path, roots))
+
+    def test_recipes_enforce_the_invariant_after_installation(self):
+        import inspect
+        verify = inspect.getsource(guest.verify)
+        self.assertLess(verify.index("verify_tool_trees()"), verify.index("root_paths.require(root_paths.TENANT_ROOTS)"))
+        self.assertLess(verify.index("root_paths.require(root_paths.TENANT_ROOTS)"), verify.index("tools.json"))
+        boat = (BOAT / "install.py").read_text()
+        main = boat[boat.index("def main():"):]
+        self.assertLess(main.index("service_preflight()"), main.index("root_paths.require(root_paths.BOAT_ROOTS)"))
+        self.assertLess(main.index("root_paths.require(root_paths.BOAT_ROOTS)"), main.index("inventory.json"))
+
+    def test_every_archive_extraction_drops_recorded_owners(self):
+        sources = {path: path.read_text() for path in (HERE / "install-guest.py", BOAT / "install.py", INSTALL_TOOLS)}
+        extractions = 0
+        for path, text in sources.items():
+            for number, line in enumerate(text.splitlines(), 1):
+                code = line.split("#")[0]
+                # The tar command itself, not "target", "tarball" or "tar.xz".
+                if re.search(r"(?<![\w.-])tar(?![\w.])", code):
+                    extractions += 1
+                    with self.subTest(path=path.name, line=number):
+                        self.assertIn("--no-same-owner", line)
+                        self.assertIn("--no-same-permissions", line)
+                if "cp -a" in code:
+                    with self.subTest(path=path.name, line=number):
+                        self.assertIn("--no-preserve=ownership", line)
+        # extract() in each Python recipe and the tar.xz branch of install-tools.sh.
+        self.assertEqual(extractions, 3)
+        for path in (HERE / "install-guest.py", BOAT / "install.py"):
+            with self.subTest(path=path.name):
+                self.assertNotIn('run("tar", "-x', sources[path])
+
+    def test_extract_masks_recorded_modes_and_restores_the_umask(self):
+        import io
+        import tarfile
+        archive = self.image.parent / "node.tar.gz"
+        with tarfile.open(archive, "w:gz") as stream:
+            for name, kind, mode in (("node-v1/bin", tarfile.DIRTYPE, 0o777), ("node-v1/bin/node", tarfile.REGTYPE, 0o777)):
+                entry = tarfile.TarInfo(name)
+                entry.type, entry.mode, entry.uid, entry.gid = kind, mode, 1001, 1001
+                stream.addfile(entry, io.BytesIO(b"") if kind == tarfile.REGTYPE else None)
+        destination = self.image.parent / "extracted"
+        destination.mkdir()
+        previous = os.umask(0)
+        try:
+            guest.extract(archive, destination, "-z", "--strip-components=1")
+            self.assertEqual(os.umask(0), 0)
+        finally:
+            os.umask(previous)
+        for relative in ("bin", "bin/node"):
+            metadata = (destination / relative).lstat()
+            with self.subTest(path=relative):
+                self.assertEqual(metadata.st_mode & 0o7777, 0o755)
+                self.assertEqual(metadata.st_uid, os.geteuid())
+
+    def test_qualification_probe_fails_a_drifted_guest_and_passes_a_clean_one(self):
+        with mock.patch("builtins.print") as printed:
+            qualification.root_path_probe(self.image, self.owner)
+        self.assertEqual(printed.call_args.args[0], qualification.ROOT_PATHS)
+        self.image.joinpath("usr/local/include").chmod(0o775)
+        with mock.patch("builtins.print") as printed, self.assertRaisesRegex(RuntimeError, "usr/local/include: mode=0775"):
+            qualification.root_path_probe(self.image, self.owner)
+        evidence = json.loads(printed.call_args_list[0].args[0].split(" ", 1)[1])
+        self.assertEqual(evidence["offender_count"], 1)
 
 
 if __name__ == "__main__":

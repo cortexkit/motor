@@ -6,6 +6,8 @@ import importlib.util
 import io
 from importlib.machinery import SourceFileLoader
 import json
+import os
+import pwd
 import sys
 from pathlib import Path
 import tempfile
@@ -208,6 +210,64 @@ class RecipeTests(unittest.TestCase):
             install.target_directories()
         self.assertEqual(run.call_args.args[:8], ('install','-d','-o','root','-g','root','-m','0755'))
         self.assertTrue({'/usr/local/bin','/usr/local/libexec','/etc/systemd/system','/etc/ssh/sshd_config.d','/etc/motor','/etc/motor/tenant'} <= set(run.call_args.args[8:]))
+
+    def test_absent_tool_home_is_created_root_owned_before_tools_install(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(install, 'run') as run:
+            home = Path(tmp, 'ubuntu')
+            self.assertEqual(install.tool_home(home), {'path': str(home), 'created': True})
+        run.assert_called_once_with('install', '-d', '-o', 'root', '-g', 'root', '-m', '0755', str(home))
+        main = (HERE / 'install.py').read_text().split('def main():', 1)[1]
+        self.assertLess(main.index('tool_home()'), main.index('tools(manifest)'))
+
+    def test_tool_home_owned_by_another_account_is_refused_with_its_identity(self):
+        if os.geteuid() == 0:
+            self.skipTest('needs a directory a non-root account owns')
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(install, 'run') as run:
+            home, proc = Path(tmp, 'ubuntu'), Path(tmp, 'proc')
+            home.mkdir(mode=0o755)
+            for pid, owner in (('123', uid), ('456', uid + 1)):
+                (proc / pid).mkdir(parents=True)
+                (proc / pid / 'status').write_text(f'Name:\tfixture\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n')
+            (proc / 'self').mkdir()
+            with self.assertRaises(ValueError) as refused:
+                install.tool_home(home, proc)
+        run.assert_not_called()
+        message = str(refused.exception)
+        self.assertIn(f'is owned by uid {uid} (', message)
+        try:
+            self.assertIn(pwd.getpwuid(uid).pw_name + ':x:' + str(uid), message)
+        except KeyError:
+            self.assertIn('no passwd entry', message)
+        self.assertIn('running processes: [123]', message)
+
+    def test_tool_home_must_be_a_root_directory_without_group_or_other_write(self):
+        for mode, expected in ((0o040755, None), (0o040775, 'mode 0775'), (0o040757, 'mode 0757'),
+                               (0o120777, 'physical directory')):
+            home = Mock()
+            home.lstat.return_value = Mock(st_uid=0, st_mode=mode)
+            home.__str__ = lambda _self: '/home/ubuntu'
+            with self.subTest(mode=oct(mode)), patch.object(install, 'run') as run:
+                if expected is None:
+                    self.assertEqual(install.tool_home(home), {'path': '/home/ubuntu', 'created': False})
+                else:
+                    with self.assertRaisesRegex(ValueError, expected):
+                        install.tool_home(home)
+                run.assert_not_called()
+
+    def test_archives_are_extracted_without_recorded_owners_under_a_fixed_umask(self):
+        seen = []
+        def record(*args, **_kwargs):
+            seen.append((args, os.umask(0o022)))
+        previous = os.umask(0o077)
+        try:
+            with patch.object(install, 'run', side_effect=record):
+                install.extract('/srv/build/downloads/node.tar.xz', '/usr/local', '-J', '--strip-components=1')
+            self.assertEqual(os.umask(previous), 0o077)
+        finally:
+            os.umask(previous)
+        self.assertEqual(seen, [(('tar', '--no-same-owner', '--no-same-permissions', '-J', '--strip-components=1',
+                                  '-xf', '/srv/build/downloads/node.tar.xz', '-C', '/usr/local'), 0o022)])
 
     def test_rendered_helper_install_normalizes_every_parent_and_fixed_binary(self):
         calls = []

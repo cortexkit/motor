@@ -179,6 +179,20 @@ either `(coreutils)` or `(GNU coreutils)`.
 executing it. The probe compares the job's `gnutest` file hash with a fresh hash
 of the host's `gnutest` file because job filesystems omit dpkg's database.
 The report carries the manifest digest and observed versions.
+
+Everything root executes from must be root-owned with no group or other
+write. That covers every entry under `/usr/local`, `/usr/bin`, `/usr/sbin`,
+`/bin`, `/sbin`, `/srv/build/cargo-home/bin`, `/home/ubuntu/.bun/bin` and
+`/home/ubuntu/.rustup`, plus each directory above them (the PATH and
+RUSTUP_HOME of `motor-boat.service`). Symlinks must be root-owned too.
+Installation enforces this after the service preflight, recorded as
+`root_owned_paths` in the inventory, and every probe phase reruns the operator
+checkout's `script/tenant-image/guest/root_paths.py` as `<phase>.root_owned_paths`.
+Before installing the runner toolchains, the recipe creates an absent `/home/ubuntu` as
+root:root 0755. If another account owns it, the recipe refuses and names the
+owner's uid, passwd entry and running processes; it never takes over a
+provider account's home. Release archives are extracted with `--no-same-owner
+--no-same-permissions` under umask 022, because Node's tarball records uid 1001.
 The manifest separates compiler entry points by role: the build server uses
 `/motor-tools/prefrontal-build-slot`, whose `.cache` must name the trusted
 `/motor-tools/sccache` script; single-job Boat uses `RUSTC_WRAPPER=sccache`
