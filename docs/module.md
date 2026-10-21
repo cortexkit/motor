@@ -452,7 +452,11 @@ this: a re-request before admission returns the same reservation and placement
 with a fresh run token. These waits don't count against the three placement
 attempts. When the deadline passes, the job gets the same refusal as for
 `no_capacity` (`hosted_capacity`, runner full, retry after 2 s), and the unused
-reservation is released. Before the durable `run_sent`
+reservation is released. That holds when the deadline cuts off the lease request
+that asks again after a `host_full` refusal: the job was waiting for the host, so
+it is refused as runner full, not unreachable. A broker that has not answered
+the job's first lease request when the deadline passes gives
+`hosted_provisioning` (unreachable). Before the durable `run_sent`
 marker, refusals identify repository-selected routing with the exact detail text
 `hosted stage-1 routing (hosted_repositories)`.
 After that marker the existing hosted reattach/finish path governs an ambiguous
@@ -490,6 +494,7 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline`,
 `stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job`,
 `stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity`,
+`stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_job_waited_on`,
 `stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted`,
 `stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
 `stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,

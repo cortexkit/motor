@@ -93,6 +93,10 @@ pub struct Harness {
     /// Refusal reasons the host sends, one per run connection and in order,
     /// before it falls back to its behavior.
     pub host_refusals: Arc<Mutex<VecDeque<&'static str>>>,
+    /// The 1-based number of the `/v1/leases` request the broker reads and
+    /// records but never answers, holding its connection open as a broker
+    /// that stopped responding would; 0 answers every request.
+    pub unanswered_lease: Arc<AtomicUsize>,
     pub tasks: Vec<JoinHandle<()>>,
 }
 impl Drop for Harness {
@@ -440,6 +444,7 @@ impl Harness {
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unanswered_lease = Arc::new(AtomicUsize::new(0));
         let http_task = tokio::spawn({
             let broker = broker.clone();
             let requests = requests.clone();
@@ -448,7 +453,11 @@ impl Harness {
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
+            let unanswered_lease = unanswered_lease.clone();
             async move {
+                // Connections of unanswered requests, kept open until the
+                // harness is dropped and aborts this task.
+                let mut unanswered = Vec::new();
                 while let Ok((mut socket, _)) = http.accept().await {
                     let mut bytes = Vec::new();
                     loop {
@@ -460,6 +469,14 @@ impl Harness {
                         if bytes.ends_with(b"\r\n\r\n") {
                             break;
                         }
+                    }
+                    // A client may open a connection and close it before
+                    // writing anything, as an HTTP client does when the
+                    // request it was connecting for is cancelled. That is not
+                    // a request; anything else that was sent is parsed as
+                    // one, and a malformed request still panics.
+                    if bytes.is_empty() {
+                        continue;
                     }
                     let text = String::from_utf8_lossy(&bytes);
                     let path = text
@@ -487,7 +504,15 @@ impl Harness {
                     socket.read_exact(&mut body).await.unwrap();
                     requests.lock().unwrap().push(path.clone());
                     let stub = if path == "/v1/leases" {
-                        lease_bodies.lock().unwrap().push(body.clone());
+                        let number = {
+                            let mut bodies = lease_bodies.lock().unwrap();
+                            bodies.push(body.clone());
+                            bodies.len()
+                        };
+                        if number == unanswered_lease.load(Ordering::SeqCst) {
+                            unanswered.push(socket);
+                            continue;
+                        }
                         lease_replies.lock().unwrap().pop_front()
                     } else {
                         None
@@ -542,6 +567,7 @@ impl Harness {
             drop_lease,
             release_admitted,
             host_refusals,
+            unanswered_lease,
             tasks: vec![host_task, http_task],
         }
     }

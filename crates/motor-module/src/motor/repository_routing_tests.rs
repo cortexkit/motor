@@ -736,13 +736,80 @@ async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
     assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
 }
 
+/// Keeps tokio's paused clock still until dropped, so only
+/// `tokio::time::advance` moves it. A paused clock otherwise jumps to the next
+/// timer whenever the runtime is idle, including while it waits for the
+/// harness's real loopback sockets, which would fire queue-wait deadlines in
+/// the middle of a lease request. Tokio makes no such jump while a blocking
+/// task runs, so this holds one open.
+struct HeldClock {
+    _release: std::sync::mpsc::Sender<()>,
+}
+impl HeldClock {
+    fn new() -> Self {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = held.recv();
+        });
+        Self { _release: release }
+    }
+}
+
+/// Waits in real time, without moving the held clock, until `done` holds.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for {what}"
+        );
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(5)))
+            .await
+            .unwrap();
+    }
+}
+
+/// Waits until job `id` has had `leases` lease requests and its host refused
+/// the last granted one as full: ck-motor gives a placement attempt back only
+/// for that refusal, just before it starts its two-second wait. Then waits
+/// for the wall clock to pass the issue second of every run token so far, so
+/// the next request needs no wait for a later token issue time; the run
+/// token's issue time is in wall-clock seconds, which the held clock does not
+/// move.
+async fn until_host_full_wait(h: &Harness, motor: &Motor, id: Uuid, leases: usize) {
+    until("the host-full wait", || {
+        h.lease_bodies.lock().unwrap().len() == leases
+            && h.tokens.load(Ordering::SeqCst) == leases
+            && motor
+                .hosted_state(id)
+                .is_some_and(|state| state.placement_attempts == 0)
+    })
+    .await;
+    let issued = h.iats.lock().unwrap().iter().copied().max().unwrap();
+    until("a later token issue second", || {
+        crate::hosted::now_s() > issued
+    })
+    .await;
+}
+
+/// The terminal record of the job whose records `job` collects, awaited in
+/// real time: the job must end without the held clock moving any further.
+async fn terminal_without_more_time(
+    job: tokio::task::JoinHandle<(Vec<u8>, TerminalRecord)>,
+) -> TerminalRecord {
+    until("the terminal record", || job.is_finished()).await;
+    job.await.unwrap().1
+}
+
 /// The broker grants a routed job's lease from a stale view of the host, and
 /// the host refuses it as full (or out of capacity) twice before admitting
 /// it. The job waits and asks again with the same job ID and lease body,
 /// then runs once on the host; nothing is released and nothing reaches the
-/// build server.
-#[tokio::test]
+/// build server. The clock is held, so each wait ends only when the test
+/// moves time on by two seconds.
+#[tokio::test(start_paused = true)]
 async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
+    let _clock = HeldClock::new();
     for refusals in [["host_full", "host_full"], ["host_full", "capacity"]] {
         let h = Harness::new(Behavior::CompleteRun).await;
         h.host_refusals.lock().unwrap().extend(refusals);
@@ -753,11 +820,17 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
         let started = tokio::time::Instant::now();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
-        let (_, terminal) = records(stream).await;
+        let job = tokio::spawn(records(stream));
+        for leases in [1, 2] {
+            until_host_full_wait(&h, &motor, id, leases).await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        let terminal = terminal_without_more_time(job).await;
         assert_eq!(terminal.outcome, Outcome::Exit { code: 23 }, "{refusals:?}");
-        assert!(
-            started.elapsed() >= Duration::from_secs(4),
-            "each host refusal waits before asking again"
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(4),
+            "each host refusal waits two seconds before asking again"
         );
         assert_eq!(h.runs.load(Ordering::SeqCst), 1);
         assert_eq!(h.tokens.load(Ordering::SeqCst), 3);
@@ -788,8 +861,12 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
 /// A host that stays full uses up the routed job's queue-wait budget and no
 /// more, then gives the same typed, retryable refusal as broker no_capacity.
 /// The unused reservation is released; nothing reaches the build server.
-#[tokio::test]
+/// With a three-second budget and the clock held, the job asks exactly
+/// twice: at the start and after one two-second wait. A second wait would
+/// end past the deadline, so the job waits out the last second instead.
+#[tokio::test(start_paused = true)]
 async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity() {
+    let _clock = HeldClock::new();
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
     let config = Config {
@@ -801,9 +878,24 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
     let started = tokio::time::Instant::now();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert!(started.elapsed() >= Duration::from_secs(3));
-    assert!(started.elapsed() < Duration::from_secs(8));
+    let job = tokio::spawn(records(stream));
+    until_host_full_wait(&h, &motor, id, 1).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    until("the second host refusal", || {
+        h.tokens.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(999)).await;
+    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert!(
+        !job.is_finished(),
+        "the job is refused when its queue-wait budget ends, not before"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let terminal = terminal_without_more_time(job).await;
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
     assert_eq!(
         terminal.outcome,
         Outcome::RefusedBeforeStart {
@@ -816,7 +908,19 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
         detail.contains("hosted stage-1 routing (hosted_repositories): hosted_capacity"),
         "{detail}"
     );
-    assert!(h.lease_bodies.lock().unwrap().len() >= 2);
+    let bodies: Vec<motor_lease::LeaseRequest> = h
+        .lease_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_slice(body).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1].job_id, id.to_string());
+    assert_eq!(
+        crate::hosted::tests::canonical_lease_bytes(&bodies[1]),
+        crate::hosted::tests::canonical_lease_bytes(&bodies[0])
+    );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert!(!motor.hosted_state(id).unwrap().run_sent);
     assert_eq!(
@@ -824,4 +928,71 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
         vec![format!("/v1/leases/{id}/release")]
     );
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+/// The queue-wait budget can end while a lease request is in flight. Once
+/// the host has refused the job as full, the job is waiting for that host,
+/// so cutting off the request that asks again still gives the host-full
+/// refusal (runner full, retry after 2 s), not the transport failure the
+/// cut-off causes, and the unused reservation is released. A broker that
+/// has not answered the job's first request when the budget ends is
+/// unreachable.
+#[tokio::test(start_paused = true)]
+async fn stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_job_waited_on() {
+    let _clock = HeldClock::new();
+    for after_host_full in [true, false] {
+        let h = Harness::new(Behavior::Refuse("host_full")).await;
+        let leases = if after_host_full { 2 } else { 1 };
+        h.unanswered_lease.store(leases, Ordering::SeqCst);
+        let (scratch, repo) = committed_repo();
+        let config = Config {
+            queue_wait_limit_s: 3,
+            ..config(&h, &repo)
+        };
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let started = tokio::time::Instant::now();
+        let stream = motor.run(request(&repo)).unwrap();
+        let id = stream.job_id;
+        let job = tokio::spawn(records(stream));
+        if after_host_full {
+            until_host_full_wait(&h, &motor, id, 1).await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        until("the unanswered lease request", || {
+            h.lease_bodies.lock().unwrap().len() == leases
+        })
+        .await;
+        tokio::time::advance(started + Duration::from_secs(3) - tokio::time::Instant::now()).await;
+        let terminal = terminal_without_more_time(job).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let (reason, code, retry_after_ms) = if after_host_full {
+            (RefusalReason::RunnerFull, "hosted_capacity", 2000)
+        } else {
+            (RefusalReason::Unreachable, "hosted_provisioning", 1000)
+        };
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart { reason },
+            "after_host_full={after_host_full}"
+        );
+        assert_eq!(terminal.retry_after_ms, Some(retry_after_ms));
+        let detail = terminal.refusal_detail.unwrap();
+        assert!(
+            detail.contains(&format!(
+                "hosted stage-1 routing (hosted_repositories): {code}"
+            )),
+            "{detail}"
+        );
+        assert_eq!(h.tokens.load(Ordering::SeqCst), leases - 1);
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        assert!(!motor.hosted_state(id).unwrap().run_sent);
+        if after_host_full {
+            assert_eq!(
+                lease_settlement_requests(&h),
+                vec![format!("/v1/leases/{id}/release")]
+            );
+        }
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    }
 }
