@@ -269,7 +269,7 @@ profile retains PrivatePIDs. The flag requires the Linux host backend; tenant
 mode additionally requires root-private local sockets rather than vsock.
 
 On systemd 255, the unit runs the installed, root-owned
-`/usr/local/bin/motor-runner job-pid-init <uid> <gid> <groups> -- <wrapper argv>`.
+`/usr/local/bin/motor-runner job-pid-init <uid> <gid> <groups> <proc-reference-json> -- <wrapper argv>`.
 The runner refuses startup if that installed executable is missing, unsafe or
 different from the running executable. The init starts as root with only
 `CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_SETPCAP` and `RestrictNamespaces=pid`,
@@ -293,8 +293,32 @@ write their step and error to a root-only setup-error file. A complete report,
 no wrapper exit code and no job output prove refused-before-start. If status
 226 has neither a valid wrapper exit file nor complete setup evidence, the
 outcome is unknown, never an assumed retry-safe refusal or job exit 226. A
-wrapper-recorded exit 226 remains a normal exit. None of these changes apply to
-build-server, tenant, or systemd >=257 units.
+wrapper-recorded exit 226 remains a normal exit. A supervisor wait failure uses
+status 227 and cannot write a setup-failure record; without a wrapper exit file
+it is an unknown outcome, never a retry-safe refusal. These changes apply only
+when Boat mode is enabled and systemd lacks PrivatePIDs, including Boat-plus-
+tenant deployments on older systemd. Ordinary build-server, non-Boat tenant
+and systemd >=257 units are unchanged.
+
+The init starts a separate session/process group, re-arms its parent-death
+SIGKILL after dropping credentials, and checks both PPid and an inherited
+supervisor pidfd to close the reparenting race (PPid is 0 across PID namespaces).
+The root supervisor closes the setup-record handle immediately after fork.
+Only trusted pre-exec code writes that root-only file, either a failure line or
+JSON telemetry recording credentials, post-drop PDEATHSIG, SID/PGID, descriptors
+that survive exec and proc protections. The live root observer checks it and
+the actual host-view session separation while a job runs.
+
+Before serving Boat fallback jobs, the runner measures protected proc mounts
+in an independent systemd reference unit using the probe's protection policy.
+The measured path/read-only set is passed in the init argv; after moving the
+mounts, the init requires exact equality or refuses before start. No guessed
+systemd mount list is embedded. clone3 explicitly returns ENOSYS in every
+supported ABI, allowing libc to fall back to the checked clone call; an unknown
+architecture is killed rather than relying on another filter. A child core
+dump is never duplicated by the privileged supervisor: it mirrors the signal
+with dumpability disabled, so systemd records killed-by-signal rather than the
+child's core-dumped bit.
 
 **What a Boat job sees in `/proc`.** The same as a build-server job: its own
 process directories (other accounts' are hidden), plus the non-process entries

@@ -17,8 +17,9 @@
 //! 4. execs the unchanged wrapper as PID 1.
 //!
 //! The first process stays outside the namespace as the unit's main process
-//! and forwards PID 1's exit code or terminating signal, so systemd records
-//! the same `ExecMainCode`/`ExecMainStatus` as on the build server.
+//! and forwards PID 1's exit code or terminating signal. The supervisor never
+//! dumps another core: a child's core-dumped status becomes killed-by-signal
+//! with the same signal number, not the same core-dumped bit.
 //!
 //! A failure before the wrapper starts writes one line starting with
 //! [`SETUP_FAILURE_PREFIX`] to [`SETUP_ERROR_FILE`] in the job's output
@@ -39,7 +40,9 @@ pub(crate) const INSTALLED_RUNNER: &str = "/usr/local/bin/motor-runner";
 pub(crate) const MODE: &str = "job-pid-init";
 /// systemd's own exit status for a failed namespace setup (`EXIT_NAMESPACE`).
 pub(crate) const SETUP_FAILED: i32 = 226;
-/// File in the job's output directory that receives a setup failure line. The
+/// No trusted command status exists if the supervisor itself cannot wait.
+pub(crate) const SUPERVISOR_FAILED: i32 = 227;
+/// File receiving a setup failure line or trusted pre-exec JSON telemetry. The
 /// runner creates it root-owned 0600 before the unit starts; only the init,
 /// still root, can open it, and it is closed before the wrapper runs.
 pub(crate) const SETUP_ERROR_FILE: &str = "setup-error";
@@ -63,6 +66,8 @@ pub(crate) struct JobIdentity {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) groups: Vec<u32>,
+    /// Protected proc mounts measured in an independent systemd reference unit.
+    pub(crate) proc_protections: Vec<(String, bool)>,
 }
 
 impl JobIdentity {
@@ -89,6 +94,7 @@ impl JobIdentity {
                 .split_whitespace()
                 .map(parse)
                 .collect::<io::Result<_>>()?,
+            proc_protections: reference_proc_protections(user)?,
         };
         if identity.uid == 0 || identity.gid == 0 || identity.groups.contains(&0) {
             return Err(io::Error::other(format!(
@@ -114,6 +120,7 @@ pub(crate) fn exec_start(identity: &JobIdentity, wrapper: &[&str]) -> Vec<String
         identity.uid.to_string(),
         identity.gid.to_string(),
         groups,
+        serde_json::to_string(&identity.proc_protections).expect("proc protection list is JSON"),
         "--".to_owned(),
     ]
     .into_iter()
@@ -213,6 +220,14 @@ fn parse_args(args: Vec<OsString>) -> io::Result<Plan> {
             .map(|group| group.parse().map_err(|_| invalid("groups")))
             .collect::<io::Result<_>>()?
     };
+    let expected = args.next().ok_or_else(|| invalid("proc protections"))?;
+    let proc_protections: Vec<(String, bool)> = serde_json::from_str(
+        expected
+            .to_str()
+            .ok_or_else(|| invalid("proc protections"))?,
+    )
+    .map_err(|_| invalid("proc protections"))?;
+    validate_proc_protections(&proc_protections)?;
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
         return Err(invalid("missing -- before the wrapper command"));
     }
@@ -229,14 +244,22 @@ fn parse_args(args: Vec<OsString>) -> io::Result<Plan> {
         return Err(invalid("the job identity must not be root"));
     }
     Ok(Plan {
-        identity: JobIdentity { uid, gid, groups },
+        identity: JobIdentity {
+            uid,
+            gid,
+            groups,
+            proc_protections,
+        },
         argv,
     })
 }
 
 /// Where a setup failure is reported: the root-only setup-error file when the
 /// unit binds it, otherwise stderr.
-struct Report(libc::c_int);
+struct Report {
+    fd: libc::c_int,
+    owned: bool,
+}
 
 impl Report {
     fn open() -> Self {
@@ -248,18 +271,30 @@ impl Report {
                 libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
-        Self(if fd < 0 { libc::STDERR_FILENO } else { fd })
+        Self {
+            fd: if fd < 0 { libc::STDERR_FILENO } else { fd },
+            owned: fd >= 0,
+        }
     }
 
     fn fail(&self, step: &str, error: impl fmt::Display) -> ! {
         let line = format!("{SETUP_FAILURE_PREFIX}{step}: {error}\n");
+        self.write(&line);
+        unsafe { libc::_exit(SETUP_FAILED) }
+    }
+
+    fn write(&self, line: &str) {
         // SAFETY: the buffer is valid for its length. Retry interrupted and
         // partial writes so the engine can recognize the setup failure line.
         unsafe {
+            if self.owned {
+                libc::ftruncate(self.fd, 0);
+                libc::lseek(self.fd, 0, libc::SEEK_SET);
+            }
             let mut written = 0;
             while written < line.len() {
                 let n = libc::write(
-                    self.0,
+                    self.fd,
                     line.as_ptr().add(written).cast(),
                     line.len() - written,
                 );
@@ -269,13 +304,22 @@ impl Report {
                     break;
                 }
             }
-            libc::_exit(SETUP_FAILED)
         }
     }
 
     fn check(&self, step: &str, result: libc::c_long) {
         if result < 0 {
             self.fail(step, io::Error::last_os_error());
+        }
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe {
+                libc::close(self.fd);
+            }
         }
     }
 }
@@ -300,26 +344,38 @@ pub fn run(args: Vec<OsString>) -> ! {
         let mut all = std::mem::zeroed::<libc::sigset_t>();
         libc::sigfillset(&mut all);
         libc::sigprocmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+        // PID 1 sees an outside parent as PPid 0 even after reparenting. A
+        // pidfd is therefore needed in addition to the ordinary PPid check.
+        let parent_fd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as libc::c_int;
+        report.check("open supervisor pidfd", parent_fd.into());
         report.check(
             "create PID namespace",
             libc::unshare(libc::CLONE_NEWPID).into(),
         );
         match libc::fork() {
             -1 => report.fail("start namespace init", io::Error::last_os_error()),
-            0 => namespace_init(&plan, &report),
+            0 => namespace_init(&plan, &report, parent_fd),
             child => {
-                let mut status = 0;
-                loop {
-                    if libc::waitpid(child, &mut status, 0) == child {
-                        break;
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EINTR) {
-                        report.fail("wait for namespace init", error);
-                    }
-                }
-                forward(status)
+                // Only the pre-exec child may authenticate a setup failure.
+                drop(report);
+                libc::close(parent_fd);
+                supervise(child)
             }
+        }
+    }
+}
+
+unsafe fn supervise(child: libc::pid_t) -> ! {
+    if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+        libc::_exit(SUPERVISOR_FAILED);
+    }
+    let mut status = 0;
+    loop {
+        if libc::waitpid(child, &mut status, 0) == child {
+            forward(status);
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            libc::_exit(SUPERVISOR_FAILED);
         }
     }
 }
@@ -350,21 +406,14 @@ fn forward(status: libc::c_int) -> ! {
     unsafe {
         match forwarded(status) {
             Forward::Exit(code) => libc::_exit(code),
-            Forward::Signal {
-                signal,
-                core_dumped,
-            } => {
+            Forward::Signal { signal, .. } => {
+                // A child core is never duplicated by this privileged parent.
+                // Its signal is preserved, but the parent's core bit is clear.
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                    libc::_exit(SUPERVISOR_FAILED);
+                }
                 if signal != libc::SIGKILL && signal != libc::SIGSTOP {
                     libc::signal(signal, libc::SIG_DFL);
-                }
-                if !core_dumped {
-                    // PID 1 died without a core dump; dying the same way must
-                    // not write one for this process either.
-                    let none = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    libc::setrlimit(libc::RLIMIT_CORE, &none);
                 }
                 let mut set = std::mem::zeroed::<libc::sigset_t>();
                 libc::sigemptyset(&mut set);
@@ -386,7 +435,7 @@ fn path(text: &str) -> CString {
 /// PID 1 of the new namespace, still root and still in the unit's mount
 /// namespace. Never returns: it execs the wrapper or exits with
 /// [`SETUP_FAILED`].
-unsafe fn namespace_init(plan: &Plan, report: &Report) -> ! {
+unsafe fn namespace_init(plan: &Plan, report: &Report, parent_fd: libc::c_int) -> ! {
     let null = std::ptr::null::<libc::c_char>();
     // If the unit's main process dies, so does the namespace. Should it die
     // before this call, systemd stops the unit and kills its whole cgroup.
@@ -394,6 +443,7 @@ unsafe fn namespace_init(plan: &Plan, report: &Report) -> ! {
         "set parent-death signal",
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong).into(),
     );
+    separate_session().unwrap_or_else(|error| report.fail("create job session", error));
     // systemd's default MountFlags=shared leaves these shared inside the unit,
     // and the kernel refuses to move a mount whose parent is shared. Both are
     // the unit's private API mounts; nothing outside the unit receives them.
@@ -467,7 +517,16 @@ unsafe fn namespace_init(plan: &Plan, report: &Report) -> ! {
         "remove proc staging directory",
         libc::rmdir(staging.as_ptr()).into(),
     );
+    let table = fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_else(|error| report.fail("read final proc mounts", error));
+    verify_proc_protections(&table, &plan.identity.proc_protections)
+        .unwrap_or_else(|error| report.fail("verify protected proc mounts", error));
+    let parent = libc::getppid();
     drop_privileges(&plan.identity, report);
+    arm_parent_death_signal(parent, parent_fd).unwrap_or_else(|error| {
+        report.fail("re-arm parent-death signal after credential drop", error)
+    });
+    libc::close(parent_fd);
     // The unit's session keyring was created for root. Give the job its own.
     report.check(
         "join a new session keyring",
@@ -500,8 +559,62 @@ unsafe fn namespace_init(plan: &Plan, report: &Report) -> ! {
     libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     let mut argv: Vec<*const libc::c_char> = plan.argv.iter().map(|arg| arg.as_ptr()).collect();
     argv.push(std::ptr::null());
+    // Root-only telemetry is written exclusively by trusted pre-exec code.
+    // The host probe reads it; the job cannot forge it or inherit its fd.
+    let mut death_signal = 0i32;
+    report.check(
+        "read parent-death signal",
+        libc::prctl(libc::PR_GET_PDEATHSIG, &mut death_signal).into(),
+    );
+    let fds = exec_fds().unwrap_or_else(|error| report.fail("inspect exec descriptors", error));
+    report.write(&format!("{}\n", serde_json::json!({"pdeathsig":death_signal, "uid":libc::getuid(), "gid":libc::getgid(),
+        "sid":libc::getsid(0), "pgid":libc::getpgrp(), "ppid":libc::getppid(), "exec_fds":fds, "proc_submounts":proc_protections(&table).unwrap()})));
     libc::execv(argv[0], argv.as_ptr());
     report.fail("exec the wrapper", io::Error::last_os_error())
+}
+
+unsafe fn arm_parent_death_signal(parent: libc::pid_t, parent_fd: libc::c_int) -> io::Result<()> {
+    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut watch = libc::pollfd {
+        fd: parent_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = libc::poll(&mut watch, 1, 0);
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if libc::getppid() != parent || ready != 0 {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Ok(())
+}
+
+unsafe fn separate_session() -> io::Result<()> {
+    if libc::setsid() < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn exec_fds() -> io::Result<Vec<i32>> {
+    let mut kept = Vec::new();
+    for entry in fs::read_dir("/proc/self/fd")? {
+        if let Some(fd) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                kept.push(fd);
+            }
+        }
+    }
+    kept.sort_unstable();
+    Ok(kept)
 }
 
 const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
@@ -628,6 +741,92 @@ fn proc_submounts(table: &str) -> io::Result<Vec<String>> {
         .collect())
 }
 
+/// Measure the same independent systemd policy used by the live Boat probe.
+/// The manager, rather than a copied list of paths, defines the expected set.
+fn reference_proc_protections(user: &str) -> io::Result<Vec<(String, bool)>> {
+    let mut command = crate::privilege::command("/usr/bin/systemd-run");
+    command.args([
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--service-type=exec",
+    ]);
+    for property in [
+        format!("User={user}"),
+        format!("Group={user}"),
+        "NoNewPrivileges=yes".into(),
+        "CapabilityBoundingSet=".into(),
+        "RestrictNamespaces=yes".into(),
+        "ProtectProc=invisible".into(),
+        "ProtectKernelTunables=yes".into(),
+        "ProtectKernelModules=yes".into(),
+        "ProtectControlGroups=yes".into(),
+        "PrivateDevices=yes".into(),
+        "PrivateNetwork=yes".into(),
+        "PrivateTmp=yes".into(),
+        "ProtectSystem=strict".into(),
+        "ProtectHome=tmpfs".into(),
+        "MountAPIVFS=yes".into(),
+        "KeyringMode=private".into(),
+    ] {
+        command.arg(format!("--property={property}"));
+    }
+    command.args(["/bin/cat", "/proc/self/mountinfo"]);
+    let output = crate::systemd::output(&mut command)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot measure systemd proc protections: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let protections = proc_protections(&String::from_utf8_lossy(&output.stdout))?;
+    validate_proc_protections(&protections)?;
+    Ok(protections)
+}
+
+fn proc_protections(table: &str) -> io::Result<Vec<(String, bool)>> {
+    let mut protections = Vec::new();
+    for line in table.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 6 {
+            return Err(io::Error::other("invalid mountinfo entry"));
+        }
+        let point = unescape(fields[4]);
+        if point.starts_with("/proc/") {
+            protections.push((point, fields[5].split(',').any(|flag| flag == "ro")));
+        }
+    }
+    protections.sort();
+    Ok(protections)
+}
+
+fn validate_proc_protections(expected: &[(String, bool)]) -> io::Result<()> {
+    if !expected
+        .iter()
+        .any(|(point, ro)| point == "/proc/sys" && *ro)
+        || expected
+            .iter()
+            .any(|(point, _)| !point.starts_with("/proc/") || point.contains('\0'))
+    {
+        return Err(io::Error::other(
+            "invalid reference proc protections: read-only /proc/sys required",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_proc_protections(table: &str, expected: &[(String, bool)]) -> io::Result<()> {
+    validate_proc_protections(expected)?;
+    let mut expected = expected.to_vec();
+    expected.sort();
+    let actual = proc_protections(table)?;
+    if actual != expected {
+        return Err(io::Error::other(format!("proc protections differ from systemd reference: expected {expected:?}, actual {actual:?}")));
+    }
+    Ok(())
+}
+
 /// mountinfo writes space, tab, newline and backslash as `\ooo` octal.
 fn unescape(field: &str) -> String {
     let bytes = field.as_bytes();
@@ -676,6 +875,7 @@ const BPF_JMP_JSET_K: u16 = 0x45;
 const BPF_RET_K: u16 = 0x06;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 /// x32 system calls are x86_64-arch calls with this bit set in the number.
@@ -694,6 +894,7 @@ const X86_64_SETNS: u32 = 308;
 const I386_CLONE: u32 = 120;
 const I386_UNSHARE: u32 = 310;
 const I386_SETNS: u32 = 346;
+const CLONE3: u32 = 435;
 
 /// A step of the filter, with jumps to named labels.
 enum Step {
@@ -710,25 +911,29 @@ enum Step {
 /// `errno` for `unshare` and `clone` whose flags include CLONE_NEWPID, and for
 /// `setns` whose namespace type is CLONE_NEWPID or 0 (any type, which systemd
 /// refuses too). It covers x86_64, x32 and i386 system call numbers and allows
-/// everything else, which systemd's filter still governs. systemd already
-/// answers `clone3` with ENOSYS and every other namespace type with EPERM.
+/// other supported-ABI calls, which systemd's filter still governs. clone3's
+/// pointed-to arguments cannot be inspected by classic BPF, so return ENOSYS
+/// explicitly and let libc fall back to clone. Unknown architectures are killed
+/// rather than trusting an inherited filter to cover an unrecognized ABI.
 /// The engine passes EPERM, the errno systemd's filter uses; tests pass a
 /// distinct value to see which refusals come from this filter.
 ///
 /// seccompiler's high-level filter targets one architecture and kills on an
 /// architecture mismatch; it has no i386 target. This small multi-ABI filter
-/// instead preserves systemd's architecture policy while handling i386 and x32
-/// namespace calls explicitly. Tests exercise both arms of every BPF jump.
+/// handles i386 and x32 namespace calls explicitly, failing closed otherwise.
+/// Tests exercise both arms of every BPF jump.
 fn namespace_filter(errno: u16) -> Vec<SockFilter> {
     use Step::*;
     let steps = [
         Load(DATA_ARCH),
         JumpIfEqual(AUDIT_ARCH_X86_64, "x86_64", "other_arch"),
         Label("other_arch"),
-        JumpIfEqual(AUDIT_ARCH_I386, "i386", "allow"),
+        JumpIfEqual(AUDIT_ARCH_I386, "i386", "kill"),
         Label("x86_64"),
         Load(DATA_NR),
         And(!X32_SYSCALL_BIT),
+        JumpIfEqual(CLONE3, "clone3", "x86_64_calls"),
+        Label("x86_64_calls"),
         JumpIfEqual(X86_64_UNSHARE, "flags", "x86_64_not_unshare"),
         Label("x86_64_not_unshare"),
         JumpIfEqual(X86_64_CLONE, "flags", "x86_64_not_clone"),
@@ -736,6 +941,8 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         JumpIfEqual(X86_64_SETNS, "nstype", "allow"),
         Label("i386"),
         Load(DATA_NR),
+        JumpIfEqual(CLONE3, "clone3", "i386_calls"),
+        Label("i386_calls"),
         JumpIfEqual(I386_UNSHARE, "flags", "i386_not_unshare"),
         Label("i386_not_unshare"),
         JumpIfEqual(I386_CLONE, "flags", "i386_not_clone"),
@@ -751,6 +958,10 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         JumpIfAnyBit(CLONE_NEWPID, "deny", "allow"),
         Label("deny"),
         Return(SECCOMP_RET_ERRNO | u32::from(errno)),
+        Label("clone3"),
+        Return(SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+        Label("kill"),
+        Return(SECCOMP_RET_KILL_PROCESS),
         Label("allow"),
         Return(SECCOMP_RET_ALLOW),
     ];

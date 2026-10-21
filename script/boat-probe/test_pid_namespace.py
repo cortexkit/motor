@@ -67,6 +67,8 @@ class PidNamespaceTests(unittest.TestCase):
             ('job_namespace_filter', ['security', 'namespace_attempts', 'pid'], {'result':0, 'errno':0}),
             ('job_namespace_filter', ['security', 'namespace_attempts'], {}),
             ('job_namespace_filter', ['security', 'status', 'Seccomp_filters'], ['1']),
+            ('job_clone3_pid_denied', ['security', 'namespace_attempts', 'clone3_pid'], {'result':-1, 'errno':errno.EPERM}),
+            ('job_inherited_fds', ['inherited_fds'], {'0':'null', '1':'stdout', '2':'stderr', '3':'leaked-report'}),
             ('proc_protections_match_systemd', ['security', 'proc_submounts'], [['/proc/sys', False]]),
             ('job_signal_state_matches_systemd', ['security', 'fresh_child', 'SigIgn'], ['1000']),
             ('session_keyring_owned_by_job', ['security', 'keyring', 'uid'], 0),
@@ -113,6 +115,24 @@ class PidNamespaceTests(unittest.TestCase):
                            ('control_exit', 1), ('survivors', [111])]:
             self.assertFalse(pid.teardown_checks(dict(good, **{key:value})), key)
         self.assertFalse(pid.teardown_checks({}))
+
+    def test_root_only_bootstrap_telemetry_requires_post_drop_and_complete_mounts(self):
+        job, host = self.fixture()
+        reference = host['job_security_reference']
+        good = {'bootstrap_record_trusted':True, 'separate_session':True,
+                'bootstrap':{'pdeathsig':9, 'uid':997, 'sid':1, 'pgid':1, 'exec_fds':[0,1,2],
+                             'proc_submounts':reference['proc_submounts']}}
+        self.assertTrue(all(pid.bootstrap_checks(good, reference).values()))
+        for key, value, check in [('pdeathsig', 0, 'post_drop_pdeathsig'), ('uid', 0, 'post_drop_pdeathsig'),
+                                 ('sid', 500, 'private_session_and_pgid'), ('pgid', 500, 'private_session_and_pgid'),
+                                 ('exec_fds', [0,1,2,3], 'bootstrap_exec_fds'),
+                                 ('proc_submounts', reference['proc_submounts'][:1], 'bootstrap_expected_submounts')]:
+            bad = copy.deepcopy(good)
+            bad['bootstrap'][key] = value
+            self.assertFalse(pid.bootstrap_checks(bad, reference)[check], key)
+        self.assertFalse(pid.bootstrap_checks(dict(good, separate_session=False), reference)['private_session_and_pgid'])
+        self.assertFalse(any(pid.bootstrap_checks(dict(good, bootstrap_record_trusted=False), reference).values()))
+        self.assertFalse(any(pid.bootstrap_checks({}, reference).values()))
 
     def test_live_sources_compile_and_reference_runs_as_systemd_job_user(self):
         compile(pid.PID_SOURCE, 'pid-job', 'exec')

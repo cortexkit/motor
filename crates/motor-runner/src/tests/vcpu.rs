@@ -724,7 +724,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
                 fs::write(&exit, contents).unwrap();
             }
             let before = calls.load(Ordering::SeqCst);
-            let status = runner.durable_exit_status(process, &exit).unwrap();
+            let status = runner.durable_exit_status(process, &exit).0.unwrap();
             assert_eq!(backend::ExecutionOutcome::Unix(status).wire(), expected);
             assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         }
@@ -732,7 +732,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     fs::write(&exit, "55\n").unwrap();
     let before = calls.load(Ordering::SeqCst);
     assert_eq!(
-        runner.durable_exit_status(process, &exit).unwrap().code(),
+        runner.durable_exit_status(process, &exit).0.unwrap().code(),
         Some(55)
     );
     assert_eq!(
@@ -746,6 +746,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     main_status.store(0, Ordering::SeqCst);
     let error = runner
         .durable_exit_status(process, &exit)
+        .0
         .unwrap_err()
         .to_string();
     assert!(error.contains("durable exit unavailable"), "{error}");
@@ -842,6 +843,10 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
         ("no init line", "", "", true),
         ("torn init line", "", line.as_str(), true),
         ("prefix without step", "", prefix_only.as_str(), true),
+        ("oversized exit", "", "", true),
+        ("sparse exit", "", "", true),
+        ("supervisor wait failed", "", complete.as_str(), true),
+        ("job exited 227", "227\n", "", true),
         ("unit without the init", "", complete.as_str(), false),
     ] {
         let f = Fixture::new();
@@ -849,13 +854,18 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
         config.boat_profile = true;
         config.boat_memory_max_bytes = Some(2 << 30);
         config.private_pids = !boat_init;
-        config.systemd_command = Some(Arc::new(|args| {
+        let supervisor_failed = case == "supervisor wait failed";
+        config.systemd_command = Some(Arc::new(move |args| {
             let text = match args {
                 ["show", "--property=LoadState", "--property=ActiveState", _] => {
                     "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
                 }
                 ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => {
-                    "ExecMainCode=1\nExecMainStatus=226\n"
+                    if supervisor_failed {
+                        "ExecMainCode=1\nExecMainStatus=227\n"
+                    } else {
+                        "ExecMainCode=1\nExecMainStatus=226\n"
+                    }
                 }
                 ["show", "--property=Result", _] => "Result=exit-code\n",
                 ["reset-failed", _] | ["list-units", ..] => "",
@@ -896,7 +906,29 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
             fs::write(output.join(name), "").unwrap();
         }
         fs::write(output.join("exit"), exit_file).unwrap();
+        if case == "oversized exit" {
+            // A valid-looking prefix plus whitespace must not be accepted by
+            // parsing a truncated prefix or reread into the privileged daemon.
+            fs::write(output.join("exit"), format!("226\n{}", " ".repeat(1 << 20))).unwrap();
+        } else if case == "sparse exit" {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(output.join("exit"))
+                .unwrap();
+            file.set_len(1 << 40).unwrap();
+        }
         fs::write(output.join(pid_init::SETUP_ERROR_FILE), setup_error).unwrap();
+        if case == "job exited 226" {
+            let process = runner.core.inner.lock().unwrap().jobs[&request.job_id].process;
+            let (status, observation) = runner.durable_exit_status(process, &output.join("exit"));
+            assert!(matches!(observation, Ok(Some(226))));
+            fs::write(output.join("exit"), "now malformed").unwrap();
+            assert!(
+                !runner.unproven_pid_bootstrap_status(&status, &observation),
+                "classification must consume the original bounded observation"
+            );
+            fs::write(output.join("exit"), exit_file).unwrap();
+        }
         runner.follow_unit(request.job_id).unwrap();
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
         let terminal = job.terminal.clone().unwrap();
@@ -912,8 +944,14 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
             assert_eq!(terminal.refusal_detail(), Some(line.as_str()), "{case}");
             assert_eq!(job.state, JobState::Tombstone, "{case}");
             assert!(job.started.is_none() && job.started_ms.is_none(), "{case}");
-        } else if case == "job exited 226" || !boat_init {
-            assert_eq!(terminal.outcome, Outcome::Exit { code: 226 }, "{case}");
+        } else if case.starts_with("job exited") || !boat_init {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::Exit {
+                    code: if case == "job exited 227" { 227 } else { 226 }
+                },
+                "{case}"
+            );
         } else {
             assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
             assert!(
@@ -921,7 +959,11 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
                 "no proof that job never started: {case}"
             );
             let output = job_output(&runner, request.job_id);
-            assert!(output.contains("bootstrap status 226"), "{case}: {output}");
+            let code = if supervisor_failed { 227 } else { 226 };
+            assert!(
+                output.contains(&format!("bootstrap status {code}")),
+                "{case}: {output}"
+            );
             assert!(
                 output.contains("setup evidence unavailable"),
                 "{case}: {output}"

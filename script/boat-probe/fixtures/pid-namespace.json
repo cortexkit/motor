@@ -4,6 +4,7 @@
     "self_cgroup": "0::/system.slice/motor-job-example.service\n",
     "pid": 2,
     "ppid": 1,
+    "inherited_fds": {"0":"/dev/null", "1":"/motor-output/stdout", "2":"/motor-output/stderr"},
     "signals": [
       {"pid": 1, "host": {"pid": 1, "uid": 0, "cgroup": "0::/init.scope\n", "comm": "systemd", "starttime": 10}, "allowed": true, "alias": true,
        "target": {"pid": 1, "uid": 997, "cgroup": "0::/system.slice/motor-job-example.service\n", "comm": "bash", "starttime": 200}},
@@ -15,7 +16,7 @@
       "fresh_child": {"SigBlk": ["0"], "SigIgn": ["0"]},
       "proc_submounts": [["/proc/sys", true], ["/proc/sysrq-trigger", true]],
       "keyring": {"id": 1234, "uid": 997, "gid": 996},
-      "namespace_attempts": {"pid": {"result": -1, "errno": 1}, "user": {"result": -1, "errno": 1}, "mount": {"result": -1, "errno": 1}, "net": {"result": -1, "errno": 1}, "ipc": {"result": -1, "errno": 1}, "uts": {"result": -1, "errno": 1}, "cgroup": {"result": -1, "errno": 1}, "setns_pid": {"result": -1, "errno": 1}, "setns_any": {"result": -1, "errno": 1}}
+      "namespace_attempts": {"pid": {"result": -1, "errno": 1}, "user": {"result": -1, "errno": 1}, "mount": {"result": -1, "errno": 1}, "net": {"result": -1, "errno": 1}, "ipc": {"result": -1, "errno": 1}, "uts": {"result": -1, "errno": 1}, "cgroup": {"result": -1, "errno": 1}, "setns_pid": {"result": -1, "errno": 1}, "setns_any": {"result": -1, "errno": 1}, "clone3_pid": {"result": -1, "errno": 38}}
     }
   },
   "reference": {

@@ -147,7 +147,7 @@ a fresh user-owned session keyring and namespace seccomp before job code runs.
 The trusted supervisor remains outside the namespace in the same cgroup. Tests:
 `isolated_job_cannot_see_another_accounts_process`,
 `boat_pid_init_unit_changes_only_what_the_init_needs`,
-`namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path`.
+`namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path`.
 The live Boat probe checks PID 1, `/proc/1/cgroup`, outside-PID ESRCH, credentials,
 capabilities, keyring ownership, proc protections and setsid-child cleanup;
 portable tests do not establish those privileged transitions.
@@ -185,6 +185,20 @@ no job output. With neither a valid exit file nor that evidence, execution is
 unknown; a wrapper-recorded exit 226 remains an ordinary job exit. Tests:
 `supervisor_reproduces_real_exit_and_sigkill_wait_status`,
 `boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit`.
+
+The exit inode is opened no-follow and parsed with a 33-byte read (32 bytes
+maximum plus one overflow byte). That observation is carried into classification,
+never reread, including for oversized or sparse files. Supervisor wait failure
+uses status 227 and no retry-safe record; without a wrapper exit status the
+outcome remains unknown. The supervisor never duplicates a child's core dump;
+it mirrors the terminating signal with its own core-dumped bit clear.
+The fallback also starts its own session, re-arms parent-death SIGKILL after
+the credential drop, checks the supervisor pidfd to close the PPid-zero race,
+and validates moved proc protections against a live independent reference.
+Tests: `post_credential_drop_rearms_parent_death_signal`,
+`job_group_sigcont_does_not_reach_supervisor_session`,
+`supervisor_wait_failure_cannot_write_a_setup_record`,
+`proc_protections_must_equal_the_independent_reference_after_moves`.
 
 4.5. The command runs as `bash -c <command>` with the request's working
 directory. Its environment is the request's filtered variables (5.1) with the

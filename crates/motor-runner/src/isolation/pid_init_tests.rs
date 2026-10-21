@@ -11,6 +11,7 @@ fn exec_start_round_trips_through_the_init_arguments() {
         uid: 997,
         gid: 996,
         groups: vec![996, 4242],
+        proc_protections: vec![("/proc/sys".into(), true)],
     };
     let wrapper = [
         "/bin/bash",
@@ -21,8 +22,16 @@ fn exec_start_round_trips_through_the_init_arguments() {
     ];
     let command = exec_start(&identity, &wrapper);
     assert_eq!(
-        command[..6],
-        [INSTALLED_RUNNER, MODE, "997", "996", "996,4242", "--"]
+        command[..7],
+        [
+            INSTALLED_RUNNER,
+            MODE,
+            "997",
+            "996",
+            "996,4242",
+            "[[\"/proc/sys\",true]]",
+            "--"
+        ]
     );
     let plan = parse_args(command[2..].iter().map(OsString::from).collect()).unwrap();
     assert_eq!(plan.identity, identity);
@@ -35,6 +44,7 @@ fn exec_start_round_trips_through_the_init_arguments() {
         uid: 5,
         gid: 6,
         groups: Vec::new(),
+        proc_protections: vec![("/proc/sys".into(), true)],
     };
     let command = exec_start(&bare, &["/bin/true"]);
     assert_eq!(command[4], "");
@@ -48,7 +58,7 @@ fn exec_start_round_trips_through_the_init_arguments() {
 
 #[test]
 fn init_arguments_refuse_root_and_malformed_commands() {
-    for (args, why) in [
+    for (mut args, why) in [
         (os(&["0", "5", "5", "--", "/bin/true"]), "root uid"),
         (os(&["5", "0", "5", "--", "/bin/true"]), "root gid"),
         (os(&["5", "5", "5,0", "--", "/bin/true"]), "group 0"),
@@ -65,6 +75,9 @@ fn init_arguments_refuse_root_and_malformed_commands() {
         ),
         (os(&["5", "5"]), "truncated"),
     ] {
+        if args.len() >= 3 {
+            args.insert(3, OsString::from("[[\"/proc/sys\",true]]"));
+        }
         assert!(parse_args(args).is_err(), "{why} must be refused");
     }
 }
@@ -103,6 +116,7 @@ fn supervisor_reproduces_real_exit_and_sigkill_wait_status() {
         226 << 8,
         libc::SIGKILL,
         libc::SIGTERM,
+        libc::SIGSEGV | 0x80,
     ] {
         // SAFETY: the forked child only changes signal state and exits; it
         // neither allocates nor touches the test harness after fork.
@@ -116,7 +130,11 @@ fn supervisor_reproduces_real_exit_and_sigkill_wait_status() {
             assert_eq!(libc::waitpid(child, &mut observed, 0), child);
             observed
         };
-        assert_eq!(observed, status, "supervisor must preserve {status:#x}");
+        assert_eq!(
+            observed,
+            status & !0x80,
+            "supervisor preserves signal without duplicating child core: {status:#x}"
+        );
     }
 }
 
@@ -149,6 +167,183 @@ fn proc_submounts_are_the_direct_children_of_the_top_proc_mount() {
     assert!(proc_submounts("garbage\n").is_err());
     assert_eq!(unescape("/a\\040b\\134c\\011"), "/a b\\c\t");
     assert_eq!(unescape("/trailing\\04"), "/trailing\\04");
+}
+
+#[test]
+fn proc_protections_must_equal_the_independent_reference_after_moves() {
+    let table = "25 20 0:22 / /proc rw - proc proc rw\n26 25 0:22 /sys /proc/sys ro - proc proc rw\n27 25 0:22 /irq /proc/irq ro - proc proc rw\n";
+    let expected = vec![("/proc/irq".into(), true), ("/proc/sys".into(), true)];
+    verify_proc_protections(table, &expected).unwrap();
+    assert!(verify_proc_protections(
+        &table.replace("27 25 0:22 /irq /proc/irq ro - proc proc rw\n", ""),
+        &expected
+    )
+    .is_err());
+    assert!(verify_proc_protections(
+        &table.replace("/sys /proc/sys ro", "/sys /proc/sys rw"),
+        &expected
+    )
+    .is_err());
+    assert!(verify_proc_protections(table, &[]).is_err());
+    assert!(verify_proc_protections(table, &[("/proc/sys".into(), true)]).is_err());
+}
+
+#[test]
+fn post_credential_drop_rearms_parent_death_signal() {
+    // The portable child uses its current IDs; privileged transitions are
+    // additionally observed in the live bootstrap's root-only telemetry.
+    unsafe {
+        let parent_fd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as i32;
+        assert!(parent_fd >= 0);
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            let parent = libc::getppid();
+            if libc::setresgid(libc::getgid(), libc::getgid(), libc::getgid()) != 0
+                || libc::setresuid(libc::getuid(), libc::getuid(), libc::getuid()) != 0
+            {
+                libc::_exit(1);
+            }
+            libc::prctl(libc::PR_SET_PDEATHSIG, 0);
+            if arm_parent_death_signal(parent, parent_fd).is_err() {
+                libc::_exit(2);
+            }
+            let mut signal = 0i32;
+            if libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) != 0 || signal != libc::SIGKILL {
+                libc::_exit(3);
+            }
+            libc::_exit(0);
+        }
+        libc::close(parent_fd);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert_eq!(status, 0);
+    }
+}
+
+#[test]
+fn job_group_sigcont_does_not_reach_supervisor_session() {
+    unsafe {
+        let supervisor = libc::fork();
+        assert!(supervisor >= 0);
+        if supervisor == 0 {
+            if libc::setsid() < 0 {
+                libc::_exit(1);
+            }
+            let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGCONT);
+            libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+            let job = libc::fork();
+            if job < 0 {
+                libc::_exit(2);
+            }
+            if job == 0 {
+                if separate_session().is_err()
+                    || libc::getsid(0) != libc::getpid()
+                    || libc::getpgrp() != libc::getpid()
+                {
+                    libc::_exit(3);
+                }
+                if libc::kill(0, libc::SIGCONT) != 0 {
+                    libc::_exit(4);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            if libc::waitpid(job, &mut status, 0) != job || status != 0 {
+                libc::_exit(5);
+            }
+            libc::sigpending(&mut blocked);
+            libc::_exit(if libc::sigismember(&blocked, libc::SIGCONT) == 0 {
+                0
+            } else {
+                6
+            });
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(supervisor, &mut status, 0), supervisor);
+        assert_eq!(status, 0, "job kill(0, SIGCONT) reached supervisor");
+    }
+}
+
+#[test]
+fn parent_pidfd_rejects_death_even_when_ppid_is_unchanged() {
+    unsafe {
+        let target = libc::fork();
+        assert!(target >= 0);
+        if target == 0 {
+            libc::_exit(0);
+        }
+        // A zombie remains addressable until waitpid, avoiding a PID-reuse race.
+        let fd = libc::syscall(libc::SYS_pidfd_open, target, 0) as i32;
+        assert!(fd >= 0);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(target, &mut status, 0), target);
+        let tester = libc::fork();
+        assert!(tester >= 0);
+        if tester == 0 {
+            let parent = libc::getppid();
+            libc::_exit(if arm_parent_death_signal(parent, fd).is_err() {
+                0
+            } else {
+                1
+            });
+        }
+        libc::close(fd);
+        assert_eq!(libc::waitpid(tester, &mut status, 0), tester);
+        assert_eq!(
+            status, 0,
+            "dead supervisor was accepted despite unchanged PPid"
+        );
+    }
+}
+
+#[test]
+fn supervisor_wait_failure_cannot_write_a_setup_record() {
+    use std::os::fd::AsRawFd;
+    let path = cortexkit_test_support::scratch_root()
+        .join(format!("supervisor-report-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(&path).unwrap();
+    unsafe {
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            let fd = file.as_raw_fd();
+            // Owned handles are closed even if open reused a missing standard
+            // descriptor; a borrowed stderr fallback must remain open.
+            if libc::dup2(fd, libc::STDIN_FILENO) != libc::STDIN_FILENO {
+                libc::_exit(2);
+            }
+            drop(Report {
+                fd: libc::STDIN_FILENO,
+                owned: true,
+            });
+            if libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD) != -1 {
+                libc::_exit(3);
+            }
+            drop(Report {
+                fd: libc::STDERR_FILENO,
+                owned: false,
+            });
+            if libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) == -1 {
+                libc::_exit(4);
+            }
+            drop(Report { fd, owned: true });
+            if libc::fcntl(fd, libc::F_GETFD) != -1 {
+                libc::_exit(1);
+            }
+            // A positive PID which is not our child forces waitpid's ECHILD
+            // error, rather than using a wildcard wait target.
+            supervise(libc::getppid());
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert_eq!(libc::WEXITSTATUS(status), SUPERVISOR_FAILED);
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -237,7 +432,7 @@ fn evaluate(
 }
 
 #[test]
-fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
+fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
     let program = namespace_filter(TEST_ERRNO);
     let deny = SECCOMP_RET_ERRNO | u32::from(TEST_ERRNO);
     let pid = u64::from(CLONE_NEWPID);
@@ -292,7 +487,10 @@ fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
         // unshare and clone.
         ("i386 x86_64 numbers", i386, X86_64_UNSHARE, [pid, 0], false),
         ("i386 other call", i386, 20, [pid, 0], false),
-        // Any other architecture is left to systemd's filter.
+        ("x86 clone3", x86, CLONE3, [pid, 88], false),
+        ("x32 clone3", x86, CLONE3 | x32, [pid, 88], false),
+        ("i386 clone3", i386, CLONE3, [pid, 88], false),
+        // Any unrecognized architecture fails closed in this filter itself.
         (
             "aarch64 unshare pid",
             AUDIT_ARCH_AARCH64,
@@ -302,7 +500,15 @@ fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
         ),
     ] {
         let result = evaluate(&program, arch, nr, args, &mut seen, &mut branches);
-        let expected = if refused { deny } else { SECCOMP_RET_ALLOW };
+        let expected = if arch != x86 && arch != i386 {
+            SECCOMP_RET_KILL_PROCESS
+        } else if nr & !x32 == CLONE3 {
+            SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+        } else if refused {
+            deny
+        } else {
+            SECCOMP_RET_ALLOW
+        };
         assert_eq!(result, expected, "{name}");
     }
     let every: BTreeSet<_> = (0..program.len()).collect();
@@ -415,6 +621,17 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
                 if (result == -1 && errno == ours) != refused {
                     libc::_exit(index as libc::c_int + 1);
                 }
+            }
+            let mut clone_args = [0u64; 11];
+            clone_args[0] = u64::from(CLONE_NEWPID);
+            if libc::syscall(
+                libc::SYS_clone3,
+                clone_args.as_ptr(),
+                std::mem::size_of_val(&clone_args),
+            ) != -1
+                || *libc::__errno_location() != libc::ENOSYS
+            {
+                libc::_exit(8);
             }
             // Runs `check` in a grandchild: Some(passed), or None when the
             // grandchild was killed before it could answer.

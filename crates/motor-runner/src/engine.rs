@@ -4460,28 +4460,38 @@ impl Runner {
                         continue;
                     }
                 }
-                let status = if durable {
+                let (status, exit_file) = if durable {
                     self.durable_exit_status(process, &directory.join("exit"))
                 } else {
-                    Err(io::Error::other(
-                        "legacy unit ended without retained exit status",
-                    ))
+                    (
+                        Err(io::Error::other(
+                            "legacy unit ended without retained exit status",
+                        )),
+                        Ok(None),
+                    )
                 };
                 #[cfg(target_os = "linux")]
-                let status = if durable && self.unproven_pid_bootstrap_status(&directory, &status) {
-                    if let Some(detail) = self.pid_namespace_setup_failure(id, &directory, &status)
-                    {
+                let status = if durable && self.unproven_pid_bootstrap_status(&status, &exit_file) {
+                    if let Some(detail) = self.pid_namespace_setup_failure(
+                        id,
+                        &directory,
+                        &status,
+                        matches!(exit_file, Ok(None)),
+                    ) {
                         return self.refuse_unstarted_unit(id, detail);
                     }
                     // Status 226 alone cannot prove whether job code ran. A
                     // missing report must not turn into a retry-safe refusal
                     // or masquerade as a trustworthy command exit code.
-                    Err(io::Error::other(
-                        "Boat PID namespace bootstrap status 226: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown",
-                    ))
+                    Err(io::Error::other(format!(
+                        "Boat PID namespace bootstrap status {}: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown",
+                        status.as_ref().ok().and_then(|status| status.code()).unwrap()
+                    )))
                 } else {
                     status
                 };
+                #[cfg(not(target_os = "linux"))]
+                let _ = exit_file;
                 return self.finish(id, status);
             }
             std::thread::park_timeout(Duration::from_millis(25));
@@ -4490,17 +4500,19 @@ impl Runner {
     #[cfg(target_os = "linux")]
     fn unproven_pid_bootstrap_status(
         &self,
-        directory: &Path,
         status: &io::Result<std::process::ExitStatus>,
+        exit_file: &io::Result<Option<u8>>,
     ) -> bool {
         self.core.config.boat_profile
             && !self.core.config.private_pids
-            && status.as_ref().ok().and_then(|status| status.code())
-                == Some(crate::isolation::pid_init::SETUP_FAILED)
-            && fs::read_to_string(directory.join("exit"))
-                .ok()
-                .and_then(|text| text.trim().parse::<u8>().ok())
-                .is_none()
+            && matches!(
+                status.as_ref().ok().and_then(|status| status.code()),
+                Some(
+                    crate::isolation::pid_init::SETUP_FAILED
+                        | crate::isolation::pid_init::SUPERVISOR_FAILED
+                )
+            )
+            && !matches!(exit_file, Ok(Some(_)))
     }
     /// A Boat job's PID namespace init that fails exits 226 before the wrapper
     /// exists, so the gate byte is never read and the command never runs. It
@@ -4513,6 +4525,7 @@ impl Runner {
         id: Uuid,
         directory: &Path,
         status: &io::Result<std::process::ExitStatus>,
+        empty_or_missing_exit: bool,
     ) -> Option<String> {
         use crate::isolation::pid_init;
         if !self.core.config.boat_profile || self.core.config.private_pids {
@@ -4521,7 +4534,7 @@ impl Runner {
         if status.as_ref().ok()?.code() != Some(pid_init::SETUP_FAILED) {
             return None;
         }
-        if fs::metadata(directory.join("exit")).is_ok_and(|m| m.len() != 0) {
+        if !empty_or_missing_exit {
             return None;
         }
         let mut text = String::new();
@@ -4618,29 +4631,47 @@ impl Runner {
         &self,
         process: Option<platform::ProcessIdentity>,
         path: &Path,
-    ) -> io::Result<std::process::ExitStatus> {
+    ) -> (io::Result<std::process::ExitStatus>, io::Result<Option<u8>>) {
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
-        let durable = (|| {
-            let mut file = crate::filesystem::read_nofollow(path)?;
+        // Observe the job-writable inode once. Classification must consume
+        // this same bounded observation, never race it with a second read.
+        let exit_file = (|| {
+            let file = match crate::filesystem::read_nofollow(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
             let mut code = String::new();
-            Read::by_ref(&mut file).take(32).read_to_string(&mut code)?;
-            let code = code.trim().parse::<i32>().map_err(io::Error::other)?;
-            if !(0..=255).contains(&code) {
-                return Err(io::Error::other("invalid durable exit code"));
+            file.take(33).read_to_string(&mut code)?;
+            if code.len() > 32 {
+                return Err(io::Error::other("oversized durable exit file"));
             }
-            #[cfg(unix)]
-            {
-                Ok(std::process::ExitStatus::from_raw(code << 8))
+            if code.is_empty() {
+                return Ok(None);
             }
-            #[cfg(windows)]
-            {
-                Ok(std::process::ExitStatus::from_raw(code as u32))
-            }
+            code.trim()
+                .parse::<u8>()
+                .map(Some)
+                .map_err(io::Error::other)
         })();
-        durable.or_else(|error| {
+        let durable = match &exit_file {
+            Ok(Some(code)) => {
+                #[cfg(unix)]
+                {
+                    Ok(std::process::ExitStatus::from_raw(i32::from(*code) << 8))
+                }
+                #[cfg(windows)]
+                {
+                    Ok(std::process::ExitStatus::from_raw(u32::from(*code)))
+                }
+            }
+            Ok(None) => Err(io::Error::other("missing or empty durable exit file")),
+            Err(error) => Err(io::Error::other(error.to_string())),
+        };
+        let status = durable.or_else(|error| {
             // The wrapper writes a fixed writable inode in a read-only output
             // directory. If it is killed before completing the write, the failed
             // unit retains its status. Read it before finish resets that unit;
@@ -4654,7 +4685,8 @@ impl Runner {
                     "durable exit unavailable: {error}; systemd exit status unavailable: {unit_error}"
                 ))),
             }
-        })
+        });
+        (status, exit_file)
     }
     fn output_at(
         &self,

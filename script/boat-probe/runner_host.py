@@ -20,7 +20,7 @@ import tempfile
 import time
 
 from credential_audit import SOURCE
-from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, control_identity_command, lifecycle_checks, outside_control_passes, pid_checks, reference_command, teardown_checks, teardown_job
+from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_checks, outside_control_passes, pid_checks, reference_command, teardown_checks, teardown_job
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -125,6 +125,7 @@ def execution_capabilities():
 
 JOB = provider.ACCESS_SOURCE + EXEC_PROBE + PID_SOURCE + r'''
 import errno, json, os, pathlib, pwd, subprocess
+exec_inherited_fds = inherited_fds()
 cg = pathlib.Path('/sys/fs/cgroup') / pathlib.Path('/proc/self/cgroup').read_text().strip().split('0::',1)[1].lstrip('/')
 shm = pathlib.Path('/dev/shm/boat-host-canary')
 private = not shm.exists()
@@ -195,6 +196,7 @@ except OSError as error:
     data['cargo_target'] = {'env': os.environ.get('CARGO_TARGET_DIR'), 'same_directory': None, 'error': type(error).__name__}
 data['execution_capabilities'] = execution_capabilities()
 data['pid_namespace'] = pid_evidence(PROTECTED_IDENTITIES)
+data['pid_namespace']['inherited_fds'] = exec_inherited_fds
 data['process_visibility']['runner_signal_probe'] = next(row for row in data['pid_namespace']['signals'] if row['pid'] == RUNNER_PID)
 print(json.dumps(data))
 '''
@@ -982,6 +984,9 @@ class RunnerHost:
                     record['setsid_' + action] = {'host':observed, 'client':completed, 'result':parsed}
                     self.check(label + '.setsid_' + action + '_reaped', teardown_checks(observed), observed)
                     self.check(label + '.setsid_' + action + '_exit_' + str(expected), lifecycle_checks(parsed, expected), parsed)
+                    if host['systemd_version'] < 257:
+                        for key, passed in bootstrap_checks(observed, host['job_security_reference']).items():
+                            self.check(label + '.setsid_' + action + '.' + key, passed, observed)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
         if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')

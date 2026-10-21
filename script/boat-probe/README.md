@@ -15,6 +15,15 @@ comm and stat starttime; an alias must have the job's UID/cgroup and a different
 starttime from that host identity. Sandbox PID 1 is intentionally such an alias
 for the job's own bash wrapper. Aliases are explicitly recorded, not skipped.
 
+`job_clone3_pid_denied` requires clone3 with CLONE_NEWPID to return ENOSYS;
+`job_inherited_fds` records the actual initial job fd inventory and allows only
+0/1/2. For each setsid teardown job on old systemd, the root observer additionally
+checks `post_drop_pdeathsig`, `private_session_and_pgid`, `bootstrap_exec_fds`
+and `bootstrap_expected_submounts`. Those checks read the root-owned 0600
+pre-exec telemetry (not job-authored claims) and compare the actual wrapper and
+supervisor sessions in the host's view. Expected mounts come from the live
+independent reference unit, not the fixture's illustrative path list.
+
 Additional production-client jobs check `job_stdin_eof`, `sigkill_job_exit_137` and
 `pid1_ignores_job_sigkill`. A root observer stops or SIGKILLs a unit while its
 client is waiting and verifies `setsid_stop_reaped`, `setsid_kill_reaped` and

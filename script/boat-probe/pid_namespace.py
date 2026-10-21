@@ -38,11 +38,25 @@ def security_evidence():
         ctypes.set_errno(0)
         result = libc.syscall(308, -1, flag)
         attempts[name] = {'result':result, 'errno':ctypes.get_errno()}
+    clone_args = (ctypes.c_ulonglong * 11)()
+    clone_args[0] = 0x20000000
+    ctypes.set_errno(0)
+    result = libc.syscall(435, ctypes.byref(clone_args), ctypes.sizeof(clone_args))
+    attempts['clone3_pid'] = {'result':result, 'errno':ctypes.get_errno()}
     return {'status':own, 'fresh_child':status(child.stdout) if child.returncode == 0 else {},
             'proc_submounts':sorted(mounts), 'keyring':keyring, 'namespace_attempts':attempts}
 '''
 
 PID_SOURCE = SECURITY_SOURCE + r'''
+def inherited_fds():
+    kept = {}
+    for fd in os.listdir('/proc/self/fd'):
+        try:
+            kept[fd] = os.readlink('/proc/self/fd/' + fd)
+        except FileNotFoundError:
+            pass
+    return kept
+
 def process_identity(pid):
     directory = pathlib.Path('/proc', str(pid))
     status = (directory/'status').read_text()
@@ -131,7 +145,7 @@ def pid_checks(job, host):
     caps = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
     signals = evidence.get('signals', [])
     attempts = security.get('namespace_attempts', {})
-    required = {'pid', 'user', 'mount', 'net', 'ipc', 'uts', 'cgroup', 'setns_pid', 'setns_any'}
+    required = {'pid', 'user', 'mount', 'net', 'ipc', 'uts', 'cgroup', 'setns_pid', 'setns_any', 'clone3_pid'}
     fresh = security.get('fresh_child', {})
     keyring = security.get('keyring', {})
     return {
@@ -150,7 +164,10 @@ def pid_checks(job, host):
             and (host.get('systemd_version', 0) >= 257 or
                  int(own.get('Seccomp_filters', ['0'])[0]) > int(expected.get('Seccomp_filters', ['0'])[0]))
             and set(attempts) == required
-            and all(a.get('result') == -1 and a.get('errno') == errno.EPERM for a in attempts.values()),
+            and all(a.get('result') == -1 and a.get('errno') == (errno.ENOSYS if name == 'clone3_pid' else errno.EPERM)
+                    for name, a in attempts.items()),
+        'job_clone3_pid_denied': attempts.get('clone3_pid') == {'result':-1, 'errno':errno.ENOSYS},
+        'job_inherited_fds': set(evidence.get('inherited_fds', {})) == {'0', '1', '2'},
         'proc_protections_match_systemd': bool(security.get('proc_submounts'))
             and security['proc_submounts'] == reference.get('proc_submounts'),
         'job_signal_state_matches_systemd': all(fresh.get(k) and fresh[k] == reference.get('fresh_child', {}).get(k)
@@ -169,7 +186,7 @@ def lifecycle_checks(result, expected):
 # The host runs this while the production client waits on a real job. Match an
 # exact argv[0] owned by motor-job, never the root observer's command line.
 TEARDOWN_SOURCE = r'''
-import json, os, pathlib, pwd, subprocess, sys, time
+import json, os, pathlib, pwd, stat, subprocess, sys, time
 marker, action = sys.argv[1:]
 uid = pwd.getpwnam('motor-job').pw_uid
 
@@ -198,6 +215,29 @@ if pids:
     if not unit.startswith('motor-job-') or not unit.endswith('.service'):
         raise ValueError('unexpected job cgroup: ' + group)
     result['unit'] = unit
+    main = int(subprocess.check_output(['systemctl', 'show', unit, '-p', 'MainPID', '--value'], text=True))
+    root = pathlib.Path(subprocess.check_output(['systemctl', 'show', unit, '-p', 'RootDirectory', '--value'], text=True).strip())
+    record = root.parent/'output/setup-error'
+    try:
+        meta = record.stat()
+        result['bootstrap_record_trusted'] = meta.st_uid == 0 and stat.S_IMODE(meta.st_mode) == 0o600
+        with record.open() as stream:
+            result['bootstrap'] = json.loads(stream.read(4096))
+    except (OSError, ValueError) as error:
+        result['bootstrap_error'] = type(error).__name__
+    members = (pathlib.Path('/sys/fs/cgroup')/group.lstrip('/')/'cgroup.procs').read_text().split()
+    wrappers = []
+    for member in members:
+        try:
+            status = pathlib.Path('/proc', member, 'status').read_text()
+            nspid = next(line.split()[1:] for line in status.splitlines() if line.startswith('NSpid:'))
+            if nspid[-1] == '1' and int(member) != main:
+                wrappers.append(int(member))
+        except (OSError, StopIteration):
+            pass
+    result['separate_session'] = (len(wrappers) == 1 and os.getsid(wrappers[0]) == wrappers[0]
+        and os.getpgid(wrappers[0]) == wrappers[0] and os.getsid(main) != os.getsid(wrappers[0])
+        and os.getpgid(main) != os.getpgid(wrappers[0]))
     result['kill_mode'] = subprocess.check_output(['systemctl', 'show', unit, '-p', 'KillMode', '--value'], text=True).strip()
     argv = ['systemctl', 'stop', unit] if action == 'stop' else ['systemctl', 'kill', '--kill-whom=all', '--signal=SIGKILL', unit]
     result['control_exit'] = subprocess.run(argv, capture_output=True, timeout=10).returncode
@@ -212,6 +252,21 @@ print(json.dumps(result))
 def teardown_checks(evidence):
     return bool(evidence.get('found')) and evidence.get('setsid') is True and evidence.get('kill_mode') == 'control-group' \
         and evidence.get('control_exit') == 0 and evidence.get('survivors') == []
+
+
+def bootstrap_checks(evidence, reference):
+    state = evidence.get('bootstrap', {})
+    trusted = evidence.get('bootstrap_record_trusted') is True
+    return {
+        'post_drop_pdeathsig': trusted and state.get('pdeathsig') == 9
+            and isinstance(state.get('uid'), int) and state['uid'] > 0
+            and reference.get('status', {}).get('Uid') == [str(state['uid'])] * 4,
+        'private_session_and_pgid': trusted and state.get('sid') == 1 and state.get('pgid') == 1
+            and evidence.get('separate_session') is True,
+        'bootstrap_exec_fds': trusted and state.get('exec_fds') == [0, 1, 2],
+        'bootstrap_expected_submounts': trusted and bool(state.get('proc_submounts'))
+            and state['proc_submounts'] == reference.get('proc_submounts'),
+    }
 
 
 def teardown_job(marker):

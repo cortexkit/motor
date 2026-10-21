@@ -121,6 +121,7 @@ fn test_identity() -> pid_init::JobIdentity {
         uid: 997,
         gid: 996,
         groups: vec![996],
+        proc_protections: vec![("/proc/sys".into(), true)],
     }
 }
 
@@ -235,17 +236,18 @@ fn boat_pid_init_unit_changes_only_what_the_init_needs() {
             .position(|arg| arg == pid_init::INSTALLED_RUNNER)
             .unwrap();
         assert_eq!(
-            init[start..start + 6],
+            init[start..start + 7],
             [
                 pid_init::INSTALLED_RUNNER,
                 pid_init::MODE,
                 "997",
                 "996",
                 "996",
+                "[[\"/proc/sys\",true]]",
                 "--"
             ]
         );
-        assert_eq!(init[start + 6], "/bin/bash");
+        assert_eq!(init[start + 7], "/bin/bash");
         // Everything else is the same argv in the same order.
         let rest = |args: &[String], drop: &[String]| -> Vec<String> {
             args.iter()
@@ -254,7 +256,7 @@ fn boat_pid_init_unit_changes_only_what_the_init_needs() {
                 .collect()
         };
         let mut init_rest = rest(&init, &added);
-        init_rest.drain(start - added.len()..start - added.len() + 6);
+        init_rest.drain(start - added.len()..start - added.len() + 7);
         assert_eq!(init_rest, rest(&private, &removed), "durable={durable}");
     }
 }
