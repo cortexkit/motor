@@ -1,6 +1,7 @@
 //! Read-only descriptor/token screening. This module never sets an ACL or
 //! impersonates a service thread; AccessCheck receives an explicit token handle.
 use super::*;
+mod lowbox;
 use crate::windows::{access_screen, VmConfig};
 use serde_json::{json, Value};
 use std::{
@@ -269,6 +270,16 @@ fn impersonation(token: HANDLE) -> io::Result<Handle> {
     Ok(Handle(result))
 }
 fn access(sd: PSECURITY_DESCRIPTOR, token: HANDLE, mask: u32) -> Value {
+    access_mapped(sd, token, mask, &mapping())
+}
+/// AccessCheck with an explicit generic mapping (files and registry keys map
+/// GENERIC_* bits differently).
+fn access_mapped(
+    sd: PSECURITY_DESCRIPTOR,
+    token: HANDLE,
+    mask: u32,
+    generic: &GENERIC_MAPPING,
+) -> Value {
     let mut privileges = vec![0u64; 32];
     let mut length = (privileges.len() * 8) as u32;
     let mut granted = 0;
@@ -278,7 +289,7 @@ fn access(sd: PSECURITY_DESCRIPTOR, token: HANDLE, mask: u32) -> Value {
             sd,
             token,
             mask,
-            &mapping(),
+            generic,
             privileges.as_mut_ptr().cast(),
             &mut length,
             &mut granted,
@@ -297,7 +308,7 @@ fn access(sd: PSECURITY_DESCRIPTOR, token: HANDLE, mask: u32) -> Value {
                 sd,
                 token,
                 mask,
-                &mapping(),
+                generic,
                 privileges.as_mut_ptr().cast(),
                 &mut length,
                 &mut granted,
@@ -758,6 +769,15 @@ pub(super) fn run(vm: &VmConfig, fixture: &Path, output: &Path) -> io::Result<()
         } else {
             json!("Listed-path candidates exist; see table. Adding an ambient group is NOT a path-independent staging-only boundary. Review the in-memory counterexample and obtain explicit policy approval before any production change")
         };
+        report["lowbox"] = lowbox::screen(
+            base.0,
+            &user,
+            vm,
+            fixture,
+            (&sd, &description),
+            &paths,
+            descriptor_complete && path_complete,
+        );
         Ok(())
     })();
     if let Err(error) = &collection {
@@ -770,6 +790,6 @@ pub(super) fn run(vm: &VmConfig, fixture: &Path, output: &Path) -> io::Result<()
         &serde_json::to_vec_pretty(&report).map_err(io::Error::other)?,
         true,
     )?;
-    println!("DIAG read-only KsecDD access screen complete={} report={}; this is not a qualification pass",report["screen_complete"],output.display());
+    println!("DIAG read-only KsecDD access screen complete={} lowbox_passing={} report={}; this is not a qualification pass",report["screen_complete"],report["lowbox"]["passing_variants"],output.display());
     collection
 }

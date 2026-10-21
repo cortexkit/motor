@@ -33,6 +33,8 @@ mod native_call_trace;
 pub(crate) mod prep;
 #[cfg(any(windows, test))]
 mod process_status;
+#[cfg(any(windows, test))]
+mod sddl_model;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]

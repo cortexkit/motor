@@ -141,6 +141,22 @@ class PrepAccessScreenTests(unittest.TestCase):
         for name in ('prep-acl.ps1','prep-access-check.ps1'):
             self.assertIn("'"+name+"'", install)
 
+    def test_lowbox_screen_is_access_check_only_and_models_lpac_and_low_label(self):
+        lowbox = (SRC / 'trusted_prep/launch/session/access_checks/lowbox.rs').read_text()
+        for forbidden in ('CreateProcess', 'SetSecurityInfo(', 'NtSetSecurityObject(', 'SetTokenInformation(', 'CreateAppContainerProfile', 'RegSetValue', 'SetNamedSecurityInfo'):
+            self.assertNotIn(forbidden, lowbox)
+        self.code('NtCreateLowBoxToken(', lowbox)
+        self.code('CreateRestrictedToken(base, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut filtered)', lowbox)
+        self.code('const INTERNET_CLIENT: &str = "S-1-15-3-1";', lowbox)
+        self.code('["registryRead", "lpacCryptoServices"]', lowbox)
+        self.code('parsed.without_all_application_packages()', lowbox)
+        self.code('Some("(ML;OICI;NW;;;LW)")', lowbox)
+        self.code('roundtrip_ok = mismatches.is_empty();', lowbox)
+        self.code('&& roundtrip_ok', lowbox)
+        self.code('decide(device_pointer, check, DEVICE_ACCESS, &file)', lowbox)
+        self.code('report["lowbox"] = lowbox::screen(', self.source)
+        model = (SRC / 'sddl_model.rs').read_text()
+        self.code('sid != "AC" && sid != ALL_APPLICATION_PACKAGES', model)
 
 if __name__ == '__main__':
     unittest.main()
