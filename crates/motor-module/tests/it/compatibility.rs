@@ -272,17 +272,23 @@ async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
             reason: RefusalReason::RequestRejected
         }
     ));
-    assert_eq!(
-        terminal.refusal_detail.as_deref(),
-        Some("return_chunked_unsupported")
-    );
-    assert!(matches!(
-        *hello.lock().unwrap(),
-        Some(Frame::Hello {
-            return_chunked: false,
-            ..
-        })
-    ));
+    let Some(Frame::Hello {
+        return_paths,
+        return_chunked,
+        ..
+    }) = hello.lock().unwrap().clone()
+    else {
+        panic!("runner Hello must be observed")
+    };
+    assert!(!return_chunked, "the pinned runner predates chunked return");
+    // A runner that predates returned files altogether is refused for that
+    // first; one that has them but not chunking, for chunking.
+    let expected = if return_paths {
+        "return_chunked_unsupported"
+    } else {
+        "return_paths_unsupported"
+    };
+    assert_eq!(terminal.refusal_detail.as_deref(), Some(expected));
     assert!(!f
         .proxy
         .frames
