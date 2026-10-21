@@ -131,6 +131,16 @@ before the recorded host start. Poll queries and candidate XML are retained even
 failures retain the original phase/error; each monitor gets a disposition JSON
 and stderr reason, including parent-requested teardown kills, so cleanup cannot
 replace a boot-gate error with an unexplained nonzero exit.
+Before real-job qualification, `qualify.ps1` restarts MotorRunner and runs a
+180-second readiness check. SCM `Running` is not sufficient: the service reports
+it before parent validation and pipe creation. Readiness requires a Hello with
+the expected protocol version and Windows platform through the service-owned
+bridge; that listener is bound only after startup validation and reconciliation.
+The `qualify-jobs.py --wait-ready` mode submits no jobs and retains SCM states,
+bridge errors and the successful Hello observation. Stopped services, invalid pipe
+ownership and wrong Hello data fail explicitly; missing pipes during startup are
+retried within the readiness limit. Any qualification error still intentionally
+stops the service, so a post-failure `Stopped` observation is not itself a crash.
 
 ## Build on Linux, not on the Windows host
 

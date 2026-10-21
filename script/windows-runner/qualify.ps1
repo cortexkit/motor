@@ -18,6 +18,21 @@ function Runner-Check([string]$Operation) {
     if ($result.exitCode -ne 0) { throw "$Operation failed exit=$($result.exitCode)" }
     return $result.stdout
 }
+function Wait-RunnerQualificationService {
+    # SCM Running is published before parent verification and named-pipe bind.
+    # A real bridge Hello, not a service status or pipe-name check alone, proves
+    # that this service instance completed startup before any real job is sent.
+    $ready = Start-SpikeNativeProcess $Python @("$Root\bin\qualify-jobs.py",'--wait-ready','--root',$Root,'--evidence',"$Evidence\service-readiness")
+    $finished = $ready.process.WaitForExit(180000)
+    if (-not $finished) {
+        $ready.process.Kill()
+        if (-not $ready.process.WaitForExit(5000)) { throw 'Runner service readiness process did not terminate after the 180-second limit' }
+    }
+    $result = Complete-SpikeNativeProcess $ready "$Evidence\service-readiness.stdout" "$Evidence\service-readiness.stderr"
+    Get-Content "$Evidence\service-readiness.stdout","$Evidence\service-readiness.stderr" | Out-Host
+    if (-not $finished) { throw 'Runner service startup/parent verification timed out after 180 seconds; inspect service-readiness evidence' }
+    if ($result.exitCode -ne 0) { throw 'Runner service is not ready for real jobs; inspect service-readiness status and bridge diagnostics' }
+}
 function Copy-QualificationEvidence {
     New-Item -ItemType Directory -Path "$Evidence\host-evidence" -Force | Out-Null
     Get-ChildItem -LiteralPath "$Root\evidence" -Force | Copy-Item -Destination "$Evidence\host-evidence" -Recurse -Force -ErrorAction Stop
@@ -172,6 +187,7 @@ try {
     Assert-RunnerPeerCleanup $peerError ($cleanupErrors.ToArray())
     Write-Host "PASS native-loopback-refused $($timeline.result) no-agent-bytes-disclosed"
     Start-Service MotorRunner
+    Wait-RunnerQualificationService
     & $Python "$Root\bin\qualify-jobs.py" --root $Root --evidence "$Evidence\real-jobs"
     if ($LASTEXITCODE -ne 0) { throw 'Real runner protocol/cache/output qualification failed' }
     if (@(Get-VM -Name 'motor-ally-*' -ErrorAction SilentlyContinue).Count -or @(Get-ChildItem "$Root\vm\jobs" -Force).Count -or @(Get-ChildItem "$Root\vm\caches" -Filter '*.attached').Count) { throw 'Qualification left a job VM, disk directory or attachment marker' }

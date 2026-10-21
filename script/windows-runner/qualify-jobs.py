@@ -19,32 +19,99 @@ def git(root, *args):
     return subprocess.check_output([r"C:\Program Files\Git\cmd\git.exe", "-C", str(root), *args], stderr=subprocess.STDOUT).decode().strip()
 
 
+class RunnerBridgeUnavailable(RuntimeError):
+    pass
+
+
+class RunnerBridgeRefused(RuntimeError):
+    pass
+
+
+def runner_service_status():
+    command = [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+               "$ErrorActionPreference='Stop'; (Get-Service -Name MotorRunner -ErrorAction Stop).Status.ToString()"]
+    try:
+        result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace", timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"cannot query runner service MotorRunner: {error}") from error
+    state = result.stdout.strip()
+    if result.returncode or state not in {"Stopped", "StartPending", "StopPending", "Running", "ContinuePending", "PausePending", "Paused"}:
+        raise RuntimeError(f"cannot query runner service MotorRunner: exit={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
+    return state
+
+
+def require_runner_service():
+    state = runner_service_status()
+    if state != "Running":
+        raise RunnerBridgeUnavailable(f"runner service not running (MotorRunner status={state}); check service startup and parent verification")
+    return state
+
+
 class Channel:
-    def __init__(self, runner, root, log):
+    def __init__(self, runner, root, log, hello_timeout: float = 30):
+        require_runner_service()
+        self.log_path = log
         self.log = log.open("wb")
-        self.process = subprocess.Popen([str(runner), "connect", "--instance", "ally", "--state-root", str(root / "state")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+        try:
+            self.process = subprocess.Popen([str(runner), "connect", "--instance", "ally", "--state-root", str(root / "state")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+        except Exception:
+            self.log.close()
+            raise
         self.lock = threading.Lock()
         self.messages = queue.Queue()
         self.stopped = threading.Event()
-        threading.Thread(target=self.read, daemon=True).start()
-        self.send({"type": "hello", "protocol_version": 1, "started": True, "gate_jobs": True})
-        hello = self.until("hello")
-        if hello.get("platforms") != ["windows"]:
-            raise RuntimeError(f"wrong runner platform: {hello}")
+        try:
+            threading.Thread(target=self.read, daemon=True).start()
+            self.send({"type": "hello", "protocol_version": 1, "started": True, "gate_jobs": True})
+            hello = self.until("hello", timeout=hello_timeout)
+            if hello.get("protocol_version") != 1 or hello.get("platforms") != ["windows"]:
+                raise RuntimeError(f"wrong runner Hello version/platform: {hello}")
+        except Exception as error:
+            classified = error
+            if isinstance(error, (OSError, TimeoutError)):
+                try:
+                    classified = RunnerBridgeUnavailable(self.bridge_failure(str(error)))
+                except Exception as diagnostic_error:
+                    classified = diagnostic_error
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                raise RuntimeError(f"{classified}; bridge cleanup failed: {cleanup_error}") from error
+            if classified is not error:
+                raise classified from error
+            raise
         threading.Thread(target=self.heartbeat, daemon=True).start()
+
+    def bridge_failure(self, reason):
+        try:
+            state = runner_service_status()
+            service = f"runner service not running (MotorRunner status={state})" if state != "Running" else "runner service is Running but its bridge is not ready; startup/parent verification may still be in progress"
+        except Exception as error:
+            service = f"runner service status unavailable: {error}"
+        self.log.flush()
+        detail = self.log_path.read_text(encoding="utf-8", errors="replace").strip()
+        if "local pipe is not owned by the running MotorRunner service" in detail:
+            raise RunnerBridgeRefused(f"runner bridge refused a non-service pipe; log={self.log_path}; diagnostics={detail}")
+        return f"{service}; {reason}; bridge exit={self.process.poll()}; log={self.log_path}; diagnostics={detail or '<empty>'}"
 
     def send(self, value):
         data = json.dumps(value, separators=(",", ":")).encode()
+        pipe = self.process.stdin
+        if pipe is None:
+            raise RuntimeError("runner bridge has no stdin pipe")
         with self.lock:
-            self.process.stdin.write(struct.pack(">I", len(data)) + data)
-            self.process.stdin.flush()
+            pipe.write(struct.pack(">I", len(data)) + data)
+            pipe.flush()
 
     def read(self):
         try:
             def exact(n):
+                pipe = self.process.stdout
+                if pipe is None:
+                    raise RuntimeError("runner bridge has no stdout pipe")
                 chunks = bytearray()
                 while len(chunks) < n:
-                    data = self.process.stdout.read(n - len(chunks))
+                    data = pipe.read(n - len(chunks))
                     if not data:
                         raise EOFError("runner bridge closed")
                     chunks.extend(data)
@@ -64,12 +131,17 @@ class Channel:
             except (OSError, ValueError):
                 return
 
-    def until(self, kind, output=None):
-        deadline = time.monotonic() + 900
+    def until(self, kind, output=None, timeout: float = 900):
+        deadline = time.monotonic() + timeout
         while True:
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"runner did not deliver {kind} within 900 seconds")
-            value = self.messages.get(timeout=max(0.01, deadline - time.monotonic()))
+                raise TimeoutError(f"runner did not deliver {kind} within {timeout} seconds")
+            try:
+                value = self.messages.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty as error:
+                raise TimeoutError(f"runner did not deliver {kind} within {timeout} seconds") from error
+            if isinstance(value, EOFError):
+                raise RunnerBridgeUnavailable(self.bridge_failure(str(value))) from value
             if isinstance(value, Exception):
                 raise value
             if value["type"] == "refusal":
@@ -81,9 +153,63 @@ class Channel:
 
     def close(self):
         self.stopped.set()
-        self.process.terminate()
-        self.process.wait(timeout=20)
-        self.log.close()
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        finally:
+            for pipe in (self.process.stdin, self.process.stdout):
+                if pipe is not None:
+                    pipe.close()
+            self.log.close()
+
+
+def wait_for_service_ready(root, runner, evidence, timeout=180):
+    started = time.monotonic()
+    observations = []
+    ready = False
+    failure = None
+    def save():
+        (evidence / "service-readiness.json").write_text(json.dumps(dict(ready=ready, failure=failure, elapsed_seconds=time.monotonic() - started, observations=observations), indent=2), encoding="utf-8")
+    try:
+        save()
+        while time.monotonic() - started < timeout:
+            state = runner_service_status()
+            observation = dict(host_unix_ms=int(time.time() * 1000), status=state)
+            observations.append(observation)
+            save()
+            if state not in {"Running", "StartPending"}:
+                raise RunnerBridgeUnavailable(f"runner service not running (MotorRunner status={state}); startup/parent verification did not complete")
+            if state == "Running":
+                try:
+                    channel = Channel(runner, root, evidence / f"bridge-ready-{len(observations)}.log", hello_timeout=min(5, max(0.01, timeout - (time.monotonic() - started))))
+                except RunnerBridgeUnavailable as error:
+                    observation["bridge_error"] = str(error)
+                else:
+                    channel.close()
+                    ready = True
+                    observation["hello_validated"] = True
+                    # The runner binds this pipe only after Runner::open has
+                    # finished parent validation and reconciliation. A Running
+                    # service status alone is earlier, not a readiness signal.
+                    print("PASS runner-service-ready parent-verification-complete windows-protocol-hello", flush=True)
+                    return
+            save()
+            time.sleep(min(0.5, max(0, timeout - (time.monotonic() - started))))
+        raise TimeoutError(f"runner service did not provide a valid Windows Hello within {timeout} seconds; inspect service startup/parent verification and readiness bridge logs")
+    except Exception as error:
+        failure = str(error)
+        raise
+    finally:
+        try:
+            save()
+        except Exception:
+            if failure is None:
+                raise
 
 
 def fixture(path):
@@ -112,6 +238,7 @@ fn real_gate_standard_account_cache_boundary_and_large_collection() {
 
 
 def run(root, runner, evidence, gate):
+    require_runner_service()
     repo = evidence / "fixture"
     commit, tree = fixture(repo)
     bundle = evidence / "fixture.bundle"
@@ -165,11 +292,19 @@ def run(root, runner, evidence, gate):
     print("PASS multi-frame-tree real-cache-reuse large-stdout large-source-collection standard-account prep-home-not-exposed real-gate-shape", flush=True)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(r"C:\ProgramData\MotorRunner"))
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--gate-command", default="cargo test --locked --offline -- --nocapture && cargo clippy --all-targets --locked --offline -- -D warnings")
-    args = parser.parse_args()
+    parser.add_argument("--wait-ready", action="store_true", help="Wait for service Running and a validated Windows Hello after parent verification")
+    args = parser.parse_args(argv)
     args.evidence.mkdir(parents=True, exist_ok=False)
-    run(args.root, args.root / "bin/motor-runner.exe", args.evidence, args.gate_command)
+    if args.wait_ready:
+        wait_for_service_ready(args.root, args.root / "bin/motor-runner.exe", args.evidence)
+    else:
+        run(args.root, args.root / "bin/motor-runner.exe", args.evidence, args.gate_command)
+
+
+if __name__ == "__main__":
+    main()
