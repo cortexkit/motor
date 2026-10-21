@@ -784,7 +784,8 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
         cleaned(runner.config(), setup.id, &a);
         let config = runner.config().clone();
         drop(runner);
-        let reopened = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+        let reopened =
+            reopen_with(|| Runner::open_with_backend(config.clone(), Box::new(FakeHost)));
         assert!(
             reopened.core.quarantined.is_empty(),
             "direct backend collections must not become unreadable jobs on restart"

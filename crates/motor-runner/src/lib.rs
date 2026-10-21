@@ -33,6 +33,8 @@ mod tenant_agent;
 mod tenant_local;
 #[cfg(test)]
 mod test_cleanup;
+#[cfg(all(test, unix))]
+mod test_helpers;
 #[cfg(test)]
 #[path = "../tests/support/process.rs"]
 mod test_process;

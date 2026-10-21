@@ -1366,7 +1366,6 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
 #[test]
 fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let output = f.scratch.join("driver-output");
     let tools = f.scratch.join("driver-tools");
@@ -1379,8 +1378,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
             "#!/bin/bash\nprintf '{\"stats\":{\"cache_misses\":{\"counts\":{\"Rust\":0}}}}\\n'\n",
         ),
     ] {
-        fs::write(tools.join(name), script).unwrap();
-        fs::set_permissions(tools.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_test_executable(&tools.join(name), script.as_bytes()).unwrap();
     }
     let mut sandbox = Sandbox {
         id: Uuid::now_v7(),
