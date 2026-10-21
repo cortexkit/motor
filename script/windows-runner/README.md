@@ -42,11 +42,18 @@ the host.
 - Service and qualification startup reuse the SYSTEM/Administrators-only parent
   record when its full file identity matches. Only a missing, unreadable or
   changed record triggers hashing, with a separate 15-minute validation deadline
-  and hash-duration evidence. Prepare and Run compare the same identity
-  (including NTFS ChangeTime) and hold read-sharing, write/delete-denying handles
-  during setup and execution; they never refresh a mismatch. Restart to re-verify
-  a changed parent. Startup and per-job checks trust the record equally; SYSTEM
-  and Administrators can change the parent, scripts, configuration and record.
+  and hash-duration evidence. Each runner process holds a read-sharing,
+  write/delete-denying parent handle from before verification until its lifetime
+  ends, including service idle time and qualification between control calls.
+  Prepare and Run also hold their own guards and never refresh a mismatch.
+  ChangeTime is deliberately not an identity field: Hyper-V rewrites identical
+  security descriptors at VM creation/removal. File ID, size, LastWrite, read-only
+  and owner/ACL must still match. The exact Hyper-V VM Bus Provider capability SID
+  receives read-only parent access alongside the VM group; no other grant is added.
+  Restart to re-verify a changed parent. Startup and jobs trust the record equally.
+  SYSTEM and Administrators are trusted; while no runner process holds a guard,
+  they can rewrite equal-length content and restore LastWrite without detection.
+  That service-stopped maintenance window is accepted, not prevented by metadata.
 - No job NIC, COM mapping, optional integration service or Enhanced Session.
   Host isolation is checked before boot, every 250 ms while running, and at
   shutdown. The creation-time VM configuration checks and later samples are

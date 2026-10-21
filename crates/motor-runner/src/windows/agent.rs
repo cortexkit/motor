@@ -18,6 +18,10 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct Runtime {
+    // Config clones share this guard, so service and qualification lifetimes
+    // deny parent writes/deletion even between their individual control calls.
+    #[cfg(windows)]
+    pub(super) parent_guard: Mutex<Option<(PathBuf, fs::File)>>,
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,

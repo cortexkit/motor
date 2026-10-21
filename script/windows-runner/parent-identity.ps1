@@ -81,11 +81,16 @@ namespace Motor {
                 info.IndexHigh.ToString("X8") + info.IndexLow.ToString("X8"),
                 (((ulong)info.SizeHigh << 32) | info.SizeLow).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 DateTime.FromFileTimeUtc(basic.LastWriteTime).ToString("O"),
-                DateTime.FromFileTimeUtc(basic.ChangeTime).ToString("O"),
                 ((basic.Attributes & 1) != 0).ToString(),
                 Security(file).GetSecurityDescriptorSddlForm(AccessControlSections.Owner |
                     AccessControlSections.Group | AccessControlSections.Access)
             };
+        }
+        public static long ChangeTime(FileStream file) {
+            BasicInformation basic;
+            Check(GetFileInformationByHandleEx(file.SafeFileHandle, 0, out basic,
+                (uint)Marshal.SizeOf(typeof(BasicInformation))));
+            return basic.ChangeTime;
         }
     }
 }
@@ -94,7 +99,9 @@ namespace Motor {
 
 function Get-RunnerParentIdentity([IO.FileStream]$Guard) {
     $values = [Motor.ParentFile]::Identity($Guard)
-    [ordered]@{volume_serial=$values[0]; file_index=$values[1]; size=$values[2]; last_write_utc=$values[3]; change_time_utc=$values[4]; read_only=$values[5]; acl=$values[6]}
+    # Hyper-V can rewrite an identical security descriptor at VM create/remove,
+    # advancing ChangeTime without changing the parent content or its ACL.
+    [ordered]@{volume_serial=$values[0]; file_index=$values[1]; size=$values[2]; last_write_utc=$values[3]; read_only=$values[4]; acl=$values[5]}
 }
 
 function Assert-RunnerFileAcl([IO.FileStream]$Guard, [switch]$ParentFile) {
@@ -104,11 +111,20 @@ function Assert-RunnerFileAcl([IO.FileStream]$Guard, [switch]$ParentFile) {
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'File owner must be SYSTEM or Administrators' }
     if (-not $acl.AreAccessRulesProtected) { throw 'File ACL must disable inheritance' }
     $allowed = @('S-1-5-18','S-1-5-32-544')
-    if ($ParentFile) { $allowed += 'S-1-5-83-0' }
+    if ($ParentFile) {
+        # Hyper-V's VM Bus Provider capability also receives access to VM disks.
+        # go-winio documents it in the grantvmgroupaccess expected-ACL fixtures;
+        # this sealed parent permits only read access, not their read/write case:
+        # https://github.com/microsoft/go-winio/blob/main/pkg/security/grantvmgroupaccess_test.go
+        $allowed += @('S-1-5-83-0','S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704')
+    }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow') { continue }
         if ($rule.IdentityReference.Value -notin $allowed) { throw 'Unexpected file ACL grant' }
         $readRights = [int][Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][Security.AccessControl.FileSystemRights]::Synchronize
+        if ($rule.IdentityReference.Value -eq 'S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704') {
+            $readRights = [int][Security.AccessControl.FileSystemRights]::Read -bor [int][Security.AccessControl.FileSystemRights]::Synchronize
+        }
         if ($ParentFile -and ($rule.FileSystemRights -band (-bnot $readRights))) { throw 'Parent ACL must grant read access only' }
     }
 }
@@ -171,8 +187,10 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
         # Skipping the digest is safe only with the sealed parent ACL and protected
         # record. Startup trusts this record exactly as the per-job check does.
         # SYSTEM and Administrators remain trusted: they can change the
-        # scripts, configuration and record too. ChangeTime catches other changes
-        # and accidents even when a same-size rewrite restores LastWriteTime.
+        # scripts, configuration and record too. The runner process holds a parent
+        # guard for its entire lifetime. When no runner holds a guard, SYSTEM or
+        # an Administrator can rewrite equal-length content and restore LastWrite;
+        # that maintenance window is accepted, not detected by this identity set.
         # Per-job callers keep this read-sharing, write/delete-denying guard until
         # the VM is off; startup reuses the same identity and trust checks.
         return $guard

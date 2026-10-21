@@ -1,4 +1,5 @@
 use super::*;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
     let vm: VmConfig = toml::from_str(&fs::read_to_string(path)?).map_err(invalid)?;
@@ -39,6 +40,35 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
     {
         return Err(invalid("native Windows runner requires instance ally, windows-vm backend and the installed state root"));
     }
+    let parent = vm.baseline_path();
+    let mut lifetime = config.windows_runtime.parent_guard.lock().unwrap();
+    if lifetime.as_ref().is_some_and(|(path, _)| path != &parent) {
+        return Err(invalid("Windows runtime already guards a different parent"));
+    }
+    // Acquire before Validate hashes/checks identity. Store only after success;
+    // an error drops the local guard even if callers retain another Config clone.
+    let guard = if lifetime.is_none() {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ: Hyper-V readers coexist; writes/deletes do not.
+            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(&parent)
+            .map_err(|error| {
+                invalid(format!("Cannot guard parent before verification: {error}"))
+            })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & 0x400 != 0
+            || !metadata.permissions().readonly()
+        {
+            return Err(invalid(
+                "Parent guard requires a sealed non-reparse regular file",
+            ));
+        }
+        Some(file)
+    } else {
+        None
+    };
     super::vm::checked_validation(super::vm::control(
         config,
         "Validate",
@@ -50,6 +80,9 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
             vm.parent_sha256.clone(),
         ],
     )?)?;
+    if let Some(file) = guard {
+        *lifetime = Some((parent, file));
+    }
     Ok(())
 }
 pub(super) fn grant_mirrors(_config: &Config) -> io::Result<()> {

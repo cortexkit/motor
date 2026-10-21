@@ -7,6 +7,13 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_process_parent_guard_is_held_across_control_calls(self):
+        windows = HERE.parents[1] / "crates/motor-runner/src/windows"
+        host = (windows / "hyperv_host.rs").read_text()
+        self.assertLess(host.index(".share_mode(1)"), host.index("checked_validation("))
+        self.assertLess(host.index("checked_validation("), host.index("*lifetime = Some((parent, file))"))
+        self.assertIn("parent_guard: Mutex<Option<(PathBuf, fs::File)>>", (windows / "agent.rs").read_text())
+
     def test_startup_accepts_matching_record_before_hashing(self):
         helper = (HERE / "parent-identity.ps1").read_text()
         startup = helper.split("function Confirm-RunnerParentVerification", 1)[1]

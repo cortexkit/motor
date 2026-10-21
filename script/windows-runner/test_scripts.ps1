@@ -67,8 +67,11 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     $record = Join-Path $fixture 'parent-verified.json'
     $parentRecord = $record
     $parentGuard = $null
+    $lifetimeGuard = $null
+    $capability = 'S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704'
     $readAcl = [Security.AccessControl.FileSecurity]::new()
-    $readAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FR;;;SY)(A;;FR;;;BA)(A;;FR;;;S-1-5-83-0)')
+    $readSddl = "O:BAG:BAD:P(A;;FR;;;SY)(A;;FR;;;BA)(A;;FR;;;S-1-5-83-0)(A;;FR;;;$capability)"
+    $readAcl.SetSecurityDescriptorSddlForm($readSddl)
     $writeAcl = [Security.AccessControl.FileSecurity]::new()
     $writeAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
     function Set-FixtureParent([string]$Contents, [DateTime]$LastWrite) {
@@ -125,15 +128,58 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS parent-identity-unchanged-and-concurrent-reader'
         $count++
 
-        # Use equal-length bytes, then restore every compared field except ChangeTime.
-        Set-FixtureParent 'modified' $lastWrite
-        $probe = [Motor.ParentFile]::Open($Parent)
-        try { $after = Get-RunnerParentIdentity $probe } finally { $probe.Dispose() }
-        foreach ($key in $before.Keys) {
-            if ($key -ne 'change_time_utc' -and $before[$key] -cne $after[$key]) { throw "FAIL same-size fixture unexpectedly changed $key" }
+        foreach ($sddl in @($readSddl.Replace("(A;;FR;;;$capability)", "(A;;FRFW;;;$capability)"), ($readSddl + '(A;;FR;;;BU)'))) {
+            $badAcl = [Security.AccessControl.FileSecurity]::new()
+            $badAcl.SetSecurityDescriptorSddlForm($sddl)
+            Set-Acl -LiteralPath $Parent -AclObject $badAcl
+            $probe = [Motor.ParentFile]::Open($Parent)
+            $rejected = $false
+            try { Assert-RunnerFileAcl $probe -ParentFile } catch { $rejected = $true } finally {
+                $probe.Dispose()
+                Set-Acl -LiteralPath $Parent -AclObject $readAcl
+            }
+            if (-not $rejected) { throw 'FAIL parent-capability-read-only-and-no-other-grant' }
         }
-        if ($before.change_time_utc -ceq $after.change_time_utc) { throw 'FAIL same-size fixture did not advance ChangeTime' }
-        Assert-FixtureRejected 'parent-identity-rejects-same-size-rewrite-with-restored-lastwrite'
+        Write-Host 'PASS parent-capability-read-only-and-no-other-grant'
+        $count++
+
+        # Model the runner's lifetime guard, not just a per-job check. Make the
+        # ACL writable so the failure proves sharing rather than access denial.
+        $lifetimeGuard = [Motor.ParentFile]::Open($Parent)
+        $changeBefore = [Motor.ParentFile]::ChangeTime($lifetimeGuard)
+        Set-Acl -LiteralPath $Parent -AclObject $writeAcl
+        [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::Normal)
+        $denied = $false
+        try {
+            $writer = [IO.File]::Open($Parent, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $bytes = [Text.Encoding]::UTF8.GetBytes('modified')
+                $writer.Write($bytes, 0, $bytes.Length)
+            } finally { $writer.Dispose() }
+        } catch {
+            if (($_.Exception.GetBaseException().HResult -band 0xffff) -ne 32) { throw }
+            $denied = $true
+        } finally {
+            [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::ReadOnly)
+            Set-Acl -LiteralPath $Parent -AclObject $readAcl
+        }
+        if (-not $denied) { throw 'FAIL parent-lifetime-guard-blocks-same-size-content-rewrite' }
+        Write-Host 'PASS parent-lifetime-guard-blocks-same-size-content-rewrite'
+        $count++
+        $after = Get-RunnerParentIdentity $lifetimeGuard
+        foreach ($key in $before.Keys) {
+            if ($before[$key] -cne $after[$key]) { throw "FAIL ChangeTime-only fixture unexpectedly changed $key" }
+        }
+        if ($changeBefore -eq [Motor.ParentFile]::ChangeTime($lifetimeGuard)) { throw 'FAIL ChangeTime-only fixture did not advance ChangeTime' }
+        $parentGuard = Open-RunnerVerifiedParent $Parent $ParentSha256 $record
+        $parentGuard.Dispose(); $parentGuard = $null
+        Write-Host 'PASS parent-identity-accepts-changetime-only-update'
+        $count++
+        $lifetimeGuard.Dispose(); $lifetimeGuard = $null
+
+        # Without a lifetime guard, LastWrite still detects an ordinary rewrite.
+        Set-FixtureParent 'modified' $lastWrite.AddMinutes(1)
+        Assert-FixtureRejected 'parent-identity-rejects-same-size-rewrite-with-changed-lastwrite'
         $metadata = @{parent=$Parent; sha256=$ParentSha256}
         $denied = $false
         try {
@@ -216,6 +262,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS parent-guard-denies-write-and-delete-and-refuses-existing-writer'
         $count++
     } finally {
+        if ($lifetimeGuard) { $lifetimeGuard.Dispose() }
         if ($parentGuard) { $parentGuard.Dispose() }
         if (Test-Path -LiteralPath $Parent) { Set-Acl -LiteralPath $Parent -AclObject $writeAcl }
         Remove-Item -LiteralPath $fixture -Recurse -Force

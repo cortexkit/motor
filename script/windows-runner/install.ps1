@@ -48,7 +48,7 @@ foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\h
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
 (Get-Item -LiteralPath $parent).IsReadOnly = $true
-& icacls.exe $parent /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:R' '*S-1-5-83-0:R' /Q | Out-Null
+& icacls.exe $parent /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:R' '*S-1-5-83-0:R' '*S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704:R' /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot seal parent ACL for Hyper-V workers' }
 & icacls.exe $parent /setowner '*S-1-5-32-544' /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted parent owner; run install.ps1 from an elevated administrator shell, not a SYSTEM scheduled task' }
