@@ -59,9 +59,10 @@ def check(roots, image=Path("/"), owner=0, limit=REPORTED):
     """Check every entry under each root, each root itself and every directory
     from `image` down to it. `roots` are absolute paths inside the image at
     `image` ("/" for a live system or a chroot; a fixture directory in tests).
-    A root that is a symlink is checked as a link and its target is walked.
-    Missing roots are listed, not treated as violations; their existing
-    ancestors are still checked."""
+    A root that is a symlink is checked as a link; its target is walked when it
+    exists inside the image and reported as a violation when it resolves
+    outside. Missing roots and dangling links are listed as missing, not as
+    violations; their existing ancestors are still checked."""
     image = Path(os.path.realpath(image))
     seen, walked, offenders, missing = set(), [], [], []
     entries = 0

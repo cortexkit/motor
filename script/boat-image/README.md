@@ -188,7 +188,7 @@ RUSTUP_HOME of `motor-boat.service`). Symlinks must be root-owned too.
 Installation enforces this after the service preflight, recorded as
 `root_owned_paths` in the inventory, and every probe phase reruns the operator
 checkout's `script/tenant-image/guest/root_paths.py` as `<phase>.root_owned_paths`.
-Before any tool is installed, the recipe creates an absent `/home/ubuntu` as
+Before installing the runner toolchains, the recipe creates an absent `/home/ubuntu` as
 root:root 0755. If another account owns it, the recipe refuses and names the
 owner's uid, passwd entry and running processes; it never takes over a
 provider account's home. Release archives are extracted with `--no-same-owner

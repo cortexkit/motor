@@ -102,10 +102,11 @@ def account_processes(uid, proc=Path("/proc")):
 
 
 def tool_home(home=TOOL_HOME, proc=Path("/proc")):
-    """The runner's PATH and RUSTUP_HOME live under /home/ubuntu, so root
-    executes from it and it must be root's. Create it root:root 0755 when
-    absent. Refuse one another account owns rather than take over a provider
-    account's home without anyone deciding to."""
+    """The runner's Bun PATH entry and its RUSTUP_HOME are under
+    /home/ubuntu, so root runs Bun and the Rust toolchains from beneath it and
+    the directory must be root's. Create it root:root 0755 when absent. Refuse
+    one another account owns rather than take over a provider account's home
+    without anyone deciding to."""
     try:
         metadata = home.lstat()
     except FileNotFoundError:
