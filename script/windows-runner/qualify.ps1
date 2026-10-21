@@ -47,6 +47,9 @@ try {
     $caches = @()
     $peerClock = [Diagnostics.Stopwatch]::StartNew()
     $timeline = [ordered]@{schema=1; hello_validated=$false}
+    $peerError = $null
+    $peerPhase = 'prepare'
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
     try {
         foreach ($id in $ids) {
             $sha = [Security.Cryptography.SHA256]::Create()
@@ -69,7 +72,10 @@ try {
         $timeline.victim_start_utc = $victimStart.ToString('o')
         $timeline.victim_start_ms = $peerClock.ElapsedMilliseconds
         $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"$Root\bin\hyperv.ps1",'-Operation','Run','-Root',$Root,'-Job',$victim)
-        $monitors += Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $monitor = Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $monitor | Add-Member -NotePropertyName job -NotePropertyValue $victim
+        $monitors += $monitor
+        $peerPhase = 'victim-boot-event'
         $boot = Wait-RunnerPeerBoot $victimVm $victimStart "$Evidence\peer-victim-boot.xml"
         $timeline.boot_utc = $boot.utc
         $timeline.boot_record_id = $boot.record_id
@@ -79,22 +85,28 @@ try {
         $timeline.boot_observed_ms = $peerClock.ElapsedMilliseconds
         # A host readiness connection would consume the guest's single listener.
         # Instead use a VM-matched host OS-boot event plus a fixed service-start margin.
+        $peerPhase = 'victim-service-margin'
         Start-Sleep -Seconds 20
         $attackerStart = [DateTime]::UtcNow
         $timeline.attacker_start_utc = $attackerStart.ToString('o')
         $timeline.attacker_start_ms = $peerClock.ElapsedMilliseconds
         $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"$Root\bin\hyperv.ps1",'-Operation','Run','-Root',$Root,'-Job',$attacker)
-        $monitors += Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $monitor = Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $monitor | Add-Member -NotePropertyName job -NotePropertyValue $attacker
+        $monitors += $monitor
+        $peerPhase = 'attacker-boot-event'
         $attackerBoot = Wait-RunnerPeerBoot $attackerVm $attackerStart "$Evidence\peer-attacker-boot.xml"
         $timeline.attacker_boot_utc = $attackerBoot.utc
         $timeline.attacker_boot_record_id = $attackerBoot.record_id
         # Retain a full qualification-only write-back window for the attacker
         # too. Its completed, synced proof is still mandatory after power-off;
         # elapsed time alone is never treated as probe completion.
+        $peerPhase = 'attacker-proof-window'
         Start-Sleep -Seconds 60
         $timeline.attacker_settled_ms = $peerClock.ElapsedMilliseconds
         # Read completion only from the stopped attacker child; never mount a
         # running disk. The victim stays running and has had no host connection.
+        $peerPhase = 'attacker-proof-harvest'
         & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $attacker
         $attackerLog = [IO.File]::ReadAllText("$Root\evidence\$attacker-guest\hyperv-agent.log")
         if ($attackerLog -notmatch ("\bboot nonce=" + $timeline.attacker_nonce + '(?:\s|$)')) { throw 'Attacker proof has no current-nonce boot log' }
@@ -105,6 +117,7 @@ try {
         $timeline.attacker_transport_connected = $proof[0].transport_connected
         $timeline.host_connect_utc = [DateTime]::UtcNow.ToString('o')
         $timeline.host_connect_ms = $peerClock.ElapsedMilliseconds
+        $peerPhase = 'victim-final-hello'
         $hello = Receive-RunnerPeerHello $victimVm $timeline.victim_nonce "$Evidence\peer-host-hello.json"
         $timeline.hello_utc = [DateTime]::UtcNow.ToString('o')
         $timeline.hello_ms = $peerClock.ElapsedMilliseconds
@@ -113,30 +126,51 @@ try {
         # Qualification only: as with the disconnect oracle, retain the full
         # window for guest log write-back before victim power-off. This is not
         # a durability guarantee and production never waits on persisted logs.
+        $peerPhase = 'victim-log-settle'
         Start-Sleep -Seconds 60
         $timeline.settled_ms = $peerClock.ElapsedMilliseconds
+        $peerPhase = 'victim-harvest'
         & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $victim
         $nativeLog = [IO.File]::ReadAllText("$Root\evidence\$victim-guest\hyperv-agent.log")
         $timeline.result = Assert-RunnerPeerEvidence $timeline.victim_nonce $victimVm $attackerVm $proof $timeline $nativeLog
-        Write-Host "PASS native-loopback-refused $($timeline.result) no-agent-bytes-disclosed"
+        $peerPhase = 'complete'
+    } catch {
+        $peerError = $_
+        $timeline.failure = @{phase=$peerPhase; message=[string]$_; error_id=$_.FullyQualifiedErrorId; script_stack=$_.ScriptStackTrace; utc=[DateTime]::UtcNow.ToString('o')}
+        [Console]::Error.WriteLine("Peer qualification failed in $peerPhase : $_")
     } finally {
-        [IO.File]::WriteAllText("$Evidence\peer-timeline.json", (ConvertTo-Json -InputObject $timeline -Depth 5), [Text.UTF8Encoding]::new($false))
         # A late-starting monitor must not boot a VM during offline collection.
-        # Normal monitors have already exited after the explicit Harvest above.
+        # Record intentional teardown kills separately from actual monitor errors.
+        $canRemove = $true
+        $timeline.monitors = @()
         foreach ($monitor in $monitors) {
-            if (-not $monitor.process.WaitForExit(5000)) {
-                $monitor.process.Kill()
-                if (-not $monitor.process.WaitForExit(5000)) { throw 'Peer monitor did not terminate; preserving VM disks rather than inspecting a live guest' }
+            try {
+                $primaryMessage = if ($peerError) { [string]$peerError } else { '' }
+                $status = Stop-RunnerPeerMonitor $monitor $Evidence $primaryMessage
+                $timeline.monitors += $status
+                if (-not $status.terminated) { $canRemove = $false }
+                if ($status.failure) { $cleanupErrors.Add($status.failure) }
+            } catch {
+                $canRemove = $false
+                $cleanupErrors.Add("Peer monitor disposition failed: $_")
+                [Console]::Error.WriteLine("Peer monitor disposition failed: $_")
             }
         }
-        foreach ($id in $ids) { & "$Root\bin\hyperv.ps1" -Operation Remove -Root $Root -Job $id }
-        foreach ($monitor in $monitors) {
-            if (-not $monitor.process.WaitForExit(120000)) { $monitor.process.Kill(); throw 'Peer VM monitor did not exit' }
-            $result = Complete-SpikeNativeProcess $monitor "$Evidence\peer-monitor-$($monitor.process.Id).stdout" "$Evidence\peer-monitor-$($monitor.process.Id).stderr"
-            if ($result.exitCode -ne 0) { throw 'Host isolation monitor failed during peer qualification' }
+        if ($canRemove) {
+            foreach ($id in $ids) {
+                try { & "$Root\bin\hyperv.ps1" -Operation Remove -Root $Root -Job $id } catch { $canRemove = $false; $cleanupErrors.Add("Remove $id failed: $_") }
+            }
+            if ($canRemove) {
+                foreach ($cache in $caches) {
+                    try { if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Force } } catch { $cleanupErrors.Add("Cache cleanup failed: $_") }
+                }
+            }
         }
-        foreach ($cache in $caches) { if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Force } }
+        $timeline.cleanup_errors = $cleanupErrors.ToArray()
+        try { Save-RunnerPeerJson "$Evidence\peer-timeline.json" $timeline } catch { $cleanupErrors.Add("Peer timeline write failed: $_"); [Console]::Error.WriteLine("Peer timeline write failed: $_") }
     }
+    Assert-RunnerPeerCleanup $peerError ($cleanupErrors.ToArray())
+    Write-Host "PASS native-loopback-refused $($timeline.result) no-agent-bytes-disclosed"
     Start-Service MotorRunner
     & $Python "$Root\bin\qualify-jobs.py" --root $Root --evidence "$Evidence\real-jobs"
     if ($LASTEXITCODE -ne 0) { throw 'Real runner protocol/cache/output qualification failed' }

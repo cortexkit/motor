@@ -125,6 +125,12 @@ boot margin assumes normal service startup; restarted/multiple listeners fail.
 `peer-timeline.json`, boot-event XML and `peer-host-hello.json` retain host-side
 ordering and the actual received frame; guest clocks are never subtracted from
 host clocks. Production jobs acquire no new delay and the sealed image is unchanged.
+The OS-boot matcher reads the Chipset event's namespaced `UserData/VmlEventLog/VmId`
+as a GUID, allowing uppercase spelling and event timestamps up to two seconds
+before the recorded host start. Poll queries and candidate XML are retained even on timeout. Peer
+failures retain the original phase/error; each monitor gets a disposition JSON
+and stderr reason, including parent-requested teardown kills, so cleanup cannot
+replace a boot-gate error with an unexplained nonzero exit.
 
 ## Build on Linux, not on the Windows host
 

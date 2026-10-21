@@ -18,7 +18,7 @@ function Assert-RunnerPeerEvidence([string]$Nonce, [Guid]$VictimVm, [Guid]$Attac
         if (-not $Timeline.Contains($key)) { throw "Missing host peer ordering evidence: $key" }
     }
     if ($Timeline.boot_event_id -ne 18601 -or $Timeline.boot_record_id -le 0 -or $Timeline.boot_vm_id -cne $VictimVm.ToString('D')) { throw 'Missing VM-matched host OS-boot event' }
-    if ($Timeline.boot_observed_ms -lt $Timeline.victim_start_ms -or $Timeline.attacker_start_ms -lt $Timeline.boot_observed_ms + 20000 -or [DateTimeOffset]::Parse($Timeline.boot_utc) -lt [DateTimeOffset]::Parse($Timeline.victim_start_utc) -or [DateTimeOffset]::Parse($Timeline.boot_observed_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_utc) -or [DateTimeOffset]::Parse($Timeline.attacker_start_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_observed_utc).AddSeconds(20)) { throw 'Attacker started before victim boot event plus 20-second margin' }
+    if ($Timeline.boot_observed_ms -lt $Timeline.victim_start_ms -or $Timeline.attacker_start_ms -lt $Timeline.boot_observed_ms + 20000 -or [DateTimeOffset]::Parse($Timeline.boot_utc) -lt [DateTimeOffset]::Parse($Timeline.victim_start_utc).AddSeconds(-2) -or [DateTimeOffset]::Parse($Timeline.boot_observed_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_utc) -or [DateTimeOffset]::Parse($Timeline.attacker_start_utc) -lt [DateTimeOffset]::Parse($Timeline.boot_observed_utc).AddSeconds(20)) { throw 'Attacker started before victim boot event plus 20-second margin' }
     $ordered = @('attacker_start','proof_observed','host_connect','hello')
     for ($i = 1; $i -lt $ordered.Count; $i++) {
         if ($Timeline[($ordered[$i] + '_ms')] -lt $Timeline[($ordered[$i-1] + '_ms')] -or [DateTimeOffset]::Parse($Timeline[($ordered[$i] + '_utc')]) -lt [DateTimeOffset]::Parse($Timeline[($ordered[$i-1] + '_utc')])) { throw 'Invalid host peer attempt/Hello ordering' }
@@ -56,21 +56,70 @@ function Assert-RunnerPeerEvidence([string]$Nonce, [Guid]$VictimVm, [Guid]$Attac
     return 'cross-vm-attempt-did-not-consume-single-listener'
 }
 
+function Save-RunnerPeerJson([string]$Path, $Value) {
+    [IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $Value -Depth 10), [Text.UTF8Encoding]::new($false))
+}
+
+function Get-RunnerPeerBootMatch([string]$EventXml, [Guid]$VmId, [DateTime]$Since) {
+    $Since = $Since.ToUniversalTime()
+    $xml = [xml]$EventXml
+    $system = $xml.SelectSingleNode("/*[local-name()='Event']/*[local-name()='System']")
+    $id = $system.SelectSingleNode("*[local-name()='EventID']")
+    $channel = $system.SelectSingleNode("*[local-name()='Channel']")
+    if (-not $id -or $id.InnerText -ne '18601' -or -not $channel -or $channel.InnerText -cne 'Microsoft-Windows-Hyper-V-Worker-Admin') { return $null }
+    # Chipset OS-boot events use namespaced UserData, not EventData/Properties.
+    # GUID parsing handles uppercase and braces without localized message matching.
+    $node = $xml.SelectSingleNode("/*[local-name()='Event']/*[local-name()='UserData']/*[local-name()='VmlEventLog']/*[local-name()='VmId']")
+    $actual = [Guid]::Empty
+    if (-not $node -or -not [Guid]::TryParse($node.InnerText, [ref]$actual) -or $actual -ne $VmId) { return $null }
+    $created = $system.SelectSingleNode("*[local-name()='TimeCreated']")
+    $utc = [DateTimeOffset]::Parse($created.GetAttribute('SystemTime')).UtcDateTime
+    # Allow event timestamps up to two seconds before the recorded host start;
+    # only this fresh VM's GUID can match. The 20s service margin is unchanged.
+    if ($utc -lt $Since.AddSeconds(-2)) { return $null }
+    $record = $system.SelectSingleNode("*[local-name()='EventRecordID']")
+    return @{utc=$utc.ToString('o'); record_id=[long]$record.InnerText; vm_id=$actual.ToString('D')}
+}
+
 function Wait-RunnerPeerBoot([Guid]$VmId, [DateTime]$Since, [string]$EvidencePath) {
+    $Since = $Since.ToUniversalTime()
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($clock.Elapsed.TotalSeconds -lt 90) {
-        $events = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Hyper-V-Worker-Admin'; Id=18601; StartTime=$Since.ToLocalTime()} -ErrorAction SilentlyContinue)
-        foreach ($event in $events) {
-            $xml = [xml]$event.ToXml()
-            $matched = @($xml.GetElementsByTagName('Data') | Where-Object { $_.InnerText.Trim('{}') -ieq $VmId.ToString('D') }).Count -gt 0
-            if ($matched -and $event.TimeCreated.ToUniversalTime() -ge $Since) {
-                [IO.File]::WriteAllText($EvidencePath, $event.ToXml(), [Text.UTF8Encoding]::new($false))
-                return @{utc=$event.TimeCreated.ToUniversalTime().ToString('o'); record_id=$event.RecordId; vm_id=$VmId.ToString('D')}
+    $queries = [Collections.Generic.List[object]]::new()
+    $candidates = @{}
+    $waitError = $null
+    try {
+        while ($clock.Elapsed.TotalSeconds -lt 90) {
+            $query = @{utc=[DateTime]::UtcNow.ToString('o'); count=0; error=$null}
+            $queries.Add($query)
+            try {
+                $events = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Hyper-V-Worker-Admin'; Id=18601; StartTime=$Since.AddSeconds(-2).ToLocalTime()} -ErrorAction Stop)
+            } catch {
+                $query.error = [string]$_
+                if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw "Hyper-V OS-boot event query failed: $_" }
+                $events = @()
             }
+            $query.count = $events.Count
+            foreach ($event in $events) {
+                $text = $event.ToXml()
+                $candidates[[string]$event.RecordId] = $text
+                $match = Get-RunnerPeerBootMatch $text $VmId $Since
+                if ($match) {
+                    [IO.File]::WriteAllText($EvidencePath, $text, [Text.UTF8Encoding]::new($false))
+                    return $match
+                }
+            }
+            Start-Sleep -Milliseconds 250
         }
-        Start-Sleep -Milliseconds 250
+        throw "No current VM-matched Hyper-V Worker/Admin 18601 OS-boot event for $VmId within 90 seconds"
+    } catch {
+        $waitError = $_
+        throw
+    } finally {
+        try { Save-RunnerPeerJson ($EvidencePath + '.queries.json') @{vm_id=$VmId.ToString('D'); since_utc=$Since.ToString('o'); clock_tolerance_seconds=2; queries=$queries.ToArray(); candidates=$candidates} } catch {
+            [Console]::Error.WriteLine("Boot query evidence write failed: $_")
+            if ($null -eq $waitError) { throw }
+        }
     }
-    throw "No current VM-matched Hyper-V Worker/Admin 18601 OS-boot event for $VmId"
 }
 
 function Initialize-RunnerPeerSocket {
@@ -168,4 +217,49 @@ function Receive-RunnerPeerHello([Guid]$VmId, [string]$Nonce, [string]$EvidenceP
         $json = ConvertTo-Json -InputObject @($attempts.ToArray()) -Depth 5
         [IO.File]::WriteAllText($EvidencePath, $json, [Text.UTF8Encoding]::new($false))
     }
+}
+
+function Stop-RunnerPeerMonitor($Monitor, [string]$Evidence, [string]$PrimaryError) {
+    $prefix = Join-Path $Evidence "peer-monitor-$($Monitor.process.Id)"
+    $status = [ordered]@{job=$Monitor.job; pid=$Monitor.process.Id; forced=$false; terminated=$false; exit_code=$null; reason='Waiting for Run monitor exit'; failure=$null}
+    try {
+        if (-not $Monitor.process.WaitForExit(5000)) {
+            $status.forced = $true
+            $status.reason = if ($PrimaryError) { "Qualification teardown after primary failure: $PrimaryError" } else { 'Run monitor did not exit after successful peer proof; forcing termination' }
+            # A killed child cannot flush an explanation. Record the parent's
+            # intent before Kill, then retain it beside the captured child output.
+            Save-RunnerPeerJson ($prefix + '.status.json') $status
+            $Monitor.process.Kill()
+            if (-not $Monitor.process.WaitForExit(5000)) { throw 'Peer monitor did not terminate; preserving VM disks rather than inspecting a live guest' }
+        }
+        $status.terminated = $true
+        $result = Complete-SpikeNativeProcess $Monitor ($prefix + '.stdout') ($prefix + '.stderr')
+        $status.exit_code = $result.exitCode
+        if ($status.forced) {
+            if (-not $PrimaryError) { $status.failure = $status.reason }
+        } elseif ($result.exitCode -ne 0) {
+            $status.reason = "Run monitor exited nonzero: exit=$($result.exitCode); stderr=$($result.stderr); stdout=$($result.stdout)"
+            $status.failure = $status.reason
+        } else { $status.reason = 'Run monitor exited normally after VM off' }
+    } catch {
+        $status.reason = "Run monitor collection/termination failed: $_"
+        $status.failure = $status.reason
+    } finally {
+        [Console]::Error.WriteLine("Peer monitor job=$($status.job) pid=$($status.pid): $($status.reason)")
+        try {
+            [IO.File]::AppendAllText(($prefix + '.stderr'), "`r`nParent monitor disposition: $($status.reason)`r`n", [Text.UTF8Encoding]::new($false))
+            Save-RunnerPeerJson ($prefix + '.status.json') $status
+        } catch {
+            [Console]::Error.WriteLine("Could not write peer monitor disposition: $_")
+            $status.failure = "Could not write peer monitor disposition: $_"
+        }
+    }
+    return [pscustomobject]$status
+}
+
+function Assert-RunnerPeerCleanup($PrimaryFailure, [string[]]$Failures) {
+    # Cleanup can report additional failures but must not replace the operation
+    # that caused teardown, especially an intentional monitor kill after timeout.
+    if ($null -ne $PrimaryFailure) { throw $PrimaryFailure }
+    if ($null -ne $Failures -and $Failures.Count) { throw ('Peer qualification monitor/cleanup failure: ' + ($Failures -join '; ')) }
 }

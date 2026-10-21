@@ -134,6 +134,108 @@ $count++
         Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
     } 'Invalid host peer attempt/Hello ordering'
 
+    $since = ([DateTimeOffset]'2026-01-01T00:00:00Z').UtcDateTime
+    # Match the real Chipset provider's namespaced UserData shape, including
+    # uppercase GUID spelling, rather than inventing EventData/Properties fields.
+    $bootXml = @"
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Hyper-V-Chipset'/><EventID>18601</EventID><TimeCreated SystemTime='2026-01-01T00:00:02Z'/><EventRecordID>429</EventRecordID><Channel>Microsoft-Windows-Hyper-V-Worker-Admin</Channel></System><UserData><VmlEventLog xmlns='http://www.microsoft.com/Windows/Virtualization/Events'><VmName>motor-peer-fixture</VmName><VmId>$($victimVm.ToString('D').ToUpperInvariant())</VmId></VmlEventLog></UserData></Event>
+"@
+    $boot = Get-RunnerPeerBootMatch $bootXml $victimVm $since
+    if (-not $boot -or $boot.vm_id -cne $victimVm.ToString('D') -or $boot.record_id -ne 429) { throw 'FAIL peer-boot-uppercase-userdata-guid-matches' }
+    Write-Host 'PASS peer-boot-uppercase-userdata-guid-matches'; $script:count++
+    $otherXml = $bootXml.Replace($victimVm.ToString('D').ToUpperInvariant(), $attackerVm.ToString('D').ToUpperInvariant())
+    if ($null -ne (Get-RunnerPeerBootMatch $otherXml $victimVm $since)) { throw 'FAIL peer-boot-different-vm-is-rejected' }
+    Write-Host 'PASS peer-boot-different-vm-is-rejected'; $script:count++
+    $oldXml = $bootXml.Replace('2026-01-01T00:00:02Z', '2025-12-31T23:59:57Z')
+    if ($null -ne (Get-RunnerPeerBootMatch $oldXml $victimVm $since)) { throw 'FAIL peer-boot-event-before-start-is-rejected' }
+    Write-Host 'PASS peer-boot-event-before-start-is-rejected'; $script:count++
+    $tolerated = $bootXml.Replace('2026-01-01T00:00:02Z', '2025-12-31T23:59:59Z')
+    if (-not (Get-RunnerPeerBootMatch $tolerated $victimVm $since)) { throw 'FAIL peer-boot-host-clock-tolerance-is-bounded' }
+    Write-Host 'PASS peer-boot-host-clock-tolerance-is-bounded'; $script:count++
+
+    $peerFixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-peer-events-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $peerFixture | Out-Null
+    $script:RunnerBootFixtureCalls = 0
+    $script:RunnerBootFixtureXml = @($otherXml, $bootXml)
+    function Get-WinEvent {
+        param($FilterHashtable, $ErrorAction)
+        $index = [Math]::Min($script:RunnerBootFixtureCalls, 1)
+        $script:RunnerBootFixtureCalls++
+        $event = [pscustomobject]@{RecordId=$script:RunnerBootFixtureCalls; xml=$script:RunnerBootFixtureXml[$index]}
+        $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value { return $this.xml }
+        return $event
+    }
+    function New-MonitorFixture([int]$Id, [bool]$Exited, [int]$Code, [bool]$Stubborn = $false) {
+        $process = [pscustomobject]@{Id=$Id; exited=$Exited; code=$Code; stubborn=$Stubborn}
+        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Timeout) return $this.exited }
+        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { if (-not $this.stubborn) { $this.exited = $true } }
+        return [pscustomobject]@{job='peer-fixture'; process=$process}
+    }
+    function Complete-SpikeNativeProcess($Running, [string]$StdoutPath, [string]$StderrPath) {
+        [IO.File]::WriteAllText($StdoutPath, '')
+        [IO.File]::WriteAllText($StderrPath, '')
+        return [pscustomobject]@{exitCode=$Running.process.code; stdout=''; stderr=''}
+    }
+    $fixtureStderr = [Console]::Error
+    try {
+        $eventPath = Join-Path $peerFixture 'boot.xml'
+        $matched = Wait-RunnerPeerBoot $victimVm $since $eventPath
+        $queries = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($eventPath + '.queries.json'))
+        if ($script:RunnerBootFixtureCalls -ne 2 -or $queries.queries.Count -ne 2 -or $matched.vm_id -cne $victimVm.ToString('D')) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
+        Write-Host 'PASS peer-boot-polls-past-unrelated-event-and-retains-queries'; $script:count++
+        # These negative cases retain reasons in files without printing expected
+        # failures to the calling shell's native stderr error stream.
+        [Console]::SetError([IO.TextWriter]::Null)
+        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 1 $false 1) $peerFixture 'Boot gate timeout'
+        if (-not $status.forced -or -not $status.terminated -or $status.failure -or [IO.File]::ReadAllText((Join-Path $peerFixture 'peer-monitor-1.stderr')) -notlike '*Boot gate timeout*') { throw 'FAIL peer-monitor-intentional-kill-retains-reason-with-empty-output' }
+        Write-Host 'PASS peer-monitor-intentional-kill-retains-reason-with-empty-output'; $script:count++
+        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 2 $true 1) $peerFixture ''
+        if ($status.forced -or -not $status.failure -or $status.reason -notlike '*exited nonzero: exit=1*') { throw 'FAIL peer-monitor-unexpected-nonzero-has-explicit-reason' }
+        Write-Host 'PASS peer-monitor-unexpected-nonzero-has-explicit-reason'; $script:count++
+        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 3 $true 0) $peerFixture ''
+        Assert-RunnerPeerCleanup $null @()
+        if ($status.failure -or $status.reason -notlike '*normally after VM off*') { throw 'FAIL peer-monitor-normal-off-has-explicit-reason' }
+        Write-Host 'PASS peer-monitor-normal-off-has-explicit-reason'; $script:count++
+        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 4 $false 1 $true) $peerFixture 'Boot gate timeout'
+        if ($status.terminated -or $status.failure -notlike '*preserving VM disks*') { throw 'FAIL peer-monitor-unreaped-preserves-disks' }
+        Write-Host 'PASS peer-monitor-unreaped-preserves-disks'; $script:count++
+        Assert-PeerFixtureRejected 'peer-cleanup-preserves-primary-boot-gate-error' {
+            Assert-RunnerPeerCleanup 'Original boot gate timeout' @('Run monitor exit=1')
+        } 'Original boot gate timeout'
+    } finally {
+        [Console]::SetError($fixtureStderr)
+        Remove-Item Function:\Get-WinEvent
+        Remove-Item Function:\Complete-SpikeNativeProcess
+        Remove-Variable -Name RunnerBootFixtureCalls,RunnerBootFixtureXml -Scope Script -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $peerFixture -Recurse -Force
+    }
+
+    & {
+        # Execute the production Run catch with failing evidence/stop mocks: the
+        # first reason and thrown error must still identify the sample failure.
+        $tries = @($control.FindAll({ param($node) $node -is [Management.Automation.Language.TryStatementAst] -and $node.Body.Extent.Text.Contains('Start-VM -VM $vm') }, $true))
+        if ($tries.Count -ne 1) { throw 'Production Run try/catch fixture is ambiguous' }
+        $body = $tries[0].CatchClauses[0].Body.Extent.Text
+        $catchSource = $body.Substring(1, $body.Length - 2)
+        function Evidence([string]$Id, [string]$Event, $Detail) { throw 'Fixture evidence write failed' }
+        function Stop-VM { throw 'Fixture VM stop failed' }
+        if ((Get-Command Stop-VM).CommandType -ne 'Function') { throw 'Run catch fixture refuses a real Stop-VM' }
+        $vm = [pscustomobject]@{State='Running'}
+        $Job = 'peer-run-fixture'
+        $writer = [IO.StringWriter]::new()
+        $previous = [Console]::Error
+        $retained = $false
+        try {
+            [Console]::SetError($writer)
+            try {
+                try { throw 'Original monitor sample failure' } catch { . ([scriptblock]::Create($catchSource)) }
+            } catch { $retained = [string]$_ -like '*Original monitor sample failure*' }
+        } finally { [Console]::SetError($previous) }
+        $text = $writer.ToString()
+        if (-not $retained -or -not $text.StartsWith('Hyper-V Run monitor job=peer-run-fixture failed: Original monitor sample failure') -or -not $text.Contains('Monitor failure evidence write failed') -or -not $text.Contains('Monitor failure VM stop failed')) { throw 'FAIL peer-run-monitor-catch-retains-original-error-and-writes-reason' }
+        Write-Host 'PASS peer-run-monitor-catch-retains-original-error-and-writes-reason'; $script:count++
+    }
+
     # The fixed header independently pins the big-endian Hello wire format.
     $payload = [Text.Encoding]::UTF8.GetBytes('{"kind":"hello","version":4,"nonce":"0123456789abcdef0123456789abcdef"}')
     if ($payload.Length -ne 71) { throw 'Hello wire fixture length changed' }

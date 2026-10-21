@@ -251,11 +251,12 @@ switch ($Operation) {
         $inspection | ConvertTo-Json -Compress
     }
     'Run' {
-        $vm = Owned-VM $Job
-        $directory = Job-Path $Job
-        $metadata = Get-Content "$directory\job.json" -Raw | ConvertFrom-Json
+        $vm = $null
         $parentGuard = $null
         try {
+            $vm = Owned-VM $Job
+            $directory = Job-Path $Job
+            $metadata = Get-Content "$directory\job.json" -Raw | ConvertFrom-Json
             # Prepare and Run are separate processes; recheck before any VM boot.
             $parentGuard = Open-RunnerVerifiedParent $metadata.parent $metadata.sha256 $parentRecord
             $parentIdentity = Get-RunnerParentIdentity $parentGuard
@@ -274,10 +275,15 @@ switch ($Operation) {
                 if ($identity[$key] -cne $parentIdentity[$key]) { throw 'parent changed since verification; restart the service to re-verify' }
             }
             Evidence $Job 'normal-off' @{parent_unchanged=$true; parent_sha256=$metadata.sha256}
+            [Console]::Error.WriteLine("Hyper-V Run monitor job=$Job exited normally: VM off, parent unchanged")
         } catch {
-            if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-            Evidence $Job 'host-isolation-failed' ([string]$_)
-            throw
+            $failure = $_
+            # Emit the original reason before best-effort evidence or VM stop;
+            # a disappearing VM must not turn a sample failure into empty output.
+            [Console]::Error.WriteLine("Hyper-V Run monitor job=$Job failed: $failure")
+            try { Evidence $Job 'host-isolation-failed' ([string]$failure) } catch { [Console]::Error.WriteLine("Monitor failure evidence write failed: $_") }
+            try { if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force } } catch { [Console]::Error.WriteLine("Monitor failure VM stop failed: $_") }
+            throw $failure
         } finally { if ($parentGuard) { $parentGuard.Dispose() } }
     }
     'Harvest' { Harvest-Job $Job }

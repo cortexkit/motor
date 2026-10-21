@@ -15,8 +15,9 @@ class PeerQualificationTests(unittest.TestCase):
     def test_victim_boot_event_and_margin_precede_attacker_start(self):
         self.assertIn("Id=18601", self.helper)
         self.assertIn("Microsoft-Windows-Hyper-V-Worker-Admin", self.helper)
-        self.assertIn("$_.InnerText.Trim('{}') -ieq $VmId.ToString('D')", self.helper)
-        self.assertIn("$event.TimeCreated.ToUniversalTime() -ge $Since", self.helper)
+        self.assertIn("[Guid]::TryParse($node.InnerText, [ref]$actual)", self.helper)
+        self.assertIn("$actual -ne $VmId", self.helper)
+        self.assertIn("$utc -lt $Since.AddSeconds(-2)", self.helper)
         self.assertIn("$Timeline.boot_observed_ms + 20000", self.helper)
         self.assertIn("Parse($Timeline.boot_observed_utc).AddSeconds(20)", self.helper)
         boot = self.control.index("$boot = Wait-RunnerPeerBoot $victimVm")
@@ -94,6 +95,60 @@ class PeerQualificationTests(unittest.TestCase):
     def test_installer_deploys_peer_qualification_helper(self):
         self.assertIn("'qualify-peer.ps1'", (HERE / "install.ps1").read_text())
         self.assertIn('. "$PSScriptRoot\\qualify-peer.ps1"', self.control)
+
+    def test_boot_event_uses_actual_userdata_and_retains_poll_diagnostics(self):
+        self.assertIn("local-name()='UserData'", self.helper)
+        self.assertIn("local-name()='VmlEventLog'", self.helper)
+        self.assertIn("local-name()='VmId'", self.helper)
+        self.assertIn("GetAttribute('SystemTime')", self.helper)
+        self.assertNotIn("GetElementsByTagName('Data')", self.helper)
+        self.assertIn("while ($clock.Elapsed.TotalSeconds -lt 90)", self.helper)
+        self.assertIn("NoMatchingEventsFound*", self.helper)
+        self.assertIn("Hyper-V OS-boot event query failed", self.helper)
+        self.assertIn(".queries.json", self.helper)
+        self.assertIn("candidates=$candidates", self.helper)
+
+    def test_monitor_cleanup_records_intent_and_preserves_primary_failure(self):
+        monitor = self.helper.split("function Stop-RunnerPeerMonitor(", 1)[1].split("function Assert-RunnerPeerCleanup(", 1)[0]
+        self.assertLess(monitor.index("Save-RunnerPeerJson"), monitor.index("$Monitor.process.Kill()"))
+        self.assertIn("Parent monitor disposition:", monitor)
+        self.assertIn("$status.terminated = $true", monitor)
+        self.assertIn("if (-not $PrimaryError) { $status.failure = $status.reason }", monitor)
+        cleanup = self.helper.split("function Assert-RunnerPeerCleanup(", 1)[1]
+        self.assertIn("if ($null -ne $PrimaryFailure) { throw $PrimaryFailure }", cleanup)
+        self.assertLess(cleanup.index("throw $PrimaryFailure"), cleanup.index("$Failures.Count"))
+        self.assertIn("$peerError = $_", self.control)
+        self.assertIn("phase=$peerPhase; message=[string]$_", self.control)
+        self.assertIn("Assert-RunnerPeerCleanup $peerError ($cleanupErrors.ToArray())", self.control)
+        self.assertIn("if (-not $status.terminated) { $canRemove = $false }", self.control)
+        self.assertNotIn("Host isolation monitor failed during peer qualification", self.control)
+
+    def test_run_monitor_logs_original_error_before_evidence_and_vm_stop(self):
+        run = (HERE / "hyperv.ps1").read_text().split("'Run' {", 1)[1].split("'Harvest' {", 1)[0]
+        self.assertLess(run.index("try {"), run.index('$metadata = Get-Content'))
+        failure = run.split("$failure = $_", 1)[1]
+        self.assertLess(failure.index("[Console]::Error.WriteLine"), failure.index("Evidence $Job 'host-isolation-failed'"))
+        self.assertLess(failure.index("[Console]::Error.WriteLine"), failure.index("Stop-VM"))
+        self.assertIn("throw $failure", failure)
+        self.assertIn("exited normally: VM off, parent unchanged", run)
+
+    def test_native_fixtures_cover_real_boot_shape_and_teardown_reasons(self):
+        fixtures = (HERE / "test_scripts.ps1").read_text()
+        for name in (
+            "peer-boot-uppercase-userdata-guid-matches",
+            "peer-boot-different-vm-is-rejected",
+            "peer-boot-event-before-start-is-rejected",
+            "peer-boot-polls-past-unrelated-event-and-retains-queries",
+            "peer-monitor-intentional-kill-retains-reason-with-empty-output",
+            "peer-monitor-unexpected-nonzero-has-explicit-reason",
+            "peer-monitor-unreaped-preserves-disks",
+            "peer-cleanup-preserves-primary-boot-gate-error",
+            "peer-run-monitor-catch-retains-original-error-and-writes-reason",
+        ):
+            self.assertIn(name, fixtures)
+        self.assertIn("Get-RunnerPeerBootMatch $bootXml $victimVm $since", fixtures)
+        self.assertIn("Wait-RunnerPeerBoot $victimVm $since $eventPath", fixtures)
+        self.assertIn("Stop-RunnerPeerMonitor (New-MonitorFixture", fixtures)
 
 
 if __name__ == "__main__":
