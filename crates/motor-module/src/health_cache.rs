@@ -157,14 +157,15 @@ impl HealthCache {
     /// exceeded that; columns keep it to a few kilobytes. `permits_cap` is a
     /// single number when it never changed in the window.
     fn history_json(&self, newest_minute: u64) -> Value {
-        let oldest_minute =
-            newest_minute.saturating_sub((HISTORY_LIMIT as u64 - 1) * MINUTE_MS);
+        let oldest_minute = newest_minute.saturating_sub((HISTORY_LIMIT as u64 - 1) * MINUTE_MS);
         let points: Vec<_> = self
             .history
             .iter()
             .filter(|point| point.minute_ms >= oldest_minute && point.minute_ms <= newest_minute)
             .collect();
-        let start = points.first().map_or(newest_minute, |point| point.minute_ms);
+        let start = points
+            .first()
+            .map_or(newest_minute, |point| point.minute_ms);
         let slots = if points.is_empty() {
             0
         } else {
@@ -181,9 +182,10 @@ impl HealthCache {
             depth[slot] = json!(point.queue_depth);
             p90[slot] = json!(point.queue_p90_ms);
         }
-        let constant_cap = points.first().map(|first| first.permits_cap).filter(|first| {
-            points.iter().all(|point| point.permits_cap == *first)
-        });
+        let constant_cap = points
+            .first()
+            .map(|first| first.permits_cap)
+            .filter(|first| points.iter().all(|point| point.permits_cap == *first));
         json!({
             "start_minute_ms": start,
             "step_ms": MINUTE_MS,

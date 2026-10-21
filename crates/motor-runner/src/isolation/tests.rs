@@ -1508,18 +1508,24 @@ fn nested_cargo_fetch_failure_logs_lockfile_and_crate_without_refusing() {
             .into_os_string()
     }));
     let mut skipped = Vec::new();
-    prefetch_cargo_with(&f.workspace, "HEAD", false, NESTED_CARGO_FETCH_TIMEOUT, |directory| {
-        let mut command = workspace::dependencies::fetch_command(
-            &f.state,
-            directory,
-            &BTreeMap::new(),
-            &f.scratch.join("cargo"),
-            &rustup,
-        )?;
-        command.env("CARGO_NET_OFFLINE", "true");
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),)
+    prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        NESTED_CARGO_FETCH_TIMEOUT,
+        |directory| {
+            let mut command = workspace::dependencies::fetch_command(
+                &f.state,
+                directory,
+                &BTreeMap::new(),
+                &f.scratch.join("cargo"),
+                &rustup,
+            )?;
+            command.env("CARGO_NET_OFFLINE", "true");
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    )
     .unwrap();
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0].0, Path::new("probes/helper/Cargo.lock"));
@@ -1597,19 +1603,25 @@ fn cargo_stale_lock_fixture(stale_root: bool) {
     }));
     let mut fetched = Vec::new();
     let mut skipped = Vec::new();
-    let result = prefetch_cargo_with(&f.workspace, "HEAD", false, NESTED_CARGO_FETCH_TIMEOUT, |directory| {
-        fetched.push(directory.to_path_buf());
-        let mut command = workspace::dependencies::fetch_command(
-            &f.state,
-            directory,
-            &BTreeMap::new(),
-            &f.scratch.join("cargo"),
-            &rustup,
-        )?;
-        command.env("CARGO_NET_OFFLINE", "true");
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),);
+    let result = prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        NESTED_CARGO_FETCH_TIMEOUT,
+        |directory| {
+            fetched.push(directory.to_path_buf());
+            let mut command = workspace::dependencies::fetch_command(
+                &f.state,
+                directory,
+                &BTreeMap::new(),
+                &f.scratch.join("cargo"),
+                &rustup,
+            )?;
+            command.env("CARGO_NET_OFFLINE", "true");
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    );
     if stale_root {
         let error = result.unwrap_err().to_string();
         assert!(
@@ -1642,19 +1654,25 @@ fn nested_cargo_fetch_deadline_skips_stall_and_gives_next_lock_a_fresh_bound() {
     let marker = f.scratch.join("ready");
     let mut skipped = Vec::new();
     let started = Instant::now();
-    prefetch_cargo_with(&f.workspace, "HEAD", false, Duration::from_millis(200), |directory| {
-        let mut command = Command::new("sh");
-        command.arg("-c");
-        if directory.ends_with("a-stalled") {
-            command.arg("printf 'cargo diagnostic before stall' >&2; sleep 30");
-        } else {
-            command
-                .arg("sleep 0.02; printf fetched > \"$MARKER\"")
-                .env("MARKER", &marker);
-        }
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),)
+    prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        Duration::from_millis(200),
+        |directory| {
+            let mut command = Command::new("sh");
+            command.arg("-c");
+            if directory.ends_with("a-stalled") {
+                command.arg("printf 'cargo diagnostic before stall' >&2; sleep 30");
+            } else {
+                command
+                    .arg("sleep 0.02; printf fetched > \"$MARKER\"")
+                    .env("MARKER", &marker);
+            }
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    )
     .unwrap();
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(fs::read_to_string(marker).unwrap(), "fetched");
@@ -1810,8 +1828,10 @@ fn cargo_prefetch_fixture(nested: bool) {
         "tip dependency must initially be absent"
     );
     let routes = BTreeMap::from([(url, mirror)]);
-    prefetch_cargo_dependencies(true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup)
-        .unwrap();
+    prefetch_cargo_dependencies(
+        true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup,
+    )
+    .unwrap();
     let ready = metadata();
     assert!(
         ready.status.success(),
