@@ -143,6 +143,7 @@ class RunnerHostTests(unittest.TestCase):
                 "proc_mountinfo": ['25 20 0:22 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible',
                                    '26 25 0:22 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible'],
                 "proc_global": {'stat': {'readable': True, 'has_line': True}, 'meminfo': {'readable': True, 'has_line': True},
+                                'locks': {'readable': True, 'has_line': True}, 'net_unix': {'readable': True, 'has_line': True},
                                 'sys_read_only': True, 'cmdline': {'readable': True, 'provider_names': False}},
                 "cargo_target": {'env': '/run/motor/target', 'same_directory': True},
                 "process_visibility": {'self_pid':10,'protected_pids':[1,2], 'proc':[{'pid':10,'uid':997,'same_cgroup':True}],
@@ -288,7 +289,8 @@ class RunnerHostTests(unittest.TestCase):
     def test_job_reads_global_proc_entries_but_kernel_tunables_stay_read_only(self):
         job = self.fixture()
         self.assertTrue(all(host.proc_checks(job).values()))
-        for entry, check in (('stat', 'proc_stat_has_btime'), ('meminfo', 'proc_meminfo_readable')):
+        for entry, check in (('stat', 'proc_stat_has_btime'), ('meminfo', 'proc_meminfo_readable'),
+                             ('locks', 'proc_locks_readable'), ('net_unix', 'proc_net_unix_readable')):
             with self.subTest(entry=entry):
                 job = self.fixture()
                 job['proc_global'][entry] = {'readable': False, 'error': 'FileNotFoundError'}
@@ -313,10 +315,13 @@ class RunnerHostTests(unittest.TestCase):
         job['proc_mountinfo'] = [line + ',subset=pid' for line in job['proc_mountinfo']]
         job['proc_global'] = {'stat': {'readable': False, 'error': 'FileNotFoundError'},
                               'meminfo': {'readable': False, 'error': 'FileNotFoundError'},
+                              'locks': {'readable': False, 'error': 'FileNotFoundError'},
+                              'net_unix': {'readable': False, 'error': 'FileNotFoundError'},
                               'sys_read_only': False, 'sys_error': 'FileNotFoundError',
                               'cmdline': {'readable': False, 'error': 'FileNotFoundError'}}
         checks = host.proc_checks(job)
-        for name in ('proc_hides_other_users', 'proc_stat_has_btime', 'proc_meminfo_readable'):
+        for name in ('proc_hides_other_users', 'proc_stat_has_btime', 'proc_meminfo_readable',
+                     'proc_locks_readable', 'proc_net_unix_readable'):
             self.assertFalse(checks[name], name)
         job = self.fixture()
         job['proc_mountinfo'] = [line + ',subset=pid' for line in job['proc_mountinfo']]

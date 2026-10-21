@@ -164,14 +164,17 @@ data['status_security'] = {key:next(line.split()[1] for line in status.splitline
 data['proc_mountinfo'] = [line for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] in ('/proc', '/proc/sys')]
 def global_proc():
     # Build-server jobs read these non-process entries (ps needs btime from
-    # /proc/stat); /proc/sys must stay read-only and the kernel command line
+    # /proc/stat; lock-holder and socket-readiness tests read /proc/locks and
+    # /proc/net/unix); /proc/sys must stay read-only and the kernel command line
     # must not carry provider credentials. Record booleans, not the contents.
+    # A None prefix only requires the entry to be readable, since it may be empty.
     out = {}
-    for path, prefix in (('/proc/stat', 'btime '), ('/proc/meminfo', 'MemTotal:')):
-        name = path.rsplit('/', 1)[1]
+    for name, path, prefix in (('stat', '/proc/stat', 'btime '), ('meminfo', '/proc/meminfo', 'MemTotal:'),
+                               ('locks', '/proc/locks', None), ('net_unix', '/proc/net/unix', 'Num ')):
         try:
             lines = pathlib.Path(path).read_text().splitlines()
-            out[name] = {'readable': True, 'has_line': any(line.startswith(prefix) for line in lines)}
+            out[name] = {'readable': True,
+                         'has_line': prefix is None or any(line.startswith(prefix) for line in lines)}
         except OSError as error:
             out[name] = {'readable': False, 'error': type(error).__name__}
     try:
@@ -557,6 +560,9 @@ def proc_checks(job):
             ('hidepid=invisible' in mount or 'hidepid=2' in mount) and 'subset=pid' not in mount for mount in options),
         'proc_stat_has_btime': proc['stat'].get('readable') is True and proc['stat'].get('has_line') is True,
         'proc_meminfo_readable': proc['meminfo'].get('readable') is True and proc['meminfo'].get('has_line') is True,
+        'proc_locks_readable': proc.get('locks', {}).get('readable') is True,
+        'proc_net_unix_readable': proc.get('net_unix', {}).get('readable') is True
+            and proc['net_unix'].get('has_line') is True,
         'proc_sys_read_only': proc['sys_read_only'] is True,
         'proc_cmdline_no_provider_names': proc['cmdline'].get('readable') is True and proc['cmdline'].get('provider_names') is False,
     }
