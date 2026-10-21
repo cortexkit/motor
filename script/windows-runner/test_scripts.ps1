@@ -350,7 +350,6 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         # Model the runner's lifetime guard, not just a per-job check. Make the
         # ACL writable so the failure proves sharing rather than access denial.
         $lifetimeGuard = [Motor.ParentFile]::Open($Parent)
-        $changeBefore = [Motor.ParentFile]::ChangeTime($lifetimeGuard)
         Set-Acl -LiteralPath $Parent -AclObject $writeAcl
         [IO.File]::SetAttributes($Parent, [IO.FileAttributes]::Normal)
         $denied = $false
@@ -370,11 +369,34 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         if (-not $denied) { throw 'FAIL parent-lifetime-guard-blocks-same-size-content-rewrite' }
         Write-Host 'PASS parent-lifetime-guard-blocks-same-size-content-rewrite'
         $count++
+        # The parent is fresh under a GUID-named directory on every run. Do not
+        # infer a ChangeTime update from the preceding sharing test's ACL writes:
+        # they can finish within one filesystem timestamp tick. Repeatedly flip
+        # Hidden to its opposite and back, preserving every original attribute,
+        # until the held handle observes the change or the bounded window ends.
+        $changeBefore = [Motor.ParentFile]::ChangeTime($lifetimeGuard)
+        $changeAfter = $changeBefore
+        $originalAttributes = [IO.File]::GetAttributes($Parent)
+        $flippedAttributes = [IO.FileAttributes]([int]$originalAttributes -bxor [int][IO.FileAttributes]::Hidden)
+        $changeClock = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Set-Acl -LiteralPath $Parent -AclObject $writeAcl
+            do {
+                [IO.File]::SetAttributes($Parent, $flippedAttributes)
+                [IO.File]::SetAttributes($Parent, $originalAttributes)
+                $changeAfter = [Motor.ParentFile]::ChangeTime($lifetimeGuard)
+                if ($changeAfter -gt $changeBefore) { break }
+                Start-Sleep -Milliseconds 25
+            } while ($changeClock.ElapsedMilliseconds -lt 2000)
+        } finally {
+            [IO.File]::SetAttributes($Parent, $originalAttributes)
+            Set-Acl -LiteralPath $Parent -AclObject $readAcl
+        }
         $after = Get-RunnerParentIdentity $lifetimeGuard
         foreach ($key in $before.Keys) {
             if ($before[$key] -cne $after[$key]) { throw "FAIL ChangeTime-only fixture unexpectedly changed $key" }
         }
-        if ($changeBefore -eq [Motor.ParentFile]::ChangeTime($lifetimeGuard)) { throw 'FAIL ChangeTime-only fixture did not advance ChangeTime' }
+        if ($changeAfter -le $changeBefore) { throw 'FAIL ChangeTime-only fixture did not advance ChangeTime within 2 seconds of attribute flips' }
         $parentGuard = Open-RunnerVerifiedParent $Parent $ParentSha256 $record
         $parentGuard.Dispose(); $parentGuard = $null
         Write-Host 'PASS parent-identity-accepts-changetime-only-update'

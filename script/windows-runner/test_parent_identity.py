@@ -7,6 +7,23 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_changetime_fixture_uses_unique_file_and_bounded_metadata_flips(self):
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("'motor-parent-tests-' + [Guid]::NewGuid()", fixture)
+        self.assertIn("$Parent = Join-Path $fixture 'parent.vhdx'", fixture)
+        change = fixture.split("# The parent is fresh under a GUID-named directory", 1)[1].split("# Without a lifetime guard", 1)[0]
+        self.assertIn("$originalAttributes = [IO.File]::GetAttributes($Parent)", change)
+        self.assertIn("-bxor [int][IO.FileAttributes]::Hidden", change)
+        self.assertLess(change.index("SetAttributes($Parent, $flippedAttributes)"), change.index("SetAttributes($Parent, $originalAttributes)"))
+        self.assertIn("$changeClock.ElapsedMilliseconds -lt 2000", change)
+        self.assertIn("Start-Sleep -Milliseconds 25", change)
+        self.assertIn("$changeAfter = [Motor.ParentFile]::ChangeTime($lifetimeGuard)", change)
+        self.assertIn("$changeAfter -le $changeBefore", change)
+        self.assertIn("finally {", change)
+        self.assertIn("Set-Acl -LiteralPath $Parent -AclObject $readAcl", change)
+        self.assertIn("foreach ($key in $before.Keys)", change)
+        self.assertIn("Open-RunnerVerifiedParent $Parent $ParentSha256 $record", change)
+
     def test_guest_collection_asserts_child_attachment_and_mounted_volume(self):
         script = (HERE / "hyperv.ps1").read_text()
         binding = script.split("function Assert-JobDiskBinding(", 1)[1].split("function Harvest-Job(", 1)[0]
