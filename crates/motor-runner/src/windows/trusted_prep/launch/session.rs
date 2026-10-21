@@ -665,7 +665,9 @@ impl Session {
             Some(Handle(result))
         } else if plan.diagnostic_policy.lowbox().is_some() {
             // No restricting SIDs: the AppContainer check is the write boundary
-            // here, and a write-restricted token would also fail KsecDD.
+            // here. A write-restricted token cannot open \Device\KsecDD (the
+            // kernel crypto device bcrypt uses) for write, because only the
+            // logon SID would count in its second, restricted access check.
             let mut result = null_mut();
             check("CreateRestrictedToken-lowbox-base", unsafe {
                 CreateRestrictedToken(

@@ -146,7 +146,8 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
 
 /// SYSTEM side: one fresh staging job, the package-SID grants, four cells, then
 /// revocation, an exact before/after comparison of the persistent grants, and
-/// staging removal. Nothing here is a qualification pass.
+/// staging removal. This gathers diagnostic evidence only; it never marks the
+/// runner as qualified.
 pub(super) fn entry(config: Config) -> io::Result<()> {
     use fs2::FileExt;
     use windows_service::{

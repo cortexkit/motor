@@ -518,7 +518,7 @@ pub(super) fn probe_context() -> io::Result<Value> {
     session::probe_context()
 }
 /// Lowbox diagnostics may run only the trusted probe copy in its fixed lowbox
-/// mode, or the production-shaped online fetch of the fixed lowbox fixture.
+/// mode, or a real online Cargo fetch (production arguments) of the fixed lowbox fixture.
 fn lowbox_plan_allowed(plan: &Plan) -> io::Result<()> {
     let probe = plan.cwd.join("fetch-manifests/probe.exe");
     let manifest = plan.cwd.join("fetch-manifests/lowbox-fixture/Cargo.toml");
