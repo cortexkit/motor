@@ -152,3 +152,17 @@ fn hosted_firecracker_bodies_match_the_published_1_17_schema() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn hosted_running_marker_is_written_whole_and_removal_tolerates_absence() {
+    let scratch = cortexkit_test_support::ScratchDir::new("running-marker");
+    let marker = scratch.join("running.json");
+    write_running_marker(&marker).unwrap();
+    let value: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert!(value["at_ms"].as_u64().unwrap() > 0);
+    assert!(!scratch.join("running.pending").exists());
+    remove_running_marker(&marker).unwrap();
+    assert!(!marker.exists());
+    // A clean stop of a VM that never wrote a marker must still succeed.
+    remove_running_marker(&marker).unwrap();
+}

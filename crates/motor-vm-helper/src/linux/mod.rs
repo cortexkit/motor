@@ -461,6 +461,18 @@ impl Machine for LinuxMachine {
     fn tenant(&mut self, tenant: &str, op: crate::tenant::Operation) -> Result<crate::Response> {
         self.tenants.handle(tenant, op)
     }
+    fn shutdown(&mut self) -> Result<()> {
+        // stop_all logs each tenant's outcome; this only summarises.
+        let failures = self.tenants.stop_all();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error(format!(
+                "{} tenant(s) recorded as unclean",
+                failures.len()
+            )))
+        }
+    }
 }
 fn inputs(kind: Kind) -> &'static [(&'static str, &'static str)] {
     if kind == Kind::Scan {

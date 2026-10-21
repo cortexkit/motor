@@ -95,13 +95,37 @@ class ProvisionTests(unittest.TestCase):
                 states[active] = "active"
                 make_base = mock.Mock(side_effect=self.fake_base)
                 validate = mock.Mock()
-                with self.assertRaisesRegex(ValueError, "must be stopped"):
+                with self.assertRaisesRegex(ValueError, "must be stopped") as refused:
                     p.switch_image("a", "v2", make_base=make_base, check_service=states.get,
                                    validate_image=validate, output=lambda _line: None)
+                # The refusal names the exact command that stops the tenant
+                # cleanly, not a bare kill of the VM.
+                self.assertIn("sudo systemctl stop motor-host.service motor-vm-helper.service", str(refused.exception))
+                self.assertIn("cleanly", str(refused.exception))
                 validate.assert_not_called()
                 make_base.assert_not_called()
                 self.assertEqual(provision_path.read_bytes(), old_config)
                 self.assertEqual(registry_path.read_bytes(), old_record)
+
+    def test_switch_image_warns_when_the_last_vm_stop_was_unclean(self):
+        self.switch_records()
+        home = p.ROOT / "tenants/a"
+        messages = []
+        switch = lambda: p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                                        validate_image=lambda _image: None, output=messages.append)
+        switch()
+        self.assertFalse(any("did not stop cleanly" in line for line in messages), messages)
+        # The helper's running marker outlived the stop: the guest's power was
+        # cut, and the operator is told that its next start runs recovery.
+        (home / "running.json").write_text("{}")
+        messages.clear()
+        switch()
+        warning = [line for line in messages if "did not stop cleanly" in line]
+        self.assertEqual(len(warning), 1, messages)
+        self.assertIn("recovery", warning[0])
+        # The switch itself does not touch the marker; the helper turns it into
+        # the unclean-stop record when the tenant next starts.
+        self.assertTrue((home / "running.json").exists())
 
     def test_switch_image_runs_the_hosted_image_inventory_command(self):
         with mock.patch.object(p.subprocess, "run") as execute:

@@ -151,6 +151,21 @@ pub trait Backend {
     fn recovery_complete(&mut self, _tenant: &str, _registry: &Registry) -> Result<()> {
         Err(Error("recovery unavailable".into()))
     }
+    /// Whether the durable running marker is present. `load` writes it before
+    /// the VMM starts and only a clean stop or a completed suspend removes it,
+    /// so a marker on a tenant that is not running means its last VM ended
+    /// without the guest flushing its disk: the helper was killed, the host
+    /// lost power, or the VMM died.
+    fn was_running(&mut self, _registry: &Registry) -> Result<bool> {
+        Ok(false)
+    }
+    fn clear_running(&mut self, _registry: &Registry) -> Result<()> {
+        Ok(())
+    }
+    /// Tenants this helper process started and may still be running.
+    fn running_tenants(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn registry(&mut self, tenant: &str) -> Result<Registry>;
     fn key(&mut self, registry: &Registry) -> Result<SnapshotKey>;
     fn saved_key(&mut self, registry: &Registry) -> Result<Option<SnapshotKey>>;
@@ -185,6 +200,7 @@ impl<B: Backend> Controller<B> {
         }
         let r = self.0.registry(tenant)?;
         r.validate(tenant)?;
+        self.record_lost_vm(tenant, &r)?;
         let mut restored = self.0.was_restored(tenant);
         match op {
             Operation::Ensure | Operation::Restore => {
@@ -219,15 +235,22 @@ impl<B: Backend> Controller<B> {
             }
             Operation::Stop => {
                 if self.0.running(tenant) {
-                    let record = match self.0.prepare_stop(tenant) {
+                    let prepared = self.0.prepare_stop(tenant);
+                    let record = match &prepared {
                         Ok(()) => Ok(()),
                         Err(error) => self.0.mark_unclean(&r, &error.to_string()),
                     };
+                    let prepared = prepared.is_ok();
                     if let Err(error) = self.0.stop(tenant) {
                         let _ = self.0.thaw(tenant);
                         return Err(error);
                     }
                     record?;
+                    // Only a stop whose guest flush succeeded is clean. After a
+                    // failed flush the marker stays as a second durable record.
+                    if prepared {
+                        self.0.clear_running(&r)?;
+                    }
                 }
             }
             Operation::Suspend => {
@@ -255,6 +278,9 @@ impl<B: Backend> Controller<B> {
                     cleanup?;
                     return Err(error);
                 }
+                // The guest froze its filesystems before the snapshot, so the
+                // disk is consistent whether the snapshot or a fresh boot runs next.
+                self.0.clear_running(&r)?;
             }
         }
         let generation = self.0.key(&r)?.generation;
@@ -264,6 +290,60 @@ impl<B: Backend> Controller<B> {
             generation,
             recovery_required: self.0.unclean(&r)?,
         }))
+    }
+    /// Turns a running marker left by a VM that is no longer running into the
+    /// unclean-stop record, so the next start skips the suspend snapshot and
+    /// the guest runs its recovery check. This covers a helper killed by
+    /// SIGKILL, a host power loss and a VMM that died on its own: none of them
+    /// ran the clean stop that removes the marker.
+    fn record_lost_vm(&mut self, tenant: &str, r: &Registry) -> Result<()> {
+        if !self.0.running(tenant) && self.0.was_running(r)? && !self.0.unclean(r)? {
+            self.0.mark_unclean(r, "vm_stopped_without_clean_stop")?;
+        }
+        Ok(())
+    }
+    /// The service stop path: stops every running tenant the way
+    /// `Operation::Stop` does (guest drain, `sync -f /tenant` and freeze,
+    /// bounded at 15 s, then the VMM is killed). A tenant that cannot be
+    /// stopped cleanly is recorded as unclean before this returns, so the
+    /// caller may exit and let systemd kill whatever is left. Returns the
+    /// tenants that did not stop cleanly, with the reason.
+    pub fn stop_all(&mut self) -> Vec<(String, Error)> {
+        let mut failures = Vec::new();
+        for tenant in self.0.running_tenants() {
+            let started = std::time::Instant::now();
+            let failure = match self.handle(&tenant, Operation::Stop) {
+                // A refused or timed-out guest flush still stops the VM. Stop
+                // has then recorded the reason and left the running marker.
+                Ok(_) => {
+                    let flushed = self
+                        .0
+                        .registry(&tenant)
+                        .and_then(|r| self.0.was_running(&r))
+                        .is_ok_and(|marker| !marker);
+                    (!flushed).then(|| Error("guest flush failed; recorded as unclean".into()))
+                }
+                Err(error) => {
+                    // The VM may still be running and will be killed by
+                    // systemd. The marker is already durable; this adds the
+                    // reason when the registry is readable.
+                    if let Ok(r) = self.0.registry(&tenant) {
+                        let _ = self.0.mark_unclean(&r, &format!("service_stop: {error}"));
+                    }
+                    Some(error)
+                }
+            };
+            // The journal keeps these, the only measurements of the stop.
+            let ms = started.elapsed().as_millis();
+            match failure {
+                None => eprintln!("tenant {tenant}: clean stop took {ms} ms"),
+                Some(error) => {
+                    eprintln!("tenant {tenant}: unclean stop after {ms} ms: {error}");
+                    failures.push((tenant, error));
+                }
+            }
+        }
+        failures
     }
     fn wake(&mut self, tenant: &str, r: &Registry) -> Result<bool> {
         let key = self.0.key(r)?;

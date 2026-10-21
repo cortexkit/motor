@@ -222,6 +222,14 @@ def move_stale_suspend(suspend, old_version):
 
 
 def switch_image(tenant, image_version, make_base=None, check_service=None, validate_image=None, output=print):
+    """Point a stopped tenant at another image.
+
+    The tenant's VM must not be running: it would keep the old image and be
+    killed later. It runs only while motor-vm-helper.service is active, so both
+    services must be stopped first, with STOP_COMMAND. Stopping the helper is
+    the clean stop: on SIGTERM it has each running guest drain, sync and freeze
+    its disk before the VM is stopped, and records any it cannot.
+    """
     tenant = component(tenant)
     image_version = component(image_version)
     lock_path = ROOT / "provision.lock"
@@ -233,7 +241,9 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         for unit in ("motor-host.service", "motor-vm-helper.service"):
             state = check_service(unit)
             if state != "inactive":
-                raise ValueError(f"{unit} must be stopped before switching a tenant image (ActiveState={state})")
+                raise ValueError(f"{unit} must be stopped before switching a tenant image (ActiveState={state}). "
+                                 f"Stop both with: {STOP_COMMAND} "
+                                 "(the helper stops each running tenant VM cleanly before it exits)")
 
         provision_path = PROVISION / f"{tenant}.json"
         registry_path = REGISTRY / f"{tenant}.json"
@@ -291,8 +301,23 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         output(f"{tenant}: {old_version} -> {image_version}")
         if moved is not None:
             output(f"moved stale suspend snapshot to {moved}")
+        if unclean_stop_evidence(tenant):
+            output(f"warning: {tenant}'s last VM did not stop cleanly ({RUNNING_MARKER} is present); "
+                   "its next start boots fresh and runs the in-guest recovery check")
         output(f"rollback: sudo python3 {Path(__file__).resolve()} switch-image {tenant} {old_version}")
         return moved
+
+
+# The helper writes this before a tenant VM starts and removes it only when the
+# guest has flushed its disk and the VM stopped. With the helper stopped, a
+# marker means the last stop cut the guest's power.
+RUNNING_MARKER = "running.json"
+STOP_COMMAND = "sudo systemctl stop motor-host.service motor-vm-helper.service"
+
+
+def unclean_stop_evidence(tenant):
+    home = ROOT / "tenants" / tenant
+    return (home / RUNNING_MARKER).exists()
 
 
 # Registry fields provision() derives from the tenant's home directory rather
@@ -826,7 +851,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     commands = parser.add_subparsers(dest="command")
-    switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image")
+    switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image; "
+                                 f"stop both services first: {STOP_COMMAND}")
     switch.add_argument("tenant")
     switch.add_argument("image_version")
     repair = commands.add_parser(

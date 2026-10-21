@@ -230,6 +230,15 @@ impl Backend for LinuxTenants {
         File::open(path.parent().unwrap())?.sync_all()?;
         Ok(())
     }
+    fn was_running(&mut self, registry: &Registry) -> Result<bool> {
+        running_marker_present(&running_marker(registry))
+    }
+    fn clear_running(&mut self, registry: &Registry) -> Result<()> {
+        remove_running_marker(&running_marker(registry))
+    }
+    fn running_tenants(&mut self) -> Vec<String> {
+        self.running.keys().cloned().collect()
+    }
     fn metrics(&mut self, tenant: &str, registry: &Registry) -> Result<(u64, u64)> {
         let memory = std::fs::read_to_string(self.vm(tenant)?.group.join("memory.current"))?
             .trim()
@@ -309,6 +318,8 @@ impl Backend for LinuxTenants {
         let prefix = if saved { "suspend" } else { "base" };
         let mut boundary_created = false;
         let mut group_created = false;
+        let marker = running_marker(r);
+        let mut marker_written = false;
         let setup = (|| {
             std::fs::create_dir_all(boundary.parent().unwrap())?;
             super::create_boundary(&boundary)?;
@@ -419,6 +430,10 @@ impl Backend for LinuxTenants {
             unsafe {
                 cmd.pre_exec(move || super::raw_place(procs.as_raw_fd()));
             }
+            // Durable before the VMM can touch the disk, so a helper killed
+            // at any later point leaves evidence of an unclean stop.
+            write_running_marker(&marker)?;
+            marker_written = true;
             Ok(cmd.spawn()?)
         })();
         let child = match setup {
@@ -435,7 +450,13 @@ impl Backend for LinuxTenants {
                 } else {
                     Ok(())
                 };
-                for cleanup in [ownership, mounts, cgroup] {
+                // Only a failed spawn follows the marker write: no VM ran.
+                let marker = if marker_written {
+                    remove_running_marker(&marker)
+                } else {
+                    Ok(())
+                };
+                for cleanup in [ownership, mounts, cgroup, marker] {
                     if let Err(error) = cleanup {
                         return Err(Error(format!("{e}; tenant cleanup failed: {error}")));
                     }
@@ -731,6 +752,38 @@ fn wait_empty(group: &Path) -> Result<()> {
         }
         std::thread::park_timeout(Duration::from_millis(10));
     }
+    Ok(())
+}
+/// Present from just before a tenant's VMM starts until a clean stop or a
+/// completed suspend, so it survives SIGKILL and power loss. It sits beside
+/// `unclean-stop.json` in the root-owned tenant home.
+fn running_marker(r: &Registry) -> PathBuf {
+    r.generation.with_file_name("running.json")
+}
+fn write_running_marker(path: &Path) -> Result<()> {
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    durable_write(path, json!({ "at_ms": at_ms }).to_string().as_bytes())
+}
+/// Any trusted regular file counts, whatever it holds: a damaged marker is
+/// still evidence. An operator can create one by hand (root-owned) to make the
+/// next start treat the tenant as stopped uncleanly.
+fn running_marker_present(path: &Path) -> Result<bool> {
+    match fs::trusted_file(path) {
+        Ok(_) => Ok(true),
+        Err(_) if !path.exists() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+fn remove_running_marker(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
 }
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {

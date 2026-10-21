@@ -265,15 +265,27 @@ fn reconcile_failure_prevents_helper_construction() {
     assert!(matches!(h.slots[0], Slot::Free));
 }
 #[test]
-fn service_uses_delegation_leaf_and_kills_the_whole_unit() {
+fn service_uses_delegation_leaf_and_sends_sigterm_only_to_the_helper() {
+    // SIGTERM to the whole cgroup (KillMode=control-group) would reach each
+    // tenant's Firecracker at the same moment as the helper and cut the
+    // guest's power before the helper could stop it cleanly. With mixed,
+    // systemd still SIGKILLs everything left once the helper exits, so the
+    // unit leaves no process behind either way.
     let unit = include_str!("../systemd/motor-vm-helper.service");
-    for setting in [
-        "Delegate=yes",
-        "DelegateSubgroup=helper",
-        "KillMode=control-group",
-    ] {
-        assert!(unit.lines().any(|l| l == setting));
+    for setting in ["Delegate=yes", "DelegateSubgroup=helper", "KillMode=mixed"] {
+        assert!(unit.lines().any(|l| l == setting), "{setting}");
     }
+    assert!(!unit.lines().any(|l| l.starts_with("SendSIGKILL=")));
+    assert!(!unit.lines().any(|l| l.starts_with("ExecStop=")));
+    // One in-flight suspend (50 s prepare, 300 s snapshot, 10 s VMM exit)
+    // plus one tenant's clean stop (45 s); the unit file explains each part.
+    let timeout: u64 = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(timeout >= 405, "{timeout}");
 }
 
 #[test]
