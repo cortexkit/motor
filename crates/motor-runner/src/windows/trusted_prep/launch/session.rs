@@ -27,6 +27,7 @@ use windows_sys::Win32::{
     },
 };
 mod access_checks;
+mod appcontainer;
 pub(super) fn access_check_run(
     vm: &crate::windows::VmConfig,
     fixture: &Path,
@@ -407,7 +408,9 @@ struct Desktop {
     name: String,
 }
 impl Desktop {
-    fn new(logon_sid: &str, explicit_writes: bool) -> io::Result<Self> {
+    /// `package` adds an AppContainer package SID beside the logon SID and
+    /// labels the objects Low, so a lowbox child (Low integrity) can use them.
+    fn new(logon_sid: &str, explicit_writes: bool, package: Option<&str>) -> io::Result<Self> {
         let name = format!("MotorPrep-{}", uuid::Uuid::now_v7().simple());
         let station_name = wide(&name);
         let desktop_name = wide("Fetch");
@@ -487,13 +490,20 @@ impl Desktop {
             } else {
                 String::new()
             };
-            let final_acl = descriptor(&format!("O:SYG:SYD:P(A;;GA;;;{logon_sid}){extra}"))?;
+            let package_ace = package.map_or_else(String::new, |sid| format!("(A;;GA;;;{sid})"));
+            let final_acl = descriptor(&format!(
+                "O:SYG:SYD:P(A;;GA;;;{logon_sid}){extra}{package_ace}"
+            ))?;
             check("private-desktop-dacl", unsafe {
                 SetUserObjectSecurity(object, &DACL_SECURITY_INFORMATION, final_acl.0)
             })?;
             // Do not depend on the SYSTEM creator's default mandatory label.
             // Label-only updates use WRITE_OWNER, not an extra security privilege.
-            let label = descriptor("S:(ML;;NW;;;ME)")?;
+            let label = descriptor(if package.is_some() {
+                "S:(ML;;NW;;;LW)"
+            } else {
+                "S:(ML;;NW;;;ME)"
+            })?;
             let mut present = 0;
             let mut defaulted = 0;
             let mut sacl = null_mut();
@@ -501,7 +511,7 @@ impl Desktop {
                 GetSecurityDescriptorSacl(label.0, &mut present, &mut sacl, &mut defaulted)
             })?;
             if present == 0 || sacl.is_null() {
-                return Err(step("private-desktop-integrity", "missing medium label"));
+                return Err(step("private-desktop-integrity", "missing mandatory label"));
             }
             win32_code("private-desktop-integrity", unsafe {
                 SetSecurityInfo(
@@ -588,6 +598,9 @@ pub(super) struct Session {
     grant: StagingGrant,
     desktop: Desktop,
     restricted: Option<Handle>,
+    /// Diagnostic lowbox cells only: the child starts as an AppContainer
+    /// process from the privilege-filtered token in `restricted`.
+    pub(super) lowbox: Option<appcontainer::Launch>,
     _diagnostic_default_dacl: Option<Local>,
     profile: Profile,
     pub(super) environment: Vec<u16>,
@@ -650,9 +663,32 @@ impl Session {
                 )
             })?;
             Some(Handle(result))
+        } else if plan.diagnostic_policy.lowbox().is_some() {
+            // No restricting SIDs: the AppContainer check is the write boundary
+            // here, and a write-restricted token would also fail KsecDD.
+            let mut result = null_mut();
+            check("CreateRestrictedToken-lowbox-base", unsafe {
+                CreateRestrictedToken(
+                    profile.token.0,
+                    DISABLE_MAX_PRIVILEGE,
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    &mut result,
+                )
+            })?;
+            Some(Handle(result))
         } else {
             None
         };
+        let lowbox = plan
+            .diagnostic_policy
+            .lowbox()
+            .map(appcontainer::Launch::new)
+            .transpose()?;
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let default_dacl_before = token_default_dacl(actual_token)?;
         let diagnostic_default_dacl = if plan.diagnostic_policy.changes_default_dacl() {
@@ -667,6 +703,7 @@ impl Session {
         let desktop = Desktop::new(
             &logon_sid,
             plan.diagnostic_policy == DiagnosticPolicy::ExplicitDesktopWrites,
+            lowbox.as_ref().map(|launch| launch.package_text.as_str()),
         )?;
         let temp = plan.cwd.join("fetch-temp");
         no_reparse(&plan.root, &temp)?;
@@ -745,11 +782,12 @@ impl Session {
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let info = json!({"user_sid":user_sid, "logon_sid":logon_sid, "restricting_sid":if plan.restricted { Some(logon_sid.clone()) } else { None },
             "token_default_dacl_before":default_dacl_before,
-            "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else { 0 })?,
+            "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else if lowbox.is_some() { DISABLE_MAX_PRIVILEGE } else { 0 })?,
+            "lowbox":lowbox.as_ref().map(|launch| launch.info.clone()),
             "window_station_readback":{"name":object_name(desktop.station)?, "dacl":object_dacl(desktop.station)?},
             "desktop_readback":{"name":object_name(desktop.desktop)?, "dacl":object_dacl(desktop.desktop)?},
             "diagnostic_policy":plan.diagnostic_policy,
-            "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":"medium",
+            "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":if lowbox.is_some() { "low" } else { "medium" },
             "desktop_dacl":format!("D:P(A;;GA;;;{logon_sid})"), "profile_loaded":true, "user_environment_block":true,
             "environment_keys":env.keys().collect::<Vec<_>>(), "temp":env["TEMP"], "tmp":env["TMP"], "userprofile":env["USERPROFILE"],
             "diagnostic_environment":if plan.diagnostic_loader_trace { Some(json!({"CARGO_HOME":env.get("CARGO_HOME"),"RUSTUP_HOME":env.get("RUSTUP_HOME"),"RUSTC":env.get("RUSTC")})) } else { None }});
@@ -758,6 +796,7 @@ impl Session {
             grant,
             desktop,
             restricted,
+            lowbox,
             _diagnostic_default_dacl: diagnostic_default_dacl,
             profile,
             environment,
@@ -791,6 +830,60 @@ impl Session {
     }
 }
 
+pub(super) fn appcontainer_context() -> Value {
+    appcontainer::current_context()
+}
+pub(super) fn appcontainer_package_sid() -> io::Result<String> {
+    appcontainer::package_sid().map(|(_, text)| text)
+}
+/// A path's DACL as SDDL, read through a handle that does not follow reparse
+/// points, so grant/revoke round trips can be compared exactly.
+pub(super) fn path_dacl_sddl(path: &Path) -> io::Result<String> {
+    let raw = unsafe {
+        CreateFileW(
+            wide(&path.to_string_lossy()).as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(step(
+            "path-dacl",
+            format!("{}: {}", path.display(), io::Error::last_os_error()),
+        ));
+    }
+    let handle = Handle(raw);
+    let mut security = null_mut();
+    win32_code("path-dacl", unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut security,
+        )
+    })?;
+    let security = Local(security);
+    let mut text = null_mut();
+    check("path-dacl-sddl", unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            security.0,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            null_mut(),
+        )
+    })?;
+    let text = Local(text.cast());
+    unsafe { read_wide(text.0.cast()) }
+}
 pub(super) fn probe_context() -> io::Result<Value> {
     let mut token = null_mut();
     check("probe-token", unsafe {

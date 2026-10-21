@@ -6,12 +6,10 @@
 //! an LPAC process ignores ACEs for ALL APPLICATION PACKAGES (S-1-15-2-1), so
 //! its decisions are the plain AppContainer decisions on descriptors with those
 //! ACEs removed in memory.
+use super::super::appcontainer::{capability_sids, package_sid, INTERNET_CLIENT, PACKAGE_NAME};
 use super::*;
 use crate::windows::sddl_model::Sddl;
 
-const PACKAGE_NAME: &str = "MotorRunner.Prep";
-/// Well-known capability SID for outbound internet access.
-const INTERNET_CLIENT: &str = "S-1-15-3-1";
 /// FILE_GENERIC_READ | FILE_EXECUTE: enough to load an image or list a directory.
 const IMAGE_READ: u32 = 0x0012_00A9;
 /// KEY_READ.
@@ -36,20 +34,6 @@ unsafe extern "system" {
     ) -> i32;
     fn NtOpenKey(handle: *mut HANDLE, access: u32, attributes: *mut Attributes) -> i32;
 }
-#[link(name = "userenv", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn DeriveAppContainerSidFromAppContainerName(name: *const u16, sid: *mut PSID) -> i32;
-}
-#[link(name = "kernelbase", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn DeriveCapabilitySidsFromName(
-        name: *const u16,
-        group_sids: *mut *mut PSID,
-        group_count: *mut u32,
-        capability_sids: *mut *mut PSID,
-        capability_count: *mut u32,
-    ) -> i32;
-}
 
 fn registry_mapping() -> GENERIC_MAPPING {
     GENERIC_MAPPING {
@@ -60,63 +44,6 @@ fn registry_mapping() -> GENERIC_MAPPING {
     }
 }
 
-/// DeriveAppContainerSidFromAppContainerName's SID must be released with FreeSid.
-struct DerivedSid(PSID);
-impl Drop for DerivedSid {
-    fn drop(&mut self) {
-        unsafe {
-            FreeSid(self.0);
-        }
-    }
-}
-fn package_sid() -> io::Result<(DerivedSid, String)> {
-    let mut sid = null_mut();
-    let result =
-        unsafe { DeriveAppContainerSidFromAppContainerName(wide(PACKAGE_NAME).as_ptr(), &mut sid) };
-    if result < 0 {
-        return Err(step(
-            "derive-package-sid",
-            format!("HRESULT 0x{:08X}", result as u32),
-        ));
-    }
-    let owned = DerivedSid(sid);
-    let text = sid_string(owned.0)?;
-    Ok((owned, text))
-}
-fn capability_sids(name: &str) -> io::Result<Vec<String>> {
-    let (mut groups, mut group_count, mut capabilities, mut count) = (null_mut(), 0, null_mut(), 0);
-    check("derive-capability-sids", unsafe {
-        DeriveCapabilitySidsFromName(
-            wide(name).as_ptr(),
-            &mut groups,
-            &mut group_count,
-            &mut capabilities,
-            &mut count,
-        )
-    })?;
-    let mut result = Vec::new();
-    let mut failure = None;
-    for index in 0..count as usize {
-        let sid = unsafe { *capabilities.add(index) };
-        match sid_string(sid) {
-            Ok(text) => result.push(text),
-            Err(error) => failure = Some(error),
-        }
-        unsafe { LocalFree(sid) };
-    }
-    for index in 0..group_count as usize {
-        unsafe { LocalFree(*groups.add(index)) };
-    }
-    unsafe {
-        LocalFree(capabilities.cast());
-        LocalFree(groups.cast());
-    }
-    match failure {
-        Some(error) => Err(error),
-        None if result.is_empty() => Err(step("derive-capability-sids", "no capability SID")),
-        None => Ok(result),
-    }
-}
 fn lowbox_token(base: HANDLE, package: PSID, capabilities: &[String]) -> io::Result<Handle> {
     // Same privilege filtering as production, but no restricting SIDs. With a
     // write-restricted token, opening KsecDD for write also has to pass a
@@ -453,9 +380,9 @@ fn all_false(decisions: &[(&str, Option<bool>)]) -> bool {
 
 /// What a staging-only grant would give, on in-memory copies of the fixture's
 /// real descriptors: traverse on the job directory, read on manifests, and
-/// write on fetch-temp only when it also carries a Low integrity label
-/// (lowbox tokens run at Low integrity, and unlabelled objects are Medium
-/// no-write-up).
+/// write on fetch-temp. Lowbox tokens run at Low integrity, so fetch-temp is
+/// checked both with a Low mandatory label and without one; the pass
+/// condition uses the labelled form.
 fn staging_hypothesis(
     stage: &str,
     manifests: &str,
@@ -494,10 +421,12 @@ fn staging_hypothesis(
     let stage_writes = writes(&traverse);
     let manifests_read = decide(pointer(&read), token, IMAGE_READ, &file)["decision"].as_bool();
     let manifests_writes = writes(&read);
+    // icacls M (0x1301bf) has no FILE_DELETE_CHILD: entries are removed through
+    // the DELETE right each one inherits from this Modify grant.
     let temp_writes = [
         ("add_file", 2),
         ("add_subdirectory", 4),
-        ("delete_child", 0x40),
+        ("delete", 0x0001_0000),
     ]
     .map(|(right, mask)| {
         (

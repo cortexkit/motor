@@ -12,6 +12,7 @@ use windows_sys::Win32::{
     Security::{LogonUserW, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT},
 };
 mod launch;
+mod lowbox;
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -401,6 +402,9 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     if matches!(mode, "rng-process-prng" | "rng-bcrypt-gen-random") {
         return launch::rng_probe(mode, output);
     }
+    if mode == "lowbox" {
+        return lowbox::probe(credential, outside, output);
+    }
     let profile =
         std::env::var_os("USERPROFILE").ok_or_else(|| invalid("prep probe has no USERPROFILE"))?;
     let profile = PathBuf::from(profile).join(format!("motor-prep-probe-{}.txt", Uuid::now_v7()));
@@ -504,6 +508,10 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
 }
 
+/// Diagnostic-only AppContainer launch cells; see `lowbox`.
+pub(super) fn lowbox_entry(config: Config) -> io::Result<()> {
+    lowbox::entry(config)
+}
 /// Diagnostic collection only: failed cells are retained, never treated as a
 /// successful preparation or permission-policy qualification.
 pub(super) fn matrix_entry(config: Config) -> io::Result<()> {

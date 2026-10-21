@@ -31,8 +31,21 @@ pub(super) enum DiagnosticPolicy {
     DefaultDaclSafeCwdPair,
     DefaultDaclProcessPrng,
     DefaultDaclBCryptRng,
+    /// Less Privileged AppContainer child with internetClient, registryRead
+    /// and lpacCryptoServices; no restricting SIDs.
+    LowboxLpac,
+    /// Plain AppContainer child with internetClient; the fallback design.
+    LowboxAppContainer,
 }
 impl DiagnosticPolicy {
+    /// Some(true) for LPAC, Some(false) for plain AppContainer, None otherwise.
+    pub(super) fn lowbox(self) -> Option<bool> {
+        match self {
+            Self::LowboxLpac => Some(true),
+            Self::LowboxAppContainer => Some(false),
+            _ => None,
+        }
+    }
     pub(super) fn changes_default_dacl(self) -> bool {
         matches!(
             self,
@@ -184,7 +197,12 @@ fn run_plan(
         restricted,
         diagnostic_policy: policy,
         diagnostic_loader_trace: retain_failure,
-        diagnostic_safe_cwd: policy.rng_mode().is_some(),
+        // The lowbox probe runs from fetch-temp so that a cwd denial on the
+        // traverse-only job directory, if any, shows up only in the Cargo cells,
+        // which keep the production working directory.
+        diagnostic_safe_cwd: policy.rng_mode().is_some()
+            || (policy.lowbox().is_some()
+                && command.get_args().next() == Some(std::ffi::OsStr::new("prep-probe"))),
         diagnostic_native_calls: retain_failure
             && matches!(
                 policy,
@@ -297,7 +315,11 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             ));
         }
     }
+    if plan.diagnostic_policy.lowbox().is_some() {
+        lowbox_plan_allowed(&plan)?;
+    }
     if rng_mode.is_none()
+        && plan.diagnostic_policy.lowbox().is_none()
         && plan.diagnostic_policy != DiagnosticPolicy::None
         && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
             || (if plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode {
@@ -494,6 +516,54 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
 
 pub(super) fn probe_context() -> io::Result<Value> {
     session::probe_context()
+}
+/// Lowbox diagnostics may run only the trusted probe copy in its fixed lowbox
+/// mode, or the production-shaped online fetch of the fixed lowbox fixture.
+fn lowbox_plan_allowed(plan: &Plan) -> io::Result<()> {
+    let probe = plan.cwd.join("fetch-manifests/probe.exe");
+    let manifest = plan.cwd.join("fetch-manifests/lowbox-fixture/Cargo.toml");
+    let probe_ok = Path::new(&plan.program) == probe
+        && plan.args.len() == 5
+        && plan.args[..2] == ["prep-probe", "lowbox"]
+        && Path::new(&plan.args[4]).parent() == Some(plan.cwd.join("fetch-temp").as_path());
+    let fetch_ok = Path::new(&plan.program) == plan.root.join("prep-toolchain/bin/cargo.exe")
+        && plan.args.len() == 6
+        && plan.args[..5]
+            == [
+                "fetch",
+                "--locked",
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--manifest-path",
+            ]
+        && Path::new(&plan.args[5]) == manifest;
+    if plan.restricted || !(probe_ok || fetch_ok) {
+        return Err(step(
+            "lowbox-diagnostic-policy",
+            format!("only the trusted lowbox probe or the fixed lowbox fixture fetch may use this variant; actual_args={:?}", plan.args),
+        ));
+    }
+    if probe_ok {
+        use sha2::{Digest, Sha256};
+        if Sha256::digest(fs::read(&plan.program)?)
+            != Sha256::digest(fs::read(std::env::current_exe()?)?)
+        {
+            return Err(step(
+                "lowbox-diagnostic-policy",
+                "probe does not match trusted runner",
+            ));
+        }
+    }
+    Ok(())
+}
+pub(super) fn appcontainer_context() -> Value {
+    session::appcontainer_context()
+}
+pub(super) fn appcontainer_package_sid() -> io::Result<String> {
+    session::appcontainer_package_sid()
+}
+pub(super) fn path_dacl_sddl(path: &Path) -> io::Result<String> {
+    session::path_dacl_sddl(path)
 }
 pub(super) fn check_path(root: &Path, path: &Path) -> io::Result<()> {
     session::no_reparse(root, path)

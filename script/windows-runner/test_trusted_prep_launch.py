@@ -51,7 +51,9 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("CloseWindowStation", self.session)
         self.assertCodeIn("window station must be non-interactive", self.session)
         self.assertCodeIn("LABEL_SECURITY_INFORMATION", self.session)
-        self.assertCodeIn('descriptor("S:(ML;;NW;;;ME)")', self.session)
+        # Production desktops stay Medium; only a lowbox diagnostic (package SID
+        # present) labels them Low for its Low-integrity child.
+        self.assertCodeIn('descriptor(if package.is_some() { "S:(ML;;NW;;;LW)" } else { "S:(ML;;NW;;;ME)" })', self.session)
         self.assertCodeIn("logon == user_sid", self.session)
 
     def test_profile_and_noninherited_user_environment_have_cleanup(self):
@@ -73,8 +75,11 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("copy_tree(&source, &cache.join(name))", self.prep)
         self.assertCodeIn("launch::check_path(&vm.layout_root, &source)", self.prep)
         control = (HERE / "hyperv.ps1").read_text()
-        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" Read $sid', control)
-        self.assertNotIn('Grant "$Root\\state\\ally\\prep-cargo" Modify $sid', control)
+        # The grants loop over the account SID and, for lowbox diagnostics only,
+        # the package SID; the persistent cache stays Read for both.
+        self.assertCodeIn('$trustees = @($sid) + @($PackageSid | Where-Object { $_ })', control)
+        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" Read $trustee', control)
+        self.assertNotIn('prep-cargo" Modify', control)
 
     def test_explicit_stdio_handle_list_and_suspended_job_assignment(self):
         self.assertCodeIn("PROC_THREAD_ATTRIBUTE_HANDLE_LIST", self.process)

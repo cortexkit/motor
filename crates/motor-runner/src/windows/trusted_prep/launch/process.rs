@@ -21,10 +21,16 @@ struct Attributes {
     pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 impl Attributes {
-    fn new(handles: &mut [HANDLE]) -> io::Result<Self> {
+    /// `extra` holds further (attribute, value, size) entries, such as the
+    /// AppContainer security capabilities; their values must outlive the list.
+    fn new(
+        handles: &mut [HANDLE],
+        extra: &[(usize, *const std::ffi::c_void, usize)],
+    ) -> io::Result<Self> {
+        let count = 1 + extra.len() as u32;
         let mut size = 0;
         unsafe {
-            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+            InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size);
         }
         if size == 0 {
             return Err(step("handle-allow-list", io::Error::last_os_error()));
@@ -32,7 +38,7 @@ impl Attributes {
         let mut storage = vec![0u128; size.div_ceil(16)];
         let pointer = storage.as_mut_ptr().cast();
         check("handle-allow-list", unsafe {
-            InitializeProcThreadAttributeList(pointer, 1, 0, &mut size)
+            InitializeProcThreadAttributeList(pointer, count, 0, &mut size)
         })?;
         let result = Self {
             _storage: storage,
@@ -49,6 +55,19 @@ impl Attributes {
                 null_mut(),
             )
         })?;
+        for (attribute, value, size) in extra {
+            check("process-attribute", unsafe {
+                UpdateProcThreadAttribute(
+                    pointer,
+                    0,
+                    *attribute,
+                    *value,
+                    *size,
+                    null_mut(),
+                    null_mut(),
+                )
+            })?;
+        }
         Ok(result)
     }
 }
@@ -142,7 +161,11 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
     let output = stdio(&plan.stdout.to_string_lossy(), false)?;
     let error = stdio(&plan.stderr.to_string_lossy(), false)?;
     let mut handles = [input.0, output.0, error.0];
-    let attributes = Attributes::new(&mut handles)?;
+    let extra = session
+        .lowbox
+        .as_ref()
+        .map_or_else(Vec::new, |launch| launch.attributes());
+    let attributes = Attributes::new(&mut handles, &extra)?;
     let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
     if job.0.is_null() {
         return Err(step("create-prep-job", io::Error::last_os_error()));

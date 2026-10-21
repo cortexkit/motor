@@ -147,8 +147,10 @@ class PrepAccessScreenTests(unittest.TestCase):
             self.assertNotIn(forbidden, lowbox)
         self.code('NtCreateLowBoxToken(', lowbox)
         self.code('CreateRestrictedToken(base, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut filtered)', lowbox)
-        self.code('const INTERNET_CLIENT: &str = "S-1-15-3-1";', lowbox)
+        appcontainer = (SRC / 'trusted_prep/launch/session/appcontainer.rs').read_text()
+        self.code('pub(super) const INTERNET_CLIENT: &str = "S-1-15-3-1";', appcontainer)
         self.code('["registryRead", "lpacCryptoServices"]', lowbox)
+        self.code('for name in ["registryRead", "lpacCryptoServices"]', appcontainer)
         self.code('parsed.without_all_application_packages()', lowbox)
         self.code('Some("(ML;OICI;NW;;;LW)")', lowbox)
         self.code('roundtrip_ok = mismatches.is_empty();', lowbox)
@@ -157,6 +159,60 @@ class PrepAccessScreenTests(unittest.TestCase):
         self.code('report["lowbox"] = lowbox::screen(', self.source)
         model = (SRC / 'sddl_model.rs').read_text()
         self.code('sid != "AC" && sid != ALL_APPLICATION_PACKAGES', model)
+
+class LowboxLaunchCellTests(unittest.TestCase):
+    """Source checks for the diagnostic AppContainer launch cells."""
+    def setUp(self):
+        self.cells = (SRC / 'trusted_prep/lowbox.rs').read_text()
+        self.launch = (SRC / 'trusted_prep/launch.rs').read_text()
+        self.appcontainer = (SRC / 'trusted_prep/launch/session/appcontainer.rs').read_text()
+        self.process = (SRC / 'trusted_prep/launch/process.rs').read_text()
+        self.session = (SRC / 'trusted_prep/launch/session.rs').read_text()
+        self.control = (HERE / 'hyperv.ps1').read_text()
+
+    def code(self, fragment, source):
+        self.assertIn(flat(fragment), flat(source))
+
+    def test_child_starts_as_lowbox_through_process_attributes(self):
+        self.code('const SECURITY_CAPABILITIES_ATTRIBUTE: usize = 0x0002_0009;', self.appcontainer)
+        self.code('const ALL_APPLICATION_PACKAGES_POLICY_ATTRIBUTE: usize = 0x0002_000F;', self.appcontainer)
+        self.code('const ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;', self.appcontainer)
+        self.code('lpac_policy: lpac.then(|| Box::new(ALL_APPLICATION_PACKAGES_OPT_OUT))', self.appcontainer)
+        self.code('let attributes = Attributes::new(&mut handles, &extra)?;', self.process)
+        self.code('.map(appcontainer::Launch::new)', self.session)
+        self.code('CreateRestrictedToken(profile.token.0, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut result)', self.session)
+        self.assertNotIn('CreateAppContainerProfile', self.appcontainer)
+
+    def test_lowbox_plans_are_fixed_and_unrestricted(self):
+        body = self.launch.split('fn lowbox_plan_allowed(', 1)[1].split('\n}\n', 1)[0]
+        self.code('plan.args[..2] == ["prep-probe", "lowbox"]', body)
+        self.code('plan.args[..5] == ["fetch", "--locked", "--target", "x86_64-pc-windows-msvc", "--manifest-path"]', body)
+        self.code('if plan.restricted || !(probe_ok || fetch_ok)', body)
+        self.code('"probe does not match trusted runner"', body)
+
+    def test_grants_use_production_builder_and_persistent_ones_are_reverted_and_compared(self):
+        self.code('"-PackageSid".into(), package.clone()', self.cells)
+        self.code('"-IncludePersistentPackage".into()', self.cells)
+        self.code('before.iter().all(Result::is_ok) && before == after', self.cells)
+        self.code('"GrantPrep"', self.cells)
+        self.code('"RevokePrep"', self.cells)
+        self.code("if ($PackageSid -and $PackageSid -notmatch '\\AS-1-15-2(-\\d+){7}\\z')", self.control)
+        self.code("if ($IncludePersistentPackage -and (-not $PackageSid -or $Operation -ne 'RevokePrep'))", self.control)
+        self.code('Grant "$full\\fetch-temp" Modify $trustee', self.control)
+
+    def test_probe_reports_live_items_without_asserting(self):
+        for fragment in ('CreateEventW(null(), 1, 0, name.as_ptr())', 'LsaConnectUntrusted(&mut handle)',
+                         '("index.crates.io", "static.crates.io")', 'TcpStream::connect_timeout(address',
+                         'launch::rng_probe(mode, &file)', 'println!("{text}")', 'launch::appcontainer_context()'):
+            self.code(fragment.replace('("index.crates.io", "static.crates.io")', '["index.crates.io", "static.crates.io"]'), self.cells)
+        self.code('checksum = \\"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\\"', self.cells)
+
+    def test_qualify_lane_routes_to_the_lowbox_entry(self):
+        control = (HERE / 'qualify.ps1').read_text()
+        branch = control.split('} elseif ($LowboxLaunch) {', 1)[1].split('} else {', 1)[0]
+        self.code("$null = Runner-Check 'qualify-prep-lowbox'", branch)
+        self.code('"qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config)', (SRC.parent / 'main.rs').read_text())
+
 
 if __name__ == '__main__':
     unittest.main()

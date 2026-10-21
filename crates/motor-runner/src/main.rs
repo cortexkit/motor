@@ -93,6 +93,8 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         #[cfg(windows)]
         "qualify-prep-matrix" => motor_runner::hyperv_qualify_prep_matrix(config),
         #[cfg(windows)]
+        "qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config),
+        #[cfg(windows)]
         "qualify-prep" => {
             let runner = Runner::open(config)?;
             motor_runner::hyperv_qualify_prep(runner.config())?;
