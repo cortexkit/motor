@@ -3,11 +3,13 @@
 import contextlib
 import copy
 import importlib.util
+import inspect
 import io
 from importlib.machinery import SourceFileLoader
 import json
 import os
 import pwd
+import stat
 import sys
 from pathlib import Path
 import tempfile
@@ -856,6 +858,134 @@ class RecipeTests(unittest.TestCase):
             (root / 'noble_InRelease').write_text('Date: Wed, 01 Jan 2025 12:00:00 UTC\n')
             with self.assertRaises(ValueError):
                 install.release_manifest(root)
+
+
+class BoatBaseLayoutTests(unittest.TestCase):
+    """Boat's base image ships /usr/local owned by its sandbox account. The
+    fixture reproduces that layout; ownership is simulated through a table that
+    Path.lstat reports and the injected chown updates, so the tests need not
+    run as root and every re-own call is observable."""
+    # A stand-in for Boat's uid 1000; any non-root uid shows the same.
+    PROVIDER = install.BOAT_BASE_UID
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.image = Path(os.path.realpath(temp.name), "image")
+        provider = ("usr/local", "usr/local/bin", "usr/local/etc", "usr/local/games", "usr/local/include",
+                    "usr/local/lib", "usr/local/sbin", "usr/local/share", "usr/local/share/man", "usr/local/src",
+                    "usr/local/share/ca-certificates", "usr/local/go/bin", "usr/local/go/src",
+                    "usr/local/rustup/toolchains/stable/bin", "usr/local/cargo/bin")
+        ours = ("usr/bin", "usr/local/lib/git/2.53.0/bin", "home/ubuntu/.bun/bin", "home/ubuntu/.rustup",
+                "srv/build/cargo-home/bin")
+        for relative in provider + ours:
+            (self.image / relative).mkdir(parents=True, exist_ok=True)
+        for relative in ("usr/local/go/bin/go", "usr/local/go/src/main.go", "usr/local/cargo/bin/cargo",
+                         "usr/local/rustup/toolchains/stable/bin/rustc", "usr/local/bin/motor-runner",
+                         "usr/local/lib/git/2.53.0/bin/git", "usr/bin/python3"):
+            (self.image / relative).write_text("#!/bin/sh\n")
+            (self.image / relative).chmod(0o755)
+        (self.image / "usr/local/man").symlink_to("share/man")
+        (self.image / "usr/local/bin/git").symlink_to("../lib/git/2.53.0/bin/git")
+        # Provider command links into its trees, absolute and relative.
+        (self.image / "usr/local/bin/go").symlink_to("/usr/local/go/bin/go")
+        (self.image / "usr/local/bin/cargo").symlink_to("../cargo/bin/cargo")
+        (self.image / "bin").symlink_to("usr/bin")
+        # Boat's /usr/local/share is also group-writable in this fixture.
+        (self.image / "usr/local/share").chmod(0o775)
+        self.owners = {}
+        for directory, directories, files in os.walk(self.image):
+            for name in ["", *directories, *files]:
+                path = Path(directory, name) if name else Path(directory)
+                relative = str(path.relative_to(self.image))
+                foreign = any(relative == tree or relative.startswith(tree + "/") for tree in
+                              ("usr/local/go", "usr/local/rustup", "usr/local/cargo")) or relative in provider + (
+                    "usr/local/man", "usr/local/bin/go", "usr/local/bin/cargo")
+                self.owners[path] = (self.PROVIDER, self.PROVIDER) if foreign else (0, 0)
+        self.chowned = []
+
+    def chown(self, path, uid, gid):
+        self.chowned.append(Path(path))
+        self.owners[Path(path)] = (uid, gid)
+
+    def simulated(self):
+        real = Path.lstat
+
+        def lstat(path):
+            metadata = real(path)
+            uid, gid = self.owners.get(Path(path), (0, 0))
+            return Mock(st_uid=uid, st_gid=gid, st_mode=metadata.st_mode)
+
+        return patch.object(Path, "lstat", lstat)
+
+    def check(self):
+        with self.simulated():
+            return install.root_paths.check(install.root_paths.BOAT_ROOTS, self.image, 0)
+
+    def apply(self):
+        with self.simulated():
+            return install.boat_base_layout(self.image, chown=self.chown)
+
+    def test_build_refuses_before_the_layout_step_and_passes_after_it(self):
+        before = self.check()
+        self.assertGreater(before["offender_count"], 0)
+        self.assertIn(f"{self.image}/usr/local/go: uid={self.PROVIDER} gid={self.PROVIDER}", before["offenders"])
+        with self.simulated(), self.assertRaisesRegex(ValueError, "root executes from are not owned by uid 0"):
+            install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
+        report = self.apply()
+        after = self.check()
+        self.assertEqual((after["offender_count"], after["offenders"]), (0, []))
+        with self.simulated():
+            install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
+        self.assertEqual([row["path"] for row in report["removed"]], list(install.BOAT_BASE_USR_LOCAL["remove"]))
+        for tree in install.BOAT_BASE_USR_LOCAL["remove"]:
+            self.assertFalse(os.path.lexists(self.image / tree.lstrip("/")), tree)
+        self.assertEqual(sorted(row["path"] for row in report["unlinked"]), ["/usr/local/bin/cargo", "/usr/local/bin/go"])
+        # Our own installs beside the provider's survive untouched.
+        for kept in ("usr/local/bin/motor-runner", "usr/local/bin/git", "usr/local/lib/git/2.53.0/bin/git"):
+            self.assertTrue(os.path.lexists(self.image / kept), kept)
+        self.assertEqual(stat.S_IMODE((self.image / "usr/local/share").lstat().st_mode), 0o755)
+
+    def test_only_the_named_list_is_re_owned(self):
+        report = self.apply()
+        named = {self.image / name.lstrip("/") for name in install.BOAT_BASE_USR_LOCAL["reown"]}
+        self.assertTrue(set(self.chowned) <= named)
+        self.assertEqual(len(self.chowned), len(set(self.chowned)))
+        present = {path for path in named if os.path.lexists(path)}
+        self.assertEqual(set(self.chowned), present)
+        self.assertEqual({self.image / row["path"].lstrip("/") for row in report["reowned"]}, present)
+        self.assertEqual(sorted(report["absent"]), ["/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages"])
+
+    def test_a_provider_path_the_list_does_not_name_still_fails_the_check(self):
+        extra = self.image / "usr/local/share/provider-extra"
+        extra.mkdir()
+        self.owners[extra] = (self.PROVIDER, self.PROVIDER)
+        self.apply()
+        self.assertNotIn(extra, self.chowned)
+        self.assertEqual(self.check()["offenders"], [f"{extra}: uid={self.PROVIDER} gid={self.PROVIDER}"])
+
+    def test_an_unexpected_owner_refuses_before_anything_changes(self):
+        self.owners[self.image / "usr/local/lib"] = (4321, 4321)
+        with self.assertRaisesRegex(ValueError, "refusing to re-own /usr/local/lib: owned by uid 4321"):
+            self.apply()
+        self.assertEqual(self.chowned, [])
+        self.assertTrue((self.image / "usr/local/go/bin/go").exists())
+        self.assertTrue((self.image / "usr/local/bin/go").is_symlink())
+
+    def test_reapplying_changes_nothing(self):
+        self.apply()
+        self.chowned.clear()
+        again = self.apply()
+        self.assertEqual((again["removed"], again["unlinked"], again["reowned"], self.chowned), ([], [], [], []))
+
+    def test_the_recipe_settles_the_layout_before_installing_and_checks_after(self):
+        main = inspect.getsource(install.main)
+        step = main.index("boat_base_layout()")
+        self.assertLess(main.index("target_directories()"), step)
+        for later in ("tool_home()", "tools(manifest)", "service_preflight()",
+                      "root_paths.require(root_paths.BOAT_ROOTS)"):
+            self.assertLess(step, main.index(later), later)
+        self.assertIn("boat_base_layout=base_layout", main)
 
 
 if __name__ == "__main__":
