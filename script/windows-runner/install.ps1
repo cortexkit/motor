@@ -11,7 +11,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . "$PSScriptRoot\accounts.ps1"
 $Root = 'C:\ProgramData\MotorRunner'
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$admin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($identity.User.Value -eq 'S-1-5-18') { throw 'Run install.ps1 from an elevated administrator shell, not a SYSTEM scheduled task; setting the parent owner requires that context' }
 if (-not $admin -or -not $LicenseAcknowledged) { throw 'Elevation and an explicit image licence acknowledgement are required' }
 if (Test-Path -LiteralPath $Root) { throw 'Root already exists; use the documented uninstall before reinstalling, preserving wanted evidence first' }
 foreach ($name in @('motor-prep','motor-ssh')) { if (Get-LocalUser $name -ErrorAction SilentlyContinue) { throw "Refusing to adopt pre-existing account $name" } }
@@ -49,7 +51,7 @@ Copy-Item -LiteralPath $ParentPath -Destination $parent
 & icacls.exe $parent /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:R' '*S-1-5-83-0:R' /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot seal parent ACL for Hyper-V workers' }
 & icacls.exe $parent /setowner '*S-1-5-32-544' /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted parent owner' }
+if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted parent owner; run install.ps1 from an elevated administrator shell, not a SYSTEM scheduled task' }
 $parentHash = (Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash
 if ($AdoptProvisioningRoot) {
     $installation.provision_root = 'C:\motor-spike\hyperv-ally'

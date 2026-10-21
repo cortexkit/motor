@@ -13,6 +13,14 @@ LOCAL_USER_DESCRIPTION_MAX = 48
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_installer_rejects_system_before_modifying_host(self):
+        script = (HERE / "install.ps1").read_text()
+        reject_system = script.index("if ($identity.User.Value -eq 'S-1-5-18')")
+        self.assertLess(reject_system, script.index("New-Item $Root"))
+        self.assertIn("elevated administrator shell, not a SYSTEM scheduled task", script)
+        owner_failure = next(line for line in script.splitlines() if "Cannot set trusted parent owner" in line)
+        self.assertIn("elevated administrator shell", owner_failure)
+
     def test_local_user_descriptions_fit_windows_limit(self):
         found = 0
         for script in sorted(HERE.glob("*.ps1")):

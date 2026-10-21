@@ -100,6 +100,11 @@ these unsigned binaries; scripts do not change Smart App Control or WDAC.
 
 ## Operator sequence (elevated Windows PowerShell 5.1)
 
+Run `install.ps1` from an elevated administrator shell, not a SYSTEM scheduled
+task. Changing the parent file's owner requires that install context; the
+installer rejects SYSTEM before creating or changing installation state.
+`run-system.ps1` is for qualification only, not installation.
+
 First compare the ZIP's SHA-256 with the checksum supplied with the release,
 then extract it to a fresh source directory, and run the parser/policy and native parent-identity fixtures **before any
 installation or VM mutation**:
