@@ -282,9 +282,28 @@ pub(crate) struct Storage {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
-    _lease: File,
+    // Fields drop after `Drop for Storage` returns, so the lease is released
+    // only once the compactor is joined and the final checkpoint is written.
+    _lease: StoreLease,
     #[cfg(test)]
     write_count: std::sync::atomic::AtomicUsize,
+}
+
+/// The locked `lease` file that makes one process the store's only writer.
+///
+/// The lock belongs to the open file description, not to this descriptor.
+/// A child forked by any thread of this process shares that description until
+/// it execs (close-on-exec only acts at exec), and closing our descriptor
+/// leaves the lock held for as long as such a child lives. Unlocking
+/// explicitly releases it for the whole description, so a dropped store's
+/// lease is free at once regardless of what other threads have forked.
+struct StoreLease(File);
+impl Drop for StoreLease {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "storage lease unlock failed; it is released when the file closes");
+        }
+    }
 }
 
 impl Drop for Storage {
@@ -520,6 +539,7 @@ impl Storage {
                 error
             }
         })?;
+        let lease = StoreLease(lease);
         let metrics = Arc::new(journal::Metrics::default());
         let (state, backend) = journal::open(root, &metrics)?;
         let state = Arc::new(Mutex::new(state));
@@ -1390,17 +1410,7 @@ mod hosted_routing_health_tests {
         assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
         assert_eq!(storage.hosted_no_host_fits_1h_at(now + 3_600_000), 0);
         drop(storage);
-        // A process another test forks at the wrong moment can briefly hold
-        // the store's lock file after it is closed here.
-        let storage = (0..100)
-            .find_map(|_| match Storage::open(&scratch) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20));
-                    None
-                }
-                other => Some(other.unwrap()),
-            })
-            .expect("store lock released");
+        let storage = Storage::open(&scratch).unwrap();
         assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
         assert_eq!(storage.hosted_routed_jobs_1h_at(now), 1);
         for (id, remaining, age) in ids {
@@ -1408,6 +1418,84 @@ mod hosted_routing_health_tests {
             assert!(job.hosted.is_none(), "age {age}");
             assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
             assert_eq!(job.queue_wait_limit_s, remaining, "age {age}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lease_release_tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// A child forked from this process that parks before exec, holding a
+    /// copy of every descriptor the process had open at fork time.
+    ///
+    /// This is what motor-runner's Linux launch backend does when the tests
+    /// run it in-process: its child waits on a gate pipe until the job's start
+    /// record is durably saved, which on a loaded machine takes many
+    /// milliseconds. Close-on-exec does not help until the child execs.
+    struct ParkedChild {
+        pid: libc::pid_t,
+        gate: Option<File>,
+    }
+    impl ParkedChild {
+        fn fork() -> Self {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // Keep the pipe out of processes other tests exec meanwhile, so
+            // only this child can hold its read end open.
+            for fd in fds {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+            }
+            let [read, write] = fds;
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                // Only async-signal-safe calls between fork and exit: another
+                // thread may hold the allocator's lock.
+                unsafe {
+                    libc::close(write);
+                    let mut byte = 0u8;
+                    while libc::read(read, (&mut byte as *mut u8).cast(), 1) < 0 {}
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(read) };
+            Self {
+                pid,
+                gate: Some(unsafe { File::from_raw_fd(write) }),
+            }
+        }
+    }
+    impl Drop for ParkedChild {
+        fn drop(&mut self) {
+            // Closing the gate lets the child read end-of-file and exit.
+            drop(self.gate.take());
+            let mut status = 0;
+            unsafe { libc::waitpid(self.pid, &mut status, 0) };
+        }
+    }
+
+    /// Dropping a store must release its lease at once, even when a forked
+    /// child still shares the lease file's open file description; otherwise
+    /// an immediate reopen in the same process (or by a restarted daemon)
+    /// sees the lease as held by another process.
+    #[test]
+    fn dropped_store_releases_its_lease_while_a_forked_child_shares_the_descriptor() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-storage-lease-release");
+        for round in 0..20 {
+            let storage = Storage::open(&scratch).unwrap();
+            let child = ParkedChild::fork();
+            drop(storage);
+            let reopened = Storage::open(&scratch)
+                .unwrap_or_else(|error| panic!("round {round}: reopen after drop: {error}"));
+            assert_eq!(
+                Storage::open(&scratch).err().map(|error| error.kind()),
+                Some(io::ErrorKind::WouldBlock),
+                "round {round}: the reopened store must still own the lease exclusively"
+            );
+            drop(reopened);
+            drop(child);
         }
     }
 }

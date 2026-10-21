@@ -198,6 +198,24 @@ impl Motor {
     pub(crate) fn shutdown_storage(&self) -> io::Result<()> {
         self.storage.shutdown()
     }
+    /// Drops this handle and waits until the tasks it spawned have dropped
+    /// their clones too, which closes the store and frees its lease.
+    ///
+    /// A job's task can still be finishing (and holding its `Motor` clone)
+    /// after the caller has read the job's terminal record, so a test that
+    /// reopens the same store right away must wait for that, not retry.
+    #[cfg(test)]
+    pub(crate) async fn close(self) {
+        let storage = Arc::downgrade(&self.storage);
+        drop(self);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while storage.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the motor's tasks still hold its store after 30s");
+    }
     pub(crate) fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
         self.storage.direct_authorized(id, secret)
     }
