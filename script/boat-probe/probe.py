@@ -709,8 +709,15 @@ def render_runner_host(data):
                      f"{display(limits.get('pids.max', 'unmeasured'))} | {display(job.get('nproc', 'unmeasured'))} | {shared} |")
     other = [c for c in checks if not any(c["name"].startswith(p.get("name", "") + ".") for p in runner.get("phases", []))]
     lines += ["", "Checks outside a phase: " + (", ".join(f"{c['name']} {c['status']}" for c in other) or "none") + ".",
-              "The limit values are read by the job from its own cgroup files; no load is generated.", "",
-              "## Timing (seconds, measured from the operator's Mac)", "",
+               "The limit values are read by the job from its own cgroup files; no load is generated.", ""]
+    failures = [c for c in checks if c.get('status') == 'FAIL']
+    if failures:
+        # Keep the recorded verdict; rendering old evidence must not silently
+        # reinterpret a failed run using newer probe rules.
+        lines += ["## Failed check reasons", "", *[
+            f"- `{check['name']}`: {display(check.get('reason', 'not recorded in this report'))}"
+            for check in failures], ""]
+    lines += ["## Timing (seconds, measured from the operator's Mac)", "",
               "| Measurement | Seconds |", "| --- | --- |"]
     prepared, snapshot = runner.get("prepared_image") or {}, runner.get("snapshot") or {}
     for label, value in (("Create to Boat-ready (first sandbox)", runner.get("create", {}).get("seconds_to_ready")),

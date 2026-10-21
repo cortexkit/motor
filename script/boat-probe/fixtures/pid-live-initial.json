@@ -1,0 +1,516 @@
+{
+  "host": {
+    "job_security_reference": {
+      "fresh_child": {
+        "SigBlk": [
+          "0000000000000000"
+        ],
+        "SigIgn": [
+          "0000000000000000"
+        ]
+      },
+      "keyring": {
+        "errno": null,
+        "gid": 985,
+        "id": 1016184161,
+        "uid": 996
+      },
+      "namespace_attempts": {
+        "cgroup": {
+          "errno": 1,
+          "result": -1
+        },
+        "clone3_pid": {
+          "errno": 38,
+          "result": -1
+        },
+        "ipc": {
+          "errno": 1,
+          "result": -1
+        },
+        "mount": {
+          "errno": 1,
+          "result": -1
+        },
+        "net": {
+          "errno": 1,
+          "result": -1
+        },
+        "pid": {
+          "errno": 1,
+          "result": -1
+        },
+        "setns_any": {
+          "errno": 1,
+          "result": -1
+        },
+        "setns_pid": {
+          "errno": 1,
+          "result": -1
+        },
+        "user": {
+          "errno": 1,
+          "result": -1
+        },
+        "uts": {
+          "errno": 1,
+          "result": -1
+        }
+      },
+      "proc_submounts": [
+        [
+          "/proc/acpi",
+          true
+        ],
+        [
+          "/proc/asound",
+          true
+        ],
+        [
+          "/proc/bus",
+          true
+        ],
+        [
+          "/proc/fs",
+          true
+        ],
+        [
+          "/proc/irq",
+          true
+        ],
+        [
+          "/proc/kallsyms",
+          true
+        ],
+        [
+          "/proc/kcore",
+          true
+        ],
+        [
+          "/proc/latency_stats",
+          true
+        ],
+        [
+          "/proc/mtrr",
+          true
+        ],
+        [
+          "/proc/scsi",
+          true
+        ],
+        [
+          "/proc/sys",
+          true
+        ],
+        [
+          "/proc/sys/fs/binfmt_misc",
+          false
+        ],
+        [
+          "/proc/sys/fs/binfmt_misc",
+          true
+        ],
+        [
+          "/proc/sysrq-trigger",
+          true
+        ]
+      ],
+      "status": {
+        "CapAmb": [
+          "0000000000000000"
+        ],
+        "CapBnd": [
+          "0000000000000000"
+        ],
+        "CapEff": [
+          "0000000000000000"
+        ],
+        "CapInh": [
+          "0000000000000000"
+        ],
+        "CapPrm": [
+          "0000000000000000"
+        ],
+        "Gid": [
+          "985",
+          "985",
+          "985",
+          "985"
+        ],
+        "Groups": [
+          "985"
+        ],
+        "NoNewPrivs": [
+          "1"
+        ],
+        "Seccomp": [
+          "2"
+        ],
+        "Seccomp_filters": [
+          "11"
+        ],
+        "Uid": [
+          "996",
+          "996",
+          "996",
+          "996"
+        ]
+      }
+    },
+    "namespaces": {
+      "mnt": "mnt:[4026531841]",
+      "net": "net:[4026531840]",
+      "pid": "pid:[4026531836]"
+    },
+    "systemd_version": 255
+  },
+  "jobs": {
+    "exit": {
+      "code": 23,
+      "stdout": "boat-round-trip\n",
+      "terminal": {
+        "outcome": {
+          "code": 23,
+          "type": "exit"
+        }
+      }
+    },
+    "job_stdin_eof": {
+      "code": 0,
+      "stdout": "boat-stdin-eof\n",
+      "terminal": {
+        "outcome": {
+          "code": 0,
+          "type": "exit"
+        }
+      }
+    },
+    "node_modules_first": {
+      "code": 0,
+      "stdout": "boat-node-modules\n",
+      "terminal": {
+        "outcome": {
+          "code": 0,
+          "type": "exit"
+        }
+      }
+    },
+    "node_modules_reuse": {
+      "code": 0,
+      "stdout": "boat-node-modules\n",
+      "terminal": {
+        "outcome": {
+          "code": 0,
+          "type": "exit"
+        }
+      }
+    },
+    "pid1_ignores_job_sigkill": {
+      "code": 0,
+      "stdout": "boat-pid1-alive",
+      "terminal": {
+        "outcome": {
+          "code": 0,
+          "type": "exit"
+        }
+      }
+    },
+    "rust": {
+      "code": 0,
+      "stdout": "boat-hello\n",
+      "terminal": {
+        "outcome": {
+          "code": 0,
+          "type": "exit"
+        }
+      }
+    },
+    "setsid_kill": {
+      "code": 137,
+      "stdout": "",
+      "terminal": {
+        "outcome": {
+          "signal": 9,
+          "type": "signal"
+        }
+      }
+    },
+    "setsid_stop": {
+      "code": 143,
+      "stdout": "",
+      "terminal": {
+        "outcome": {
+          "code": 143,
+          "type": "exit"
+        }
+      }
+    },
+    "sigkill_job": {
+      "code": 137,
+      "stdout": "",
+      "terminal": {
+        "outcome": {
+          "code": 137,
+          "type": "exit"
+        }
+      }
+    }
+  },
+  "pid_job": {
+    "namespaces": {
+      "mnt": "mnt:[4026532517]",
+      "net": "net:[4026532437]",
+      "pid": "pid:[4026532518]"
+    },
+    "pid_namespace": {
+      "inherited_fds": {
+        "0": "/dev/null",
+        "1": "/motor-output/stdout",
+        "2": "/motor-output/stderr"
+      },
+      "init": {
+        "cgroup": "0::/system.slice/motor-job-01a15f2c-f539-7254-bfc6-3dbb8d74b776.service\n",
+        "comm": "bash\n",
+        "status": "Name:\tbash\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t996\t996\t996\t996\nGid:\t985\t985\t985\t985\nFDSize:\t64\nGroups:\t985 \nNStgid:\t1\nNSpid:\t1\nNSpgid:\t1\nNSsid:\t1\nKthread:\t0\nVmPeak:\t    7488 kB\nVmSize:\t    7488 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t    3904 kB\nVmRSS:\t    3904 kB\nRssAnon:\t     368 kB\nRssFile:\t    3536 kB\nRssShmem:\t       0 kB\nVmData:\t     436 kB\nVmStk:\t     148 kB\nVmExe:\t     956 kB\nVmLib:\t    1824 kB\nVmPTE:\t      60 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff\nThreads:\t1\nSigQ:\t0/63749\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000010000\nSigIgn:\t0000000000000004\nSigCgt:\t0000000000010002\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t15\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tconditional enabled\nCpus_allowed:\tff\nCpus_allowed_list:\t0-7\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t2\nnonvoluntary_ctxt_switches:\t0\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n"
+      },
+      "pid": 2,
+      "ppid": 1,
+      "security": {
+        "fresh_child": {
+          "SigBlk": [
+            "0000000000000000"
+          ],
+          "SigIgn": [
+            "0000000000000000"
+          ]
+        },
+        "keyring": {
+          "errno": null,
+          "gid": 985,
+          "id": 945557956,
+          "uid": 996
+        },
+        "namespace_attempts": {
+          "cgroup": {
+            "errno": 1,
+            "result": -1
+          },
+          "clone3_pid": {
+            "errno": 38,
+            "result": -1
+          },
+          "ipc": {
+            "errno": 1,
+            "result": -1
+          },
+          "mount": {
+            "errno": 1,
+            "result": -1
+          },
+          "net": {
+            "errno": 1,
+            "result": -1
+          },
+          "pid": {
+            "errno": 1,
+            "result": -1
+          },
+          "setns_any": {
+            "errno": 1,
+            "result": -1
+          },
+          "setns_pid": {
+            "errno": 1,
+            "result": -1
+          },
+          "user": {
+            "errno": 1,
+            "result": -1
+          },
+          "uts": {
+            "errno": 1,
+            "result": -1
+          }
+        },
+        "proc_submounts": [
+          [
+            "/proc/acpi",
+            true
+          ],
+          [
+            "/proc/asound",
+            true
+          ],
+          [
+            "/proc/bus",
+            true
+          ],
+          [
+            "/proc/fs",
+            true
+          ],
+          [
+            "/proc/irq",
+            true
+          ],
+          [
+            "/proc/kallsyms",
+            true
+          ],
+          [
+            "/proc/kcore",
+            true
+          ],
+          [
+            "/proc/latency_stats",
+            true
+          ],
+          [
+            "/proc/mtrr",
+            true
+          ],
+          [
+            "/proc/scsi",
+            true
+          ],
+          [
+            "/proc/sys",
+            true
+          ],
+          [
+            "/proc/sys/fs/binfmt_misc",
+            false
+          ],
+          [
+            "/proc/sys/fs/binfmt_misc",
+            true
+          ],
+          [
+            "/proc/sysrq-trigger",
+            true
+          ]
+        ],
+        "status": {
+          "CapAmb": [
+            "0000000000000000"
+          ],
+          "CapBnd": [
+            "0000000000000000"
+          ],
+          "CapEff": [
+            "0000000000000000"
+          ],
+          "CapInh": [
+            "0000000000000000"
+          ],
+          "CapPrm": [
+            "0000000000000000"
+          ],
+          "Gid": [
+            "985",
+            "985",
+            "985",
+            "985"
+          ],
+          "Groups": [
+            "985"
+          ],
+          "NoNewPrivs": [
+            "1"
+          ],
+          "Seccomp": [
+            "2"
+          ],
+          "Seccomp_filters": [
+            "15"
+          ],
+          "Uid": [
+            "996",
+            "996",
+            "996",
+            "996"
+          ]
+        }
+      },
+      "self_cgroup": "0::/system.slice/motor-job-01a15f2c-f539-7254-bfc6-3dbb8d74b776.service\n",
+      "signals": [
+        {
+          "alias": true,
+          "allowed": true,
+          "host": {
+            "cgroup": "0::/init.scope\n",
+            "comm": "systemd",
+            "pid": 1,
+            "starttime": 8,
+            "uid": 0
+          },
+          "pid": 1,
+          "target": {
+            "cgroup": "0::/system.slice/motor-job-01a15f2c-f539-7254-bfc6-3dbb8d74b776.service\n",
+            "comm": "bash",
+            "pid": 1,
+            "starttime": 148910,
+            "uid": 996
+          }
+        },
+        {
+          "alias": false,
+          "allowed": false,
+          "errno": 3,
+          "host": {
+            "cgroup": "0::/system.slice/ssh.service\n",
+            "comm": "sshd",
+            "pid": 27142,
+            "starttime": 40547,
+            "uid": 0
+          },
+          "pid": 27142,
+          "target_errno": 2
+        },
+        {
+          "alias": false,
+          "allowed": false,
+          "errno": 3,
+          "host": {
+            "cgroup": "0::/system.slice/motor-boat.service\n",
+            "comm": "motor-runner",
+            "pid": 73010,
+            "starttime": 140842,
+            "uid": 0
+          },
+          "pid": 73010,
+          "target_errno": 2
+        },
+        {
+          "alias": false,
+          "allowed": false,
+          "errno": 3,
+          "host": {
+            "cgroup": "0::/system.slice/motor-boat-host.service\n",
+            "comm": "motor-host",
+            "pid": 73219,
+            "starttime": 141599,
+            "uid": 0
+          },
+          "pid": 73219,
+          "target_errno": 2
+        }
+      ]
+    },
+    "process_visibility": {
+      "protected_pids": [
+        1,
+        27142,
+        73010,
+        73219
+      ]
+    },
+    "uid": 996
+  },
+  "provenance": {
+    "description": "Field projection of the real initial-phase results; terminal outcomes and Linux syscall values are unchanged.",
+    "prepared_image": "motor-boat-prepared-7e2ff15aaf7a",
+    "results_sha256": "f589992b30ead23299697e56210a33305e1f8d00c00cb15ef55f8990d3777ada",
+    "source_revision": "f1f5ec44e1f711554217e118417084fda4dfd2a2"
+  }
+}

@@ -24,6 +24,35 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_real_initial_job_checks_replay_without_relaxing_outcomes(self):
+        live = json.loads(Path(__file__).with_name('fixtures').joinpath('pid-live-initial.json').read_text())
+        lane = host.RunnerHost(Mock(data={}))
+        for name, code, marker in [('node_modules_first', 0, 'boat-node-modules'), ('node_modules_reuse', 0, 'boat-node-modules'),
+                                   ('exit', 23, 'boat-round-trip'), ('rust', 0, 'boat-hello'),
+                                   ('sigkill_job', 137, None), ('pid1_ignores_job_sigkill', 0, 'boat-pid1-alive'),
+                                   ('setsid_stop', 143, None)]:
+            lane.check_job('initial.' + name, live['jobs'][name], code, marker=marker)
+        lane.check_job('initial.job_stdin_eof', live['jobs']['job_stdin_eof'], 0, exact_stdout='boat-stdin-eof')
+        lane.check_job('initial.setsid_kill', live['jobs']['setsid_kill'], 137, signal=9)
+        checks = host.pid_checks(live['pid_job'], live['host'])
+        self.assertTrue(all(checks.values()))
+        for name in ('job_namespace_filter', 'job_clone3_pid_denied'):
+            lane.check('initial.' + name, checks[name], live['pid_job'])
+        self.assertEqual(len(lane.data['checks']), 11)
+        self.assertTrue(all(check['status'] == 'PASS' for check in lane.data['checks']))
+
+    def test_each_failed_runner_check_records_a_reason(self):
+        lane = host.RunnerHost(Mock(data={}))
+        lane.check('initial.required', False, {'observed':False})
+        lane.check('initial.overridden', True, {}, status='FAIL')
+        lane.check_job('initial.exit', {'code':23, 'terminal':{'outcome':{'kind':'exit', 'code':23}}}, 23)
+        lane.check_job('initial.output', {'code':0, 'terminal':{'outcome':{'type':'exit', 'code':0}}}, 0, marker='boat-hello')
+        self.assertTrue(all(row['status'] == 'FAIL' and row.get('reason') for row in lane.data['checks']))
+        self.assertIn('terminal.outcome', lane.data['checks'][2]['reason'])
+        self.assertIn("'type': 'exit'", lane.data['checks'][2]['reason'])
+        self.assertIn("'kind': 'exit'", lane.data['checks'][2]['reason'])
+        self.assertIn('boat-hello', lane.data['checks'][3]['reason'])
+
     def test_successful_service_without_proven_reclaim_is_inconclusive(self):
         data = {'seconds': 1020.0268031730001, 'started': 267.587254226,
                 'before': None, 'seeded': '25618 211478 35468037632 4613912571 0 -900\n',
@@ -239,7 +268,7 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.storage_timeline_checks([]))
 
     def test_client_requires_a_terminal(self):
-        self.assertEqual(host.job_result('{"code":23,"terminal":{"outcome":{"kind":"exit","code":23}}}')["code"], 23)
+        self.assertEqual(host.job_result('{"code":23,"terminal":{"outcome":{"type":"exit","code":23}}}')["code"], 23)
         for text in ("{}", "not json", '{"code":true,"terminal":{}}'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 host.job_result(text)

@@ -15,6 +15,20 @@ comm and stat starttime; an alias must have the job's UID/cgroup and a different
 starttime from that host identity. Sandbox PID 1 is intentionally such an alias
 for the job's own bash wrapper. Aliases are explicitly recorded, not skipped.
 
+Guest errno values are Linux ABI values even when the operator runs the probe
+on macOS (Linux ENOSYS is 38, not macOS's 78). Lifecycle checks use the wire
+protocol's `outcome.type`: a command killed beneath the wrapper yields an
+`exit` with code137, while SIGKILL of the unit yields `signal` with signal9 and
+the client's normalized code137. Those outcomes are checked separately, not
+accepted interchangeably. `fixtures/pid-live-initial.json` projects real job
+results covering both cases and the cross-platform errno comparison.
+
+New runner-host FAIL records include a `reason`, rendered under failed-check
+reasons in the Markdown report. Lifecycle and namespace-filter reasons include
+the expected and observed terminal or syscall values. Rendering historical
+evidence preserves its recorded verdict rather than recomputing a pass under
+newer rules.
+
 `job_clone3_pid_denied` requires clone3 with CLONE_NEWPID to return ENOSYS;
 `job_inherited_fds` records the actual initial job fd inventory and allows only
 0/1/2. For each setsid teardown job on old systemd, the root observer additionally

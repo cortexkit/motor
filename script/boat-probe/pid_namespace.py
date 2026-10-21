@@ -1,6 +1,11 @@
 """Live evidence and fail-closed checks for the Boat job PID bootstrap."""
 import errno
 
+# These syscall results come from the Linux guest, not the operator's OS.
+# In particular, macOS assigns ENOSYS 78 while Linux assigns it 38.
+LINUX_ENOSYS = 38
+NAMESPACE_ATTEMPTS = {'pid', 'user', 'mount', 'net', 'ipc', 'uts', 'cgroup', 'setns_pid', 'setns_any', 'clone3_pid'}
+
 # Shared by the ordinary User=motor-job reference unit and the real job. The
 # reference records systemd's credentials and protected proc mounts, not expected
 # values reconstructed by the bootstrap being tested.
@@ -134,6 +139,41 @@ def reference_command():
                        '/usr/bin/python3', '-c', source])
 
 
+def namespace_failure_reasons(security, reference, systemd_version):
+    own = security.get('status', {})
+    expected = reference.get('status', {})
+    attempts = security.get('namespace_attempts', {})
+    failures = []
+    if own.get('Seccomp') != ['2']:
+        failures.append(f"expected Seccomp=2; observed {own.get('Seccomp')!r}")
+    if systemd_version < 257:
+        try:
+            stacked = int(own.get('Seccomp_filters', ['0'])[0]) > int(expected.get('Seccomp_filters', ['0'])[0])
+        except (ValueError, TypeError, IndexError):
+            stacked = False
+        if not stacked:
+            failures.append(f"expected more seccomp filters than the reference; job={own.get('Seccomp_filters')!r}, reference={expected.get('Seccomp_filters')!r}")
+    if set(attempts) != NAMESPACE_ATTEMPTS:
+        failures.append(f"namespace attempts missing={sorted(NAMESPACE_ATTEMPTS - set(attempts))!r}, unexpected={sorted(set(attempts) - NAMESPACE_ATTEMPTS)!r}")
+    for name, attempt in sorted(attempts.items()):
+        expected_errno = LINUX_ENOSYS if name == 'clone3_pid' else errno.EPERM
+        if attempt.get('result') != -1 or attempt.get('errno') != expected_errno:
+            failures.append(f"{name}: expected result=-1 and Linux errno={expected_errno}; observed {attempt!r}")
+    return failures
+
+
+def pid_failure_reason(name, job, host):
+    security = job.get('pid_namespace', {}).get('security', {})
+    if name == 'job_namespace_filter':
+        return '; '.join(namespace_failure_reasons(security, host.get('job_security_reference', {}), host.get('systemd_version', 0))) or None
+    if name == 'job_clone3_pid_denied':
+        observed = security.get('namespace_attempts', {}).get('clone3_pid')
+        if observed == {'result':-1, 'errno':LINUX_ENOSYS}:
+            return None
+        return f"clone3 with CLONE_NEWPID must return result=-1 and Linux ENOSYS={LINUX_ENOSYS}; observed {observed!r}"
+    return f"isolation requirement {name} did not match its recorded job/host evidence"
+
+
 def pid_checks(job, host):
     evidence = job.get('pid_namespace', {})
     init = evidence.get('init', {})
@@ -145,7 +185,6 @@ def pid_checks(job, host):
     caps = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
     signals = evidence.get('signals', [])
     attempts = security.get('namespace_attempts', {})
-    required = {'pid', 'user', 'mount', 'net', 'ipc', 'uts', 'cgroup', 'setns_pid', 'setns_any', 'clone3_pid'}
     fresh = security.get('fresh_child', {})
     keyring = security.get('keyring', {})
     return {
@@ -160,13 +199,8 @@ def pid_checks(job, host):
             and own['Uid'] == [str(job['uid'])] * 4,
         'all_job_capabilities_empty': all(own.get(k) and all(int(v, 16) == 0 for v in own[k]) for k in caps),
         'job_no_new_privileges': own.get('NoNewPrivs') == ['1'],
-        'job_namespace_filter': own.get('Seccomp') == ['2']
-            and (host.get('systemd_version', 0) >= 257 or
-                 int(own.get('Seccomp_filters', ['0'])[0]) > int(expected.get('Seccomp_filters', ['0'])[0]))
-            and set(attempts) == required
-            and all(a.get('result') == -1 and a.get('errno') == (errno.ENOSYS if name == 'clone3_pid' else errno.EPERM)
-                    for name, a in attempts.items()),
-        'job_clone3_pid_denied': attempts.get('clone3_pid') == {'result':-1, 'errno':errno.ENOSYS},
+        'job_namespace_filter': not namespace_failure_reasons(security, reference, host.get('systemd_version', 0)),
+        'job_clone3_pid_denied': attempts.get('clone3_pid') == {'result':-1, 'errno':LINUX_ENOSYS},
         'job_inherited_fds': set(evidence.get('inherited_fds', {})) == {'0', '1', '2'},
         'proc_protections_match_systemd': bool(security.get('proc_submounts'))
             and security['proc_submounts'] == reference.get('proc_submounts'),
@@ -178,9 +212,23 @@ def pid_checks(job, host):
     }
 
 
-def lifecycle_checks(result, expected):
+def lifecycle_failure(result, expected, *, signal=None, marker=None, exact_stdout=None):
     outcome = result.get('terminal', {}).get('outcome', {})
-    return result.get('code') == expected and outcome == {'kind':'exit', 'code':expected}
+    if type(result.get('code')) is not int or result['code'] != expected:
+        return f"expected client code {expected}; observed {result.get('code')!r}"
+    expected_outcome = {'type':'exit', 'code':expected} if signal is None else {'type':'signal', 'signal':signal}
+    if outcome != expected_outcome:
+        return f"expected terminal.outcome={expected_outcome!r}; observed {outcome!r}"
+    stdout = result.get('stdout', '')
+    if marker is not None and (not isinstance(stdout, str) or marker not in stdout):
+        return f"expected stdout to contain {marker!r}"
+    if exact_stdout is not None and (not isinstance(stdout, str) or stdout.strip() != exact_stdout):
+        return f"expected stripped stdout to equal {exact_stdout!r}"
+    return None
+
+
+def lifecycle_checks(result, expected, *, signal=None):
+    return lifecycle_failure(result, expected, signal=signal) is None
 
 
 # The host runs this while the production client waits on a real job. Match an
