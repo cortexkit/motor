@@ -672,6 +672,7 @@ async fn cloud_boat_provisioning_response_retries_then_parses_booked_lease() {
             &vector["booked"]["request"]["body"],
             "hosted-test-bearer".into(),
             tokio::time::Instant::now() + Duration::from_secs(30),
+            Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
         )
         .await
         .unwrap();
@@ -741,6 +742,7 @@ async fn cloud_boat_provisioning_budget_exhaustion_is_retryable_and_bounded() {
             &vector["provisioning"]["request"]["body"],
             "hosted-test-bearer".into(),
             started + Duration::from_millis(budget_ms),
+            Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
         )
         .await;
     let elapsed = started.elapsed();

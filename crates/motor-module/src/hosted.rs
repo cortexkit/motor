@@ -694,6 +694,14 @@ impl Client {
         storage
             .hosted_update(id, |state| state.lease_request = Some(body.clone()))
             .map_err(|_| Error::Broker)?;
+        // The refusal returned if the queue-wait deadline passes before the
+        // broker answers the next lease request. By default a broker that
+        // has not answered in time is treated as unreachable. After the
+        // granted host refused the job as full, the deadline ends a wait for
+        // that host to free a slot, so a request cut off by the deadline
+        // returns the host-full refusal (runner full) rather than the
+        // transport failure the cut-off causes.
+        let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
         loop {
             let state = storage
                 .job(id)
@@ -707,7 +715,7 @@ impl Client {
                     .await
                     .is_err()
                 {
-                    return Err(Error::Provisioning(MIN_PROVISIONING_RETRY_MS));
+                    return Err(cut_off);
                 }
             }
             let attempt = state.placement_attempts;
@@ -720,7 +728,7 @@ impl Client {
             // means no HTTP request was sent to create a reservation for it.
             let bearer = match tokio::time::timeout_at(provisioning_deadline, self.bearer()).await {
                 Ok(result) => result?,
-                Err(_) => return Err(Error::Provisioning(MIN_PROVISIONING_RETRY_MS)),
+                Err(_) => return Err(cut_off),
             };
             // Even if the lease response is lost, the broker may have issued a
             // token. Wait past its possible issue second before requesting another:
@@ -735,7 +743,15 @@ impl Client {
             tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
                 spilled, "hosted lease requested");
             let lease: Lease = match self
-                .post_ready_authorized("/v1/leases", &body, bearer, provisioning_deadline)
+                .post_ready_authorized(
+                    "/v1/leases",
+                    &body,
+                    bearer,
+                    provisioning_deadline,
+                    // The host-full wait ends with this request: whatever the
+                    // broker answers decides what happens next.
+                    std::mem::replace(&mut cut_off, Error::Provisioning(MIN_PROVISIONING_RETRY_MS)),
+                )
                 .await
             {
                 Ok(l) => l,
@@ -823,6 +839,7 @@ impl Client {
                         .map_err(|_| Error::Broker)?;
                     tracing::info!(job_id = %id, attempt, code = e.code(),
                         retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
+                    cut_off = Error::NoCapacity(HOST_FULL_RETRY_MS);
                     tokio::time::sleep_until(retry_at).await;
                     continue;
                 }
@@ -862,7 +879,13 @@ impl Client {
         };
         let deadline = tokio::time::Instant::now() + SHADOW_PROVISIONING_BUDGET;
         let lease: Lease = self
-            .post_ready_authorized("/v1/leases", &wire, self.bearer().await?, deadline)
+            .post_ready_authorized(
+                "/v1/leases",
+                &wire,
+                self.bearer().await?,
+                deadline,
+                Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
+            )
             .await?;
         *booked = Some(lease.clone());
         let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
@@ -887,14 +910,21 @@ impl Client {
     ) -> Result<R, Error> {
         self.post(path, body).await
     }
+    /// Posts until the broker grants or refuses, waiting out `202
+    /// provisioning` and routed `503 no_capacity` answers until `deadline`.
+    /// When the deadline passes first, the request in flight is dropped and
+    /// the refusal for the wait the deadline ended is returned: the broker's
+    /// latest provisioning or capacity answer or, before the broker has sent
+    /// one, `cut_off`, which describes the caller's own wait.
     async fn post_ready_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &T,
         mut bearer: String,
         deadline: tokio::time::Instant,
+        cut_off: Error,
     ) -> Result<R, Error> {
-        let mut pending = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
+        let mut pending = cut_off;
         loop {
             match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await
             {
