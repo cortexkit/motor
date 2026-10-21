@@ -939,7 +939,6 @@ fn cache_javascript_install(
     install: &JavascriptInstall,
     command: &mut Command,
 ) -> io::Result<()> {
-    use fs2::FileExt;
     let manager_version = javascript_version(command, command.get_program())?;
     let node_version = if javascript_manager(install.lockfile) == "bun" {
         Vec::new()

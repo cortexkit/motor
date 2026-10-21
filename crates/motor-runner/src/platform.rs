@@ -417,9 +417,42 @@ pub(crate) fn build_wrapper(
     Ok(())
 }
 
+/// An open JavaScript cache lock file; lock it with `lock_exclusive` or
+/// `try_lock_exclusive`.
+///
+/// Dropping it releases the lock explicitly before closing the file. A process
+/// that another thread forks gets a copy of every open descriptor and keeps it
+/// until it execs (or for good, if it never does). An flock belongs to the open
+/// file that every copy shares, so closing our descriptor alone would leave the
+/// lock held by that copy for a while, and eviction or the next setup step
+/// would see the cache entry as still in use. An explicit unlock releases it
+/// for every copy at once.
+pub(crate) struct JavascriptCacheLock(File);
+
+impl JavascriptCacheLock {
+    // Outside tests only the Linux JavaScript install step waits for this
+    // lock; eviction only tries it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn lock_exclusive(&self) -> io::Result<()> {
+        fs2::FileExt::lock_exclusive(&self.0)
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
+        fs2::FileExt::try_lock_exclusive(&self.0)
+    }
+}
+
+impl Drop for JavascriptCacheLock {
+    fn drop(&mut self) {
+        // When this open file holds no lock (a failed try), unlocking is a
+        // no-op: flock state belongs to the open file, not to the path.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Keep cache-use locks outside evictable entries so a rename or deletion cannot
 /// give another setup step a different lock for the same install key.
-pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<File> {
+pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<JavascriptCacheLock> {
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::other("invalid JavaScript cache key"));
     }
@@ -431,6 +464,7 @@ pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<File>
         .read(true)
         .write(true)
         .open(locks.join(key))
+        .map(JavascriptCacheLock)
 }
 
 #[cfg(test)]

@@ -1458,10 +1458,24 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
     use std::{
         net::TcpListener,
         os::{
+            fd::AsRawFd,
             linux::net::SocketAddrExt,
             unix::net::{SocketAddr, UnixListener},
         },
     };
+    // Other test threads keep forking processes, and each one shares every
+    // open descriptor until it execs, so a dropped listener can go on
+    // accepting for a moment. shutdown() stops a listening socket for every
+    // copy at once. A child parked before exec holds copies during each check,
+    // so the closed case cannot pass or fail by timing.
+    fn stop_listening(fd: &impl AsRawFd) {
+        assert_eq!(
+            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
     let scratch = cortexkit_test_support::ScratchDir::new("sccache-readiness");
     let probe = prepare_cache_readiness_probe(scratch.path()).unwrap();
     let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1475,8 +1489,11 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
             .success()
     };
     assert!(tcp_status());
-    drop(tcp);
+    let forked = crate::test_helpers::fork_before_exec().unwrap();
+    stop_listening(&tcp);
     assert!(!tcp_status());
+    drop(forked);
+    drop(tcp);
     let name = format!("motor-cache-probe-{}", Uuid::now_v7());
     let socket = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
     let listener = UnixListener::bind_addr(&socket).unwrap();
@@ -1488,8 +1505,11 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
             .success()
     };
     assert!(uds_status());
-    drop(listener);
+    let forked = crate::test_helpers::fork_before_exec().unwrap();
+    stop_listening(&listener);
     assert!(!uds_status());
+    drop(forked);
+    drop(listener);
 }
 
 #[test]

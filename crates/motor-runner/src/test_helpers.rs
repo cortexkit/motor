@@ -45,6 +45,71 @@ pub(crate) fn write_test_executable(path: &Path, contents: &[u8]) -> io::Result<
     write_test_executable_with(path, contents, |_| Ok(()))
 }
 
+/// A child process forked from the test process and stopped before `exec`,
+/// holding a copy of every descriptor the test process had open at the fork.
+///
+/// Tests run on many threads, and other threads spawn processes all the time.
+/// Each such child briefly shares every open descriptor, so a lock, socket or
+/// file a test closes may stay open in another process for a moment. This
+/// makes that moment last until the guard is dropped, so a test can prove its
+/// release does not depend on it. Dropping the guard lets the child exec and
+/// waits for it.
+pub(crate) struct ForkedBeforeExec {
+    release: std::os::unix::net::UnixStream,
+    child: Option<thread::JoinHandle<io::Result<std::process::ExitStatus>>>,
+}
+
+pub(crate) fn fork_before_exec() -> io::Result<ForkedBeforeExec> {
+    use std::os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt};
+    let (mut parent, child) = UnixStream::pair()?;
+    parent.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let child_fd = child.as_raw_fd();
+    let forked = thread::spawn(move || {
+        let _child_channel = child;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", ":"]);
+        // SAFETY: between fork and exec the closure only calls write and read,
+        // which are async-signal-safe, on a descriptor the child inherited,
+        // and on failure reads errno, which does not allocate.
+        unsafe {
+            command.pre_exec(move || {
+                let ready = [1u8];
+                if libc::write(child_fd, ready.as_ptr().cast(), ready.len()) != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut release = [0u8];
+                if libc::read(child_fd, release.as_mut_ptr().cast(), release.len()) != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.status()
+    });
+    let mut ready = [0u8];
+    if let Err(error) = parent.read_exact(&mut ready) {
+        // Release a child that is parked but answered too late, then reap it.
+        let _ = parent.write_all(&[1]);
+        let _ = forked.join();
+        return Err(io::Error::other(format!(
+            "forked child did not reach pre-exec: {error}"
+        )));
+    }
+    Ok(ForkedBeforeExec {
+        release: parent,
+        child: Some(forked),
+    })
+}
+
+impl Drop for ForkedBeforeExec {
+    fn drop(&mut self) {
+        let _ = self.release.write_all(&[1]);
+        if let Some(child) = self.child.take() {
+            let _ = child.join();
+        }
+    }
+}
+
 fn write_test_executable_with(
     path: &Path,
     contents: &[u8],
