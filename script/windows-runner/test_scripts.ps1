@@ -73,6 +73,90 @@ $count++
     } finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
 }
 
+& {
+    . "$PSScriptRoot\qualify-peer.ps1"
+    $nonce = '0123456789abcdef0123456789abcdef'
+    $victimVm = [Guid]'01234567-89ab-cdef-0123-456789abcdef'
+    $attackerVm = [Guid]'fedcba98-7654-3210-fedc-ba9876543210'
+    $proof = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$false})
+    function New-PeerFixtureTimeline {
+        return @{victim_start_ms=0; boot_observed_ms=1000; attacker_start_ms=21000; proof_observed_ms=60000; host_connect_ms=60001; hello_ms=60010; settled_ms=120010;
+            victim_start_utc='2026-01-01T00:00:00Z'; boot_utc='2026-01-01T00:00:00.500Z'; boot_observed_utc='2026-01-01T00:00:01Z'; attacker_start_utc='2026-01-01T00:00:21Z'; proof_observed_utc='2026-01-01T00:01:00Z'; host_connect_utc='2026-01-01T00:01:00.001Z'; hello_utc='2026-01-01T00:01:00.010Z';
+            hello_validated=$true; hello_nonce=$nonce; victim_vm_id=$victimVm.ToString('D'); attacker_vm_id=$attackerVm.ToString('D'); boot_event_id=18601; boot_record_id=123; boot_vm_id=$victimVm.ToString('D')}
+    }
+    $log = "boot nonce=$nonce`nhvsock listening vm_id=00000000000000000000000000000000`nhvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838`nhvsock accepted peer vm_id=a42e7cdad03f480c9cc2a4de20abb878 listen=All`n"
+    function Assert-PeerFixtureRejected([string]$Name, [scriptblock]$Action, [string]$Expected) {
+        $denied = $false
+        try { $null = & $Action } catch {
+            if ([string]$_ -notlike "*$Expected*") { throw }
+            $denied = $true
+        }
+        if (-not $denied) { throw "FAIL $Name" }
+        Write-Host "PASS $Name"
+        $script:count++
+    }
+    $timeline = New-PeerFixtureTimeline
+    $result = Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline $log
+    if ($result -ne 'cross-vm-attempt-did-not-consume-single-listener') { throw 'FAIL peer-false-with-final-hello-and-single-parent-accept' }
+    Write-Host 'PASS peer-false-with-final-hello-and-single-parent-accept'
+    $script:count++
+    Assert-PeerFixtureRejected 'peer-host-hello-failure-is-unproven' {
+        $changed = New-PeerFixtureTimeline; $changed.hello_validated = $false
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
+    } 'Victim unavailable; isolation not proven'
+    Assert-PeerFixtureRejected 'peer-attacker-before-boot-margin-is-unproven' {
+        $changed = New-PeerFixtureTimeline; $changed.attacker_start_ms = 20999
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
+    } 'Attacker started before victim boot event plus 20-second margin'
+    $connected = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$true})
+    Assert-PeerFixtureRejected 'peer-connected-attacker-needs-native-refusal' {
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $connected $timeline $log
+    } 'Connected attacker has no native refusal'
+    $refusedLog = $log.Replace('hvsock accepted peer', "hvsock refused peer vm_id=$($attackerVm.ToString('N'))`nhvsock accepted peer")
+    if ((Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $connected $timeline $refusedLog) -ne 'native-foreign-vm-refused') { throw 'FAIL peer-connected-attacker-with-native-refusal' }
+    Write-Host 'PASS peer-connected-attacker-with-native-refusal'
+    $script:count++
+    Assert-PeerFixtureRejected 'peer-requires-native-loopback-refusal' {
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ($log -replace 'hvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838','unrelated message')
+    } 'Parent accept was not preceded by listening and native loopback refusal'
+    Assert-PeerFixtureRejected 'peer-rejects-non-parent-accept' {
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ($log.Replace('a42e7cdad03f480c9cc2a4de20abb878', $attackerVm.ToString('N')))
+    } 'Victim accepted a non-parent peer'
+    Assert-PeerFixtureRejected 'peer-rejects-stale-or-restarted-listener' {
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ("boot nonce=$nonce`n" + $log)
+    } 'Victim must show one current-nonce listener'
+    Assert-PeerFixtureRejected 'peer-requires-full-settle-window' {
+        $changed = New-PeerFixtureTimeline; $changed.settled_ms--
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
+    } 'full 60-second settle window'
+    Assert-PeerFixtureRejected 'peer-host-hello-must-follow-completed-attempt' {
+        $changed = New-PeerFixtureTimeline; $changed.host_connect_ms = 59999
+        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
+    } 'Invalid host peer attempt/Hello ordering'
+
+    # The fixed header independently pins the big-endian Hello wire format.
+    $payload = [Text.Encoding]::UTF8.GetBytes('{"kind":"hello","version":4,"nonce":"0123456789abcdef0123456789abcdef"}')
+    if ($payload.Length -ne 71) { throw 'Hello wire fixture length changed' }
+    $frame = [byte[]]([byte[]]@(0,0,0,71) + $payload)
+    if ((Convert-RunnerPeerHello $frame $nonce).nonce -cne $nonce) { throw 'FAIL peer-hello-validates-current-wire-version-and-nonce' }
+    Write-Host 'PASS peer-hello-validates-current-wire-version-and-nonce'
+    $script:count++
+    $badFrames = @($frame.Clone(), $frame.Clone(), $frame.Clone())
+    $badFrames[0][3] = 70
+    $badFrames[1][30] = [byte][char]'5'
+    $badFrames[2][42] = [byte][char]'f'
+    foreach ($bad in $badFrames) {
+        $denied = $false
+        try { $null = Convert-RunnerPeerHello $bad $nonce } catch { $denied = $true }
+        if (-not $denied) { throw 'FAIL peer-hello-rejects-bad-length-version-or-nonce' }
+    }
+    Write-Host 'PASS peer-hello-rejects-bad-length-version-or-nonce'
+    $script:count++
+    Initialize-RunnerPeerSocket
+    Write-Host 'PASS peer-native-socket-helper-compiles-without-dialing'
+    $script:count++
+}
+
 $switch = $control.Find({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true)
 $prepare = @($switch.Clauses | Where-Object { $_.Item1 -is [Management.Automation.Language.StringConstantExpressionAst] -and $_.Item1.Value -eq 'Prepare' })
 if ($prepare.Count -ne 1) { throw 'FAIL boot-nonce-production-contract: Prepare clause missing' }

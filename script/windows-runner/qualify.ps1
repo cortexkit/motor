@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
+. "$PSScriptRoot\qualify-peer.ps1"
 if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') { throw 'Use run-system.ps1; restricted process creation requires SYSTEM privileges' }
 $env:HOME = "$Root\service-home"
 $env:Path = 'C:\Windows\System32;C:\Windows;C:\Program Files\Git\cmd;C:\Program Files\Git\bin'
@@ -44,6 +45,8 @@ try {
     $ids = @($victim,$attacker)
     $monitors = @()
     $caches = @()
+    $peerClock = [Diagnostics.Stopwatch]::StartNew()
+    $timeline = [ordered]@{schema=1; hello_validated=$false}
     try {
         foreach ($id in $ids) {
             $sha = [Security.Cryptography.SHA256]::Create()
@@ -56,24 +59,68 @@ try {
             & "$Root\bin\hyperv.ps1" -Operation Prepare -Root $Root -Job $id -Parent $parent -ParentSha256 $parentHash -Cache $cache -Nonce $bootNonce -PeerTargetsJson $targets
             if ($id -eq $attacker) { Set-VM -Name "motor-ally-$id" -ProcessorCount 2; Set-VMMemory -VMName "motor-ally-$id" -StartupBytes 2GB }
         }
-        foreach ($id in $ids) {
-            $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"$Root\bin\hyperv.ps1",'-Operation','Run','-Root',$Root,'-Job',$id)
-            $monitors += Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
-        }
-        Start-Sleep -Seconds 35
-        $foreignVm = (Get-VM -Name "motor-ally-$attacker").Id.ToString('N')
-        foreach ($id in $ids) { & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $id }
-        $nativeLog = Get-Content "$Root\evidence\$victim-guest\hyperv-agent.log" -Raw
-        foreach ($peer in @('e0e16197dd564a1091955ee7a155a838', $foreignVm)) {
-            if ($nativeLog -notmatch "hvsock refused peer vm_id=$peer") { throw "Victim has no native refusal for $peer; transport failure alone is not proof" }
-        }
-        if ($nativeLog -match 'hvsock accepted peer') { throw 'Victim admitted an untrusted partition' }
-        foreach ($id in $ids) {
-            $proof = @(Get-Content "$Root\evidence\$id-guest\peer-proof.json" -Raw | ConvertFrom-Json)
-            if ($proof.Count -ne 1 -or -not $proof[0].transport_connected) { throw 'Peer probe never reached the victim transport' }
-        }
-        Write-Host 'PASS native-loopback-refused native-foreign-vm-refused no-agent-bytes-disclosed'
+        $victimVm = [Guid](Get-VM -Name "motor-ally-$victim").Id
+        $attackerVm = [Guid](Get-VM -Name "motor-ally-$attacker").Id
+        $timeline.victim_vm_id = $victimVm.ToString('D')
+        $timeline.attacker_vm_id = $attackerVm.ToString('D')
+        $timeline.victim_nonce = ([Guid]$victim).ToString('N')
+        $timeline.attacker_nonce = ([Guid]$attacker).ToString('N')
+        $victimStart = [DateTime]::UtcNow
+        $timeline.victim_start_utc = $victimStart.ToString('o')
+        $timeline.victim_start_ms = $peerClock.ElapsedMilliseconds
+        $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"$Root\bin\hyperv.ps1",'-Operation','Run','-Root',$Root,'-Job',$victim)
+        $monitors += Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $boot = Wait-RunnerPeerBoot $victimVm $victimStart "$Evidence\peer-victim-boot.xml"
+        $timeline.boot_utc = $boot.utc
+        $timeline.boot_record_id = $boot.record_id
+        $timeline.boot_event_id = 18601
+        $timeline.boot_vm_id = $boot.vm_id
+        $timeline.boot_observed_utc = [DateTime]::UtcNow.ToString('o')
+        $timeline.boot_observed_ms = $peerClock.ElapsedMilliseconds
+        # A host readiness connection would consume the guest's single listener.
+        # Instead use a VM-matched host OS-boot event plus a fixed service-start margin.
+        Start-Sleep -Seconds 20
+        $attackerStart = [DateTime]::UtcNow
+        $timeline.attacker_start_utc = $attackerStart.ToString('o')
+        $timeline.attacker_start_ms = $peerClock.ElapsedMilliseconds
+        $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"$Root\bin\hyperv.ps1",'-Operation','Run','-Root',$Root,'-Job',$attacker)
+        $monitors += Start-SpikeNativeProcess 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' $arguments
+        $attackerBoot = Wait-RunnerPeerBoot $attackerVm $attackerStart "$Evidence\peer-attacker-boot.xml"
+        $timeline.attacker_boot_utc = $attackerBoot.utc
+        $timeline.attacker_boot_record_id = $attackerBoot.record_id
+        # Retain a full qualification-only write-back window for the attacker
+        # too. Its completed, synced proof is still mandatory after power-off;
+        # elapsed time alone is never treated as probe completion.
+        Start-Sleep -Seconds 60
+        $timeline.attacker_settled_ms = $peerClock.ElapsedMilliseconds
+        # Read completion only from the stopped attacker child; never mount a
+        # running disk. The victim stays running and has had no host connection.
+        & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $attacker
+        $attackerLog = [IO.File]::ReadAllText("$Root\evidence\$attacker-guest\hyperv-agent.log")
+        if ($attackerLog -notmatch ("\bboot nonce=" + $timeline.attacker_nonce + '(?:\s|$)')) { throw 'Attacker proof has no current-nonce boot log' }
+        $proof = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText("$Root\evidence\$attacker-guest\peer-proof.json"))
+        if (@($proof).Count -ne 1 -or [Guid]::Parse($proof[0].target) -ne $victimVm -or $proof[0].transport_connected -isnot [bool]) { throw 'Missing completed attacker proof for the current victim' }
+        $timeline.proof_observed_utc = [DateTime]::UtcNow.ToString('o')
+        $timeline.proof_observed_ms = $peerClock.ElapsedMilliseconds
+        $timeline.attacker_transport_connected = $proof[0].transport_connected
+        $timeline.host_connect_utc = [DateTime]::UtcNow.ToString('o')
+        $timeline.host_connect_ms = $peerClock.ElapsedMilliseconds
+        $hello = Receive-RunnerPeerHello $victimVm $timeline.victim_nonce "$Evidence\peer-host-hello.json"
+        $timeline.hello_utc = [DateTime]::UtcNow.ToString('o')
+        $timeline.hello_ms = $peerClock.ElapsedMilliseconds
+        $timeline.hello_nonce = $hello.nonce
+        $timeline.hello_validated = $true
+        # Qualification only: as with the disconnect oracle, retain the full
+        # window for guest log write-back before victim power-off. This is not
+        # a durability guarantee and production never waits on persisted logs.
+        Start-Sleep -Seconds 60
+        $timeline.settled_ms = $peerClock.ElapsedMilliseconds
+        & "$Root\bin\hyperv.ps1" -Operation Harvest -Root $Root -Job $victim
+        $nativeLog = [IO.File]::ReadAllText("$Root\evidence\$victim-guest\hyperv-agent.log")
+        $timeline.result = Assert-RunnerPeerEvidence $timeline.victim_nonce $victimVm $attackerVm $proof $timeline $nativeLog
+        Write-Host "PASS native-loopback-refused $($timeline.result) no-agent-bytes-disclosed"
     } finally {
+        [IO.File]::WriteAllText("$Evidence\peer-timeline.json", (ConvertTo-Json -InputObject $timeline -Depth 5), [Text.UTF8Encoding]::new($false))
         # A late-starting monitor must not boot a VM during offline collection.
         # Normal monitors have already exited after the explicit Harvest above.
         foreach ($monitor in $monitors) {

@@ -108,6 +108,24 @@ The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enable
 a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;
 qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
+Peer qualification starts the victim alone and records its VM-matched Hyper-V
+Worker/Admin OS-boot event 18601, then waits at least 20 seconds before starting
+the attacker. There is deliberately no readiness dial: the unchanged guest agent
+closes its single listener on its first host accept. The attacker is stopped and
+read-only harvested first; its completed proof must name the current victim VM.
+Only then does the host connect and validate the victim's Hello version and nonce.
+After a full 60-second qualification-only log-settle window, the victim log must
+show one current-nonce listener, native loopback refusal, and exactly one parent
+accept. A connected attacker additionally requires its native refusal in that log;
+a failed sibling connect is accepted only with the boot/margin, completed proof,
+and final host Hello evidence. This proves that the sibling attempt did not consume
+or reach the single listener, not that every sibling transport failure is a native
+agent refusal or that a particular Hyper-V routing policy is universal. The fixed
+boot margin assumes normal service startup; restarted/multiple listeners fail.
+`peer-timeline.json`, boot-event XML and `peer-host-hello.json` retain host-side
+ordering and the actual received frame; guest clocks are never subtracted from
+host clocks. Production jobs acquire no new delay and the sealed image is unchanged.
+
 ## Build on Linux, not on the Windows host
 
 From a source checkout, only after approving Microsoft's licence terms:
