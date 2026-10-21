@@ -61,7 +61,19 @@ pub enum Behavior {
     DropRunAck,
     WrongHello,
     ReturnCapFailure,
+    /// The run connection carries `Started` and the first output record; the
+    /// job then ends on the host, which reports its usage to the broker and
+    /// drops the connection before the rest of the output and the terminal
+    /// reach ck-motor. An attach replays everything from its cursor.
+    SettleThenDrop,
 }
+
+/// The host key the harness registers with its fake broker, so the fake host
+/// can sign its own usage report.
+pub const HOST_MACHINE_SEED: [u8; 32] = [11; 32];
+/// Exit code and output of the `SettleThenDrop` job.
+pub const SETTLED_EXIT_CODE: i32 = 41;
+pub const SETTLED_OUTPUT: [&[u8]; 2] = [b"before the drop\n", b"after the drop\n"];
 
 type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
 
@@ -148,12 +160,17 @@ impl Harness {
             .unwrap(),
         ));
         std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+        broker.lock().unwrap().register_host(
+            "test-host".into(),
+            SigningKey::from_bytes(&HOST_MACHINE_SEED).verifying_key(),
+        );
         let tokens = Arc::new(AtomicUsize::new(0));
         let iats = Arc::new(Mutex::new(Vec::new()));
         let runs = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
         let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let host_task = tokio::spawn({
+            let broker = broker.clone();
             let host_refusals = host_refusals.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
@@ -168,6 +185,7 @@ impl Harness {
                     let runs = runs.clone();
                     let frames = frames.clone();
                     let host_refusals = host_refusals.clone();
+                    let broker = broker.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
                             return;
@@ -308,6 +326,11 @@ impl Harness {
                                 }
                                 Frame::Run(run) => {
                                     runs.fetch_add(1, Ordering::SeqCst);
+                                    if matches!(behavior, Behavior::SettleThenDrop) {
+                                        settle_then_drop(&mut tls, &broker, &claims, run.network)
+                                            .await;
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::DropRunAck) {
                                         return;
                                     }
@@ -346,7 +369,11 @@ impl Harness {
                                     .unwrap();
                                     return;
                                 }
-                                Frame::Attach(_) => {
+                                Frame::Attach(attach) => {
+                                    if matches!(behavior, Behavior::SettleThenDrop) {
+                                        replay_settled(&mut tls, &claims, attach.from_seq).await;
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::ReturnCapFailure) {
                                         motor_protocol::write_frame_async(
                                             &mut tls,
@@ -536,5 +563,143 @@ impl Harness {
         )
         .with_timeout(30)
         .with_weight_hint(2)
+    }
+}
+
+/// Milliseconds of runtime the `SettleThenDrop` host reports per vCPU; the
+/// broker settles `vcpus * SETTLED_RUNTIME_MS` and the replayed
+/// `HostedTerminal` bills the same amount.
+pub const SETTLED_RUNTIME_MS: u64 = 3000;
+
+/// The `SettleThenDrop` job's sequenced records: `Started`, then one output
+/// record per `SETTLED_OUTPUT` entry.
+fn settled_records(id: Uuid) -> Vec<(u64, Frame)> {
+    let mut records = vec![(
+        0,
+        Frame::Started {
+            job_id: id,
+            seq: 0,
+            queue_wait_ms: 0,
+            started_at_ms: 1_730_000_000_000,
+            path_mapping: None,
+        },
+    )];
+    for (seq, bytes) in (1..).zip(SETTLED_OUTPUT) {
+        records.push((
+            seq,
+            Frame::Output(Output::new(
+                seq,
+                OutputStream::Stdout,
+                BytePayload(bytes.to_vec()),
+            )),
+        ));
+    }
+    records
+}
+
+/// The run connection of `Behavior::SettleThenDrop`: ck-motor receives the
+/// acknowledgement, `Started` and the first output record. The job then ends
+/// on the host, which reports its usage to the broker (settling the job there)
+/// and drops the connection before the last output record and the terminal
+/// are delivered.
+async fn settle_then_drop<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    broker: &Mutex<FakeBroker>,
+    claims: &Claims,
+    network: Option<Network>,
+) {
+    let id = Uuid::parse_str(&claims.jti).unwrap();
+    let mut accepted = Accepted::new(id, 0);
+    accepted.network = network;
+    motor_protocol::write_frame_async(socket, &Frame::Accepted(accepted))
+        .await
+        .unwrap();
+    for (_, frame) in settled_records(id).into_iter().take(2) {
+        motor_protocol::write_frame_async(socket, &frame)
+            .await
+            .unwrap();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let usage = Usage {
+        job_id: claims.jti.clone(),
+        vcpus: claims.vcpus,
+        started_at_ms: now_ms - SETTLED_RUNTIME_MS,
+        ended_at_ms: now_ms,
+        mem_peak_mib: None,
+        egress_bytes: None,
+        outcome: UsageOutcome::Exit,
+    };
+    let body = serde_json::to_vec(&usage).unwrap();
+    let path = "/v1/hosts/test-host/usage";
+    let headers = HostHeaders::sign(
+        "test-host",
+        "POST",
+        path,
+        &body,
+        now_ms,
+        now_ms * 1000,
+        &SigningKey::from_bytes(&HOST_MACHINE_SEED),
+    )
+    .unwrap();
+    let reply = broker.lock().unwrap().handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&headers),
+            body: &body,
+        },
+        now_ms,
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.body["settled_vcpu_ms"],
+        u64::from(claims.vcpus) * SETTLED_RUNTIME_MS
+    );
+}
+
+/// An attach to the ended `SettleThenDrop` job: the host replays its retained
+/// records from the caller's cursor, then the terminal and the hosted
+/// settlement it already reported. It reports no usage again.
+async fn replay_settled<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    claims: &Claims,
+    from_seq: u64,
+) {
+    let id = Uuid::parse_str(&claims.jti).unwrap();
+    for (seq, frame) in settled_records(id) {
+        if seq >= from_seq {
+            motor_protocol::write_frame_async(socket, &frame)
+                .await
+                .unwrap();
+        }
+    }
+    for frame in [
+        Frame::Terminal(
+            TerminalRecord::new(
+                id,
+                Outcome::Exit {
+                    code: SETTLED_EXIT_CODE,
+                },
+                SETTLED_RUNTIME_MS,
+                0,
+                0,
+            )
+            .with_ran(Ran::Remote),
+        ),
+        Frame::HostedTerminal(HostedTerminal {
+            job_id: id,
+            placement: "first_party/test-host".into(),
+            billed_vcpu_ms: u64::from(claims.vcpus) * SETTLED_RUNTIME_MS,
+            max_runtime_s: claims.max_s,
+        }),
+    ] {
+        motor_protocol::write_frame_async(socket, &frame)
+            .await
+            .unwrap();
     }
 }

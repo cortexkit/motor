@@ -58,7 +58,9 @@ jobs settled any other way still get 409 `job_finished`.
 refused for the `main` instance (also enforced by the pure `FakeBroker` model).
 It serves the lease, reattach, release, heartbeat, usage and public JWKS routes. Reservations
 and counters are in memory; restart is a test reset. It settles expired unreported
-jobs as `host_lost`. No job bytes are transported. Machine-worker authentication
+jobs as `host_lost`. A job settled by its host's usage report still gets an
+attach token on reattach for 86400 s (`SETTLED_REATTACH_WINDOW_MS`) after the
+report; `host_lost` and released jobs keep their 409. No job bytes are transported. Machine-worker authentication
 is an exact configured test bearer mapped to a subject, not CK account acquisition.
 
 ```sh

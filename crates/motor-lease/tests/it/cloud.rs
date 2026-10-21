@@ -322,9 +322,9 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
 
 /// CLOUD's `settled-reattach.json`: a registered host settles a job by usage
 /// report, and a later reattach still gets 200 with an `attach` token and the
-/// lease's unchanged fields. The fake, seeded with the vector's keys and
-/// clocks, reproduces the lease, settlement and reattach replies byte for byte
-/// and leaves the settlement as it was.
+/// lease's unchanged fields. Seeded with the vector's keys and clocks, the fake
+/// returns the same statuses and JSON bodies for the lease, the settlement and
+/// the reattach, and the reattach leaves the settlement as it was.
 #[test]
 fn cloud_settled_reattach_reply_matches_fake() {
     let v = vector("settled-reattach.json");
