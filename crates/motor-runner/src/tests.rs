@@ -25,6 +25,8 @@ mod gate_priority;
 mod git_dependencies;
 #[path = "tests/health.rs"]
 mod health;
+#[path = "tests/held_prerequisites.rs"]
+mod held_prerequisites;
 #[path = "tests/migration.rs"]
 mod migration;
 #[path = "tests/monitoring.rs"]
