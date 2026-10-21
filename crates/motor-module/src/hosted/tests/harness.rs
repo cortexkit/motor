@@ -78,6 +78,9 @@ pub struct Harness {
     pub finished: Arc<std::sync::atomic::AtomicBool>,
     pub drop_lease: Arc<std::sync::atomic::AtomicBool>,
     pub release_admitted: Arc<std::sync::atomic::AtomicBool>,
+    /// Refusal reasons the host sends, one per run connection and in order,
+    /// before it falls back to its behavior.
+    pub host_refusals: Arc<Mutex<VecDeque<&'static str>>>,
     pub tasks: Vec<JoinHandle<()>>,
 }
 impl Drop for Harness {
@@ -149,7 +152,9 @@ impl Harness {
         let iats = Arc::new(Mutex::new(Vec::new()));
         let runs = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
+        let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let host_task = tokio::spawn({
+            let host_refusals = host_refusals.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
             let runs = runs.clone();
@@ -162,6 +167,7 @@ impl Harness {
                     let iats = iats.clone();
                     let runs = runs.clone();
                     let frames = frames.clone();
+                    let host_refusals = host_refusals.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
                             return;
@@ -215,7 +221,15 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
-                        if let Behavior::Refuse(reason) = behavior {
+                        let queued = if purpose == Purpose::Run {
+                            host_refusals.lock().unwrap().pop_front()
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = queued.or(match behavior {
+                            Behavior::Refuse(reason) => Some(reason),
+                            _ => None,
+                        }) {
                             if purpose == Purpose::Run {
                                 super::super::tls::write(
                                     &mut tls,
@@ -500,6 +514,7 @@ impl Harness {
             finished,
             drop_lease,
             release_admitted,
+            host_refusals,
             tasks: vec![host_task, http_task],
         }
     }

@@ -154,6 +154,11 @@ pub(crate) enum Error {
     HostFull,
     Capacity,
     NoCapacity(u64),
+    /// The broker answered a lease request with `no_host_fits`: no host it
+    /// could ever place the job on has that many vCPUs, so asking again cannot
+    /// succeed. Carries the broker's `max_vcpus`, the largest count it could
+    /// place, when the reply included a valid one.
+    NoHostFits(Option<u64>),
     InternalFailure,
     Connect,
     Broker,
@@ -180,6 +185,11 @@ pub(crate) enum Error {
 pub(crate) const SHADOW_PROVISIONING_BUDGET: Duration = Duration::from_secs(300);
 const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
 const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
+/// How long a repository-routed job waits before asking again after the
+/// granted host refused it as full. The host sends no Retry-After, and its
+/// slots free as soon as a running job ends, so this is shorter than the
+/// broker's usual 5-second `no_capacity` wait.
+const HOST_FULL_RETRY_MS: u64 = 2_000;
 fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
     ms.clamp(MIN_PROVISIONING_RETRY_MS, MAX_PROVISIONING_RETRY_MS)
 }
@@ -201,6 +211,7 @@ impl Error {
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull => "hosted_host_full",
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
+            Self::NoHostFits(_) => "hosted_no_host_fits",
             Self::InternalFailure => "hosted_internal_failure",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
@@ -557,6 +568,15 @@ impl Client {
                         Error::NoCapacity(bounded_provisioning_retry_ms(retry_after_ms))
                     }
                     Some("capacity" | "no_capacity") => Error::Capacity,
+                    // Keyed on the error code alone: the broker sends it with
+                    // HTTP 422, but no status makes it worth retrying. The
+                    // `max_vcpus` count is informational; a missing or
+                    // malformed one is recorded as unknown.
+                    Some("no_host_fits") if path == "/v1/leases" => Error::NoHostFits(
+                        code.as_ref()
+                            .and_then(|v| v.get("max_vcpus"))
+                            .and_then(serde_json::Value::as_u64),
+                    ),
                     Some("host_full") => Error::HostFull,
                     Some("job_released") => Error::Released,
                     // A refused lease has no granted lease for release to cancel.
@@ -693,6 +713,7 @@ impl Client {
             let attempt = state.placement_attempts;
             let spilled = state.spill_wait_ms.is_some();
             let hosted_test = state.hosted_test;
+            let repository_routed = state.repository_routed;
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -721,6 +742,10 @@ impl Client {
                 Err(error) => {
                     tracing::info!(job_id = %id, attempt, code = error.code(), "hosted lease not granted");
                     match error {
+                        // No host can ever hold this many vCPUs, so the same
+                        // request would be refused again. The caller decides
+                        // where the job goes instead.
+                        Error::NoHostFits(_) => return Err(error),
                         // A broker without capacity for a spilled job will not
                         // gain it within seconds (its Boat start cap is hourly);
                         // the build server is the better place to retry.
@@ -773,6 +798,34 @@ impl Client {
                 Ok(channel) => return Ok((channel, lease)),
                 Err(e) if lease.ssh.is_some() => return Err(e),
                 Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
+                // The broker's view of the host lags its heartbeats, so it can
+                // grant a lease the host then refuses as full. A routed job
+                // would have queued on the build server, so it waits for the
+                // host instead, within its queue-wait budget, the way it waits
+                // out 503 no_capacity. The host stored nothing for the
+                // refused token, and the broker keeps the reservation, so
+                // asking again with the same job ID and body returns the same
+                // placement with a fresh run token, which the host accepts
+                // because its issue time is later. These waits are not failed
+                // placements, so they don't use up the three placement
+                // attempts.
+                Err(e @ (Error::HostFull | Error::Capacity)) if repository_routed => {
+                    let retry_at =
+                        tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
+                    if retry_at >= provisioning_deadline {
+                        tokio::time::sleep_until(provisioning_deadline).await;
+                        return Err(Error::NoCapacity(HOST_FULL_RETRY_MS));
+                    }
+                    storage
+                        .hosted_update(id, |state| {
+                            state.placement_attempts = state.placement_attempts.saturating_sub(1)
+                        })
+                        .map_err(|_| Error::Broker)?;
+                    tracing::info!(job_id = %id, attempt, code = e.code(),
+                        retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
+                    tokio::time::sleep_until(retry_at).await;
+                    continue;
+                }
                 Err(e) if e.replaceable() && attempt < 2 => continue,
                 Err(e) => return Err(e),
             }
@@ -950,6 +1003,55 @@ mod shadow_wire_tests {
         );
         assert!(booked.is_none());
         assert_eq!(http.requests.lock().unwrap().len(), 1);
+    }
+    /// A shadow lease answered `no_host_fits` is skipped after one request:
+    /// nothing is booked and the broker is not asked again. The broker's
+    /// `max_vcpus` is kept when it is a number and read as unknown otherwise.
+    #[tokio::test]
+    async fn shadow_no_host_fits_is_one_request_with_or_without_max_vcpus() {
+        for (reply, expected) in [
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":8}),
+                Some(8),
+            ),
+            (serde_json::json!({"error":"no_host_fits"}), None),
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":"eight"}),
+                None,
+            ),
+            (
+                serde_json::json!({"error":"no_host_fits","max_vcpus":-1}),
+                None,
+            ),
+        ] {
+            let http = test_http::Http::new(move |path, _| {
+                assert_eq!(path, "/v1/leases");
+                (422, reply.clone())
+            })
+            .await;
+            std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+            let client = Client::new(HostedJobState {
+                broker_url: http.url.clone(),
+                token_source: BrokerTokenSource::Fake,
+                ..HostedJobState::default()
+            });
+            let (_scratch, repo) = boat_tests::committed_repo();
+            let path = repo.to_str().unwrap();
+            let request = RunRequest::new(path, path, path, "true")
+                .with_timeout(30)
+                .with_weight_hint(16);
+            let mut booked = None;
+            assert_eq!(
+                client
+                    .shadow_run(Uuid::now_v7(), &request, &[1; 32], &mut booked)
+                    .await
+                    .err(),
+                Some(Error::NoHostFits(expected))
+            );
+            assert!(booked.is_none());
+            assert_eq!(http.requests.lock().unwrap().len(), 1);
+            assert_eq!(client.broker_code().as_deref(), Some("no_host_fits"));
+        }
     }
     #[test]
     fn shadow_wire_omits_false_appends_true_and_preserves_ordinary_fields() {

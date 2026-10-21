@@ -64,6 +64,7 @@ fn cloud_final_files_match_their_manifest_digests() {
     for path in [
         "cloud/runners-contract.md",
         "cloud/no-spill-lease.json",
+        "cloud/no-host-fits-lease.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/host-signature.json",
@@ -91,7 +92,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "e91e698c1b819225f06a54d2a3869d32c0de36edc380aba177a669810567f08b",
+            "6bdd60e0c282ef767539521c9e3c7b2b1ff7c58c222796da4160bf6befb0caa1",
+        ),
+        (
+            "no-host-fits-lease.json",
+            "a9b710bf74e5e5b385cbeff3119fbeb17e58ff1a314389bf3f29edc34e1f1c2c",
         ),
         (
             "no-spill-lease.json",

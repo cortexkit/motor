@@ -310,6 +310,19 @@ fn fake_binary_refusal_and_shortening_flags_work_over_http() {
 }
 
 #[test]
+fn fake_binary_max_vcpus_flag_answers_no_host_fits_over_http() {
+    let server = Server::start(&["--max-vcpus", "8"]);
+    let mut request = lease_request();
+    request.vcpus = 16;
+    assert_eq!(
+        server.post("/v1/leases", &request),
+        (422, json!({"error":"no_host_fits","max_vcpus":8}))
+    );
+    request.vcpus = 8;
+    assert_eq!(server.post("/v1/leases", &request).0, 201);
+}
+
+#[test]
 fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
     let server = Server::start(&[]);
     let (status, body) = server.post("/v1/leases", &lease_request());

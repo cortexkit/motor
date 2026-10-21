@@ -1,0 +1,61 @@
+{
+  "note": "TEST-ONLY bytes produced by the broker with Boat enabled and one idle registered host whose per-job ceiling is below the request; seeds reproduce the keys.",
+  "key_id": "runner_2026_10",
+  "test_only_job_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "test_only_requester_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "test_only_machine_seed_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "clock_ms": 1900000000123,
+  "lease_id": "12345678-1234-4321-8765-123456789abc",
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "host_registry": {
+    "host_id": "ovh-1",
+    "max_job_vcpus": 8,
+    "max_job_mem_mib": 28672
+  },
+  "host_snapshot": {
+    "host_id": "ovh-1",
+    "host_generation": 1,
+    "counter": 1,
+    "received_at_ms": 1900000000123,
+    "free_vcpus": 8,
+    "free_mem_mib": 28672,
+    "healthy": true,
+    "queued": 0,
+    "warm": [],
+    "running": []
+  },
+  "request": {
+    "method": "POST",
+    "pathname": "/v1/leases",
+    "body": {
+      "job_id": "019e4567-89ab-7cde-8012-3456789abcd4",
+      "vcpus": 16,
+      "platform": "linux-x64",
+      "net": true,
+      "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+      "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+      "placement_hint": null,
+      "avoid_host": null,
+      "timeout_s": 100,
+      "requester_jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+      },
+      "allow_spill": false
+    },
+    "body_bytes": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcd4\",\"vcpus\":16,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+  },
+  "lease_hash": "8bb712780cc6d6062a8285f6863ec4cdf1bce2990d78fe13ef0914616555606c",
+  "reply": {
+    "status": 422,
+    "headers": {
+      "Retry-After": null
+    },
+    "body": {
+      "error": "no_host_fits",
+      "max_vcpus": 8
+    },
+    "body_bytes": "{\"error\":\"no_host_fits\",\"max_vcpus\":8}"
+  }
+}

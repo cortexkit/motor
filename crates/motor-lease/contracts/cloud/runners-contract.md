@@ -107,7 +107,8 @@ request bytes, not canonical JSON.
 
 ### Error catalog
 
-Every error body is exactly `{"error":"<code>"}`, with no other member.
+Every error body is exactly `{"error":"<code>"}`, with no other member, except `no_host_fits`,
+which is exactly `{"error":"no_host_fits","max_vcpus":<integer>}` in that member order.
 
 | Status | Code |
 | --- | --- |
@@ -117,12 +118,15 @@ Every error body is exactly `{"error":"<code>"}`, with no other member.
 | 403 | `shadow_not_allowed` |
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
+| 422 | `no_host_fits` (lease only; never carries `Retry-After`) |
 | 500 | `internal` |
 | 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal or the tenant's Boat start limit names a longer wait |
 
 Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
 retryable transport failures. `sandbox_lost` is final for that job: its Boat sandbox stopped or
-failed under the lease, and ck-motor must start a new `job_id`. Host retries after a consumed counter must use a new counter.
+failed under the lease, and ck-motor must start a new `job_id`. `no_host_fits` is final for that
+lease body: retrying it never succeeds while the registry is unchanged, so the client routes the
+job elsewhere or asks for at most `max_vcpus`. Host retries after a consumed counter must use a new counter.
 
 ## Client endpoints
 
@@ -188,10 +192,31 @@ After authentication and schema validation, checks proceed in this order:
    different hash is 409 `job_conflict`. These replies do not reserve again.
 3. Ask for placement. If no active host has the requested platform, return 400
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
-   `no_capacity`. Before returning a refusal, repeat the existing-job check so a concurrent
+   `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
+   `no_host_fits`. Before returning a refusal, repeat the existing-job check so a concurrent
    successful lease wins over that refusal. When `allow_spill` is not `false`, Boat spill is
-   enabled and the platform equals `BOAT_PLATFORM`, either refusal is replaced by the spill path in
-   [Boat placements](#boat-placements).
+   enabled and the platform equals `BOAT_PLATFORM`, either 400 or 503 refusal is replaced by the
+   spill path in [Boat placements](#boat-placements), and so is `no_host_fits` when a Boat size
+   fits the lease.
+
+   **Never fits (`no_host_fits`).** The candidates are every `status = 'active'` host of the
+   lease's platform except the one `avoid_host` names. Health, heartbeat age, generation and free
+   capacity are ignored: they are temporary, so a host that could fit when idle and healthy
+   keeps the answer at `no_capacity`. A candidate can fit when its registry per-job ceilings are
+   both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ max(16384, 3584 × vcpus)`.
+   If any candidate's ceiling is unrecorded (NULL), the broker never concludes "never fits" and
+   answers exactly as without this rule. With at least one candidate, all ceilings recorded and
+   none able to fit, the reply is **422** `{"error":"no_host_fits","max_vcpus":N}` with no
+   `Retry-After`. Without any candidate (no active host has the platform, or only the avoided host
+   does) the codes above apply unchanged. When the lease allows spill, Boat is available for its
+   platform (enabled, configured, with a current image) and a Boat size fits, the lease spills
+   instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
+   `v` whose `v` and `max(16384, 3584 × v)` both fit its ceilings (0 if none), maximized over
+   candidates; when the lease allows spill and Boat is available for its platform, also the
+   largest Boat size's `vcpus`. A `no_host_fits` refusal makes no Boat call and leaves no
+   `TenantDO` job row, reservation, provisioning hold, pool claim or spill record, so a
+   re-request of the same body gets the same answer. `test-vectors/runners/no-host-fits-lease.json`
+   pins one such request and its exact reply bytes.
 4. Compute the budget candidate from current totals. For finite allowances,
    `remaining = max(0, allowance − settled_total − reserved_total)` and
    `max_s = min(timeout_s, floor(remaining / (vcpus × 1000)))`; unlimited uses `timeout_s`.
@@ -453,7 +478,9 @@ serves at most one live lease**. Placement hints never select a sandbox.
 other value is 400 `bad_request`. `false` requires a registered host: when placement refuses,
 the broker returns that refusal unchanged (including its status, body and Retry-After), never
 claims or creates a Boat sandbox, makes no Boat calls and leaves no spill record for that lease.
-For example, a full registered fleet returns 503 `no_capacity` with Retry-After `5`.
+For example, a full registered fleet returns 503 `no_capacity` with Retry-After `5`, and a job
+larger than every registered host's per-job ceiling returns 422 `no_host_fits` whose
+`max_vcpus` counts registered hosts only.
 `true` or omission preserves ordinary spill behavior. This is per lease, not per tenant, so
 callers sharing a fleet account can choose independently. The field is optional during the
 cutover; once ck-motor always sends it, the broker will make it required in a later change.
@@ -464,7 +491,8 @@ before shadow permission or any job claim is checked.
 **Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), and `BOAT_SIZES`
 (the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
 `vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
-fitting size is 503 `no_capacity`.
+fitting size is 503 `no_capacity`, or 422 `no_host_fits` when no registered host could ever fit
+the lease either (see step 3 of the lease order).
 
 **Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
 lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
@@ -600,6 +628,10 @@ lease request and exact reply, including the lease id and SPKI hash.
 requester key, the Boat 202 provisioning reply, the booked Boat lease reply, a finish call and
 reply, `sandbox_lost` on reattach and finish, and the requester key's OpenSSH encoding and
 authorized_keys line.
+
+`test-vectors/runners/no-spill-lease.json` and `test-vectors/runners/no-host-fits-lease.json`
+pin the registered-host-only refusals: a full host's 503 `no_capacity`, and the 422
+`no_host_fits` for a job above the only host's per-job ceiling.
 
 `workers/runners/test/vectors.test.ts` and `workers/runners/test/boat-vectors.test.ts` compare real
 implementation output to those committed bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,

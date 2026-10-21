@@ -643,6 +643,13 @@ impl Motor {
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let (mut request, returns) = submission;
+        // A repository-routed job the broker could never place runs on the
+        // build server under the queue-wait limit it has left; see
+        // `Storage::routed_direct_no_host_fits`.
+        let wait = match self.storage.job(id) {
+            Some(job) if job.routed_direct_reason.is_some() => job.queue_wait_limit_s,
+            _ => wait,
+        };
         let shadow_request = (self.hosted_state(id).is_none()
             && self
                 .storage
@@ -717,6 +724,24 @@ impl Motor {
                         request.timeout = Some(lease.max_s);
                         request.weight_hint = Some(request.weight_hint.unwrap_or(2));
                         Ok(channel)
+                    }
+                    Err(crate::hosted::Error::NoHostFits(max_vcpus))
+                        if self
+                            .hosted_state(id)
+                            .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                    {
+                        // No hosted host can ever hold this job, so choosing
+                        // hosted for it was wrong from the start. This undoes
+                        // a routing decision before any placement; it is not
+                        // a hosted failure falling back. Nothing was booked,
+                        // so there is no lease to release or finish.
+                        let spent_ms =
+                            u64::try_from(spill_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        self.storage.routed_direct_no_host_fits(id, spent_ms)?;
+                        tracing::info!(job_id = %id, vcpus = request.weight_hint.unwrap_or(2),
+                            max_vcpus = %max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+                            "hosted no_host_fits; routing to build server");
+                        return Ok(true);
                     }
                     Err(error) => {
                         // The hosted client never sends a Run frame, so this
@@ -1309,7 +1334,11 @@ impl Motor {
     }
     pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
         let routed = self.storage.hosted_routed_jobs_1h();
-        if !self.config.hosted_runners && self.config.hosted_repositories.is_empty() && routed == 0
+        let no_host_fits = self.storage.hosted_no_host_fits_1h();
+        if !self.config.hosted_runners
+            && self.config.hosted_repositories.is_empty()
+            && routed == 0
+            && no_host_fits == 0
         {
             return None;
         }
@@ -1318,6 +1347,7 @@ impl Motor {
         Some(serde_json::json!({
             "hosted": self.config.hosted_runners,
             "hosted_routed_jobs_1h": routed,
+            "hosted_no_host_fits_1h": no_host_fits,
             "token_source": self.config.broker_token_source,
             "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
             "last_lease_error": error,

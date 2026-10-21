@@ -19,10 +19,10 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors seven canonical files
-verbatim: the contract and `no-spill-lease.json` at commit `95fd2d1`,
-`lease.json` and `boat-lease.json` at `3d70bcf`, and the other vectors at
-`00e688e`. `contracts/digest-manifest.json` records source paths,
+`test-vectors/runners/`. `contracts/cloud/` mirrors eight canonical files
+verbatim: the contract and `no-host-fits-lease.json` at commit `916347e`,
+`no-spill-lease.json` at `95fd2d1`, `lease.json` and `boat-lease.json` at
+`3d70bcf`, and the other vectors at `00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
 and settlement replies directly to these external vectors; they never regenerate
@@ -34,6 +34,14 @@ It also records the real broker's `503 no_capacity` and `Retry-After` when only 
 full registered host is selectable, even with Boat enabled. Existing vectors
 retain their bytes and digests; absence of `allow_spill` is distinct from either
 boolean in a lease hash, so re-requests preserve both presence and value.
+
+`no-host-fits-lease.json` records the broker's final refusal for a no-spill
+16-vCPU lease when the only registered host's per-job ceiling is 8 vCPUs: HTTP
+422 with exactly `{"error":"no_host_fits","max_vcpus":8}` and no `Retry-After`.
+It is the only error body with a member besides `error`. The refusal is final
+for that request body; with spill allowed and Boat on, a job that fits a Boat
+size still spills, and `max_vcpus` then counts Boat sizes too. A host with no
+recorded per-job ceiling never produces it.
 
 ## Fake broker test executable
 
@@ -61,6 +69,9 @@ The first stdout line gives its bound address; credentials are never printed.
 
 `--refuse CODE` refuses leases with HTTP 403 before creating a reservation.
 `--max-s SECONDS` simulates a budget-shortened runtime (including below 10 s).
+`--max-vcpus N` simulates a fleet whose largest host holds N vCPUs: a new lease
+asking for more is answered HTTP 422 `{"error":"no_host_fits","max_vcpus":N}`
+before any reservation is made.
 The reservation is `vcpus * granted max_s * 1000`. Model tests can set a finite
 allowance to exercise budget shortening and the below-10 refusal; `--max-s` can
 also deliberately issue a below-10 cap as a hostile-client test control.

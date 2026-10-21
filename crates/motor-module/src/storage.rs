@@ -28,6 +28,8 @@ const LEGACY_RETENTION_MS: u64 = 49 * 60 * 60 * 1000;
 const MAX_VERIFIED_TIPS: usize = 256;
 const MAX_FAILED_TIPS: usize = 256;
 const FAILED_TIP_TTL: Duration = Duration::from_secs(60);
+/// The stored `routed_direct_reason` of a job the broker answered `no_host_fits`.
+const NO_HOST_FITS: &str = "no_host_fits";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -83,6 +85,13 @@ pub(crate) struct Job {
     /// under this ID. The caller keeps using its original job ID throughout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_server_job_id: Option<Uuid>,
+    /// Why a job first routed to hosted runners by `hosted_repositories` was
+    /// sent to the build server instead, before any hosted placement. Set
+    /// together with removing the job's hosted route, so a restart or a later
+    /// attach treats it as an ordinary build-server job. The only reason so
+    /// far is `no_host_fits`: no hosted host could ever hold its vCPUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_direct_reason: Option<String>,
 }
 impl Job {
     fn lacks_newer_fields(&self) -> bool {
@@ -99,6 +108,7 @@ impl Job {
             && self.retain_until_ms.is_none()
             && self.workspace_key.is_none()
             && self.build_server_job_id.is_none()
+            && self.routed_direct_reason.is_none()
     }
 
     fn legacy_expired(&self, id: Uuid, now: u64) -> bool {
@@ -377,15 +387,32 @@ impl Storage {
         self.hosted_routed_jobs_1h_at(now_ms())
     }
     fn hosted_routed_jobs_1h_at(&self, now: u64) -> usize {
+        self.jobs_minted_in_last_hour(now, |job| {
+            job.hosted
+                .as_ref()
+                .is_some_and(|route| route.repository_routed)
+        })
+    }
+    /// Jobs selected by `hosted_repositories` in the last hour that the broker
+    /// answered `no_host_fits`, and that therefore ran on the build server.
+    pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
+        self.hosted_no_host_fits_1h_at(now_ms())
+    }
+    fn hosted_no_host_fits_1h_at(&self, now: u64) -> usize {
+        self.jobs_minted_in_last_hour(now, |job| {
+            job.routed_direct_reason.as_deref() == Some(NO_HOST_FITS)
+        })
+    }
+    /// Counts the jobs matching `matches` whose job ID was minted in the hour
+    /// before `now`. Job IDs are UUIDv7, so the ID carries its creation time.
+    fn jobs_minted_in_last_hour(&self, now: u64, matches: impl Fn(&Job) -> bool) -> usize {
         self.state
             .lock()
             .unwrap()
             .jobs
             .iter()
             .filter(|(id, job)| {
-                job.hosted
-                    .as_ref()
-                    .is_some_and(|route| route.repository_routed)
+                matches(job)
                     && id.get_timestamp().is_some_and(|timestamp| {
                         let (seconds, nanos) = timestamp.to_unix();
                         let minted = seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000;
@@ -394,6 +421,33 @@ impl Storage {
                     })
             })
             .count()
+    }
+    /// Durably send a repository-routed job to the build server because the
+    /// broker answered `no_host_fits` before any placement. The hosted route
+    /// is removed, so nothing later releases or finishes a lease the broker
+    /// never booked, and a restart attaches to the build server instead of
+    /// asking for a lease again.
+    ///
+    /// The build server's queue-wait limit starts when it receives the Run
+    /// frame, and both it and ck-motor enforce the stored limit. The time
+    /// already spent asking for a lease is taken off that limit here, once,
+    /// so the job waits no longer in total than its limit allowed. It is
+    /// rounded down to whole seconds, and a positive limit stays at least one
+    /// second, because the build server reads zero as "refuse if it has to
+    /// queue at all".
+    pub(crate) fn routed_direct_no_host_fits(&self, id: Uuid, spent_ms: u64) -> io::Result<()> {
+        self.update(|s| {
+            if let Some(job) = s.jobs.get_mut(&id) {
+                job.hosted = None;
+                job.routed_direct_reason = Some(NO_HOST_FITS.into());
+                if job.queue_wait_limit_s > 0 {
+                    job.queue_wait_limit_s = job
+                        .queue_wait_limit_s
+                        .saturating_sub(spent_ms / 1000)
+                        .max(1);
+                }
+            }
+        })
     }
     pub(crate) fn hosted_route(
         &self,
@@ -1280,5 +1334,80 @@ mod hosted_routing_health_tests {
         drop(storage);
         let storage = Storage::open(&scratch).unwrap();
         assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
+    }
+
+    /// Sending a routed job to the build server removes its hosted route,
+    /// records why, and takes the whole seconds already spent off its
+    /// queue-wait limit exactly once; all of it survives reopening the store.
+    #[test]
+    fn no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-no-host-fits");
+        let storage = Storage::open(&scratch).unwrap();
+        let now = now_ms();
+        let mut ids = Vec::new();
+        for (age, limit, spent_ms, remaining) in [
+            (0, 300, 2_999, 298),
+            (3_599_999, 2, 5_000, 1),
+            (3_600_000, 300, 0, 300),
+            (0, 0, 5_000, 0),
+        ] {
+            let minted = now - age;
+            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                minted / 1000,
+                ((minted % 1000) * 1_000_000) as u32,
+            ));
+            storage.create(id, limit, None, None, false).unwrap();
+            storage
+                .hosted_route(
+                    id,
+                    crate::HostedJobState {
+                        repository_routed: true,
+                        lease_attempted: true,
+                        ..crate::HostedJobState::default()
+                    },
+                )
+                .unwrap();
+            storage.routed_direct_no_host_fits(id, spent_ms).unwrap();
+            ids.push((id, remaining, age));
+        }
+        // Not a no_host_fits decision: a routed job still on its hosted route.
+        let routed = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            now / 1000,
+            ((now % 1000) * 1_000_000) as u32,
+        ));
+        storage.create(routed, 300, None, None, false).unwrap();
+        storage
+            .hosted_route(
+                routed,
+                crate::HostedJobState {
+                    repository_routed: true,
+                    ..crate::HostedJobState::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now + 3_600_000), 0);
+        drop(storage);
+        // A process another test forks at the wrong moment can briefly hold
+        // the store's lock file after it is closed here.
+        let storage = (0..100)
+            .find_map(|_| match Storage::open(&scratch) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                }
+                other => Some(other.unwrap()),
+            })
+            .expect("store lock released");
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 1);
+        for (id, remaining, age) in ids {
+            let job = storage.job(id).unwrap();
+            assert!(job.hosted.is_none(), "age {age}");
+            assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
+            assert_eq!(job.queue_wait_limit_s, remaining, "age {age}");
+        }
     }
 }
