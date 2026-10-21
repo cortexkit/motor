@@ -92,7 +92,7 @@ def install_tools(pins):
     Path("/usr/local/bin/bun").chmod(0o755)
     run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts",
         f"npm@{pins['npm']}", f"pnpm@{pins['pnpm']}")
-    run("bash", str(BUILD / "script/runner/install-tools.sh"))
+    run("bash", str(BUILD / "script/runner/install-tools.sh"), "tenant")
     run("sh", str(BUILD / "script/runner/build-sccache.sh"))
 
     PREFIX.mkdir(parents=True)

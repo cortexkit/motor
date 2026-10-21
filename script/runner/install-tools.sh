@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Install the pinned Cargo tools and versioned runtime archives from
-# toolchain.json. Run on the build server as ubuntu, or on Boat as root:
-#   bash script/runner/install-tools.sh [build-server|boat] [runtime-only]
+# toolchain.json. Run on the build server as ubuntu, or as root while building
+# a Boat or tenant VM image:
+#   bash script/runner/install-tools.sh [build-server|boat|tenant] [runtime-only]
 # cargo skips registry tools already installed at the pinned version. Removing
 # a tool entry from toolchain.json does not uninstall the tool or remove its links.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 role="${1:-build-server}"
 mode="${2:-all}"
-case "$role" in build-server|boat) ;; *) echo "unknown install role: $role" >&2; exit 2 ;; esac
+case "$role" in build-server|boat|tenant) ;; *) echo "unknown install role: $role" >&2; exit 2 ;; esac
 case "$mode" in all|runtime-only) ;; *) echo "unknown install mode: $mode" >&2; exit 2 ;; esac
 export CARGO_HOME=/srv/build/cargo-home RUSTUP_HOME=/home/ubuntu/.rustup TMPDIR=/srv/build/tmp
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -83,6 +84,8 @@ PY
 )
 while IFS='|' read -r name version link url sha format install_dir install_path archive_path strip_components; do
   [ -n "$name" ] || continue
+  # The build server's node22 is installed by its operator; images install it
+  # from the pinned archive like every other runtime.
   if [ "$name" = node22 ] && [ "$role" = build-server ]; then
     node22="$(rooted "$link")"
     actual=$("$node22" --version 2>/dev/null || true)
