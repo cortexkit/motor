@@ -81,6 +81,14 @@ Conditions without an exact 0.2.8 refusal variant, for the caller-types owner:
   terminal is already stored, keep that result even when billing is unavailable.
 - `hosted_job_admitted` is recovery via attach, not resubmission. Settled/released
   jobs (`hosted_job_finished`, `hosted_job_released`) do not authorize a fresh Run.
+- A job whose stream dropped after its own host ended and settled it by usage
+  report is still reattachable for 24 hours: the broker answers the reattach with
+  an attach token instead of `job_finished`, the host replays the remaining
+  output, terminal and billed usage from ck-motor's cursor, and the job ends with
+  its real exit code. ck-motor reports and settles nothing for it. Boat jobs and
+  jobs settled any other way keep `job_finished` (outcome unknown unless a real
+  terminal is already stored). Test:
+  `stream_lost_after_host_settled_reattaches_and_replays_the_real_terminal`.
 
 Tests: `hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main`,
 `hosted_refusals_use_legacy_reason_and_distinct_codes`, and the account-token

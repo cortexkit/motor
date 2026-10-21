@@ -19,10 +19,11 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors eight canonical files
-verbatim: the contract and `no-host-fits-lease.json` at commit `916347e`,
-`no-spill-lease.json` at `95fd2d1`, `lease.json` and `boat-lease.json` at
-`3d70bcf`, and the other vectors at `00e688e`. `contracts/digest-manifest.json` records source paths,
+`test-vectors/runners/`. `contracts/cloud/` mirrors nine canonical files
+verbatim: the contract and `settled-reattach.json` at commit `c8600ac`,
+`no-host-fits-lease.json` at `916347e`, `no-spill-lease.json` at `95fd2d1`,
+`lease.json` and `boat-lease.json` at `3d70bcf`, and the other vectors at
+`00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
 and settlement replies directly to these external vectors; they never regenerate
@@ -43,13 +44,23 @@ for that request body; with spill allowed and Boat on, a job that fits a Boat
 size still spills, and `max_vcpus` then counts Boat sizes too. A host with no
 recorded per-job ceiling never produces it.
 
+`settled-reattach.json` records a reattach for a registered-host job that its
+host already settled by usage report: HTTP 200 with a `purpose: "attach"` token
+and the lease's unchanged id, placement, endpoint, SPKI hash, `max_s` and
+`reserved_vcpu_ms`, and identical tenant totals before and after it. The broker
+answers this way for 24 hours after such a settlement so a client that lost the
+end of a job's output can reconnect and have the host replay it. Boat jobs and
+jobs settled any other way still get 409 `job_finished`.
+
 ## Fake broker test executable
 
 `motor-fake-broker` is a loopback HTTP test server, not a production broker. It is
 refused for the `main` instance (also enforced by the pure `FakeBroker` model).
 It serves the lease, reattach, release, heartbeat, usage and public JWKS routes. Reservations
 and counters are in memory; restart is a test reset. It settles expired unreported
-jobs as `host_lost`. No job bytes are transported. Machine-worker authentication
+jobs as `host_lost`. A job settled by its host's usage report still gets an
+attach token on reattach for 86400 s (`SETTLED_REATTACH_WINDOW_MS`) after the
+report; `host_lost` and released jobs keep their 409. No job bytes are transported. Machine-worker authentication
 is an exact configured test bearer mapped to a subject, not CK account acquisition.
 
 ```sh

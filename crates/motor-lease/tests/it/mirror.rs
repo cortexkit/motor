@@ -70,6 +70,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/host-signature.json",
         "cloud/lease.json",
         "cloud/usage-settlement.json",
+        "cloud/settled-reattach.json",
     ] {
         let entry = manifest
             .files
@@ -92,7 +93,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "6bdd60e0c282ef767539521c9e3c7b2b1ff7c58c222796da4160bf6befb0caa1",
+            "b87b90189b3bb3a695758aef69f383c71e47205ac5dc4f6f75d3d31b8dafe4b2",
         ),
         (
             "no-host-fits-lease.json",
@@ -121,6 +122,10 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         (
             "usage-settlement.json",
             "4f53e2eb16dd586308f31f9a9ffe986c1f214a65aa45dd973f2a3de1f63084b7",
+        ),
+        (
+            "settled-reattach.json",
+            "ebf6197a1dc1b59a7284ced6b9b61cf9cca604bb32b510354ad134842dd9f6ba",
         ),
     ] {
         assert_eq!(

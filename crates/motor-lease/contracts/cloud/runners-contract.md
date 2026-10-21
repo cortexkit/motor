@@ -45,8 +45,10 @@ Hosts check expiration at connect only. They reject any other `alg` or `typ`, un
 `crit` header, wrong `iss` or `aud`, any purpose other than `run` or `attach`, and extra or missing
 claims. Host executions are keyed by `jti`: a `run` token starts an execution only if none exists
 for that job; later tokens reconnect without starting another execution or restarting `max_s`.
-An `attach` token never starts an execution. An ended execution refuses connection. These are
-host obligations, not execution logic implemented in the broker.
+An `attach` token never starts an execution. A `run` token for an ended execution is refused. An
+`attach` token for an ended execution is accepted while the host retains the job's terminal
+record: the host replays the retained output and terminal records and reports no further usage.
+These are host obligations, not execution logic implemented in the broker.
 
 `GET /.well-known/jwks.json` is unauthenticated and returns 200 `{"keys":[…]}` with
 `Cache-Control: public, max-age=300`. Each key is
@@ -270,8 +272,28 @@ Lease id, placement, endpoint, SPKI hash, run limit and reservation remain uncha
 `attach` token is bound to the supplied key and has its own `iat` and `exp = iat + 300`. It reserves
 and settles nothing and does not move the original deadline. Earlier tokens are not revoked;
 they expire at their own `exp`. Unknown, claim-only or another tenant's jobs return 404
-`job_unknown`. A release marker is 409 `job_released`, taking precedence over a settled job's
-409 `job_finished`.
+`job_unknown`. For a known job the broker then decides, in this order:
+
+1. A release marker is 409 `job_released`, even after settlement.
+2. A job settled with reason `lost` (a lost Boat sandbox) is 409 `sandbox_lost`.
+3. A settled registered-host job (any provider but Boat) whose settlement came from its host's
+   usage report (reason `reported`), with a recorded settlement time `settled_at_ms` such that
+   `settled_at_ms + 86400000 > now` (86400 s), returns 200 with an `attach` token and exactly the
+   reply an unsettled host job gets: the same lease id, placement, endpoint, SPKI hash, `max_s`
+   and `reserved_vcpu_ms`. The host keeps such a job's terminal record and output for 24 hours
+   and replays them to an `attach` token, so a client that lost the end of the output can recover
+   it. This reattach reserves and settles nothing, changes no totals, writes no usage and changes
+   no job field. The window is registered-host only because a Boat sandbox is reused for another
+   job and its SSH keys rewritten, so an attach could reach a sandbox now serving someone else.
+4. Every other settled job is 409 `job_finished`: Boat jobs, jobs settled as `host_lost`,
+   `released` or `deadline` (or `finished`), and any settled job whose settlement is 86400 s old or
+   older or has no recorded settlement time (jobs settled before the time was recorded).
+
+The same rule is checked again after signing, so a job released or settled for any other reason
+while its token was being signed is refused with the code above, and a job settled by its host's
+usage report in that time still gets the token. Lease re-request and release keep answering a
+settled job with 409 `job_finished` (or `job_released`). `test-vectors/runners/settled-reattach.json`
+pins a reattach for a usage-settled host job with the tenant totals before and after it.
 
 ### POST /v1/leases/{job_id}/release
 
@@ -624,6 +646,9 @@ the fixed signing seed and its derived public key. `test-vectors/runners/lease.j
 lease request and exact reply, including the lease id and SPKI hash.
 `test-vectors/runners/host-signature.json` pins the exact host signature input and signature.
 `test-vectors/runners/usage-settlement.json` pins the report and settlement reply.
+`test-vectors/runners/settled-reattach.json` pins a reattach for a job its host already settled by
+usage report: the 200 `attach` reply with the lease's unchanged fields, and the identical tenant
+read before and after it.
 `test-vectors/runners/boat-lease.json` pins, with a recorded test size and the recorded test
 requester key, the Boat 202 provisioning reply, the booked Boat lease reply, a finish call and
 reply, `sandbox_lost` on reattach and finish, and the requester key's OpenSSH encoding and

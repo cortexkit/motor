@@ -234,6 +234,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 
 mod account;
 pub(crate) mod harness;
+mod settled_reattach;
 use harness::*;
 use motor_protocol::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

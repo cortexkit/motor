@@ -320,6 +320,158 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
 }
 
+/// CLOUD's `settled-reattach.json`: a registered host settles a job by usage
+/// report, and a later reattach still gets 200 with an `attach` token and the
+/// lease's unchanged fields. Seeded with the vector's keys and clocks, the fake
+/// returns the same statuses and JSON bodies for the lease, the settlement and
+/// the reattach, and the reattach leaves the settlement as it was.
+#[test]
+fn cloud_settled_reattach_reply_matches_fake() {
+    let v = vector("settled-reattach.json");
+    let lease_reply = &v["lease"]["reply"]["body"];
+    let mut broker = FakeBroker::new(
+        "cloud-vector",
+        FakeConfig {
+            worker_bearer: BEARER.into(),
+            subject: format!("acct:{}", v["account"].as_str().unwrap()),
+            placement: serde_json::from_value(lease_reply["placement"].clone()).unwrap(),
+            endpoint: v["host"]["endpoint"].as_str().unwrap().into(),
+            endpoint_spki_sha256: v["host"]["endpoint_spki_sha256"].as_str().unwrap().into(),
+            kid: v["key_id"].as_str().unwrap().into(),
+            signing_key: seed(v["test_only_job_seed_hex"].as_str().unwrap()),
+            announced_keys: vec![],
+        },
+    )
+    .unwrap();
+    broker.knobs.allowance_vcpu_ms = v["tenant_before"]["body"]["allowance"].as_u64();
+    broker.knobs.lease_id = Some(v["lease_id"].as_str().unwrap().into());
+    let machine = seed(v["test_only_machine_seed_hex"].as_str().unwrap());
+    let host_id = v["host"]["host_id"].as_str().unwrap();
+    assert_eq!(
+        machine.verifying_key().to_bytes().to_vec(),
+        (0..32)
+            .map(|i| u8::from_str_radix(
+                &v["host"]["public_key_hex"].as_str().unwrap()[i * 2..i * 2 + 2],
+                16
+            )
+            .unwrap())
+            .collect::<Vec<_>>()
+    );
+    broker.register_host(host_id.into(), machine.verifying_key());
+    let requester = seed(v["test_only_requester_seed_hex"].as_str().unwrap());
+
+    let request: LeaseRequest =
+        serde_json::from_value(v["lease"]["request"]["body"].clone()).unwrap();
+    assert_eq!(
+        request.requester_jwk,
+        RequesterJwk::from_key(&requester.verifying_key())
+    );
+    let leased = post(
+        &mut broker,
+        v["lease"]["request"]["pathname"].as_str().unwrap(),
+        &request,
+        v["lease_clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        (leased.status, &leased.body),
+        (
+            v["lease"]["reply"]["status"].as_u64().unwrap() as u16,
+            lease_reply
+        )
+    );
+
+    let u = &v["usage"]["request"];
+    let usage: Usage = serde_json::from_value(u["body"].clone()).unwrap();
+    let body = serde_json::to_vec(&usage).unwrap();
+    let path = u["pathname"].as_str().unwrap();
+    let timestamp = u["headers"]["CK-Timestamp"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let counter = u["headers"]["CK-Counter"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let signed =
+        HostHeaders::sign(host_id, "POST", path, &body, timestamp, counter, &machine).unwrap();
+    assert_eq!(signed.signature, u["headers"]["CK-Signature"]);
+    let settled = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&signed),
+            body: &body,
+        },
+        v["usage_clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        (settled.status, &settled.body),
+        (
+            v["usage"]["reply"]["status"].as_u64().unwrap() as u16,
+            &v["usage"]["reply"]["body"]
+        )
+    );
+    let settlement = |broker: &FakeBroker| {
+        broker
+            .settlement(&request.job_id)
+            .map(|(reply, reason)| (serde_json::to_value(reply).unwrap(), reason))
+    };
+    let before = settlement(&broker);
+    assert_eq!(before, Some((v["usage"]["reply"]["body"].clone(), "usage")));
+    // The tenant read before and after the reattach is identical in CLOUD, and
+    // its settled total is this job's settlement.
+    assert_eq!(v["tenant_before"], v["tenant_after"]);
+    assert_eq!(
+        v["tenant_before"]["body"]["settled_vcpu_ms"],
+        v["usage"]["reply"]["body"]["settled_vcpu_ms"]
+    );
+
+    let attach: ReattachRequest =
+        serde_json::from_value(v["reattach"]["request"]["body"].clone()).unwrap();
+    let reattached = post(
+        &mut broker,
+        v["reattach"]["request"]["pathname"].as_str().unwrap(),
+        &attach,
+        v["clock_ms"].as_u64().unwrap(),
+    );
+    let expected = &v["reattach"]["reply"]["body"];
+    assert_eq!(
+        (reattached.status, &reattached.body),
+        (
+            v["reattach"]["reply"]["status"].as_u64().unwrap() as u16,
+            expected
+        )
+    );
+    for field in [
+        "lease_id",
+        "job_id",
+        "placement",
+        "endpoint",
+        "endpoint_spki_sha256",
+        "max_s",
+        "reserved_vcpu_ms",
+    ] {
+        assert_eq!(expected[field], lease_reply[field], "{field}");
+    }
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(broker.jwks())).unwrap();
+    let claims = verify_token(
+        expected["job_token"].as_str().unwrap(),
+        &keys,
+        host_id,
+        Some(&request.job_id),
+        Purpose::Attach,
+        v["clock_ms"].as_u64().unwrap() / 1000,
+    )
+    .unwrap();
+    assert_eq!(claims.purpose, Purpose::Attach);
+    assert_eq!(settlement(&broker), before);
+}
+
 /// CLOUD's `no-host-fits-lease.json` is a no-spill 16-vCPU lease against a
 /// single registered host whose per-job ceiling is 8 vCPUs. The fake broker,
 /// limited to that ceiling, answers the same request with the same status and

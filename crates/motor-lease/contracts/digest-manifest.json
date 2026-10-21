@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "916347ef26048a0c6aeb7d39dd2c81d8ae5257e7",
+    "revision": "c8600ac",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "6bdd60e0c282ef767539521c9e3c7b2b1ff7c58c222796da4160bf6befb0caa1",
+      "sha256": "b87b90189b3bb3a695758aef69f383c71e47205ac5dc4f6f75d3d31b8dafe4b2",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "916347ef26048a0c6aeb7d39dd2c81d8ae5257e7",
+      "source_commit": "c8600ac",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -69,6 +69,14 @@
       "source_repository": "cortexkit-cloud",
       "source_commit": "00e688e",
       "source_path": "test-vectors/runners/usage-settlement.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/settled-reattach.json",
+      "sha256": "ebf6197a1dc1b59a7284ced6b9b61cf9cca604bb32b510354ad134842dd9f6ba",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "c8600ac",
+      "source_path": "test-vectors/runners/settled-reattach.json",
       "canonical": true
     }
   ]
