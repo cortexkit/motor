@@ -56,7 +56,7 @@ fn debug_string(process: HANDLE, info: OUTPUT_DEBUG_STRING_INFO) -> Value {
         None
     };
     data.truncate(read.min(data.len()));
-    let text = crate::windows::debug_text::decode(&data,info.fUnicode != 0);
+    let text = crate::windows::debug_text::decode(&data, info.fUnicode != 0);
     json!({"text":text,"unicode":info.fUnicode != 0,"read_complete":success != 0,
         "read_error":read_error})
 }

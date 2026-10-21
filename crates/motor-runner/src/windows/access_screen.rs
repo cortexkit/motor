@@ -1,9 +1,25 @@
 //! Conservative decisions for read-only descriptor screening, not real I/O.
-pub(super) fn decision(api_ok: bool, access_status: bool, granted: u32, requested: u32) -> Option<bool> {
-    if !api_ok || (access_status && granted & requested != requested) { None } else { Some(access_status) }
+pub(super) fn decision(
+    api_ok: bool,
+    access_status: bool,
+    granted: u32,
+    requested: u32,
+) -> Option<bool> {
+    if !api_ok || (access_status && granted & requested != requested) {
+        None
+    } else {
+        Some(access_status)
+    }
 }
-pub(super) fn passes_screen(device: Option<bool>, rights: &[Option<bool>], controls_ok: bool) -> bool {
-    controls_ok && device == Some(true) && !rights.is_empty() && rights.iter().all(|right| *right == Some(false))
+pub(super) fn passes_screen(
+    device: Option<bool>,
+    rights: &[Option<bool>],
+    controls_ok: bool,
+) -> bool {
+    controls_ok
+        && device == Some(true)
+        && !rights.is_empty()
+        && rights.iter().all(|right| *right == Some(false))
 }
 #[cfg(test)]
 mod tests {
@@ -22,8 +38,8 @@ mod tests {
     fn access_screen_never_accepts_missing_paths_or_partial_write_grants() {
         assert!(!passes_screen(Some(true), &[], true));
         assert!(!passes_screen(Some(true), &[None], true));
-        assert!(!passes_screen(Some(true), &[Some(false),Some(true)], true));
+        assert!(!passes_screen(Some(true), &[Some(false), Some(true)], true));
         assert!(!passes_screen(Some(true), &[Some(false)], false));
-        assert!(passes_screen(Some(true), &[Some(false),Some(false)], true));
+        assert!(passes_screen(Some(true), &[Some(false), Some(false)], true));
     }
 }

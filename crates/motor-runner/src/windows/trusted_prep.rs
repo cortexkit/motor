@@ -99,7 +99,9 @@ fn run_as_batch(
 pub(super) fn launch_entry(arguments: &[String]) -> io::Result<()> {
     launch::entry(arguments)
 }
-pub(super) fn access_check_entry(arguments: &[String]) -> io::Result<()> {launch::access_check_entry(arguments)}
+pub(super) fn access_check_entry(arguments: &[String]) -> io::Result<()> {
+    launch::access_check_entry(arguments)
+}
 pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),

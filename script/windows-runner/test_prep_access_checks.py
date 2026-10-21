@@ -56,6 +56,9 @@ class PrepAccessScreenTests(unittest.TestCase):
         for value in ('windows_temp', 'profile', 'profile_local_temp', 'persistent_prep_cache', 'service_home', 'fixture_manifests', 'fixture_manifest_file', 'toolchain', 'cargo_executable', 'rustc_executable', 'runner_root_outside_staging', 'baselines_directory', 'configured_parent', 'baseline_parent_directory'):
             self.assertIn(value, self.source)
         self.code('vm.baseline_path()', self.source)
+        self.assertIn('runner_root_child_outside_staging', self.source)
+        self.code('eq_ignore_ascii_case("staging")', self.source)
+        self.code('None=>gaps.push(', self.source)
         self.code('"image_discovery_gaps"', self.source)
         self.code('path.descriptor.is_some()', self.source)
         self.code('path.description["security"]["integrity_label_error"].is_null()', self.source)
