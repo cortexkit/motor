@@ -16,6 +16,8 @@ use windows_sys::Win32::{
     Storage::FileSystem::GetFinalPathNameByHandleW,
     System::Diagnostics::Debug::*,
 };
+#[cfg(target_arch = "x86_64")]
+mod native_calls;
 
 pub(super) fn path(plan: &Plan) -> PathBuf {
     let stem = plan.stdout.file_stem().unwrap().to_string_lossy();
@@ -78,6 +80,14 @@ pub(super) fn wait(plan: &Plan, process: HANDLE, deadline: Instant) -> io::Resul
     let mut seen_breakpoint = false;
     let mut total_bytes = 0;
     let mut truncated = false;
+    #[cfg(target_arch = "x86_64")]
+    let mut calls = plan
+        .diagnostic_native_calls
+        .then(|| native_calls::NativeCalls::new(process));
+    #[cfg(not(target_arch = "x86_64"))]
+    if plan.diagnostic_native_calls {
+        return Err(step("native-call-trace", "x64 diagnostic only"));
+    }
     loop {
         if Instant::now() >= deadline {
             return Err(step(
@@ -95,9 +105,16 @@ pub(super) fn wait(plan: &Plan, process: HANDLE, deadline: Instant) -> io::Resul
         }
         let mut disposition = DBG_CONTINUE;
         let mut terminal = None;
+        let mut instrumentation_error = None;
         let detail = unsafe {
             match event.dwDebugEventCode {
                 CREATE_PROCESS_DEBUG_EVENT => {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        if let Err(error) = calls.thread_created(event.dwThreadId) {
+                            instrumentation_error = Some(error);
+                        }
+                    }
                     let data = event.u.CreateProcessInfo;
                     let image = module_path(data.hFile);
                     if !data.hFile.is_null() && data.hFile as isize != -1 {
@@ -108,25 +125,81 @@ pub(super) fn wait(plan: &Plan, process: HANDLE, deadline: Instant) -> io::Resul
                 LOAD_DLL_DEBUG_EVENT => {
                     let data = event.u.LoadDll;
                     let image = module_path(data.hFile);
+                    let mut armed = None;
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        match calls.module_loaded(
+                            data.lpBaseOfDll as u64,
+                            image["path"].as_str().unwrap_or(""),
+                        ) {
+                            Ok(value) => armed = value,
+                            Err(error) => instrumentation_error = Some(error),
+                        }
+                    }
                     if !data.hFile.is_null() && data.hFile as isize != -1 {
                         CloseHandle(data.hFile);
                     }
-                    json!({"kind":"load-dll","image":image,"base":format!("0x{:X}",data.lpBaseOfDll as usize)})
+                    json!({"kind":"load-dll","image":image,"base":format!("0x{:X}",data.lpBaseOfDll as usize),"native_call_trace":armed})
                 }
                 OUTPUT_DEBUG_STRING_EVENT => {
-                    json!({"kind":"loader-debug-string","message":debug_string(process,event.u.DebugString)})
+                    let message = debug_string(process, event.u.DebugString);
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        calls.loader_message(message["text"].as_str().unwrap_or(""));
+                    }
+                    json!({"kind":"loader-debug-string","message":message})
                 }
                 EXCEPTION_DEBUG_EVENT => {
                     let data = event.u.Exception;
                     let code = data.ExceptionRecord.ExceptionCode;
-                    if code == STATUS_BREAKPOINT && !seen_breakpoint {
-                        seen_breakpoint = true;
-                    } else {
-                        disposition = DBG_EXCEPTION_NOT_HANDLED;
+                    let mut intercepted = None;
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        match calls.exception(
+                            event.dwThreadId,
+                            code,
+                            data.ExceptionRecord.ExceptionAddress as u64,
+                        ) {
+                            Ok(value) => intercepted = value,
+                            Err(error) => {
+                                instrumentation_error = Some(error);
+                                disposition = DBG_EXCEPTION_NOT_HANDLED;
+                            }
+                        }
                     }
-                    json!({"kind":"exception","status":format!("0x{:08X}",code as u32),"first_chance":data.dwFirstChance,
+                    if let Some(record) = intercepted {
+                        record
+                    } else {
+                        if code == STATUS_BREAKPOINT
+                            && !seen_breakpoint
+                            && instrumentation_error.is_none()
+                        {
+                            seen_breakpoint = true;
+                        } else {
+                            disposition = DBG_EXCEPTION_NOT_HANDLED;
+                        }
+                        json!({"kind":"exception","status":format!("0x{:08X}",code as u32),"first_chance":data.dwFirstChance,
                     "address":format!("0x{:X}",data.ExceptionRecord.ExceptionAddress as usize),
                     "parameters":data.ExceptionRecord.ExceptionInformation[..(data.ExceptionRecord.NumberParameters as usize).min(15)]})
+                    }
+                }
+                CREATE_THREAD_DEBUG_EVENT => {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        if let Err(error) = calls.thread_created(event.dwThreadId) {
+                            instrumentation_error = Some(error);
+                        }
+                    }
+                    json!({"kind":"create-thread"})
+                }
+                EXIT_THREAD_DEBUG_EVENT => {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(calls) = &mut calls {
+                        if let Err(error) = calls.thread_exited(event.dwThreadId) {
+                            instrumentation_error = Some(error);
+                        }
+                    }
+                    json!({"kind":"exit-thread"})
                 }
                 EXIT_PROCESS_DEBUG_EVENT => {
                     let code = event.u.ExitProcess.dwExitCode;
@@ -138,9 +211,39 @@ pub(super) fn wait(plan: &Plan, process: HANDLE, deadline: Instant) -> io::Resul
         };
         // Release every debug stop before file I/O can fail. Process/thread debug
         // handles are managed by Windows after exit events; hFile is ours to close.
+        #[cfg(target_arch = "x86_64")]
+        if instrumentation_error.is_some() {
+            if let Some(calls) = &mut calls {
+                let address = if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+                    Some(unsafe { event.u.Exception.ExceptionRecord.ExceptionAddress } as u64)
+                } else {
+                    None
+                };
+                if let Err(error) = calls.abort(event.dwThreadId, address) {
+                    instrumentation_error = Some(step(
+                        "native-call-abort",
+                        format!(
+                            "{}; rollback: {error}",
+                            instrumentation_error.as_ref().unwrap()
+                        ),
+                    ));
+                }
+            }
+        }
         check("ContinueDebugEvent", unsafe {
             ContinueDebugEvent(event.dwProcessId, event.dwThreadId, disposition)
         })?;
+        if let Some(error) = instrumentation_error {
+            let record =
+                json!({"kind":"native-call-instrumentation-error","error":error.to_string()});
+            serde_json::to_writer(&mut log, &record).map_err(io::Error::other)?;
+            log.write_all(b"\n")?;
+            log.sync_all()?;
+            return Err(error);
+        }
+        if detail["kind"] == "native-call-single-step" {
+            continue;
+        }
         if total_bytes < 4 * 1024 * 1024 {
             let record = json!({"since_start_ms":started.elapsed().as_millis(),"pid":event.dwProcessId,"tid":event.dwThreadId,"event":detail});
             let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;

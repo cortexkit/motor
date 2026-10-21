@@ -118,7 +118,7 @@ qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
-This stops MotorRunner and runs thirteen probe/Cargo/rustc token comparisons without
+This stops MotorRunner and runs sixteen probe/Cargo/rustc token comparisons without
 VM qualification. It records requested token flags separately from actual
 `IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
 The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
@@ -139,8 +139,19 @@ the wrapper while it is restoring these settings. The release includes its own
 native debug-event collector, so no gflags, WinDbg or new host installation is
 required. Protected `*.loader.jsonl` evidence contains Windows DLL-load events,
 loader debug strings and exceptions. Process/thread security-descriptor readbacks
-and actual Cargo/Rustup-home values accompany each diagnostic launch. The last
-two cells isolate runner-before-Cargo and repeated-Cargo ordering on one token.
+and actual Cargo/Rustup-home values accompany each diagnostic launch. Cells 12–13
+isolate runner-before-Cargo and repeated-Cargo ordering on one token.
+Cell 14 compares the traverse-only root cwd with the already-authorized staging
+temp cwd on the same token/desktop, then calls both RNG probes on that session.
+Cells 15–16 independently call dynamically resolved `ProcessPrng` (BOOL) and
+`BCryptGenRandom` (NTSTATUS, system-preferred RNG) in a restricted probe with safe
+cwd; random bytes are never logged. These cells additionally trace selected x64
+ntdll object API entries/returns with decoded object names when available, target
+metadata, requested access and NTSTATUS. Breakpoint bytes are patched only in the
+disposable debuggee's private memory; one-instruction stepping briefly changes its
+thread context and pauses other debuggee threads. Neither affects host DLL files
+or production launches. An interrupted step/unwound call aborts collection with
+an explicit instrumentation error instead of assigning a later return to it.
 Production launches do not enable loader snaps or debugger creation flags.
 
 Peer qualification starts the victim alone and records its VM-matched Hyper-V

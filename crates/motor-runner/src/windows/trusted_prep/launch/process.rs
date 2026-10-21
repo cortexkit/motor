@@ -176,6 +176,11 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
     );
     let mut command = wide(&arguments.join(" "));
     let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    let working_directory = if plan.diagnostic_safe_cwd {
+        plan.cwd.join("fetch-temp")
+    } else {
+        plan.cwd.clone()
+    };
     let flags = CREATION_FLAGS
         | if plan.diagnostic_loader_trace {
             DEBUG_ONLY_THIS_PROCESS
@@ -192,7 +197,7 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
             1,
             flags,
             session.environment.as_ptr().cast(),
-            wide(&plan.cwd.to_string_lossy()).as_ptr(),
+            wide(&working_directory.to_string_lossy()).as_ptr(),
             &startup.StartupInfo,
             &mut info,
         )
@@ -232,7 +237,7 @@ pub(super) fn run(plan: &Plan, session: &Session, released: &mut bool) -> io::Re
         super::save_process_report(
             plan,
             &serde_json::json!({"pid":info.dwProcessId,"tid":info.dwThreadId,
-            "creation_flags":format!("0x{flags:08X}"),"process_security":inspect(tree.process.0),"thread_security":inspect(thread.0),
+            "creation_flags":format!("0x{flags:08X}"),"working_directory":working_directory,"process_security":inspect(tree.process.0),"thread_security":inspect(thread.0),
             "loader_trace":trace::path(plan),"native_debugger":"DEBUG_ONLY_THIS_PROCESS; Windows loader snaps from temporary IFEO flags"}),
         )?;
     }

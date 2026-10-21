@@ -211,6 +211,74 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("loader-snaps-restores-after-failed-native-action", fixtures)
         self.assertCodeIn("'loader-snaps.ps1'", (HERE / "install.ps1").read_text())
 
+    def test_safe_cwd_is_an_exact_same_token_comparison_not_a_new_grant(self):
+        self.assertCodeIn("diagnostic_safe_cwd: policy.rng_mode().is_some()", self.launch)
+        self.assertCodeIn("plan.cwd.join(\"fetch-temp\")", self.process)
+        self.assertCodeIn("let working_directory = if plan.diagnostic_safe_cwd", self.process)
+        self.assertCodeIn("safe.diagnostic_safe_cwd = true", self.launch)
+        self.assertCodeIn("process::run(&safe, &context", self.launch)
+        self.assertCodeIn("diagnostic_rng_call(&plan, &context", self.launch)
+        self.assertCodeIn("process::run(&rng, context, released)", self.launch)
+        self.assertCodeIn('"same_token_as_safe_cwd_cargo":true', self.launch)
+        self.assertCodeIn("DefaultDaclSafeCwdPair", self.prep)
+
+    def test_direct_rng_probes_are_dynamic_and_keep_return_types_distinct(self):
+        rng = (WINDOWS / "trusted_prep/launch/rng.rs").read_text()
+        for value in ("ProcessPrng", "BCryptGenRandom", "LoadLibraryExW", "LOAD_LIBRARY_SEARCH_SYSTEM32", "GetProcAddress", "FreeLibrary", "BCRYPT_USE_SYSTEM_PREFERRED_RNG"):
+            self.assertCodeIn(value, rng)
+        self.assertCodeIn('"return_type"] = json!("BOOL")', rng)
+        self.assertCodeIn('"return_type"] = json!("NTSTATUS")', rng)
+        self.assertCodeIn('"random_bytes_logged":false', rng)
+        self.assertCodeIn("write_volatile(byte, 0)", rng)
+        self.assertCodeIn("call(null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 0x00000002)", rng)
+        probe = self.prep.split("pub(crate) fn probe(", 1)[1].split("pub(super) fn matrix_entry", 1)[0]
+        self.assertLess(probe.index("return launch::rng_probe"), probe.index("let profile"))
+        self.assertCodeIn("DefaultDaclProcessPrng", self.prep)
+        self.assertCodeIn("DefaultDaclBCryptRng", self.prep)
+
+    def test_native_access_trace_reads_targets_rights_and_actual_return_status(self):
+        native = (WINDOWS / "trusted_prep/launch/process/trace/native_calls.rs").read_text()
+        trace = (WINDOWS / "trusted_prep/launch/process/trace.rs").read_text()
+        for value in ("NtCreateFile", "NtOpenFile", "NtOpenSection", "NtOpenKey", "NtOpenProcess", "NtOpenThread", "NtDeviceIoControlFile", "NtConnectPort"):
+            self.assertCodeIn(value, native)
+        for value in ("GetThreadContext", "SetThreadContext", "ReadProcessMemory", "WriteProcessMemory", "VirtualProtectEx", "FlushInstructionCache", "DuplicateHandle", "NtQueryObject"):
+            self.assertCodeIn(value, native)
+        self.assertCodeIn("native_call_trace::ntstatus(context.0.Rax)", native)
+        self.assertCodeIn("native_call_trace::matches_return", native)
+        self.assertCodeIn('"desired_access":access_text(call.access)', native)
+        self.assertCodeIn("Some(context.Rdx as u32)", native)
+        self.assertCodeIn('"pending_completion_not_observed":code==0x103', native)
+        self.assertCodeIn("self.target(&api, &context.0)", native)
+        self.assertCodeIn("plan.diagnostic_native_calls.then", trace)
+        self.assertCodeIn("calls.exception(event.dwThreadId", trace)
+        self.assertCodeIn("calls.module_loaded", trace)
+        self.assertCodeIn("self.remote_exports(base)", native)
+        self.assertCodeIn("mapping\":\"remote PE export table", native)
+        self.assertCodeIn("self.pause_others(tid)", native)
+        self.assertCodeIn("context.0.Rip = address", native)
+        self.assertNotIn("context.0.Rax =", native)
+
+    def test_native_trace_aborts_cleanly_instead_of_misattributing_unwinds(self):
+        native = (WINDOWS / "trusted_prep/launch/process/trace/native_calls.rs").read_text()
+        trace = (WINDOWS / "trusted_prep/launch/process/trace.rs").read_text()
+        self.assertCodeIn("interrupted an instrumented call/step", native)
+        exception = native.split("pub(super) fn exception(",1)[1].split("pub(super) fn abort(",1)[0]
+        self.assertCodeIn("step.suspended.release()", exception)
+        self.assertCodeIn("self.steps.insert(tid, step)", exception)
+        self.assertCodeIn("native_call_trace::defer_breakpoint(owner, tid)", exception)
+        self.assertCodeIn("native-call-deferred-breakpoint", exception)
+        self.assertCodeIn("self.patch(address, self.points[&address].original)?", exception)
+        self.assertCodeIn("context.0.EFlags |= 0x100", exception)
+        self.assertCodeIn("GetExitCodeThread", native)
+        self.assertCodeIn("pub(super) fn abort", native)
+        self.assertCodeIn("self.patch(*address, point.original)", native)
+        self.assertCodeIn("self.calls.clear()", native)
+        self.assertLess(trace.index("calls.abort("), trace.index('check("ContinueDebugEvent"'))
+        point = native.split("fn point(", 1)[1].split("fn site(", 1)[0]
+        self.assertLess(point.index("self.points.insert"), point.index("self.patch(address, 0xcc)"))
+        self.assertCodeIn("let exports = self.remote_exports(base)?", native)
+        self.assertCodeIn("let mut candidates", native)
+
 
 if __name__ == "__main__":
     unittest.main()

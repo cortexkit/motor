@@ -24,6 +24,8 @@ mod host;
 mod host;
 #[cfg(windows)]
 mod hvsock;
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+mod native_call_trace;
 pub(crate) mod prep;
 #[cfg(any(windows, test))]
 mod process_status;

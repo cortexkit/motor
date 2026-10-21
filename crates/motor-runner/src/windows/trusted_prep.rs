@@ -395,6 +395,9 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     let credential = Path::new(&arguments[1]);
     let outside = Path::new(&arguments[2]);
     let output = Path::new(&arguments[3]);
+    if matches!(mode, "rng-process-prng" | "rng-bcrypt-gen-random") {
+        return launch::rng_probe(mode, output);
+    }
     let profile =
         std::env::var_os("USERPROFILE").ok_or_else(|| invalid("prep probe has no USERPROFILE"))?;
     let profile = PathBuf::from(profile).join(format!("motor-prep-probe-{}.txt", Uuid::now_v7()));
@@ -571,8 +574,9 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
             &["-Staging".into(), stage.to_string_lossy().into()],
         )?)?;
         use launch::DiagnosticPolicy::{
-            DefaultDacl, DefaultDaclCargoTwice, DefaultDaclProbeFirst, DefaultDaclRestrictedCode,
-            Everyone, ExplicitDesktopWrites, FetchDefaultDaclRestrictedCode, None as Production,
+            DefaultDacl, DefaultDaclBCryptRng, DefaultDaclCargoTwice, DefaultDaclProbeFirst,
+            DefaultDaclProcessPrng, DefaultDaclRestrictedCode, DefaultDaclSafeCwdPair, Everyone,
+            ExplicitDesktopWrites, FetchDefaultDaclRestrictedCode, None as Production,
             RestrictedCode,
         };
         for (index, name, program, restricted, policy) in [
@@ -649,6 +653,27 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 true,
                 DefaultDaclCargoTwice,
             ),
+            (
+                14,
+                "default-dacl-cargo-cwd-pair-same-token",
+                &cargo,
+                true,
+                DefaultDaclSafeCwdPair,
+            ),
+            (
+                15,
+                "default-dacl-probe-ProcessPrng-safe-cwd",
+                &probe,
+                true,
+                DefaultDaclProcessPrng,
+            ),
+            (
+                16,
+                "default-dacl-probe-BCryptGenRandom-safe-cwd",
+                &probe,
+                true,
+                DefaultDaclBCryptRng,
+            ),
         ] {
             let mut command = Command::new(program);
             command.env_clear().env("SYSTEMROOT", r"C:\Windows").env(
@@ -656,10 +681,14 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 stage.join(format!("fetch-temp/cargo-{index}")),
             );
             command.env("RUSTC", &rustc);
-            if index <= 2 {
+            if index <= 2 || index >= 15 {
                 command
                     .arg("prep-probe")
-                    .arg(if restricted {
+                    .arg(if index == 15 {
+                        "rng-process-prng"
+                    } else if index == 16 {
+                        "rng-bcrypt-gen-random"
+                    } else if restricted {
                         "restricted"
                     } else {
                         "base-control"
@@ -688,6 +717,12 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 report["launch"]["lp_desktop"]
             );
             let deferred = report.get("cleanup_deferred").is_some();
+            if index >= 15 {
+                eprintln!(
+                    "DIAG direct-rng cell={index} result={}",
+                    report["rng_probe"]
+                );
+            }
             let boundary = report["write_probe"]["proof"].as_object().map(|proof| {
                 report["write_probe"]["exit_code"] == 0
                     && proof

@@ -12,6 +12,7 @@ use std::{
 };
 
 mod process;
+mod rng;
 mod session;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,9 @@ pub(super) enum DiagnosticPolicy {
     FetchDefaultDaclRestrictedCode,
     DefaultDaclProbeFirst,
     DefaultDaclCargoTwice,
+    DefaultDaclSafeCwdPair,
+    DefaultDaclProcessPrng,
+    DefaultDaclBCryptRng,
 }
 impl DiagnosticPolicy {
     pub(super) fn changes_default_dacl(self) -> bool {
@@ -37,6 +41,9 @@ impl DiagnosticPolicy {
                 | Self::FetchDefaultDaclRestrictedCode
                 | Self::DefaultDaclProbeFirst
                 | Self::DefaultDaclCargoTwice
+                | Self::DefaultDaclSafeCwdPair
+                | Self::DefaultDaclProcessPrng
+                | Self::DefaultDaclBCryptRng
         )
     }
     pub(super) fn adds_restricted_code(self) -> bool {
@@ -49,6 +56,13 @@ impl DiagnosticPolicy {
     }
     fn checks_writes(self) -> bool {
         self.changes_default_dacl() || self.adds_restricted_code()
+    }
+    fn rng_mode(self) -> Option<&'static str> {
+        match self {
+            Self::DefaultDaclProcessPrng => Some("rng-process-prng"),
+            Self::DefaultDaclBCryptRng => Some("rng-bcrypt-gen-random"),
+            _ => None,
+        }
     }
 }
 
@@ -68,6 +82,10 @@ struct Plan {
     diagnostic_policy: DiagnosticPolicy,
     #[serde(default)]
     diagnostic_loader_trace: bool,
+    #[serde(default)]
+    diagnostic_safe_cwd: bool,
+    #[serde(default)]
+    diagnostic_native_calls: bool,
 }
 
 fn step(name: &str, error: impl std::fmt::Display) -> io::Error {
@@ -166,6 +184,14 @@ fn run_plan(
         restricted,
         diagnostic_policy: policy,
         diagnostic_loader_trace: retain_failure,
+        diagnostic_safe_cwd: policy.rng_mode().is_some(),
+        diagnostic_native_calls: retain_failure
+            && matches!(
+                policy,
+                DiagnosticPolicy::DefaultDaclSafeCwdPair
+                    | DiagnosticPolicy::DefaultDaclProcessPrng
+                    | DiagnosticPolicy::DefaultDaclBCryptRng
+            ),
         report: root.join("evidence").join(format!("prep-launch-{id}.json")),
         stdout: cwd.join("fetch-temp").join(format!("{id}.stdout")),
         stderr: cwd.join("fetch-temp").join(format!("{id}.stderr")),
@@ -247,7 +273,32 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
     session::no_reparse(&plan.root, &plan.cwd)?;
     // Token controls cannot be used by production fetch. Only the fixed offline
     // diagnostic fixture may use the fetch variant; all other controls are --version.
-    if plan.diagnostic_policy != DiagnosticPolicy::None
+    let rng_mode = plan.diagnostic_policy.rng_mode();
+    if let Some(mode) = rng_mode {
+        if !plan.restricted
+            || Path::new(&plan.program) != plan.cwd.join("fetch-manifests/probe.exe")
+            || plan.args.len() != 5
+            || plan.args[0] != "prep-probe"
+            || plan.args[1] != mode
+            || Path::new(&plan.args[4]).parent() != Some(plan.cwd.join("fetch-temp").as_path())
+        {
+            return Err(step(
+                "rng-diagnostic-policy",
+                "only the fixed trusted RNG probe may use this variant",
+            ));
+        }
+        use sha2::{Digest, Sha256};
+        if Sha256::digest(fs::read(&plan.program)?)
+            != Sha256::digest(fs::read(std::env::current_exe()?)?)
+        {
+            return Err(step(
+                "rng-diagnostic-policy",
+                "probe does not match trusted runner",
+            ));
+        }
+    }
+    if rng_mode.is_none()
+        && plan.diagnostic_policy != DiagnosticPolicy::None
         && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
             || (if plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode {
                 plan.args.len() != 5
@@ -325,6 +376,11 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         report["exit_status"] = json!(process_status::describe(code));
         report["stdout"] = json!(bounded_text(&plan.stdout)?);
         report["stderr"] = json!(bounded_text(&plan.stderr)?);
+        if rng_mode.is_some() {
+            report["rng_probe"] = json!(fs::read(&plan.args[4])
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()));
+        }
         if plan.diagnostic_loader_trace {
             report["process_diagnostics"] = diagnostic_process_report(&plan);
         }
@@ -345,6 +401,40 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
                 }
                 Err(error) => json!({"error":error.to_string()}),
             };
+        }
+        if plan.diagnostic_policy == DiagnosticPolicy::DefaultDaclSafeCwdPair {
+            let mut safe = plan.clone();
+            safe.diagnostic_safe_cwd = true;
+            safe.stdout = plan.stdout.with_extension("safe-cwd.stdout");
+            safe.stderr = plan.stderr.with_extension("safe-cwd.stderr");
+            let mut released = true;
+            let outcome = process::run(&safe, &context, &mut released);
+            if !released {
+                std::mem::forget(context);
+                report["cleanup_deferred"] = json!("unreaped safe-cwd Cargo");
+                return Err(step("safe-cwd", "child not reaped"));
+            }
+            report["safe_cwd_cargo"] = match outcome {
+                Ok(exit) => {
+                    json!({"same_token_as_primary":true,"exit_code":exit,"exit_status":process_status::describe(exit),"process_diagnostics":diagnostic_process_report(&safe),"stdout":bounded_text(&safe.stdout)?,"stderr":bounded_text(&safe.stderr)?})
+                }
+                Err(error) => json!({"error":error.to_string()}),
+            };
+            let mut rng_calls = Vec::new();
+            for mode in ["rng-process-prng", "rng-bcrypt-gen-random"] {
+                let mut released = true;
+                let result = diagnostic_rng_call(&plan, &context, &mut released, mode);
+                if !released {
+                    std::mem::forget(context);
+                    report["cleanup_deferred"] = json!("unreaped same-token RNG probe");
+                    return Err(step("same-token-rng", "child not reaped"));
+                }
+                rng_calls.push(match result {
+                    Ok(value) => value,
+                    Err(error) => json!({"mode":mode,"error":error.to_string()}),
+                });
+            }
+            report["safe_cwd_rng_comparisons"] = json!(rng_calls);
         }
         if plan.diagnostic_policy.checks_writes() {
             // Reuse the exact created token, profile and desktop: relogging the
@@ -467,6 +557,8 @@ fn diagnostic_write_probe(
         stderr: plan.stderr.with_extension("write-probe.stderr"),
         diagnostic_policy: DiagnosticPolicy::None,
         diagnostic_loader_trace: plan.diagnostic_loader_trace,
+        diagnostic_safe_cwd: plan.diagnostic_safe_cwd,
+        diagnostic_native_calls: plan.diagnostic_native_calls,
     };
     let result = process::run(&probe, context, released);
     let code = result?;
@@ -498,5 +590,43 @@ fn save_process_report(plan: &Plan, value: &Value) -> io::Result<()> {
         &plan.stdout.with_extension("process.json"),
         &serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
         false,
+    )
+}
+pub(super) fn rng_probe(mode: &str, output: &Path) -> io::Result<()> {
+    rng::probe(mode, output)
+}
+
+fn diagnostic_rng_call(
+    plan: &Plan,
+    context: &session::Session,
+    released: &mut bool,
+    mode: &str,
+) -> io::Result<Value> {
+    use sha2::{Digest, Sha256};
+    let program = plan.cwd.join("fetch-manifests/probe.exe");
+    session::no_reparse(&plan.root, &program)?;
+    if Sha256::digest(fs::read(&program)?) != Sha256::digest(fs::read(std::env::current_exe()?)?) {
+        return Err(step("same-token-rng", "probe differs from trusted runner"));
+    }
+    let mut rng = plan.clone();
+    rng.program = program.to_string_lossy().into_owned();
+    rng.diagnostic_safe_cwd = true;
+    let output = plan.stdout.with_extension(format!("{mode}.json"));
+    rng.stdout = plan.stdout.with_extension(format!("{mode}.stdout"));
+    rng.stderr = plan.stderr.with_extension(format!("{mode}.stderr"));
+    rng.args = vec![
+        "prep-probe".into(),
+        mode.into(),
+        "unused".into(),
+        "unused".into(),
+        output.to_string_lossy().into_owned(),
+    ];
+    let code = process::run(&rng, context, released)?;
+    let proof = fs::read(&output)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    Ok(
+        json!({"same_token_as_safe_cwd_cargo":true,"mode":mode,"exit_status":process_status::describe(code),"rng_probe":proof,
+        "process_diagnostics":diagnostic_process_report(&rng),"stdout":bounded_text(&rng.stdout)?,"stderr":bounded_text(&rng.stderr)?}),
     )
 }
