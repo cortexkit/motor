@@ -132,6 +132,22 @@ Only one signed request is in flight. `usage_conflict`, `job_settled` and
 days an entry is archived under `journal_dir/outbox-expired` and the queue moves
 on. A 401 emits a key-retirement alert for an operator to check clock reversal.
 
+Billing and lease records are kept for 13 months (`BILLING_RETENTION_MS`, 395
+days) after the job finished, then deleted: the lease with its account
+identifier, billing state, no-start report, pending cancel, and every queued,
+set-aside (including its `outbox-expired` file) or rejected usage request for
+the job, plus expired replay nonces. A job is kept whatever its age while its
+lease is open, its usage report is computed but not yet queued, or a queued
+report is inside its 30-day retry window, and while its token has not
+expired. The tick runs a pass every ten minutes, deleting at most
+`RETENTION_BATCH` jobs per pass (the next pass follows at once while a backlog
+remains), through the same journal write as every other change.
+
+The broker's heartbeat reply may list closed accounts as `closed_subjects`.
+The host closes only tenants its binding map binds to a listed subject,
+refuses their new jobs, and removes the tenant through the helper once its
+last job has drained; see `docs/hosted-host.md`.
+
 The read-only `tenant_metrics` helper operation samples the VM's
 `memory.current` and its own nftables forward-rule byte counter at start, end and
 periodic heartbeats. VM-lifetime `memory.peak` cannot be scoped to one lease
