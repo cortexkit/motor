@@ -268,17 +268,33 @@ build server never silently loses PID isolation. On newer systemd even the Boat
 profile retains PrivatePIDs. The flag requires the Linux host backend; tenant
 mode additionally requires root-private local sockets rather than vsock.
 
-On systemd 255, jobs share the sandbox's PID namespace. The per-job PID
-visibility boundary is lost: jobs using the same `motor-job` UID can see and
-signal each other's processes. The daemon also inhabits that namespace, but
-**ProtectProc=invisible and its different UID remain in force**; shared namespace
-does not grant permission to signal the daemon or override that `/proc` filter.
-The Boat job unit sets `ProtectProc=invisible`, `User=motor-job`,
-`Group=motor-job`, `NoNewPrivileges=yes`, an empty `CapabilityBoundingSet`,
-`RestrictNamespaces=yes`, `ProtectKernelTunables=yes` and `MountAPIVFS=yes`.
-`ProtectProc` hides other users' process directories; the UID/capability rules
-deny signals to root and provider-user processes. These are not a replacement
-PID namespace against another process with the same UID.
+On systemd 255, the unit runs the installed, root-owned
+`/usr/local/bin/motor-runner job-pid-init <uid> <gid> <groups> -- <wrapper argv>`.
+The runner refuses startup if that installed executable is missing, unsafe or
+different from the running executable. The init starts as root with only
+`CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_SETPCAP` and `RestrictNamespaces=pid`,
+creates a PID namespace, then forks its PID 1. That child mounts a fresh
+`nosuid,nodev,noexec,hidepid=invisible` proc and moves systemd's protected proc
+submounts into it. It drops to the exact `motor-job` UID, GID and supplementary
+groups, empties all capability sets, joins a fresh session keyring as that user,
+and stacks a filter restoring `RestrictNamespaces=yes` equivalence. Only then
+does it exec the unchanged bash wrapper as PID 1; the command is PID 2.
+`NoNewPrivileges=yes` and all other filesystem/network restrictions apply
+throughout. Loader/allocator environment controls (`LD_*`, `GLIBC_TUNABLES`,
+`GCONV_PATH`, `LOCPATH`, `MALLOC_*`) are refused before starting such a unit.
+
+The root supervisor stays outside that PID namespace, in the same unit cgroup,
+and mirrors the wrapper's exit or terminating signal. It uses one extra task
+and some memory under the unchanged limits. The wrapper still reads the stdin
+FIFO gate and writes the exit file. A SIGKILLed command reports 137, while a
+SIGKILLed wrapper produces signal 9 for systemd's status fallback; OOM
+classification still reads the unit cgroup's `Result`. Bootstrap failures
+write their step and error to a root-only setup-error file. A complete report,
+no wrapper exit code and no job output prove refused-before-start. If status
+226 has neither a valid wrapper exit file nor complete setup evidence, the
+outcome is unknown, never an assumed retry-safe refusal or job exit 226. A
+wrapper-recorded exit 226 remains a normal exit. None of these changes apply to
+build-server, tenant, or systemd >=257 units.
 
 **What a Boat job sees in `/proc`.** The same as a build-server job: its own
 process directories (other accounts' are hidden), plus the non-process entries
@@ -298,11 +314,23 @@ The live job must record only its own UID/cgroup in `/proc`, only its own UID in
 `ps`, a `/proc` mount with `hidepid=invisible` and without `subset=pid`, a
 `btime` line in `/proc/stat` and a readable `/proc/meminfo`, a read-only
 `/proc/sys`, no provider credential names in `/proc/cmdline`, zero
-capabilities, and **EPERM**, not ESRCH, for `kill -0` on the known live runner
-PID.
+capabilities, and **ESRCH**, not EPERM, for `kill -0` on known outside PID
+numbers with no local alias. The host records each control's UID, cgroup,
+comm and stat starttime. A numeric alias passes only with the job's UID/cgroup
+and a different starttime from the host identity, and is recorded as an alias.
+In particular the sandbox's PID 1 becomes the job's own wrapper, not an
+outside process accessible through that numeric name.
+It must read `/proc/1/cgroup` equal to its own, see `bash` as PID 1 and itself
+as PID 2, and match an ordinary systemd `User=motor-job` reference unit's
+credentials, signal state and protected proc submounts. The probe records
+keyring ID/UID/GID, all five capability sets, no-new-privileges and attempted
+namespace syscalls. It also verifies normal exit 23, self-SIGKILL exit 137,
+PID 1 ignoring an in-namespace SIGKILL, and cgroup teardown of a setsid child
+under both stop and SIGKILL.
 The host records runner, endpoint, sshd and provider-process PIDs as visibility
-negative controls. **Exactly one job may be admitted per sandbox**: these
-controls do not restore a same-UID PID-namespace boundary. Do not mix tenants. Nested Firecracker using the existing
+negative controls. **Exactly one job may be admitted per sandbox** remains
+the provider policy, not a workaround for a missing PID boundary. Do not mix
+tenants. Nested Firecracker using the existing
 pinned tenant image is the follow-up for identical server isolation; the
 prerequisite evidence shows KVM API 12 and AMD nested=1/SVM, not a boot or speed
 qualification.
@@ -560,8 +588,8 @@ The only custom transport is TCP to an API-host-key-pinned SSH local forward.
 
 One original is created with noEnv, source is uploaded over pinned SSH and
 checksum-verified, and the recipe builds that source commit. Real jobs test exit
-23, an offline Rust build, identity, lo-only networking, private shm, the explicit
-shared PID profile and the three cgroup files. The probe audits account credentials
+23, an offline Rust build, identity, lo-only networking, private shm, the private
+PID layout and the three cgroup files. The probe audits account credentials
 before snapshot, saves a named snapshot, deletes the original, and only after
 completed deletion or the provider's stopped `waiting_for_uploads` stage creates
 the clone, also with noEnv. It measures create request → first real terminal
@@ -688,6 +716,10 @@ motor-boat-prepared-99da3e87bb31` run at source revision `5ffcb1a`, on `large`
 each of the `initial`, `snapshot_clone` and `resumed` phases plus four snapshot
 hygiene checks and `sshd.dropin_survives_resume`.
 
+This historical run predates the per-job PID bootstrap. Its shared-PID and
+EPERM observations below do not qualify the current private-PID profile;
+the operator must rebuild and rerun the expanded probe for that evidence.
+
 - **Real jobs, through the production client** over the API-pinned SSH forward:
   the exit job returned code 23 with its output, the offline Rust 1.99.0 build
   printed `boat-hello`, in every phase. Each job took 1.0–1.4 s end to end from
@@ -701,8 +733,8 @@ hygiene checks and `sshd.dropin_survives_resume`.
   environment or readable files.
 - **PID namespace: not private.** The job's `pid` namespace equals the host's
   (`pid:[4026531836]` in all phases). Boat's systemd 255 has no
-  `PrivatePIDs=yes`, so this profile substitutes the `/proc` and signal controls
-  above and admits exactly one job per sandbox (see the isolation profile).
+  `PrivatePIDs=yes`; that older profile substituted the `/proc` and signal
+  controls above. The current profile uses `job-pid-init` instead.
 - **cgroup limits** from the job's own `memory.max`, `cpu.max`, `pids.max`:
   `cpu.max` `800000 100000` (8 vCPUs) with `nproc` 8, `pids.max` 4096, and
   `memory.max` equal to the start wrapper's budget:

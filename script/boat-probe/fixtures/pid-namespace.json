@@ -1,0 +1,27 @@
+{
+  "pid_namespace": {
+    "init": {"cgroup": "0::/system.slice/motor-job-example.service\n", "comm": "bash\n", "status": "Name:\tbash\nPPid:\t0\n"},
+    "self_cgroup": "0::/system.slice/motor-job-example.service\n",
+    "pid": 2,
+    "ppid": 1,
+    "signals": [
+      {"pid": 1, "host": {"pid": 1, "uid": 0, "cgroup": "0::/init.scope\n", "comm": "systemd", "starttime": 10}, "allowed": true, "alias": true,
+       "target": {"pid": 1, "uid": 997, "cgroup": "0::/system.slice/motor-job-example.service\n", "comm": "bash", "starttime": 200}},
+      {"pid": 101, "host": {"pid": 101, "uid": 0, "cgroup": "0::/system.slice/motor-boat.service\n", "comm": "motor-runner", "starttime": 100}, "allowed": false, "errno": 3, "target_errno": 2, "alias": false},
+      {"pid": 102, "host": {"pid": 102, "uid": 0, "cgroup": "0::/system.slice/motor-boat-host.service\n", "comm": "motor-host", "starttime": 101}, "allowed": false, "errno": 3, "target_errno": 2, "alias": false}
+    ],
+    "security": {
+      "status": {"Uid": ["997", "997", "997", "997"], "Gid": ["996", "996", "996", "996"], "Groups": ["996"], "CapInh": ["0"], "CapPrm": ["0"], "CapEff": ["0"], "CapBnd": ["0"], "CapAmb": ["0"], "NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["2"]},
+      "fresh_child": {"SigBlk": ["0"], "SigIgn": ["0"]},
+      "proc_submounts": [["/proc/sys", true], ["/proc/sysrq-trigger", true]],
+      "keyring": {"id": 1234, "uid": 997, "gid": 996},
+      "namespace_attempts": {"pid": {"result": -1, "errno": 1}, "user": {"result": -1, "errno": 1}, "mount": {"result": -1, "errno": 1}, "net": {"result": -1, "errno": 1}, "ipc": {"result": -1, "errno": 1}, "uts": {"result": -1, "errno": 1}, "cgroup": {"result": -1, "errno": 1}, "setns_pid": {"result": -1, "errno": 1}, "setns_any": {"result": -1, "errno": 1}}
+    }
+  },
+  "reference": {
+    "status": {"Uid": ["997", "997", "997", "997"], "Gid": ["996", "996", "996", "996"], "Groups": ["996"], "Seccomp_filters": ["1"]},
+    "fresh_child": {"SigBlk": ["0"], "SigIgn": ["0"]},
+    "proc_submounts": [["/proc/sys", true], ["/proc/sysrq-trigger", true]],
+    "keyring": {"id": 5678, "uid": 997, "gid": 996}
+  }
+}

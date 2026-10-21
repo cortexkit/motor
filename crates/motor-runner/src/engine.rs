@@ -4468,16 +4468,39 @@ impl Runner {
                     ))
                 };
                 #[cfg(target_os = "linux")]
-                if durable {
+                let status = if durable && self.unproven_pid_bootstrap_status(&directory, &status) {
                     if let Some(detail) = self.pid_namespace_setup_failure(id, &directory, &status)
                     {
                         return self.refuse_unstarted_unit(id, detail);
                     }
-                }
+                    // Status 226 alone cannot prove whether job code ran. A
+                    // missing report must not turn into a retry-safe refusal
+                    // or masquerade as a trustworthy command exit code.
+                    Err(io::Error::other(
+                        "Boat PID namespace bootstrap status 226: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown",
+                    ))
+                } else {
+                    status
+                };
                 return self.finish(id, status);
             }
             std::thread::park_timeout(Duration::from_millis(25));
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn unproven_pid_bootstrap_status(
+        &self,
+        directory: &Path,
+        status: &io::Result<std::process::ExitStatus>,
+    ) -> bool {
+        self.core.config.boat_profile
+            && !self.core.config.private_pids
+            && status.as_ref().ok().and_then(|status| status.code())
+                == Some(crate::isolation::pid_init::SETUP_FAILED)
+            && fs::read_to_string(directory.join("exit"))
+                .ok()
+                .and_then(|text| text.trim().parse::<u8>().ok())
+                .is_none()
     }
     /// A Boat job's PID namespace init that fails exits 226 before the wrapper
     /// exists, so the gate byte is never read and the command never runs. It
@@ -4507,12 +4530,17 @@ impl Runner {
             .take(4096)
             .read_to_string(&mut text)
             .ok()?;
-        let line = text.lines().next()?;
-        if !line.starts_with(pid_init::SETUP_FAILURE_PREFIX) {
+        // A torn write, including a prefix without its step/error, is not
+        // authenticated evidence of a complete bootstrap failure report.
+        let line = text.split_once('\n')?.0;
+        let (step, error) = line
+            .strip_prefix(pid_init::SETUP_FAILURE_PREFIX)?
+            .split_once(": ")?;
+        if step.is_empty() || error.is_empty() {
             return None;
         }
-        // Output would mean something ran after all; then the ordinary path
-        // reports the unit's status.
+        // Output could mean job code ran. Without proof that nothing ran,
+        // leave execution unknown rather than mark the refusal retry-safe.
         let inner = self.core.inner.lock().unwrap();
         let job = inner.jobs.get(&id)?;
         (job.terminal.is_none() && job.chunks.is_empty()).then(|| line.to_owned())

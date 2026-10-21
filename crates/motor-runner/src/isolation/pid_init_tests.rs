@@ -94,6 +94,33 @@ fn exit_and_signal_statuses_forward_unchanged() {
 }
 
 #[test]
+fn supervisor_reproduces_real_exit_and_sigkill_wait_status() {
+    for status in [
+        0,
+        23 << 8,
+        125 << 8,
+        137 << 8,
+        226 << 8,
+        libc::SIGKILL,
+        libc::SIGTERM,
+    ] {
+        // SAFETY: the forked child only changes signal state and exits; it
+        // neither allocates nor touches the test harness after fork.
+        let observed = unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                forward(status);
+            }
+            let mut observed = 0;
+            assert_eq!(libc::waitpid(child, &mut observed, 0), child);
+            observed
+        };
+        assert_eq!(observed, status, "supervisor must preserve {status:#x}");
+    }
+}
+
+#[test]
 fn proc_submounts_are_the_direct_children_of_the_top_proc_mount() {
     // A job root's mounts: the old /proc, its protected submounts (one with a
     // nested mount of its own), the new proc at the staging directory, and a
@@ -132,6 +159,18 @@ fn a_runner_outside_the_installed_path_refuses_to_serve_boat_jobs() {
 }
 
 #[test]
+fn a_missing_installed_runner_refuses_to_serve_boat_jobs() {
+    let missing = cortexkit_test_support::scratch_root()
+        .join(format!("missing-runner-{}", uuid::Uuid::now_v7()));
+    let error = check_runner_path(&std::env::current_exe().unwrap(), &missing).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(
+        error.to_string().contains(missing.to_str().unwrap()),
+        "{error}"
+    );
+}
+
+#[test]
 fn loader_and_allocator_variables_are_refused() {
     assert!(refuse_loader_environment(["PATH", "HOME", "RUST_LOG", "CARGO_TERM_COLOR"]).is_ok());
     for name in [
@@ -161,6 +200,7 @@ fn evaluate(
     nr: u32,
     args: [u64; 2],
     seen: &mut BTreeSet<usize>,
+    branches: &mut BTreeSet<(usize, usize)>,
 ) -> u32 {
     let mut data = [0u8; 64];
     data[0..4].copy_from_slice(&nr.to_ne_bytes());
@@ -173,7 +213,7 @@ fn evaluate(
         seen.insert(pc);
         let insn = program[pc];
         let jump = |taken: bool| pc + 1 + usize::from(if taken { insn.jt } else { insn.jf });
-        pc = match insn.code {
+        let next = match insn.code {
             BPF_LD_W_ABS => {
                 let at = insn.k as usize;
                 a = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
@@ -188,6 +228,10 @@ fn evaluate(
             BPF_RET_K => return insn.k,
             code => panic!("unexpected opcode {code:#x} at {pc}"),
         };
+        if matches!(insn.code, BPF_JMP_JEQ_K | BPF_JMP_JSET_K) {
+            branches.insert((pc, next));
+        }
+        pc = next;
         assert!(pc < program.len(), "jump past the end of the program");
     }
 }
@@ -203,6 +247,7 @@ fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
     let x86 = AUDIT_ARCH_X86_64;
     let i386 = AUDIT_ARCH_I386;
     let mut seen = BTreeSet::new();
+    let mut branches = BTreeSet::new();
     for (name, arch, nr, args, refused) in [
         ("x86_64 unshare pid", x86, X86_64_UNSHARE, [pid, 0], true),
         (
@@ -256,7 +301,7 @@ fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
             false,
         ),
     ] {
-        let result = evaluate(&program, arch, nr, args, &mut seen);
+        let result = evaluate(&program, arch, nr, args, &mut seen, &mut branches);
         let expected = if refused { deny } else { SECCOMP_RET_ALLOW };
         assert_eq!(result, expected, "{name}");
     }
@@ -265,6 +310,18 @@ fn namespace_filter_refuses_exactly_new_pid_namespaces_on_every_path() {
         seen, every,
         "every instruction and jump target must be exercised"
     );
+    let every_branch: BTreeSet<_> = program
+        .iter()
+        .enumerate()
+        .filter(|(_, insn)| matches!(insn.code, BPF_JMP_JEQ_K | BPF_JMP_JSET_K))
+        .flat_map(|(pc, insn)| {
+            [
+                (pc, pc + 1 + usize::from(insn.jt)),
+                (pc, pc + 1 + usize::from(insn.jf)),
+            ]
+        })
+        .collect();
+    assert_eq!(branches, every_branch, "both arms of every jump must run");
     // The production program differs only in the errno it returns.
     let production = namespace_filter(libc::EPERM as u16);
     assert_eq!(production.len(), program.len());
@@ -314,35 +371,48 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
             let ours = libc::c_int::from(TEST_ERRNO);
             let refused_here =
                 |result: libc::c_long| result == -1 && *libc::__errno_location() == ours;
+            // errno belongs to the most recent syscall, not to its saved
+            // return value. Capture both before evaluating the next call.
+            let observed = |result: libc::c_long| (result, *libc::__errno_location());
             let pid = libc::c_long::from(CLONE_NEWPID);
-            let checks: [(libc::c_long, bool); 7] = [
-                (libc::syscall(libc::SYS_unshare, pid), true),
-                (libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUTS), false),
+            let checks = [
+                (observed(libc::syscall(libc::SYS_unshare, pid)), true),
                 (
-                    libc::syscall(
+                    observed(libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUTS)),
+                    false,
+                ),
+                (
+                    observed(libc::syscall(
                         libc::SYS_clone,
                         pid | libc::CLONE_THREAD as libc::c_long,
                         0,
                         0,
                         0,
                         0,
-                    ),
+                    )),
                     true,
                 ),
                 // CLONE_THREAD without CLONE_SIGHAND is EINVAL, so nothing forks.
                 (
-                    libc::syscall(libc::SYS_clone, libc::CLONE_THREAD, 0, 0, 0, 0),
+                    observed(libc::syscall(
+                        libc::SYS_clone,
+                        libc::CLONE_THREAD,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
                     false,
                 ),
-                (libc::syscall(libc::SYS_setns, -1, pid), true),
-                (libc::syscall(libc::SYS_setns, -1, 0), true),
+                (observed(libc::syscall(libc::SYS_setns, -1, pid)), true),
+                (observed(libc::syscall(libc::SYS_setns, -1, 0)), true),
                 (
-                    libc::syscall(libc::SYS_setns, -1, libc::CLONE_NEWNET),
+                    observed(libc::syscall(libc::SYS_setns, -1, libc::CLONE_NEWNET)),
                     false,
                 ),
             ];
-            for (index, (result, refused)) in checks.into_iter().enumerate() {
-                if refused_here(result) != refused {
+            for (index, ((result, errno), refused)) in checks.into_iter().enumerate() {
+                if (result == -1 && errno == ours) != refused {
                     libc::_exit(index as libc::c_int + 1);
                 }
             }

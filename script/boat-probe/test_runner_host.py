@@ -134,7 +134,8 @@ class RunnerHostTests(unittest.TestCase):
 
     def fixture(self):
         return {"user": "motor-job", "uid": 997, "interfaces": ["lo"],
-                "namespaces": {"net": "net:[2]", "pid": "pid:[1]", "mnt": "mnt:[2]"},
+                "pid_namespace": json.loads(Path(__file__).with_name('fixtures').joinpath('pid-namespace.json').read_text())['pid_namespace'],
+                "namespaces": {"net": "net:[2]", "pid": "pid:[2]", "mnt": "mnt:[2]"},
                 "private_shm": True, "shm_writable": True, "nproc": "8",
                 "execution_capabilities": {'checks': {'a_tmpdir_hardlink_exec': True, 'b_bin_sh': True, 'c_bun_shebang': True}},
                 "limits": {"memory.max": "15569256448", "cpu.max": "800000 100000", "pids.max": "4096"},
@@ -146,14 +147,15 @@ class RunnerHostTests(unittest.TestCase):
                                 'locks': {'readable': True, 'has_line': True}, 'net_unix': {'readable': True, 'has_line': True},
                                 'sys_read_only': True, 'cmdline': {'readable': True, 'provider_names': False}},
                 "cargo_target": {'env': '/run/motor/target', 'same_directory': True},
-                "process_visibility": {'self_pid':10,'protected_pids':[1,2], 'proc':[{'pid':10,'uid':997,'same_cgroup':True}],
-                    'ps':{'exit_code':0,'rows':[{'pid':10,'uid':997,'comm':'python3'}]},
-                    'runner_signal_probe':{'pid':1,'allowed':False,'errno':1}},
+                "process_visibility": {'self_pid':2,'protected_pids':[1,101,102], 'proc':[{'pid':1,'uid':997,'same_cgroup':True}, {'pid':2,'uid':997,'same_cgroup':True}],
+                    'ps':{'exit_code':0,'rows':[{'pid':1,'uid':997,'comm':'bash'}, {'pid':2,'uid':997,'comm':'python3'}]},
+                    'runner_signal_probe':json.loads(Path(__file__).with_name('fixtures').joinpath('pid-namespace.json').read_text())['pid_namespace']['signals'][1]},
                 "provider_access": {'inherited_names': [], 'files': {'/home/user/.config/ascii/boat/config.json': {'readable':False}},
                                     'processes': {'1': {'readable':False}}}}
 
     def baseline(self):
-        return {"namespaces": {"net": "net:[1]", "pid": "pid:[1]"},
+        return {"namespaces": {"net": "net:[1]", "pid": "pid:[1]"}, "systemd_version":255,
+                "job_security_reference": json.loads(Path(__file__).with_name('fixtures').joinpath('pid-namespace.json').read_text())['reference'],
                 "memory_budget": {"mem_available_bytes": 16*(1<<30), "runner_idle_bytes": 1<<30,
                                   "margin_bytes": 512*(1<<20), "memory_max_bytes": 15569256448}}
 
@@ -276,14 +278,14 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.provider_access_denied(access))
         self.assertFalse(host.provider_access_denied({'files':{}, 'processes':{}, 'inherited_names':[]}))
 
-    def test_process_visibility_requires_own_cgroup_and_signal_permission_denial(self):
+    def test_process_visibility_requires_own_cgroup_and_outside_pid_esrch(self):
         job = self.fixture()
         self.assertTrue(all(host.process_visibility_checks(job).values()))
         job['process_visibility']['proc'].append({'pid':2,'uid':0,'same_cgroup':False})
         self.assertFalse(host.process_visibility_checks(job)['proc_only_job_processes'])
         job['process_visibility']['ps']['rows'].append({'pid':2,'uid':0,'comm':'motor-runner'})
         self.assertFalse(host.process_visibility_checks(job)['ps_only_job_processes'])
-        job['process_visibility']['runner_signal_probe']['errno'] = 3
+        job['process_visibility']['runner_signal_probe']['errno'] = errno.EPERM
         self.assertFalse(host.process_visibility_checks(job)['cannot_signal_runner'])
 
     def test_job_reads_global_proc_entries_but_kernel_tunables_stay_read_only(self):

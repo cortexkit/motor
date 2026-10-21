@@ -823,8 +823,9 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
 /// A Boat job's PID namespace init that fails exits 226 before the wrapper
 /// reads the gate, so the command never ran. That must reach the caller as a
 /// retry-safe refusal carrying the init's reason, never as "exit 226". The
-/// same status with an exit file, or without the init's line, is the job's
-/// own exit and stays one.
+/// same status with an exit file is the job's own exit. Without a complete
+/// init report or exit file, execution is unknown and must not be retried as
+/// though the command never ran.
 #[cfg(target_os = "linux")]
 #[test]
 fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit() {
@@ -833,11 +834,15 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
         "{}mount the namespace's proc: Operation not permitted (os error 1)",
         pid_init::SETUP_FAILURE_PREFIX
     );
+    let complete = format!("{line}\n");
+    let prefix_only = format!("{}\n", pid_init::SETUP_FAILURE_PREFIX);
     for (case, exit_file, setup_error, boat_init) in [
-        ("setup failure", "", line.as_str(), true),
-        ("job exited 226", "226\n", line.as_str(), true),
+        ("setup failure", "", complete.as_str(), true),
+        ("job exited 226", "226\n", complete.as_str(), true),
         ("no init line", "", "", true),
-        ("unit without the init", "", line.as_str(), false),
+        ("torn init line", "", line.as_str(), true),
+        ("prefix without step", "", prefix_only.as_str(), true),
+        ("unit without the init", "", complete.as_str(), false),
     ] {
         let f = Fixture::new();
         let mut config = f.config();
@@ -907,8 +912,20 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
             assert_eq!(terminal.refusal_detail(), Some(line.as_str()), "{case}");
             assert_eq!(job.state, JobState::Tombstone, "{case}");
             assert!(job.started.is_none() && job.started_ms.is_none(), "{case}");
-        } else {
+        } else if case == "job exited 226" || !boat_init {
             assert_eq!(terminal.outcome, Outcome::Exit { code: 226 }, "{case}");
+        } else {
+            assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
+            assert!(
+                job.started.is_some(),
+                "no proof that job never started: {case}"
+            );
+            let output = job_output(&runner, request.job_id);
+            assert!(output.contains("bootstrap status 226"), "{case}: {output}");
+            assert!(
+                output.contains("setup evidence unavailable"),
+                "{case}: {output}"
+            );
         }
     }
 }

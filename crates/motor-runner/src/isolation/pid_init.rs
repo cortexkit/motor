@@ -151,19 +151,20 @@ pub(crate) fn refuse_loader_environment<'a>(
 /// path. Otherwise a unit could run a different build than the daemon, or one
 /// a non-root user could replace.
 pub(crate) fn check_installed_runner() -> io::Result<()> {
+    check_runner_path(&std::env::current_exe()?, Path::new(INSTALLED_RUNNER))
+}
+
+fn check_runner_path(running: &Path, installed: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let installed = Path::new(INSTALLED_RUNNER);
-    let running = std::env::current_exe()?;
-    if running.canonicalize()? != installed {
-        return Err(io::Error::other(format!(
-            "--boat-profile on systemd before 257 runs each job's PID namespace init from {INSTALLED_RUNNER}; this runner is {}. Run the installed runner",
-            running.display()
-        )));
-    }
     for path in installed.ancestors() {
-        let metadata = fs::symlink_metadata(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("job PID namespace init {}: {error}", path.display()),
+            )
+        })?;
         let kind_ok = if path == installed {
-            metadata.is_file()
+            metadata.is_file() && metadata.mode() & 0o111 != 0
         } else {
             metadata.is_dir()
         };
@@ -175,6 +176,12 @@ pub(crate) fn check_installed_runner() -> io::Result<()> {
                 metadata.mode() & 0o7777
             )));
         }
+    }
+    if running.canonicalize()? != installed {
+        return Err(io::Error::other(format!(
+            "--boat-profile on systemd before 257 runs each job's PID namespace init from {}; this runner is {}. Run the installed runner",
+            installed.display(), running.display()
+        )));
     }
     Ok(())
 }
@@ -246,10 +253,22 @@ impl Report {
 
     fn fail(&self, step: &str, error: impl fmt::Display) -> ! {
         let line = format!("{SETUP_FAILURE_PREFIX}{step}: {error}\n");
-        // SAFETY: the buffer is valid for its length; a short or failed write
-        // leaves only the exit status, which still marks a setup failure.
+        // SAFETY: the buffer is valid for its length. Retry interrupted and
+        // partial writes so the engine can recognize the setup failure line.
         unsafe {
-            libc::write(self.0, line.as_ptr().cast(), line.len());
+            let mut written = 0;
+            while written < line.len() {
+                let n = libc::write(
+                    self.0,
+                    line.as_ptr().add(written).cast(),
+                    line.len() - written,
+                );
+                if n > 0 {
+                    written += n as usize;
+                } else if n == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
             libc::_exit(SETUP_FAILED)
         }
     }
@@ -695,6 +714,11 @@ enum Step {
 /// answers `clone3` with ENOSYS and every other namespace type with EPERM.
 /// The engine passes EPERM, the errno systemd's filter uses; tests pass a
 /// distinct value to see which refusals come from this filter.
+///
+/// seccompiler's high-level filter targets one architecture and kills on an
+/// architecture mismatch; it has no i386 target. This small multi-ABI filter
+/// instead preserves systemd's architecture policy while handling i386 and x32
+/// namespace calls explicitly. Tests exercise both arms of every BPF jump.
 fn namespace_filter(errno: u16) -> Vec<SockFilter> {
     use Step::*;
     let steps = [
