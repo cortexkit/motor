@@ -1,6 +1,7 @@
 //! Mac-side executor. Submitted commands only ever reach the remote runner;
 //! transport loss after submission is recovered by attach, never by rerunning.
 mod agent;
+mod agent_route;
 #[cfg(feature = "bench-client")]
 pub mod benchmark;
 pub mod cli;

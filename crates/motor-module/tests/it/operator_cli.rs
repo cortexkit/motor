@@ -1693,3 +1693,166 @@ async fn hosted_runs_are_direct_only_and_need_a_configured_broker() {
             motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id)));
     }
 }
+
+/// Every record an agent `exec.attach` from `from_seq` receives, through its terminal.
+async fn attach_records(daemon: &Daemon, id: Uuid, from_seq: u64) -> Vec<StreamRecord> {
+    let mut frames = daemon
+        .send(
+            AFT_CHANNEL,
+            json!({"op":"exec.attach", "params":AttachRequest::new(id, from_seq)}),
+        )
+        .await;
+    let mut records = Vec::new();
+    loop {
+        let frame = next(&mut frames).await;
+        assert_eq!(frame.header.ty, FrameType::StreamData, "{}", body(&frame));
+        let record: StreamRecord = serde_json::from_slice(&frame.body).unwrap();
+        let terminal = matches!(record, StreamRecord::Terminal(_));
+        records.push(record);
+        if terminal {
+            return records;
+        }
+    }
+}
+
+fn return_results(records: &[StreamRecord]) -> Vec<&cortexkit_exec_remote_types::ReturnResult> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            StreamRecord::ReturnResult(result) => Some(result),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn agent_return_paths_send_return_result_immediately_before_the_terminal() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    let request = f
+        .request("mkdir -p out; printf x > out/file; exit 23")
+        .with_return_paths(vec!["out/file".into()]);
+    let records = run_records(&daemon, AFT_CHANNEL, request).await;
+    let terminal = last_terminal(&records);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    // A build-server job reports no hosted placement.
+    assert_eq!(terminal.hosted(), None);
+    let results = return_results(&records);
+    assert_eq!(results.len(), 1, "{records:?}");
+    assert!(
+        matches!(&records[records.len() - 2], StreamRecord::ReturnResult(_)),
+        "{records:?}"
+    );
+    let result = results[0];
+    assert_eq!(result.job_id(), terminal.job_id);
+    let files = result.returned_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path(), "out/file");
+    assert_eq!(files[0].data(), b"x");
+    // The runner was asked for the absolute path under the request's cwd.
+    let run = f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|frame| match frame {
+            motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id => Some(run.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        run.return_paths,
+        [f.key.join("out/file").to_str().unwrap().to_owned()]
+    );
+    // A reattach from the start replays it before the terminal; one past its
+    // sequence number does not repeat it.
+    let replay = attach_records(&daemon, terminal.job_id, 0).await;
+    assert_eq!(return_results(&replay), results, "{replay:?}");
+    let after = attach_records(&daemon, terminal.job_id, result.seq() + 1).await;
+    assert!(return_results(&after).is_empty(), "{after:?}");
+    assert_eq!(last_terminal(&after).outcome, Outcome::Exit { code: 23 });
+}
+
+#[tokio::test]
+async fn agent_without_return_paths_never_receives_a_return_result() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    // A cap alone asks for nothing; only non-empty return_paths opts in.
+    let request = f
+        .request("mkdir -p out; printf x > out/file; exit 0")
+        .with_return_max_bytes(1);
+    let records = run_records(&daemon, AFT_CHANNEL, request).await;
+    let terminal = last_terminal(&records);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+    assert!(return_results(&records).is_empty(), "{records:?}");
+    assert!(
+        records
+            .iter()
+            .all(|record| !matches!(record, StreamRecord::Unknown { .. })),
+        "{records:?}"
+    );
+    let replay = attach_records(&daemon, terminal.job_id, 0).await;
+    assert!(return_results(&replay).is_empty(), "{replay:?}");
+    assert!(f.proxy.frames.lock().unwrap().iter().any(|frame| matches!(frame,
+        motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id && run.return_paths.is_empty())));
+}
+
+#[tokio::test]
+async fn agent_over_cap_return_max_bytes_is_invalid_params_and_never_runs() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    let request = f
+        .request("true")
+        .with_return_paths(vec!["out".into()])
+        .with_return_max_bytes(cortexkit_exec_remote_types::RETURN_MAX_BYTES_CAP + 1);
+    let refused = error(
+        &daemon
+            .request(AFT_CHANNEL, "exec.run", json!(request))
+            .await,
+    );
+    assert_eq!(refused["code"], "invalid_params", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("return_max_bytes"),
+        "{refused}"
+    );
+    assert!(
+        f.proxy.frames.lock().unwrap().is_empty(),
+        "a refused request must not reach the runner"
+    );
+    // An absolute path is not relative to cwd: refused before start.
+    let records = run_records(
+        &daemon,
+        AFT_CHANNEL,
+        f.request("true")
+            .with_return_paths(vec![f.key.join("out").to_str().unwrap().into()]),
+    )
+    .await;
+    let terminal = last_terminal(&records);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some("return_paths_exceeded")
+    );
+    assert!(f.proxy.frames.lock().unwrap().is_empty());
+}

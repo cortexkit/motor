@@ -24,7 +24,9 @@ components. They do not ship in this repository.
 - Environment: the daemon supplies `SUBC_MODULE_ID=ck-motor` and the launch
   nonce. `PATH` must reach `ssh` and `git`. `HOME` and `XDG_DATA_HOME` locate the
   development storage fallback. No runner secret is passed in the environment.
-- The manifest's `capabilities.provides` is exactly `["exec-remote/v1"]`.
+- The manifest's `capabilities.provides` is `["exec-remote/v1", "flow-scopes/v1",
+  "exec-remote-return/v1"]`, plus `exec-remote-windows/v1` when a Windows runner
+  is configured and `exec-remote-net/v1` when `network_routing` is on.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
 
@@ -275,6 +277,49 @@ On shutdown `ck-motor` exports its storage checkpoint, stops its SSH control
 master before stopping the agent, and removes its runtime directory. A force-kill
 skips that cleanup: stop any
 orphaned SSH master before reusing a crashed installation's storage root.
+
+## Agent runs: hosted usage and returned files
+
+These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
+`cortexkit-exec-remote-types` 0.2.9. Source: `crates/motor-module/src/agent_route.rs`.
+
+**Hosted usage.** A job whose Run frame went to a hosted runner (first-party or
+Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
+host (for example `ovh-1` or `boat:<sandbox_id>`), and `billed_vcpu_ms` once
+billing has settled. Build-server jobs omit `hosted`, and so do spills that went
+back to the build server. ck-motor adds no wait for billing. The job stream
+already holds a first-party hosted terminal up to five seconds for the host's
+settlement record, and settles a Boat job with the broker before sending its
+terminal record. If billing is still pending after that, `billed_vcpu_ms` is
+absent. A
+later `exec.attach` re-sends the terminal record and `exec.status` returns it,
+both with the figure as it stands at that moment.
+
+**Returned files.** `return_paths` names files relative to the request's `cwd`;
+`return_max_bytes` caps their total size, 262,144 bytes when absent. A larger
+cap is refused as `invalid_params` before any job exists, whether or not paths
+accompany it. Each path is joined to `cwd`, then the same lexical bounds as
+direct runs apply before start: an absolute path, `..`, more than 64 paths or a
+path outside the workspace is refused as `request_rejected` with
+`return_paths_exceeded`. Hosted runners collect files in the same way as the
+build server. The runner's result reaches the caller as a `return_result` record
+immediately before the terminal record, with cwd-relative paths. Collection
+failures (`over_cap`, `missing`, `escape`, `not_regular`, `frame_limit`) do not
+change the job's outcome. A reattach from before the record's `seq` replays it.
+
+Only a request with non-empty `return_paths` receives the record. This route
+has no per-caller capability handshake: `started` goes to every caller, and
+older callers skip it as an unknown record. ck-motor instead lists `exec-remote-return/v1` among
+its capabilities, and a caller sends paths only to a module that lists it.
+Callers built before 0.2.9 cannot send the field, so they never receive the
+record.
+
+Tests: `agent_route::tests` in `crates/motor-module/src/agent_route_tests.rs`
+(hosted usage, settled and pending billing, a hosted return result), and in
+`crates/motor-module/tests/it/operator_cli.rs`
+`agent_return_paths_send_return_result_immediately_before_the_terminal`,
+`agent_without_return_paths_never_receives_a_return_result`,
+`agent_over_cap_return_max_bytes_is_invalid_params_and_never_runs`.
 
 ## Direct runs
 
