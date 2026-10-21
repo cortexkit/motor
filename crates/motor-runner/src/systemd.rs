@@ -92,7 +92,7 @@ pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
     }
     let enabled = private_pids_capability(&String::from_utf8_lossy(&output.stdout), boat_profile)?;
     if !enabled {
-        tracing::warn!("Boat single-tenant profile: systemd lacks PrivatePIDs; jobs share the host PID namespace");
+        tracing::info!("Boat profile: systemd lacks PrivatePIDs; jobs use the runner's PID namespace bootstrap");
     }
     Ok(enabled)
 }

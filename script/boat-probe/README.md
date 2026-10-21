@@ -1,5 +1,39 @@
 # Boat spill-provider environment probe
 
+The runner-host lane also checks Boat's per-job PID bootstrap on systemd 255.
+`pid_namespace.py` collects evidence in the real job and in an independent
+`User=motor-job` reference unit. Check names include `boat_pid_profile`,
+`pid1_cgroup_readable`, `pid1_same_cgroup`, `pid1_is_wrapper`, `job_pid_is_small`,
+`outside_pids_esrch_or_proven_alias`, `job_credentials_match_systemd`,
+`all_job_capabilities_empty`, `job_no_new_privileges`, `job_namespace_filter`,
+`proc_protections_match_systemd`, `job_signal_state_matches_systemd` and
+`session_keyring_owned_by_job`. The existing proc/ps checks still require only
+job processes. Known runner, endpoint, sshd and provider PID numbers must yield
+ESRCH with no proc entry, not the old shared-PID-namespace EPERM result, unless
+the number aliases a proven job-local process. The host records UID, cgroup,
+comm and stat starttime; an alias must have the job's UID/cgroup and a different
+starttime from that host identity. Sandbox PID 1 is intentionally such an alias
+for the job's own bash wrapper. Aliases are explicitly recorded, not skipped.
+
+`job_clone3_pid_denied` requires clone3 with CLONE_NEWPID to return ENOSYS;
+`job_inherited_fds` records the actual initial job fd inventory and allows only
+0/1/2. For each setsid teardown job on old systemd, the root observer additionally
+checks `post_drop_pdeathsig`, `private_session_and_pgid`, `bootstrap_exec_fds`
+and `bootstrap_expected_submounts`. Those checks read the root-owned 0600
+pre-exec telemetry (not job-authored claims) and compare the actual wrapper and
+supervisor sessions in the host's view. Expected mounts come from the live
+independent reference unit, not the fixture's illustrative path list.
+
+Additional production-client jobs check `job_stdin_eof`, `sigkill_job_exit_137` and
+`pid1_ignores_job_sigkill`. A root observer stops or SIGKILLs a unit while its
+client is waiting and verifies `setsid_stop_reaped`, `setsid_kill_reaped` and
+the corresponding `setsid_stop_exit_143` / `setsid_kill_exit_137`. The escapee
+ignores TERM and has its own session; the observer must find it before acting,
+check `KillMode=control-group`, and see no survivor after teardown. These are
+live operator checks, not claims made by fixture tests. Offline regression
+fixtures are in `fixtures/pid-namespace.json`; run
+`python3 -m unittest discover -s script/boat-probe -p 'test_*.py' -v`.
+
 Operator-only, disposable measurement harness. Python 3.10+ and its standard
 library are the only local requirements. Portable tests prove parsing and cleanup
 plumbing, **not** the behavior of a Boat sandbox or motor-runner.

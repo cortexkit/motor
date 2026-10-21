@@ -13,6 +13,20 @@ const MAX_DRAIN_TIMEOUT_S: u64 = 86_400;
 mod native_service;
 
 fn main() -> io::Result<()> {
+    // A Boat job unit execs the runner as its PID namespace init. Dispatch it
+    // first: it must fork while the process is still single-threaded, before
+    // any runtime or logging starts, and its arguments carry the job command
+    // as raw bytes.
+    #[cfg(target_os = "linux")]
+    {
+        let mut raw = std::env::args_os().skip(1);
+        if raw
+            .next()
+            .is_some_and(|mode| mode == motor_runner::JOB_PID_INIT_MODE)
+        {
+            motor_runner::job_pid_init(raw.collect());
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "prep-probe") {

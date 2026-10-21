@@ -54,6 +54,10 @@ pub struct Config {
     pub(crate) private_pids: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_unset_environment: Vec<String>,
+    /// The job account's ids, set when Boat jobs run the runner's PID
+    /// namespace init because systemd lacks PrivatePIDs.
+    #[cfg(target_os = "linux")]
+    pub(crate) pid_init: Option<crate::isolation::pid_init::JobIdentity>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.
     pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
@@ -225,6 +229,8 @@ impl Config {
             private_pids: true,
             #[cfg(target_os = "linux")]
             boat_unset_environment: Vec::new(),
+            #[cfg(target_os = "linux")]
+            pid_init: None,
             tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
@@ -839,6 +845,13 @@ impl Runner {
                 config.boat_unset_environment = crate::systemd::provider_environment_names()?;
             }
             crate::isolation::validate_account()?;
+            if config.boat_profile && !config.private_pids {
+                // Job units exec the installed runner as their PID namespace
+                // init; tests run from the build tree and never reach a unit.
+                #[cfg(not(test))]
+                crate::isolation::pid_init::check_installed_runner()?;
+                config.pid_init = Some(crate::isolation::job_identity()?);
+            }
             #[cfg(test)]
             if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
                 crate::isolation::prepare_shared_read_access_from(
@@ -4447,45 +4460,218 @@ impl Runner {
                         continue;
                     }
                 }
-                let status = if durable {
+                let (status, exit_file) = if durable {
                     self.durable_exit_status(process, &directory.join("exit"))
                 } else {
-                    Err(io::Error::other(
-                        "legacy unit ended without retained exit status",
-                    ))
+                    (
+                        Err(io::Error::other(
+                            "legacy unit ended without retained exit status",
+                        )),
+                        Ok(None),
+                    )
                 };
+                #[cfg(target_os = "linux")]
+                let status = if durable && self.unproven_pid_bootstrap_status(&status, &exit_file) {
+                    if let Some(detail) = self.pid_namespace_setup_failure(
+                        id,
+                        &directory,
+                        &status,
+                        matches!(exit_file, Ok(None)),
+                    ) {
+                        return self.refuse_unstarted_unit(id, detail);
+                    }
+                    // Status 226 alone cannot prove whether job code ran. A
+                    // missing report must not turn into a retry-safe refusal
+                    // or masquerade as a trustworthy command exit code.
+                    Err(io::Error::other(format!(
+                        "Boat PID namespace bootstrap status {}: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown",
+                        status.as_ref().ok().and_then(|status| status.code()).unwrap()
+                    )))
+                } else {
+                    status
+                };
+                #[cfg(not(target_os = "linux"))]
+                let _ = exit_file;
                 return self.finish(id, status);
             }
             std::thread::park_timeout(Duration::from_millis(25));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn unproven_pid_bootstrap_status(
+        &self,
+        status: &io::Result<std::process::ExitStatus>,
+        exit_file: &io::Result<Option<u8>>,
+    ) -> bool {
+        self.core.config.boat_profile
+            && !self.core.config.private_pids
+            && matches!(
+                status.as_ref().ok().and_then(|status| status.code()),
+                Some(
+                    crate::isolation::pid_init::SETUP_FAILED
+                        | crate::isolation::pid_init::SUPERVISOR_FAILED
+                )
+            )
+            && !matches!(exit_file, Ok(Some(_)))
+    }
+    /// A Boat job's PID namespace init that fails exits 226 before the wrapper
+    /// exists, so the gate byte is never read and the command never runs. It
+    /// proves this by the line it wrote to the root-only setup-error file,
+    /// which nothing writes once the wrapper starts. Returns that line when
+    /// all of this holds and the wrapper wrote no exit code.
+    #[cfg(target_os = "linux")]
+    fn pid_namespace_setup_failure(
+        &self,
+        id: Uuid,
+        directory: &Path,
+        status: &io::Result<std::process::ExitStatus>,
+        empty_or_missing_exit: bool,
+    ) -> Option<String> {
+        use crate::isolation::pid_init;
+        if !self.core.config.boat_profile || self.core.config.private_pids {
+            return None;
+        }
+        if status.as_ref().ok()?.code() != Some(pid_init::SETUP_FAILED) {
+            return None;
+        }
+        if !empty_or_missing_exit {
+            return None;
+        }
+        let mut text = String::new();
+        crate::filesystem::read_nofollow(&directory.join(pid_init::SETUP_ERROR_FILE))
+            .ok()?
+            .take(4096)
+            .read_to_string(&mut text)
+            .ok()?;
+        // A torn write, including a prefix without its step/error, is not
+        // authenticated evidence of a complete bootstrap failure report.
+        let line = text.split_once('\n')?.0;
+        let (step, error) = line
+            .strip_prefix(pid_init::SETUP_FAILURE_PREFIX)?
+            .split_once(": ")?;
+        if step.is_empty() || error.is_empty() {
+            return None;
+        }
+        // Output could mean job code ran. Without proof that nothing ran,
+        // leave execution unknown rather than mark the refusal retry-safe.
+        let inner = self.core.inner.lock().unwrap();
+        let job = inner.jobs.get(&id)?;
+        (job.terminal.is_none() && job.chunks.is_empty()).then(|| line.to_owned())
+    }
+    /// Record a job whose unit ended before its command could start as
+    /// refused before start, which callers may safely retry. Its Started
+    /// record is withdrawn, as when the launch itself fails before the gate.
+    #[cfg(target_os = "linux")]
+    fn refuse_unstarted_unit(&self, id: Uuid, detail: String) -> io::Result<()> {
+        let process = self.core.inner.lock().unwrap().jobs[&id].process;
+        // Reading the result also resets the failed unit so systemd unloads
+        // it, as the normal finish path does.
+        let _ = self.core.backend.oom_stopped(&self.core.config, process);
+        let mut finished = {
+            let mut inner = self.core.inner.lock().unwrap();
+            if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
+                return Ok(());
+            }
+            inner.jobs[&id].clone()
+        };
+        let safe = self.safe_refusal_detail(
+            &detail,
+            finished
+                .request
+                .as_ref()
+                .into_iter()
+                .flat_map(|request| request.env.values().cloned()),
+        );
+        finished.process = None;
+        finished.started_ms = None;
+        finished.started = None;
+        finished.next_seq = 0;
+        refuse_before_start(
+            &self.core.health,
+            &mut finished,
+            RefusalReason::WorkspaceSetupFailed,
+            &detail,
+            Some(safe),
+            self.now(),
+        );
+        finished.state = JobState::Tombstone;
+        let log = self.job_log(id);
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let write = log.write.lock().unwrap();
+            match self.save(&finished) {
+                Ok(()) => {
+                    let mut inner = self.core.inner.lock().unwrap();
+                    inner.jobs.insert(id, finished.clone());
+                    inner.finalizing.remove(&id);
+                    inner.starting.remove(&id);
+                    inner.exit_statuses.remove(&id);
+                    inner.kill_retries.remove(&id);
+                    inner.cpu_times.remove(&id);
+                    if finished.base {
+                        self.finish_base(
+                            &mut inner,
+                            finished.request.as_ref().unwrap(),
+                            false,
+                            None,
+                        )?;
+                    }
+                    return self.catalog(&inner);
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %id, %error, "refusal record failed; retrying");
+                    drop(write);
+                    std::thread::park_timeout(delay);
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
         }
     }
     fn durable_exit_status(
         &self,
         process: Option<platform::ProcessIdentity>,
         path: &Path,
-    ) -> io::Result<std::process::ExitStatus> {
+    ) -> (io::Result<std::process::ExitStatus>, io::Result<Option<u8>>) {
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
-        let durable = (|| {
-            let mut file = crate::filesystem::read_nofollow(path)?;
+        // Observe the job-writable inode once. Classification must consume
+        // this same bounded observation, never race it with a second read.
+        let exit_file = (|| {
+            let file = match crate::filesystem::read_nofollow(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
             let mut code = String::new();
-            Read::by_ref(&mut file).take(32).read_to_string(&mut code)?;
-            let code = code.trim().parse::<i32>().map_err(io::Error::other)?;
-            if !(0..=255).contains(&code) {
-                return Err(io::Error::other("invalid durable exit code"));
+            file.take(33).read_to_string(&mut code)?;
+            if code.len() > 32 {
+                return Err(io::Error::other("oversized durable exit file"));
             }
-            #[cfg(unix)]
-            {
-                Ok(std::process::ExitStatus::from_raw(code << 8))
+            if code.is_empty() {
+                return Ok(None);
             }
-            #[cfg(windows)]
-            {
-                Ok(std::process::ExitStatus::from_raw(code as u32))
-            }
+            code.trim()
+                .parse::<u8>()
+                .map(Some)
+                .map_err(io::Error::other)
         })();
-        durable.or_else(|error| {
+        let durable = match &exit_file {
+            Ok(Some(code)) => {
+                #[cfg(unix)]
+                {
+                    Ok(std::process::ExitStatus::from_raw(i32::from(*code) << 8))
+                }
+                #[cfg(windows)]
+                {
+                    Ok(std::process::ExitStatus::from_raw(u32::from(*code)))
+                }
+            }
+            Ok(None) => Err(io::Error::other("missing or empty durable exit file")),
+            Err(error) => Err(io::Error::other(error.to_string())),
+        };
+        let status = durable.or_else(|error| {
             // The wrapper writes a fixed writable inode in a read-only output
             // directory. If it is killed before completing the write, the failed
             // unit retains its status. Read it before finish resets that unit;
@@ -4499,7 +4685,8 @@ impl Runner {
                     "durable exit unavailable: {error}; systemd exit status unavailable: {unit_error}"
                 ))),
             }
-        })
+        });
+        (status, exit_file)
     }
     fn output_at(
         &self,

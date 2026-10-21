@@ -7,6 +7,9 @@ mod writer;
 #[path = "privilege.rs"]
 mod privilege;
 
+#[path = "command_golden_tests.rs"]
+mod command_golden;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.
@@ -113,6 +116,15 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
     }
 }
 
+fn test_identity() -> pid_init::JobIdentity {
+    pid_init::JobIdentity {
+        uid: 997,
+        gid: 996,
+        groups: vec![996],
+        proc_protections: vec![("/proc/sys".into(), true)],
+    }
+}
+
 #[test]
 fn boat_command_preserves_isolation_and_limits_without_private_pids() {
     let f = Fixture::new();
@@ -120,6 +132,7 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
         let command = f
             .command_sandbox()
             .with_boat_profile(boat, private_pids, Some(14 * (1 << 30)))
+            .with_pid_init(Some(test_identity()))
             .without_provider_environment(&["BOAT_FUTURE".to_owned()])
             .command("true", &f.workspace, &[], true, &[1, 2], 2)
             .unwrap();
@@ -138,10 +151,12 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             "ProtectKernelTunables=yes",
             "NoNewPrivileges=yes",
             "KillMode=control-group",
-            "User=motor-job",
         ] {
             assert!(args.contains(&format!("--property={property}").as_str()));
         }
+        // Without PrivatePIDs the unit starts as root for the PID namespace
+        // init, which drops to motor-job itself before the wrapper runs.
+        assert_eq!(args.contains(&"--property=User=motor-job"), private_pids);
         assert!(args
             .iter()
             .any(|a| a.starts_with("--property=TemporaryFileSystem=/dev/shm:")));
@@ -158,6 +173,116 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             boat
         );
     }
+}
+
+/// The Boat unit for systemd before 257 differs from the PrivatePIDs Boat
+/// unit only where the PID namespace init needs it: no PrivatePIDs, no User=
+/// or Group=, the init's capabilities, RestrictNamespaces=pid, the setup-error
+/// bind, and the init in front of the unchanged wrapper argv.
+#[test]
+fn boat_pid_init_unit_changes_only_what_the_init_needs() {
+    let f = Fixture::new();
+    let render = |private_pids: bool, durable: bool| {
+        let sandbox = f
+            .command_sandbox()
+            .with_boat_profile(true, private_pids, Some(14 << 30))
+            .with_pid_init(Some(test_identity()));
+        let mut sandbox = sandbox;
+        sandbox.read_write = vec![f.workspace.to_str().unwrap().into()];
+        let env = [("RUST_LOG".to_string(), "info".to_string())];
+        let command = sandbox
+            .command("cargo test", &f.workspace, &env, durable, &[1, 2], 2)
+            .unwrap();
+        let id = sandbox.id.to_string();
+        command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().replace(&id, "<ID>"))
+            .collect::<Vec<_>>()
+    };
+    let setup_error = format!(
+        "{}:/motor-output/setup-error",
+        f.scratch.join("unprepared/output/setup-error").display()
+    );
+    let workspace = f.workspace.to_str().unwrap();
+    for durable in [true, false] {
+        let private = render(true, durable);
+        let init = render(false, durable);
+        let removed = [
+            "--property=PrivatePIDs=yes".to_owned(),
+            "--property=User=motor-job".to_owned(),
+            "--property=Group=motor-job".to_owned(),
+            "--property=CapabilityBoundingSet=".to_owned(),
+            "--property=RestrictNamespaces=yes".to_owned(),
+            format!("--property=BindPaths={workspace}"),
+        ];
+        let added = [
+            format!(
+                "--property=CapabilityBoundingSet={}",
+                pid_init::UNIT_CAPABILITIES
+            ),
+            "--property=RestrictNamespaces=pid".to_owned(),
+            format!("--property=BindPaths={workspace} {setup_error}"),
+        ];
+        for arg in removed.iter() {
+            assert!(private.contains(arg), "{arg} missing from {private:?}");
+            assert!(!init.contains(arg), "{arg} kept in {init:?}");
+        }
+        for arg in added.iter() {
+            assert!(init.contains(arg), "{arg} missing from {init:?}");
+        }
+        // The init's own arguments sit right before the wrapper's.
+        let start = init
+            .iter()
+            .position(|arg| arg == pid_init::INSTALLED_RUNNER)
+            .unwrap();
+        assert_eq!(
+            init[start..start + 7],
+            [
+                pid_init::INSTALLED_RUNNER,
+                pid_init::MODE,
+                "997",
+                "996",
+                "996",
+                "[[\"/proc/sys\",true]]",
+                "--"
+            ]
+        );
+        assert_eq!(init[start + 7], "/bin/bash");
+        // Everything else is the same argv in the same order.
+        let rest = |args: &[String], drop: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|arg| !drop.contains(arg))
+                .cloned()
+                .collect()
+        };
+        let mut init_rest = rest(&init, &added);
+        init_rest.drain(start - added.len()..start - added.len() + 7);
+        assert_eq!(init_rest, rest(&private, &removed), "durable={durable}");
+    }
+}
+
+#[test]
+fn boat_pid_init_unit_refuses_loader_variables_and_a_missing_identity() {
+    let f = Fixture::new();
+    let sandbox = || {
+        f.command_sandbox()
+            .with_boat_profile(true, false, Some(14 << 30))
+    };
+    let error = sandbox()
+        .command("true", &f.workspace, &[], true, &[1], 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("identity"), "{error}");
+    let env = [("LD_PRELOAD".to_string(), "/tmp/x.so".to_string())];
+    let error = sandbox()
+        .with_pid_init(Some(test_identity()))
+        .command("true", &f.workspace, &env, true, &[1], 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+    // Units without the init keep their environment rules.
+    assert!(f
+        .command_sandbox()
+        .command("true", &f.workspace, &env, true, &[1], 1)
+        .is_ok());
 }
 
 #[test]
@@ -311,6 +436,7 @@ impl Fixture {
             private_pids: true,
             boat_profile: false,
             boat_memory_max: None,
+            pid_init: None,
             provider_unset_env: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
@@ -438,6 +564,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        pid_init: None,
         provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
@@ -928,6 +1055,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                pid_init: None,
                 provider_unset_env: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
@@ -980,6 +1108,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                pid_init: None,
                 provider_unset_env: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
@@ -1400,6 +1529,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        pid_init: None,
         provider_unset_env: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod cargo_fetch;
 mod hosts;
+pub(crate) mod pid_init;
 mod readable;
 
 const USER: &str = "motor-job";
@@ -38,6 +39,12 @@ fn checked(command: &mut Command) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The job account's numeric identity, which the Boat PID namespace init
+/// applies in place of systemd's `User=` and `Group=`.
+pub(crate) fn job_identity() -> io::Result<pid_init::JobIdentity> {
+    pid_init::JobIdentity::resolve(USER)
 }
 
 pub(crate) fn validate_account() -> io::Result<()> {
@@ -1501,6 +1508,9 @@ pub(crate) struct Sandbox {
     private_pids: bool,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
+    /// Set for Boat jobs on systemd before 257: the identity the PID namespace
+    /// init drops to (see `pid_init`).
+    pid_init: Option<pid_init::JobIdentity>,
     provider_unset_env: Vec<String>,
 }
 
@@ -2247,6 +2257,7 @@ impl Sandbox {
             private_pids: true,
             boat_profile: false,
             boat_memory_max: None,
+            pid_init: None,
             provider_unset_env: Vec::new(),
         })
     }
@@ -2270,6 +2281,23 @@ impl Sandbox {
         self.private_pids = private_pids;
         self.boat_memory_max = if enabled { memory_max } else { None };
         self
+    }
+    /// The job identity for Boat units that cannot use PrivatePIDs. Only those
+    /// units use it; see [`Sandbox::uses_pid_init`].
+    pub(crate) fn with_pid_init(mut self, identity: Option<pid_init::JobIdentity>) -> Self {
+        self.pid_init = identity;
+        self
+    }
+    /// Boat sandboxes on systemd before 257 start the unit as root and run
+    /// the runner's PID namespace init in front of the wrapper.
+    fn uses_pid_init(&self) -> bool {
+        self.boat_profile && !self.private_pids
+    }
+    fn setup_error_path(&self) -> PathBuf {
+        self.runtime
+            .0
+            .join("output")
+            .join(pid_init::SETUP_ERROR_FILE)
     }
     pub(crate) fn without_provider_environment(mut self, names: &[String]) -> Self {
         self.provider_unset_env = names.to_vec();
@@ -2304,6 +2332,15 @@ impl Sandbox {
         requested_vcpus: u32,
     ) -> io::Result<Command> {
         let user = self.user;
+        let pid_init = if self.uses_pid_init() {
+            Some(self.pid_init.as_ref().ok_or_else(|| {
+                io::Error::other(
+                    "a Boat job without PrivatePIDs needs the job account's identity for its PID namespace init",
+                )
+            })?)
+        } else {
+            None
+        };
         let mut cmd = crate::privilege::command("/usr/bin/systemd-run");
         let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR");
         // Output is a read-only directory with fixed writable file bind mounts,
@@ -2404,8 +2441,12 @@ impl Sandbox {
         cmd.arg(format!(
             "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
         ));
-        cmd.arg(format!("--property=User={user}"))
-            .arg(format!("--property=Group={user}"));
+        // The PID namespace init must start as root. It drops to the same
+        // identity itself, from the job account's numeric ids.
+        if pid_init.is_none() {
+            cmd.arg(format!("--property=User={user}"))
+                .arg(format!("--property=Group={user}"));
+        }
         for property in [
             "NoNewPrivileges=yes",
             "CapabilityBoundingSet=",
@@ -2431,6 +2472,18 @@ impl Sandbox {
             "TimeoutStopSec=2s",
             "SendSIGKILL=yes",
         ] {
+            // The PID namespace init needs these capabilities to create the
+            // namespace, mount its /proc and change identity, and the seccomp
+            // filter must let it create a PID namespace. It empties the
+            // bounding set and adds its own filter refusing new PID namespaces
+            // before the wrapper runs, so the job ends up with the values below.
+            let property = match property {
+                "CapabilityBoundingSet=" if pid_init.is_some() => {
+                    format!("CapabilityBoundingSet={}", pid_init::UNIT_CAPABILITIES)
+                }
+                "RestrictNamespaces=yes" if pid_init.is_some() => "RestrictNamespaces=pid".into(),
+                property => property.to_owned(),
+            };
             cmd.arg(format!("--property={property}"));
         }
         #[cfg(test)]
@@ -2438,11 +2491,18 @@ impl Sandbox {
         #[cfg(not(test))]
         let parent_umask = 0o022;
         cmd.arg(format!("--property=UMask={parent_umask:04o}"));
+        let mut read_write = self.read_write.clone();
+        if pid_init.is_some() {
+            read_write.push(bind(
+                &self.setup_error_path(),
+                &Path::new("/motor-output").join(pid_init::SETUP_ERROR_FILE),
+            )?);
+        }
         for (key, value) in [
             ("RootDirectory", word(&self.root)?),
             ("WorkingDirectory", word(cwd)?),
             ("BindReadOnlyPaths", self.read_only.join(" ")),
-            ("BindPaths", self.read_write.join(" ")),
+            ("BindPaths", read_write.join(" ")),
         ] {
             cmd.arg(format!("--property={key}={value}"));
         }
@@ -2465,6 +2525,9 @@ impl Sandbox {
         ] {
             env.insert(key.into(), value);
         }
+        if pid_init.is_some() {
+            pid_init::refuse_loader_environment(env.keys().map(String::as_str))?;
+        }
         for (key, value) in env {
             cmd.arg(format!("--setenv={key}={value}"));
         }
@@ -2473,7 +2536,11 @@ impl Sandbox {
         // one-byte release switches the command's stdin to /dev/null so the
         // still-open gate writer cannot block ordinary input reads.
         // Cancellation cannot precede creation of an untracked privileged job.
-        cmd.args(["/bin/bash", "-c", shell, user, command]);
+        let wrapper = ["/bin/bash", "-c", shell, user, command];
+        match pid_init {
+            Some(identity) => cmd.args(pid_init::exec_start(identity, &wrapper)),
+            None => cmd.args(wrapper),
+        };
         Ok(cmd)
     }
 
@@ -2513,6 +2580,18 @@ impl Sandbox {
             start: 0,
             unit: Some(self.id),
         });
+        if self.uses_pid_init() {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The init reports a setup failure here, while still root. The file
+            // is root-owned 0600, so the job cannot open it afterwards.
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(self.setup_error_path())?;
+        }
         let gate = if durable {
             use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
             let path = self.runtime.0.join("gate");
@@ -2554,9 +2633,13 @@ impl Sandbox {
             discard_unstarted(self.id);
             let _ = child.kill();
             let output = child.wait_with_output()?;
+            // A PID namespace init that failed before the unit counted as
+            // started left its reason here, not in systemd-run's output.
+            let setup = fs::read_to_string(self.setup_error_path()).unwrap_or_default();
             return Err(io::Error::other(format!(
-                "sandbox did not start: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "sandbox did not start: {}{}",
+                String::from_utf8_lossy(&output.stderr),
+                setup.trim_end()
             )));
         }
         let active_at = Instant::now();

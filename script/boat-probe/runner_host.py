@@ -4,7 +4,6 @@ readiness marker) in each order the broker can produce. The endpoint only
 trusts the production broker's signing keys, so no token it accepts is used."""
 import contextlib
 import base64
-import errno
 import gzip
 import hashlib
 import importlib.util
@@ -21,6 +20,7 @@ import tempfile
 import time
 
 from credential_audit import SOURCE
+from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_checks, outside_control_passes, pid_checks, reference_command, teardown_checks, teardown_job
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -123,8 +123,9 @@ def execution_capabilities():
     return result
 '''
 
-JOB = provider.ACCESS_SOURCE + EXEC_PROBE + r'''
+JOB = provider.ACCESS_SOURCE + EXEC_PROBE + PID_SOURCE + r'''
 import errno, json, os, pathlib, pwd, subprocess
+exec_inherited_fds = inherited_fds()
 cg = pathlib.Path('/sys/fs/cgroup') / pathlib.Path('/proc/self/cgroup').read_text().strip().split('0::',1)[1].lstrip('/')
 shm = pathlib.Path('/dev/shm/boat-host-canary')
 private = not shm.exists()
@@ -194,6 +195,9 @@ try:
 except OSError as error:
     data['cargo_target'] = {'env': os.environ.get('CARGO_TARGET_DIR'), 'same_directory': None, 'error': type(error).__name__}
 data['execution_capabilities'] = execution_capabilities()
+data['pid_namespace'] = pid_evidence(PROTECTED_IDENTITIES)
+data['pid_namespace']['inherited_fds'] = exec_inherited_fds
+data['process_visibility']['runner_signal_probe'] = next(row for row in data['pid_namespace']['signals'] if row['pid'] == RUNNER_PID)
 print(json.dumps(data))
 '''
 HOST = SOURCE + r'''
@@ -247,6 +251,7 @@ for path in [pathlib.Path('/run/motor-tenant'), *[pathlib.Path('/run/motor-tenan
     meta = path.lstat()
     tenant_sockets[str(path)] = {'uid':meta.st_uid, 'mode':oct(stat.S_IMODE(meta.st_mode)), 'socket':stat.S_ISSOCK(meta.st_mode)}
 print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('net','pid','mnt')},
+    'systemd_version':int(subprocess.check_output(['systemctl', '--version'], text=True).split()[1]),
     'credential_audit': credential_audit(), 'ssh_config': configs,
     'sshd': capture(['/usr/sbin/sshd','-T']),
     'systemd_env': capture(['systemd-run','--wait','--pipe','--collect','python3','-c',ENV_NAMES]),
@@ -586,10 +591,9 @@ def isolation_checks(job, host):
         **job['execution_capabilities']['checks'],
         **process_visibility_checks(job),
         **proc_checks(job),
+        **pid_checks(job, host),
         # Rust jobs build in the build server's fixed folder, bound to ./target.
         "fixed_cargo_target_dir": job['cargo_target'].get('env') == '/run/motor/target' and job['cargo_target'].get('same_directory') is True,
-        # This explicit Boat profile does not promise a private PID namespace on systemd 255.
-        "boat_pid_profile": job["namespaces"]["pid"] == host["namespaces"]["pid"],
     }
 
 
@@ -601,11 +605,11 @@ def process_visibility_checks(job):
     signal = visibility['runner_signal_probe']
     return {
         'proc_only_job_processes': bool(proc) and any(row['pid'] == visibility['self_pid'] for row in proc) and
-            all(row.get('uid') == job['uid'] and row.get('same_cgroup') and row['pid'] not in protected for row in proc),
+            all(row.get('uid') == job['uid'] and row.get('same_cgroup') for row in proc),
         'ps_only_job_processes': ps['exit_code'] == 0 and bool(ps['rows']) and
             any(row['pid'] == visibility['self_pid'] for row in ps['rows']) and
-            all(row['uid'] == job['uid'] and row['pid'] not in protected for row in ps['rows']),
-        'cannot_signal_runner': signal['pid'] in protected and signal.get('allowed') is False and signal.get('errno') == errno.EPERM,
+            all(row['uid'] == job['uid'] for row in ps['rows']),
+        'cannot_signal_runner': signal['pid'] in protected and outside_control_passes(signal, job['uid'], job['pid_namespace']['self_cgroup']),
     }
 
 
@@ -943,6 +947,8 @@ class RunnerHost:
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
+        host['job_security_reference'] = json.loads(self.execute(
+            sid, 'sudo -n ' + reference_command())['stdout'])
         record['toolchain_parity'] = json.loads(self.execute(
             sid, "sudo -n python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
         self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
@@ -965,7 +971,10 @@ class RunnerHost:
         self.check(label + '.outside_job_cannot_read_provider_tokens', provider_access_denied(host['provider_sanitization']['outside_job_after']), host['provider_sanitization'])
         self.check(label + '.protected_services_running', bool(host['sshd_pids']) and host['runner_pid'] > 0 and host['idle_services_memory']['motor-boat-host']['main_pid'] > 0, {'runner':host['runner_pid'],'host':host['idle_services_memory']['motor-boat-host']['main_pid'],'sshd':host['sshd_pids']})
         protected = [host['runner_pid'], host['idle_services_memory']['motor-boat-host']['main_pid'], *host['sshd_pids'], *[p['pid'] for p in host['provider_sanitization']['processes']]]
-        job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\n' + JOB
+        host['outside_pid_controls'] = json.loads(self.execute(sid, control_identity_command(protected))['stdout'])
+        identities = host['outside_pid_controls']['live']
+        protected = [row['pid'] for row in identities]
+        job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\nPROTECTED_IDENTITIES=' + repr(identities) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
                 gnu_test_hash = (record['toolchain_parity']['observed']['tools'].get('gnutest') or {}).get('sha256')
@@ -975,7 +984,10 @@ class RunnerHost:
                                          ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
                                             job=True, gnu_test_sha256=gnu_test_hash, cargo_seed_sha256=self.probe.cargo_seed_sha256))),
                                          ('offline_cargo_seed', 'python3 -c ' + shlex.quote(CARGO_OFFLINE_PROBE.read_text())),
-                                       ("isolation", "python3 -c " + shlex.quote(job_script))]
+                                        ("isolation", "python3 -c " + shlex.quote(job_script)),
+                                        ('sigkill_job', 'kill -KILL $$'),
+                                        ('job_stdin_eof', "python3 -c 'import os; print(\"boat-stdin-eof\" if os.read(0, 1) == b\"\" else \"unexpected-input\")'"),
+                                        ('pid1_ignores_job_sigkill', 'kill -KILL 1; printf boat-pid1-alive')]
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))
                 for name, command in jobs:
@@ -1001,14 +1013,40 @@ class RunnerHost:
                     elif name == "isolation":
                         for key, passed in isolation_result_checks(parsed, host).items():
                             self.check(label + "." + key, parsed["code"] == 0 and passed, parsed)
+                    elif name == 'sigkill_job':
+                        self.check(label + '.sigkill_job_exit_137', lifecycle_checks(parsed, 137), parsed)
+                    elif name == 'pid1_ignores_job_sigkill':
+                        self.check(label + '.pid1_ignores_job_sigkill', lifecycle_checks(parsed, 0)
+                                   and 'boat-pid1-alive' in parsed['stdout'], parsed)
+                    elif name == 'job_stdin_eof':
+                        self.check(label + '.job_stdin_eof', lifecycle_checks(parsed, 0)
+                                   and parsed['stdout'].strip() == 'boat-stdin-eof', parsed)
                     else:
                         expected = 23 if name == "exit" else 0
                         marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
-                        self.check(label + "." + name, parsed["code"] == expected and marker in parsed["stdout"], parsed)
+                        self.check(label + "." + name, lifecycle_checks(parsed, expected) and marker in parsed["stdout"], parsed)
                     state = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
                     record.setdefault('storage_after_jobs', {})[name] = state
                     for key, passed in storage_checks(state).items():
                         self.check(label + '.' + name + '.' + key, passed, state)
+                # Observe and stop the unit from the sandbox's root namespace
+                # while the client waits, including a child that escaped setsid.
+                from concurrent.futures import ThreadPoolExecutor
+                for action, expected in [('stop', 143), ('kill', 137)]:
+                    marker = 'boat-pid-teardown-' + label + '-' + action
+                    command = teardown_job(marker)
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        pending = executor.submit(process, [str(client), address, str(repository), storage, command], timeout=90)
+                        observed = json.loads(self.execute(sid, 'sudo -n python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
+                                                          + ' ' + shlex.quote(marker) + ' ' + action, timeout=60)['stdout'])
+                        completed = pending.result()
+                    parsed = job_result(completed['stdout']) if completed.get('exit_code') == 0 else {}
+                    record['setsid_' + action] = {'host':observed, 'client':completed, 'result':parsed}
+                    self.check(label + '.setsid_' + action + '_reaped', teardown_checks(observed), observed)
+                    self.check(label + '.setsid_' + action + '_exit_' + str(expected), lifecycle_checks(parsed, expected), parsed)
+                    if host['systemd_version'] < 257:
+                        for key, passed in bootstrap_checks(observed, host['job_security_reference']).items():
+                            self.check(label + '.setsid_' + action + '.' + key, passed, observed)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
         if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')

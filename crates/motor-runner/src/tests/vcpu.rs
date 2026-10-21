@@ -724,7 +724,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
                 fs::write(&exit, contents).unwrap();
             }
             let before = calls.load(Ordering::SeqCst);
-            let status = runner.durable_exit_status(process, &exit).unwrap();
+            let status = runner.durable_exit_status(process, &exit).0.unwrap();
             assert_eq!(backend::ExecutionOutcome::Unix(status).wire(), expected);
             assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         }
@@ -732,7 +732,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     fs::write(&exit, "55\n").unwrap();
     let before = calls.load(Ordering::SeqCst);
     assert_eq!(
-        runner.durable_exit_status(process, &exit).unwrap().code(),
+        runner.durable_exit_status(process, &exit).0.unwrap().code(),
         Some(55)
     );
     assert_eq!(
@@ -746,6 +746,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     main_status.store(0, Ordering::SeqCst);
     let error = runner
         .durable_exit_status(process, &exit)
+        .0
         .unwrap_err()
         .to_string();
     assert!(error.contains("durable exit unavailable"), "{error}");
@@ -817,6 +818,157 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
         );
         assert!(job_output(&runner, request.job_id).contains("systemd exit status unavailable"));
         assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
+    }
+}
+
+/// A Boat job's PID namespace init that fails exits 226 before the wrapper
+/// reads the gate, so the command never ran. That must reach the caller as a
+/// retry-safe refusal carrying the init's reason, never as "exit 226". The
+/// same status with an exit file is the job's own exit. Without a complete
+/// init report or exit file, execution is unknown and must not be retried as
+/// though the command never ran.
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit() {
+    use crate::isolation::pid_init;
+    let line = format!(
+        "{}mount the namespace's proc: Operation not permitted (os error 1)",
+        pid_init::SETUP_FAILURE_PREFIX
+    );
+    let complete = format!("{line}\n");
+    let prefix_only = format!("{}\n", pid_init::SETUP_FAILURE_PREFIX);
+    for (case, exit_file, setup_error, boat_init) in [
+        ("setup failure", "", complete.as_str(), true),
+        ("job exited 226", "226\n", complete.as_str(), true),
+        ("no init line", "", "", true),
+        ("torn init line", "", line.as_str(), true),
+        ("prefix without step", "", prefix_only.as_str(), true),
+        ("oversized exit", "", "", true),
+        ("sparse exit", "", "", true),
+        ("supervisor wait failed", "", complete.as_str(), true),
+        ("job exited 227", "227\n", "", true),
+        ("unit without the init", "", complete.as_str(), false),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.boat_profile = true;
+        config.boat_memory_max_bytes = Some(2 << 30);
+        config.private_pids = !boat_init;
+        let supervisor_failed = case == "supervisor wait failed";
+        config.systemd_command = Some(Arc::new(move |args| {
+            let text = match args {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
+                    "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                }
+                ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => {
+                    if supervisor_failed {
+                        "ExecMainCode=1\nExecMainStatus=227\n"
+                    } else {
+                        "ExecMainCode=1\nExecMainStatus=226\n"
+                    }
+                }
+                ["show", "--property=Result", _] => "Result=exit-code\n",
+                ["reset-failed", _] | ["list-units", ..] => "",
+                _ => panic!("unexpected systemd command: {args:?}"),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: text.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }));
+        let runner = Runner::open(config).unwrap();
+        let (request, _) = f.run("true");
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.started = Some(Started::new(0, 0, runner.now()));
+            job.next_seq = 1;
+            job.durable_output = true;
+            job.process = Some(platform::ProcessIdentity {
+                pid: 0,
+                start: 0,
+                unit: Some(Uuid::now_v7()),
+            });
+            runner.save(job).unwrap();
+        }
+        let output = runner
+            .config()
+            .state_dir()
+            .join("sandboxes")
+            .join(request.job_id.to_string())
+            .join("output");
+        fs::create_dir_all(&output).unwrap();
+        for name in ["stdout", "stderr"] {
+            fs::write(output.join(name), "").unwrap();
+        }
+        fs::write(output.join("exit"), exit_file).unwrap();
+        if case == "oversized exit" {
+            // A valid-looking prefix plus whitespace must not be accepted by
+            // parsing a truncated prefix or reread into the privileged daemon.
+            fs::write(output.join("exit"), format!("226\n{}", " ".repeat(1 << 20))).unwrap();
+        } else if case == "sparse exit" {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(output.join("exit"))
+                .unwrap();
+            file.set_len(1 << 40).unwrap();
+        }
+        fs::write(output.join(pid_init::SETUP_ERROR_FILE), setup_error).unwrap();
+        if case == "job exited 226" {
+            let process = runner.core.inner.lock().unwrap().jobs[&request.job_id].process;
+            let (status, observation) = runner.durable_exit_status(process, &output.join("exit"));
+            assert!(matches!(observation, Ok(Some(226))));
+            fs::write(output.join("exit"), "now malformed").unwrap();
+            assert!(
+                !runner.unproven_pid_bootstrap_status(&status, &observation),
+                "classification must consume the original bounded observation"
+            );
+            fs::write(output.join("exit"), exit_file).unwrap();
+        }
+        runner.follow_unit(request.job_id).unwrap();
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        let terminal = job.terminal.clone().unwrap();
+        if case == "setup failure" {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::WorkspaceSetupFailed
+                },
+                "{case}"
+            );
+            assert_eq!(terminal.ran, Some(Ran::None), "{case}");
+            assert_eq!(terminal.refusal_detail(), Some(line.as_str()), "{case}");
+            assert_eq!(job.state, JobState::Tombstone, "{case}");
+            assert!(job.started.is_none() && job.started_ms.is_none(), "{case}");
+        } else if case.starts_with("job exited") || !boat_init {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::Exit {
+                    code: if case == "job exited 227" { 227 } else { 226 }
+                },
+                "{case}"
+            );
+        } else {
+            assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
+            assert!(
+                job.started.is_some(),
+                "no proof that job never started: {case}"
+            );
+            let output = job_output(&runner, request.job_id);
+            let code = if supervisor_failed { 227 } else { 226 };
+            assert!(
+                output.contains(&format!("bootstrap status {code}")),
+                "{case}: {output}"
+            );
+            assert!(
+                output.contains("setup evidence unavailable"),
+                "{case}: {output}"
+            );
+        }
     }
 }
 
