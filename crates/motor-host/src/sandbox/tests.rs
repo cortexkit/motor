@@ -378,6 +378,8 @@ async fn sandbox_valid_admission_orders_verified_lease_and_reattach_binds_fresh_
     .await
     .unwrap();
     assert_eq!(read_frame(&mut client).await.unwrap()["type"], "terminal");
+    // The host now waits for the client to close after its last frame.
+    drop(client);
     task.await.unwrap().unwrap();
     let host = f.runtime.host.lock().unwrap();
     assert!(host.snapshot.billing.is_empty());

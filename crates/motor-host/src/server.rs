@@ -1006,6 +1006,12 @@ where
         armed: true,
     };
     drop(prelude_guard);
+    // Set once job frames start flowing to the client (relay or stored
+    // replay); from then on the connection ends with a graceful drain.
+    let streamed = AtomicBool::new(false);
+    // Set once this connection has written the job's final frames to the
+    // client. Delivery is only recorded after the client then closes cleanly.
+    let terminal_written = AtomicBool::new(false);
     let outcome = async {
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(claims.exp.saturating_mul(1000).saturating_sub(unix_ms()));
@@ -1034,7 +1040,8 @@ where
             .at(Side::Client, "first_frame")?;
         let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
         if stored {
-            return serve_stored(&runtime, &claims.jti, &first, &mut client).await;
+            streamed.store(true, Ordering::Release);
+            return serve_stored(&runtime, &claims.jti, &first, &mut client, &terminal_written).await;
         }
         let delivery_runtime = runtime.clone();
         let delivery_claims = claims.clone();
@@ -1073,7 +1080,10 @@ where
         let mut guest = tokio::net::UnixStream::from_std(stream).at(Side::Host, "relay_start")?;
         write_frame(&mut guest, &first).await.at(Side::Guest, "relay_start")?;
         guest.write_all(&buffered).await.at(Side::Guest, "relay_start")?;
-        let (mut cr, mut cw) = tokio::io::split(client);
+        streamed.store(true, Ordering::Release);
+        // Split a borrow, not the stream itself: once the relay ends, `serve`
+        // still needs the client stream to close it gracefully.
+        let (mut cr, mut cw) = tokio::io::split(&mut client);
         let (mut gr, mut gw) = guest.split();
         // This connection owns the reverse drain after decoding Terminal or
         // selecting host-settled final frames; ownership is not client delivery.
@@ -1115,7 +1125,7 @@ where
                             if let Some(frames) = frames {
                                 draining_terminal.store(true, Ordering::Release);
                                 for frame in frames { write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
-                                runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
+                                terminal_written.store(true, Ordering::Release);
                                 break None;
                             }
                         }
@@ -1127,7 +1137,7 @@ where
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
                     for frame in frames { write_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
+                    terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
                 let frame = frame.at(Side::Guest, "relay")?;
@@ -1146,6 +1156,7 @@ where
                     draining_terminal.store(true, Ordering::Release);
                     if runtime.sandbox_identity.is_some() {
                         write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                        terminal_written.store(true, Ordering::Release);
                         return Ok::<(),anyhow::Error>(());
                     }
                     let control = runtime.control.clone();
@@ -1163,8 +1174,8 @@ where
                     };
                     write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
                     write_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
-                    tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
+                    terminal_written.store(true, Ordering::Release);
+                    tracing::debug!(jti = claims.jti, "connection_terminal_written");
                     return Ok::<(),anyhow::Error>(());
                 }
                 write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
@@ -1175,7 +1186,17 @@ where
         tokio::select! { result = to_guest => { result?; }, result = to_client => { result?; } }
         Ok(())
     };
-    tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) }
+    let result = tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) };
+    if streamed.load(Ordering::Acquire) {
+        // The connection record, and with it the lease's hold on the tenant,
+        // stays in place until this drain ends; `connection.finish()` runs after.
+        let clean = close_client(&mut client, &claims.jti).await;
+        if clean && terminal_written.load(Ordering::Acquire) {
+            runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "terminal_delivered")?;
+            tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
+        }
+    }
+    result
     }.await
     .map_err(|error| error.context(ConnectionJob(claims.jti.clone())));
     connection.finish().await;
@@ -1187,6 +1208,7 @@ async fn serve_stored(
     job: &str,
     first: &Value,
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    terminal_written: &AtomicBool,
 ) -> Result<()> {
     if first["type"] != "hello" {
         return Err(closed(Side::Client, "stored_hello", "expected hello"));
@@ -1222,12 +1244,7 @@ async fn serve_stored(
                         .await
                         .at(Side::Client, "stored_terminal")?;
                 }
-                runtime
-                    .host
-                    .lock()
-                    .expect("host lock")
-                    .terminal_delivered(job, unix_ms())
-                    .at(Side::Host, "stored_terminal")?;
+                terminal_written.store(true, Ordering::Release);
                 return Ok(());
             }
             Some("job_status") => {
@@ -1247,6 +1264,75 @@ async fn serve_stored(
                 .await
                 .at(Side::Client, "stored_cancel")?,
             _ => return Err(closed(Side::Client, "stored_request", "operation_refused")),
+        }
+    }
+}
+
+/// How long a connection that has finished sending waits for its client to
+/// read the rest and close. Everything still in flight at that point fits in
+/// the two ends' socket buffers: Linux and macOS autotune each to a few MiB at
+/// most, so under 16 MiB in all. Two minutes covers that at about 130 KiB/s,
+/// well below the slowest rate seen from a real client (about 320 KiB/s). A
+/// client that has everything closes at once; this bound only limits how long
+/// a stalled one holds the connection open.
+pub const CLIENT_DRAIN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Ends a client connection that carried job frames without losing any of them.
+///
+/// Dropping a TCP socket while the client's heartbeats sit unread in its
+/// receive queue, or arrive after the drop, makes the kernel answer with a
+/// reset. A reset discards whatever the host had not yet sent, and can make the
+/// client discard what it had not yet read, so a slow client lost the end of
+/// its output and the terminal record. Instead, finish the write side (TLS
+/// close_notify, then FIN after all queued data), then read and discard client
+/// input until the client closes, bounded by [`CLIENT_DRAIN_DEADLINE`]. Returns
+/// whether the client closed cleanly. That is the host's evidence the client
+/// read every frame: a client that closes with frames unread resets instead.
+async fn close_client(client: &mut (impl AsyncRead + AsyncWrite + Unpin), jti: &str) -> bool {
+    let started = tokio::time::Instant::now();
+    let deadline = started + CLIENT_DRAIN_DEADLINE;
+    let shutdown = match tokio::time::timeout_at(deadline, client.shutdown()).await {
+        Ok(result) => result.map_err(|error| format!("{:?}: {error}", error.kind())),
+        Err(_) => Err("timed out".to_owned()),
+    };
+    if let Err(cause) = shutdown {
+        tracing::info!(
+            jti,
+            side = "client",
+            step = "drain",
+            cause,
+            "client_drain_ended"
+        );
+        return false;
+    }
+    let mut buffer = [0; 4096];
+    let cause = loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) => break None,
+            Ok(Ok(_)) => {}
+            // A TLS client that closes its socket without close_notify has
+            // still read everything up to our FIN before closing.
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break None,
+            Ok(Err(error)) => break Some(format!("{:?}: {error}", error.kind())),
+            Err(_) => break Some("timed out".to_owned()),
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match cause {
+        None => {
+            tracing::debug!(jti, elapsed_ms, "client_drain_closed");
+            true
+        }
+        Some(cause) => {
+            tracing::info!(
+                jti,
+                side = "client",
+                step = "drain",
+                cause,
+                elapsed_ms,
+                "client_drain_ended"
+            );
+            false
         }
     }
 }

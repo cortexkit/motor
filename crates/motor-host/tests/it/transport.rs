@@ -292,6 +292,7 @@ async fn journal_failure_blocks_sequenced_client_frame() {
     )
     .unwrap();
     assert!(read_frame(&mut client).await.is_err());
+    drop(client);
     assert!(task.await.unwrap().is_err());
     assert_eq!(
         runtime.host.lock().unwrap().snapshot.leases[JOB].highest_seq,
@@ -640,9 +641,12 @@ async fn live_relay_replacement_closes_without_advancing_clock() {
     c.iat += 1;
     c.exp += 1;
     let (replacement, _) = runtime.host.lock().unwrap().claim(c, unix_ms()).unwrap();
+    // The superseded connection ends its side at once; the host then waits
+    // for the client to close rather than resetting it.
+    assert!(read_frame(&mut client).await.is_err());
+    drop(client);
     task.await.unwrap().unwrap();
     assert_eq!(tokio::time::Instant::now(), before);
-    assert!(read_frame(&mut client).await.is_err());
     runtime.host.lock().unwrap().close(replacement).unwrap();
     runtime.host.lock().unwrap().guest_unready("tenant");
 }
@@ -981,6 +985,8 @@ async fn host_settled_attach_replays_identically_without_waking_or_relaying_vm()
             assert_eq!(&frames, previous);
         }
         previous = Some(frames);
+        // The host waits for the client to close after the stored frames.
+        drop(client);
         task.await.unwrap().unwrap();
     }
     assert!(fake.calls.lock().unwrap().is_empty());
@@ -1100,6 +1106,10 @@ async fn terminal_delivery_with_optional_guest_input_close(close_input: bool) {
     assert_eq!(read_frame(&mut client).await.unwrap(), terminal);
     let hosted = read_frame(&mut client).await.unwrap();
     assert_eq!(hosted["billed_vcpu_ms"], 3000);
+    // Delivery, which queues usage at once, is recorded only when the client
+    // closes cleanly after reading the terminal frames.
+    assert!(runtime.host.lock().unwrap().snapshot.outbox.is_empty());
+    drop(client);
     task.await.unwrap().unwrap();
     assert_eq!(runtime.host.lock().unwrap().snapshot.outbox.len(), 1);
 }
@@ -1164,6 +1174,7 @@ async fn host_loss_sends_stored_frames_even_when_guest_eof_wins_the_relay_race()
         read_frame(&mut client).await.unwrap()["type"],
         "hosted_terminal"
     );
+    drop(client);
     task.await.unwrap().unwrap();
 }
 
@@ -1197,6 +1208,9 @@ async fn a_guest_that_closes_after_accepted_is_reported_as_a_guest_eof_in_the_re
     .unwrap();
     assert_eq!(read_frame(&mut client).await.unwrap()["type"], "accepted");
     drop(guest);
+    // The host ends its side, then waits for the client to close.
+    assert!(read_frame(&mut client).await.is_err());
+    drop(client);
     let error = task.await.unwrap().unwrap_err();
     let report = motor_host::server::describe_close(&error);
     assert_eq!(
@@ -1222,4 +1236,369 @@ async fn a_guest_that_closes_after_accepted_is_reported_as_a_guest_eof_in_the_re
         ("client", "lease_hello", None)
     );
     runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
+/// A loopback TCP connection whose socket buffers are kept small, so a slow
+/// reader leaves job frames queued in the kernel rather than read ahead.
+/// Returns (client, accepted host side).
+async fn small_buffer_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listening = tokio::net::TcpSocket::new_v4().unwrap();
+    listening.set_recv_buffer_size(16 * 1024).unwrap();
+    listening.set_send_buffer_size(16 * 1024).unwrap();
+    listening.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = listening.listen(1).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connecting = tokio::net::TcpSocket::new_v4().unwrap();
+    connecting.set_recv_buffer_size(16 * 1024).unwrap();
+    let (client, accepted) = tokio::join!(connecting.connect(address), listener.accept());
+    (client.unwrap(), accepted.unwrap().0)
+}
+
+/// Runs the prelude and relay handshake on `client`, then records the job as
+/// admitted and started at `now`. Returns the fake runner's end of the relay.
+async fn started_relay(
+    runtime: &Arc<Runtime>,
+    fake: &Fake,
+    broker: &SigningKey,
+    requester: &SigningKey,
+    c: &Claims,
+    client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    now: u64,
+) -> UnixStream {
+    let challenge = hello(client, broker, requester, c).await;
+    assert_eq!(
+        respond(client, requester, c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let mut guest = peer(fake).await;
+    guest = tokio::task::spawn_blocking(move || {
+        assert_eq!(read_json(&mut guest).unwrap()["type"], "verified_lease");
+        assert_eq!(read_json(&mut guest).unwrap()["type"], "hello");
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(client).await.unwrap()["type"], "hello");
+    let mut h = runtime.host.lock().unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Admitted, Some(JOB), None),
+        now,
+    )
+    .unwrap();
+    h.event(
+        "tenant",
+        &event(2, TenantEventKind::Started, Some(JOB), None),
+        now,
+    )
+    .unwrap();
+    h.sample(
+        "tenant",
+        motor_host::billing::Metrics {
+            memory_bytes: 1048576,
+            egress_bytes: 0,
+        },
+    )
+    .unwrap();
+    guest
+}
+
+fn exit_terminal() -> Value {
+    json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":0},"wall_ms":3000,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null})
+}
+
+/// Reading past the job's frames must end in a clean EOF (the host's FIN),
+/// never in a reset.
+async fn assert_clean_eof(client: &mut (impl AsyncRead + Unpin)) {
+    let error = read_frame(client)
+        .await
+        .expect_err("nothing follows hosted_terminal");
+    let io = error
+        .downcast_ref::<std::io::Error>()
+        .unwrap_or_else(|| panic!("{error:#}"));
+    assert_eq!(
+        io.kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "host must close with FIN, not reset: {io}"
+    );
+}
+
+/// The live soak's failure: the job ends while a slow client is still behind,
+/// the client keeps sending its one-per-second heartbeats, and the host used to
+/// drop the socket as soon as it had written the terminal frames. That close
+/// reset the connection and the client lost its last output and the terminal.
+/// Here a slow TCP client must receive every output frame, the terminal and
+/// the hosted terminal, then a clean EOF; billing must still end at the job's
+/// real end, not when the drain finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_client_heartbeating_past_job_end_receives_every_frame_through_the_terminal() {
+    const FRAMES: u64 = 400;
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = small_buffer_tcp_pair().await;
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let now = unix_ms();
+    let guest = started_relay(&runtime, &fake, &broker, &requester, &c, &mut client, now).await;
+    let (mut reader, mut writer) = client.into_split();
+    let heartbeats = tokio::spawn(async move {
+        // Like ck-motor, keep heartbeating until the connection is gone; a
+        // failed write just means the host has closed.
+        loop {
+            if write_frame(&mut writer, &json!({"type":"heartbeat"}))
+                .await
+                .is_err()
+            {
+                return writer;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+    let runner = std::thread::spawn(move || {
+        let mut guest = guest;
+        let data = "A".repeat(8 * 1024);
+        for seq in 1..=FRAMES {
+            write_json(
+                &mut guest,
+                &json!({"type":"output","job_id":JOB,"seq":seq,"data":data}),
+            )
+            .unwrap();
+        }
+        write_json(&mut guest, &exit_terminal()).unwrap();
+        guest
+    });
+    // The job ends now, while nearly all of its output is still unread.
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            now + 3000,
+        )
+        .unwrap();
+    for seq in 1..=FRAMES {
+        let frame = read_frame(&mut reader)
+            .await
+            .unwrap_or_else(|error| panic!("output {seq}: {error:#}"));
+        assert_eq!(frame["seq"], seq);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert_eq!(read_frame(&mut reader).await.unwrap(), exit_terminal());
+    let hosted = read_frame(&mut reader).await.unwrap();
+    assert_eq!(hosted["type"], "hosted_terminal");
+    assert_clean_eof(&mut reader).await;
+    // The host holds the connection, and with it the lease's hold on the
+    // tenant, until the client closes.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !task.is_finished(),
+        "host must wait for the client to close"
+    );
+    heartbeats.abort();
+    drop(heartbeats.await);
+    drop(reader);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let _guest = runner.join().unwrap();
+    let h = runtime.host.lock().unwrap();
+    let billing = &h.snapshot.billing[JOB];
+    let usage = billing.usage.as_ref().unwrap();
+    assert_eq!((usage.started_at_ms, usage.ended_at_ms), (now, now + 3000));
+    assert_eq!(hosted["billed_vcpu_ms"], 3000);
+    assert!(
+        billing.delivered,
+        "a clean close after the terminal is delivery"
+    );
+    assert_eq!(h.snapshot.outbox.len(), 1);
+}
+
+/// Unread client data at lease end is what turns a close into a reset. The
+/// client here sends far more than the host will ever forward (the runner
+/// never reads), so the host's receive queue is full when the job ends. The
+/// client must still read the terminal frames and then a clean EOF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_never_resets_a_client_with_unread_data_at_lease_end() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = small_buffer_tcp_pair().await;
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let now = unix_ms();
+    let mut guest = started_relay(&runtime, &fake, &broker, &requester, &c, &mut client, now).await;
+    let (mut reader, mut writer) = client.into_split();
+    let flood = tokio::spawn(async move {
+        let padding = "h".repeat(1024);
+        while write_frame(&mut writer, &json!({"type":"heartbeat","pad":padding}))
+            .await
+            .is_ok()
+        {}
+        writer
+    });
+    // Let the flood fill the runner relay and the host's receive queue.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            now + 3000,
+        )
+        .unwrap();
+    guest = tokio::task::spawn_blocking(move || {
+        write_json(
+            &mut guest,
+            &json!({"type":"output","job_id":JOB,"seq":1,"data":"aGVsbG8="}),
+        )
+        .unwrap();
+        write_json(&mut guest, &exit_terminal()).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    // Give a host that drops the socket now time to do it before reading.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(read_frame(&mut reader).await.unwrap()["seq"], 1);
+    assert_eq!(read_frame(&mut reader).await.unwrap(), exit_terminal());
+    assert_eq!(
+        read_frame(&mut reader).await.unwrap()["type"],
+        "hosted_terminal"
+    );
+    assert_clean_eof(&mut reader).await;
+    flood.abort();
+    drop(flood.await);
+    drop(reader);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(guest);
+}
+
+/// A client that stops reading after the terminal and never closes is bounded
+/// by the drain deadline; it is not recorded as delivered, so usage waits for
+/// the delivery grace instead.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_never_closes_is_released_at_the_drain_deadline_without_delivery() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let now = unix_ms();
+    let mut guest = started_relay(&runtime, &fake, &broker, &requester, &c, &mut client, now).await;
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            now + 3000,
+        )
+        .unwrap();
+    write_json(&mut guest, &exit_terminal()).unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap(), exit_terminal());
+    assert_eq!(
+        read_frame(&mut client).await.unwrap()["type"],
+        "hosted_terminal"
+    );
+    assert_clean_eof(&mut client).await;
+    tokio::time::sleep(motor_host::server::CLIENT_DRAIN_DEADLINE / 2).await;
+    assert!(!task.is_finished());
+    tokio::time::sleep(motor_host::server::CLIENT_DRAIN_DEADLINE).await;
+    task.await.unwrap().unwrap();
+    let h = runtime.host.lock().unwrap();
+    assert!(!h.snapshot.billing[JOB].delivered);
+    assert!(h.snapshot.outbox.is_empty());
+    drop(client);
+}
+
+/// Motor's side of reattaching after the job ended: an attach token for an
+/// ended job whose output the runner still holds is relayed to the runner, and
+/// the client receives the remaining output, the terminal and the hosted
+/// terminal. Today the broker refuses that reattach once usage is settled.
+#[tokio::test]
+async fn attach_after_the_job_ended_replays_the_rest_through_the_hosted_terminal() {
+    let (runtime, fake, broker, requester, mut c) = fixture();
+    let now = unix_ms();
+    {
+        let mut h = runtime.host.lock().unwrap();
+        let (id, _) = h.claim(c.clone(), now).unwrap();
+        h.delivered(id).unwrap();
+        for (seq, kind, at) in [
+            (1, TenantEventKind::Admitted, now),
+            (2, TenantEventKind::Started, now),
+            (3, TenantEventKind::Terminal, now + 3000),
+        ] {
+            h.event("tenant", &event(seq, kind, Some(JOB), None), at)
+                .unwrap();
+        }
+        h.sample(
+            "tenant",
+            motor_host::billing::Metrics {
+                memory_bytes: 1048576,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+        h.watermark(JOB, 4).unwrap();
+        h.receive_terminal(JOB, exit_terminal(), now + 3100)
+            .unwrap();
+        h.close(id).unwrap();
+        assert!(h.snapshot.billing[JOB].hosted_terminal.is_some());
+    }
+    c.purpose = motor_lease::Purpose::Attach;
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB,"from_seq":3}),
+    )
+    .await
+    .unwrap();
+    let mut guest = peer(&fake).await;
+    tokio::task::spawn_blocking(move || {
+        let verified = read_json(&mut guest).unwrap();
+        assert_eq!(
+            (verified["type"].as_str(), verified["purpose"].as_str()),
+            (Some("verified_lease"), Some("attach"))
+        );
+        assert_eq!(read_json(&mut guest).unwrap()["type"], "hello");
+        assert_eq!(read_json(&mut guest).unwrap()["from_seq"], 3);
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        for seq in 3..=4 {
+            write_json(
+                &mut guest,
+                &json!({"type":"output","job_id":JOB,"seq":seq,"data":""}),
+            )
+            .unwrap();
+        }
+        write_json(&mut guest, &exit_terminal()).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+    assert_eq!(read_frame(&mut client).await.unwrap()["seq"], 3);
+    assert_eq!(read_frame(&mut client).await.unwrap()["seq"], 4);
+    assert_eq!(read_frame(&mut client).await.unwrap(), exit_terminal());
+    let hosted = read_frame(&mut client).await.unwrap();
+    assert_eq!(hosted["billed_vcpu_ms"], 3000);
+    assert_clean_eof(&mut client).await;
+    drop(client);
+    task.await.unwrap().unwrap();
 }
