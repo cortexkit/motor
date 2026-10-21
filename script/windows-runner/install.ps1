@@ -60,7 +60,7 @@ function New-OwnedUser([string]$Name) {
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $secret = 'Aa1!' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
-    New-LocalUser -Name $Name -Password (ConvertTo-SecureString $secret -AsPlainText -Force) -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires -Description 'Owned by MotorRunner installer; remove with its uninstall script' | Out-Null
+    New-LocalUser -Name $Name -Password (ConvertTo-SecureString $secret -AsPlainText -Force) -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires -Description 'Owned by MotorRunner; remove with its uninstall' | Out-Null
     $user = Get-LocalUser $Name
     $users = Get-LocalGroup -SID 'S-1-5-32-545'
     if (-not (Get-LocalGroupMember $users | Where-Object SID -eq $user.SID)) { Add-LocalGroupMember $users -Member $Name }

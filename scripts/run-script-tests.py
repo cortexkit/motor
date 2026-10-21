@@ -41,6 +41,7 @@ TEST_FILES = [
     "script/windows-vm/test_control.py",
     "script/windows-vm/test_provisioning.py",
     "script/windows-runner/test_cache_manifest.py",
+    "script/windows-runner/test_install_script.py",
     "script/hyperv-spike/test_seed.py",
     "script/hyperv-spike/test_account_serial.py",
     "scripts/tests/test_safety_fences.py",
