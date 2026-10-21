@@ -1187,10 +1187,10 @@ fn allow_spill_projection_distinguishes_false_and_true_but_not_requester_rotatio
     }
 }
 
-/// The broker requires `allow_spill` on every lease body. The client type still
-/// parses a body without it, so requests ck-motor stored before it always sent
-/// the member load, but the fake answers such a body 400 `bad_request` and
-/// books nothing, as it does for any non-boolean value.
+/// The broker requires `allow_spill` on every lease body. `LeaseRequest` still
+/// deserializes a body without it, so lease requests ck-motor stored before it
+/// always sent the member still load, but the fake answers such a body 400
+/// `bad_request` and books nothing, as it does for any non-boolean value.
 #[test]
 fn allow_spill_is_required_and_must_be_boolean() {
     let mut body = serde_json::to_value(lease_request()).unwrap();
