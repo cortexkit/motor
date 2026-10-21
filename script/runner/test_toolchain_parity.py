@@ -325,6 +325,15 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(parity.main(), 1)
         self.assertFalse(json.loads(out.getvalue())['passed'])
 
+    def test_capture_cli_measures_the_tools_the_manifest_names(self):
+        seen = []
+        with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture']), \
+             patch.object(parity, 'capture', side_effect=lambda manifest=None: seen.append(manifest) or {}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(parity.main(), 0)
+        self.assertEqual(1, len(seen))
+        self.assertIn('bun-1.3.14', seen[0]['tools'])
+
     def test_check_cli_fails_when_git_version_differs_from_the_server(self):
         actual = self.observed()
         actual['tools']['git']['version'] = 'git version 2.43.0'

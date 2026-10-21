@@ -1,40 +1,4 @@
 {
-  "windows_cross": {
-    "cargo_xwin": "0.23.1",
-    "vs_manifest": "17",
-    "manifest_note": "cargo-xwin 0.23.1 rejects minor 17.14 in --xwin-version despite its help text; component versions remain exact and the resolved manifest/cache content hashes are recorded.",
-    "sdk": "10.0.26100",
-    "crt": "14.44.17.14",
-    "vs_channel_build": "17.14.37806.7",
-    "package_manifest_sha256": "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
-    "resolved_components": {
-      "Microsoft.VC.14.44.17.14.CRT.Headers": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.Headers.base": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.Headers.Resources": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop": "14.44.35226",
-      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base": "14.44.35226",
-      "Win11SDK_10.0.26100": "10.0.26100.15"
-    },
-    "cache_tree_sha256": "3c8ae4a1113c0d056b443311753a5d4fcaab0baf4d208bc9885ef5cd324d406f",
-    "sdk_subdir": "xwin",
-    "cache_scope_note": "The unchanged tree hash covers Microsoft's xwin/ payload subtree, with xwin/ in each relative path. cargo-xwin creates a host clang-cl symlink and cmake/ wrappers outside it while building; those are generated tool configuration, not SDK/CRT inputs.",
-    "prep_toolchain": {
-      "version": "1.99.0",
-      "target": "x86_64-pc-windows-msvc",
-      "components": {
-        "cargo": "6201b8dcea8cc55ccfa12e842adf1b2c2aa96490a6cb4f129bf03f2df08c80c9",
-        "rustc": "20fed82e629c1ed145f9e9bdee9aad65e790d4237a49bcfc61221eda69e35b14",
-        "rust-std": "adadeafff137a7610884696912b853d4de259c4299ab035b66661e2e0f923ff0"
-      },
-      "cargo_exe_sha256": "c9b44417dc8228b81923a1068a3c09e32d2793f2cced2a816789cf433c1f0d46",
-      "rustc_exe_sha256": "fc40f1c8b65095a22a48c111aadc279c26a049b7e4161e8b99ffe3eb23873e86"
-    },
-    "arch": "x86_64",
-    "variant": "desktop",
-    "cache": "target/windows-cross/cache",
-    "tools": "target/windows-cross/tools",
-    "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation."
-  },
   "accepted_os_differences": [
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: Boat builds the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of Ubuntu's git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
@@ -59,7 +23,7 @@
       "acl": "2.3.2-2",
       "binaryen": "120-4build1",
       "build-essential": "12.12ubuntu2.26.04.2",
-      "ca-certificates": "20260601~26.04.1",
+      "ca-certificates": "20260816ubuntu0.26.04.1",
       "clang": "1:21.1.6-71",
       "curl": "8.18.0-1ubuntu2.8",
       "g++-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
@@ -82,7 +46,7 @@
       "unzip": "6.0-29ubuntu1",
       "util-linux": "2.41.3-3ubuntu2.2",
       "xfsprogs": "6.18.0-3",
-      "xz-utils": "5.8.3-1"
+      "xz-utils": "5.8.3-1ubuntu0.1"
     },
     "required": [
       "python3",
@@ -113,7 +77,7 @@
       "g++-mingw-w64-x86-64"
     ]
   },
-  "capture_sha256": "844f7432dfa9b83888e8fe36af2e20467f77b7189c96bc24d4419b9d4f1e6467",
+  "capture_sha256": "cd01ba4dede6681441ed7b9884f105476c53657e5d48a4dad6e7b3adee6a9c26",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
@@ -652,5 +616,41 @@
       "realpath_suffix": "-gcc-win32",
       "version_pattern": "x86_64-w64-mingw32-gcc \\(GCC\\) [0-9.]+-win32"
     }
+  },
+  "windows_cross": {
+    "arch": "x86_64",
+    "cache": "target/windows-cross/cache",
+    "cache_scope_note": "The unchanged tree hash covers Microsoft's xwin/ payload subtree, with xwin/ in each relative path. cargo-xwin creates a host clang-cl symlink and cmake/ wrappers outside it while building; those are generated tool configuration, not SDK/CRT inputs.",
+    "cache_tree_sha256": "3c8ae4a1113c0d056b443311753a5d4fcaab0baf4d208bc9885ef5cd324d406f",
+    "cargo_xwin": "0.23.1",
+    "crt": "14.44.17.14",
+    "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation.",
+    "manifest_note": "cargo-xwin 0.23.1 rejects minor 17.14 in --xwin-version despite its help text; component versions remain exact and the resolved manifest/cache content hashes are recorded.",
+    "package_manifest_sha256": "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
+    "prep_toolchain": {
+      "cargo_exe_sha256": "c9b44417dc8228b81923a1068a3c09e32d2793f2cced2a816789cf433c1f0d46",
+      "components": {
+        "cargo": "6201b8dcea8cc55ccfa12e842adf1b2c2aa96490a6cb4f129bf03f2df08c80c9",
+        "rust-std": "adadeafff137a7610884696912b853d4de259c4299ab035b66661e2e0f923ff0",
+        "rustc": "20fed82e629c1ed145f9e9bdee9aad65e790d4237a49bcfc61221eda69e35b14"
+      },
+      "rustc_exe_sha256": "fc40f1c8b65095a22a48c111aadc279c26a049b7e4161e8b99ffe3eb23873e86",
+      "target": "x86_64-pc-windows-msvc",
+      "version": "1.99.0"
+    },
+    "resolved_components": {
+      "Microsoft.VC.14.44.17.14.CRT.Headers": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.Headers.Resources": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.Headers.base": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop": "14.44.35226",
+      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base": "14.44.35226",
+      "Win11SDK_10.0.26100": "10.0.26100.15"
+    },
+    "sdk": "10.0.26100",
+    "sdk_subdir": "xwin",
+    "tools": "target/windows-cross/tools",
+    "variant": "desktop",
+    "vs_channel_build": "17.14.37806.7",
+    "vs_manifest": "17"
   }
 }

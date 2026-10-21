@@ -494,7 +494,10 @@ def main():
     if bool(args.cargo_seed_manifest) != bool(args.cargo_seed_sha256):
         parser.error('--cargo-seed-manifest and --cargo-seed-sha256 must be supplied together')
     if args.capture:
-        result = capture()
+        # The manifest names tools beyond the built-in list (pinned variants such
+        # as bun-1.3.14) and the GNU coreutils locations; without it the capture
+        # omits them and --from-capture refuses it as unmeasured.
+        result = capture(json.loads(args.manifest.read_text()))
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(
