@@ -143,27 +143,24 @@ The exact body fields, in canonical order, are:
 
 ```text
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
- placement_hint, avoid_host, timeout_s, requester_jwk}
+ placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill}
 ```
 
-plus optional boolean members `shadow` and `allow_spill`, described under "Shadow leases" and
-"Per-lease spill policy" below. No other members are accepted.
+plus the optional boolean member `shadow`. `allow_spill` is a required boolean, described under
+"Per-lease spill policy" below; `shadow` is described under "Shadow leases". No other members
+are accepted.
 
 The canonical lease hash uses this exact member order:
 
 ```text
-{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill?, shadow? }
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill, shadow? }
 ```
 
-It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` and before the
-optional `shadow`; it is included only when the request has the key, with its exact boolean
-value (both `true` and `false` are hashed when present). `shadow` stays last and is included
-only when true. `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`,
-the exact canonical JSON string hashed, for clients to byte-compare. Omitting
-`allow_spill` leaves every existing request's hash byte-for-byte unchanged; explicitly sending
-`true` or `false` changes the hash. A re-request must repeat both its presence and value or
-receive 409 `job_conflict` wherever a differing lease hash conflicts. In particular, absent and
-`true` have identical spill behavior but different request identities.
+It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` with its exact boolean
+value (`true` and `false` hash differently). `shadow` stays last and is included only when true.
+`test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`, the exact canonical
+JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
+value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
 
 `vcpus` is 1–64 and `timeout_s` 10–7200. `net` is boolean. There is no client `mem_mib` field:
 the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
@@ -196,7 +193,7 @@ After authentication and schema validation, checks proceed in this order:
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
    `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
    `no_host_fits`. Before returning a refusal, repeat the existing-job check so a concurrent
-   successful lease wins over that refusal. When `allow_spill` is not `false`, Boat spill is
+   successful lease wins over that refusal. When `allow_spill` is `true`, Boat spill is
    enabled and the platform equals `BOAT_PLATFORM`, either 400 or 503 refusal is replaced by the
    spill path in [Boat placements](#boat-placements), and so is `no_host_fits` when a Boat size
    fits the lease.
@@ -496,16 +493,16 @@ is configured; with it off no lease spills, while sandboxes that already exist a
 and cleaned up. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
 serves at most one live lease**. Placement hints never select a sandbox.
 
-**Per-lease spill policy.** The optional `allow_spill` member is strictly a JSON boolean; any
-other value is 400 `bad_request`. `false` requires a registered host: when placement refuses,
+**Per-lease spill policy.** The required `allow_spill` member is strictly a JSON boolean; a body
+without it, or with any other value, is 400 `bad_request` before any job claim or Boat call.
+`false` requires a registered host: when placement refuses,
 the broker returns that refusal unchanged (including its status, body and Retry-After), never
 claims or creates a Boat sandbox, makes no Boat calls and leaves no spill record for that lease.
 For example, a full registered fleet returns 503 `no_capacity` with Retry-After `5`, and a job
 larger than every registered host's per-job ceiling returns 422 `no_host_fits` whose
 `max_vcpus` counts registered hosts only.
-`true` or omission preserves ordinary spill behavior. This is per lease, not per tenant, so
-callers sharing a fleet account can choose independently. The field is optional during the
-cutover; once ck-motor always sends it, the broker will make it required in a later change.
+`true` allows ordinary spill behavior. This is per lease, not per tenant, so
+callers sharing a fleet account can choose independently.
 It does not override the Boat enablement, platform, size or budget gates. `shadow: true` with
 `allow_spill: false` is contradictory and returns 400 `bad_request` during schema validation,
 before shadow permission or any job claim is checked.
@@ -601,7 +598,7 @@ machine-time meter per run window) are recorded in D1 only, until a billing rule
 the same job on the build server; its caller is served elsewhere. The lease body may carry
 `shadow: true`. Absent and `false` mean an ordinary lease and canonicalize identically: the
 canonical lease hash omits the member then, so ordinary leases hash exactly as before, and appends
-`"shadow":true` as the last member when it is true (after `allow_spill`, if present).
+`"shadow":true` as the last member, after `allow_spill`, when it is true.
 A re-request must repeat it. Any other value is 400 `bad_request`.
 
 - Only accounts with the operator-set shadow permission in D1 `allowances` may send it; any other

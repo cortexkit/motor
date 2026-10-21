@@ -19,10 +19,10 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors nine canonical files
-verbatim: the contract and `settled-reattach.json` at commit `c8600ac`,
-`no-host-fits-lease.json` at `916347e`, `no-spill-lease.json` at `95fd2d1`,
-`lease.json` and `boat-lease.json` at `3d70bcf`, and the other vectors at
+`test-vectors/runners/`. `contracts/cloud/` mirrors ten canonical files
+verbatim: the contract, `lease.json`, `boat-lease.json`, `shadow-lease.json`
+and `settled-reattach.json` at commit `e483f20`, `no-host-fits-lease.json` at
+`916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
 `00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
@@ -32,9 +32,16 @@ or rewrite the canonical bytes.
 `no-spill-lease.json` pins the ordinary lease-hash projection, excluding
 `requester_jwk` and including an explicitly false `allow_spill` after `timeout_s`.
 It also records the real broker's `503 no_capacity` and `Retry-After` when only a
-full registered host is selectable, even with Boat enabled. Existing vectors
-retain their bytes and digests; absence of `allow_spill` is distinct from either
-boolean in a lease hash, so re-requests preserve both presence and value.
+full registered host is selectable, even with Boat enabled.
+
+Since `e483f20` the broker requires `allow_spill` on every lease body and
+answers a body without it 400 `bad_request` before claiming the job; the fake
+broker does the same. `lease.json`, `boat-lease.json` and
+`settled-reattach.json` now send `"allow_spill": true`. `shadow-lease.json`
+records a Boat shadow lease (`allow_spill: true`, then `shadow: true`) and its
+`lease_hash`: the ordinary projection without `requester_jwk`, with
+`"shadow":true` as the last member after `allow_spill`. A re-request must
+repeat the same `allow_spill` value.
 
 `no-host-fits-lease.json` records the broker's final refusal for a no-spill
 16-vCPU lease when the only registered host's per-job ceiling is 8 vCPUs: HTTP

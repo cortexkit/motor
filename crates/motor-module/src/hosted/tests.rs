@@ -863,12 +863,16 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
         serde_json::from_value(v["request"]["body"]["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
-        None,
+        // An ordinary spilled lease, as `Client::run` builds it for a job that
+        // was not routed to hosted runners by repository.
+        Some(true),
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
     // The broker's lease hash takes the fields in this order, and
-    // `avoid_host` comes right after `placement_hint`.
+    // `avoid_host` comes right after `placement_hint`. ck-motor sends
+    // `allow_spill` where the hash places it, before `requester_jwk`; the
+    // broker accepts members in any order.
     let text = serde_json::to_string(&body).unwrap();
     let positions: Vec<_> = [
         "job_id",
@@ -880,6 +884,7 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         "placement_hint",
         "avoid_host",
         "timeout_s",
+        "allow_spill",
         "requester_jwk",
     ]
     .iter()
@@ -998,10 +1003,57 @@ fn cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash() {
     let spill = canonical_lease_bytes(&changed);
     assert_ne!(
         absent, spill,
-        "Absent and true have different lease hashes despite the same placement policy"
+        "An absent member and true project to different lease-hash inputs"
     );
     assert_ne!(absent, canonical);
     assert_ne!(spill, canonical);
+}
+
+/// CLOUD's `no-host-fits-lease.json` records a 16-vCPU repository-routed lease
+/// (`allow_spill: false`) and its lease hash; ck-motor's body for the same job
+/// has the same members and the same hash.
+#[test]
+fn cloud_no_host_fits_request_matches_the_vector_body_and_hash() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-host-fits-lease.json"
+    ))
+    .unwrap();
+    let expected: motor_lease::LeaseRequest =
+        serde_json::from_str(vector["request"]["body_bytes"].as_str().unwrap()).unwrap();
+    assert_eq!(expected.allow_spill, Some(false));
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_timeout(expected.timeout_s)
+    .with_weight_hint(expected.vcpus);
+    if expected.net {
+        request.network = Some(Network::Outbound);
+    }
+    let body = lease_body(
+        Uuid::parse_str(&expected.job_id).unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        Some(false),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        vector["request"]["body"]
+    );
+    assert_eq!(
+        motor_lease::sha256_hex(canonical_lease_bytes(&body).as_bytes()),
+        vector["lease_hash"]
+    );
 }
 
 #[tokio::test]
@@ -1032,11 +1084,15 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
         route.lease_request = Some(body);
         let storage = stored(&scratch, id, route.clone());
         for _ in 0..2 {
-            let (channel, _) = Client::new(route.clone())
-                .run(id, &request, &storage)
-                .await
-                .unwrap();
-            drop(channel);
+            let result = Client::new(route.clone()).run(id, &request, &storage).await;
+            if allow_spill.is_some() {
+                drop(result.unwrap().0);
+            } else {
+                // A request stored before ck-motor always sent allow_spill is
+                // re-sent unchanged; the broker now requires the member and
+                // refuses it as malformed, which the client reports as rejected.
+                assert_eq!(result.err(), Some(Error::Rejected));
+            }
         }
         let bodies = h.lease_bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2);

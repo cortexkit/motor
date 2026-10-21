@@ -432,7 +432,9 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
         serde_json::from_value(booked_request["placement_hint"].clone()).unwrap(),
         serde_json::from_value(booked_request["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
-        None,
+        // Every lease ck-motor sends that can reach Boat (spill and shadow)
+        // allows spilling.
+        Some(true),
     )
     .unwrap();
     let built = serde_json::to_value(&lease_request).unwrap();
@@ -449,6 +451,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
             "placement_hint",
             "avoid_host",
             "timeout_s",
+            "allow_spill",
         ] {
             assert_eq!(
                 built[field], expected[field],

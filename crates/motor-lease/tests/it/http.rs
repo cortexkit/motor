@@ -340,6 +340,22 @@ fn fake_binary_max_vcpus_flag_answers_no_host_fits_over_http() {
     assert_eq!(server.post("/v1/leases", &request).0, 201);
 }
 
+/// Over real HTTP, the fake executable answers a lease body without
+/// `allow_spill` 400 `bad_request`, as the broker does, and still books the
+/// same lease once the member is present.
+#[test]
+fn fake_binary_refuses_a_lease_without_allow_spill_over_http() {
+    let server = Server::start(&[]);
+    let mut body = serde_json::to_value(lease_request()).unwrap();
+    body.as_object_mut().unwrap().remove("allow_spill");
+    assert_eq!(
+        server.post("/v1/leases", &body),
+        (400, json!({"error":"bad_request"}))
+    );
+    body["allow_spill"] = json!(false);
+    assert_eq!(server.post("/v1/leases", &body).0, 201);
+}
+
 #[test]
 fn http_release_route_is_idempotent_and_admission_cancels_pending_release() {
     let server = Server::start(&[]);

@@ -1,6 +1,6 @@
 use super::common::*;
 use ed25519_dalek::SigningKey;
-use motor_lease::fake::{BrokerRequest, FakeBroker};
+use motor_lease::fake::{BrokerReply, BrokerRequest, FakeBroker};
 use motor_lease::*;
 use serde_json::json;
 
@@ -1160,36 +1160,63 @@ fn routing_authentication_and_media_type_checks_have_contract_precedence() {
 }
 
 #[test]
-fn allow_spill_projection_distinguishes_absent_false_and_true_but_not_requester_rotation() {
-    for initial in [None, Some(false), Some(true)] {
+fn allow_spill_projection_distinguishes_false_and_true_but_not_requester_rotation() {
+    for initial in [false, true] {
         let mut b = broker();
         let mut request = lease_request();
-        request.allow_spill = initial;
+        request.allow_spill = Some(initial);
         issued(&mut b, &request, NOW);
         request.requester_jwk =
             RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key());
         issued(&mut b, &request, NOW + 1000);
-        for changed in [None, Some(false), Some(true)] {
-            if changed == initial {
-                continue;
-            }
-            request.allow_spill = changed;
-            assert_eq!(
-                post(&mut b, "/v1/leases", &request, NOW + 2000).body,
-                json!({"error":"job_conflict"}),
-                "{initial:?} -> {changed:?}"
-            );
-        }
+        request.allow_spill = Some(!initial);
+        assert_eq!(
+            post(&mut b, "/v1/leases", &request, NOW + 2000).body,
+            json!({"error":"job_conflict"}),
+            "{initial} -> {}",
+            !initial
+        );
+        // Dropping the member on a re-request is a malformed body, refused
+        // before the existing job is consulted.
+        request.allow_spill = None;
+        assert_eq!(
+            post(&mut b, "/v1/leases", &request, NOW + 2000),
+            BrokerReply::error(400, "bad_request"),
+            "{initial} -> absent"
+        );
     }
 }
 
+/// The broker requires `allow_spill` on every lease body. `LeaseRequest` still
+/// deserializes a body without it, so lease requests ck-motor stored before it
+/// always sent the member still load, but the fake answers such a body 400
+/// `bad_request` and books nothing, as it does for any non-boolean value.
 #[test]
-fn allow_spill_is_optional_for_old_bodies_but_must_be_boolean_when_present() {
+fn allow_spill_is_required_and_must_be_boolean() {
     let mut body = serde_json::to_value(lease_request()).unwrap();
     body.as_object_mut().unwrap().remove("allow_spill");
     let parsed: LeaseRequest = serde_json::from_value(body.clone()).unwrap();
     assert_eq!(parsed.allow_spill, None);
-    assert_eq!(serde_json::to_value(parsed).unwrap(), body);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+    let mut b = broker();
+    assert_eq!(
+        post(&mut b, "/v1/leases", &body, NOW),
+        BrokerReply::error(400, "bad_request")
+    );
+    // Nothing was claimed: the job is unknown to reattach.
+    assert_eq!(
+        post(
+            &mut b,
+            &format!("/v1/leases/{}/reattach", parsed.job_id),
+            &ReattachRequest {
+                requester_jwk: parsed.requester_jwk.clone(),
+            },
+            NOW,
+        ),
+        BrokerReply::error(404, "job_unknown")
+    );
+    body["allow_spill"] = json!(true);
+    assert_eq!(post(&mut b, "/v1/leases", &body, NOW).status, 201);
     for bad in [serde_json::Value::Null, json!(0), json!("false")] {
         body["allow_spill"] = bad;
         assert_eq!(
