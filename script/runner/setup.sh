@@ -158,6 +158,13 @@ fi
 # shellcheck disable=SC2086 # policy_args is empty or two validated words.
 ssh -o BatchMode=yes -o ForwardAgent=no "$host" python3 - $policy_args < "$script_dir/inbound_policy.py"
 "$script_dir/sync.sh" "$root"
+# Keep the versioned runtime binaries available through the same job-visible
+# paths on the build server as on Boat; Cargo tool installation remains separate.
+ssh -o BatchMode=yes -o ForwardAgent=no "$host" "bash -s -- $name" <<'REMOTE'
+set -euo pipefail
+cd "/srv/build/src/$1"
+bash script/runner/install-tools.sh build-server runtime-only
+REMOTE
 # Some source copies provide a checksum-verified NATS fixture installer.
 # The motor repository has no NATS tests or installer; provision it only when
 # the source repository requests it, not as a dependency on another checkout.

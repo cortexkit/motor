@@ -1,13 +1,16 @@
 import importlib.util
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 
@@ -24,6 +27,14 @@ class CaptureTests(unittest.TestCase):
                                (FileNotFoundError("missing"), "missing")):
             with self.subTest(error=message), patch.object(parity.subprocess, "run", side_effect=error):
                 self.assertEqual(parity.binary_version("/bin/tool", {}), {"version": None, "error": message})
+
+    def test_package_alias_version_comes_from_its_pinned_package(self):
+        observed = {'pnpm': {'version': '11.1.2', 'exit_code': 0}}
+        with patch.object(parity, 'binary_version', side_effect=AssertionError('alias must not be executed')):
+            self.assertEqual({'version': '11.1.2', 'exit_code': 0},
+                             parity.tool_version('/usr/local/bin/pnpx', {}, observed, 'pnpm'))
+        self.assertEqual({'version': None, 'exit_code': 1},
+                         parity.tool_version('/usr/local/bin/pnpx', {}, {}, 'pnpm'))
 
     def test_sccache_inventory_never_runs_a_cache_process(self):
         with patch.object(parity.subprocess, "run") as run:
@@ -113,7 +124,9 @@ class ParityTests(unittest.TestCase):
         for name, expected in manifest['cargo_binaries'].items():
             if 'matches' in expected:
                 bins[name]['sha256'] = bins[expected['matches']]['sha256']
-        tools = {name: {'path': spec['path'], 'realpath': spec['path'] + spec.get('realpath_suffix', ''),
+        tools = {name: {'path': spec['path'],
+                        'realpath': spec['path'] + spec.get('realpath_suffix',
+                                                             spec.get('realpath_suffix_by_role', {}).get(role, '')),
                         'version': spec.get('version', spec.get('observed_build_server_version')), 'exit_code': 0}
                  for name, spec in manifest['tools'].items()}
         tools.update({name: {'path': path, 'version': name[3:] + ' (GNU coreutils) 9.7', 'exit_code': 0}
@@ -134,6 +147,8 @@ class ParityTests(unittest.TestCase):
                     'supervisor_cache': '/motor-tools/sccache' if role == 'build-server' else None,
                     'wrapper_readonly': True, 'backend_readonly': True,
                 },
+                'local_bin_entries': sorted(name for name, spec in manifest['tools'].items()
+                                            if spec['path'].startswith('/usr/local/bin/')),
                 'mountinfo': '1 0 0:0 / /home/ubuntu/.rustup ro - ext4 /dev/example rw',
                 'cargo_registry': self.registry()}
 
@@ -248,6 +263,33 @@ class ParityTests(unittest.TestCase):
         del actual['apt_packages']['libsqlite3-dev']
         self.assertFalse(self.report(actual)['passed'])
 
+    def test_build_server_job_visible_tools_are_in_the_catalogue(self):
+        actual = self.observed()
+        actual['local_bin_entries'].extend(
+            ('bun-1.3.14', 'node22', 'corepack', 'npx', 'pnpx', 'pnx'))
+        errors = self.report(actual)['errors']
+        self.assertFalse(errors, errors)
+
+    def test_uncatalogued_local_bin_entries_fail_except_host_services(self):
+        actual = self.observed()
+        actual['local_bin_entries'].extend(
+            ('unlisted-tool', 'motor-host-agent', 'firecracker-worker', 'jailer-worker', 'firecracker', 'jailer'))
+        errors = self.report(actual)['errors']
+        inventory_errors = [error for error in errors if error.startswith('uncatalogued job-visible /usr/local/bin entries:')]
+        self.assertEqual(['uncatalogued job-visible /usr/local/bin entries: firecracker, jailer, unlisted-tool'],
+                         inventory_errors)
+
+    def test_local_bin_capture_includes_only_executable_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / 'visible'
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o755)
+            (root / 'non-executable').write_text('data')
+            (root / 'directory').mkdir()
+            (root / 'visible-link').symlink_to(executable)
+            self.assertEqual(['visible', 'visible-link'], parity.local_bin_entries(root))
+
     def test_readonly_rustup_and_exact_job_path_are_checked(self):
         actual = self.observed()
         actual['mountinfo'] = actual['mountinfo'].replace('ro -', 'rw -')
@@ -257,7 +299,7 @@ class ParityTests(unittest.TestCase):
         self.assertFalse(self.report(actual, job=True)['passed'])
 
     def test_boat_cache_artifact_hashes_bind_the_build_record_to_live_binaries(self):
-        actual = self.observed()
+        actual = self.observed('boat')
         actual['sccache_artifacts'] = {'inputs_sha256': self.manifest['sccache']['inputs_sha256'], 'binaries': {
             name: actual['cargo_binaries'][name]['sha256'] for name in self.manifest['sccache']['build_server_sha256']}}
         self.assertEqual(parity.differences(self.manifest, actual, role='boat'), [])
@@ -287,6 +329,21 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = json.loads(parity.MANIFEST.read_text())
+            archive_dir = root / 'archive-fixtures'
+            archive_dir.mkdir()
+            bun_payload = b'#!/bin/sh\necho 1.3.14\n'
+            bun_archive = archive_dir / 'bun.zip'
+            with zipfile.ZipFile(bun_archive, 'w') as archive:
+                archive.writestr('bun-linux-x64/bun', bun_payload)
+            node_payload = b'#!/bin/sh\necho v22.22.1\n'
+            node_archive = archive_dir / 'node.tar.xz'
+            with tarfile.open(node_archive, 'w:xz') as archive:
+                entry = tarfile.TarInfo('node-v22.22.1-linux-x64/bin/node')
+                entry.size = len(node_payload)
+                entry.mode = 0o755
+                archive.addfile(entry, io.BytesIO(node_payload))
+            for name, archive_path in (('bun-1.3.14', bun_archive), ('node22', node_archive)):
+                manifest['tools'][name]['archive']['sha256'] = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             (root / 'toolchain.json').write_text(json.dumps(manifest))
             script = root / 'install-tools.sh'
             script.write_text((parity.HERE / 'install-tools.sh').read_text().replace('/srv/build', str(root)))
@@ -295,20 +352,45 @@ class InstallerTests(unittest.TestCase):
             cargo = fake_bin / 'cargo'
             cargo.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
                              'args = sys.argv[1:]\n'
+                             'open(os.environ["TEST_CARGO_LOG"], "a").write("install\\n")\n'
                              'manifest = json.loads(pathlib.Path(os.environ["TEST_MANIFEST"]).read_text())\n'
                              'tool = next(row for row in manifest["cargo_installs"] if row["crate"] == args[-1])\n'
                              'root = pathlib.Path(args[args.index("--root")+1] if "--root" in args else os.environ["CARGO_HOME"])\n'
                              '(root / "bin").mkdir(parents=True, exist_ok=True)\n'
-                             'for name in tool["bins"]: (root / "bin" / name).write_text("binary:" + " ".join(args))\n')
+                              'for name in tool["bins"]: (root / "bin" / name).write_text("binary:" + " ".join(args))\n')
             cargo.chmod(0o755)
-            result = subprocess.run(['bash', str(script)], env=dict(os.environ, TEST_MANIFEST=str(root / 'toolchain.json'),
-                                    PATH=str(fake_bin) + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
+            curl = fake_bin / 'curl'
+            curl.write_text('#!/usr/bin/env python3\nimport os, pathlib, shutil, sys\n'
+                            'args = sys.argv[1:]\n'
+                            'url = next(arg for arg in args if arg.startswith("https://"))\n'
+                            'target = pathlib.Path(args[args.index("-o") + 1])\n'
+                            'source = pathlib.Path(os.environ["TEST_ARCHIVE_DIR"]) / ("bun.zip" if "bun-linux-x64.zip" in url else "node.tar.xz")\n'
+                            'shutil.copyfile(source, target)\n')
+            curl.chmod(0o755)
+            env = dict(os.environ, TEST_MANIFEST=str(root / 'toolchain.json'), TEST_ARCHIVE_DIR=str(archive_dir),
+                       TEST_CARGO_LOG=str(root / 'cargo-installs.log'),
+                       TOOLCHAIN_INSTALL_ROOT=str(root / 'sysroot'),
+                       PATH=str(fake_bin) + os.pathsep + os.environ['PATH'])
+            result = subprocess.run(['bash', str(script), 'boat'], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             bins = root / 'cargo-home/bin'
             self.assertIn('--locked --version =0.9.138 cargo-nextest', (bins / 'cargo-nextest').read_text())
             default = bins / 'ckdev-mutate'
             self.assertEqual(default.read_bytes(), (bins / 'ckdev-mutate-9d6b663d').read_bytes())
             self.assertTrue((bins / 'worker-codegen').is_file())
+            sysroot = root / 'sysroot'
+            self.assertEqual(str(sysroot / 'usr/local/lib/bun/1.3.14/bin/bun'),
+                             os.readlink(sysroot / 'usr/local/bin/bun-1.3.14'))
+            self.assertEqual(bun_payload, (sysroot / 'usr/local/lib/bun/1.3.14/bin/bun').read_bytes())
+            self.assertEqual(str(sysroot / 'usr/local/lib/nodejs/22.22.1/bin/node'),
+                             os.readlink(sysroot / 'usr/local/bin/node22'))
+            self.assertEqual(node_payload,
+                             (sysroot / 'usr/local/lib/nodejs/22.22.1/bin/node').read_bytes())
+            cargo_log = (root / 'cargo-installs.log').read_text()
+            runtime = subprocess.run(['bash', str(script), 'build-server', 'runtime-only'], env=env,
+                                     capture_output=True, text=True)
+            self.assertEqual(runtime.returncode, 0, runtime.stderr)
+            self.assertEqual(cargo_log, (root / 'cargo-installs.log').read_text())
             for tool in manifest['cargo_installs']:
                 if 'git' in tool:
                     self.assertIn('--rev ' + tool['rev'], (bins / ('ckdev-mutate-' + tool['rev'][:8])).read_text())

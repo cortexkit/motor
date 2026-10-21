@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Install every Cargo tool pinned in toolchain.json into the shared Cargo
-# home. Run on the server as ubuntu, from a motor checkout:
-#   bash script/runner/install-tools.sh
-# cargo skips a tool already installed at the pinned version, so rerunning is
-# cheap. Removing a line does not uninstall the tool or remove its links.
+# Install the pinned Cargo tools and versioned runtime archives from
+# toolchain.json. Run on the build server as ubuntu, or on Boat as root:
+#   bash script/runner/install-tools.sh [build-server|boat] [runtime-only]
+# cargo skips registry tools already installed at the pinned version. Removing
+# a tool entry from toolchain.json does not uninstall the tool or remove its links.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
+role="${1:-build-server}"
+mode="${2:-all}"
+case "$role" in build-server|boat) ;; *) echo "unknown install role: $role" >&2; exit 2 ;; esac
+case "$mode" in all|runtime-only) ;; *) echo "unknown install mode: $mode" >&2; exit 2 ;; esac
 export CARGO_HOME=/srv/build/cargo-home RUSTUP_HOME=/home/ubuntu/.rustup TMPDIR=/srv/build/tmp
 export PATH="$CARGO_HOME/bin:$PATH"
 # cargo keeps one install per crate in a root, so each revision of a git tool
@@ -23,6 +27,7 @@ place() {
   mv -fT "$CARGO_HOME/bin/.$2.tmp" "$CARGO_HOME/bin/$2"
 }
 
+if [ "$mode" = all ]; then
 tools=$(python3 -c '
 import json, sys
 for tool in json.load(open(sys.argv[1]))["cargo_installs"]:
@@ -50,4 +55,76 @@ while read -r crate spec rev flag; do
       ;;
   esac
 done <<< "$tools"
-ls -l "$CARGO_HOME/bin"
+  ls -l "$CARGO_HOME/bin"
+fi
+
+install_root="${TOOLCHAIN_INSTALL_ROOT:-}"
+rooted() { printf '%s%s' "$install_root" "$1"; }
+as_root() {
+  if [ -n "$install_root" ] || [ "$EUID" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+mkdir -p "$TMPDIR"
+archives=$(python3 - "$here/toolchain.json" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+for name, spec in sorted(manifest["tools"].items()):
+    archive = spec.get("archive")
+    if archive:
+        print("|".join(str(value) for value in (
+            name, spec["version"], spec["path"], archive["url"], archive["sha256"],
+            archive["format"], archive["install_dir"], archive["install_path"],
+            archive.get("archive_path", ""), archive.get("strip_components", 0))))
+PY
+)
+while IFS='|' read -r name version link url sha format install_dir install_path archive_path strip_components; do
+  [ -n "$name" ] || continue
+  if [ "$name" = node22 ] && [ "$role" = build-server ]; then
+    node22="$(rooted "$link")"
+    actual=$("$node22" --version 2>/dev/null || true)
+    [ "$actual" = "$version" ] || {
+      echo "build-server node22 must already be $version at $link (observed ${actual:-missing})" >&2
+      exit 1
+    }
+    continue
+  fi
+
+  tmp=$(mktemp -d "$TMPDIR/toolchain-archive.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "$url" -o "$tmp/archive"
+  printf '%s  %s\n' "$sha" "$tmp/archive" | sha256sum --check --status || {
+    echo "$name: archive SHA-256 mismatch" >&2
+    exit 1
+  }
+  destination="$(rooted "$install_dir")"
+  case "$format" in
+    zip)
+      mkdir -p "$tmp/extracted"
+      unzip -p "$tmp/archive" "$archive_path" > "$tmp/binary"
+      [ -s "$tmp/binary" ] || { echo "$name: archive member is empty" >&2; exit 1; }
+      as_root install -d -m 0755 "$destination/$(dirname "$install_path")"
+      as_root install -m 0755 "$tmp/binary" "$destination/$install_path"
+      ;;
+    tar.xz)
+      mkdir -p "$tmp/extracted"
+      tar -xJf "$tmp/archive" --strip-components="$strip_components" -C "$tmp/extracted"
+      [ -x "$tmp/extracted/$install_path" ] || { echo "$name: archive binary is missing" >&2; exit 1; }
+      as_root install -d -m 0755 "$destination"
+      as_root cp -a "$tmp/extracted/." "$destination/"
+      ;;
+    *) echo "$name: unsupported archive format: $format" >&2; exit 1 ;;
+  esac
+  link_path="$(rooted "$link")"
+  target="$(rooted "$install_dir/$install_path")"
+  as_root install -d -m 0755 "$(dirname "$link_path")"
+  as_root rm -f "$link_path.tmp.$$"
+  as_root ln -s "$target" "$link_path.tmp.$$"
+  as_root mv -Tf "$link_path.tmp.$$" "$link_path"
+  rm -rf "$tmp"
+  trap - EXIT
+  echo "installed $name $version from pinned archive"
+done <<< "$archives"
