@@ -22,6 +22,14 @@ class InstallScriptTests(unittest.TestCase):
                                      f"{script.name}: {match.group(1)!r}")
         self.assertGreater(found, 0, "no New-LocalUser -Description literal found to check")
 
+    def test_cmd_never_echoes_a_variable_straight_into_a_redirect(self):
+        # In cmd, `echo %errorlevel%>file` with a one-digit value reads as a
+        # handle redirect (`0>`), so the file gets "ECHO is off." instead of
+        # the code. Put the redirect first: `>file echo %errorlevel%`.
+        for script in sorted(HERE.glob("*.ps1")):
+            for number, line in enumerate(script.read_text().splitlines(), 1):
+                self.assertIsNone(re.search(r"(?i)\becho\s+%\w+%\s*>", line), f"{script.name}:{number}: {line.strip()}")
+
 
 if __name__ == "__main__":
     unittest.main()

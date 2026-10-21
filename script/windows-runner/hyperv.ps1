@@ -65,7 +65,16 @@ switch ($Operation) {
         $servicesRoot = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices'
         $registrations = @(Get-ChildItem -LiteralPath $servicesRoot | ForEach-Object { @{service=$_.PSChildName; properties=(Get-ItemProperty -LiteralPath $_.PSPath | Select-Object ElementName)} })
         $registrations | ConvertTo-Json -Depth 4 | Set-Content "$Root\evidence\host-hvsock-registrations.json" -Encoding UTF8
-        if (@($registrations | Where-Object { $_.service -ne '92c268b0-cddd-40a4-a664-f32e50ad35ea' }).Count) { throw 'Additional host hvsock registrations require an isolation review; no foreign registration was changed' }
+        # Windows registers the two PowerShell Direct session services on every
+        # Hyper-V host (HV_GUID_VM_SESSION_SERVICE_ID and _ID_2). They name the
+        # guest-side vmicvmsession service the host connects to; no host process
+        # listens on them for guests. Any other registration still needs review.
+        $windowsDefaults = @{ '999E53D4-3D5C-4C3E-8779-BED06EC056E1' = 'VM Session Service'; 'A5201C21-2770-4C11-A68E-F182EDB29220' = 'VM Session Service-2' }
+        $foreign = @($registrations | Where-Object {
+            $_.service -ne '92c268b0-cddd-40a4-a664-f32e50ad35ea' -and
+            -not ($windowsDefaults.ContainsKey($_.service.ToUpperInvariant()) -and $_.properties.ElementName -ceq $windowsDefaults[$_.service.ToUpperInvariant()])
+        })
+        if ($foreign.Count) { throw 'Additional host hvsock registrations require an isolation review; no foreign registration was changed' }
         $registration = Get-ItemProperty -LiteralPath $key
         if ($registration.MotorOwner -ne 'motor-runner-hyperv' -or $registration.MotorRoot -cne $Root) { throw 'hvsock registration not owned by runner' }
         $prep = Get-LocalUser -Name motor-prep

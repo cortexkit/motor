@@ -13,7 +13,7 @@ $wrapper = "$Evidence\run.cmd"
 @"
 @echo off
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$Root\bin\qualify.ps1" -Python "$Python" -Evidence "$Evidence" > "$Evidence\qualification.log" 2>&1
-echo %errorlevel%>"$Evidence\exit.txt"
+>"$Evidence\exit.txt" echo %errorlevel%
 "@ | Set-Content $wrapper -Encoding ascii
 $name = 'MotorRunnerQualification-' + [Guid]::NewGuid().ToString()
 try {
