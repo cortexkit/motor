@@ -6,6 +6,7 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
     let json = serde_json::to_value(&config).unwrap();
     for key in [
         "hosted_runners",
+        "hosted_repositories",
         "broker_url",
         "broker_token_source",
         "spill_to_hosted",
@@ -286,6 +287,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 avoid_host: None,
                 timeout_s: 30,
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
+                allow_spill: Some(true),
             },
         )
         .await
@@ -860,6 +862,7 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
         serde_json::from_value(v["request"]["body"]["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
+        None,
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
@@ -919,4 +922,139 @@ async fn hosted_job_released_stops_reattaching_without_resubmitting() {
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+// The wire body places requester_jwk last. Remove exactly that member to
+// project its serialized fields into the broker's ordinary lease-hash input.
+// Hashing is a broker operation; this projection is only used by contract tests.
+pub(crate) fn canonical_lease_bytes(body: &motor_lease::LeaseRequest) -> String {
+    let wire = serde_json::to_string(body).unwrap();
+    let requester = format!(
+        ",\"requester_jwk\":{}}}",
+        serde_json::to_string(&body.requester_jwk).unwrap()
+    );
+    format!(
+        "{}}}",
+        wire.strip_suffix(&requester)
+            .expect("requester key is the final wire member")
+    )
+}
+
+#[test]
+fn cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-spill-lease.json"
+    ))
+    .unwrap();
+    let expected: motor_lease::LeaseRequest =
+        serde_json::from_str(vector["request"]["body_bytes"].as_str().unwrap()).unwrap();
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_timeout(expected.timeout_s)
+    .with_weight_hint(expected.vcpus);
+    if expected.net {
+        request.network = Some(Network::Outbound);
+    }
+    let body = lease_body(
+        Uuid::parse_str(&expected.job_id).unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        Some(false),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        vector["request"]["body"]
+    );
+    let canonical = canonical_lease_bytes(&body);
+    assert_eq!(canonical, vector["canonical_lease_bytes"].as_str().unwrap());
+    assert_eq!(
+        motor_lease::sha256_hex(canonical.as_bytes()),
+        vector["lease_hash"]
+    );
+    let mut changed = body.clone();
+    changed.requester_jwk =
+        motor_lease::RequesterJwk::from_key(&SigningKey::from_bytes(&[8; 32]).verifying_key());
+    assert_eq!(
+        canonical_lease_bytes(&changed),
+        canonical,
+        "Requester rotation is not part of the lease hash"
+    );
+    changed.allow_spill = None;
+    let absent = canonical_lease_bytes(&changed);
+    changed.allow_spill = Some(true);
+    let spill = canonical_lease_bytes(&changed);
+    assert_ne!(
+        absent, spill,
+        "Absent and true have different lease hashes despite the same placement policy"
+    );
+    assert_ne!(absent, canonical);
+    assert_ne!(spill, canonical);
+}
+
+#[tokio::test]
+async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
+    for allow_spill in [None, Some(false), Some(true)] {
+        let h = Harness::new(Behavior::Normal).await;
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let request = Harness::request(&scratch.0);
+        let body = lease_body(
+            id,
+            &request,
+            (
+                motor_lease::base64url(&[1; 32]),
+                motor_lease::base64url(&[2; 32]),
+            ),
+            None,
+            None,
+            motor_lease::RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+            allow_spill,
+        )
+        .unwrap();
+        let expected = canonical_lease_bytes(&body);
+        let mut route = h.route.clone();
+        // Deliberately disagree with the saved request: a config change must
+        // not change either the presence or the value on a re-request.
+        route.repository_routed = allow_spill != Some(false);
+        route.lease_request = Some(body);
+        let storage = stored(&scratch, id, route.clone());
+        for _ in 0..2 {
+            let (channel, _) = Client::new(route.clone())
+                .run(id, &request, &storage)
+                .await
+                .unwrap();
+            drop(channel);
+        }
+        let bodies = h.lease_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for bytes in bodies.iter() {
+            let sent: motor_lease::LeaseRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(sent.allow_spill, allow_spill);
+            assert_eq!(canonical_lease_bytes(&sent), expected);
+        }
+        assert_eq!(
+            storage
+                .job(id)
+                .unwrap()
+                .hosted
+                .unwrap()
+                .lease_request
+                .unwrap()
+                .allow_spill,
+            allow_spill
+        );
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    }
 }

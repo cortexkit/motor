@@ -228,7 +228,18 @@ impl Motor {
                 .queue_wait_limit_s
                 .unwrap_or(self.config.queue_wait_limit_s)
         };
+        // repository_root is resolved by the caller from Git's common directory,
+        // not the workspace key, which changes for each linked worktree.
+        let repository_routed = !hosted_test
+            && request.platform != Some(Platform::Windows)
+            && std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
+                self.config
+                    .hosted_repositories
+                    .iter()
+                    .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
+            });
         let spill = !hosted_test
+            && !repository_routed
             && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill)
             && self.config.spill_after_s <= wait;
         let instance = self
@@ -247,6 +258,13 @@ impl Motor {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
             self.storage.hosted_route(id, route)?;
+        } else if repository_routed {
+            let mut route = crate::HostedJobState::new(&self.config);
+            route.repository_routed = true;
+            route.hosted_no_fallback = true;
+            self.storage.hosted_route(id, route)?;
+            tracing::info!(job_id = %id, repo = %request.repository_root,
+                "routed to hosted (hosted_repositories)");
         } else if self.config.hosted_runners && request.platform != Some(Platform::Windows) {
             self.storage
                 .hosted_route(id, crate::HostedJobState::new(&self.config))?;
@@ -412,7 +430,8 @@ impl Motor {
                     tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
                         run_sent = state.run_sent, "hosted release");
                     if released == Err(crate::hosted::Error::Admitted) {
-                        if state.run_sent || state.placement.is_some() {
+                        if state.run_sent || (!state.repository_routed && state.placement.is_some())
+                        {
                             let (_, wake) = watch::channel(false);
                             return self.follow(id, 0, None, tx, wake).await;
                         }
@@ -420,9 +439,11 @@ impl Motor {
                         // with no recorded placement and no Run frame sent is a
                         // Boat booking whose lease reply ck-motor never
                         // accepted. Nothing ran: settle it and refuse.
-                        self.hosted_client(state)
-                            .finish_never_ran(id, &self.storage)
-                            .await?;
+                        if !state.repository_routed {
+                            self.hosted_client(state)
+                                .finish_never_ran(id, &self.storage)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -444,6 +465,17 @@ impl Motor {
                 Some(d) if d.starts_with(&code) => d,
                 other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
             })
+        } else {
+            detail
+        };
+        let detail = if self
+            .hosted_state(id)
+            .is_some_and(|s| s.repository_routed && !s.run_sent)
+        {
+            Some(format!(
+                "hosted stage-1 routing (hosted_repositories): {}",
+                detail.as_deref().unwrap_or("request refused")
+            ))
         } else {
             detail
         };
@@ -692,10 +724,18 @@ impl Motor {
                             return Ok(true);
                         }
                         match error {
-                            crate::hosted::Error::Admitted => {
+                            crate::hosted::Error::Admitted
+                                if !self
+                                    .hosted_state(id)
+                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                            {
                                 return self.follow_inner(id, 0, None, tx, wake, spill_after).await
                             }
-                            crate::hosted::Error::SandboxLost => {
+                            crate::hosted::Error::SandboxLost
+                                if !self
+                                    .hosted_state(id)
+                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                            {
                                 return self.lost_sandbox(id, tx).await.map(|_| false)
                             }
                             error => {
@@ -1267,13 +1307,16 @@ impl Motor {
         self.storage.job(id).and_then(|j| j.return_result)
     }
     pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
-        if !self.config.hosted_runners {
+        let routed = self.storage.hosted_routed_jobs_1h();
+        if !self.config.hosted_runners && self.config.hosted_repositories.is_empty() && routed == 0
+        {
             return None;
         }
         let last = self.storage.last_hosted();
         let error = last.as_ref().and_then(|s| s.hosted_code.as_deref());
         Some(serde_json::json!({
-            "hosted": true,
+            "hosted": self.config.hosted_runners,
+            "hosted_routed_jobs_1h": routed,
             "token_source": self.config.broker_token_source,
             "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
             "last_lease_error": error,
@@ -2266,6 +2309,9 @@ async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord)
 #[cfg(test)]
 #[path = "queue_tests.rs"]
 mod queue_tests;
+
+#[cfg(test)]
+mod repository_routing_tests;
 
 #[cfg(test)]
 #[path = "started_tests.rs"]

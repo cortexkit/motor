@@ -1029,3 +1029,43 @@ fn routing_authentication_and_media_type_checks_have_contract_precedence() {
         json!({"error":"bad_request"})
     );
 }
+
+#[test]
+fn allow_spill_projection_distinguishes_absent_false_and_true_but_not_requester_rotation() {
+    for initial in [None, Some(false), Some(true)] {
+        let mut b = broker();
+        let mut request = lease_request();
+        request.allow_spill = initial;
+        issued(&mut b, &request, NOW);
+        request.requester_jwk =
+            RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key());
+        issued(&mut b, &request, NOW + 1000);
+        for changed in [None, Some(false), Some(true)] {
+            if changed == initial {
+                continue;
+            }
+            request.allow_spill = changed;
+            assert_eq!(
+                post(&mut b, "/v1/leases", &request, NOW + 2000).body,
+                json!({"error":"job_conflict"}),
+                "{initial:?} -> {changed:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn allow_spill_is_optional_for_old_bodies_but_must_be_boolean_when_present() {
+    let mut body = serde_json::to_value(lease_request()).unwrap();
+    body.as_object_mut().unwrap().remove("allow_spill");
+    let parsed: LeaseRequest = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(parsed.allow_spill, None);
+    assert_eq!(serde_json::to_value(parsed).unwrap(), body);
+    for bad in [serde_json::Value::Null, json!(0), json!("false")] {
+        body["allow_spill"] = bad;
+        assert_eq!(
+            post(&mut broker(), "/v1/leases", &body, NOW).body,
+            json!({"error":"bad_request"})
+        );
+    }
+}

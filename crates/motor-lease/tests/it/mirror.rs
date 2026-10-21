@@ -63,6 +63,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
     for path in [
         "cloud/runners-contract.md",
+        "cloud/no-spill-lease.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/host-signature.json",
@@ -78,6 +79,49 @@ fn cloud_final_files_match_their_manifest_digests() {
             sha256_hex(&std::fs::read(root.join(path)).unwrap()),
             entry.sha256,
             "digest mismatch: {path}"
+        );
+    }
+}
+
+#[test]
+fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts/cloud");
+    // These published digests are independent of the editable manifest. Adding
+    // a policy vector must not change the existing cloud vectors' pinned bytes.
+    for (path, digest) in [
+        (
+            "runners-contract.md",
+            "e91e698c1b819225f06a54d2a3869d32c0de36edc380aba177a669810567f08b",
+        ),
+        (
+            "no-spill-lease.json",
+            "167deadc03d9a1d8e43edf80af8a7ab840ee9641fe485c9c70a8859af0229b94",
+        ),
+        (
+            "boat-lease.json",
+            "52727d1b3e9499d5bb1a14ae4179871e642ee7addaf66939e3cd1c5a394d1f5a",
+        ),
+        (
+            "host-signature.json",
+            "9c8876854bb955aa4468ffe9cf61f68d31327bc4e13367813f8c2e89c5e1b398",
+        ),
+        (
+            "job-tokens.json",
+            "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+        ),
+        (
+            "lease.json",
+            "87149636bf948abed08819a52ebd69cbbff3c73159eb4995a31beea71ddfa05f",
+        ),
+        (
+            "usage-settlement.json",
+            "4f53e2eb16dd586308f31f9a9ffe986c1f214a65aa45dd973f2a3de1f63084b7",
+        ),
+    ] {
+        assert_eq!(
+            sha256_hex(&std::fs::read(root.join(path)).unwrap()),
+            digest,
+            "{path}"
         );
     }
 }

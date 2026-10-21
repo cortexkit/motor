@@ -3,16 +3,24 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "3d70bcf",
+    "revision": "95fd2d1372801900d6a116f965f140868433077e",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "f30ade5e7045db3c0ea5277c6d3625fbaa350c0fe081872d19dc1dc8431c5448",
+      "sha256": "e91e698c1b819225f06a54d2a3869d32c0de36edc380aba177a669810567f08b",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "3d70bcf",
+      "source_commit": "95fd2d1372801900d6a116f965f140868433077e",
       "source_path": "docs/runners-contract.md",
+      "canonical": true
+    },
+    {
+      "path": "cloud/no-spill-lease.json",
+      "sha256": "167deadc03d9a1d8e43edf80af8a7ab840ee9641fe485c9c70a8859af0229b94",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "95fd2d1372801900d6a116f965f140868433077e",
+      "source_path": "test-vectors/runners/no-spill-lease.json",
       "canonical": true
     },
     {

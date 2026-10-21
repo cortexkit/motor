@@ -44,6 +44,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root`, `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `queue_wait_limit_s` | `300` | Default queue-wait budget for a job. |
+| `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose ordinary Linux jobs request hosted leases instead of the direct runner. See [repository routing](#hosted-repository-routing). |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
@@ -372,6 +373,59 @@ refusal equivalence (`crates/motor-module/tests/it/operator_cli.rs`):
 `cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret`.
 CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
 `attach_never_accepts_an_argv_secret_or_echoes_it`.
+
+## Hosted repository routing
+
+`hosted_repositories` selects repositories for a staged hosted rollout without
+changing other fleet traffic. Matching uses the resolved `repository_root`, not
+the workspace key: the main checkout, linked worker worktrees and linked gate
+checkouts share that identity. Independent clones have different identities and
+must be listed separately. Paths are canonicalized for comparison; entries must
+be absolute. The empty default is omitted from serialized Config so older clients
+with closed schemas can still read it.
+
+Both agent and direct jobs for a listed repository request a lease before any
+direct-runner submission. The lease sends `avoid_host: null` (ignoring
+`spill_avoid_host`) and `allow_spill: false`, restricting placement to registered
+hosts rather than Boat. These jobs never enter the spill path or fall back to the
+direct runner. Windows stays on its direct runner. Outbound-network jobs can use
+hosted leases: the request's `net` flag must match the signed lease claim, and
+`network_routing` must still be enabled. Unlisted jobs retain their existing
+direct and spill behavior; spilled leases and shadow leases send `allow_spill:
+true`.
+
+For a repository-routed job, broker `503 no_capacity` responses wait for
+`Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one
+second) before retrying the identical request, including its job ID. Capacity
+and `202 provisioning` retries share one queue-wait deadline. Exhaustion yields
+a typed retryable refusal, never local execution. Before the durable `run_sent`
+marker, refusals identify repository-selected routing with the exact detail text
+`hosted stage-1 routing (hosted_repositories)`.
+After that marker the existing hosted reattach/finish path governs an ambiguous
+submission. Each selected job logs one INFO event, `routed to hosted
+(hosted_repositories)`, with `job_id` and `repo` fields. Hosted health metrics
+include `hosted_routed_jobs_1h`, counting repository-selected jobs (including
+refusals) in the last hour; stored route decisions survive restart.
+
+Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding_a_host`,
+`unlisted_and_windows_jobs_keep_the_direct_path`,
+`stage1_pre_run_failures_are_typed_and_never_submit_directly`,
+`stage1_lost_run_ack_reattaches_without_direct_fallback`,
+`stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host`,
+`stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline`,
+`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
+`shadow_lease_explicitly_allows_spill`, and
+`hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
+`crates/motor-lease/contracts/cloud/`. Tests
+`cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash`,
+`stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored_request`,
+and `stored_allow_spill_presence_and_value_survive_lease_re_requests` check its
+hash projection, capacity reply, and stable re-request policy. Requester keys are
+excluded from the lease hash; an absent `allow_spill` and either explicit boolean
+have distinct hashes, so the stored request preserves presence as well as value.
+`python3 scripts/mixed-version.py` checks the default Config against the pinned
+older client.
 
 ## Hosted shadow comparisons
 

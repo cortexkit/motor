@@ -361,6 +361,28 @@ impl Storage {
             .filter_map(|j| j.hosted.clone())
             .find(|h| h.lease_attempted)
     }
+    pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
+        self.hosted_routed_jobs_1h_at(now_ms())
+    }
+    fn hosted_routed_jobs_1h_at(&self, now: u64) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|(id, job)| {
+                job.hosted
+                    .as_ref()
+                    .is_some_and(|route| route.repository_routed)
+                    && id.get_timestamp().is_some_and(|timestamp| {
+                        let (seconds, nanos) = timestamp.to_unix();
+                        let minted = seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000;
+                        now.checked_sub(minted)
+                            .is_some_and(|age| age < 60 * 60 * 1000)
+                    })
+            })
+            .count()
+    }
     pub(crate) fn hosted_route(
         &self,
         id: Uuid,
@@ -1211,5 +1233,40 @@ mod verified_tip_tests {
         }
         assert_eq!(storage.failed_tips.lock().unwrap().len(), MAX_FAILED_TIPS);
         assert!(!storage.tip_failed_recently(&key, now + Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
+mod hosted_routing_health_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_routed_counter_only_counts_repository_routes_in_the_last_hour() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-route-health");
+        let storage = Storage::open(&scratch).unwrap();
+        let now = now_ms();
+        for (age, routed) in [(0, true), (3_599_999, true), (3_600_000, true), (0, false)] {
+            let minted = now - age;
+            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                minted / 1000,
+                ((minted % 1000) * 1_000_000) as u32,
+            ));
+            storage.create(id, 30, None, None, false).unwrap();
+            storage
+                .hosted_route(
+                    id,
+                    crate::HostedJobState {
+                        repository_routed: routed,
+                        ..crate::HostedJobState::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now + 3_600_000), 0);
+        drop(storage);
+        let storage = Storage::open(&scratch).unwrap();
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
     }
 }

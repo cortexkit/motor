@@ -9,6 +9,11 @@ use std::{
 pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_runners: bool,
+    /// Main-checkout repository identities whose ordinary jobs use hosted leases.
+    /// Workspace paths are deliberately not matched: linked worktrees share the
+    /// resolved repository_root of their main checkout. Windows stays direct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_repositories: Vec<String>,
     /// Move only proven capacity-permit waits to hosted runners. Defaults are
     /// omitted so older clients with a closed Config schema can still load it.
     #[serde(skip_serializing_if = "is_false")]
@@ -215,6 +220,7 @@ impl Default for Config {
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
             hosted_runners: false,
+            hosted_repositories: Vec::new(),
             spill_to_hosted: false,
             shadow_to_hosted: ShadowConfig::default(),
             spill_after_s: 45,
@@ -354,6 +360,15 @@ impl Config {
         }
         if self.worktree_roots.iter().any(|p| !p.is_absolute()) {
             return Err(io::Error::other("worktree_roots must be absolute"));
+        }
+        if self
+            .hosted_repositories
+            .iter()
+            .any(|p| !Path::new(p).is_absolute())
+        {
+            return Err(io::Error::other(
+                "hosted_repositories must be absolute repository roots",
+            ));
         }
         if self
             .spill_avoid_host
