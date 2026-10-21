@@ -1,6 +1,9 @@
 use super::*;
 
-fn javascript_entry_lock(state: &Path, path: &Path) -> io::Result<Option<File>> {
+fn javascript_entry_lock(
+    state: &Path,
+    path: &Path,
+) -> io::Result<Option<platform::JavascriptCacheLock>> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let key = name.split('.').next().unwrap_or_default();
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {

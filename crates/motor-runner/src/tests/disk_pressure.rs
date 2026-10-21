@@ -1042,6 +1042,10 @@ fn disk_guard_reclaims_interrupted_javascript_publications_after_lock_release() 
         pressure.store(true, Ordering::SeqCst);
         assert!(runner.ensure_disk_space().unwrap().is_some());
         assert!(temporary.exists(), "{root} must survive while locked");
+        // A process another thread forks while the lock is held shares the
+        // lock's open file until it execs. Releasing must not wait for it.
+        #[cfg(unix)]
+        let _forked = crate::test_helpers::fork_before_exec().unwrap();
         drop(lock);
         assert!(runner.ensure_disk_space().unwrap().is_none());
         assert!(!temporary.exists(), "{root} must be reclaimed after unlock");
@@ -1072,6 +1076,18 @@ fn disk_soft_pressure_evicts_old_javascript_entries_but_keeps_recent_ones() {
             entries.push(path);
         }
     }
+    // Eviction checks whether each entry is in use by taking and releasing its
+    // lock, as setup does. A process another thread forks while the lock is
+    // held shares the lock's open file until it execs; a release must not wait
+    // for that, or the entry would look busy and survive the pass.
+    #[cfg(unix)]
+    let _forked = {
+        let lock = platform::javascript_cache_lock(&state, &"a".repeat(64)).unwrap();
+        lock.lock_exclusive().unwrap();
+        let forked = crate::test_helpers::fork_before_exec().unwrap();
+        drop(lock);
+        forked
+    };
     assert!(runner.ensure_disk_space().unwrap().is_none());
     for path in old {
         assert!(
