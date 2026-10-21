@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "c8600ac",
+    "revision": "e483f20",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "b87b90189b3bb3a695758aef69f383c71e47205ac5dc4f6f75d3d31b8dafe4b2",
+      "sha256": "4879abb9d7e90bb301c6e2f8abf2d37a16f127792a3065ee78eee62e39a897b7",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "c8600ac",
+      "source_commit": "e483f20",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -33,9 +33,9 @@
     },
     {
       "path": "cloud/boat-lease.json",
-      "sha256": "52727d1b3e9499d5bb1a14ae4179871e642ee7addaf66939e3cd1c5a394d1f5a",
+      "sha256": "a8bdda4fa90dff6607e534efabfa1a17c71b52377af91b714a7a50b9fd4f83bb",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "3d70bcf",
+      "source_commit": "e483f20",
       "source_path": "test-vectors/runners/boat-lease.json",
       "canonical": true
     },
@@ -57,9 +57,9 @@
     },
     {
       "path": "cloud/lease.json",
-      "sha256": "87149636bf948abed08819a52ebd69cbbff3c73159eb4995a31beea71ddfa05f",
+      "sha256": "aa3996947d5da23807cd32813be57c673610c23ed704d92bf95b24db8ee14d81",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "3d70bcf",
+      "source_commit": "e483f20",
       "source_path": "test-vectors/runners/lease.json",
       "canonical": true
     },
@@ -73,10 +73,18 @@
     },
     {
       "path": "cloud/settled-reattach.json",
-      "sha256": "ebf6197a1dc1b59a7284ced6b9b61cf9cca604bb32b510354ad134842dd9f6ba",
+      "sha256": "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "c8600ac",
+      "source_commit": "e483f20",
       "source_path": "test-vectors/runners/settled-reattach.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/shadow-lease.json",
+      "sha256": "cf0f4481a403e2ab3ab2e7cf65a3375bf70131e4e2e8ad1786e6541c9cf33574",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "e483f20",
+      "source_path": "test-vectors/runners/shadow-lease.json",
       "canonical": true
     }
   ]

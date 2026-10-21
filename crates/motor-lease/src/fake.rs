@@ -213,7 +213,10 @@ impl FakeBroker {
     }
 
     fn lease(&mut self, request: LeaseRequest, now_s: u64) -> BrokerReply {
-        if request.requester_jwk.verifying_key().is_err()
+        // The broker requires an explicit spill policy on every lease body and
+        // refuses one without it before looking up or claiming the job.
+        if request.allow_spill.is_none()
+            || request.requester_jwk.verifying_key().is_err()
             || !valid_job_id(&request.job_id)
             || !(1..=64).contains(&request.vcpus)
             || !(10..=7200).contains(&request.timeout_s)
@@ -589,8 +592,10 @@ fn valid_keyed_hash(value: &str) -> bool {
 }
 
 /// The ordinary lease-hash projection: requester keys can rotate on a re-request,
-/// but placement and resource choices (including an explicitly false allow_spill)
-/// cannot. The fake serves registered hosts only and does not accept shadow leases.
+/// but placement and resource choices (including the allow_spill value) cannot.
+/// `lease` refuses a body without allow_spill before this is used, so the member
+/// is always present here. The fake serves registered hosts only and does not
+/// accept shadow leases.
 fn lease_identity(request: &LeaseRequest) -> Value {
     let mut identity = json!({
         "job_id": request.job_id,

@@ -1090,4 +1090,78 @@ mod shadow_wire_tests {
         );
         assert_eq!(value, serde_json::to_value(&ordinary).unwrap());
     }
+    /// CLOUD's `shadow-lease.json` records a shadow lease's request body and
+    /// lease hash. ck-motor builds the shadow body the way `shadow_run` does
+    /// (no placement hint, spill allowed, then `shadow: true`); its members
+    /// match the recorded body, and its wire bytes without `requester_jwk`
+    /// are the hashed projection: the ordinary projection with
+    /// `"shadow":true` appended after `allow_spill`.
+    #[test]
+    fn cloud_shadow_lease_body_and_hash_match_the_shadow_vector() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../motor-lease/contracts/cloud/shadow-lease.json"
+        ))
+        .unwrap();
+        let expected = &vector["booked"]["request"]["body"];
+        assert_eq!(expected, &vector["provisioning"]["request"]["body"]);
+        let seed: [u8; 32] = vector["requester"]["test_only_seed_hex"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let key = SigningKey::from_bytes(&seed);
+        let mut request = RunRequest::new(
+            "/home/test/repo",
+            "/home/test/repo",
+            "/home/test/repo",
+            "true",
+        )
+        .with_platform(motor_protocol::Platform::Linux)
+        .with_weight_hint(expected["vcpus"].as_u64().unwrap() as u32)
+        .with_timeout(expected["timeout_s"].as_u64().unwrap());
+        if expected["net"] == true {
+            request.network = Some(motor_protocol::Network::Outbound);
+        }
+        let body = lease_body(
+            Uuid::parse_str(expected["job_id"].as_str().unwrap()).unwrap(),
+            &request,
+            (
+                expected["workspace_key_hash"].as_str().unwrap().into(),
+                expected["repo_hash"].as_str().unwrap().into(),
+            ),
+            None,
+            serde_json::from_value(expected["avoid_host"].clone()).unwrap(),
+            RequesterJwk::from_key(&key.verifying_key()),
+            Some(true),
+        )
+        .unwrap();
+        let wire = ShadowLeaseRequest {
+            request: &body,
+            shadow: true,
+        };
+        assert_eq!(&serde_json::to_value(&wire).unwrap(), expected);
+        let text = serde_json::to_string(&wire).unwrap();
+        let requester = format!(
+            ",\"requester_jwk\":{}",
+            serde_json::to_string(&body.requester_jwk).unwrap()
+        );
+        assert_eq!(text.matches(&requester).count(), 1, "{text}");
+        let canonical = text.replacen(&requester, "", 1);
+        let ordinary = super::tests::canonical_lease_bytes(&body);
+        assert_eq!(
+            canonical,
+            format!("{},\"shadow\":true}}", &ordinary[..ordinary.len() - 1])
+        );
+        assert!(canonical.ends_with(",\"timeout_s\":100,\"allow_spill\":true,\"shadow\":true}"));
+        assert_eq!(
+            motor_lease::sha256_hex(canonical.as_bytes()),
+            vector["lease_hash"]
+        );
+    }
 }
