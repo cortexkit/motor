@@ -46,6 +46,7 @@ TEST_FILES = [
     "script/windows-runner/test_parent_identity.py",
     "script/windows-runner/test_qualify_jobs.py",
     "script/windows-runner/test_qualify_peer.py",
+    "script/windows-runner/test_trusted_prep_launch.py",
     "script/hyperv-spike/test_seed.py",
     "script/hyperv-spike/test_account_serial.py",
     "scripts/tests/test_safety_fences.py",

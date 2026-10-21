@@ -25,6 +25,8 @@ mod host;
 #[cfg(windows)]
 mod hvsock;
 pub(crate) mod prep;
+#[cfg(any(windows, test))]
+mod process_status;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -51,6 +53,10 @@ pub(crate) fn qualify_prep(config: &Config) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {
     trusted_prep::probe(args)
+}
+#[cfg(windows)]
+pub(crate) fn prep_launch(args: &[String]) -> io::Result<()> {
+    trusted_prep::launch_entry(args)
 }
 #[cfg(windows)]
 pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {

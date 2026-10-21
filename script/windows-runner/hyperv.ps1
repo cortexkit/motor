@@ -205,7 +205,7 @@ switch ($Operation) {
         Grant $full '(X)' $sid
         foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" '(OI)(CI)RX' $sid }
         Grant "$full\fetch-temp" '(OI)(CI)M' $sid
-        Grant "$Root\state\ally\prep-cargo" '(OI)(CI)M' $sid
+        Grant "$Root\state\ally\prep-cargo" '(OI)(CI)RX' $sid
         Grant "$Root\prep-toolchain" '(OI)(CI)RX' $sid
     }
     'Prepare' {

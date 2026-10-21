@@ -2,20 +2,16 @@
 use super::*;
 use std::{
     collections::BTreeMap,
-    mem::{size_of, zeroed},
+    mem::zeroed,
     ptr::{null, null_mut},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, HANDLE, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, LocalFree, HANDLE},
     Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
-    Security::{
-        CreateRestrictedToken, GetTokenInformation, LogonUserW, TokenUser, DISABLE_MAX_PRIVILEGE,
-        LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, SID_AND_ATTRIBUTES, TOKEN_USER,
-        WRITE_RESTRICTED,
-    },
-    System::{JobObjects::*, Threading::*},
+    Security::{LogonUserW, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT},
 };
+mod launch;
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -33,7 +29,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-fn token(root: &Path, restrict: bool) -> io::Result<Handle> {
+fn token(root: &Path) -> io::Result<Handle> {
     let mut bytes = fs::read(root.join("prep-secret.dpapi"))?;
     let input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len() as u32,
@@ -82,47 +78,12 @@ fn token(root: &Path, restrict: bool) -> io::Result<Handle> {
         }
     }
     checked(success)?;
-    let base = Handle(result);
-    if !restrict {
-        return Ok(base);
-    }
-    let mut required = 0;
-    unsafe { GetTokenInformation(base.0, TokenUser, null_mut(), 0, &mut required) };
-    let mut user = vec![0u64; (required as usize).div_ceil(8)];
-    unsafe {
-        checked(GetTokenInformation(
-            base.0,
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            required,
-            &mut required,
-        ))?;
-        let sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
-        let restriction = SID_AND_ATTRIBUTES {
-            Sid: sid,
-            Attributes: 0,
-        };
-        let mut restricted = null_mut();
-        // A write must pass the ordinary account DACL and this SID check. Broad
-        // Users/Authenticated Users grants on host temp directories do not grant
-        // the restricting SID, unlike the explicit per-job/cache ACLs.
-        checked(CreateRestrictedToken(
-            base.0,
-            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
-            0,
-            null(),
-            0,
-            null(),
-            1,
-            &restriction,
-            &mut restricted,
-        ))?;
-        Ok(Handle(restricted))
-    }
+    Ok(Handle(result))
 }
 
-/// No inherited handles, no profile, no repository working directory, no shell.
-/// Suspending before Job Object assignment closes the child escape race.
+/// Fetch-only batch child with a private desktop and loaded user profile.
+/// Only controlled staging stdio handles are inherited; writes require the
+/// logon SID granted inside staging. Suspend until Job Object assignment.
 pub(super) fn fetch(config: &Config, command: &mut Command, cwd: &Path) -> io::Result<()> {
     run_as_batch(config, command, cwd, true)
 }
@@ -132,87 +93,11 @@ fn run_as_batch(
     cwd: &Path,
     restrict: bool,
 ) -> io::Result<()> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let token = token(root, restrict)?;
-    let program = command
-        .get_program()
-        .to_str()
-        .ok_or_else(|| invalid("non-UTF8 prep program"))?;
-    let mut args = vec![motor_winagent::quote_windows_arg(program)];
-    for arg in command.get_args() {
-        args.push(motor_winagent::quote_windows_arg(
-            arg.to_str()
-                .ok_or_else(|| invalid("non-UTF8 prep argument"))?,
-        ));
-    }
-    let mut line = wide(&args.join(" "));
-    let mut env = BTreeMap::new();
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            env.insert(
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            );
-        }
-    }
-    let environment = motor_winagent::environment::encode_block(&env)?;
-    unsafe {
-        let job = Handle(CreateJobObjectW(null(), null()));
-        if job.0.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 32;
-        checked(SetInformationJobObject(
-            job.0,
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ))?;
-        let mut startup: STARTUPINFOW = zeroed();
-        startup.cb = size_of::<STARTUPINFOW>() as u32;
-        let mut info: PROCESS_INFORMATION = zeroed();
-        checked(CreateProcessAsUserW(
-            token.0,
-            wide(program).as_ptr(),
-            line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            wide(&cwd.to_string_lossy()).as_ptr(),
-            &startup,
-            &mut info,
-        ))?;
-        let process = Handle(info.hProcess);
-        let thread = Handle(info.hThread);
-        if AssignProcessToJobObject(job.0, process.0) == 0 {
-            let error = io::Error::last_os_error();
-            TerminateProcess(process.0, 1);
-            WaitForSingleObject(process.0, 5000);
-            return Err(error);
-        }
-        if ResumeThread(thread.0) == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        let deadline = Instant::now() + Duration::from_secs(600);
-        while WaitForSingleObject(process.0, 50) != WAIT_OBJECT_0 {
-            if Instant::now() >= deadline {
-                return Err(invalid("Windows trusted preparation exceeded 600 seconds"));
-            }
-        }
-        let mut code = 0;
-        checked(GetExitCodeProcess(process.0, &mut code))?;
-        if code != 0 {
-            return Err(invalid(format!(
-                "Windows trusted cargo fetch exited {code}"
-            )));
-        }
-    }
-    Ok(())
+    launch::run(config, command, cwd, restrict).map(|_| ())
+}
+
+pub(super) fn launch_entry(arguments: &[String]) -> io::Result<()> {
+    launch::entry(arguments)
 }
 pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
@@ -223,7 +108,14 @@ pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
 }
 
 fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
     let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_attributes() & 0x400 != 0
+        || fs::symlink_metadata(target)
+            .is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
+    {
+        return Err(invalid("reparse point in trusted preparation cache"));
+    }
     crate::filesystem::identity(source)?;
     if metadata.is_dir() {
         fs::create_dir_all(target)?;
@@ -232,6 +124,22 @@ fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
             copy_tree(&entry.path(), &target.join(entry.file_name()))?;
         }
     } else if metadata.is_file() {
+        if let Ok(existing) = fs::metadata(target) {
+            if existing.permissions().readonly() {
+                let attributes = existing.file_attributes()
+                    & !windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+                checked(unsafe {
+                    windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                        wide(&target.to_string_lossy()).as_ptr(),
+                        if attributes == 0 {
+                            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+                        } else {
+                            attributes
+                        },
+                    )
+                })?;
+            }
+        }
         fs::copy(source, target)?;
     } else {
         return Err(invalid("special file in trusted preparation input"));
@@ -296,6 +204,22 @@ pub(super) fn prepare_fetch(
     copy_manifests(&staging.join("m"), &manifests.join("m"))?;
     let cache = config.state_dir().join("prep-cargo");
     fs::create_dir_all(&cache)?;
+    // The child never gets write rights to the persistent host cache. SYSTEM
+    // seeds/publishes only selected cache directories under the serialized lock.
+    let fetch_cache = staging.join("fetch-temp/cargo-home");
+    fs::create_dir_all(&fetch_cache)?;
+    for name in [
+        "registry/index",
+        "registry/cache",
+        "git/db",
+        "git/checkouts",
+    ] {
+        let source = cache.join(name);
+        if source.exists() {
+            launch::check_path(&vm.layout_root, &source)?;
+            copy_tree(&source, &fetch_cache.join(name))?;
+        }
+    }
     let mut fetch_command = Command::new(&cargo);
     fetch_command.env_clear();
     for (key, value) in command.get_envs() {
@@ -315,7 +239,7 @@ pub(super) fn prepare_fetch(
         }
     }
     fetch_command
-        .env("CARGO_HOME", &cache)
+        .env("CARGO_HOME", &fetch_cache)
         .env("SYSTEMROOT", r"C:\Windows")
         .env("TEMP", staging.join("fetch-temp"))
         .env("TMP", staging.join("fetch-temp"))
@@ -337,8 +261,12 @@ pub(super) fn prepare_fetch(
             "git/db",
             "git/checkouts",
         ] {
-            let source = cache.join(name);
+            let source = fetch_cache.join(name);
             if source.exists() {
+                launch::check_path(&vm.layout_root, &source)?;
+                launch::check_target(&vm.layout_root, &cache.join(name))?;
+                launch::check_target(&vm.layout_root, &staging.join("cargo-home").join(name))?;
+                copy_tree(&source, &cache.join(name))?;
                 copy_tree(&source, &staging.join("cargo-home").join(name))?;
             }
         }
@@ -397,15 +325,52 @@ pub(super) fn qualify(config: &Config) -> io::Result<()> {
             fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
             let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
             let expected = if restricted { "denied" } else { "allowed" };
+            let expected_sids = if restricted {
+                serde_json::json!([proof["logon_sid"]])
+            } else {
+                serde_json::json!([])
+            };
             if proof["outside_write"] != expected
                 || proof["allowed_write"] != "allowed"
                 || (restricted && proof["credential_read"] != "denied")
+                || proof["profile_write"] != expected
+                || proof["profile_environment"] != true
+                || proof["window_station_visible"] != false
+                || proof["restricting_sids"] != expected_sids
             {
                 return Err(invalid(
                     "prep qualification did not exercise the expected native access checks",
                 ));
             }
         }
+        // The account/file probe does not exercise Cargo's loader imports.
+        // Run the actual pinned executable through exactly the same broker.
+        let cargo = root.join("prep-toolchain/bin/cargo.exe");
+        use sha2::{Digest, Sha256};
+        if format!("{:x}", Sha256::digest(fs::read(&cargo)?))
+            != config
+                .windows
+                .as_ref()
+                .unwrap()
+                .prep_cargo_sha256
+                .to_ascii_lowercase()
+        {
+            return Err(invalid("qualification prep cargo SHA-256 mismatch"));
+        }
+        let mut version = Command::new(&cargo);
+        version
+            .arg("--version")
+            .env_clear()
+            .env("SYSTEMROOT", r"C:\Windows")
+            .env("CARGO_HOME", stage.join("fetch-temp/cargo-version"));
+        let report = launch::run(config, &version, &stage, true)?;
+        let stdout = report["stdout"].as_str().unwrap_or("").trim();
+        if !stdout.starts_with("cargo ") {
+            return Err(invalid(
+                "native cargo --version fixture returned no Cargo version",
+            ));
+        }
+        eprintln!("PASS native-trusted-fetch-cargo-version {stdout} status={} profile-loaded private-desktop write-restricted", report["exit_status"].as_str().unwrap_or("missing"));
         if outside.exists() {
             return Err(invalid("prep qualification left an outside file"));
         }
@@ -430,11 +395,30 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     let credential = Path::new(&arguments[1]);
     let outside = Path::new(&arguments[2]);
     let output = Path::new(&arguments[3]);
-    let proof = match mode {
+    let profile =
+        std::env::var_os("USERPROFILE").ok_or_else(|| invalid("prep probe has no USERPROFILE"))?;
+    let profile = PathBuf::from(profile).join(format!("motor-prep-probe-{}.txt", Uuid::now_v7()));
+    let temp =
+        PathBuf::from(std::env::var_os("TEMP").ok_or_else(|| invalid("prep probe has no TEMP"))?);
+    let write_root = PathBuf::from(
+        std::env::var_os("MOTOR_PREP_WRITE_ROOT")
+            .ok_or_else(|| invalid("prep probe has no staging write root"))?,
+    );
+    if temp != write_root
+        || std::env::var_os("TMP").map(PathBuf::from).as_ref() != Some(&write_root)
+    {
+        return Err(invalid("prep TEMP/TMP must point inside staging"));
+    }
+    let temp_probe = temp.join(format!("temp-probe-{}.txt", Uuid::now_v7()));
+    fs::write(&temp_probe, b"staging temp write")?;
+    fs::remove_file(&temp_probe)?;
+    let mut proof = match mode {
         "base-control" => {
             fs::write(outside, b"unrestricted batch write control")?;
             fs::remove_file(outside)?;
-            serde_json::json!({"outside_write":"allowed","allowed_write":"allowed"})
+            fs::write(&profile, b"unrestricted profile write control")?;
+            fs::remove_file(&profile)?;
+            serde_json::json!({"outside_write":"allowed","allowed_write":"allowed","profile_write":"allowed"})
         }
         "restricted" => {
             match fs::File::open(credential) {
@@ -453,9 +437,23 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
                     ))
                 }
             }
-            serde_json::json!({"credential_read":"denied","outside_write":"denied","allowed_write":"allowed"})
+            match fs::write(&profile, b"must be denied") {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                _ => {
+                    let _ = fs::remove_file(&profile);
+                    return Err(invalid(
+                        "restricted fetch token must not write the loaded profile",
+                    ));
+                }
+            }
+            serde_json::json!({"credential_read":"denied","outside_write":"denied","allowed_write":"allowed","profile_write":"denied"})
         }
         _ => return Err(invalid("unknown prep-probe mode")),
     };
+    let context = launch::probe_context()?;
+    proof
+        .as_object_mut()
+        .unwrap()
+        .extend(context.as_object().unwrap().clone());
     fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
 }

@@ -26,12 +26,20 @@ the host.
   prints sshd's public host key for the client pin. No ambient client SSH configuration is required.
 - VM management is a boot-start SCM service running as SYSTEM. Trusted Cargo
   **fetch only** uses a separate batch-only `motor-prep` account, a write-restricted
-  token, a kill-on-close/process-limited Job Object and no inherited handles.
+  token, a kill-on-close/process-limited Job Object and allow-listed staging stdio
+  handles only. A one-shot SYSTEM broker creates a private non-interactive window
+  station/desktop for the fetch logon session, loads its profile and builds its
+  user environment; Cargo itself never runs as SYSTEM or an administrator.
   The fetch view contains copied manifests/lockfiles and empty target
   placeholders, not the job's source files. Runner keys remain under the private
   runner-state ACL. A serialized fetch section revokes each job's grants
   before another prep begins. The runner's Cargo cache is the only persistent
-  writable preparation directory. Only selected registry/git results are staged.
+  preparation cache, seeded/published by SYSTEM. The fetch token's distinct logon
+  SID grants writes only inside its staging temp tree, not the loaded profile,
+  shared host temp or persistent cache. Only selected registry/git results are staged.
+  Native prep qualification also executes the pinned `cargo --version` through
+  this broker; launch diagnostics name the desktop/profile setup and unsigned
+  hex exit status, including `0xC0000142 STATUS_DLL_INIT_FAILED` for loader failure.
 - Each job gets a fresh differencing OS disk and nonce. A tiny read-only DVD
   delivers boot metadata without mounting a job disk on the host. It is not a
   host filesystem share or a live guest/host service. The real workspace cache
