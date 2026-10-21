@@ -188,6 +188,21 @@ RUSTUP_HOME of `motor-boat.service`). Symlinks must be root-owned too.
 Installation enforces this after the service preflight, recorded as
 `root_owned_paths` in the inventory, and every probe phase reruns the operator
 checkout's `script/tenant-image/guest/root_paths.py` as `<phase>.root_owned_paths`.
+Boat's base image ships `/usr/local` owned by uid 1000, its sandbox account
+(Boat's exec API runs as that account, which has passwordless sudo). Right
+after installing packages, before the tool installers write under `/usr/local`, the recipe
+applies `BOAT_BASE_USR_LOCAL` in `install.py`, recorded as `boat_base_layout` in
+the inventory. It removes Boat's `/usr/local/go`, `/usr/local/rustup` and
+`/usr/local/cargo`, which nothing in the image uses (the runner, endpoint and
+jobs take Rust from `/home/ubuntu/.rustup` and `/srv/build/cargo-home`, the
+build server's manifest names no Go, and no unit or job PATH names those
+directories), together with any symlink directly in a PATH directory that
+points into them. It then re-owns `/usr/local` and the named skeleton directories
+beneath it to root:root with group/other write cleared, one path at a time, never
+recursively. A listed path owned by any uid other than 0 or 1000 refuses the build
+before the step changes any listed path. Anything else a provider image leaves under a root
+executed path is not touched and still fails the root-owned path check by name,
+so extending the list is a deliberate change.
 Before installing the runner toolchains, the recipe creates an absent `/home/ubuntu` as
 root:root 0755. If another account owns it, the recipe refuses and names the
 owner's uid, passwd entry and running processes; it never takes over a

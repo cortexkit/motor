@@ -50,6 +50,40 @@ RUNNER_INPUTS = (
 )
 # motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
 TOOL_HOME = Path("/home/ubuntu")
+# Boat's base ships /usr/local as uid 1000: the provider's sandbox account,
+# which Boat's exec API runs as and which has passwordless sudo. Root runs the
+# runner, the endpoint and the job PID namespace init from /usr/local, so every
+# path there must be root's (root_paths.py). The recipe settles that provider
+# layout here, by name, before the tool installers write under /usr/local; it
+# never re-owns a tree recursively. A listed path that is absent is skipped; one owned by any account
+# other than root or BOAT_BASE_UID refuses the build. Whatever this list does not
+# name stays subject to the root-owned path check, which then fails naming it,
+# so a provider change is decided here rather than absorbed silently.
+BOAT_BASE_UID = 1000
+BOAT_BASE_USR_LOCAL = {
+    # Provider toolchains the image never uses. The runner, the endpoint and
+    # jobs take Rust from RUSTUP_HOME=/home/ubuntu/.rustup and
+    # CARGO_HOME=/srv/build/cargo-home (jobs: /motor-home/cargo), the build
+    # server's toolchain manifest names no Go, and no unit or job PATH names
+    # these directories. Jobs mount /usr read-only, so removing the trees also
+    # keeps them out of job view, as on the build server.
+    "remove": ("/usr/local/go", "/usr/local/rustup", "/usr/local/cargo"),
+    # Directories searched for a command name: motor-boat.service's PATH and
+    # systemd's default PATH, which motor-boat-host.service inherits. A symlink
+    # directly in one of them that points into a removed tree (a provider
+    # /usr/local/bin/go, say) is removed with the tree, so nothing root or a
+    # job runs by name still leads there.
+    "search_path": ("/home/ubuntu/.bun/bin", "/srv/build/cargo-home/bin", "/usr/local/sbin", "/usr/local/bin",
+                    "/usr/sbin", "/usr/bin", "/sbin", "/bin"),
+    # Directories that stay and receive our installs, each re-owned root:root
+    # with group/other write cleared, never recursively: /usr/local and Ubuntu
+    # base-files' skeleton beneath it (man is its link to share/man), plus the
+    # directories the image's python3 and ca-certificates packages create there.
+    "reown": ("/usr/local", "/usr/local/bin", "/usr/local/etc", "/usr/local/games", "/usr/local/include",
+              "/usr/local/lib", "/usr/local/man", "/usr/local/sbin", "/usr/local/share", "/usr/local/share/man",
+              "/usr/local/src", "/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages",
+              "/usr/local/share/ca-certificates"),
+}
 
 
 def run(*args, capture=False):
@@ -131,6 +165,83 @@ def tool_home(home=TOOL_HOME, proc=Path("/proc")):
         raise ValueError(f"{home} has mode {stat.S_IMODE(metadata.st_mode):04o}; group or other may write "
                          "where root executes the runner's tools")
     return {"path": str(home), "created": False}
+
+
+def boat_base_layout(image=Path("/"), layout=BOAT_BASE_USR_LOCAL, provider_uid=BOAT_BASE_UID, chown=os.lchown):
+    """Apply BOAT_BASE_USR_LOCAL to the image at `image` ("/" when building, a
+    fixture directory in tests) and return what changed. Every listed path's
+    owner is checked before anything changes, so a refusal leaves the image as
+    it was. Idempotent: a reapplied recipe finds the trees gone and the
+    directories already root's."""
+    image = Path(os.path.realpath(image))
+
+    def inside(name):
+        return image / name.lstrip("/")
+
+    def provider_or_root(name, metadata, action):
+        if metadata.st_uid not in (0, provider_uid):
+            raise ValueError(f"refusing to {action} {name}: owned by uid {metadata.st_uid}, "
+                             f"neither root nor Boat's base account uid {provider_uid}")
+        return {"path": name, "uid": metadata.st_uid, "gid": metadata.st_gid}
+
+    report = {"provider_uid": provider_uid, "removed": [], "unlinked": [], "reowned": [], "absent": []}
+    trees, links, directories = [], [], []
+    for name in layout["remove"]:
+        path = inside(name)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            report["absent"].append(name)
+            continue
+        trees.append((path, metadata, provider_or_root(name, metadata, "remove")))
+    # An absolute link target is read beneath `image` and a relative one from
+    # the link's directory, both normalized without following any link, so a
+    # fixture's absolute links never reach the running system's files.
+    searched = set()
+    for name in layout["search_path"]:
+        directory = Path(os.path.realpath(inside(name)))
+        if directory in searched or not directory.is_dir():
+            continue
+        searched.add(directory)
+        for entry in sorted(directory.iterdir()):
+            if not entry.is_symlink():
+                continue
+            target = os.readlink(entry)
+            lexical = Path(os.path.normpath(inside(target) if os.path.isabs(target) else entry.parent / target))
+            if any(lexical == tree or tree in lexical.parents for tree, _, _ in trees):
+                record = provider_or_root("/" + str(entry.relative_to(image)), entry.lstat(), "unlink")
+                links.append((entry, dict(record, target=target)))
+    for name in layout["reown"]:
+        path = inside(name)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            report["absent"].append(name)
+            continue
+        directories.append((path, metadata, provider_or_root(name, metadata, "re-own")))
+
+    for entry, record in links:
+        entry.unlink()
+        report["unlinked"].append(record)
+    for path, metadata, record in trees:
+        if stat.S_ISDIR(metadata.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        report["removed"].append(record)
+    for path, metadata, record in directories:
+        mode = stat.S_IMODE(metadata.st_mode)
+        changed = False
+        if (metadata.st_uid, metadata.st_gid) != (0, 0):
+            chown(path, 0, 0)
+            changed = True
+        # A symlink's own mode bits are meaningless on Linux.
+        if not stat.S_ISLNK(metadata.st_mode) and mode & 0o022:
+            path.chmod(mode & ~0o022)
+            changed = True
+        if changed:
+            report["reowned"].append(dict(record, mode=f"{mode:04o}"))
+    return report
 
 
 def download(url, destination, expected):
@@ -532,6 +643,9 @@ def main():
     run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
     target_directories()
     accounts()
+    # Before the tool installers write under /usr/local; the root-owned path
+    # check after the service preflight then covers everything the list leaves.
+    base_layout = boat_base_layout()
     home = tool_home()
     run('/usr/bin/python3', str(HERE / 'motor-boat-credentials.py'), '--output', '/srv/build/boat-provider-audit.json')
     # Check the administrative path and firewall transaction before long tool builds.
@@ -562,7 +676,8 @@ def main():
         "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
-                      cargo_seed=seed_inventory, tool_home=home, root_owned_paths=owned,
+                      cargo_seed=seed_inventory, tool_home=home, boat_base_layout=base_layout,
+                      root_owned_paths=owned,
                      packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
                       parity=parity_result,
                       provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))
