@@ -13,8 +13,23 @@ Restart=on-failure
 RestartSec=1
 Delegate=yes
 DelegateSubgroup=helper
-KillMode=control-group
-TimeoutStopSec=30
+# Tenant VMs run in this unit's cgroup. SIGTERM goes only to the helper, which
+# stops each running tenant cleanly (guest drain, sync and freeze, then the
+# VMM) and exits. systemd then SIGKILLs whatever is left in the cgroup: job
+# VMs, and any tenant the helper recorded as unclean.
+KillMode=mixed
+# The helper serves one request at a time, so a stop first waits for the one in
+# progress. The slowest is a suspend: guest prepare up to 50 s (vsock relay
+# 20 s, agent 30 s), then Firecracker pauses the VM and writes the guest
+# memory in snapshot/create. Each API call has a 300 s timeout; the pause
+# returns at once, so 300 s covers both. Then VMM exit up to 10 s. Then each
+# running tenant's clean stop takes up to 45 s: relay 20 s, guest flush 15 s,
+# VMM exit 10 s. No suspend or drain times have been measured yet (the helper
+# logs each tenant's stop time), so this uses those bounds: 360 s + 45 s for
+# one tenant, rounded up. Add 45 s for each further tenant on the host. Past
+# it, systemd SIGKILLs and the tenants' next start runs the guest's recovery
+# check.
+TimeoutStopSec=420
 UMask=0022
 LimitNOFILE=65536
 

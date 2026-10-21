@@ -172,7 +172,22 @@ extra rule.
 
    `switch-image` takes the shared `/var/lib/motor-vm/provision.lock` and refuses
    unless both `motor-host.service` and `motor-vm-helper.service` are inactive; it
-   does not stop or start either service. It verifies the image with the hosted
+   does not stop or start either service. Stop them first with
+
+   ```sh
+   sudo systemctl stop motor-host.service motor-vm-helper.service
+   ```
+
+   Stopping the helper is the clean stop: it has each running tenant's guest
+   drain, `sync -f /tenant` and freeze (bounded at 15 s) before it stops the
+   VM, and only then exits. The guest refuses that while its runner has a job
+   queued or running, so stop when the tenant is idle; a tenant that cannot be
+   stopped cleanly is recorded as unclean and its next start runs the in-guest
+   recovery check. `journalctl -u motor-vm-helper` shows `tenant tenant-1: clean
+   stop took N ms` or the reason it was not clean. The stop can take up to
+   `TimeoutStopSec` (420 s) when a suspend is in progress. If the tenant's
+   last stop was not clean, `switch-image` prints a warning saying so.
+   It verifies the image with the hosted
    image inventory command, builds the tenant's size-specific base if needed,
    and updates the helper registry and `/etc/motor-host/provision/tenant-1.json`
    together. An image-mismatched suspend snapshot is moved to a timestamped
@@ -232,11 +247,28 @@ sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --stop
 ```
 
 `--stop` disables and stops `motor-host` first, so it sends no further
-heartbeat. It then disables and stops the helper, which stops the tenant VM;
-the disk is kept, and its next start runs the in-guest recovery checks. It
+heartbeat. It then disables and stops the helper, which stops the tenant VM
+cleanly, as described for `switch-image` above; the disk is kept. If the stop
+was not clean, the next start runs the in-guest recovery checks. It
 deletes the `<port>/tcp ... # motor-host-agent` firewall rule and checks that
 the server is back to SSH only (`inbound policy: SSH only`). It keeps the keys,
 journal, configs and tenant disk; never delete a tenant disk or the journal as
 part of a rollback.
 
 To return to service, run `--check`, then `--start`.
+
+## Upgrading a helper that predates the clean stop
+
+A helper built before the clean service stop dies on SIGTERM and wrote no
+`running.json` marker, so the restart onto the new one cuts a running tenant's
+power and nothing detects it. Before restarting it, check for a running tenant
+VM with `pgrep -af 'firecracker.*--id tenant-'`. If one is listed, either wait
+until the tenant is suspended (the process is gone), or record the stop as
+unclean first so the next start runs the in-guest recovery check:
+
+```sh
+echo '{}' | sudo tee /var/lib/motor-vm/tenants/tenant-1/running.json
+```
+
+Do not write the marker for a tenant that is not running: it discards the
+suspend snapshot and runs recovery for nothing.

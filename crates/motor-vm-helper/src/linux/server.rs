@@ -45,6 +45,8 @@ pub fn serve(
     allowed: Vec<u32>,
     socket_gid: u32,
 ) -> Result<()> {
+    // Before any thread exists, so every thread inherits the blocked mask.
+    let signals = crate::signals::StopSignals::block()?;
     let helper = Arc::new(Mutex::new(Helper::new(machine, count, allowed)?));
     // Only the reconciled helper publishes a listener. Refuse non-socket state,
     // rather than unlinking an arbitrary file on a privileged path.
@@ -64,6 +66,19 @@ pub fn serve(
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));
         maintenance.lock().unwrap().maintain();
+    });
+    let stopping = helper.clone();
+    std::thread::spawn(move || {
+        // A tenant that did not stop cleanly is already recorded as unclean,
+        // so its next start runs the guest's recovery check. Exit 0 either
+        // way: the stop was requested, and a failed unit would make
+        // `provision.py switch-image`, which needs both services inactive,
+        // refuse until the failure is reset by hand.
+        match crate::signals::stop_on_signal(&stopping, &signals) {
+            Ok(signal) => eprintln!("motor-vm-helper: stopped after signal {signal}"),
+            Err(e) => eprintln!("motor-vm-helper: {e}"),
+        }
+        std::process::exit(0);
     });
     for connection in listener.incoming() {
         let stream = connection?;

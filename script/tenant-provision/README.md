@@ -75,6 +75,17 @@ that already agree are left alone. Tests:
 `test_switch_image_refuses_the_live_mismatch_until_it_is_repaired`,
 `test_repair_refuses_without_changing_anything_unless_only_the_image_differs`.
 
+`provision.py switch-image <tenant> <image>` refuses while `motor-host.service`
+or `motor-vm-helper.service` is active, and the refusal names the clean stop:
+`sudo systemctl stop motor-host.service motor-vm-helper.service`. Stopping the
+helper stops each running tenant VM cleanly (guest drain, sync and freeze, then
+the VM) before it exits, so the switch never cuts a guest's power. If the
+helper's `running.json` marker is still in the tenant home, the last stop was
+not clean; the switch goes ahead and warns that the next start runs the
+in-guest recovery check. The procedure is in `docs/hosted-host.md`. Tests:
+`test_switch_image_refuses_when_either_service_is_running`,
+`test_switch_image_warns_when_the_last_vm_stop_was_unclean`.
+
 Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

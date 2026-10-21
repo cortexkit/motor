@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod signals;
 pub mod tenant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +213,11 @@ pub trait Machine {
     fn tenant(&mut self, _tenant: &str, _op: tenant::Operation) -> Result<Response> {
         Err(Error("tenant VMs are not configured".into()))
     }
+    /// Runs before the helper exits on a stop signal. Tenant VMs are in the
+    /// service's cgroup, so whatever this leaves running systemd kills.
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct Helper<M: Machine> {
@@ -220,6 +226,7 @@ pub struct Helper<M: Machine> {
     allowed_uids: Vec<u32>,
     connections: BTreeMap<u64, Peer>,
     next_connection: u64,
+    stopping: bool,
 }
 impl<M: Machine> Helper<M> {
     /// Reconciliation is a barrier: a server may bind its socket only after this
@@ -235,7 +242,14 @@ impl<M: Machine> Helper<M> {
             allowed_uids,
             connections: BTreeMap::new(),
             next_connection: 0,
+            stopping: false,
         })
+    }
+    /// Stops tenant VMs cleanly for a service stop. Afterwards every request
+    /// is refused, so nothing can start a VM between this and the exit.
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.stopping = true;
+        self.machine.shutdown()
     }
     pub fn connect(&mut self, peer: Peer) -> Result<u64> {
         if !self.allowed_uids.contains(&peer.uid) {
@@ -264,6 +278,9 @@ impl<M: Machine> Helper<M> {
             .connections
             .get(&connection)
             .ok_or_else(|| Error("connection is not authorised".into()))?;
+        if self.stopping {
+            return Err(Error("helper is stopping".into()));
+        }
         match request {
             Request::Acquire { instance, job_id } => {
                 let identity = Identity::parse(instance, &job_id)?;

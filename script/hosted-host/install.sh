@@ -354,7 +354,7 @@ start_units() {
 
 stop_units() {
   # Stop the agent first so it sends no further heartbeat, then the helper,
-  # which stops the tenant VM. Nothing on disk is removed.
+  # which stops the tenant VM cleanly before it exits. Nothing on disk is removed.
   systemctl disable --now motor-host.service || fail "cannot stop motor-host.service"
   systemctl disable --now motor-vm-helper.service || fail "cannot stop motor-vm-helper.service"
   # Delete the agent rule by number, highest first so earlier numbers stay valid.
