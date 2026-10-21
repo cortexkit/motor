@@ -290,7 +290,7 @@ fn service_uses_delegation_leaf_and_sends_sigterm_only_to_the_helper() {
 
 #[test]
 fn storage_mount_keeps_vm_reads_below_root_owned_ancestors() {
-    let mount = include_str!("../systemd/var-lib-motor\\x2dvm.mount");
+    let mount = include_str!("../systemd/motor-vm-storage.mount");
     for setting in [
         "What=/srv/build/vm",
         "Where=/var/lib/motor-vm",
@@ -310,7 +310,7 @@ fn storage_mount_keeps_vm_reads_below_root_owned_ancestors() {
 
 #[test]
 fn storage_companion_stops_propagation_before_helper_start() {
-    let mount = include_str!("../systemd/var-lib-motor\\x2dvm.mount");
+    let mount = include_str!("../systemd/motor-vm-storage.mount");
     assert!(mount
         .lines()
         .any(|line| line == "Wants=motor-vm-storage-private.service"));

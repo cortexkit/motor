@@ -167,8 +167,15 @@ preflight() {
   done
   # The storage view is installed by the VM storage step and must already be a
   # private bind mount; this script never changes it.
-  for unit in 'var-lib-motor\x2dvm.mount' motor-vm-storage-private.service; do
-    if cmp -s "$checkout/crates/motor-vm-helper/systemd/$unit" "$UNIT_DIR/$unit"; then
+  # The mount unit's installed name must be the systemd escape of its path,
+  # which contains a backslash; the checkout keeps it under a portable name
+  # because Windows checkouts cannot hold a backslash in a file name.
+  local source unit
+  for pair in 'motor-vm-storage.mount:var-lib-motor\x2dvm.mount' \
+    motor-vm-storage-private.service:motor-vm-storage-private.service; do
+    source=${pair%%:*}
+    unit=${pair#*:}
+    if cmp -s "$checkout/crates/motor-vm-helper/systemd/$source" "$UNIT_DIR/$unit"; then
       ok "$UNIT_DIR/$unit matches the checkout"
     else
       fail "$UNIT_DIR/$unit is missing or differs; see docs/linux-microvm.md#install"

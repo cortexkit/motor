@@ -9,7 +9,8 @@ instance runs jobs.
 its host prerequisites, installation, protocol, restart behavior and tests.
 The helper's fixed storage root is `/var/lib/motor-vm`, the root-trusted bind
 view of `/srv/build/vm`. Install and enable the versioned
-`systemd/var-lib-motor\x2dvm.mount` unit and
+`systemd/motor-vm-storage.mount` unit (installed as `var-lib-motor\x2dvm.mount`,
+the name systemd requires for that path) and
 `systemd/motor-vm-storage-private.service` companion before starting the helper.
 The companion runs `mount --make-rprivate` after mounting, so mounts cannot
 propagate back through the source alias; the helper requires it. The install
