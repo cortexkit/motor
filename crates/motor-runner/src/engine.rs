@@ -54,6 +54,10 @@ pub struct Config {
     pub(crate) private_pids: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_unset_environment: Vec<String>,
+    /// The job account's ids, set when Boat jobs run the runner's PID
+    /// namespace init because systemd lacks PrivatePIDs.
+    #[cfg(target_os = "linux")]
+    pub(crate) pid_init: Option<crate::isolation::pid_init::JobIdentity>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.
     pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
@@ -225,6 +229,8 @@ impl Config {
             private_pids: true,
             #[cfg(target_os = "linux")]
             boat_unset_environment: Vec::new(),
+            #[cfg(target_os = "linux")]
+            pid_init: None,
             tenant_socket_dir: None,
             instance: instance.into(),
             build_slot_root: state_root.join("build-slots"),
@@ -839,6 +845,13 @@ impl Runner {
                 config.boat_unset_environment = crate::systemd::provider_environment_names()?;
             }
             crate::isolation::validate_account()?;
+            if config.boat_profile && !config.private_pids {
+                // Job units exec the installed runner as their PID namespace
+                // init; tests run from the build tree and never reach a unit.
+                #[cfg(not(test))]
+                crate::isolation::pid_init::check_installed_runner()?;
+                config.pid_init = Some(crate::isolation::job_identity()?);
+            }
             #[cfg(test)]
             if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
                 crate::isolation::prepare_shared_read_access_from(
@@ -4454,9 +4467,123 @@ impl Runner {
                         "legacy unit ended without retained exit status",
                     ))
                 };
+                #[cfg(target_os = "linux")]
+                if durable {
+                    if let Some(detail) = self.pid_namespace_setup_failure(id, &directory, &status)
+                    {
+                        return self.refuse_unstarted_unit(id, detail);
+                    }
+                }
                 return self.finish(id, status);
             }
             std::thread::park_timeout(Duration::from_millis(25));
+        }
+    }
+    /// A Boat job's PID namespace init that fails exits 226 before the wrapper
+    /// exists, so the gate byte is never read and the command never runs. It
+    /// proves this by the line it wrote to the root-only setup-error file,
+    /// which nothing writes once the wrapper starts. Returns that line when
+    /// all of this holds and the wrapper wrote no exit code.
+    #[cfg(target_os = "linux")]
+    fn pid_namespace_setup_failure(
+        &self,
+        id: Uuid,
+        directory: &Path,
+        status: &io::Result<std::process::ExitStatus>,
+    ) -> Option<String> {
+        use crate::isolation::pid_init;
+        if !self.core.config.boat_profile || self.core.config.private_pids {
+            return None;
+        }
+        if status.as_ref().ok()?.code() != Some(pid_init::SETUP_FAILED) {
+            return None;
+        }
+        if fs::metadata(directory.join("exit")).is_ok_and(|m| m.len() != 0) {
+            return None;
+        }
+        let mut text = String::new();
+        crate::filesystem::read_nofollow(&directory.join(pid_init::SETUP_ERROR_FILE))
+            .ok()?
+            .take(4096)
+            .read_to_string(&mut text)
+            .ok()?;
+        let line = text.lines().next()?;
+        if !line.starts_with(pid_init::SETUP_FAILURE_PREFIX) {
+            return None;
+        }
+        // Output would mean something ran after all; then the ordinary path
+        // reports the unit's status.
+        let inner = self.core.inner.lock().unwrap();
+        let job = inner.jobs.get(&id)?;
+        (job.terminal.is_none() && job.chunks.is_empty()).then(|| line.to_owned())
+    }
+    /// Record a job whose unit ended before its command could start as
+    /// refused before start, which callers may safely retry. Its Started
+    /// record is withdrawn, as when the launch itself fails before the gate.
+    #[cfg(target_os = "linux")]
+    fn refuse_unstarted_unit(&self, id: Uuid, detail: String) -> io::Result<()> {
+        let process = self.core.inner.lock().unwrap().jobs[&id].process;
+        // Reading the result also resets the failed unit so systemd unloads
+        // it, as the normal finish path does.
+        let _ = self.core.backend.oom_stopped(&self.core.config, process);
+        let mut finished = {
+            let mut inner = self.core.inner.lock().unwrap();
+            if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
+                return Ok(());
+            }
+            inner.jobs[&id].clone()
+        };
+        let safe = self.safe_refusal_detail(
+            &detail,
+            finished
+                .request
+                .as_ref()
+                .into_iter()
+                .flat_map(|request| request.env.values().cloned()),
+        );
+        finished.process = None;
+        finished.started_ms = None;
+        finished.started = None;
+        finished.next_seq = 0;
+        refuse_before_start(
+            &self.core.health,
+            &mut finished,
+            RefusalReason::WorkspaceSetupFailed,
+            &detail,
+            Some(safe),
+            self.now(),
+        );
+        finished.state = JobState::Tombstone;
+        let log = self.job_log(id);
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let write = log.write.lock().unwrap();
+            match self.save(&finished) {
+                Ok(()) => {
+                    let mut inner = self.core.inner.lock().unwrap();
+                    inner.jobs.insert(id, finished.clone());
+                    inner.finalizing.remove(&id);
+                    inner.starting.remove(&id);
+                    inner.exit_statuses.remove(&id);
+                    inner.kill_retries.remove(&id);
+                    inner.cpu_times.remove(&id);
+                    if finished.base {
+                        self.finish_base(
+                            &mut inner,
+                            finished.request.as_ref().unwrap(),
+                            false,
+                            None,
+                        )?;
+                    }
+                    return self.catalog(&inner);
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %id, %error, "refusal record failed; retrying");
+                    drop(write);
+                    std::thread::park_timeout(delay);
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
         }
     }
     fn durable_exit_status(

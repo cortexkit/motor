@@ -633,6 +633,7 @@ impl Backend for HostBackend {
                                 config.private_pids,
                                 config.boat_memory_max_bytes,
                             )
+                            .with_pid_init(config.pid_init.clone())
                             .without_provider_environment(&config.boat_unset_environment)
                     })
                     .and_then(|sandbox| {

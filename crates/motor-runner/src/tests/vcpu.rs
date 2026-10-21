@@ -820,6 +820,99 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
     }
 }
 
+/// A Boat job's PID namespace init that fails exits 226 before the wrapper
+/// reads the gate, so the command never ran. That must reach the caller as a
+/// retry-safe refusal carrying the init's reason, never as "exit 226". The
+/// same status with an exit file, or without the init's line, is the job's
+/// own exit and stays one.
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit() {
+    use crate::isolation::pid_init;
+    let line = format!(
+        "{}mount the namespace's proc: Operation not permitted (os error 1)",
+        pid_init::SETUP_FAILURE_PREFIX
+    );
+    for (case, exit_file, setup_error, boat_init) in [
+        ("setup failure", "", line.as_str(), true),
+        ("job exited 226", "226\n", line.as_str(), true),
+        ("no init line", "", "", true),
+        ("unit without the init", "", line.as_str(), false),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.boat_profile = true;
+        config.boat_memory_max_bytes = Some(2 << 30);
+        config.private_pids = !boat_init;
+        config.systemd_command = Some(Arc::new(|args| {
+            let text = match args {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
+                    "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                }
+                ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => {
+                    "ExecMainCode=1\nExecMainStatus=226\n"
+                }
+                ["show", "--property=Result", _] => "Result=exit-code\n",
+                ["reset-failed", _] | ["list-units", ..] => "",
+                _ => panic!("unexpected systemd command: {args:?}"),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: text.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }));
+        let runner = Runner::open(config).unwrap();
+        let (request, _) = f.run("true");
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.started = Some(Started::new(0, 0, runner.now()));
+            job.next_seq = 1;
+            job.durable_output = true;
+            job.process = Some(platform::ProcessIdentity {
+                pid: 0,
+                start: 0,
+                unit: Some(Uuid::now_v7()),
+            });
+            runner.save(job).unwrap();
+        }
+        let output = runner
+            .config()
+            .state_dir()
+            .join("sandboxes")
+            .join(request.job_id.to_string())
+            .join("output");
+        fs::create_dir_all(&output).unwrap();
+        for name in ["stdout", "stderr"] {
+            fs::write(output.join(name), "").unwrap();
+        }
+        fs::write(output.join("exit"), exit_file).unwrap();
+        fs::write(output.join(pid_init::SETUP_ERROR_FILE), setup_error).unwrap();
+        runner.follow_unit(request.job_id).unwrap();
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        let terminal = job.terminal.clone().unwrap();
+        if case == "setup failure" {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::WorkspaceSetupFailed
+                },
+                "{case}"
+            );
+            assert_eq!(terminal.ran, Some(Ran::None), "{case}");
+            assert_eq!(terminal.refusal_detail(), Some(line.as_str()), "{case}");
+            assert_eq!(job.state, JobState::Tombstone, "{case}");
+            assert!(job.started.is_none() && job.started_ms.is_none(), "{case}");
+        } else {
+            assert_eq!(terminal.outcome, Outcome::Exit { code: 226 }, "{case}");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd isolation"]

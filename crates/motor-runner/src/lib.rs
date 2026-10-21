@@ -66,6 +66,16 @@ pub fn permission_helper_digest() -> String {
 pub fn check_permissions_helper() -> std::io::Result<()> {
     permissions::check_install()
 }
+/// PID 1 of a Boat job's PID namespace on systemd before 257; the job unit
+/// execs the installed runner in this mode. Never returns.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub const JOB_PID_INIT_MODE: &str = isolation::pid_init::MODE;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn job_pid_init(args: Vec<std::ffi::OsString>) -> ! {
+    isolation::pid_init::run(args)
+}
 #[cfg(target_os = "linux")]
 pub use tenant::serve_tenant;
 #[cfg(target_os = "linux")]
