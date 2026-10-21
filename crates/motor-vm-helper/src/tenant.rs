@@ -38,6 +38,7 @@ pub enum Operation {
     Adopt,
     Metrics,
     RecoveryComplete,
+    Remove,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -189,6 +190,21 @@ pub trait Backend {
     fn metrics(&mut self, _tenant: &str, _registry: &Registry) -> Result<(u64, u64)> {
         Err(Error("tenant metrics unavailable".into()))
     }
+    /// Whether anything of a VM is left for this tenant even when this helper
+    /// process did not start it: its cgroup or its jail.
+    fn vm_present(&mut self, _tenant: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Quarantines the stopped tenant's data and removes its records and
+    /// network setup; returns the quarantine folder.
+    fn remove(&mut self, _tenant: &str, _registry: &Registry) -> Result<PathBuf> {
+        Err(Error("tenant removal unavailable".into()))
+    }
+    /// Completes a removal whose registry entry is already gone but whose
+    /// data was not yet moved; `None` when there is none.
+    fn resume_removal(&mut self, _tenant: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 pub struct Controller<B: Backend>(pub B);
@@ -197,6 +213,9 @@ impl<B: Backend> Controller<B> {
         validate_name(tenant)?;
         if let Operation::Relay(port) = op {
             validate_port(port)?;
+        }
+        if let Operation::Remove = op {
+            return self.remove(tenant);
         }
         let r = self.0.registry(tenant)?;
         r.validate(tenant)?;
@@ -215,6 +234,7 @@ impl<B: Backend> Controller<B> {
             Operation::Cpu(vcpus) => self.0.cpu(tenant, &r.cpu_max(vcpus)?)?,
             Operation::Egress => self.0.egress(tenant, &r)?,
             Operation::Adopt => {}
+            Operation::Remove => unreachable!("removal returns before the registry is read"),
             Operation::RecoveryComplete => self.0.recovery_complete(tenant, &r)?,
             Operation::Metrics => {
                 let (memory_bytes, egress_bytes) = self.0.metrics(tenant, &r)?;
@@ -290,6 +310,30 @@ impl<B: Backend> Controller<B> {
             generation,
             recovery_required: self.0.unclean(&r)?,
         }))
+    }
+    /// The caller names a tenant only. Its registry entry decides what goes,
+    /// so an unknown tenant is refused, and the VM must already be stopped:
+    /// the helper checks that itself rather than trusting the caller. Every
+    /// tenant operation runs under the helper's one lock, so no suspend or
+    /// snapshot can be in progress while this runs.
+    fn remove(&mut self, tenant: &str) -> Result<Response> {
+        let r = match self.0.registry(tenant) {
+            Ok(r) => r,
+            Err(error) => {
+                return match self.0.resume_removal(tenant)? {
+                    Some(quarantine) => Ok(removed(quarantine)),
+                    None => Err(error),
+                }
+            }
+        };
+        r.validate(tenant)?;
+        if self.0.running(tenant) || self.0.vm_present(tenant)? {
+            return Err(Error(
+                "tenant VM is running; stop it before removing the tenant".into(),
+            ));
+        }
+        let quarantine = self.0.remove(tenant, &r)?;
+        Ok(removed(quarantine))
     }
     /// Turns a running marker left by a VM that is no longer running into the
     /// unclean-stop record, so the next start skips the suspend snapshot and
@@ -394,6 +438,12 @@ impl<B: Backend> Controller<B> {
         }
         result.map(|()| false)
     }
+}
+
+fn removed(quarantine: PathBuf) -> Response {
+    Response::new(Reply::Removed {
+        quarantine: quarantine.display().to_string(),
+    })
 }
 
 #[cfg(test)]

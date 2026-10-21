@@ -599,6 +599,44 @@ impl Backend for LinuxTenants {
         let root = self.vm(tenant)?.root.clone();
         connect_relay(&root, port)
     }
+    fn vm_present(&mut self, tenant: &str) -> Result<bool> {
+        crate::tenant::validate_name(tenant)?;
+        let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
+        Ok(self.groups.join(tenant).exists() || jail.exists())
+    }
+    fn remove(&mut self, tenant: &str, r: &Registry) -> Result<PathBuf> {
+        let paths = crate::removal::Paths::live();
+        let _lock = crate::removal::lock(&paths)?;
+        let unix_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let quarantine = crate::removal::begin(&paths, tenant, unix_s)?;
+        // Reconcile the firewall over every other tenant: that drops this
+        // tenant's chains, counter and UFW route grant and leaves the rest.
+        let remaining = tenant_network::without(self.registries()?, r);
+        tenant_network::install(&remaining)?;
+        tenant_network::remove_tap(r)?;
+        crate::removal::finish(&paths, tenant, &quarantine)?;
+        eprintln!(
+            "tenant {tenant}: removed records and network; data quarantined at {} until purge",
+            quarantine.display()
+        );
+        Ok(quarantine)
+    }
+    fn resume_removal(&mut self, tenant: &str) -> Result<Option<PathBuf>> {
+        let paths = crate::removal::Paths::live();
+        let _lock = crate::removal::lock(&paths)?;
+        let Some(quarantine) = crate::removal::pending(&paths, tenant)? else {
+            return Ok(None);
+        };
+        crate::removal::finish(&paths, tenant, &quarantine)?;
+        eprintln!(
+            "tenant {tenant}: completed an interrupted removal; data quarantined at {}",
+            quarantine.display()
+        );
+        Ok(Some(quarantine))
+    }
 }
 
 fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {

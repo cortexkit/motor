@@ -48,6 +48,7 @@ struct Fake {
     space: u64,
     unclean: bool,
     marker: bool,
+    present: bool,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -60,6 +61,7 @@ impl Default for Fake {
             space: u64::MAX,
             unclean: false,
             marker: false,
+            present: false,
         }
     }
 }
@@ -117,6 +119,15 @@ impl Backend for Fake {
     fn registry(&mut self, _: &str) -> Result<Registry> {
         self.call("registry")?;
         Ok(registry("a"))
+    }
+    fn vm_present(&mut self, _: &str) -> Result<bool> {
+        Ok(self.present)
+    }
+    fn remove(&mut self, tenant: &str, _: &Registry) -> Result<PathBuf> {
+        self.call("remove")?;
+        Ok(PathBuf::from(format!(
+            "/var/lib/motor-vm/removed/{tenant}-1"
+        )))
     }
     fn key(&mut self, _: &Registry) -> Result<SnapshotKey> {
         Ok(key(self.generation))
@@ -451,6 +462,7 @@ fn hosted_tenant_wire_rejects_extra_arguments_without_changing_job_ops() {
         "adopt",
         "set_cpu_max",
         "open_relay",
+        "remove_tenant",
     ] {
         let mut value = json!({"op":op,"tenant":"a"});
         if op == "set_cpu_max" {
@@ -760,4 +772,47 @@ fn a_vm_that_died_on_its_own_is_recorded_unclean_before_it_is_started_again() {
         }
     ));
     assert_eq!(c.0.calls[..2], ["registry", "unclean-fsync"]);
+}
+
+#[test]
+fn removal_refuses_an_unknown_tenant_and_a_running_vm_before_touching_anything() {
+    // An unknown name: no registry entry, and no interrupted removal to finish.
+    let mut c = Controller(Fake {
+        fail: "registry",
+        ..Fake::default()
+    });
+    assert!(c.handle("a", Operation::Remove).is_err());
+    assert_eq!(c.0.calls, ["registry"]);
+    // A registry entry that belongs to another tenant name.
+    let mut c = Controller(Fake::default());
+    assert!(c.handle("b", Operation::Remove).is_err());
+    assert_eq!(c.0.calls, ["registry"]);
+    for (running, present) in [(true, false), (false, true)] {
+        let mut c = Controller(Fake {
+            running,
+            present,
+            ..Fake::default()
+        });
+        let error = c.handle("a", Operation::Remove).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "tenant VM is running; stop it before removing the tenant"
+        );
+        assert_eq!(
+            c.0.calls,
+            ["registry"],
+            "running={running} present={present}"
+        );
+    }
+    let mut c = Controller(Fake::default());
+    assert!(matches!(
+        c.handle("a", Operation::Remove).unwrap().reply,
+        Reply::Removed { ref quarantine } if quarantine == "/var/lib/motor-vm/removed/a-1"
+    ));
+    assert_eq!(c.0.calls, ["registry", "remove"]);
+    // The wire names a tenant and nothing else.
+    assert!(serde_json::from_value::<crate::Request>(
+        json!({"op":"remove_tenant","tenant":"a","quarantine":"/tmp"})
+    )
+    .is_err());
 }

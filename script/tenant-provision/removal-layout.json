@@ -1,0 +1,24 @@
+{
+  "lock": "/var/lib/motor-vm/provision.lock",
+  "quarantine": "/var/lib/motor-vm/removed/{tenant}-{unix_s}",
+  "moved": {
+    "/var/lib/motor-vm/tenants/{tenant}": "home"
+  },
+  "records": {
+    "/etc/motor-vm-helper/tenants/{tenant}.json": "records/registry.json",
+    "/etc/motor-host/provision/{tenant}.json": "records/provision.json"
+  },
+  "binding": {
+    "file": "/etc/motor-host/tenants.json",
+    "saved_as": "records/binding.json"
+  },
+  "network": [
+    "tap mtap{tap}",
+    "nft chain tenant_mtap{tap}_input",
+    "nft chain tenant_mtap{tap}_forward",
+    "nft chain tenant_mtap{tap}_nat",
+    "nft counter tenant_mtap{tap}_egress",
+    "ufw route motor-tenant-mtap{tap}"
+  ],
+  "purge_age_s": 604800
+}

@@ -51,6 +51,30 @@ pub fn ensure(r: &Registry, uid: u32) -> Result<()> {
     Ok(())
 }
 
+/// The registries left once `removed` is gone. Tap indices are unique across
+/// registries, so the tap identifies the removed tenant.
+pub fn without(registries: Vec<Registry>, removed: &Registry) -> Vec<Registry> {
+    registries
+        .into_iter()
+        .filter(|r| r.tap_index != removed.tap_index)
+        .collect()
+}
+
+/// Deletes a removed tenant's tap. Reconciliation never deletes taps (a
+/// stopped tenant keeps its own), so removal does it explicitly.
+pub fn remove_tap(r: &Registry) -> Result<()> {
+    let tap = r.tap();
+    let exists = Command::new("/usr/sbin/ip")
+        .args(["link", "show", "dev", &tap])
+        .output()?
+        .status
+        .success();
+    if exists {
+        run(&["link", "delete", "dev", &tap])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn rules(registries: &[Registry], existing: Option<&serde_json::Value>) -> Result<String> {
     policy_rules(registries, existing, &std::collections::BTreeSet::new())
@@ -667,6 +691,30 @@ mod tests {
         nft.apply(&reconcile);
         nft.traffic("mtap1", 10);
         assert_eq!(forward_bytes(&nft.snapshot(), "mtap1").unwrap(), 165);
+    }
+
+    #[test]
+    fn removing_a_tenant_drops_only_its_firewall_objects_and_keeps_other_counters() {
+        let a = crate::tenant::tests::registry("a");
+        let mut b = crate::tenant::tests::registry("b");
+        b.tap_index = 2;
+        let mut nft = NftObjects::default();
+        nft.apply(&rules(&[a.clone(), b.clone()], None).unwrap());
+        nft.traffic("mtap1", 40);
+        nft.traffic("mtap2", 90);
+        let remaining = without(vec![a.clone(), b.clone()], &b);
+        assert_eq!(
+            remaining.iter().map(|r| r.tap_index).collect::<Vec<_>>(),
+            [1]
+        );
+        nft.apply(&rules(&remaining, Some(&nft.snapshot())).unwrap());
+        for suffix in ["input", "forward", "nat"] {
+            assert!(!nft.chains.contains(&format!("tenant_mtap2_{suffix}")));
+            assert!(nft.chains.contains(&format!("tenant_mtap1_{suffix}")));
+        }
+        assert!(forward_bytes(&nft.snapshot(), "mtap2").is_err());
+        nft.traffic("mtap1", 2);
+        assert_eq!(forward_bytes(&nft.snapshot(), "mtap1").unwrap(), 42);
     }
 
     #[test]
