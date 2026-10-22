@@ -53,6 +53,10 @@ fn service_main(_: Vec<OsString>) {
                 // Publish StopPending and request cancellation before Runner::open returns.
                 STOP.store(true, Ordering::Release);
                 motor_runner::request_windows_service_stop();
+                tracing::info!(
+                    service_state = "StopPending",
+                    "native runner service received stop control"
+                );
                 if let Ok(slot) = callback_status.lock() {
                     if let Some(handle) = slot.as_ref() {
                         let _ =

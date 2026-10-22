@@ -125,6 +125,7 @@ class ParentVerificationTests(unittest.TestCase):
             service.index("runtime.block_on(super::run(args))"),
         )
         self.assertIn("ServiceState::StopPending", native_service)
+        self.assertIn('service_state = "StopPending"', native_service)
         self.assertIn("motor_runner::request_windows_service_stop()", native_service)
         self.assertIn("pub fn request_windows_service_stop()", library)
         self.assertIn("SERVICE_STOP_REQUESTED.store(true, Ordering::Release)", windows)
@@ -164,6 +165,7 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("Stop-Service -Name MotorRunner -ErrorAction Stop", stop)
         self.assertIn("Start-Sleep -Milliseconds 250", stop)
         self.assertIn("did not reach Stopped", stop)
+        self.assertIn("SERVICE-STOP state=", stop)
         self.assertEqual(script.count("Stop-RunnerServiceBounded"), 5)
 
     def test_installer_deploys_identity_helper(self):

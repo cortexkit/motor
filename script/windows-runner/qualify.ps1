@@ -31,10 +31,15 @@ function Stop-RunnerServiceBounded([int]$TimeoutSeconds = 120) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $stopSent = $false
     $lastState = 'Unknown'
+    $lastReportedState = ''
     $lastStopError = ''
     while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         $service = Get-Service -Name MotorRunner -ErrorAction Stop
         $lastState = [string]$service.Status
+        if ($lastState -ne $lastReportedState) {
+            Write-Host "SERVICE-STOP state=$lastState elapsed_ms=$($clock.ElapsedMilliseconds) utc=$([DateTime]::UtcNow.ToString('o'))"
+            $lastReportedState = $lastState
+        }
         if ($service.Status -eq 'Stopped') { return }
         if ($service.Status -eq 'StopPending') { $stopSent = $true }
         if (-not $stopSent) {
