@@ -3,11 +3,13 @@ param([string]$Root = 'C:\ProgramData\MotorRunner', [Parameter(Mandatory)][strin
       [switch]$PrepLaunchMatrix,
       [switch]$AccessChecksOnly,
       [switch]$OfflineCargoOnly,
+      [switch]$LocalRegistryOnly,
       [string]$Evidence = ('C:\motor-runner-evidence\' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
-if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
+if (($OfflineCargoOnly -or $LocalRegistryOnly) -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'Cargo cache diagnostics are separate lanes' }
+if ($OfflineCargoOnly -and $LocalRegistryOnly) { throw 'Choose one Cargo cache diagnostic lane' }
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or $Evidence -notmatch '^C:\\motor-runner-evidence\\[A-Za-z0-9-]+$') { throw 'Use the owned runner root and a dedicated external evidence directory' }
 $Python = (Resolve-Path -LiteralPath $Python).Path
 if (Test-Path -LiteralPath $Evidence) { throw 'Fresh evidence directory required' }
@@ -18,6 +20,7 @@ $wrapper = "$Evidence\run.cmd"
 $diagnosticArgument = if ($PrepLaunchMatrix) { ' -PrepLaunchMatrix' } else { '' }
 if ($AccessChecksOnly) { $diagnosticArgument += ' -AccessChecksOnly' }
 if ($OfflineCargoOnly) { $diagnosticArgument += ' -OfflineCargoOnly' }
+if ($LocalRegistryOnly) { $diagnosticArgument += ' -LocalRegistryOnly' }
 @"
 @echo off
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$Root\bin\qualify.ps1" -Python "$Python" -Evidence "$Evidence"$diagnosticArgument > "$Evidence\qualification.log" 2>&1

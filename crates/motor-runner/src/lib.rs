@@ -116,6 +116,11 @@ pub fn hyperv_qualify_prep_offline_cargo(config: Config) -> std::io::Result<()> 
 }
 #[cfg(windows)]
 #[doc(hidden)]
+pub fn hyperv_qualify_prep_local_registry(config: Config) -> std::io::Result<()> {
+    windows::qualify_prep_local_registry(config)
+}
+#[cfg(windows)]
+#[doc(hidden)]
 pub fn hyperv_prep_probe(args: &[String]) -> std::io::Result<()> {
     windows::prep_probe(args)
 }

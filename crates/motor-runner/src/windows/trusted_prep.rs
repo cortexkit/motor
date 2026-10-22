@@ -12,6 +12,7 @@ use windows_sys::Win32::{
     Security::{LogonUserW, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT},
 };
 mod launch;
+mod local_registry;
 struct Handle(HANDLE);
 impl Handle {
     fn close(&mut self) -> io::Result<()> {
@@ -904,6 +905,102 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
     launch::write_diagnostic_update(&report_path, &report)?;
     println!(
         "DIAG offline-cargo-cache report={} staging_removed={}",
+        report_path.display(),
+        report["staging_removed"]
+    );
+    result?;
+    cleanup
+}
+
+/// SYSTEM-only proof for building a Cargo local registry from direct downloads.
+pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    launch::require_system()?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(io::Error::other)?;
+    let status = manager
+        .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
+        .and_then(|service| service.query_status())
+        .map_err(io::Error::other)?;
+    if status.current_state != ServiceState::Stopped {
+        return Err(invalid(
+            "Stop MotorRunner before the local-registry Cargo proof",
+        ));
+    }
+    let runner = crate::Runner::open(config)?;
+    let config = runner.config();
+    let vm = config.windows.as_ref().unwrap();
+    let root = &vm.layout_root;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("prep.lock"))?;
+    lock.lock_exclusive()?;
+
+    let cargo = root.join("prep-toolchain/bin/cargo.exe");
+    let rustc = root.join("prep-toolchain/bin/rustc.exe");
+    let cargo_sha256 = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
+    if cargo_sha256 != vm.prep_cargo_sha256.to_ascii_lowercase() {
+        return Err(invalid("local-registry proof prep cargo SHA-256 mismatch"));
+    }
+    let rustc_sha256 = format!("{:x}", Sha256::digest(fs::read(&rustc)?));
+
+    let id = Uuid::now_v7();
+    let stage = root.join("staging").join(id.to_string());
+    let fixture = stage.join("fetch-manifests/offline-cargo");
+    let report_path = root
+        .join("evidence")
+        .join(format!("prep-local-registry-{id}.json"));
+    let mut report = serde_json::json!({
+        "diagnostic_only": true,
+        "production_policy_unchanged": true,
+        "actor": "SYSTEM runner; pinned Cargo runs only in this disposable proof",
+        "fixture": {"manifest": fixture.join("Cargo.toml"), "lockfile": fixture.join("Cargo.lock"), "dependency": "cfg-if 1.0.4 from crates.io"},
+        "toolchain": {"cargo": cargo, "cargo_sha256": cargo_sha256, "cargo_pin": vm.prep_cargo_sha256,
+            "rustc": rustc, "rustc_sha256": rustc_sha256},
+        "staging": stage,
+        "staging_removed": false
+    });
+    launch::write_diagnostic_update(&report_path, &report)?;
+
+    let result: io::Result<()> = (|| {
+        fs::create_dir_all(fixture.join("src"))?;
+        fs::create_dir_all(stage.join("fetch-temp"))?;
+        fs::write(fixture.join("Cargo.toml"), OFFLINE_CARGO_MANIFEST)?;
+        fs::write(fixture.join("Cargo.lock"), OFFLINE_CARGO_LOCK)?;
+        fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n")?;
+        let proof = local_registry::prove(&cargo, &rustc, &fixture, &stage, &report_path)?;
+        let passed = proof["proof_passed"] == true;
+        report["local_registry_proof"] = proof;
+        if !passed {
+            return Err(invalid(
+                "local-registry Cargo proof failed; inspect its evidence report",
+            ));
+        }
+        Ok(())
+    })();
+
+    let cleanup = remove_staging(config, &stage);
+    report["staging_removed"] = serde_json::json!(cleanup.is_ok() && !stage.exists());
+    report["staging_leftover"] = if stage.exists() {
+        serde_json::json!(stage)
+    } else {
+        serde_json::Value::Null
+    };
+    if let Err(error) = &result {
+        report["error"] = serde_json::json!(error.to_string());
+    }
+    launch::write_diagnostic_update(&report_path, &report)?;
+    println!(
+        "DIAG local-registry report={} staging_removed={}",
         report_path.display(),
         report["staging_removed"]
     );

@@ -144,6 +144,32 @@ runner. No restricted `motor-prep` Cargo process is launched. The diagnostic is
 evidence collection only and does not change production fetching. Inspect the
 copied `prep-offline-cargo-*.json` report; leave the service stopped for review.
 
+Before using local Cargo registry source replacement in production, run its
+SYSTEM-only proof lane from elevated PowerShell 5.1:
+
+```powershell
+$python = (Get-Command python.exe -ErrorAction Stop).Source
+$evidence = 'C:\motor-runner-evidence\local-registry-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
+  -Python $python -Evidence $evidence -LocalRegistryOnly
+if ($LASTEXITCODE -ne 0) { throw "Local registry proof failed; preserve $evidence" }
+```
+
+This disposable diagnostic downloads only the crates.io index config, the raw
+`cfg-if` index record, and its checksum-pinned `.crate` file from their allowlisted
+HTTPS hosts with redirects disabled and response-size limits. It assembles the
+standard `index/` plus `.crate` local-registry layout, then uses a fresh Cargo home
+whose only initial file is the source-replacement config. The pinned Cargo runs
+`fetch --locked --offline` and `build --locked --offline`; the report records both
+results and confirms Cargo.lock stayed byte-identical. A one-byte archive mutation
+must be refused before writing by the runner's checksum gate, and Cargo must reject
+the same changed archive when that gate is bypassed. A fixture repository
+`.cargo/config.toml` selects an empty source to show whether project config overrides
+the Cargo-home replacement; if it does, production jobs must refuse such a config
+rather than silently using a different source. This is evidence collection only;
+it does not alter production fetching. Inspect `prep-local-registry-*.json` and leave
+the service stopped for review.
+
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
 This stops MotorRunner and runs fifteen probe/Cargo/rustc token comparisons without

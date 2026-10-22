@@ -1,9 +1,10 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$OfflineCargoOnly)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$OfflineCargoOnly, [switch]$LocalRegistryOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
-if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
+if (($OfflineCargoOnly -or $LocalRegistryOnly) -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'Cargo cache diagnostics are separate lanes' }
+if ($OfflineCargoOnly -and $LocalRegistryOnly) { throw 'Choose one Cargo cache diagnostic lane' }
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\qualify-peer.ps1"
@@ -63,6 +64,16 @@ if ($OfflineCargoOnly) {
         $null = Runner-Check 'qualify-prep-offline-cargo'
     } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Offline Cargo evidence copy failed: $_" -WarningAction Continue }
+    }
+    return
+}
+if ($LocalRegistryOnly) {
+    $service = Get-Service MotorRunner
+    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
+    try {
+        $null = Runner-Check 'qualify-prep-local-registry'
+    } finally {
+        try { Copy-QualificationEvidence } catch { Write-Warning "Local registry evidence copy failed: $_" -WarningAction Continue }
     }
     return
 }

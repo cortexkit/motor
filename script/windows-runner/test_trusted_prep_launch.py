@@ -17,6 +17,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
 
     def setUp(self):
         self.prep = (WINDOWS / "trusted_prep.rs").read_text()
+        self.local_registry = (WINDOWS / "trusted_prep/local_registry.rs").read_text()
         self.launch = (WINDOWS / "trusted_prep/launch.rs").read_text()
         self.session = (WINDOWS / "trusted_prep/launch/session.rs").read_text()
         self.process = (WINDOWS / "trusted_prep/launch/process.rs").read_text()
@@ -174,6 +175,39 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn('"fetch", "--locked", "--manifest-path"', self.prep)
         self.assertNotIn('DiagnosticPolicy::OfflineCargo', self.launch)
         self.assertNotIn('offline-cargo-home', self.launch)
+
+    def test_local_registry_proof_uses_allowlisted_downloads_and_offline_pinned_cargo(self):
+        wrapper = (HERE / "run-system.ps1").read_text()
+        qualify = (HERE / "qualify.ps1").read_text()
+        main = (ROOT / "crates/motor-runner/src/main.rs").read_text()
+        library = (ROOT / "crates/motor-runner/src/lib.rs").read_text()
+        windows = (ROOT / "crates/motor-runner/src/windows.rs").read_text()
+        self.assertCodeIn("[switch]$LocalRegistryOnly", wrapper)
+        self.assertCodeIn("-LocalRegistryOnly", wrapper)
+        self.assertCodeIn("Runner-Check 'qualify-prep-local-registry'", qualify)
+        self.assertCodeIn('"qualify-prep-local-registry" => motor_runner::hyperv_qualify_prep_local_registry(config)', main)
+        self.assertCodeIn("pub fn hyperv_qualify_prep_local_registry", library)
+        self.assertCodeIn("trusted_prep::local_registry_entry(config)", windows)
+        for fragment in (
+            '"index.crates.io", "/config.json"',
+            '"index.crates.io", "/cf/g-/cfg-if"',
+            '"static.crates.io", "/crates/cfg-if/cfg-if-1.0.4.crate"',
+            "WINHTTP_OPTION_REDIRECT_POLICY_NEVER",
+            "MAX_INDEX_BYTES: usize = 64 * 1024",
+            "MAX_ARCHIVE_BYTES: usize = 1024 * 1024",
+            "fn write_verified_archive",
+            "verify_index_checksum(&index_bytes)?",
+            'local-registry = \\\"{path}\\\"',
+            'args([operation, "--locked", "--offline", "--manifest-path"])',
+            'run_cargo(cargo, rustc, fixture, &normal_home, &target, &temp, "build")',
+            "lock_unchanged_after_fetch",
+            "lock_unchanged_after_build",
+            "cargo_rejected_changed_archive_checksum",
+            "repository_source_override_test",
+        ):
+            self.assertCodeIn(fragment, self.local_registry)
+        archive_gate = self.local_registry.split("fn write_verified_archive(", 1)[1].split("\n}", 1)[0]
+        self.assertLess(archive_gate.index("if checksum != CFG_IF_CHECKSUM"), archive_gate.index("OpenOptions::new"))
 
     def test_default_dacl_change_is_diagnostic_only_with_actual_readbacks(self):
         self.assertCodeIn("if plan.diagnostic_policy.changes_default_dacl()", self.session)

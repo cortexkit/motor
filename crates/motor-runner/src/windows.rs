@@ -65,6 +65,10 @@ pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {
     trusted_prep::offline_cargo_entry(config)
 }
 #[cfg(windows)]
+pub(crate) fn qualify_prep_local_registry(config: Config) -> io::Result<()> {
+    trusted_prep::local_registry_entry(config)
+}
+#[cfg(windows)]
 pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {
     trusted_prep::probe(args)
 }
