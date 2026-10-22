@@ -56,7 +56,7 @@ function Remove-RunnerPrepAccount([string]$Root, [string]$Sid) {
             throw 'motor-prep profile path changed or is still loaded; preserving it'
         }
         $path = [string]$profile.LocalPath
-        if (Test-Path -LiteralPath $path -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw 'Reparse motor-prep profile refused'
         }
         $profile | Remove-CimInstance

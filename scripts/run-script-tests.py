@@ -43,6 +43,7 @@ TEST_FILES = [
     "script/windows-runner/test_cache_manifest.py",
     "script/windows-runner/test_diagnose_connect.py",
     "script/windows-runner/test_install_script.py",
+    "script/windows-runner/test_powershell_precedence.py",
     "script/windows-runner/test_parent_identity.py",
     "script/windows-runner/test_qualify_jobs.py",
     "script/windows-runner/test_qualify_peer.py",
