@@ -414,6 +414,28 @@ impl SshConnector {
         *owned = Some(master);
         Ok(())
     }
+    /// The code health reports. Unlike `refusal`, which lets a job try again
+    /// once a sign failure's backoff has passed, this keeps showing the sign
+    /// failure until a sign succeeds.
+    pub(crate) fn health_refusal(&self) -> Option<&'static str> {
+        self.refusal_from(VaultAgent::health_refusal)
+    }
+    fn refusal_from(
+        &self,
+        agent_refusal: fn(&VaultAgent) -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        if self.credentials.stopped.load(Ordering::Acquire) {
+            return Some("runner_agent_stopped");
+        }
+        let current = self.credentials.current.lock().unwrap();
+        current
+            .failure
+            .or_else(|| current.agent.as_deref().and_then(agent_refusal))
+    }
+    #[cfg(test)]
+    pub(crate) fn agent(&self) -> Option<Arc<VaultAgent>> {
+        self.credentials.current.lock().unwrap().agent.clone()
+    }
 }
 
 impl Drop for SshConnector {
@@ -476,13 +498,7 @@ impl Connector for SshConnector {
         }
     }
     fn refusal(&self) -> Option<&'static str> {
-        if self.credentials.stopped.load(Ordering::Acquire) {
-            return Some("runner_agent_stopped");
-        }
-        let current = self.credentials.current.lock().unwrap();
-        current
-            .failure
-            .or_else(|| current.agent.as_ref().and_then(|agent| agent.refusal()))
+        self.refusal_from(VaultAgent::refusal)
     }
     fn connect(
         &self,
