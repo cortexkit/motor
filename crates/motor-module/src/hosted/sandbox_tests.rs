@@ -309,8 +309,8 @@ impl motor_host::journal::Journal for FullDisk {
 /// An endpoint that cannot record the lease answers with `storage_full`
 /// instead of closing the connection. ck-motor then reports the host's
 /// reason, where before it logged `hosted_connect_failed` with an empty
-/// `host_reason`, and treats the refusal like a full host: replaceable, and
-/// the job never ran.
+/// `host_reason`. Like a refusal from a full host, the endpoint never
+/// started the job, so ck-motor may place it on another host.
 #[tokio::test]
 async fn a_full_endpoint_journal_is_a_named_storage_full_refusal() {
     let endpoint = Endpoint::new();

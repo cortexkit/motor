@@ -164,8 +164,9 @@ pub(crate) enum Error {
     /// never retried, never sent back to the build server, never run locally.
     AccountClosed,
     InternalFailure,
-    /// The host refused the lease because its disk is full: it recorded
-    /// nothing and no runner saw the job, so the job never ran.
+    /// The host refused the lease because its disk is full. It recorded
+    /// nothing and no runner saw the job, so this attempt never started it
+    /// and the job may be placed elsewhere.
     StorageFull,
     Connect,
     Broker,
