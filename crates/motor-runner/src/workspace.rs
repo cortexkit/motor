@@ -206,7 +206,7 @@ pub(crate) fn validate(
 
 /// Resolve existing ancestors as well as future destinations. A missing suffix
 /// must not hide an existing symlink pointing outside an authorized root.
-fn destination(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

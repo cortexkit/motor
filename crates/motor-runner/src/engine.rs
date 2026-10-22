@@ -225,6 +225,10 @@ pub struct Config {
     /// unit, which needs sudo and systemd.
     #[cfg(test)]
     pub(crate) snapshot_helper_launcher: Option<crate::sibling_snapshots::helper::Launcher>,
+    /// Replaces the host's boot ID, which sibling snapshot metadata records
+    /// so that a snapshot published before a host restart is checked again.
+    #[cfg(test)]
+    pub(crate) boot_id_override: Option<String>,
     /// Replaces the runner's JavaScript environment digest in sibling
     /// snapshot keys, which otherwise runs each package manager.
     #[cfg(test)]
@@ -434,6 +438,8 @@ impl Config {
             sibling_snapshot_access: None,
             #[cfg(test)]
             snapshot_helper_launcher: None,
+            #[cfg(test)]
+            boot_id_override: None,
             #[cfg(test)]
             javascript_environment_override: None,
             #[cfg(test)]

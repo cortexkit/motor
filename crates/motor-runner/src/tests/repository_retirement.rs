@@ -310,3 +310,68 @@ fn retirement_deletes_sibling_snapshots_with_the_mirror_but_not_while_a_job_name
     assert!(!mirror.exists());
     assert!(!snapshots.exists());
 }
+
+/// Retiring a repository deletes its legacy in-place sibling checkout, so it
+/// waits while that path overlaps, under any spelling, a workspace of
+/// another repository or work in flight: here a catalogued workspace inside
+/// the checkout, then the checkout itself catalogued as another
+/// repository's workspace through a symlinked prefix. Once nothing else
+/// holds the path, the checkout retires with the mirror.
+#[test]
+fn retirement_waits_for_workspaces_inside_or_at_a_legacy_sibling_checkout() {
+    let f = Fixture::new();
+    let runner = quiet_runner(&f);
+    let mirror = runner.core.trees.ensure_mirror(&f.canonical).unwrap();
+    let checkout = PathBuf::from(&f.canonical);
+    let inner_workspace = checkout.join("worktree");
+    fs::create_dir_all(inner_workspace.join("target")).unwrap();
+    fs::write(inner_workspace.join("target/keep"), "other repository\n").unwrap();
+    let alias = f.scratch.join("remote/alias");
+    std::os::unix::fs::symlink(checkout.parent().unwrap(), &alias).unwrap();
+    let aliased = alias.join(checkout.file_name().unwrap());
+    let old = runner.now() - MIRROR_UNUSED_MS - DAY_MS;
+    let workspace_of_main = |inner: &mut Inner, key: &Path| {
+        inner.catalog.workspaces.insert(
+            text(key).into(),
+            Workspace {
+                repository: f.root.clone(),
+                used_ms: runner.now(),
+                ..Workspace::default()
+            },
+        );
+    };
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .sibling_commits
+            .insert(f.canonical.clone(), "c".repeat(40));
+        workspace_of_main(&mut inner, &inner_workspace);
+    }
+    set_stamp(&runner, &f.canonical, old);
+    runner.retire_unused_repositories().unwrap();
+    assert!(mirror.exists());
+    assert!(inner_workspace.join("target/keep").exists());
+
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.catalog.workspaces.clear();
+        workspace_of_main(&mut inner, &aliased);
+    }
+    runner.retire_unused_repositories().unwrap();
+    assert!(mirror.exists());
+    assert!(inner_workspace.join("target/keep").exists());
+
+    runner.core.inner.lock().unwrap().catalog.workspaces.clear();
+    runner.retire_unused_repositories().unwrap();
+    assert!(!mirror.exists());
+    assert!(!checkout.exists());
+    assert!(!runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .sibling_commits
+        .contains_key(&f.canonical));
+}
