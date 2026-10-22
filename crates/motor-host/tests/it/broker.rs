@@ -373,3 +373,55 @@ fn heartbeat_replies_close_bound_accounts_and_malformed_replies_are_harmless() {
     assert_eq!(h.snapshot.closed.len(), 1);
     assert_eq!(h.snapshot.closed["tenant"].sub, sub);
 }
+
+/// The account-closure vector's heartbeat reply, served as the bytes the
+/// contract defines (`ignored` first, then `closed_subjects`), closes the
+/// tenant bound to the listed account. A pre-closure broker's reply, without
+/// the member, still confirms its heartbeat and closes nothing.
+#[test]
+fn heartbeat_reply_with_cloud_closure_bytes_closes_the_bound_tenant() {
+    let v: Value = serde_json::from_str(super::closure::ACCOUNT_CLOSURE).unwrap();
+    let closed = v["heartbeat"]["reply"]["body"]["closed_subjects"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cloud_reply = format!(r#"{{"ignored":[],"closed_subjects":["{closed}"]}}"#);
+    assert_eq!(
+        serde_json::from_str::<Value>(&cloud_reply).unwrap(),
+        v["heartbeat"]["reply"]["body"]
+    );
+    // The host's only tenant is bound to the vector's closed account.
+    assert_eq!(claims(JOB).sub, closed);
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime.host.lock().unwrap().start_billing(ms).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let replies = [r#"{"ignored":[]}"#.to_owned(), cloud_reply];
+    let broker = std::thread::spawn(move || {
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (path, _) = read_request(&stream);
+            assert!(path.ends_with("/heartbeat"), "{path}");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let mut sender = Sender::new(
+        runtime.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    sender.test_endpoint(endpoint);
+    for n in 0..2 {
+        sender.step(ms + n * 15_000).unwrap();
+        let h = runtime.host.lock().unwrap();
+        assert!(h.snapshot.outbox.is_empty(), "heartbeat {n} not confirmed");
+        assert!(h.snapshot.rejected_outbox.is_empty());
+        assert_eq!(h.is_closed("tenant"), n == 1, "after heartbeat {n}");
+    }
+    broker.join().unwrap();
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.closed["tenant"].sub,
+        closed
+    );
+}

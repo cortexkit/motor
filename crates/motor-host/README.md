@@ -143,7 +143,10 @@ expired. The tick runs a pass every ten minutes, deleting at most
 `RETENTION_BATCH` jobs per pass (the next pass follows at once while a backlog
 remains), through the same journal write as every other change.
 
-The broker's heartbeat reply may list closed accounts as `closed_subjects`.
+The broker's heartbeat reply lists closed accounts as `closed_subjects`: always
+present from the broker, sorted, empty when none of the reported tenants is
+closed. A reply without the member (a broker older than account closure)
+closes nothing and still confirms the heartbeat.
 The host closes only tenants its binding map binds to a listed subject,
 refuses their new jobs, and removes the tenant through the helper once its
 last job has drained; see `docs/hosted-host.md`.

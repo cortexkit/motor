@@ -271,7 +271,12 @@ the tenant home (`home/`: disk, generation, suspend snapshot, set-aside
 The shared size base under the image is not per tenant and is kept.
 
 **Automatic.** The broker lists closed accounts in its heartbeat reply as
-`closed_subjects` (`["acct:<ULID>", ...]`). motor-host maps each subject to a
+`closed_subjects` (`["acct:<ULID>", ...]`): always present, sorted, and empty
+unless a tenant the heartbeat reports (a warm entry, or the owner of a running
+job) belongs to a closed account. Closure is permanent. A reply without the
+member, from a broker older than account closure, closes nothing. The broker
+also refuses the closed account's new leases (403 `account_closed`), while its
+placed jobs run to their end. motor-host maps each subject to a
 tenant only through its binding map (`/etc/motor-host/tenants.json`), ignores
 subjects bound to no tenant, records the closure in its journal and refuses
 new jobs for the tenant (`auth`). Once the tenant has no open lease or
