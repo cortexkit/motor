@@ -25,6 +25,8 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.main = (ROOT / "crates/motor-runner/src/main.rs").read_text()
         self.library = (ROOT / "crates/motor-runner/src/lib.rs").read_text()
         self.prepare = (WINDOWS / "prep.rs").read_text()
+        self.agent = (ROOT / "crates/motor-winagent/src/lib.rs").read_text()
+        self.agent_main = (ROOT / "crates/motor-winagent/src/main.rs").read_text()
         self.hyperv = (HERE / "hyperv.ps1").read_text()
         self.install = (HERE / "install.ps1").read_text()
         self.parent_helper = (HERE / "parent-identity.ps1").read_text()
@@ -105,6 +107,12 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn("unsupported repository Cargo {key} configuration", self.prepare)
         self.assertCodeIn("repository_source_override_is_named_and_rejected_before_registry_fetch", self.prepare)
 
+    def test_guest_rewrites_host_registry_path_to_absolute_cargo_home_path(self):
+        self.assertCodeIn("rewrite_local_registry_config(&home)?", self.agent_main)
+        self.assertCodeIn("pub fn rewrite_local_registry_config(cargo_home: &std::path::Path)", self.agent)
+        self.assertCodeIn('let local_registry = cargo_home.join("local-registry")', self.agent)
+        self.assertCodeIn("local_registry_config_is_rewritten_to_absolute_guest_cargo_home", self.agent)
+
     def test_restricted_token_and_access_check_diagnostics_are_removed(self):
         self.assertFalse((WINDOWS / "trusted_prep/launch").exists())
         self.assertFalse((WINDOWS / "trusted_prep/lowbox.rs").exists())
@@ -163,7 +171,6 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
             "MAX_CRATE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024",
             "fn write_verified_archive",
             "verify_locked_index_records(&bytes, &name, &locked)?",
-            'local-registry = \\\"{path}\\\"',
             'args([operation, "--locked", "--offline", "--manifest-path"])',
             'run_cargo(cargo, rustc, fixture, &second_home, &target, &temp, "build")',
             "lock_unchanged_after_fetch",
@@ -173,6 +180,15 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
             '"diagnostic_error_mentions_cfg_if": override_error_mentions_cfg_if',
         ):
             self.assertCodeIn(fragment, self.registry)
+        self.assertCodeIn("super::super::prep::local_registry_source_config(local_registry, source_name)", self.registry)
+        self.assertCodeIn(
+            "written_source_path_is_absolute_and_names_the_registry_directory",
+            self.prepare,
+        )
+        self.assertCodeIn('"source_config_path": local_registry', self.registry)
+        self.assertCodeIn('"source_config_is_absolute": local_registry.is_absolute()', self.registry)
+        self.assertCodeIn('write_job_cargo_config(cargo_home, local_registry.as_deref())?', self.registry)
+        self.assertCodeIn('write_job_cargo_config(&corrupt_home, Some(&corrupt_registry))?', self.registry)
         archive_gate = self.registry.split("fn write_verified_archive(", 1)[1].split("\n}", 1)[0]
         self.assertCodeIn(
             'report["repository_source_override_test"]["diagnostic_error_mentions_cfg_if"] == true',

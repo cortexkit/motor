@@ -478,14 +478,8 @@ fn write_verified_archive(
     Ok(checksum)
 }
 
-fn source_config(local_registry: &Path, source_name: &str) -> String {
-    let path = local_registry
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    format!(
-        "[source.crates-io]\nreplace-with = \"{source_name}\"\n\n[source.{source_name}]\nlocal-registry = \"{path}\"\n"
-    )
+fn source_config(local_registry: &Path, source_name: &str) -> io::Result<String> {
+    super::super::prep::local_registry_source_config(local_registry, source_name)
 }
 
 fn run_cargo(
@@ -660,11 +654,11 @@ fn valid_crates_io_config(bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn write_job_cargo_config(cargo_home: &Path, has_crates_io: bool) -> io::Result<()> {
-    let source = if has_crates_io {
-        "[source.crates-io]\nreplace-with = \"motor-local\"\n\n[source.motor-local]\nlocal-registry = \"local-registry\"\n\n"
+fn write_job_cargo_config(cargo_home: &Path, local_registry: Option<&Path>) -> io::Result<()> {
+    let source = if let Some(local_registry) = local_registry {
+        source_config(local_registry, "motor-local")?
     } else {
-        ""
+        String::new()
     };
     let config = format!("{source}[net]\ngit-fetch-with-cli = true\n");
     write_new_file(cargo_home, Path::new("config.toml"), config.as_bytes())?;
@@ -868,7 +862,12 @@ fn prepare_for_job_with_progress(
     reject_reparse_under(staging, cargo_home)?;
 
     let mut stats = FetchStats::default();
-    if !packages.is_empty() {
+    let local_registry = if packages.is_empty() {
+        None
+    } else {
+        Some(cargo_home.join("local-registry"))
+    };
+    if let Some(job_registry) = local_registry.as_deref() {
         let config_relative = PathBuf::from("index/config.json");
         let config_path = cache_root.join(&config_relative);
         let cached_config = match fs::read(&config_path) {
@@ -900,11 +899,10 @@ fn prepare_for_job_with_progress(
             }));
             bytes
         };
-        let job_registry = cargo_home.join("local-registry");
-        reject_reparse_under(cargo_home, &job_registry)?;
+        reject_reparse_under(cargo_home, job_registry)?;
         fs::create_dir_all(job_registry.join("index"))?;
         phase("copy crates.io config into per-job local registry")?;
-        write_new_file(&job_registry, Path::new("index/config.json"), &config_bytes)?;
+        write_new_file(job_registry, Path::new("index/config.json"), &config_bytes)?;
 
         let mut by_name: BTreeMap<String, Vec<RegistryPackage>> = BTreeMap::new();
         for package in &packages {
@@ -966,7 +964,7 @@ fn prepare_for_job_with_progress(
             phase(&format!(
                 "copy crates.io index entry for {name} into job registry"
             ))?;
-            write_new_file(&job_registry, &job_index_relative, &index_bytes)?;
+            write_new_file(job_registry, &job_index_relative, &index_bytes)?;
 
             for package in locked {
                 let filename = format!("{}-{}.crate", package.name, package.version);
@@ -1054,7 +1052,7 @@ fn prepare_for_job_with_progress(
                 copy_cache_file(
                     cache_root,
                     &archive_relative,
-                    &job_registry,
+                    job_registry,
                     &archive_relative,
                 )?;
             }
@@ -1062,7 +1060,7 @@ fn prepare_for_job_with_progress(
     }
 
     phase("write runner-owned offline Cargo source configuration")?;
-    write_job_cargo_config(cargo_home, !packages.is_empty())?;
+    write_job_cargo_config(cargo_home, local_registry.as_deref())?;
     phase("write runner-owned offline Git bundle rewrites")?;
     write_git_rewrites(cargo_home, routes)?;
     Ok(stats)
@@ -1144,7 +1142,8 @@ pub(super) fn prove(
         "cargo_home_before_commands": {
             "path": second_home,
             "runner_config": "config.toml",
-            "source_config_relative_path": "local-registry",
+            "source_config_path": local_registry,
+            "source_config_is_absolute": local_registry.is_absolute(),
             "cfg_if_index_config_bytes": index_config.len(),
             "cfg_if_index_record_bytes": index_entry.len(),
             "cfg_if_index_record_sha256": format!("{:x}", Sha256::digest(&index_entry)),
@@ -1195,7 +1194,7 @@ pub(super) fn prove(
         corrupt_registry.join("cfg-if-1.0.4.crate"),
         &changed_archive,
     )?;
-    write_job_cargo_config(&corrupt_home, true)?;
+    write_job_cargo_config(&corrupt_home, Some(&corrupt_registry))?;
     write_git_rewrites(&corrupt_home, &no_git_routes)?;
     super::log_phase(
         progress_path,
@@ -1243,12 +1242,12 @@ pub(super) fn prove(
     fs::create_dir_all(&repository_config_dir)?;
     fs::write(
         repository_config_dir.join("config.toml"),
-        source_config(&empty_registry, "repository-override"),
+        source_config(&empty_registry, "repository-override")?,
     )?;
     let override_home = stage.join("fetch-temp/repository-override-home");
     fs::create_dir_all(&override_home)?;
     super::copy_tree(&local_registry, &override_home.join("local-registry"))?;
-    write_job_cargo_config(&override_home, true)?;
+    write_job_cargo_config(&override_home, Some(&override_home.join("local-registry")))?;
     write_git_rewrites(&override_home, &no_git_routes)?;
     super::log_phase(
         progress_path,

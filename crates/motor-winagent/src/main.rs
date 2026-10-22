@@ -1511,6 +1511,9 @@ ConvertTo-Json -InputObject $items -Compress
         };
         archive.flush()?;
         unpack_tree(&mut archive, Path::new(SOURCE_ROOT), &home)?;
+        // The archive's host paths do not exist in the VM; pin Cargo to the
+        // absolute local-registry path under the guest user's CARGO_HOME.
+        motor_winagent::rewrite_local_registry_config(&home)?;
         let before = inventory(Path::new(SOURCE_ROOT))?;
         let cwd = PathBuf::from(mapped_cwd(&command.cwd)?);
         if !cwd.is_dir() {

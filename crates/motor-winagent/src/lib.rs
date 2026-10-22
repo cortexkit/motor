@@ -852,6 +852,69 @@ pub fn unpack_tree(
     Ok(())
 }
 
+pub fn rewrite_local_registry_config(cargo_home: &std::path::Path) -> io::Result<()> {
+    safe_directory(cargo_home)?;
+    let config_path = cargo_home.join("config.toml");
+    let metadata = std::fs::symlink_metadata(&config_path)?;
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err(invalid(format!(
+            "job Cargo config is not a regular file: {}",
+            config_path.display()
+        )));
+    }
+    let original = std::fs::read_to_string(&config_path)?;
+    if !original
+        .lines()
+        .any(|line| line.trim() == "[source.motor-local]")
+    {
+        return Ok(());
+    }
+
+    let local_registry = cargo_home.join("local-registry");
+    safe_directory(&local_registry)?;
+    if !local_registry.is_absolute() {
+        return Err(invalid("guest local Cargo registry path is not absolute"));
+    }
+    let escaped_path = local_registry
+        .to_str()
+        .ok_or_else(|| invalid("guest local Cargo registry path is not UTF-8"))?
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let mut section = String::new();
+    let mut replacements = 0;
+    let mut rewritten = String::with_capacity(original.len());
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed.to_owned();
+        }
+        if section == "[source.motor-local]"
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "local-registry")
+        {
+            replacements += 1;
+            let indentation = &line[..line.len() - line.trim_start().len()];
+            rewritten.push_str(indentation);
+            rewritten.push_str(&format!("local-registry = \"{escaped_path}\"\n"));
+        } else {
+            rewritten.push_str(line);
+            rewritten.push('\n');
+        }
+    }
+    if replacements != 1 {
+        return Err(invalid(format!(
+            "expected one local-registry path in job Cargo config, found {replacements}"
+        )));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&config_path)?;
+    file.write_all(rewritten.as_bytes())?;
+    file.sync_all()
+}
+
 pub type Inventory = BTreeMap<String, [u8; 32]>;
 
 /// Target directories live on the cache disk and must never enter collected
@@ -986,6 +1049,30 @@ fn append_source_link(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn local_registry_config_is_rewritten_to_absolute_guest_cargo_home() {
+        let scratch = Scratch::new();
+        let cargo_home = scratch.0.join("profile/.cargo");
+        let registry = cargo_home.join("local-registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[source.crates-io]\nreplace-with = \"motor-local\"\n\n[source.motor-local]\nlocal-registry = \"C:\\\\host\\\\staging\\\\cargo-home\\\\local-registry\"\n\n[net]\ngit-fetch-with-cli = true\n",
+        )
+        .unwrap();
+
+        rewrite_local_registry_config(&cargo_home).unwrap();
+
+        let config = std::fs::read_to_string(cargo_home.join("config.toml")).unwrap();
+        let expected = registry
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        assert!(config.contains(&format!("local-registry = \"{expected}\"")));
+        assert!(std::path::Path::new(&registry).is_absolute());
+        assert!(!config.contains("C:\\\\host\\\\staging\\\\cargo-home\\\\local-registry"));
+    }
 
     #[test]
     fn cache_timings_are_bounded_service_frames_not_command_output() {

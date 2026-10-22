@@ -303,6 +303,31 @@ pub(super) fn validate_git_source_url(url: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+pub(super) fn local_registry_source_config(
+    local_registry: &Path,
+    source_name: &str,
+) -> io::Result<String> {
+    if !local_registry.is_absolute()
+        || local_registry
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(invalid(format!(
+            "local Cargo registry path must be absolute and normalized: {}",
+            local_registry.display()
+        )));
+    }
+    let path = local_registry
+        .to_str()
+        .ok_or_else(|| invalid("local Cargo registry path is not UTF-8"))?
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    Ok(format!(
+        "[source.crates-io]\nreplace-with = \"{source_name}\"\n\n[source.{source_name}]\nlocal-registry = \"{path}\"\n"
+    ))
+}
+
 fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<()> {
     for url in routes.keys() {
         validate_git_source_url(url)?;
@@ -1034,5 +1059,27 @@ mod repository_cargo_source_tests {
         )
         .unwrap();
         validate_repository_cargo_sources(&staging).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod local_registry_source_config_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn written_source_path_is_absolute_and_names_the_registry_directory() {
+        let scratch = ScratchDir::new("local-registry-absolute-source");
+        let registry = scratch
+            .path()
+            .join("fetch-temp/local-registry-second-job/local-registry");
+        fs::create_dir_all(&registry).unwrap();
+        let config = local_registry_source_config(&registry, "motor-local").unwrap();
+        let parsed: toml::Value = toml::from_str(&config).unwrap();
+        let written_path = parsed["source"]["motor-local"]["local-registry"]
+            .as_str()
+            .expect("local-registry source path");
+        assert!(Path::new(written_path).is_absolute());
+        assert_eq!(PathBuf::from(written_path), registry);
     }
 }
