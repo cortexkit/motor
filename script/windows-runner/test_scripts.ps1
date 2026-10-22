@@ -10,7 +10,6 @@ $files = @(Get-ChildItem $PSScriptRoot -Filter '*.ps1') + @(
     Get-Item "$PSScriptRoot\..\hyperv-spike\provision.ps1"
     Get-Item "$PSScriptRoot\..\windows-vm\bootstrap.ps1"
     Get-Item "$PSScriptRoot\..\windows-vm\setup-job-baseline.ps1"
-    Get-Item "$PSScriptRoot\..\..\crates\motor-winagent\src\hyperv_disk_inventory.ps1"
 )
 $count = 0
 foreach ($file in $files) {
@@ -86,7 +85,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         )
     }
     try {
-        $inventoryPath = Join-Path $PSScriptRoot '..\..\crates\motor-winagent\src\hyperv_disk_inventory.ps1'
+        $inventoryPath = Join-Path $PSScriptRoot 'hyperv_disk_inventory.ps1'
         $inventory = @((& $inventoryPath) | ConvertFrom-Json)
         if ($script:diskInventoryGetDiskCalls -ne 1 -or $script:diskInventoryPerDiskQuery) {
             throw 'FAIL hyperv-cache-inventory-uses-one-storage-query'

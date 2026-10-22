@@ -734,7 +734,9 @@ mod guest {
             // Query Get-Disk once for the inventory; a per-drive provider call
             // delays cache mounting on a cold guest boot.
             let inventory = reporter.step(CacheStep::DiskSerial, || {
-                powershell(include_str!("hyperv_disk_inventory.ps1"))
+                powershell(include_str!(
+                    "../../../script/windows-runner/hyperv_disk_inventory.ps1"
+                ))
             })?;
             diagnostic!("Hyper-V disk topology {}", inventory);
             let disks: Vec<motor_winagent::cache::HypervDisk> =
