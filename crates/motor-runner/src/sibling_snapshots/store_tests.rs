@@ -765,3 +765,223 @@ fn isolated_sibling_snapshot_creation_drops_job_write_grants() {
     assert!(!root.contains("default:"), "{root}");
     assert_eq!(mode(&directory.join("kept")) & 0o022, 0);
 }
+
+/// What a deletion's reference check answers in these tests: it claims the
+/// snapshot, as `Runner::delete_sibling_snapshot` does when nothing
+/// references it.
+fn unreferenced(claim: &dyn Fn() -> bool) -> Option<bool> {
+    Some(claim())
+}
+
+#[test]
+fn deletion_moves_the_directory_away_then_removes_its_metadata_and_releases_its_claim() {
+    let f = Fixture::new("motor-snapshot-store-delete");
+    let (commit, tree) = f.commit(&[("source", "one\n")]);
+    let key = f.key(&commit, &commit);
+    let store = SnapshotStore::default();
+    let directory = f.resolve(&store, &key, &tree).unwrap();
+    let aside = f.scratch.join("aside");
+
+    let referenced = store
+        .delete(&directory, &aside, |_: &dyn Fn() -> bool| None)
+        .unwrap();
+    assert_eq!(referenced, Deletion::Referenced);
+    assert_eq!(entries(&f.snapshots()), published(&directory));
+    assert!(!aside.exists());
+    assert!(
+        store.claim_for_deletion(&directory),
+        "a referenced snapshot is not left claimed"
+    );
+    store.release_deletion(&directory);
+
+    assert_eq!(
+        store.delete(&directory, &aside, unreferenced).unwrap(),
+        Deletion::Removed
+    );
+    assert_eq!(entries(&f.snapshots()), Vec::<String>::new());
+    assert_eq!(fs::read_to_string(aside.join("source")).unwrap(), "one\n");
+    assert!(
+        store.claim_for_deletion(&directory),
+        "the deletion's claim is released"
+    );
+    store.release_deletion(&directory);
+    assert_eq!(
+        store.delete(&directory, &aside, unreferenced).unwrap(),
+        Deletion::Absent
+    );
+
+    // The next setup that needs the snapshot builds it again.
+    assert_eq!(f.resolve(&store, &key, &tree).unwrap(), directory);
+    assert_eq!(entries(&f.snapshots()), published(&directory));
+}
+
+/// A deletion that finds the directory already gone still removes the
+/// metadata an interrupted deletion left, and maintenance removes such
+/// metadata on its own; metadata beside a directory stays.
+#[test]
+fn metadata_left_without_its_directory_is_removed() {
+    let f = Fixture::new("motor-snapshot-store-orphan");
+    let (commit, tree) = f.commit(&[("source", "one\n")]);
+    let (other, other_tree) = f.commit(&[("source", "two\n")]);
+    let store = SnapshotStore::default();
+    let kept = f.resolve(&store, &f.key(&commit, &commit), &tree).unwrap();
+    let orphan = f
+        .resolve(&store, &f.key(&other, &other), &other_tree)
+        .unwrap();
+    // As a crash between the two steps of a deletion leaves it.
+    fs::rename(&orphan, f.scratch.join("moved")).unwrap();
+    fs::create_dir(f.snapshots().join(format!(
+        "{}{TEMPORARY_MARKER}{}",
+        kept.file_name().unwrap().to_string_lossy(),
+        Uuid::now_v7()
+    )))
+    .unwrap();
+
+    assert_eq!(
+        orphaned_metadata(&f.snapshots()).unwrap(),
+        std::slice::from_ref(&orphan)
+    );
+    assert!(store.remove_orphaned_metadata(&orphan).unwrap());
+    assert!(!store.remove_orphaned_metadata(&kept).unwrap());
+    assert!(!metadata_path(&orphan).exists());
+    assert!(metadata_path(&kept).exists());
+    assert_eq!(
+        orphaned_metadata(&f.snapshots()).unwrap(),
+        Vec::<PathBuf>::new()
+    );
+    // Only the final name is listed, not the temporary entry beside it.
+    let listed: Vec<_> = list(&f.snapshots())
+        .unwrap()
+        .into_iter()
+        .map(|snapshot| snapshot.directory)
+        .collect();
+    assert_eq!(listed, std::slice::from_ref(&kept));
+    assert_eq!(temporaries(&f.snapshots()).unwrap().len(), 1);
+}
+
+#[test]
+fn listing_puts_the_most_recently_used_snapshot_first() {
+    let f = Fixture::new("motor-snapshot-store-list");
+    let store = SnapshotStore::default();
+    let mut directories = Vec::new();
+    for (index, content) in ["one\n", "two\n", "three\n"].into_iter().enumerate() {
+        let (commit, tree) = f.commit(&[("source", content)]);
+        let directory = f.resolve(&store, &f.key(&commit, &commit), &tree).unwrap();
+        set_mtime(&directory, old_time(1_000_000_000 + [20, 30, 10][index]));
+        directories.push(directory);
+    }
+    let listed: Vec<_> = list(&f.snapshots())
+        .unwrap()
+        .into_iter()
+        .map(|snapshot| (snapshot.directory, snapshot.used))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (directories[1].clone(), old_time(1_000_000_030)),
+            (directories[0].clone(), old_time(1_000_000_020)),
+            (directories[2].clone(), old_time(1_000_000_010)),
+        ]
+    );
+}
+
+/// A deletion that reaches a snapshot while a creation copies it as its
+/// predecessor is refused and changes nothing; the creation finishes from
+/// the intact copy.
+#[test]
+fn deletion_during_predecessor_copy_is_refused() {
+    let f = Fixture::new("motor-snapshot-store-delete-copying");
+    let (first, first_tree) = f.commit(&[("source", "one\n")]);
+    let (second, second_tree) = f.commit(&[("source", "two\n")]);
+    let (copying, copying_wait) = mpsc::channel();
+    let (resume, resume_wait) = mpsc::channel::<()>();
+    let (copying, resume_wait) = (Mutex::new(copying), Mutex::new(resume_wait));
+    let store = SnapshotStore {
+        clone_override: Some(Arc::new(move |source: &Path, target: &Path| {
+            copying.lock().unwrap().send(()).unwrap();
+            resume_wait
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60))
+                .map_err(io::Error::other)?;
+            copy_tree(source, target)
+        })),
+        ..SnapshotStore::default()
+    };
+    let predecessor = f
+        .resolve(&store, &f.key(&first, &first), &first_tree)
+        .unwrap();
+    let aside = f.scratch.join("aside");
+    std::thread::scope(|scope| {
+        let creation = scope.spawn(|| f.resolve(&store, &f.key(&second, &second), &second_tree));
+        copying_wait.recv_timeout(Duration::from_secs(60)).unwrap();
+        // The creation holds its own key mutex, not the predecessor's.
+        let deletion = store.delete(&predecessor, &aside, unreferenced).unwrap();
+        resume.send(()).unwrap();
+        let created = creation.join().unwrap().unwrap();
+        assert_eq!(deletion, Deletion::Copying);
+        assert_eq!(fs::read_to_string(created.join("source")).unwrap(), "two\n");
+    });
+    assert!(!aside.exists());
+    assert_eq!(read_metadata(&predecessor).unwrap().tree_hash, first_tree);
+    assert_eq!(f.trees.tree_hash(&predecessor).unwrap(), first_tree);
+    // Once the creation has published, the same deletion goes through.
+    assert_eq!(
+        store.delete(&predecessor, &aside, unreferenced).unwrap(),
+        Deletion::Removed
+    );
+}
+
+/// A snapshot a deletion has claimed is never picked as a predecessor: a
+/// creation that starts while the deletion holds the victim's key mutex
+/// finishes from a fresh clone, without waiting for that mutex or reading
+/// the victim.
+#[test]
+fn creation_during_a_deletion_neither_waits_for_nor_reads_the_victim() {
+    let f = Fixture::new("motor-snapshot-store-delete-claimed");
+    let (first, first_tree) = f.commit(&[("source", "one\n")]);
+    let (second, second_tree) = f.commit(&[("source", "two\n")]);
+    let (claimed, claimed_wait) = mpsc::channel();
+    let (resume, resume_wait) = mpsc::channel::<()>();
+    let (claimed, resume_wait) = (Mutex::new(claimed), Mutex::new(resume_wait));
+    let (copying_store, calls) = copying_store();
+    let store = SnapshotStore {
+        deletion_claimed: Some(Arc::new(move |_: &Path| {
+            claimed.lock().unwrap().send(()).unwrap();
+            resume_wait
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap();
+        })),
+        ..copying_store
+    };
+    let victim = f
+        .resolve(&store, &f.key(&first, &first), &first_tree)
+        .unwrap();
+    let aside = f.scratch.join("aside");
+    let (done, done_wait) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let deletion = scope.spawn(|| store.delete(&victim, &aside, unreferenced));
+        claimed_wait.recv_timeout(Duration::from_secs(60)).unwrap();
+        let creation = scope.spawn(|| {
+            let created = f.resolve(&store, &f.key(&second, &second), &second_tree);
+            done.send(()).unwrap();
+            created
+        });
+        let finished_while_claimed = done_wait.recv_timeout(Duration::from_secs(60)).is_ok();
+        resume.send(()).unwrap();
+        let created = creation.join().unwrap().unwrap();
+        assert!(
+            finished_while_claimed,
+            "the creation must not wait for the victim's key mutex"
+        );
+        assert_eq!(deletion.join().unwrap().unwrap(), Deletion::Removed);
+        assert_eq!(fs::read_to_string(created.join("source")).unwrap(), "two\n");
+    });
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the claimed victim was the only ready snapshot, so nothing is copied"
+    );
+    assert_eq!(fs::read_to_string(aside.join("source")).unwrap(), "one\n");
+}

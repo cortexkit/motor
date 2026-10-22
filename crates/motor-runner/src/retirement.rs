@@ -4,9 +4,10 @@
 //! that repository's history. A mirror no job has used for 30 days is
 //! deleted, together with everything derived from that one repository that
 //! would otherwise keep the mirror (or the repository's code) alive: its Head
-//! workspaces, its sibling checkout, its warm-build record and fill checkout,
-//! and its JavaScript install and manager caches. Shared caches not keyed to
-//! one repository (the Cargo registry, the compile cache) are not touched.
+//! workspaces, its sibling checkout, its sibling snapshots, its warm-build
+//! record and fill checkout, and its JavaScript install and manager caches.
+//! Shared caches not keyed to one repository (the Cargo registry, the
+//! compile cache) are not touched.
 use super::*;
 
 /// How long a repository mirror may go unused before it is retired. The
@@ -301,6 +302,16 @@ impl Runner {
                 self.discard(&path)?;
                 removed.push(format!("{kind} {}", path.display()));
             }
+        }
+        // Every sibling snapshot of the repository. A job, reservation,
+        // admission or Prepare that names the repository as a sibling blocks
+        // its retirement, and every snapshot creation or switch touch runs
+        // under one of them, so no key mutex is needed: nothing can be
+        // creating or touching a snapshot here.
+        let snapshots = self.core.config.sibling_snapshots_dir().join(name);
+        if fs::symlink_metadata(&snapshots).is_ok() {
+            self.discard(&snapshots)?;
+            removed.push(format!("sibling snapshots {}", snapshots.display()));
         }
         let mirror = self.core.trees.mirrors.join(name);
         self.long_work("retire_mirror");

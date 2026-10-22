@@ -376,6 +376,13 @@ fn configure_options(
             "--sibling-freshness-entries" => {
                 config.sibling_freshness_entries = value.parse().map_err(io::Error::other)?
             }
+            "--sibling-snapshot-cap" => {
+                config.sibling_snapshot_cap = value.parse().map_err(io::Error::other)?
+            }
+            "--sibling-snapshot-idle-s" => {
+                config.sibling_snapshot_idle =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),

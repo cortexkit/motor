@@ -267,3 +267,46 @@ fn work_arriving_mid_retirement_waits_and_then_starts_fresh() {
         head
     );
 }
+
+/// Retirement deletes a repository's sibling snapshots with its mirror, and
+/// never while a retained job names the repository as a sibling.
+#[test]
+fn retirement_deletes_sibling_snapshots_with_the_mirror_but_not_while_a_job_names_them() {
+    let f = Fixture::new();
+    let runner = quiet_runner(&f);
+    let mirror = runner.core.trees.ensure_mirror(&f.canonical).unwrap();
+    let environment =
+        crate::sibling_snapshots::JavascriptEnvironment::digest(&BTreeMap::new(), b"", &[]);
+    let commit = "a".repeat(40);
+    let key =
+        crate::sibling_snapshots::SnapshotKey::new(&f.canonical, &commit, &commit, &environment)
+            .unwrap();
+    let snapshot = crate::sibling_snapshots::store::publish_for_test(
+        &runner.core.config,
+        &key,
+        &commit,
+        SystemTime::now(),
+    );
+    let snapshots = snapshot.parent().unwrap().to_path_buf();
+    assert_eq!(
+        snapshots.file_name().unwrap().to_string_lossy(),
+        workspace::name(&f.canonical)
+    );
+    let old = runner.now() - MIRROR_UNUSED_MS - DAY_MS;
+    set_stamp(&runner, &f.canonical, old);
+    // Another repository's job that declared the sibling finished long ago
+    // but is still retained.
+    let (request, _) = f.run("true");
+    assert_eq!(request.siblings[0].canonical_path, f.canonical);
+    let mut job = Job::new(request.job_id, Some(request), old, 1, 1);
+    job.terminal(Outcome::Exit { code: 0 }, old);
+    runner.core.inner.lock().unwrap().jobs.insert(job.id, job);
+    runner.retire_unused_repositories().unwrap();
+    assert!(mirror.exists());
+    assert!(snapshot.join("source").exists());
+
+    runner.core.inner.lock().unwrap().jobs.clear();
+    runner.retire_unused_repositories().unwrap();
+    assert!(!mirror.exists());
+    assert!(!snapshots.exists());
+}

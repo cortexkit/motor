@@ -18,8 +18,10 @@
 //! directory without readable metadata is removed and built again.
 //!
 //! Lock order: a setup takes a key mutex while holding no state lock, job log
-//! lock or other key mutex. The registry mutex below is only ever taken last
-//! and held briefly.
+//! lock or other key mutex. A deletion takes the runner's state lock inside
+//! the victim's key mutex, after the disk lock when pressure eviction
+//! deletes: disk, then snapshot key, then state. The registry mutex below is
+//! only ever taken last and held briefly.
 
 use super::SnapshotKey;
 use crate::{
@@ -132,6 +134,38 @@ pub(crate) struct SnapshotStore {
     /// snapshot to touch and before it writes any, with the key mutex held.
     #[cfg(test)]
     pub(crate) touch_inspected: Option<TouchHook>,
+    /// Called by `delete` once it has claimed a snapshot and before it moves
+    /// the directory away, with the key mutex held.
+    #[cfg(test)]
+    pub(crate) deletion_claimed: Option<TouchHook>,
+}
+
+/// How one `SnapshotStore::delete` ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deletion {
+    /// The directory now lives at the caller's `aside` path, and its
+    /// metadata is gone.
+    Removed,
+    /// Nothing was at the snapshot's name; any metadata left there is gone.
+    Absent,
+    /// Something references the snapshot; nothing changed.
+    Referenced,
+    /// A creation is copying the snapshot as its predecessor; nothing
+    /// changed.
+    Copying,
+}
+
+/// A deletion's claim on a snapshot, released when the deletion ends,
+/// whether it succeeded or not.
+struct Claim<'a> {
+    store: &'a SnapshotStore,
+    directory: &'a Path,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.store.release_deletion(self.directory);
+    }
 }
 
 /// A predecessor registered by a creation, released when the creation ends.
@@ -251,6 +285,63 @@ impl SnapshotStore {
 
     pub(crate) fn release_deletion(&self, directory: &Path) {
         lock(&self.registry).deleting.remove(directory);
+    }
+
+    /// Deletes the snapshot at `directory` by the deletion protocol, while
+    /// holding its key mutex:
+    ///
+    /// 1. `claim_unreferenced` takes the runner's state lock, checks that
+    ///    nothing references the snapshot, and, still holding the state lock,
+    ///    calls the claim it is given and returns that claim's result. It
+    ///    returns `None`, claiming nothing, when the snapshot is referenced.
+    ///    The claim fails while a creation is copying the snapshot, and once
+    ///    it succeeds no creation picks the snapshot as its predecessor.
+    /// 2. The directory is renamed to `aside`, which takes it away from its
+    ///    final name in one step, and then its metadata is removed. The
+    ///    caller deletes `aside` afterwards, without any lock.
+    ///
+    /// A setup that needs the snapshot meanwhile waits for the key mutex,
+    /// then finds no snapshot and creates it again. The caller must hold no
+    /// state lock, job log lock or snapshot key mutex.
+    pub(crate) fn delete(
+        &self,
+        directory: &Path,
+        aside: &Path,
+        claim_unreferenced: impl FnOnce(&dyn Fn() -> bool) -> Option<bool>,
+    ) -> io::Result<Deletion> {
+        self.with_key_lock(directory, || {
+            match claim_unreferenced(&|| self.claim_for_deletion(directory)) {
+                None => return Ok(Deletion::Referenced),
+                Some(false) => return Ok(Deletion::Copying),
+                Some(true) => {}
+            }
+            let _claim = Claim {
+                store: self,
+                directory,
+            };
+            #[cfg(test)]
+            if let Some(claimed) = &self.deletion_claimed {
+                claimed(directory);
+            }
+            remove_published(directory, aside)
+        })
+    }
+
+    /// Removes the metadata file `<name>.json` when no directory `<name>`
+    /// exists beside it, as a deletion interrupted between its two steps
+    /// leaves it. The check and the removal happen under the snapshot's key
+    /// mutex, so a creation publishing that snapshot is never undone.
+    pub(crate) fn remove_orphaned_metadata(&self, directory: &Path) -> io::Result<bool> {
+        self.with_key_lock(directory, || {
+            if fs::symlink_metadata(directory).is_ok() {
+                return Ok(false);
+            }
+            match fs::remove_file(metadata_path(directory)) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
     }
 
     /// Runs `work` while holding the mutex of the snapshot at `directory`.
@@ -468,6 +559,163 @@ fn discard(directory: &Path) -> io::Result<()> {
         tracing::warn!(path = %doomed.display(), %error, "cannot remove unusable sibling snapshot");
     }
     Ok(())
+}
+
+/// The second step of `SnapshotStore::delete`: the directory leaves its
+/// final name before its metadata goes, so a crash in between leaves
+/// metadata without a directory, which reads as absent.
+fn remove_published(directory: &Path, aside: &Path) -> io::Result<Deletion> {
+    let removed = match fs::symlink_metadata(directory) {
+        Ok(_) => {
+            crate::filesystem::rename(directory, aside)?;
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    match fs::remove_file(metadata_path(directory)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = directory.parent() {
+        if let Err(error) = crate::filesystem::sync_directory(parent) {
+            tracing::warn!(path = %parent.display(), %error, "cannot sync sibling snapshot directory after a deletion");
+        }
+    }
+    Ok(if removed {
+        Deletion::Removed
+    } else {
+        Deletion::Absent
+    })
+}
+
+/// One entry at a snapshot's final name, as listed for removal.
+#[derive(Clone, Debug)]
+pub(crate) struct Listed {
+    pub(crate) directory: PathBuf,
+    /// The directory's mtime: when a setup last used the snapshot.
+    pub(crate) used: SystemTime,
+}
+
+/// The repository directories under the snapshot root `root`.
+pub(crate) fn repositories(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut repositories = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            repositories.push(entry.path());
+        }
+    }
+    repositories.sort();
+    Ok(repositories)
+}
+
+/// Every entry at a final snapshot name in one repository's directory, most
+/// recently used first. Metadata files and temporary directories have a `.`
+/// in their names and are left out; a final name never has one. An entry
+/// without usable metadata is listed too: it takes disk space all the same,
+/// and the next setup that needs it would remove it anyway.
+pub(crate) fn list(repository: &Path) -> io::Result<Vec<Listed>> {
+    let entries = match fs::read_dir(repository) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut listed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().contains('.') {
+            continue;
+        }
+        let found = match fs::symlink_metadata(entry.path()) {
+            Ok(found) => found,
+            // Removed since the directory was read.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        listed.push(Listed {
+            directory: entry.path(),
+            used: found.modified()?,
+        });
+    }
+    listed.sort_by(|a, b| {
+        b.used
+            .cmp(&a.used)
+            .then_with(|| a.directory.cmp(&b.directory))
+    });
+    Ok(listed)
+}
+
+/// The snapshot directories in one repository's directory whose metadata file
+/// is all that is left of them, as `<name>` paths.
+pub(crate) fn orphaned_metadata(repository: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(repository) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut orphaned = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        let Some(snapshot) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let directory = repository.join(snapshot);
+        if !snapshot.contains('.') && fs::symlink_metadata(&directory).is_err() {
+            orphaned.push(directory);
+        }
+    }
+    Ok(orphaned)
+}
+
+/// The temporary entries (`<name>.tmp-<uuid>`) in one repository's
+/// directory: creations and removals that a crash interrupted. Only safe to
+/// remove while no creation can be running, at startup.
+pub(crate) fn temporaries(repository: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(repository) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut temporaries = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .contains(TEMPORARY_MARKER)
+        {
+            temporaries.push(entry.path());
+        }
+    }
+    Ok(temporaries)
+}
+
+/// Publishes an empty snapshot directory of `key` with metadata for
+/// `tree_hash`, last used at `used`, for tests of what happens to published
+/// snapshots.
+#[cfg(test)]
+pub(crate) fn publish_for_test(
+    config: &Config,
+    key: &SnapshotKey,
+    tree_hash: &str,
+    used: SystemTime,
+) -> PathBuf {
+    let directory = key.directory(config);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("source"), "snapshot\n").unwrap();
+    atomic_json(&metadata_path(&directory), &Metadata::new(key, tree_hash)).unwrap();
+    fs::File::open(&directory)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(used))
+        .unwrap();
+    directory
 }
 
 fn remove_tree(path: &Path) -> io::Result<()> {
