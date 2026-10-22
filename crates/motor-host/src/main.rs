@@ -2,7 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 use motor_host::enroll;
 use motor_host::helper::Helper;
 use motor_host::journal::FileJournal;
-use motor_host::server::{admin_socket, serve, unix_ms, Runtime};
+use motor_host::server::{admin_socket, serve_with_slot, unix_ms, Runtime};
 use motor_host::state::{Host, Tenant};
 use motor_vm_helper::tenant::{validate_name, Registry};
 use serde::Deserialize;
@@ -173,25 +173,37 @@ async fn main() -> Result<()> {
         .with_single_cert(certs, key)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let ingress = Arc::new(motor_host::ingress::Ingress::default());
+    let summary = ingress.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            summary.summarize();
+        }
+    });
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, peer) = listener.accept().await?;
+        let Some(slot) = ingress.admit(peer) else {
+            drop(socket);
+            continue;
+        };
         let acceptor = acceptor.clone();
         let runtime = runtime.clone();
+        let ingress = ingress.clone();
         tokio::spawn(async move {
             let accepted =
                 tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await;
-            if let Ok(Ok(stream)) = accepted {
-                // Errors deliberately omit peer-controlled data and credentials.
-                if let Err(error) = serve(runtime, stream).await {
-                    let report = motor_host::server::describe_close(&error);
-                    tracing::warn!(
-                        jti = report.jti,
-                        side = report.side,
-                        step = report.step,
-                        cause = %report.cause,
-                        "connection_closed"
-                    );
+            match accepted {
+                Ok(Ok(stream)) => {
+                    if let Err(error) = serve_with_slot(runtime, stream, Some(slot)).await {
+                        let report = motor_host::server::describe_close(&error);
+                        ingress.closed(peer, &report);
+                    }
                 }
+                Ok(Err(_)) => ingress.tls_closed(peer, "invalid TLS handshake"),
+                Err(_) => ingress.tls_closed(peer, "timed out"),
             }
         });
     }

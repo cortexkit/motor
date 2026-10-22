@@ -2,6 +2,51 @@ use super::*;
 use cortexkit_test_support::ScratchDir;
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+impl io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn runner_reader_reports_eof_with_the_last_frame_instead_of_silent_detach() {
+    use tokio::io::AsyncWriteExt;
+    let logs = Logs::default();
+    let subscriber = motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (mut client, server) = tokio::io::duplex(1024);
+    write_frame_async(
+        &mut client,
+        &Frame::Heartbeat {
+            queue_wait_ms: None,
+        },
+    )
+    .await
+    .unwrap();
+    client.shutdown().await.unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let (activity, _) = watch::channel(Activity::default());
+    reader(server, tx, activity, None).await;
+    assert!(matches!(rx.recv().await, Some(Frame::Heartbeat { .. })));
+    assert!(rx.recv().await.is_none());
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(output.contains("runner_channel_closed"), "{output}");
+    for field in [
+        "direction=read",
+        "reason=eof",
+        "frames=1",
+        "frame_type=heartbeat",
+    ] {
+        assert!(output.contains(field), "{output}");
+    }
+}
+
 fn fixture() -> (ScratchDir, Runner, Run, Vec<u8>) {
     let scratch = ScratchDir::new("motor-transfer-clock");
     let mut config = crate::Config::new(scratch.join("state"), "transfer-clock");

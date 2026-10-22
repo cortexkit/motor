@@ -172,6 +172,7 @@ async fn reader<R: AsyncRead + Unpin>(
     activity: watch::Sender<Activity>,
     tenant: Option<Arc<TenantConnection>>,
 ) {
+    let mut trace = ChannelTrace::new(tenant.as_deref(), "read");
     let mut read = ActivityRead {
         read,
         activity,
@@ -185,16 +186,18 @@ async fn reader<R: AsyncRead + Unpin>(
                 result = read_record_async(&mut read) => match result {
                     Ok(Some(DecodedFrame::Frame(frame))) => Ok(Some(frame)),
                     Ok(None) => Ok(None),
-                    Ok(Some(DecodedFrame::Unknown(_))) => { ctx.operation_refused("unknown", "unknown frame type"); break; }
+                    Ok(Some(DecodedFrame::Unknown(_))) => { trace.reason = "unknown_frame"; ctx.operation_refused("unknown", "unknown frame type"); break; }
                     Err(error) => {
                         // The decode error text can quote peer bytes; log its kind only.
                         tracing::warn!(jti = %ctx.lease.jti, kind = ?error.kind(), "tenant frame read failed");
                         ctx.operation_refused("undecodable", "frame read failed");
+                        trace.reason = "read_error";
+                        trace.error_kind = Some(error.kind());
                         break;
                     }
                 },
                 _ = tokio::time::sleep_until(ctx.deadline()), if ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
-                    if ctx.expire().await { break; }
+                    if ctx.expire().await { trace.reason = "lease_expired"; break; }
                     continue;
                 }
             }
@@ -203,15 +206,22 @@ async fn reader<R: AsyncRead + Unpin>(
         };
         let frame = match result {
             Ok(Some(frame)) => frame,
-            Ok(None) => break,
+            Ok(None) => {
+                trace.reason = "eof";
+                break;
+            }
             Err(error) => {
                 tracing::warn!(%error, "runner frame read/decode failed");
+                trace.reason = "read_error";
+                trace.error_kind = Some(error.kind());
                 break;
             }
         };
+        trace.frame(&frame);
         if let Some(ctx) = &tenant {
             if !ctx.allowed(&frame, &mut hello, &mut ran) {
                 ctx.operation_refused(&frame_type(&frame), "not allowed on this tenant connection");
+                trace.reason = "operation_refused";
                 break;
             }
         }
@@ -222,6 +232,7 @@ async fn reader<R: AsyncRead + Unpin>(
             }
         });
         if tx.send(frame).await.is_err() {
+            trace.reason = "session_input_closed";
             break;
         }
     }
@@ -239,16 +250,19 @@ async fn writer<W: AsyncWrite + Unpin>(
     job: watch::Receiver<Option<QueueProgress>>,
     tenant: Option<Arc<TenantConnection>>,
 ) {
+    let mut trace = ChannelTrace::new(tenant.as_deref(), "write");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
         let frame = tokio::select! {
-            frame = rx.recv() => match frame { Some(f) => f, None => break },
+            frame = rx.recv() => match frame { Some(f) => f, None => { trace.reason = "session_output_closed"; break; } },
             _ = heartbeat.tick() => Frame::Heartbeat {
                 queue_wait_ms: job.borrow().as_ref().and_then(QueueProgress::elapsed_ms),
             },
         };
+        trace.frame(&frame);
         if let Some(ctx) = &tenant {
             if ctx.state.lock().await.closed {
+                trace.reason = "reader_closed";
                 break;
             }
         }
@@ -258,6 +272,7 @@ async fn writer<W: AsyncWrite + Unpin>(
                 state.cause = RefusedCause::Expired;
                 state.closed = true;
                 ctx.changed.notify_one();
+                trace.reason = "lease_expired";
                 break;
             }
             let result = match tokio::time::timeout_at(
@@ -293,7 +308,7 @@ async fn writer<W: AsyncWrite + Unpin>(
         } else if let Some(ctx) = &tenant {
             tokio::select! {
                 result = write_frame_async(&mut write, &frame) => result,
-                _ = ctx.stop_write.notified() => break,
+                _ = ctx.stop_write.notified() => { trace.reason = "reader_closed"; break; },
             }
         } else {
             write_frame_async(&mut write, &frame).await
@@ -307,6 +322,8 @@ async fn writer<W: AsyncWrite + Unpin>(
                 _ => "control",
             };
             tracing::warn!(%error, frame_type, "runner frame write failed");
+            trace.reason = "write_error";
+            trace.error_kind = Some(error.kind());
             break;
         }
         if matches!(frame, Frame::Hello { .. }) {
@@ -326,6 +343,58 @@ async fn writer<W: AsyncWrite + Unpin>(
             }
             _ => {}
         }
+    }
+}
+
+struct ChannelTrace {
+    jti: Option<Uuid>,
+    direction: &'static str,
+    reason: &'static str,
+    error_kind: Option<io::ErrorKind>,
+    frames: u64,
+    frame_type: &'static str,
+    seq: Option<u64>,
+    started: std::time::Instant,
+}
+impl ChannelTrace {
+    fn new(tenant: Option<&TenantConnection>, direction: &'static str) -> Self {
+        Self {
+            jti: tenant.map(|ctx| ctx.lease.jti),
+            direction,
+            reason: "cancelled",
+            error_kind: None,
+            frames: 0,
+            frame_type: "none",
+            seq: None,
+            started: std::time::Instant::now(),
+        }
+    }
+    fn frame(&mut self, frame: &Frame) {
+        self.frames += 1;
+        self.seq = match frame {
+            Frame::Output(output) => Some(output.seq),
+            Frame::Started { seq, .. } => Some(*seq),
+            _ => None,
+        };
+        self.frame_type = match frame {
+            Frame::Hello { .. } => "hello",
+            Frame::Run(_) => "run",
+            Frame::Attach(_) => "attach",
+            Frame::Heartbeat { .. } => "heartbeat",
+            Frame::BundleChunk { .. } => "bundle_chunk",
+            Frame::Accepted(_) => "accepted",
+            Frame::Started { .. } => "started",
+            Frame::Output(_) => "output",
+            Frame::Terminal(_) => "terminal",
+            _ => "control",
+        };
+    }
+}
+impl Drop for ChannelTrace {
+    fn drop(&mut self) {
+        tracing::info!(jti = ?self.jti, direction = self.direction, reason = self.reason,
+            error_kind = ?self.error_kind, frames = self.frames, frame_type = self.frame_type,
+            seq = self.seq, elapsed_ms = self.started.elapsed().as_millis() as u64, "runner_channel_closed");
     }
 }
 

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::{
@@ -532,8 +532,17 @@ impl Backend for LinuxTenants {
     }
     fn snapshot(&mut self, tenant: &str, r: &Registry, key: &SnapshotKey) -> Result<()> {
         let vm = self.vm(tenant)?;
-        api(&vm.root, "PATCH", "/vm", &json!({"state":"Paused"}))?;
+        // A lost pause reply may still have paused the VM. Compensation must
+        // issue Resume even when the API call itself fails.
         vm.paused = true;
+        api_with_timeout(
+            &vm.root,
+            "PATCH",
+            "/vm",
+            &json!({"state":"Paused"}),
+            Duration::from_secs(10),
+        )
+        .map_err(|e| Error(e.to_string()))?;
         let high = vm.group.join("memory.high");
         let previous = std::fs::read_to_string(&high)?;
         std::fs::write(
@@ -541,7 +550,13 @@ impl Backend for LinuxTenants {
             (r.snapshot_memory_high_mib.min(r.guest_ram_mib) * 1048576).to_string(),
         )?;
         let result = (|| {
-            api(&vm.root, "PUT", "/snapshot/create", &snapshot_body())?;
+            let timeout = snapshot_create_timeout(r.guest_ram_mib);
+            eprintln!(
+                "tenant {tenant}: suspend_snapshot_create ram_mib={} timeout_ms={}",
+                r.guest_ram_mib,
+                timeout.as_millis()
+            );
+            create_snapshot(&vm.root, timeout)?;
             for (src, dst) in [
                 ("new.vmstate", "suspend.vmstate"),
                 ("new.memory", "suspend.memory"),
@@ -557,7 +572,14 @@ impl Backend for LinuxTenants {
                 &serde_json::to_vec(key).map_err(|e| Error(e.to_string()))?,
             )
         })();
-        std::fs::write(high, previous)?;
+        let restored = std::fs::write(high, previous);
+        if result.is_err() {
+            if let Err(error) = restored {
+                eprintln!("tenant {tenant}: suspend_restore_memory_high_failed: {error}");
+            }
+            return result;
+        }
+        restored?;
         result
     }
     fn stop(&mut self, tenant: &str) -> Result<()> {
@@ -691,23 +713,134 @@ fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
     Ok(())
 }
 
+/// Budget for 64 MiB/s plus 30 s of overhead. Reserve two minutes of the host's
+/// 600 s helper deadline for guest preparation, pause and failure compensation.
+fn snapshot_create_timeout(ram_mib: u64) -> Duration {
+    Duration::from_secs(ram_mib.div_ceil(64).saturating_add(30).clamp(60, 480))
+}
+
+pub(crate) fn create_snapshot(root: &Path, timeout: Duration) -> Result<()> {
+    api_with_timeout(root, "PUT", "/snapshot/create", &snapshot_body(), timeout).map_err(|error| {
+        let prefix = if error.request_started {
+            crate::tenant::SNAPSHOT_CREATE_UNCERTAIN
+        } else {
+            "suspend_create_not_sent"
+        };
+        Error(format!("{prefix}: {error}"))
+    })
+}
+
+struct ApiFailure {
+    method: String,
+    path: String,
+    step: &'static str,
+    request_started: bool,
+    elapsed_ms: u128,
+    timeout_ms: u128,
+    detail: String,
+}
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Firecracker {} {} step={} request_started={} elapsed_ms={} timeout_ms={}: {}",
+            self.method,
+            self.path,
+            self.step,
+            self.request_started,
+            self.elapsed_ms,
+            self.timeout_ms,
+            self.detail
+        )
+    }
+}
+
 pub fn api(root: &Path, method: &str, path: &str, body: &Value) -> Result<()> {
-    let root_fd = File::open(root)?;
-    let mut socket =
-        UnixStream::connect(format!("/proc/self/fd/{}/api.sock", root_fd.as_raw_fd()))?;
-    socket.set_read_timeout(Some(Duration::from_secs(300)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+    api_with_timeout(root, method, path, body, Duration::from_secs(300))
+        .map_err(|error| Error(error.to_string()))
+}
+
+fn api_with_timeout(
+    root: &Path,
+    method: &str,
+    path: &str,
+    body: &Value,
+    timeout: Duration,
+) -> std::result::Result<(), Box<ApiFailure>> {
+    let started = std::time::Instant::now();
+    let failure = |step, request_started, error: std::io::Error| {
+        Box::new(ApiFailure {
+            method: method.into(),
+            path: path.into(),
+            step,
+            request_started,
+            elapsed_ms: started.elapsed().as_millis(),
+            timeout_ms: timeout.as_millis(),
+            detail: if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                format!("api_timeout: {error}")
+            } else {
+                format!("{:?}: {error}", error.kind())
+            },
+        })
+    };
+    let root_fd = File::open(root).map_err(|e| failure("open_jail_root", false, e))?;
+    let mut socket = UnixStream::connect(format!("/proc/self/fd/{}/api.sock", root_fd.as_raw_fd()))
+        .map_err(|e| failure("connect", false, e))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| failure("set_read_timeout", false, e))?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| failure("set_write_timeout", false, e))?;
     let data = body.to_string();
-    write!(socket, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len())?;
+    write!(socket, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len())
+        .map_err(|e| failure("write_request", true, e))?;
     let mut reader = BufReader::new(socket);
     let mut status = String::new();
-    reader.read_line(&mut status)?;
-    if status.split_whitespace().nth(1) != Some("204") {
-        return Err(Error(format!(
-            "Firecracker {method} {path}: {}",
-            status.trim()
-        )));
+    // Read one byte at a time with an absolute deadline; a trickled HTTP status
+    // must not extend the helper's reply budget indefinitely.
+    let end = started + timeout;
+    while !status.ends_with('\n') {
+        let remaining = end.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(failure(
+                "read_status",
+                true,
+                std::io::ErrorKind::TimedOut.into(),
+            ));
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| failure("set_read_timeout", true, e))?;
+        let mut byte = [0];
+        reader
+            .read_exact(&mut byte)
+            .map_err(|e| failure("read_status", true, e))?;
+        status.push(byte[0] as char);
+        if status.len() > 1024 {
+            return Err(failure(
+                "read_status",
+                true,
+                std::io::Error::other("status line too long"),
+            ));
+        }
     }
+    if status.split_whitespace().nth(1) != Some("204") {
+        return Err(failure(
+            "response_status",
+            true,
+            std::io::Error::other(status.trim()),
+        ));
+    }
+    eprintln!(
+        "Firecracker {method} {path} completed elapsed_ms={} timeout_ms={}",
+        started.elapsed().as_millis(),
+        timeout.as_millis()
+    );
     Ok(())
 }
 fn load_body(prefix: &str, tap: &str) -> Value {

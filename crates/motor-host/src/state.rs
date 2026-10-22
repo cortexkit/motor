@@ -166,6 +166,8 @@ struct LiveVm {
     runner_idle: bool,
     space_logged: bool,
     idle_since_ms: Option<u64>,
+    suspend_failures: u32,
+    suspend_retry_after_ms: u64,
     events_since_ms: Option<u64>,
 }
 
@@ -847,6 +849,9 @@ impl Host {
         };
         let idle = self.is_ready(tenant) && !self.is_suspending(tenant) && self.tenant_idle(tenant);
         let live = self.live.entry(tenant.to_owned()).or_default();
+        if idle_suspend_s == 0 || now_ms < live.suspend_retry_after_ms {
+            return false;
+        }
         if !idle {
             live.idle_since_ms = None;
             live.space_logged = false;
@@ -901,10 +906,31 @@ impl Host {
             self.guest_unready(tenant);
         }
         let live = self.live.entry(tenant.to_owned()).or_default();
+        if succeeded {
+            live.suspend_failures = 0;
+            live.suspend_retry_after_ms = 0;
+        }
         live.suspending = false;
         live.idle_since_ms = None;
         self.publish_connections();
         still_idle
+    }
+    pub(crate) fn suspend_failed(&mut self, tenant: &str, now_ms: u64) {
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        live.suspend_failures = live.suspend_failures.saturating_add(1);
+        // Snapshot failures can saturate shared storage. Activity does not erase
+        // this cooldown: a busy/idle cycle must not trigger another large write.
+        let delay_ms = (30 * 60 * 1000u64)
+            .saturating_mul(1 << live.suspend_failures.saturating_sub(1).min(4))
+            .min(6 * 60 * 60 * 1000);
+        live.suspend_retry_after_ms = now_ms.saturating_add(delay_ms);
+        tracing::info!(
+            tenant,
+            failures = live.suspend_failures,
+            retry_after_ms = live.suspend_retry_after_ms,
+            delay_ms,
+            "suspend_backoff"
+        );
     }
 }
 fn counted(l: &Lease, now_ms: u64) -> bool {

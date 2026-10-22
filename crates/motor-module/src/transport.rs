@@ -1209,6 +1209,27 @@ mod hello_tests {
 #[cfg(test)]
 mod disconnect_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn boundary_eof_is_not_reported_as_a_truncated_frame() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(server);
+        let mut channel = Channel::new(Box::new(client));
+        let error = channel.next().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "EOF at frame boundary");
+    }
+
+    #[tokio::test]
+    async fn partial_body_eof_still_reports_truncation() {
+        let (client, mut server) = tokio::io::duplex(64);
+        server.write_all(&[0, 0, 0, 12, b'{']).await.unwrap();
+        drop(server);
+        let mut channel = Channel::new(Box::new(client));
+        let error = channel.next().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "truncated JSON frame");
+    }
     use std::task::{Context, Poll};
     struct FailedWriter;
     impl AsyncRead for FailedWriter {
@@ -1372,7 +1393,7 @@ async fn read_exact_active<R: AsyncRead + Unpin>(
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "truncated frame",
+                "EOF at frame boundary",
             ));
         }
         bytes = &mut bytes[n..];

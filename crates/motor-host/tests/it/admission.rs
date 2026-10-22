@@ -483,3 +483,57 @@ fn suspend_reservation_rechecks_idle_and_preserves_new_activity() {
     assert_eq!(h.snapshot.leases[JOB2].state, LeaseState::Reserved);
     assert_eq!(h.quota("tenant", (NOW + 120) * 1000), 1);
 }
+
+#[test]
+fn refused_suspend_backs_off_across_activity_and_success_resets_the_cooldown() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Idle, None, None),
+        NOW * 1000,
+    )
+    .unwrap();
+    let mut now = NOW * 1000;
+    for delay in [
+        1_800_000, 3_600_000, 7_200_000, 14_400_000, 21_600_000, 21_600_000,
+    ] {
+        assert!(!h.suspend_candidate("tenant", now));
+        now += 60_000;
+        assert!(h.begin_suspend("tenant", now, u64::MAX));
+        h.finish_suspend("tenant", false);
+        h.suspend_failed("tenant", now);
+        h.prelude("tenant", true);
+        h.prelude("tenant", false);
+        assert!(!h.suspend_candidate("tenant", now + delay - 1));
+        now += delay;
+        // A fresh idle period is still required after the backoff.
+        assert!(!h.suspend_candidate("tenant", now));
+    }
+    now += 60_000;
+    assert!(h.begin_suspend("tenant", now, u64::MAX));
+    h.finish_suspend("tenant", true);
+    h.guest_ready("tenant", 2).unwrap();
+    assert!(!h.suspend_candidate("tenant", now));
+    assert!(h.begin_suspend("tenant", now + 60_000, u64::MAX));
+    h.finish_suspend("tenant", false);
+    h.suspend_failed("tenant", now + 60_000);
+    assert!(!h.suspend_candidate("tenant", now + 1_859_999));
+    assert!(!h.suspend_candidate("tenant", now + 1_860_000));
+    assert!(h.suspend_candidate("tenant", now + 1_920_000));
+}
+
+#[test]
+fn zero_idle_suspend_disables_snapshot_attempts() {
+    let mut h = host();
+    h.tenants.values_mut().next().unwrap().idle_suspend_s = 0;
+    h.guest_ready("tenant", 1).unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Idle, None, None),
+        NOW * 1000,
+    )
+    .unwrap();
+    assert!(!h.suspend_candidate("tenant", NOW * 1000));
+    assert!(!h.suspend_candidate("tenant", u64::MAX));
+}

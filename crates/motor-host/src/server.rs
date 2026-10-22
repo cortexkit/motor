@@ -809,11 +809,16 @@ impl Runtime {
             }
         }
         let result = self.control.suspend(tenant);
-        let still_idle = self
-            .host
-            .lock()
-            .expect("host lock")
-            .finish_suspend(tenant, result.is_ok());
+        let mut host = self.host.lock().expect("host lock");
+        let still_idle = host.finish_suspend(tenant, result.is_ok());
+        if let Err(error) = &result {
+            // A failed create may have required killing the VMM. Reconcile via
+            // the helper on the next lease instead of trusting stale readiness.
+            host.guest_unready(tenant);
+            host.suspend_failed(tenant, unix_ms());
+            tracing::warn!(tenant, detail = %format!("{error:#}"), "tenant_suspend_failed");
+        }
+        drop(host);
         if result.is_ok() && !still_idle {
             tracing::info!(tenant, "suspended_with_new_activity");
         }
@@ -951,6 +956,17 @@ impl Drop for PreludeGuard {
 pub async fn serve<S>(runtime: Arc<Runtime>, mut client: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_with_slot(runtime, &mut client, None).await
+}
+
+pub async fn serve_with_slot<S>(
+    runtime: Arc<Runtime>,
+    mut client: S,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let first = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
         .await
@@ -1093,6 +1109,8 @@ where
             return Err(e).at(Side::Host, "admission");
         }
     };
+    // Only a verified challenge releases the pre-authentication connection budget.
+    drop(slot);
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
     let connection = ConnectionGuard {
@@ -1186,6 +1204,7 @@ where
         // This connection owns the reverse drain after decoding Terminal or
         // selecting host-settled final frames; ownership is not client delivery.
         let draining_terminal = AtomicBool::new(false);
+        let relay_trace = crate::relay::RelayTrace::new(&claims.jti);
         // Copy by hand rather than with tokio::io::copy, so a failure says
         // whether reading the client or writing the guest failed.
         let to_guest = async {
@@ -1199,13 +1218,14 @@ where
                 if draining_terminal.load(Ordering::Acquire) {
                     continue;
                 }
-                if let Err(error) = gw.write_all(&buffer[..n]).await {
+                if let Err(error) = relay_trace.guest_input(&mut gw, &buffer[..n]).await {
                     if draining_terminal.load(Ordering::Acquire)
                         && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected)
                     {
                         tracing::debug!(jti = claims.jti, side = "guest", step = "relay", cause = %error, "guest_input_closed_during_terminal_drain");
                         continue;
                     }
+                    tracing::warn!(jti = claims.jti, operation = "write_guest_uds", cause = %error, "relay_io_failed");
                     return Err(error).at(Side::Guest, "relay");
                 }
             }
@@ -1222,7 +1242,7 @@ where
                             let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                             if let Some(frames) = frames {
                                 draining_terminal.store(true, Ordering::Release);
-                                for frame in frames { write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
                                 terminal_written.store(true, Ordering::Release);
                                 break None;
                             }
@@ -1234,7 +1254,7 @@ where
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
-                    for frame in frames { write_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
+                    for frame in frames { relay_trace.client_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
                     terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
@@ -1253,7 +1273,7 @@ where
                     // forwarding while this connection waits for billing.
                     draining_terminal.store(true, Ordering::Release);
                     if runtime.sandbox_identity.is_some() {
-                        write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                        relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
                         terminal_written.store(true, Ordering::Release);
                         return Ok::<(),anyhow::Error>(());
                     }
@@ -1270,13 +1290,13 @@ where
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
-                    write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
-                    write_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
+                    relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                    relay_trace.client_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
                     terminal_written.store(true, Ordering::Release);
                     tracing::debug!(jti = claims.jti, "connection_terminal_written");
                     return Ok::<(),anyhow::Error>(());
                 }
-                write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
