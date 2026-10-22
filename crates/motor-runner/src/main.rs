@@ -333,6 +333,7 @@ fn configure_options(
         }
         if arg == "--boat-profile" {
             config.boat_profile = true;
+            config.disk_reserve_bytes = motor_runner::BOAT_DISK_RESERVE_BYTES;
             continue;
         }
         let value = args

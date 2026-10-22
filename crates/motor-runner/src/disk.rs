@@ -594,6 +594,25 @@ impl Runner {
     /// Delete synchronously off the state lock and probe after each tree. Rename
     /// to trash is not enough: on XFS shared extents may reclaim no free space.
     pub(super) fn ensure_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
+        self.reclaim_disk_space(false)
+    }
+
+    /// The disk pass for admitting a Run request. A Boat sandbox serves one job
+    /// at a time for one tenant, so a workspace that the next job does not
+    /// reuse is unlikely to be used again, while keeping it can leave the next
+    /// build too little room: with jobs back to back every workspace counts as
+    /// recently used and the ordinary pass keeps it as long as the floor holds.
+    /// There every idle workspace is evicted before admission, whatever the
+    /// free space. The request's own workspace and siblings stay, because the
+    /// caller registered them as admitting before this pass.
+    pub(super) fn ensure_admission_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
+        self.reclaim_disk_space(self.core.config.boat_profile)
+    }
+
+    /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
+    /// deleted regardless of age or free space before the ordinary rules apply
+    /// to everything else.
+    fn reclaim_disk_space(&self, sweep_idle_workspaces: bool) -> io::Result<Option<RunnerDiskFull>> {
         self.ensure_admission_ownership()?;
         let _pressure = self.core.disk.lock().unwrap();
         let floor = self.core.config.free_space_floor_bytes;
@@ -617,7 +636,7 @@ impl Runner {
                 floor_bytes: floor,
             }));
         }
-        if free >= soft {
+        if free >= soft && !sweep_idle_workspaces {
             return Ok(None);
         }
         let device = crate::filesystem::device(&self.core.trees.state)?;
@@ -647,6 +666,14 @@ impl Runner {
                     if attempted.contains(&c.path)
                         || inner.eviction_retry_after.contains_key(&c.path)
                     {
+                        return false;
+                    }
+                    if sweep_idle_workspaces && c.workspace.is_some() {
+                        return true;
+                    }
+                    // Only a sweep continues past the soft goal, and only for
+                    // workspaces.
+                    if free >= soft {
                         return false;
                     }
                     // Only caches are worth keeping for reuse. A dead job's private
@@ -860,12 +887,18 @@ impl Runner {
             }
             drop(inner);
             free = probe()?;
-            if free >= soft {
+            if free >= soft && !sweep_idle_workspaces {
                 self.core.health.lock().unwrap().record(self.now(), |c| {
                     c.skipped_recent += skipped_recent.len() as u64;
                 });
                 return Ok(None);
             }
+        }
+        if free >= soft {
+            self.core.health.lock().unwrap().record(self.now(), |c| {
+                c.skipped_recent += skipped_recent.len() as u64;
+            });
+            return Ok(None);
         }
         if free >= floor {
             self.core.health.lock().unwrap().record(self.now(), |c| {
@@ -890,5 +923,118 @@ impl Runner {
             free_bytes: free,
             floor_bytes: floor,
         }))
+    }
+}
+
+/// How often an idle runner with a disk reserve checks whether its disk has
+/// dropped under the admission floor.
+pub(super) const DISK_UPKEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a failed write ran out of space (ENOSPC).
+pub(super) fn storage_full(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::StorageFull
+}
+
+impl Runner {
+    fn disk_reserve_path(&self) -> PathBuf {
+        self.core.trees.state.join("disk-reserve")
+    }
+
+    /// Keeps a runner that reserves disk (the Boat profile) able to admit a job
+    /// without waiting for one to arrive. Admission is the only other place
+    /// that evicts, and in a Boat sandbox nothing reaches admission while the
+    /// disk is full: the endpoint's journal shares this disk and the endpoint
+    /// withdraws its readiness below the floor. So when no job is live and free
+    /// space is under the floor, this runs the ordinary pressure pass, which
+    /// below the floor may evict any idle workspace, including the one the last
+    /// job used. Once free space is back above the floor, it recreates the disk
+    /// reserve if a full disk used it up.
+    pub(crate) fn disk_upkeep(&self) -> io::Result<()> {
+        let floor = self.core.config.free_space_floor_bytes;
+        if self.core.config.disk_reserve_bytes == 0 || floor == 0 {
+            return Ok(());
+        }
+        let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
+        if probe()? < floor {
+            let idle = {
+                let inner = self.core.inner.lock().unwrap();
+                inner.jobs.values().all(|job| job.terminal.is_some())
+                    && inner.starting.is_empty()
+                    && inner.admitting.is_empty()
+                    && inner.preparing.is_empty()
+                    && inner.transfers.is_empty()
+            };
+            if !idle {
+                return Ok(());
+            }
+            self.ensure_disk_space()?;
+            if probe()? < floor {
+                return Ok(());
+            }
+        }
+        self.restore_disk_reserve()
+    }
+
+    /// Writes the reserve file out in full, so its blocks are really
+    /// allocated, and moves it into place only once complete.
+    fn restore_disk_reserve(&self) -> io::Result<()> {
+        let bytes = self.core.config.disk_reserve_bytes;
+        let path = self.disk_reserve_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(invalid("runner disk reserve is not a regular file"))
+            }
+            Ok(metadata) if metadata.len() == bytes => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let temporary = path.with_extension("tmp");
+        let written = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temporary)?;
+            let chunk = vec![0; 1 << 20];
+            let mut left = bytes;
+            while left > 0 {
+                let n = left.min(chunk.len() as u64) as usize;
+                file.write_all(&chunk[..n])?;
+                left -= n as u64;
+            }
+            file.sync_all()?;
+            fs::rename(&temporary, &path)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        written?;
+        tracing::info!(bytes, "runner disk reserve restored");
+        Ok(())
+    }
+
+    /// Frees the reserve after a write ran out of space, so the records that
+    /// let a finished job end (its terminal record, the catalog, the
+    /// endpoint's journal) can still be written. Returns whether a reserve was
+    /// removed.
+    pub(super) fn release_disk_reserve(&self) -> bool {
+        if self.core.config.disk_reserve_bytes == 0 {
+            return false;
+        }
+        match fs::remove_file(self.disk_reserve_path()) {
+            Ok(()) => {
+                tracing::warn!(
+                    bytes = self.core.config.disk_reserve_bytes,
+                    "runner disk reserve released after the disk filled"
+                );
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::error!(%error, "cannot release runner disk reserve");
+                false
+            }
+        }
     }
 }

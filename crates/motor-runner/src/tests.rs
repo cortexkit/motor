@@ -13,6 +13,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[path = "tests/cancellation.rs"]
 mod cancellation;
+#[path = "tests/boat_disk.rs"]
+mod boat_disk;
 #[path = "tests/dependency_writer.rs"]
 mod dependency_writer;
 #[path = "tests/disk_pressure.rs"]

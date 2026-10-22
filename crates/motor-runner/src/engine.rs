@@ -41,6 +41,10 @@ mod retirement;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+/// The disk reserve a Boat sandbox keeps (see `Config::disk_reserve_bytes`):
+/// enough for terminal records, the catalog and the endpoint's journal to be
+/// written after a job has used up every other byte.
+pub const BOAT_DISK_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]
 type JobWriteHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
@@ -109,6 +113,11 @@ pub struct Config {
     pub free_space_floor_bytes: u64,
     /// Optional soft reclaim goal; absent preserves twice the admission floor.
     pub free_space_eviction_bytes: Option<u64>,
+    /// Size of the preallocated file the runner keeps in its state directory
+    /// so that a job which fills the disk on its own can still have its
+    /// terminal record written (see `disk.rs`). Zero keeps no reserve; the
+    /// Boat profile sets one.
+    pub disk_reserve_bytes: u64,
     /// Only catalogued workspaces beneath these roots may be pressure-evicted.
     pub workspace_roots: Vec<PathBuf>,
     /// Authorized destinations for caller workspaces, heads and siblings.
@@ -300,6 +309,7 @@ impl Config {
             windows_prep_executable: None,
             free_space_floor_bytes: DEFAULT_FREE_SPACE_FLOOR_BYTES,
             free_space_eviction_bytes: None,
+            disk_reserve_bytes: 0,
             workspace_roots: vec![PathBuf::from("/Users")],
             owned_workspace_roots: vec![PathBuf::from("/Users")],
             drop_timeout: Duration::from_secs(60),
@@ -1402,6 +1412,21 @@ impl Runner {
         if runner.core.config.manual_tick {
             return Ok(runner);
         }
+        if runner.core.config.disk_reserve_bytes > 0 {
+            if let Err(error) = runner.disk_upkeep() {
+                tracing::warn!(%error, "runner disk upkeep failed");
+            }
+            let weak = Arc::downgrade(&runner.core);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(disk::DISK_UPKEEP_INTERVAL);
+                let Some(core) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = (Runner { core }).disk_upkeep() {
+                    tracing::warn!(%error, "runner disk upkeep failed");
+                }
+            });
+        }
         let weak = Arc::downgrade(&runner.core);
         std::thread::spawn(move || loop {
             let Some(core) = weak.upgrade() else {
@@ -1955,7 +1980,7 @@ impl Runner {
         // Recheck ordinary admission after cleanup; another request may have
         // occupied the workspace or queue while deletion ran off the state lock.
         let disk_full = if initial_refusal.is_none() {
-            self.ensure_disk_space()?
+            self.ensure_admission_disk_space()?
         } else {
             None
         };
@@ -5655,6 +5680,12 @@ impl Runner {
                 }
                 Err(error) => {
                     tracing::warn!(%id, %error, "terminal persistence failed; retrying");
+                    // A job that used up the disk on its own leaves no room
+                    // for its terminal record, and nothing else frees space
+                    // while it stays unfinished. The reserve exists for this.
+                    if disk::storage_full(&error) {
+                        self.release_disk_reserve();
+                    }
                     // Backoff belongs to this job's monitor, never the scheduler
                     // or the state lock used by admission and other jobs.
                     drop(inner);
