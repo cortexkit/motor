@@ -304,6 +304,7 @@ impl JobSiblings {
 
     /// Each resolved sibling as (snapshot directory, canonical path), the
     /// pairs the sandbox and the Cargo prefetch mount.
+    #[cfg(target_os = "linux")]
     pub(crate) fn mounts(&self) -> Vec<(PathBuf, PathBuf)> {
         self.resolved
             .iter()

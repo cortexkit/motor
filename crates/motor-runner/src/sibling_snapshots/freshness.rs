@@ -213,6 +213,7 @@ impl Pending {
     }
 
     /// The sibling's canonical path.
+    #[cfg(target_os = "linux")]
     pub(crate) fn sibling(&self) -> &str {
         &self.sibling
     }

@@ -2809,8 +2809,9 @@ impl Runner {
         if inner.dropping.is_empty() {
             return false;
         }
-        // A drop deletes a host path. Only an in-place sibling lives at one;
-        // a snapshot cannot be affected by it.
+        // A drop deletes a host path. A job set up in snapshot mode mounts its
+        // siblings from snapshots, which no drop of a host path can affect,
+        // so only its own workspace counts there.
         let siblings = if inner.sibling_fences == crate::sibling_snapshots::SiblingFences::InPlace {
             siblings
         } else {
