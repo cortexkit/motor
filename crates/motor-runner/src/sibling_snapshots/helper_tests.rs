@@ -14,30 +14,50 @@ fn output(code: i32, stdout: &str) -> Output {
     }
 }
 
-/// A config whose systemctl calls are answered by `show` for `show` and
-/// recorded in `calls`, and whose helper launches return `launched`.
-fn config(
+/// A helper whose main process exited with status 0: with RemainAfterExit
+/// the unit stays loaded and active in the `exited` state.
+const SUCCEEDED: &str = "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\n\
+                         ExecMainCode=1\nExecMainStatus=0\n";
+
+/// A successful unit once it has been stopped and unloaded.
+const UNLOADED: &str = "LoadState=not-found\nActiveState=inactive\nSubState=dead\n";
+
+/// A config whose systemctl calls are recorded in `calls` and answered with
+/// `before` for `show` until the runner asks systemd to stop the unit, and
+/// with `after` from then on. Helper starts are recorded in `launched` and
+/// succeed.
+fn fake(
     scratch: &ScratchDir,
-    instance: &str,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
-    show: &'static str,
+    before: &'static str,
+    after: &'static str,
     launched: Arc<Mutex<Vec<Vec<String>>>>,
-    exit: i32,
 ) -> Config {
-    let mut config = Config::new(scratch.join("runner"), instance);
+    let mut config = Config::new(scratch.join("runner"), "main");
     fs::create_dir_all(config.state_dir()).unwrap();
     config.systemd_command = Some(Arc::new(move |args| {
-        calls
-            .lock()
-            .unwrap()
-            .push(args.iter().map(|arg| arg.to_string()).collect());
-        Ok(output(0, if args[0] == "show" { show } else { "" }))
+        let mut calls = calls.lock().unwrap();
+        calls.push(args.iter().map(|arg| arg.to_string()).collect());
+        let stopped = calls.iter().any(|call| call[0] == "stop");
+        Ok(output(
+            0,
+            match (args[0], stopped) {
+                ("show", false) => before,
+                ("show", true) => after,
+                _ => "",
+            },
+        ))
     }));
     config.snapshot_helper_launcher = Some(Arc::new(move |args| {
         launched.lock().unwrap().push(args.to_vec());
-        Ok(output(exit, ""))
+        Ok(output(0, ""))
     }));
     config
+}
+
+/// A config whose helper ends as `state` says.
+fn ending(scratch: &ScratchDir, state: &'static str) -> Config {
+    fake(scratch, Arc::default(), state, UNLOADED, Arc::default())
 }
 
 fn shell(directory: &Path) -> Command {
@@ -48,6 +68,17 @@ fn shell(directory: &Path) -> Command {
         .env("MOTOR_HELPER_SET", "a \"quoted\" $value\\")
         .env_remove("HOME");
     command
+}
+
+fn run_prefetch(config: &Config, scratch: &ScratchDir, limit: Duration) -> io::Result<()> {
+    let view = View::prefetch(&scratch.join("w/a"), &[]).unwrap();
+    run(
+        config,
+        Helper::CargoPrefetch,
+        limit,
+        &shell(&config.state_dir()),
+        &view,
+    )
 }
 
 #[test]
@@ -76,15 +107,13 @@ fn snapshot_helper_names_match_only_their_own_instance() {
 #[test]
 fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbours() {
     let scratch = ScratchDir::new("snapshot-helper-arguments");
-    let calls = Arc::default();
     let launched: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let mut config = config(
+    let mut config = fake(
         &scratch,
-        "main",
-        calls,
-        "LoadState=not-found\nActiveState=inactive\nResult=success\n",
+        Arc::default(),
+        SUCCEEDED,
+        UNLOADED,
         launched.clone(),
-        0,
     );
     config.snapshot_prefetch_timeout = Duration::from_secs(321);
     let workspace = scratch.join("worktrees/a");
@@ -111,8 +140,10 @@ fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbour
     assert!(belongs_to("main", unit), "{unit}");
     let w = |path: &Path| word(path).unwrap();
     for expected in [
-        "--wait".to_string(),
-        "--service-type=exec".into(),
+        "--service-type=exec".to_string(),
+        // The unit stays loaded after a successful exit, so the runner can
+        // read how its main process ended.
+        "--property=RemainAfterExit=yes".into(),
         format!("--uid={}", unsafe { libc::geteuid() }),
         "--property=RuntimeMaxSec=321000ms".into(),
         "--property=KillMode=control-group".into(),
@@ -146,19 +177,24 @@ fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbour
     assert_eq!(arguments[separator + 1..], ["/bin/sh", "-c", "exit 0"]);
     // The environment travels in a file, never as unit properties.
     assert!(!arguments.iter().any(|a| a.contains("MOTOR_HELPER_SET")));
+    // The helper's output goes to a file, not through systemd-run, whose own
+    // exit status says nothing about how the main process ended.
+    assert!(!arguments.iter().any(|a| a == "--wait" || a == "--pipe"));
+    assert!(arguments
+        .iter()
+        .any(|a| a.starts_with("--property=StandardError=append:")));
 }
 
 #[test]
 fn snapshot_javascript_helper_runs_in_the_snapshot_at_the_sibling_path() {
     let scratch = ScratchDir::new("snapshot-helper-javascript");
     let launched: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let config = config(
+    let config = fake(
         &scratch,
-        "main",
         Arc::default(),
-        "LoadState=loaded\nActiveState=inactive\nResult=success\n",
+        SUCCEEDED,
+        UNLOADED,
         launched.clone(),
-        0,
     );
     let sibling = scratch.join("source/b");
     let snapshot = config.sibling_snapshots_dir().join("b/1234.tmp-x");
@@ -204,14 +240,7 @@ const DEFAULT_LIMIT_FOR_TESTS: Duration = Duration::from_secs(15 * 60);
 fn snapshot_helper_environment_is_private_and_removed_after_the_run() {
     let scratch = ScratchDir::new("snapshot-helper-environment");
     let seen: Arc<Mutex<Option<(u32, String)>>> = Arc::default();
-    let mut config = config(
-        &scratch,
-        "main",
-        Arc::default(),
-        "LoadState=not-found\nActiveState=inactive\n",
-        Arc::default(),
-        0,
-    );
+    let mut config = ending(&scratch, SUCCEEDED);
     let observed = seen.clone();
     config.snapshot_helper_launcher = Some(Arc::new(move |args| {
         let file = args
@@ -254,28 +283,20 @@ fn snapshot_helper_environment_is_private_and_removed_after_the_run() {
 fn snapshot_helper_timeout_fails_setup_naming_the_helper_and_its_limit() {
     let scratch = ScratchDir::new("snapshot-helper-timeout");
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let mut config = config(
+    let mut config = fake(
         &scratch,
-        "main",
         calls.clone(),
-        "LoadState=loaded\nActiveState=failed\nResult=timeout\n",
+        "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=timeout\n\
+         ExecMainCode=2\nExecMainStatus=15\n",
+        UNLOADED,
         Arc::default(),
-        1,
     );
     // The unit runs for its whole limit before systemd stops it.
     config.snapshot_helper_launcher = Some(Arc::new(|_| {
         std::thread::sleep(Duration::from_millis(20));
-        Ok(output(1, ""))
+        Ok(output(0, ""))
     }));
-    let view = View::prefetch(&scratch.join("w/a"), &[]).unwrap();
-    let error = run(
-        &config,
-        Helper::CargoPrefetch,
-        Duration::from_millis(10),
-        &shell(&config.state_dir()),
-        &view,
-    )
-    .unwrap_err();
+    let error = run_prefetch(&config, &scratch, Duration::from_millis(10)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     let message = error.to_string();
     for expected in [
@@ -293,13 +314,10 @@ fn snapshot_helper_timeout_fails_setup_naming_the_helper_and_its_limit() {
 #[test]
 fn snapshot_helper_failure_is_not_reported_as_a_timeout() {
     let scratch = ScratchDir::new("snapshot-helper-failure");
-    let config = config(
+    let config = ending(
         &scratch,
-        "main",
-        Arc::default(),
-        "LoadState=loaded\nActiveState=failed\nResult=exit-code\n",
-        Arc::default(),
-        3,
+        "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\n\
+         ExecMainCode=1\nExecMainStatus=3\n",
     );
     let view = View::javascript(&scratch.join("snapshot"), &scratch.join("source/b"));
     fs::create_dir_all(scratch.join("snapshot")).unwrap();
@@ -312,73 +330,144 @@ fn snapshot_helper_failure_is_not_reported_as_a_timeout() {
     )
     .unwrap_err();
     assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(
+        message.contains("JavaScript install helper unit motor-snaphelper-main-")
+            && message.contains("exited with status 3"),
+        "{message}"
+    );
+}
+
+/// systemd counts a main process killed by SIGTERM during a stop as a clean
+/// end and reports Result=success, as for a helper that startup cleanup
+/// stopped. That is not a successful prefetch or install.
+#[test]
+fn snapshot_helper_killed_by_a_stop_fails_although_systemd_reports_success() {
+    let scratch = ScratchDir::new("snapshot-helper-stopped");
+    let config = ending(
+        &scratch,
+        "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n\
+         ExecMainCode=2\nExecMainStatus=15\n",
+    );
+    let error = run_prefetch(&config, &scratch, Duration::from_secs(60)).unwrap_err();
+    assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(
+        message.contains("killed by signal SIGTERM (15)") && message.contains("result success"),
+        "{message}"
+    );
+}
+
+/// A helper unit that was stopped and unloaded before the runner could read
+/// how its main process ended has not shown that it succeeded.
+#[test]
+fn snapshot_helper_unloaded_before_its_end_was_read_fails() {
+    let scratch = ScratchDir::new("snapshot-helper-unloaded");
+    let config = ending(&scratch, UNLOADED);
+    let error = run_prefetch(&config, &scratch, Duration::from_secs(60)).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("JavaScript install helper unit motor-snaphelper-main-"),
+            .contains("stopped and unloaded from outside"),
         "{error}"
     );
 }
 
-/// A main process that succeeded but left processes that ignored SIGTERM:
-/// systemd kills them and reports Result=timeout, but the helper did not run
-/// out of time and its work is done.
+#[test]
+fn snapshot_helper_success_needs_exit_status_zero_and_result_success() {
+    let exit = |result: &str, code: i32, status: i32| {
+        classify(
+            &Observed::Ended(MainExit {
+                result: Some(result.into()),
+                code: Some(code),
+                status: Some(status),
+            }),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+    };
+    assert_eq!(exit("success", libc::CLD_EXITED, 0), Verdict::Succeeded);
+    for (result, code, status, reason) in [
+        (
+            "success",
+            libc::CLD_KILLED,
+            15,
+            "killed by signal SIGTERM (15)",
+        ),
+        (
+            "signal",
+            libc::CLD_KILLED,
+            9,
+            "killed by signal SIGKILL (9)",
+        ),
+        (
+            "core-dump",
+            libc::CLD_DUMPED,
+            11,
+            "dumped core on signal SIGSEGV (11)",
+        ),
+        ("exit-code", libc::CLD_EXITED, 1, "exited with status 1"),
+        // A stop that needed SIGKILL before the limit is not a time-out.
+        (
+            "timeout",
+            libc::CLD_KILLED,
+            9,
+            "killed by signal SIGKILL (9)",
+        ),
+    ] {
+        match exit(result, code, status) {
+            Verdict::Failed(message) => assert!(message.contains(reason), "{message}"),
+            verdict => panic!("{result}/{code}/{status}: {verdict:?}"),
+        }
+    }
+    assert!(matches!(
+        classify(
+            &Observed::Ended(MainExit::default()),
+            Duration::ZERO,
+            Duration::from_secs(60)
+        ),
+        Verdict::Failed(message) if message.contains("reported no exit")
+    ));
+    assert_eq!(
+        classify(&Observed::Overran, Duration::ZERO, Duration::from_secs(60)),
+        Verdict::TimedOut
+    );
+}
+
+/// A main process that exited 0 but left processes that ignore SIGTERM:
+/// the stop that removes them needs SIGKILL and systemd then reports
+/// Result=timeout, but the helper's work is done.
 #[test]
 fn snapshot_helper_main_success_with_killed_leftovers_is_not_a_timeout() {
     let scratch = ScratchDir::new("snapshot-helper-leftovers");
-    let config = config(
+    let config = fake(
         &scratch,
-        "main",
         Arc::default(),
-        "LoadState=loaded\nActiveState=failed\nResult=timeout\nExecMainCode=1\nExecMainStatus=0\n",
+        SUCCEEDED,
+        "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=timeout\n\
+         ExecMainCode=1\nExecMainStatus=0\n",
         Arc::default(),
-        1,
     );
-    let view = View::prefetch(&scratch.join("w/a"), &[]).unwrap();
-    run(
-        &config,
-        Helper::CargoPrefetch,
-        Duration::from_secs(60),
-        &shell(&config.state_dir()),
-        &view,
-    )
-    .unwrap();
+    run_prefetch(&config, &scratch, Duration::from_secs(60)).unwrap();
 }
 
 #[test]
 fn snapshot_helper_returns_only_after_its_unit_is_inactive() {
     let scratch = ScratchDir::new("snapshot-helper-settle");
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let mut config = config(&scratch, "main", calls.clone(), "", Arc::default(), 0);
-    // The unit is still deactivating when systemd-run returns, and becomes
-    // inactive only after the runner has stopped it.
-    let recorded = calls.clone();
-    config.systemd_command = Some(Arc::new(move |args| {
-        let mut calls = recorded.lock().unwrap();
-        calls.push(args.iter().map(|arg| arg.to_string()).collect());
-        let stopped = calls.iter().any(|call| call[0] == "kill");
-        Ok(output(
-            0,
-            match (args[0], stopped) {
-                ("show", false) => "LoadState=loaded\nActiveState=deactivating\nResult=success\n",
-                ("show", true) => "LoadState=loaded\nActiveState=inactive\nResult=success\n",
-                _ => "",
-            },
-        ))
-    }));
-    let view = View::prefetch(&scratch.join("w/a"), &[]).unwrap();
-    run(
-        &config,
-        Helper::CargoPrefetch,
-        Duration::from_secs(5),
-        &shell(&config.state_dir()),
-        &view,
-    )
-    .unwrap();
+    // The main process has exited and the unit is still active; it becomes
+    // inactive only once the runner has stopped it.
+    let config = fake(
+        &scratch,
+        calls.clone(),
+        SUCCEEDED,
+        "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n",
+        Arc::default(),
+    );
+    run_prefetch(&config, &scratch, Duration::from_secs(5)).unwrap();
     let calls = calls.lock().unwrap();
     let verbs: Vec<_> = calls.iter().map(|call| call[0].as_str()).collect();
-    assert_eq!(verbs, ["show", "stop", "kill", "show"]);
-    assert_eq!(calls[2][1..3], ["--kill-whom=all", "--signal=KILL"]);
+    assert_eq!(verbs, ["show", "show", "stop", "show"]);
 }
 
 #[test]
@@ -406,7 +495,7 @@ fn snapshot_helper_startup_stops_only_this_instances_units() {
     config.systemd_command = Some(Arc::new(move |args| {
         let mut calls = recorded.lock().unwrap();
         calls.push(args.iter().map(|arg| arg.to_string()).collect());
-        let stopped = calls.iter().any(|call| call[0] == "kill");
+        let stopped = calls.iter().any(|call| call[0] == "stop");
         Ok(output(
             0,
             match args[0] {
@@ -428,7 +517,7 @@ fn snapshot_helper_startup_stops_only_this_instances_units() {
         .map(|call| call.last().unwrap().as_str())
         .collect();
     assert_eq!(touched, BTreeSet::from([main.as_str()]));
-    assert!(calls.iter().any(|call| call[0] == "kill"));
+    assert!(calls.iter().any(|call| call[0] == "stop"));
     assert_eq!(fs::read_dir(&stale).unwrap().count(), 0);
     drop(runner);
 }

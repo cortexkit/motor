@@ -5,13 +5,24 @@
 //! `../<sibling>` path dependencies, and the JavaScript install of a new
 //! snapshot, whose local dependencies may name P absolutely.
 //!
-//! Each helper runs as the daemon's own account in a private mount namespace.
-//! The parent directory of every mounted path is replaced by an empty
-//! read-only tmpfs, and only the declared paths are bound into it, so the
-//! helper sees the same tree at P that a job will see and cannot read the host
-//! checkout at P at all. Directories the helper itself needs (the runner
-//! state, Cargo and rustup homes, the executables on PATH) stay visible at
-//! their own paths.
+//! Each helper runs with the runner's own identity: the unit's user and group
+//! are the daemon's effective uid and gid (`--uid`/`--gid`), the identity
+//! with which the in-place Cargo prefetch and JavaScript install run today,
+//! as plain children of the daemon. systemd gives the unit that user's
+//! supplementary groups from the account database. Only the mount namespace
+//! differs: the parent directory of every mounted path is replaced by an
+//! empty read-only tmpfs, and only the declared paths are bound into it, so
+//! the helper sees the same tree at P that a job will see and cannot read
+//! the host checkout at P at all. Directories the helper itself needs (the
+//! runner state, Cargo and rustup homes, the executables on PATH) stay
+//! visible at their own paths.
+//!
+//! A helper succeeds only when systemd reports that the unit's main process
+//! exited with status 0 and the unit's result is `success`. The result alone
+//! is not enough: systemd counts a main process killed by SIGTERM during a
+//! stop as a clean end, so a helper stopped from outside, for example by
+//! the startup cleanup of a restarted runner, would otherwise pass as
+//! successful.
 //!
 //! Each helper unit has its own time limit (`RuntimeMaxSec`), and stopping it
 //! kills its whole cgroup, ending with SIGKILL for processes that ignore
@@ -44,24 +55,30 @@ pub(crate) type Launcher = std::sync::Arc<dyn Fn(&[String]) -> io::Result<Output
 pub(crate) const UNIT_PREFIX: &str = "motor-snaphelper-";
 
 /// Directory under the instance state that holds each running helper's
-/// environment file.
+/// environment file and the file its output goes to.
 const ENVIRONMENT_DIRECTORY: &str = "snapshot-helpers";
 
 /// How long systemd waits after SIGTERM before it sends SIGKILL to whatever
 /// is left in a stopping helper's cgroup.
 const STOP_TIMEOUT: &str = "2s";
 
-/// How much longer than a helper's own limit the daemon waits for
-/// `systemd-run` to return before it stops the unit itself. systemd enforces
-/// the limit; this only covers a `systemd-run` that never returns.
+/// How much longer than a helper's own limit the daemon waits for its main
+/// process to end before it stops the unit itself. systemd enforces the
+/// limit; this only covers a unit whose limit somehow did not fire.
+const END_GRACE: Duration = Duration::from_secs(30);
+
+/// How long `systemd-run` may take to start a helper unit.
 #[cfg(target_os = "linux")]
-const LAUNCH_GRACE: Duration = Duration::from_secs(30);
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long after asking systemd to stop a helper the runner sends SIGKILL
+/// to its cgroup itself. systemd escalates to SIGKILL after `STOP_TIMEOUT`.
+const KILL_AFTER: Duration = Duration::from_secs(4);
 
 /// How long setup waits for a stopped helper unit to become inactive.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Captured diagnostics are cut to this many bytes.
-#[cfg(target_os = "linux")]
 const DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 /// What a helper unit runs. Each kind has its own configured time limit.
@@ -271,9 +288,13 @@ pub(crate) fn belongs_to(instance: &str, unit: &str) -> bool {
 }
 
 /// Runs `command` in a helper unit with the mount namespace `view`, and
-/// returns once the unit is no longer active. Fails when the command fails,
-/// when the unit exceeds `limit`, and when the unit cannot be confirmed
-/// inactive; a time-out names the helper and its limit.
+/// returns once the unit is no longer active. Succeeds only when systemd
+/// reports that the unit's main process exited with status 0 and the unit's
+/// result is `success`. A main process killed by a signal, including the
+/// SIGTERM of a stop from outside the helper (which systemd counts as a clean
+/// end of the unit), fails the helper. So does a unit that ran past `limit`,
+/// with an error naming the helper and its limit, and a unit that cannot be
+/// confirmed inactive.
 ///
 /// The unit gets the environment the command would get as a child of the
 /// daemon: the daemon's environment with the command's own changes applied.
@@ -289,75 +310,68 @@ pub(crate) fn run(
 ) -> io::Result<()> {
     let id = Uuid::now_v7();
     let unit = unit_name(&config.instance, id);
-    let environment = environment_path(config, id);
-    let arguments = write_environment(&environment, command)
-        .and_then(|()| arguments(config, &unit, limit, command, view, &environment));
+    let files = Files::new(config, id);
     let started = Instant::now();
-    let launched = arguments.and_then(|arguments| {
-        crate::setup_log::phase(helper.label(), || launch(config, &arguments, limit))
-    });
+    let observed = files
+        .create(command)
+        .and_then(|()| arguments(config, &unit, limit, command, view, &files))
+        .and_then(|arguments| {
+            crate::setup_log::phase(helper.label(), || {
+                start(config, &arguments)?;
+                observe(config, &unit, limit + END_GRACE)
+            })
+        });
     // Whatever happened above, the unit must be inactive before setup
     // continues and releases anything the helper was using.
-    let ended = settle(config, &unit);
-    if let Err(error) = fs::remove_file(&environment) {
-        if error.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %environment.display(), %error, "cannot remove snapshot helper environment");
-        }
-    }
-    let ended = ended.map_err(|error| {
+    let settled = settle(config, &unit);
+    let output = files.output();
+    files.remove();
+    let settled = settled.map_err(|error| {
         io::Error::other(format!(
             "{} helper unit {unit} could not be confirmed stopped: {error}",
             helper.label()
         ))
     })?;
-    let timed_out = || {
+    let observed = observed.map_err(|error| {
         io::Error::new(
+            error.kind(),
+            format!("{} helper unit {unit}: {error}{output}", helper.label()),
+        )
+    })?;
+    match classify(&observed, started.elapsed(), limit) {
+        Verdict::Succeeded => {
+            if settled
+                .result
+                .as_deref()
+                .is_some_and(|result| result != "success")
+            {
+                tracing::warn!(
+                    unit,
+                    result = settled.result.as_deref().unwrap_or_default(),
+                    "snapshot helper succeeded, but systemd had to kill processes it left behind"
+                );
+            }
+            Ok(())
+        }
+        Verdict::TimedOut => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "{} helper unit {unit} exceeded its time limit of {} s ({}); systemd stopped it \
-                 and every process it started",
+                 and every process it started{output}",
                 helper.label(),
                 limit.as_secs_f64(),
                 helper.setting()
             ),
-        )
-    };
-    // systemd also reports Result=timeout when processes left behind by a
-    // main process that exited ignore SIGTERM and need SIGKILL. Only a unit
-    // that ran for its whole limit ran out of time.
-    let ran_out = ended.result.as_deref() == Some("timeout") && started.elapsed() >= limit;
-    match launched {
-        _ if ran_out => Err(timed_out()),
-        Ok(Launched::DeadlineExpired) => Err(timed_out()),
-        Ok(Launched::Exited(output)) if output.status.success() => Ok(()),
-        Ok(Launched::Exited(_)) if ended.main_succeeded => {
-            tracing::warn!(
-                unit,
-                result = ended.result.as_deref().unwrap_or_default(),
-                "snapshot helper succeeded, but systemd had to kill processes it left behind"
-            );
-            Ok(())
-        }
-        Ok(Launched::Exited(output)) => Err(io::Error::other(format!(
-            "{} helper unit {unit} failed ({}{}): {}",
-            helper.label(),
-            output.status,
-            ended
-                .result
-                .as_deref()
-                .map(|result| format!(", result {result}"))
-                .unwrap_or_default(),
-            String::from_utf8_lossy(&output.stderr)
-        ))),
-        Err(error) => Err(io::Error::new(
-            error.kind(),
-            format!("{} helper unit {unit}: {error}", helper.label()),
         )),
+        Verdict::Failed(reason) => Err(io::Error::other(format!(
+            "{} helper unit {unit} failed: {reason}{output}",
+            helper.label()
+        ))),
     }
 }
 
 /// Stops every helper unit this runner instance left behind, for example
-/// when it was killed during a setup, and removes their environment files.
+/// when it was killed during a setup, and removes their files.
 /// Units of other instances on the same host are left alone, even when their
 /// instance name starts with this one's.
 pub(crate) fn stop_stale(config: &Config) -> io::Result<()> {
@@ -403,11 +417,64 @@ pub(crate) fn stop_stale(config: &Config) -> io::Result<()> {
     Ok(())
 }
 
-fn environment_path(config: &Config, id: Uuid) -> PathBuf {
-    config
-        .state_dir()
-        .join(ENVIRONMENT_DIRECTORY)
-        .join(format!("{id}.env"))
+/// A helper's private files under `<state>/snapshot-helpers`: its
+/// environment, and the file systemd appends its output to. Both belong to
+/// the daemon and are readable only by it.
+struct Files {
+    environment: PathBuf,
+    output: PathBuf,
+}
+
+impl Files {
+    fn new(config: &Config, id: Uuid) -> Self {
+        let directory = config.state_dir().join(ENVIRONMENT_DIRECTORY);
+        Self {
+            environment: directory.join(format!("{id}.env")),
+            output: directory.join(format!("{id}.log")),
+        }
+    }
+
+    fn create(&self, command: &Command) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        write_environment(&self.environment, command)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.output)?;
+        Ok(())
+    }
+
+    /// The end of the helper's output, as a suffix for an error message.
+    fn output(&self) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let read = || -> io::Result<Vec<u8>> {
+            let mut file = fs::File::open(&self.output)?;
+            let length = file.metadata()?.len();
+            file.seek(SeekFrom::Start(
+                length.saturating_sub(DIAGNOSTIC_BYTES as u64),
+            ))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        match read() {
+            Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+                format!("; output: {}", String::from_utf8_lossy(&bytes).trim())
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn remove(&self) {
+        for path in [&self.environment, &self.output] {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %error, "cannot remove snapshot helper file");
+                }
+            }
+        }
+    }
 }
 
 /// The environment a child of the daemon running `command` would get.
@@ -505,7 +572,7 @@ fn arguments(
     limit: Duration,
     command: &Command,
     view: &View,
-    environment_file: &Path,
+    files: &Files,
 ) -> io::Result<Vec<String>> {
     let program = program(command)?;
     let directory = command
@@ -525,11 +592,17 @@ fn arguments(
         view = view.keep(&directory, false);
     }
     view = view.keep(directory, true);
+    let output = files
+        .output
+        .to_str()
+        .ok_or_else(|| io::Error::other("non-UTF-8 helper output path"))?;
     let mut arguments = vec![
-        "--wait".to_string(),
-        "--pipe".into(),
-        "--quiet".into(),
+        "--quiet".to_string(),
         "--service-type=exec".into(),
+        // A main process that exits successfully leaves the unit active and
+        // loaded, so its exit can be read. Without this a successful unit
+        // is unloaded at once, like one that a stop killed.
+        "--property=RemainAfterExit=yes".into(),
         // Arguments are passed as they are; nothing in them is a variable.
         "--expand-environment=no".into(),
         format!("--unit={unit}"),
@@ -541,7 +614,9 @@ fn arguments(
             "--property=WorkingDirectory={}",
             word(&view.inside(directory))?
         ),
-        format!("--property=EnvironmentFile={}", word(environment_file)?),
+        format!("--property=EnvironmentFile={}", word(&files.environment)?),
+        format!("--property=StandardOutput=append:{output}"),
+        format!("--property=StandardError=append:{output}"),
         format!("--property=RuntimeMaxSec={}ms", limit.as_millis().max(1)),
         "--property=KillMode=control-group".into(),
         "--property=SendSIGKILL=yes".into(),
@@ -567,17 +642,112 @@ fn arguments(
     Ok(arguments)
 }
 
-enum Launched {
-    Exited(Output),
-    /// `systemd-run` had not returned well after the unit's own limit.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    DeadlineExpired,
+/// What `observe` saw of a helper unit.
+#[derive(Debug)]
+enum Observed {
+    /// The unit's main process has ended and systemd still holds the unit.
+    Ended(MainExit),
+    /// The unit was unloaded before its end could be read. Only a unit that
+    /// became inactive is unloaded, and a helper's own successful end keeps
+    /// it active, so the unit was stopped from outside the helper.
+    Gone,
+    /// The unit was still running well after its own limit.
+    Overran,
 }
 
-fn launch(config: &Config, arguments: &[String], limit: Duration) -> io::Result<Launched> {
+/// The unit properties that say how its main process ended.
+#[derive(Debug, Default)]
+struct MainExit {
+    /// systemd's `Result` for the unit.
+    result: Option<String>,
+    /// `ExecMainCode`: waitid's CLD_* code for the main process.
+    code: Option<i32>,
+    /// `ExecMainStatus`: the exit status, or the signal for CLD_KILLED and
+    /// CLD_DUMPED.
+    status: Option<i32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Succeeded,
+    TimedOut,
+    Failed(String),
+}
+
+/// Decides how a helper ended. Success needs the main process to have
+/// exited with status 0 and the unit's result to be `success`: systemd also
+/// reports `success` for a unit whose main process a stop killed with
+/// SIGTERM, so the result alone proves nothing.
+fn classify(observed: &Observed, elapsed: Duration, limit: Duration) -> Verdict {
+    let exit = match observed {
+        Observed::Overran => return Verdict::TimedOut,
+        Observed::Gone => {
+            return Verdict::Failed(
+                "the unit was stopped and unloaded from outside the helper before its main \
+                 process's exit could be read"
+                    .into(),
+            )
+        }
+        Observed::Ended(exit) => exit,
+    };
+    let result = exit.result.as_deref().unwrap_or("unknown");
+    // A stop from outside that needed SIGKILL also reports `timeout`; only a
+    // unit that ran for its whole limit ran out of time.
+    if result == "timeout" && elapsed >= limit {
+        return Verdict::TimedOut;
+    }
+    let main = match (exit.code, exit.status) {
+        (Some(libc::CLD_EXITED), Some(0)) if result == "success" => return Verdict::Succeeded,
+        (Some(libc::CLD_EXITED), Some(status)) => {
+            format!("its main process exited with status {status}")
+        }
+        (Some(libc::CLD_KILLED), Some(signal)) => {
+            format!(
+                "its main process was killed by signal {}",
+                signal_name(signal)
+            )
+        }
+        (Some(libc::CLD_DUMPED), Some(signal)) => format!(
+            "its main process dumped core on signal {}",
+            signal_name(signal)
+        ),
+        (code, status) => format!(
+            "its main process reported no exit (ExecMainCode={}, ExecMainStatus={})",
+            code.map(|code| code.to_string()).unwrap_or_default(),
+            status.map(|status| status.to_string()).unwrap_or_default()
+        ),
+    };
+    Verdict::Failed(format!("{main}; unit result {result}"))
+}
+
+/// `SIGTERM (15)` for the common signals, the number for the others.
+fn signal_name(signal: i32) -> String {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        _ => return signal.to_string(),
+    };
+    format!("{name} ({signal})")
+}
+
+/// Starts the helper unit. `systemd-run` returns once the main process has
+/// been started; `observe` then waits for it to end.
+fn start(config: &Config, arguments: &[String]) -> io::Result<()> {
     #[cfg(test)]
     if let Some(launcher) = &config.snapshot_helper_launcher {
-        return launcher(arguments).map(Launched::Exited);
+        return started(launcher(arguments)?);
     }
     let _ = config;
     #[cfg(target_os = "linux")]
@@ -593,17 +763,14 @@ fn launch(config: &Config, arguments: &[String], limit: Duration) -> io::Result<
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut captured = Vec::new();
-            let mut buffer = [0; 8192];
-            while let Ok(n) = stderr.read(&mut buffer) {
-                if n == 0 {
-                    break;
-                }
-                let room = DIAGNOSTIC_BYTES.saturating_sub(captured.len());
-                captured.extend_from_slice(&buffer[..n.min(room)]);
-            }
+            let _ = stderr
+                .by_ref()
+                .take(DIAGNOSTIC_BYTES as u64)
+                .read_to_end(&mut captured);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
             let _ = sender.send(captured);
         });
-        let deadline = Instant::now() + limit + LAUNCH_GRACE;
+        let deadline = Instant::now() + START_TIMEOUT;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -611,23 +778,25 @@ fn launch(config: &Config, arguments: &[String], limit: Duration) -> io::Result<
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Ok(Launched::DeadlineExpired);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("systemd-run did not start the unit within {START_TIMEOUT:?}"),
+                ));
             }
-            std::thread::park_timeout(Duration::from_millis(20));
+            std::thread::park_timeout(Duration::from_millis(10));
         };
-        // The unit has ended, so nothing holds the pipe open for long.
         let stderr = receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or_default();
-        Ok(Launched::Exited(Output {
+        started(Output {
             status,
             stdout: Vec::new(),
             stderr,
-        }))
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (arguments, limit);
+        let _ = arguments;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "snapshot helper units need an isolated Linux runner",
@@ -635,59 +804,118 @@ fn launch(config: &Config, arguments: &[String], limit: Duration) -> io::Result<
     }
 }
 
-/// How a helper unit ended, as far as systemd still knew when it was
-/// settled. A unit that ended cleanly may already be unloaded.
-#[derive(Default)]
-struct Ended {
-    /// systemd's `Result` for the unit.
-    result: Option<String>,
-    /// Whether the unit's main process exited with status 0.
-    main_succeeded: bool,
+fn started(output: Output) -> io::Result<()> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "systemd-run could not start it ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
-/// Waits until `unit` is inactive, stopping it and then killing its whole
-/// cgroup if it is still running, and unloads it if it failed.
-fn settle(config: &Config, unit: &str) -> io::Result<Ended> {
-    let deadline = Instant::now() + SETTLE_TIMEOUT;
-    let mut stopping = false;
-    loop {
-        let output = crate::backend::systemctl(
-            config,
-            &[
-                "show",
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--property=Result",
-                "--property=ExecMainCode",
-                "--property=ExecMainStatus",
-                unit,
-            ],
-        )?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "inspect {unit}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let property = |name: &str| {
-            text.lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-                .map(str::to_string)
-        };
-        let load = property("LoadState");
-        let active = property("ActiveState");
-        if load.as_deref() == Some("not-found") {
-            return Ok(Ended::default());
-        }
-        // ExecMainCode holds waitid's CLD_* code: CLD_EXITED for an exit.
-        let ended = Ended {
+/// The unit properties `observe` and `settle` read.
+struct UnitState {
+    load: Option<String>,
+    active: Option<String>,
+    sub: Option<String>,
+    exit: MainExit,
+}
+
+fn unit_state(config: &Config, unit: &str) -> io::Result<UnitState> {
+    let output = crate::backend::systemctl(
+        config,
+        &[
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+            unit,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "inspect {unit}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let property = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    let number = |name: &str| property(name).and_then(|value| value.parse().ok());
+    Ok(UnitState {
+        load: property("LoadState"),
+        active: property("ActiveState"),
+        sub: property("SubState"),
+        exit: MainExit {
             result: property("Result"),
-            main_succeeded: property("ExecMainCode") == Some(libc::CLD_EXITED.to_string())
-                && property("ExecMainStatus").as_deref() == Some("0"),
-        };
-        match active.as_deref() {
-            Some("inactive") => return Ok(ended),
+            code: number("ExecMainCode"),
+            status: number("ExecMainStatus"),
+        },
+    })
+}
+
+/// Waits until the unit's main process has ended, or until `deadline` after
+/// the start. Units run with `RemainAfterExit=yes`, so after a main process
+/// that exited successfully the unit stays loaded and active, in the
+/// `exited` state, and its exit can be read; anything the main process left
+/// running stays in its cgroup until `settle` stops the unit.
+fn observe(config: &Config, unit: &str, deadline: Duration) -> io::Result<Observed> {
+    let deadline = Instant::now() + deadline;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        let state = unit_state(config, unit)?;
+        if state.load.as_deref() == Some("not-found") {
+            return Ok(Observed::Gone);
+        }
+        match (state.active.as_deref(), state.sub.as_deref()) {
+            (Some("active"), Some("exited")) | (Some("failed" | "inactive"), _) => {
+                return Ok(Observed::Ended(state.exit))
+            }
+            (None, _) => return Err(io::Error::other(format!("inspect {unit}: no ActiveState"))),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Ok(Observed::Overran);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(250));
+    }
+}
+
+/// How a helper unit was left once it was inactive.
+struct Settled {
+    /// systemd's `Result` for the unit, unless it was already unloaded.
+    result: Option<String>,
+}
+
+/// Waits until `unit` is inactive, and unloads it if it failed. A unit still
+/// active is stopped, which sends SIGTERM to its whole cgroup and SIGKILL
+/// after `STOP_TIMEOUT`; if it is still not inactive a little later, the
+/// runner sends SIGKILL to the cgroup itself.
+fn settle(config: &Config, unit: &str) -> io::Result<Settled> {
+    let started = Instant::now();
+    let mut stopped = false;
+    let mut killed = false;
+    loop {
+        let state = unit_state(config, unit)?;
+        if state.load.as_deref() == Some("not-found") {
+            return Ok(Settled { result: None });
+        }
+        match state.active.as_deref() {
+            Some("inactive") => {
+                return Ok(Settled {
+                    result: state.exit.result,
+                })
+            }
             Some("failed") => {
                 let reset = crate::backend::systemctl(config, &["reset-failed", unit])?;
                 if !reset.status.success()
@@ -695,30 +923,35 @@ fn settle(config: &Config, unit: &str) -> io::Result<Ended> {
                 {
                     tracing::warn!(unit, stderr = %String::from_utf8_lossy(&reset.stderr), "cannot unload failed snapshot helper");
                 }
-                return Ok(ended);
+                return Ok(Settled {
+                    result: state.exit.result,
+                });
             }
             Some(_) => {}
             None => return Err(io::Error::other(format!("inspect {unit}: no ActiveState"))),
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= SETTLE_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
                     "{unit} is still {} after {SETTLE_TIMEOUT:?}",
-                    active.unwrap_or_default()
+                    state.active.unwrap_or_default()
                 ),
             ));
         }
-        if !stopping {
-            stopping = true;
-            for args in [
-                ["stop", "--no-block", unit].as_slice(),
-                ["kill", "--kill-whom=all", "--signal=KILL", unit].as_slice(),
-            ] {
-                let output = crate::backend::systemctl(config, args)?;
-                if !output.status.success() {
-                    tracing::warn!(unit, stderr = %String::from_utf8_lossy(&output.stderr), "cannot stop snapshot helper");
-                }
+        let command: Option<&[&str]> = if !stopped {
+            stopped = true;
+            Some(&["stop", "--no-block", unit])
+        } else if !killed && started.elapsed() >= KILL_AFTER {
+            killed = true;
+            Some(&["kill", "--kill-whom=all", "--signal=KILL", unit])
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            let output = crate::backend::systemctl(config, command)?;
+            if !output.status.success() {
+                tracing::warn!(unit, stderr = %String::from_utf8_lossy(&output.stderr), "cannot stop snapshot helper");
             }
         }
         std::thread::sleep(Duration::from_millis(50));
