@@ -15,8 +15,9 @@
 //!
 //! Each helper unit has its own time limit (`RuntimeMaxSec`), and stopping it
 //! kills its whole cgroup, ending with SIGKILL for processes that ignore
-//! SIGTERM. Setup confirms the unit is no longer active before it returns,
-//! whether the helper succeeded, failed or ran out of time.
+//! SIGTERM. Before it returns, setup waits for the unit to become inactive,
+//! whether the helper succeeded, failed or ran out of time, and fails if it
+//! cannot confirm that state.
 //!
 //! Units are named `motor-snaphelper-<instance>-<uuid>.service`, outside the
 //! `motor-job-*` pattern that the runner lists as job units. Instance names
