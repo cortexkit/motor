@@ -2039,10 +2039,11 @@ impl Runner {
             None
         };
         self.long_work("admission_record");
-        // Taken before the state lock, as cancel, withdraw, refuse and attach
-        // take it, so none of them writes its own record for this ID while
-        // this admission's record is being saved below. A duplicate Run for
-        // this ID also waits here, and then finds the job.
+        // This job's `log.write` lock, taken before the state lock. Cancel,
+        // withdraw, refuse and attach take the same lock before writing the
+        // job's record, so none of them writes one for this ID while this
+        // admission's record is being saved below. A duplicate Run for this
+        // ID also waits here, and then finds the job.
         let log = self.job_log(request.job_id);
         let _write = log.write.lock().unwrap();
         let mut inner = self.core.inner.lock().unwrap();
@@ -2433,8 +2434,9 @@ impl Runner {
                 )
             })
             .and_then(|()| trees.import_dependencies(directory, &request.git_dependencies));
-        // Legacy clients may name an unmerged job branch; only opted-in tips
-        // may queue cache fills. What that needs from the mirror is read here,
+        // Legacy clients may name an unmerged job branch, so only a tip the
+        // client marks as the default branch's (`default_branch_tip`) may
+        // queue a cache fill. What that needs from the mirror is read here,
         // before the state lock is taken: each read runs git.
         let plan = (default_branch_tip
             && fetched.is_ok()

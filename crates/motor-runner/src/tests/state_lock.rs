@@ -778,8 +778,8 @@ fn maintenance_catalog_save_holds_no_lock() {
 }
 
 /// A workspace prepare writes the catalog without the state lock, and keeps
-/// its workspace reserved until the catalog record, which drop and retention
-/// delete the workspace by, is durable.
+/// its workspace reserved until the workspace's catalog entry is durable:
+/// drop and retention find the workspaces they delete through those entries.
 #[test]
 fn prepare_catalog_save_holds_no_lock_and_keeps_the_reservation() {
     let f = SaveFixture::new("catalog_save");
