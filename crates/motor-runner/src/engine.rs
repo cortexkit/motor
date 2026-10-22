@@ -618,7 +618,7 @@ struct Core {
     config: Config,
     backend: Box<dyn Backend>,
     trees: Trees,
-    inner: Mutex<Inner>,
+    inner: crate::state_lock::StateLock<Inner>,
     job_logs: Mutex<BTreeMap<Uuid, Arc<JobLog>>>,
     /// Ref mutations acquire this before the state lock, which is released
     /// before Git runs. Keep pinning and ownership publication in one turn.
@@ -653,6 +653,12 @@ struct JobLog {
     /// Output commits take it through `write_for_output` and cancellation
     /// through `write_ahead_of_output`; other callers lock it directly.
     write: Mutex<()>,
+    /// Held by a cancel or kill retry from its last check that finalization
+    /// is not claimed until its unit query and stop have been issued, which
+    /// run without the state lock. Claiming finalization takes it first, so
+    /// a job being finalized is never signalled. Acquire after `write`, if
+    /// held, and never while holding the state lock.
+    signalling: Mutex<()>,
     /// How many cancels are waiting for `write`. An output commit waits for
     /// this to reach zero before it takes `write`. Without that, a job whose
     /// output arrives faster than it can be committed keeps a cancel waiting
@@ -1300,7 +1306,7 @@ impl Runner {
                 config,
                 backend,
                 trees,
-                inner: Mutex::new(Inner {
+                inner: crate::state_lock::StateLock::new(Inner {
                     writer: None,
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
@@ -3115,16 +3121,24 @@ impl Runner {
                 drop(inner);
                 self.save(&updated)?;
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded");
+                let signalling = log.signalling.lock().unwrap();
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
                 if inner.finalizing.contains(&id) {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
                     return Ok(());
                 }
-                let job = &inner.jobs[&id];
+                let job = inner.jobs[&id].clone();
+                // Query and stop the unit without the state lock: each is a
+                // systemctl process, slow on a loaded host, and every other
+                // job's admission and status reply waits for that lock.
+                // `signalling` keeps finalization from being claimed
+                // meanwhile, so an exited job being finalized is never
+                // signalled.
+                drop(inner);
                 if job.process.is_none() || self.unit_alive(job.process)? == Some(false) {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
-                    drop(inner);
+                    drop(signalling);
                     drop(write);
                     return self.finish(
                         id,
@@ -3132,7 +3146,7 @@ impl Runner {
                     );
                 } else {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
-                    self.core.backend.cancel(&self.core.config, job, false)?;
+                    self.core.backend.cancel(&self.core.config, &job, false)?;
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel issued unit stop");
                 }
             } else {
@@ -3566,41 +3580,72 @@ impl Runner {
     /// ended. The record keeps the manifest and says the bytes expired; it is
     /// saved first, so a crash before the deletion leaves only bytes that
     /// startup recovery removes, never a record naming missing files. A job
-    /// being replayed keeps its bytes until a later pass.
-    fn expire_returned_files(&self, inner: &mut Inner) {
+    /// being replayed keeps its bytes until a later pass. Runs without the
+    /// state lock held, taking it only to choose and mark each job: the save
+    /// fsyncs and the deletion can unlink thousands of files.
+    fn expire_returned_files(&self) {
         let now = self.now();
-        let due: Vec<_> = inner
+        let due = |job: &Job| {
+            job.returned.as_ref().is_some_and(|r| !r.expired)
+                && job
+                    .finished_ms
+                    .is_some_and(|finished| now.saturating_sub(finished) >= RETURN_RETENTION_MS)
+        };
+        let candidates: Vec<_> = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
             .jobs
             .values()
-            .filter(|job| {
-                job.returned.as_ref().is_some_and(|r| !r.expired)
-                    && job
-                        .finished_ms
-                        .is_some_and(|finished| now.saturating_sub(finished) >= RETURN_RETENTION_MS)
-            })
+            .filter(|job| due(job))
             .map(|job| job.id)
             .collect();
-        for id in due {
+        for id in candidates {
             let log = self.job_log(id);
+            // Every writer of a finished job's record holds this lock, so the
+            // record cannot change between the mark below and its save.
             let Ok(_write) = log.write.try_lock() else {
                 continue;
             };
-            if log.retention.lock().unwrap().readers != 0 {
-                continue;
-            }
-            let mut job = inner.jobs[&id].clone();
-            let returned = job.returned.as_mut().unwrap();
-            returned.expired = true;
-            let directory = self
-                .record_path(id)
-                .parent()
-                .unwrap()
-                .join(&returned.directory);
+            let (job, directory) = {
+                let mut inner = self.core.inner.lock().unwrap();
+                // Replays lease files under the state lock and skip returned
+                // files marked expired, so once this check and the mark are
+                // made under it, no reader can name the bytes being deleted.
+                if log.retention.lock().unwrap().readers != 0 {
+                    continue;
+                }
+                let Some(job) = inner.jobs.get_mut(&id).filter(|job| due(job)) else {
+                    continue;
+                };
+                let returned = job.returned.as_mut().unwrap();
+                returned.expired = true;
+                let directory = self
+                    .record_path(id)
+                    .parent()
+                    .unwrap()
+                    .join(&returned.directory);
+                (job.clone(), directory)
+            };
             if let Err(error) = self.save(&job) {
                 tracing::warn!(%id, %error, "returned file expiry could not be saved; retrying later");
+                // The bytes are still there; let replays send them and a
+                // later pass retry the expiry.
+                if let Some(returned) = self
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .jobs
+                    .get_mut(&id)
+                    .and_then(|job| job.returned.as_mut())
+                {
+                    returned.expired = false;
+                }
                 continue;
             }
-            inner.jobs.insert(id, job);
+            self.long_work("returned_files_remove");
             match fs::remove_dir_all(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3616,6 +3661,44 @@ impl Runner {
         if self.core.config.windows_instance() {
             self.core.config.windows_runtime.retry_cleanups();
         }
+        let mut set_aside = Vec::new();
+        let maintained = self.maintain_state(&mut set_aside);
+        // Expired job directories were moved aside under the state lock;
+        // unlinking their output and returned files can take seconds on a
+        // busy disk, so it happens here, with the lock released. Startup
+        // deletes whatever a crash leaves in the trash directory.
+        for directory in set_aside {
+            self.long_work("expired_job_remove");
+            if let Err(error) = fs::remove_dir_all(&directory) {
+                tracing::warn!(path = %directory.display(), %error, "expired job files could not be deleted; startup retries");
+            }
+        }
+        self.expire_returned_files();
+        if !maintained? {
+            return Ok(());
+        }
+        self.prune_refs()?;
+        self.retire_unused_repositories()
+    }
+    /// Move an expired job's directory into the trash directory, so the
+    /// caller can delete it after releasing the state lock. Only directories
+    /// are moved; for anything else this fails and `maintain_state` tries to
+    /// delete the path in place, which refuses a non-directory as before.
+    fn set_aside_job_directory(&self, id: Uuid, directory: &Path) -> io::Result<PathBuf> {
+        if !directory.symlink_metadata()?.is_dir() {
+            return Err(io::Error::other("expired job path is not a directory"));
+        }
+        fs::create_dir_all(self.trash())?;
+        let aside = self.trash().join(format!("job-{id}-{}", Uuid::now_v7()));
+        fs::rename(directory, &aside)?;
+        Ok(aside)
+    }
+    /// The part of `maintenance` that runs under the state lock. Returns
+    /// whether repository maintenance may follow (not while quarantined).
+    /// Expired job directories it moves aside are pushed to `set_aside` for
+    /// deletion once the lock is released; one that cannot be moved is
+    /// deleted in place, under the lock, as before.
+    fn maintain_state(&self, set_aside: &mut Vec<PathBuf>) -> io::Result<bool> {
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
         let expired: Vec<_> = inner
@@ -3636,7 +3719,18 @@ impl Runner {
             if log.retention.lock().unwrap().readers != 0 {
                 continue;
             }
-            match fs::remove_dir_all(self.record_path(id).parent().unwrap()) {
+            // Once the record leaves `jobs` under this lock, no replay can
+            // lease the directory's files, so the deletion may run later.
+            // Where the directory cannot be moved aside, delete it here.
+            let directory = self.record_path(id).parent().unwrap().to_owned();
+            let removed = match self.set_aside_job_directory(id, &directory) {
+                Ok(aside) => {
+                    set_aside.push(aside);
+                    Ok(())
+                }
+                Err(_) => fs::remove_dir_all(&directory),
+            };
+            match removed {
                 Ok(()) => {
                     inner.jobs.remove(&id);
                     self.core.repository_usage.lock().unwrap().remove(id);
@@ -3646,14 +3740,13 @@ impl Runner {
                 }
             }
         }
-        self.expire_returned_files(&mut inner);
         self.core.job_logs.lock().unwrap().retain(|id, log| {
             inner.jobs.contains_key(id)
                 || inner.pending_replays.contains(id)
                 || Arc::strong_count(log) > 1
         });
         if !self.core.quarantined.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let idle: Vec<_> = inner
             .catalog
@@ -3737,9 +3830,7 @@ impl Runner {
             active_transfers.contains(id) || self.now().saturating_sub(t.finished_ms) < RETENTION_MS
         });
         self.catalog(&inner)?;
-        drop(inner);
-        self.prune_refs()?;
-        self.retire_unused_repositories()
+        Ok(true)
     }
 
     /// Check the mirrors a failed bundle fetch targeted and remove refs git
@@ -4031,6 +4122,7 @@ impl Runner {
             let Ok(_write) = log.write.try_lock() else {
                 continue;
             };
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             let Some(job) = inner
                 .jobs
@@ -4070,43 +4162,54 @@ impl Runner {
                 continue;
             }
             let job = inner.jobs[&id].clone();
-            let Some((_, killed_at)) = job.kill.as_ref() else {
+            let Some((_, killed_at)) = job.kill else {
                 continue;
             };
-            let retry = inner.kill_retries.entry(id).or_insert((0, instant));
-            if instant < retry.1 {
+            let (attempts, due) = *inner.kill_retries.entry(id).or_insert((0, instant));
+            if instant < due {
                 continue;
             }
-            let gone = match self.unit_alive(job.process) {
-                Ok(alive) => job.process.is_none() || alive == Some(false),
+            // Query and signal the unit without the state lock: each is a
+            // systemctl process, slow on a loaded host, and every admission,
+            // status reply and cancel waits for that lock. `_signalling`
+            // keeps finalization from being claimed meanwhile, and `_write`
+            // keeps any other pass from retrying this job, so the retry state
+            // read above is still this job's when it is written back below.
+            drop(inner);
+            let next = match self.unit_alive(job.process) {
                 Err(error) => {
                     tracing::warn!(job_id = %id, %error, "cannot inspect cancelled unit; retrying");
-                    retry.1 = instant + Duration::from_secs(5);
-                    continue;
+                    (attempts, instant + Duration::from_secs(5))
+                }
+                Ok(alive) if job.process.is_none() || alive == Some(false) => {
+                    let runner = self.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = runner
+                            .finish(id, Err(io::Error::other("cancelled unit already exited")))
+                        {
+                            tracing::error!(%id, %error, "terminal bookkeeping failed");
+                        }
+                    });
+                    (attempts, instant + Duration::from_secs(5))
+                }
+                Ok(_) => {
+                    let hard = now.saturating_sub(killed_at) >= 2000;
+                    if hard && attempts < 3 {
+                        self.core.backend.cancel(&self.core.config, &job, true)?;
+                        (
+                            attempts + 1,
+                            instant + Duration::from_millis(500 * (1 << (attempts + 1))),
+                        )
+                    } else if !hard && attempts == 0 {
+                        self.core.backend.cancel(&self.core.config, &job, false)?;
+                        (attempts, instant + Duration::from_secs(2))
+                    } else {
+                        (attempts, instant + Duration::from_secs(5))
+                    }
                 }
             };
-            if gone {
-                retry.1 = instant + Duration::from_secs(5);
-                let runner = self.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) =
-                        runner.finish(id, Err(io::Error::other("cancelled unit already exited")))
-                    {
-                        tracing::error!(%id, %error, "terminal bookkeeping failed");
-                    }
-                });
-                continue;
-            }
-            let hard = now.saturating_sub(*killed_at) >= 2000;
-            if hard && retry.0 < 3 {
-                self.core.backend.cancel(&self.core.config, &job, true)?;
-                retry.0 += 1;
-                retry.1 = instant + Duration::from_millis(500 * (1 << retry.0));
-            } else if !hard && retry.0 == 0 {
-                self.core.backend.cancel(&self.core.config, &job, false)?;
-                retry.1 = instant + Duration::from_secs(2);
-            } else {
-                retry.1 = instant + Duration::from_secs(5);
+            if let Some(retry) = self.core.inner.lock().unwrap().kill_retries.get_mut(&id) {
+                *retry = next;
             }
         }
         Ok(())
@@ -4120,6 +4223,17 @@ impl Runner {
         if now.saturating_sub(inner.maintained_ms) >= 60_000 {
             inner.maintained_ms = now;
             drop(inner);
+            // Production logs at info level, so the per-hold debug events of
+            // `StateLock` are not written; one line a minute names the
+            // longest holder whenever any hold was slow.
+            if let Some(longest) = self.core.inner.take_longest() {
+                tracing::info!(
+                    site = %longest.site,
+                    held_ms = longest.held.as_millis() as u64,
+                    slow_holds = longest.slow_holds,
+                    "longest state lock hold since the previous report"
+                );
+            }
             self.maintenance()?;
             inner = self.core.inner.lock().unwrap();
         }
@@ -4967,6 +5081,9 @@ impl Runner {
         // it, as the normal finish path does.
         let _ = self.core.backend.oom_stopped(&self.core.config, process);
         let mut finished = {
+            // As in `finish_execution`: wait out a stop signalling this unit.
+            let log = self.job_log(id);
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
                 return Ok(());
@@ -5222,6 +5339,11 @@ impl Runner {
         // workspace until the terminal is committed.
         let finish_started = std::time::Instant::now();
         let job = {
+            // Wait out a cancel or deadline stop that is querying or
+            // signalling the unit without the state lock (see
+            // `JobLog::signalling`) before claiming finalization.
+            let log = self.job_log(id);
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
                 return Ok(());

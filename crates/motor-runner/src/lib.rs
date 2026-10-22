@@ -23,6 +23,7 @@ mod return_paths;
 mod server;
 mod setup_log;
 mod spool;
+mod state_lock;
 mod storage;
 #[cfg(any(target_os = "linux", test))]
 mod systemd;
