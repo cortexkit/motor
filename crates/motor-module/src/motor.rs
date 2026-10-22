@@ -441,6 +441,13 @@ impl Motor {
         if self.hosted_state(id).is_some() {
             tracing::warn!(job_id = %id, step = "refused_before_start", ?reason,
                 cause = detail.as_deref().unwrap_or("no refusal detail"), "hosted job stopped");
+            if self
+                .hosted_state(id)
+                .is_some_and(|state| state.spill_wait_ms.is_some())
+            {
+                tracing::info!(job_id = %id, outcome = "refused", ?reason,
+                    cause = detail.as_deref().unwrap_or("no refusal detail"), "spill outcome");
+            }
         }
         let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
             .with_ran(Ran::None);
@@ -792,12 +799,22 @@ impl Motor {
                         return Ok(true);
                     }
                     Err(error) => {
+                        if spilled && matches!(error, crate::hosted::Error::Provisioning(_)) {
+                            let waited_ms = u64::try_from(spill_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            tracing::info!(job_id = %id, outcome = "provisioning_budget_exhausted",
+                                waited_ms, "spill provisioning budget exhausted");
+                        }
                         // The hosted client never sends a Run frame, so this
                         // failure proves the job did not start anywhere. A
-                        // closed account may not run anywhere, so its refusal
-                        // never sends a spilled job back to the build server.
-                        if error != crate::hosted::Error::AccountClosed
-                            && self.return_spill(id, error.code(), spill_started).await?
+                        // closed account or a deliberately rejected request
+                        // must still stay final rather than bypass the refusal.
+                        if !matches!(
+                            error,
+                            crate::hosted::Error::AccountClosed
+                                | crate::hosted::Error::Rejected
+                                | crate::hosted::Error::Platform
+                        ) && self.return_spill(id, error.code(), spill_started).await?
                         {
                             return Ok(true);
                         }
@@ -1136,6 +1153,9 @@ impl Motor {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
                 if hosted {
                     tracing::info!(job_id = %id, step = "admission", cause = "runner accepted Run", "hosted Run accepted");
+                    if spilled {
+                        tracing::info!(job_id = %id, outcome = "placed", "spill outcome");
+                    }
                 }
                 // Older runners may accept the job but ignore its network request.
                 // Cancel before uploading, rather than silently running it offline.
@@ -1417,7 +1437,7 @@ impl Motor {
                 .hosted_state(id)
                 .is_some_and(|route| route.spill_wait_ms.is_some())
             {
-                tracing::info!(job_id = %id, cause,
+                tracing::info!(job_id = %id, outcome = "reattaching", cause,
                     "spilled job's Run frame may have reached its hosted runner; reattaching, not resubmitting");
             }
             return Ok(false);
@@ -1449,6 +1469,7 @@ impl Motor {
             job_id = %id,
             build_server_job_id = %build_server_id,
             broker_code = cause,
+            outcome = "returned_to_build_server",
             spill_ms,
             "spill not placed; resubmitted to build server"
         );
