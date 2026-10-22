@@ -404,6 +404,8 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
     let _release = Release(hold.clone());
     hold.arm();
     let mut config = f.config();
+    // Dispatch explicitly so a scheduler tick cannot race the cleanup lock probe.
+    config.manual_tick = true;
     config.disable_warm_builds = true;
     config.isolate_jobs = isolated;
     config.long_work = Some(hold.hook());
@@ -430,6 +432,7 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
     .unwrap();
     let (request, bytes) = f.run("sleep 60");
     f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
     reached(&hold).await;
     {
         let inner = runner
