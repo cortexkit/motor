@@ -97,7 +97,7 @@ impl Metadata {
     /// they were last known whole: the metadata names a boot other than
     /// `boot`, the current one. When the current boot is unknown nothing can
     /// be told, and the snapshot is trusted as before.
-    fn from_an_earlier_boot(&self, boot: Option<&str>) -> bool {
+    fn predates_boot(&self, boot: Option<&str>) -> bool {
         boot.is_some_and(|boot| self.boot_id.as_deref() != Some(boot))
     }
 
@@ -256,7 +256,7 @@ impl SnapshotStore {
         self.with_key_lock(&directory, || {
             match existing(key, &directory)? {
                 Existing::Ready(metadata) if metadata.tree_hash == tree_hash => {
-                    if metadata.from_an_earlier_boot(boot.as_deref()) {
+                    if metadata.predates_boot(boot.as_deref()) {
                         // The first use since the host restarted: the files
                         // may not have reached the disk before it went down.
                         match verify_after_reboot(trees, key, &metadata, &directory) {
@@ -568,7 +568,7 @@ fn ready_snapshots(key: &SnapshotKey, parent: &Path, boot: Option<&str>) -> Vec<
             (found.is_dir()
                 && metadata.version == METADATA_VERSION
                 && metadata.repository == key.repository
-                && !metadata.from_an_earlier_boot(boot))
+                && !metadata.predates_boot(boot))
             .then_some((found.modified().ok()?, path))
         })
         .collect();
