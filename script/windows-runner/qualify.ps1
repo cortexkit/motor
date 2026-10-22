@@ -14,6 +14,7 @@ $config = @('--instance','ally','--state-root',"$Root\state",'--backend','window
 function Runner-Check([string]$Operation) {
     Write-Host "RUN $Operation started_utc=$([DateTime]::UtcNow.ToString('o'))"
     $process = Start-SpikeNativeProcess $exe (@($Operation) + $config)
+    Write-Host "WAIT $Operation process_exit timeout_seconds=180"
     $finished = $process.process.WaitForExit(180000)
     if (-not $finished) {
         try { $process.process.Kill() } catch { }
