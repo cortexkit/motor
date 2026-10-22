@@ -7,10 +7,14 @@ Tests use cortexkit_test_support::scratch_root(), the published fenced helper;
 its OS-root derivation lives outside this repository and needs no exemption.
 Untracked Rust files are checked too, so adding a suite cannot bypass the gate.
 """
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Python 3.11 or newer is required; run: python3.11 scripts/test-scratch.py")
+
 from pathlib import Path
 import re
 import runpy
-import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 # The motor census reads 58 non-symlink crates/**/*.rs files with the loop below.

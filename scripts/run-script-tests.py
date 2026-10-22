@@ -44,6 +44,7 @@ TEST_FILES = [
     "script/windows-runner/test_install_script.py",
     "script/hyperv-spike/test_seed.py",
     "script/hyperv-spike/test_account_serial.py",
+    "scripts/tests/test_python_version.py",
     "scripts/tests/test_safety_fences.py",
     "scripts/tests/test_test_binary_fold.py",
     "scripts/tests/test_unreachable_modules.py",

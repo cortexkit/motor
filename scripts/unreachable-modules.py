@@ -27,9 +27,13 @@ Requires Python 3.11 or newer for standard-library TOML parsing.
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Python 3.11 or newer is required; run: python3.11 scripts/unreachable-modules.py")
+
 import re
 import subprocess
-import sys
 import tomllib
 from collections import defaultdict, deque
 from dataclasses import dataclass

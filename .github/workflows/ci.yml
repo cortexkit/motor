@@ -84,6 +84,23 @@ jobs:
         run: python3 scripts/mixed-version.py
       - name: Protocol vectors
         run: python3 crates/motor-protocol/tests/generate_vectors.py --check
+
+  python-safety:
+    name: Python safety
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Motor safety gates and self-tests
         run: |
           python3 scripts/test-binary-fold.py
@@ -92,3 +109,14 @@ jobs:
           python3 scripts/test-scratch.py
           python3 scripts/subc-daemon-env.py
           python3 scripts/run-script-tests.py
+
+  ci-success:
+    name: CI success
+    runs-on: ubuntu-24.04
+    needs: [linux-ordinary, python-safety]
+    if: ${{ always() }}
+    steps:
+      - name: Both jobs succeeded
+        run: |
+          test "${{ needs.linux-ordinary.result }}" = success
+          test "${{ needs.python-safety.result }}" = success
