@@ -296,3 +296,65 @@ async fn a_closed_forward_is_a_connect_failure_at_the_lease_hello() {
         })
     );
 }
+
+/// A journal on a full disk, as the endpoint's journal was when the runner
+/// filled the sandbox's disk.
+struct FullDisk;
+impl motor_host::journal::Journal for FullDisk {
+    fn store(&mut self, _: &motor_host::state::Snapshot) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
+/// An endpoint that cannot record the lease answers with `storage_full`
+/// instead of closing the connection. ck-motor then reports the host's
+/// reason, where before it logged `hosted_connect_failed` with an empty
+/// `host_reason`. Like a refusal from a full host, the endpoint never
+/// started the job, so ck-motor may place it on another host.
+#[tokio::test]
+async fn a_full_endpoint_journal_is_a_named_storage_full_refusal() {
+    let endpoint = Endpoint::new();
+    endpoint
+        .runtime
+        .host
+        .lock()
+        .unwrap()
+        .replace_journal(Box::new(FullDisk));
+    let requester = SigningKey::from_bytes(&[42; 32]);
+    let (_, lease) = endpoint.lease(&requester, 8, 13312);
+    let claims = tls::claims(
+        lease.job_id.parse().unwrap(),
+        &lease,
+        &requester,
+        Purpose::Run,
+    )
+    .unwrap();
+    let listener = sandbox::bind(0).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let runtime = endpoint.runtime.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        serve(runtime, socket).await
+    });
+    let pipe = tokio::net::TcpStream::connect(address).await.unwrap();
+    let failure = tls::authenticate(Box::new(pipe), &lease, &requester, &claims)
+        .await
+        .err();
+    assert_eq!(
+        failure,
+        Some(tls::ConnectFailure {
+            error: Error::StorageFull,
+            step: "lease_ok",
+            host_reason: Some("storage_full".into()),
+        })
+    );
+    assert!(
+        server.await.unwrap().is_err(),
+        "the endpoint logs the close"
+    );
+    assert_eq!(Error::StorageFull.code(), "hosted_storage_full");
+    assert_eq!(
+        Error::StorageFull.reason(),
+        motor_protocol::RefusalReason::RunnerFull
+    );
+}

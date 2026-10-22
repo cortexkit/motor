@@ -164,6 +164,10 @@ pub(crate) enum Error {
     /// never retried, never sent back to the build server, never run locally.
     AccountClosed,
     InternalFailure,
+    /// The host refused the lease because its disk is full. It recorded
+    /// nothing and no runner saw the job, so this attempt never started it
+    /// and the job may be placed elsewhere.
+    StorageFull,
     Connect,
     Broker,
     NoTimeout,
@@ -218,6 +222,7 @@ impl Error {
             Self::NoHostFits(_) => "hosted_no_host_fits",
             Self::AccountClosed => "hosted_account_closed",
             Self::InternalFailure => "hosted_internal_failure",
+            Self::StorageFull => "hosted_storage_full",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
             Self::NoTimeout => "hosted_no_timeout",
@@ -247,7 +252,9 @@ impl Error {
             | Self::AccountAuthRequired
             | Self::AccountPermanent
             | Self::AccountInvalid => RefusalReason::RunnerAuthenticationFailed,
-            Self::HostFull | Self::Capacity | Self::NoCapacity(_) => RefusalReason::RunnerFull,
+            Self::HostFull | Self::Capacity | Self::NoCapacity(_) | Self::StorageFull => {
+                RefusalReason::RunnerFull
+            }
             Self::Connect | Self::Broker | Self::AccountTransient(_) | Self::Provisioning(_) => {
                 RefusalReason::Unreachable
             }
@@ -283,13 +290,17 @@ impl Error {
         }
     }
     fn replaceable(self) -> bool {
-        matches!(self, Self::HostFull | Self::Capacity | Self::Connect)
+        matches!(
+            self,
+            Self::HostFull | Self::Capacity | Self::StorageFull | Self::Connect
+        )
     }
     fn from_host(reason: &str) -> Self {
         match reason {
             "host_full" => Self::HostFull,
             "capacity" => Self::Capacity,
             "internal_failure" => Self::InternalFailure,
+            "storage_full" => Self::StorageFull,
             "expired" => Self::Expired,
             _ => Self::Auth,
         }

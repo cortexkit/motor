@@ -82,6 +82,8 @@ pub enum Refusal {
     HostFull,
     Capacity,
     InternalFailure,
+    /// The host could not record the lease because its disk is full.
+    StorageFull,
 }
 impl Refusal {
     pub fn wire(self) -> &'static str {
@@ -91,6 +93,7 @@ impl Refusal {
             Self::HostFull => "host_full",
             Self::Capacity => "capacity",
             Self::InternalFailure => "internal_failure",
+            Self::StorageFull => "storage_full",
         }
     }
 }
@@ -114,6 +117,20 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// The refusal a requester receives when this error ends its admission.
+    /// A journal write that ran out of space is `storage_full`; any other
+    /// journal failure is `internal_failure`.
+    pub fn refusal(&self) -> Refusal {
+        match self {
+            Self::Refused(reason) => *reason,
+            Self::Journal(error) if error.kind() == io::ErrorKind::StorageFull => {
+                Refusal::StorageFull
+            }
+            Self::Journal(_) => Refusal::InternalFailure,
+        }
+    }
+}
 fn refuse<T>(r: Refusal) -> Result<T, Error> {
     Err(Error::Refused(r))
 }
@@ -194,6 +211,12 @@ impl Host {
             provider_managed: false,
             retention_due_ms: 0,
         }
+    }
+    /// Replaces the journal, so tests can make writes fail the way a full
+    /// disk does. Production never swaps the journal of a running host.
+    #[doc(hidden)]
+    pub fn replace_journal(&mut self, journal: Box<dyn Journal>) {
+        self.journal = journal;
     }
     pub(crate) fn sandbox(ceiling: u32, snapshot: Snapshot, journal: Box<dyn Journal>) -> Self {
         let mut host = Self::new(

@@ -542,6 +542,9 @@ async fn waiting_refusal(reason: motor_host::state::Refusal) {
             Refusal::InternalFailure => {
                 panic!("internal failures occur during delivery, not admission waiting")
             }
+            Refusal::StorageFull => {
+                panic!("a full journal ends admission before it waits")
+            }
         }
     }
     assert_eq!(

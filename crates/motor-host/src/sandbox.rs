@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
 
 // Interim Boat lease values, confirmed with CLOUD's draft. Keep the audience,
@@ -79,6 +79,18 @@ pub struct Config {
     /// Optional external storage-health authority for readiness publication.
     #[serde(default)]
     pub storage_health: Option<StorageHealthConfig>,
+    /// Optional free-space floor for readiness publication: the runner's
+    /// admission floor on the disk holding its state and this endpoint's
+    /// journal. Below it the runner refuses jobs, so the sandbox is not ready.
+    #[serde(default)]
+    pub disk_floor: Option<DiskFloorConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskFloorConfig {
+    pub path: PathBuf,
+    pub floor_bytes: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -171,6 +183,147 @@ impl StorageHealthGate {
             && monotonic_ns()? < state.expires_monotonic_ns)
     }
 }
+
+/// How long a successful tick keeps the endpoint admissible. The ticker runs
+/// every 100 ms, so a tick thread that stops or hangs withdraws readiness
+/// after this long, the same lease length the storage watcher uses.
+const TICK_HEALTH_TTL_NS: u64 = 5_000_000_000;
+
+pub(crate) type FreeSpaceProbe = Arc<dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync>;
+
+fn available_bytes(path: &Path) -> std::io::Result<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(std::io::Error::other)?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(stats.f_bavail).saturating_mul(u64::from(stats.f_frsize)))
+}
+
+#[derive(Default)]
+struct TickHealth {
+    last_ok_ns: Option<u64>,
+    failure: Option<String>,
+}
+
+/// The endpoint's own conditions for publishing readiness: the marker means
+/// "this sandbox can admit a job", so it is withheld while the tenant's
+/// recovery is pending, while host ticks fail or stop, and while free space
+/// is under the runner's admission floor. The broker books any sandbox whose
+/// marker exists, so a marker over a sandbox that cannot admit turns every
+/// booking into a failed connection.
+pub(crate) struct AdmissionGate {
+    disk: Option<(DiskFloorConfig, FreeSpaceProbe)>,
+    tick: Mutex<TickHealth>,
+    /// The reason last logged for withholding readiness, so a lasting
+    /// condition is logged once rather than every second.
+    withheld: Mutex<Option<String>>,
+}
+
+impl AdmissionGate {
+    pub(crate) fn new(disk: Option<DiskFloorConfig>) -> Self {
+        Self::with_probe(disk, Arc::new(available_bytes))
+    }
+
+    fn with_probe(disk: Option<DiskFloorConfig>, probe: FreeSpaceProbe) -> Self {
+        Self {
+            disk: disk.map(|disk| (disk, probe)),
+            tick: Mutex::new(TickHealth::default()),
+            withheld: Mutex::new(None),
+        }
+    }
+
+    /// Records one tick's result and logs a failure with its cause. A failure
+    /// that repeats on every tick is logged once, until it changes or a tick
+    /// succeeds.
+    pub(crate) fn tick_finished(&self, result: &Result<()>) {
+        let mut tick = self.tick.lock().expect("tick health lock");
+        match result {
+            Ok(()) => {
+                if tick.failure.take().is_some() {
+                    tracing::info!("sandbox_tick_recovered");
+                }
+                tick.last_ok_ns = monotonic_ns().ok();
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                if tick.failure.as_deref() != Some(detail.as_str()) {
+                    tracing::error!(detail = %detail, "sandbox_tick_failed");
+                }
+                tick.failure = Some(detail);
+            }
+        }
+    }
+
+    /// Why the sandbox cannot admit a job now, or `None` when it can.
+    fn withholding(&self, runtime: &Runtime) -> Option<String> {
+        if let Some(tenant) = runtime.recovery_pending().first() {
+            return Some(format!("tenant_recovery_pending tenant={tenant}"));
+        }
+        {
+            let tick = self.tick.lock().expect("tick health lock");
+            if let Some(failure) = &tick.failure {
+                return Some(format!("tick_failed: {failure}"));
+            }
+            let fresh = tick.last_ok_ns.is_some_and(|ok| {
+                monotonic_ns().is_ok_and(|now| now.saturating_sub(ok) < TICK_HEALTH_TTL_NS)
+            });
+            if !fresh {
+                return Some("tick_stale".into());
+            }
+        }
+        if let Some((disk, probe)) = &self.disk {
+            match probe(&disk.path) {
+                Ok(free) if free < disk.floor_bytes => {
+                    return Some(format!(
+                        "disk_below_floor free_bytes={free} floor_bytes={}",
+                        disk.floor_bytes
+                    ))
+                }
+                Ok(_) => {}
+                Err(error) => return Some(format!("disk_probe_failed: {error}")),
+            }
+        }
+        None
+    }
+
+    /// [`Self::withholding`], logging when the reason changes.
+    fn admissible(&self, runtime: &Runtime) -> bool {
+        let reason = self.withholding(runtime);
+        let mut withheld = self.withheld.lock().expect("withheld lock");
+        if *withheld != reason {
+            match &reason {
+                Some(reason) => tracing::warn!(reason = %reason, "endpoint_readiness_withheld"),
+                None => tracing::info!("endpoint_admissible"),
+            }
+            *withheld = reason.clone();
+        }
+        reason.is_none()
+    }
+}
+
+/// Retries a pending tenant recovery, logging a failure with its cause once
+/// per distinct cause.
+fn retry_recovery(runtime: &Arc<Runtime>, last: &mut Option<String>) {
+    if runtime.recovery_pending().is_empty() {
+        return;
+    }
+    match runtime.retry_recovery() {
+        Ok(()) => {
+            tracing::info!("tenant_recovered");
+            *last = None;
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if last.as_deref() != Some(detail.as_str()) {
+                tracing::error!(detail = %detail, "tenant_recovery_pending");
+            }
+            *last = Some(detail);
+        }
+    }
+}
 fn default_identity() -> PathBuf {
     ID_FILE.into()
 }
@@ -257,15 +410,18 @@ pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 const KEY_RETRY_S: u64 = 5;
 
 /// Make the readiness marker agree with the endpoint's current state: the
-/// sandbox id when broker keys and identity are valid and any configured storage
-/// watcher reports the startup identity healthy, otherwise no file. Called only
-/// once the loopback listener is bound. Publication and storage withdrawal share
-/// an exclusive lock so an old health read cannot recreate a withdrawn marker. The
-/// marker is replaced by rename, so a reader never sees a partial id.
+/// sandbox id when broker keys and identity are valid, any configured storage
+/// watcher reports the startup identity healthy, and `gate` finds the sandbox
+/// able to admit a job; otherwise no file. Called only once the loopback
+/// listener is bound. Publication and storage withdrawal share an exclusive
+/// lock, and every condition is read after taking it, so an old read cannot
+/// recreate a withdrawn marker. The marker is replaced by rename, so a reader
+/// never sees a partial id.
 pub(crate) fn publish_readiness(
     runtime: &Runtime,
     marker: &Path,
     storage: Option<&StorageHealthGate>,
+    gate: &AdmissionGate,
 ) -> std::io::Result<()> {
     let mut wanted = if runtime.keys.read().expect("keys lock").is_empty() {
         None
@@ -295,6 +451,9 @@ pub(crate) fn publish_readiness(
                 return Err(error);
             }
         }
+    }
+    if wanted.is_some() && !gate.admissible(runtime) {
+        wanted = None;
     }
     if wanted.is_none() {
         return withdraw_readiness(marker);
@@ -345,6 +504,7 @@ pub async fn run(config: Config) -> Result<()> {
         .as_ref()
         .map(|health| StorageHealthGate::new(health.clone(), 0))
         .transpose()?;
+    let gate = Arc::new(AdmissionGate::new(config.disk_floor.clone()));
     let runtime = runtime(config)?;
     runtime.fetch_keys.store(true, Ordering::Relaxed);
     let startup = runtime.clone();
@@ -359,25 +519,28 @@ pub async fn run(config: Config) -> Result<()> {
         refresher.refresh_keys(0);
     });
     let ticker = runtime.clone();
+    let tick_gate = gate.clone();
     std::thread::spawn(move || loop {
-        if ticker.tick(unix_ms()).is_err() {
-            tracing::error!("sandbox_tick_failed");
-        }
+        tick_gate.tick_finished(&ticker.tick(unix_ms()));
         std::thread::sleep(Duration::from_millis(100));
     });
     let listener = bind(port).await.context("sandbox loopback listener")?;
     if let Some(marker) = marker {
         let ready = runtime.clone();
-        std::thread::spawn(move || loop {
-            // A startup fetch can fail (network not up yet); retry until a
-            // key set is held instead of waiting for the 10-minute refresh.
-            if ready.keys.read().expect("keys lock").is_empty() {
-                ready.refresh_keys(KEY_RETRY_S);
+        std::thread::spawn(move || {
+            let mut recovery_failure = None;
+            loop {
+                // A startup fetch can fail (network not up yet); retry until a
+                // key set is held instead of waiting for the 10-minute refresh.
+                if ready.keys.read().expect("keys lock").is_empty() {
+                    ready.refresh_keys(KEY_RETRY_S);
+                }
+                retry_recovery(&ready, &mut recovery_failure);
+                if publish_readiness(&ready, &marker, storage.as_ref(), &gate).is_err() {
+                    tracing::warn!("endpoint_ready_marker_failed");
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
-            if publish_readiness(&ready, &marker, storage.as_ref()).is_err() {
-                tracing::warn!("endpoint_ready_marker_failed");
-            }
-            std::thread::sleep(Duration::from_secs(1));
         });
     }
     loop {

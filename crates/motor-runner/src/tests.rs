@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::{UnixListener, UnixStream};
 
+#[path = "tests/boat_disk.rs"]
+mod boat_disk;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
 #[path = "tests/dependency_writer.rs"]
