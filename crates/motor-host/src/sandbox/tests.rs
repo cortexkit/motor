@@ -35,6 +35,7 @@ impl Fixture {
             port: 0,
             ready_marker: None,
             storage_health: None,
+            disk_floor: None,
         };
         let jobs = tokio::net::UnixListener::bind(&config.job_socket).unwrap();
         let mut runtime = runtime(config).unwrap();
@@ -540,27 +541,28 @@ async fn sandbox_refusals_name_the_failing_check() {
 async fn sandbox_ready_marker_tracks_keys_and_identity() {
     let f = Fixture::new();
     let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
     let id = f.dir.path().join("id");
     let keys = std::mem::take(&mut *f.runtime.keys.write().unwrap());
-    publish_readiness(&f.runtime, &marker, None).unwrap();
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert!(!marker.exists(), "no marker before a JWKS is loaded");
     *f.runtime.keys.write().unwrap() = keys;
-    publish_readiness(&f.runtime, &marker, None).unwrap();
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
     let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o644);
     std::fs::remove_file(&id).unwrap();
-    publish_readiness(&f.runtime, &marker, None).unwrap();
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert!(!marker.exists(), "a missing identity withdraws readiness");
     std::fs::write(&id, "bx_other").unwrap();
     std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o644)).unwrap();
-    publish_readiness(&f.runtime, &marker, None).unwrap();
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert!(
         !marker.exists(),
         "an identity file with the wrong mode is not ready"
     );
     std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o444)).unwrap();
-    publish_readiness(&f.runtime, &marker, None).unwrap();
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "bx_other");
     assert!(!marker.with_extension("tmp").exists());
 }
@@ -602,7 +604,8 @@ async fn sandbox_storage_withdrawal_prevents_endpoint_republication() {
     let f = Fixture::new();
     let gate = storage_gate(&f);
     let marker = f.dir.path().join("endpoint-ready");
-    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    let admission = admissible(&f);
+    publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
     {
         let _lock = gate.lock().unwrap();
@@ -610,7 +613,7 @@ async fn sandbox_storage_withdrawal_prevents_endpoint_republication() {
         std::fs::remove_file(&marker).unwrap();
     }
     for _ in 0..3 {
-        publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+        publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
         assert!(
             !marker.exists(),
             "valid endpoint keys cannot override storage withdrawal"
@@ -623,9 +626,10 @@ async fn sandbox_storage_missing_health_withdraws_instead_of_publishing() {
     let f = Fixture::new();
     let gate = storage_gate(&f);
     let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
     std::fs::write(&marker, ID).unwrap();
     std::fs::remove_file(&gate.config.state_file).unwrap();
-    assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+    assert!(publish_readiness(&f.runtime, &marker, Some(&gate), &admission).is_err());
     assert!(!marker.exists(), "missing watcher state is not healthy");
 }
 
@@ -634,10 +638,11 @@ async fn sandbox_storage_identity_must_match_endpoint_startup() {
     let f = Fixture::new();
     let gate = storage_gate(&f);
     let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
     let mut changed = gate.identity;
     changed[2] += 1;
     write_storage_health(&gate, "healthy", Some(changed));
-    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
     assert!(
         !marker.exists(),
         "health for another workspace identity cannot admit this endpoint"
@@ -649,12 +654,13 @@ async fn sandbox_storage_expired_health_cannot_recreate_readiness() {
     let f = Fixture::new();
     let gate = storage_gate(&f);
     let marker = f.dir.path().join("endpoint-ready");
-    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    let admission = admissible(&f);
+    publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
     let mut state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&gate.config.state_file).unwrap()).unwrap();
     state["expires_monotonic_ns"] = serde_json::json!(0);
     std::fs::write(&gate.config.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
-    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
     assert!(
         !marker.exists(),
         "stale health cannot outlive a dead storage watcher"
@@ -666,12 +672,14 @@ async fn sandbox_storage_withdrawal_serializes_with_concurrent_publication() {
     let f = Fixture::new();
     let gate = Arc::new(storage_gate(&f));
     let marker = f.dir.path().join("endpoint-ready");
-    publish_readiness(&f.runtime, &marker, Some(&gate)).unwrap();
+    let admission = admissible(&f);
+    publish_readiness(&f.runtime, &marker, Some(&gate), &admission).unwrap();
     let lock = gate.lock().unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let writer_gate = gate.clone();
     let writer_marker = marker.clone();
+    let writer_admission = admission.clone();
     let runtime = f.runtime.clone();
     let writer = std::thread::spawn(move || {
         started_tx.send(()).unwrap();
@@ -680,6 +688,7 @@ async fn sandbox_storage_withdrawal_serializes_with_concurrent_publication() {
                 &runtime,
                 &writer_marker,
                 Some(&writer_gate),
+                &writer_admission,
             ))
             .unwrap();
     });
@@ -707,6 +716,7 @@ async fn sandbox_storage_unsafe_or_malformed_health_is_not_ready() {
     let f = Fixture::new();
     let gate = storage_gate(&f);
     let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
     for malformed in [false, true] {
         std::fs::write(&marker, ID).unwrap();
         if malformed {
@@ -723,14 +733,183 @@ async fn sandbox_storage_unsafe_or_malformed_health_is_not_ready() {
             )
             .unwrap();
         }
-        assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+        assert!(publish_readiness(&f.runtime, &marker, Some(&gate), &admission).is_err());
         assert!(!marker.exists());
     }
     std::fs::remove_file(&gate.config.lock_file).unwrap();
-    assert!(publish_readiness(&f.runtime, &marker, Some(&gate)).is_err());
+    assert!(publish_readiness(&f.runtime, &marker, Some(&gate), &admission).is_err());
     assert!(
         !marker.exists(),
         "the endpoint never creates a missing watcher lock"
     );
     assert!(!gate.config.lock_file.exists());
+}
+
+/// A gate that finds the fixture admissible: its tenant recovered and a tick
+/// just succeeded. The tests below take one condition away at a time.
+fn admissible(f: &Fixture) -> Arc<AdmissionGate> {
+    f.runtime
+        .host
+        .lock()
+        .unwrap()
+        .guest_ready("sandbox", 1)
+        .unwrap();
+    let gate = Arc::new(AdmissionGate::new(None));
+    gate.tick_finished(&Ok(()));
+    gate
+}
+
+/// A journal on a disk that may be full, the way Boat's host journal shares
+/// the runner's disk.
+struct FullDisk(Arc<std::sync::atomic::AtomicBool>);
+impl crate::journal::Journal for FullDisk {
+    fn store(&mut self, _: &crate::state::Snapshot) -> std::io::Result<()> {
+        if self.0.load(Ordering::SeqCst) {
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn fill_disk(f: &Fixture) -> Arc<std::sync::atomic::AtomicBool> {
+    let full = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    f.runtime
+        .host
+        .lock()
+        .unwrap()
+        .replace_journal(Box::new(FullDisk(full.clone())));
+    full
+}
+
+#[tokio::test]
+async fn sandbox_ready_marker_waits_for_a_successful_tick() {
+    let f = Fixture::new();
+    let marker = f.dir.path().join("endpoint-ready");
+    admissible(&f);
+    let fresh = AdmissionGate::new(None);
+    publish_readiness(&f.runtime, &marker, None, &fresh).unwrap();
+    assert!(!marker.exists(), "no tick has run yet");
+    fresh.tick_finished(&Ok(()));
+    publish_readiness(&f.runtime, &marker, None, &fresh).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+}
+
+/// The endpoint restarted with a full disk: startup recovery could not record
+/// the tenant ready, so the tenant stays pending, and admission would fail at
+/// the journal. The marker an earlier process left is withdrawn and not
+/// published again until recovery succeeds.
+#[tokio::test]
+async fn sandbox_recovery_pending_withdraws_readiness_and_restart_does_not_republish() {
+    let f = Fixture::new();
+    let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+    let full = fill_disk(&f);
+    // A restarted endpoint's tenant starts not ready.
+    f.runtime.host.lock().unwrap().guest_unready("sandbox");
+    f.runtime.recover().unwrap();
+    assert_eq!(f.runtime.recovery_pending(), vec!["sandbox".to_owned()]);
+    for _ in 0..3 {
+        let mut failure = None;
+        retry_recovery(&f.runtime, &mut failure);
+        let failure = failure.expect("recovery still fails");
+        assert!(failure.contains("No space left on device"), "{failure}");
+        publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+        assert!(
+            !marker.exists(),
+            "a sandbox whose tenant is not recovered cannot admit"
+        );
+    }
+    full.store(false, Ordering::SeqCst);
+    let mut failure = None;
+    retry_recovery(&f.runtime, &mut failure);
+    assert!(failure.is_none());
+    assert!(f.runtime.recovery_pending().is_empty());
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+}
+
+#[tokio::test]
+async fn sandbox_failing_or_stale_ticks_withdraw_readiness() {
+    let f = Fixture::new();
+    let marker = f.dir.path().join("endpoint-ready");
+    let admission = admissible(&f);
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert!(marker.exists());
+    admission.tick_finished(&Err(anyhow::anyhow!(
+        "journal: No space left on device (os error 28)"
+    )));
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert!(!marker.exists(), "a failing tick withdraws readiness");
+    admission.tick_finished(&Ok(()));
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert!(marker.exists());
+    admission.tick.lock().unwrap().last_ok_ns =
+        Some(monotonic_ns().unwrap().saturating_sub(TICK_HEALTH_TTL_NS));
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert!(
+        !marker.exists(),
+        "a tick thread that stopped expires readiness"
+    );
+}
+
+/// Below the runner's admission floor the runner refuses every job, so the
+/// marker is withdrawn, stays withdrawn, and returns once space is freed.
+#[tokio::test]
+async fn sandbox_disk_under_the_floor_withdraws_readiness_until_space_is_freed() {
+    let f = Fixture::new();
+    let marker = f.dir.path().join("endpoint-ready");
+    admissible(&f);
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(200));
+    let probe = {
+        let free = free.clone();
+        Arc::new(move |_: &Path| Ok::<_, std::io::Error>(free.load(Ordering::SeqCst)))
+    };
+    let admission = AdmissionGate::with_probe(
+        Some(DiskFloorConfig {
+            path: f.dir.path().into(),
+            floor_bytes: 100,
+        }),
+        probe,
+    );
+    admission.tick_finished(&Ok(()));
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+    free.store(99, Ordering::SeqCst);
+    for _ in 0..3 {
+        publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+        assert!(!marker.exists(), "under the floor the runner refuses jobs");
+    }
+    free.store(100, Ordering::SeqCst);
+    publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+}
+
+#[test]
+fn sandbox_disk_floor_probe_reads_real_free_space() {
+    let free = available_bytes(Path::new("/")).unwrap();
+    assert!(free > 0);
+    assert!(available_bytes(Path::new("/nonexistent-motor-path")).is_err());
+}
+
+/// A journal write that runs out of space at admission is answered with a
+/// typed refusal before the connection closes, so ck-motor can log why, and
+/// the endpoint's close log names the journal error instead of "host error".
+#[tokio::test]
+async fn sandbox_full_journal_at_admission_is_refused_as_storage_full() {
+    let mut f = Fixture::new();
+    let (token, c) = f.lease();
+    fill_disk(&f);
+    let (mut client, task) = f.connect().await;
+    let challenge = hello(&mut client, &token, &f.requester).await;
+    assert_eq!(
+        respond(&mut client, &signature(&f.requester, &c, challenge)).await,
+        refused("storage_full")
+    );
+    let error = task.await.unwrap().unwrap_err();
+    let report = crate::server::describe_close(&error);
+    assert_eq!((report.side, report.step), ("host", "admission"));
+    assert!(report.cause.contains("StorageFull"), "{}", report.cause);
 }

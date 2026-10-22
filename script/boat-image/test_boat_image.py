@@ -667,6 +667,11 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(config['ready_marker'], str(start.ENDPOINT_READY))
         self.assertEqual(config['storage_health'], {'state_file': str(start.STORAGE_HEALTH),
             'lock_file': str(start.STORAGE_LOCK), 'identity_paths': [str(start.STATE), str(start.USERS)]})
+        # The endpoint's readiness floor is the runner's admission floor on the
+        # runner's state disk, the one the unit passes the runner.
+        unit = (HERE / 'motor-boat.service').read_text()
+        self.assertIn(f"--free-space-floor-bytes {config['disk_floor']['floor_bytes']} ", unit)
+        self.assertIn(f"--state-root {config['disk_floor']['path']} ", unit)
 
     def test_storage_watch_notify_uses_systemd_datagram_socket(self):
         with tempfile.TemporaryDirectory() as tmp, start.socket.socket(start.socket.AF_UNIX, start.socket.SOCK_DGRAM) as receiver:

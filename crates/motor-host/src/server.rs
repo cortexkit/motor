@@ -125,6 +125,9 @@ pub fn describe_close(error: &anyhow::Error) -> CloseReport {
             if let Some(Error::Refused(reason)) = layer.downcast_ref::<Error>() {
                 return Some(format!("refused {}", reason.wire()));
             }
+            if let Some(Error::Journal(io)) = layer.downcast_ref::<Error>() {
+                return Some(format!("journal {:?}: {io}", io.kind()));
+            }
             None
         })
         .or_else(|| {
@@ -296,8 +299,8 @@ impl Runtime {
             .collect();
         for tenant in tenants {
             if self.control.adopt(&tenant)? {
-                if self.ensure(&tenant).is_err() {
-                    tracing::error!(tenant, "tenant_recovery_pending");
+                if let Err(error) = self.ensure(&tenant) {
+                    tracing::error!(tenant, detail = %format!("{error:#}"), "tenant_recovery_pending");
                 }
             } else {
                 self.host
@@ -381,6 +384,29 @@ impl Runtime {
         self.ensure_locked(tenant)?;
         self.start_events(tenant.to_owned());
         Ok(())
+    }
+    /// Tenants that are neither ready nor removed. In a sandbox, where the
+    /// broker owns the VM and nothing suspends it, such a tenant is one whose
+    /// recovery failed: until it is ready, no job can be admitted.
+    pub(crate) fn recovery_pending(&self) -> Vec<String> {
+        let host = self.host.lock().expect("host lock");
+        self.tenant_operations
+            .keys()
+            .filter(|tenant| !host.is_removed(tenant) && !host.is_ready(tenant))
+            .cloned()
+            .collect()
+    }
+    /// Repeats startup recovery for every tenant [`Self::recovery_pending`]
+    /// names, returning the first failure. Startup recovers only once, and in
+    /// a sandbox whose readiness is withdrawn no admission arrives to retry.
+    pub(crate) fn retry_recovery(self: &Arc<Self>) -> Result<()> {
+        let mut failure = None;
+        for tenant in self.recovery_pending() {
+            if let Err(error) = self.ensure(&tenant) {
+                failure.get_or_insert(error.context(format!("recover tenant {tenant}")));
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
     pub(crate) fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
         self.tenant_operations
@@ -1053,7 +1079,19 @@ where
             .at(Side::Client, "lease_refused")?;
             return Ok(());
         }
-        Err((e, _)) => return Err(e).at(Side::Host, "admission"),
+        Err((e, _)) => {
+            // A journal failure (a full disk, most often) is still answered,
+            // so the requester logs why instead of seeing a closed connection.
+            let reason = e.refusal();
+            log_refusal("challenge", reason, "admission", Some(&claims.jti));
+            write_frame(
+                &mut client,
+                &json!({"type":"lease_refused", "reason":reason.wire()}),
+            )
+            .await
+            .at(Side::Client, "lease_refused")?;
+            return Err(e).at(Side::Host, "admission");
+        }
     };
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));

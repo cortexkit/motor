@@ -612,7 +612,10 @@ impl Runner {
     /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
     /// deleted regardless of age or free space before the ordinary rules apply
     /// to everything else.
-    fn reclaim_disk_space(&self, sweep_idle_workspaces: bool) -> io::Result<Option<RunnerDiskFull>> {
+    fn reclaim_disk_space(
+        &self,
+        sweep_idle_workspaces: bool,
+    ) -> io::Result<Option<RunnerDiskFull>> {
         self.ensure_admission_ownership()?;
         let _pressure = self.core.disk.lock().unwrap();
         let floor = self.core.config.free_space_floor_bytes;

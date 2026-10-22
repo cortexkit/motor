@@ -20,7 +20,10 @@ fn workspace(runner: &Runner, path: &Path, used_ms: u64) {
 
 /// The Boat image's thresholds (24 GiB floor, 32 GiB soft goal) with a free
 /// space probe the test controls.
-fn boat_config(f: &Fixture, probe: impl Fn(&Path) -> io::Result<u64> + Send + Sync + 'static) -> Config {
+fn boat_config(
+    f: &Fixture,
+    probe: impl Fn(&Path) -> io::Result<u64> + Send + Sync + 'static,
+) -> Config {
     let mut c = f.config();
     c.boat_profile = true;
     c.boat_memory_max_bytes = Some(2 << 30);
@@ -101,7 +104,10 @@ fn boat_admission_refuses_typed_when_eviction_leaves_free_space_under_the_floor(
         }) if free_bytes == 10 * GIB && floor_bytes == 24 * GIB
     ));
     assert!(!other.exists());
-    assert!(own.exists(), "an admitting job's own workspace is never evicted");
+    assert!(
+        own.exists(),
+        "an admitting job's own workspace is never evicted"
+    );
     let job = runner.job_status(request.job_id).unwrap();
     assert_eq!(job.state, "tombstone");
     assert_eq!(
@@ -214,11 +220,12 @@ async fn terminal_record_spends_the_disk_reserve_when_the_disk_is_full() {
         let runner = runner.clone();
         std::thread::spawn(move || runner.monitor_unit(id))
     };
-    wait_for(|| {
-        read_json::<Job>(&runner.record_path(id)).is_ok_and(|job| job.terminal.is_some())
-    })
-    .await;
+    wait_for(|| read_json::<Job>(&runner.record_path(id)).is_ok_and(|job| job.terminal.is_some()))
+        .await;
     monitor.join().unwrap();
     assert!(attempts.load(Ordering::SeqCst) >= 1);
-    assert!(!reserve.exists(), "the reserve was spent on the terminal record");
+    assert!(
+        !reserve.exists(),
+        "the reserve was spent on the terminal record"
+    );
 }

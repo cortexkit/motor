@@ -38,6 +38,9 @@ root_paths = importlib.util.module_from_spec(root_paths_spec)
 root_paths_spec.loader.exec_module(root_paths)
 BUILD = Path("/srv/build")
 STATE = Path("/var/lib/motor-boat")
+# The runner's admission floor, the --free-space-floor-bytes value in
+# motor-boat.service. The endpoint withholds readiness below it.
+FREE_SPACE_FLOOR_BYTES = 24 << 30
 APT_LISTS = Path('/var/lib/apt/lists/motor-boat')
 APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourceparts=/etc/apt/motor-boat.sources.d',
                '-o', 'Dir::State::lists=' + str(APT_LISTS), '-o', 'Acquire::AllowInsecureRepositories=false',
@@ -639,6 +642,7 @@ def configure(pins, revision):
             'lock_file': '/run/motor-boat-storage/lock',
             'identity_paths': ['/var/lib/motor-boat', '/Users'],
         },
+        'disk_floor': {'path': str(STATE / 'state'), 'floor_bytes': FREE_SPACE_FLOOR_BYTES},
     }, indent=2) + '\n')
     Path('/etc/motor/image-revision').write_text(revision + '\n')
     Path("/etc/motor/tenant").mkdir(parents=True, exist_ok=True)
