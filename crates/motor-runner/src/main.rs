@@ -373,6 +373,9 @@ fn configure_options(
                 config.snapshot_javascript_timeout =
                     std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
             }
+            "--sibling-freshness-entries" => {
+                config.sibling_freshness_entries = value.parse().map_err(io::Error::other)?
+            }
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),

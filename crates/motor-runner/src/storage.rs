@@ -428,6 +428,13 @@ pub(crate) struct Workspace {
     pub snapshot: String,
     pub siblings: Vec<SiblingSnapshot>,
     pub used_ms: u64,
+    /// Per sibling path, the trees whose artifacts may still be in this
+    /// workspace's `target/`, used to keep Cargo from reusing them after a
+    /// switch to another sibling snapshot; see `sibling_snapshots::freshness`.
+    /// Only setups that mounted siblings from snapshots write it. It goes away
+    /// with the entry, which is removed when the workspace is deleted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sibling_freshness: BTreeMap<String, crate::sibling_snapshots::freshness::Record>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

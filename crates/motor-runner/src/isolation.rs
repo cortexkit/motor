@@ -669,15 +669,7 @@ fn javascript_install_command(
         Err(error) => return Err(error),
     }
     let manager = javascript_manager(install.lockfile);
-    let executable = if manager == "bun" {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".bun/bin/bun"))
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("bun"))
-    } else {
-        PathBuf::from(manager)
-    };
-    let mut command = Command::new(executable);
+    let mut command = Command::new(javascript_executable(manager));
     if manager == "npm" {
         command.args(["ci", "--ignore-scripts"]);
     } else {
@@ -685,6 +677,42 @@ fn javascript_install_command(
     }
     command.current_dir(directory);
     Ok(command)
+}
+
+fn javascript_executable(manager: &str) -> PathBuf {
+    if manager == "bun" {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".bun/bin/bun"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("bun"))
+    } else {
+        PathBuf::from(manager)
+    }
+}
+
+/// The `--version` output of every package manager installs can use, by
+/// manager name, and of Node, for the sibling snapshot key. A manager that
+/// is missing or fails is left out and a missing Node gives empty output, so
+/// installing one changes the key without making snapshot setup fail here;
+/// an install that needs it still fails as it does today.
+pub(crate) fn javascript_runner_versions() -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
+    let version = |executable: PathBuf| {
+        Command::new(executable)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+    };
+    let managers = ["bun", "npm", "pnpm"]
+        .into_iter()
+        .filter_map(|manager| {
+            version(javascript_executable(manager)).map(|output| (manager.to_string(), output))
+        })
+        .collect();
+    let node = version(PathBuf::from("node")).unwrap_or_default();
+    (managers, node)
 }
 
 fn javascript_version(command: &Command, executable: &std::ffi::OsStr) -> io::Result<Vec<u8>> {

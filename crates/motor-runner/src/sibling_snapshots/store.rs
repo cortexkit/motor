@@ -123,6 +123,10 @@ pub(crate) struct SnapshotStore {
     registry: Mutex<Registry>,
     #[cfg(test)]
     pub(crate) clone_override: Option<CloneHook>,
+    /// Called by the switch touch once it has decided which paths of a
+    /// snapshot to touch and before it writes any, with the key mutex held.
+    #[cfg(test)]
+    pub(crate) touch_inspected: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
 }
 
 /// A predecessor registered by a creation, released when the creation ends.
