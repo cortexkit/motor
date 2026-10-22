@@ -1753,6 +1753,37 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_line_names_its_retry_hint_only_when_it_has_one() {
+        let id = Uuid::now_v7();
+        let refused = TerminalRecord::new(
+            id,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerAuthenticationFailed,
+            },
+            0,
+            0,
+            0,
+        );
+        for (terminal, line) in [
+            (
+                refused
+                    .clone()
+                    .with_refusal_detail("runner_sign_unavailable")
+                    .with_retry_after_ms(1500),
+                format!("ck motor run: refused before start: runner_authentication_failed: runner_sign_unavailable (retry after 1500 ms) (job_id={id})\n"),
+            ),
+            (
+                refused.with_refusal_detail("runner_sign_grant_refused"),
+                format!("ck motor run: refused before start: runner_authentication_failed: runner_sign_grant_refused (job_id={id})\n"),
+            ),
+        ] {
+            let mut err = Vec::new();
+            assert_eq!(settle(&terminal, &mut err), EXIT_REFUSED);
+            assert_eq!(String::from_utf8(err).unwrap(), line);
+        }
+    }
+
+    #[test]
     fn the_workspace_is_the_checkout_containing_cwd() {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-workspace");
         let main = fs::canonicalize(scratch.path()).unwrap().join("main");

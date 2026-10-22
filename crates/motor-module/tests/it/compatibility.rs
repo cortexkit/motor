@@ -978,25 +978,36 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
     let helper =
         std::env::var_os("MOTOR_COMPAT_CLIENT").expect("run python3 scripts/mixed-version.py");
     let f = Fixture::new(Cut::None, 28).await;
-    for (reason, tag, detail) in [
+    for (reason, tag, detail, retry_after_ms) in [
         (
             RefusalReason::LostToRestart,
             "lost_to_restart",
             "runner restarted before the job could start",
+            None,
         ),
         (
             RefusalReason::RequestRejected,
             "request_rejected",
             "prepare_unsupported: Prepare is unsupported by the Windows instance",
+            None,
         ),
         (
             RefusalReason::RunnerAuthenticationFailed,
             "runner_authentication_failed",
             "runner_sign_missing",
+            None,
+        ),
+        // A transient signing failure carries a retry hint, which the oldest
+        // client must read as written.
+        (
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_authentication_failed",
+            "runner_sign_unavailable",
+            Some(1500),
         ),
     ] {
-        let path = f.scratch.join(format!("{tag}.json"));
-        let terminal = TerminalRecord::new(
+        let path = f.scratch.join(format!("{tag}-{detail}.json"));
+        let mut terminal = TerminalRecord::new(
             Uuid::now_v7(),
             Outcome::RefusedBeforeStart { reason },
             0,
@@ -1005,6 +1016,7 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
         )
         .with_refusal_detail(detail)
         .with_ran(Ran::None);
+        terminal.retry_after_ms = retry_after_ms;
         fs::write(
             &path,
             serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap(),
@@ -1034,6 +1046,6 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
         assert_eq!(old["reason"], tag);
         assert_eq!(old["refusal_detail"], detail);
         assert_eq!(old["ran"], "none");
-        assert_eq!(old["retry_after_ms"], serde_json::Value::Null);
+        assert_eq!(old["retry_after_ms"], serde_json::json!(retry_after_ms));
     }
 }

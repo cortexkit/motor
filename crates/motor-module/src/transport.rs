@@ -41,6 +41,12 @@ pub trait Connector: Send + Sync {
     fn windows_refusal(&self) -> Option<&'static str> {
         self.refusal()
     }
+    /// The `retry_after_ms` hint for a job this connector refused with
+    /// `code`: how long until the refusal may clear without an operator.
+    /// `None` unless the refusal is transient.
+    fn retry_after_ms(&self, _code: &str) -> Option<u64> {
+        None
+    }
     fn connect(&self, id: Uuid) -> ConnectFuture<'_>;
     fn connect_to<'a>(
         &'a self,
@@ -77,6 +83,9 @@ impl Connector for InstanceConnector {
         } else {
             self.connector.refusal()
         }
+    }
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        self.connector.retry_after_ms(code)
     }
     fn connect(
         &self,
@@ -499,6 +508,12 @@ impl Connector for SshConnector {
     }
     fn refusal(&self) -> Option<&'static str> {
         self.refusal_from(VaultAgent::refusal)
+    }
+    /// Only the signing agent's transient failures carry a hint. Credential,
+    /// agent and SSH configuration refusals need an operator.
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        let agent = self.credentials.current.lock().unwrap().agent.clone()?;
+        agent.retry_after_ms(code)
     }
     fn connect(
         &self,
