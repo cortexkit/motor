@@ -117,7 +117,7 @@ which is exactly `{"error":"no_host_fits","max_vcpus":<integer>}` in that member
 | 400 | `bad_request`, `platform_unsupported` |
 | 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
 | 402 | `budget_exhausted` |
-| 403 | `shadow_not_allowed` |
+| 403 | `shadow_not_allowed`, `account_closed` (lease only; never carries `Retry-After`) |
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 422 | `no_host_fits` (lease only; never carries `Retry-After`) |
@@ -128,7 +128,9 @@ Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for tha
 retryable transport failures. `sandbox_lost` is final for that job: its Boat sandbox stopped or
 failed under the lease, and ck-motor must start a new `job_id`. `no_host_fits` is final for that
 lease body: retrying it never succeeds while the registry is unchanged, so the client routes the
-job elsewhere or asks for at most `max_vcpus`. Host retries after a consumed counter must use a new counter.
+job elsewhere or asks for at most `max_vcpus`. `account_closed` is final for that account: it was
+closed (the customer left) and gets no new lease, ever; see [Account closure](#account-closure).
+Host retries after a consumed counter must use a new counter.
 
 ## Client endpoints
 
@@ -183,12 +185,19 @@ hash covers `avoid_host`, so a re-request must repeat it exactly; a different va
 After authentication and schema validation, checks proceed in this order:
 
 1. Read the account's allowance, then claim `job_id` in D1. A claim belonging to another tenant is
-   404 `job_unknown` and reveals none of that job's data.
+   404 `job_unknown` and reveals none of that job's data. A closed account writes no new claim
+   (see [Account closure](#account-closure)).
 2. Check for an existing `TenantDO` row. A release marker takes precedence and gives 409
    `job_released`, even after settlement. Otherwise a settled job is 409 `job_finished`; a reserved
    job ever reported `admitted` or `started` is 409 `job_admitted`. Otherwise an identical lease hash
    returns 201 on the same reservation, with a fresh `run` token for this requester's key. A
-   different hash is 409 `job_conflict`. These replies do not reserve again.
+   different hash is 409 `job_conflict`. These replies do not reserve again. With no row and no
+   Boat provisioning record for the job, a closed account's lease is refused 403
+   `account_closed`, with no placement, Boat call, provisioning record or reservation. Otherwise,
+   after the broker deletes job records under the
+   [retention rule](runners.md#retention), a lease whose `job_id` (UUIDv7) time falls at or before
+   that tenant's deleted period is refused 404 `job_unknown`, so a deleted job id is never accepted
+   again. The D1 claim from step 1 remains, as for any refusal.
 3. Ask for placement. If no active host has the requested platform, return 400
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
    `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
@@ -233,7 +242,9 @@ with no totals, 2 vCPUs and timeout 100 gives `max_s: 12`, reservation 24000; 20
 
 Placement and budget refusals leave no `TenantDO` job row and unchanged totals, but retain the D1
 claim. The same tenant can retry after capacity returns or allowance increases; another tenant
-still gets 404. Existing-job refusals never mutate its row or totals.
+still gets 404. Existing-job refusals never mutate its row or totals. Claims, job rows and
+settlement records are deleted 13 months after they were written or settled
+([retention](runners.md#retention)); a deleted job is unknown from then on.
 
 Success is **201** with exactly these fields (the same shape is used by reattach):
 
@@ -269,7 +280,8 @@ Lease id, placement, endpoint, SPKI hash, run limit and reservation remain uncha
 `attach` token is bound to the supplied key and has its own `iat` and `exp = iat + 300`. It reserves
 and settles nothing and does not move the original deadline. Earlier tokens are not revoked;
 they expire at their own `exp`. Unknown, claim-only or another tenant's jobs return 404
-`job_unknown`. For a known job the broker then decides, in this order:
+`job_unknown`, and so does a job whose records were deleted under the retention rule. For a known
+job the broker then decides, in this order:
 
 1. A release marker is 409 `job_released`, even after settlement.
 2. A job settled with reason `lost` (a lost Boat sandbox) is 409 `sandbox_lost`.
@@ -289,7 +301,9 @@ they expire at their own `exp`. Unknown, claim-only or another tenant's jobs ret
 The same rule is checked again after signing, so a job released or settled for any other reason
 while its token was being signed is refused with the code above, and a job settled by its host's
 usage report in that time still gets the token. Lease re-request and release keep answering a
-settled job with 409 `job_finished` (or `job_released`). `test-vectors/runners/settled-reattach.json`
+settled job with 409 `job_finished` (or `job_released`) until its record is deleted 13 months
+after settlement; from then on they, like reattach, answer 404 `job_unknown`.
+`test-vectors/runners/settled-reattach.json`
 pins a reattach for a usage-settled host job with the tenant totals before and after it.
 
 ### POST /v1/leases/{job_id}/release
@@ -425,8 +439,19 @@ host has no effect. A reserved job on this host updates
 `started` permanently mark it admitted; later `reserved` does not clear that flag. This prevents
 lease re-request, but not reattach.
 
-Success is **200** with exactly `{"ignored":[<job_id>…]}`, strings in entry order and no other
-member. A valid heartbeat from a retired host still updates elapsed time and snapshots.
+Success is **200** with exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…]}`, in that
+member order and with no other member. `ignored` lists strings in entry order.
+
+`closed_subjects` lists the closed accounts (see [Account closure](#account-closure)) among the
+tenants this heartbeat's snapshot reports: each `warm` entry's `tenant`, and the owner of each
+`running` job the broker holds a D1 claim for (listed or not in `ignored`). Each is the same
+`acct:<account ULID>` string the broker uses for tenants in placement and `warm` entries, sorted,
+without duplicates; a closed account the snapshot does not report is never listed, and the array
+is empty when none is closed. For each listed subject the host deletes that tenant's data (its
+VM disks, warm state and cached workspaces) once that tenant's last lease on the host has ended;
+it keeps running the tenant's current jobs to their end. Closure is permanent, so a listed
+subject never needs to be undone. A valid heartbeat from a retired host still updates elapsed
+time and snapshots.
 
 ### POST /v1/hosts/{host_id}/usage
 
@@ -636,6 +661,29 @@ A re-request must repeat it. Any other value is 400 `bad_request`.
   resume.
 - Nothing in the sandbox signs to the broker: no report key, heartbeat or usage report.
 
+## Account closure
+
+When a customer leaves, an operator closes the account (`close-account`, see
+[runners.md](runners.md#close-an-account)); the broker records `closed_at_ms` on the account's D1
+`allowances` row. Closure is permanent: there is no reopen.
+
+- **New leases are refused.** A `POST /v1/leases` for a `job_id` the account's `TenantDO` holds
+  neither a job nor a Boat provisioning record for is **403** `{"error":"account_closed"}`, with no
+  `Retry-After`. It is final: the client must not retry it here. No placement, Boat call,
+  provisioning record, reservation or D1 claim results.
+- **Existing jobs run to their end.** A re-request of a job already placed or provisioning keeps
+  its normal answer (201 with a fresh `run` token, or 202 while its sandbox starts, then 201), and
+  reattach, release, finish, host heartbeats and host usage reports for existing jobs work as for
+  an open account, so every job settles normally. `GET /v1/tenant` keeps answering.
+- **Boat sandboxes are retired.** The broker's Cron tells the account's `TenantDO` it is closed.
+  From then on the tenant never claims or creates a sandbox again (even for a lease read as open
+  just before the closure, which is refused 403 `account_closed`). Every sandbox no lease or
+  provisioning record holds is stopped and then deleted at once; one under a live lease, or
+  claimed by a provisioning record, is stopped and deleted as soon as that lease or record ends.
+- **Hosts delete the tenant's data.** Heartbeat replies list the closed tenants a host reports in
+  `closed_subjects` (see the heartbeat endpoint above). The host deletes each listed tenant's
+  disks after that tenant's last lease on the host ends.
+
 ## Pinned conformance evidence
 
 `test-vectors/runners/job-tokens.json` pins both token purposes and their header/claim bytes,
@@ -654,6 +702,12 @@ authorized_keys line.
 `test-vectors/runners/no-spill-lease.json` and `test-vectors/runners/no-host-fits-lease.json`
 pin the registered-host-only refusals: a full host's 503 `no_capacity`, and the 422
 `no_host_fits` for a job above the only host's per-job ceiling.
+
+`test-vectors/runners/account-closure.json` pins a closed account: its lease refused with the
+final 403 `account_closed` (no `Retry-After`), and a signed heartbeat whose snapshot reports warm
+entries for that closed account and for an open one, with the exact reply bytes
+`{"ignored":[],"closed_subjects":["acct:<closed account>"]}`. A third, closed account the host
+does not report stays out of the reply.
 
 `workers/runners/test/vectors.test.ts` and `workers/runners/test/boat-vectors.test.ts` compare real
 implementation output to those committed bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,
