@@ -315,6 +315,17 @@ async fn writer<W: AsyncWrite + Unpin>(
                 "runner hello written"
             );
         }
+        // Record when these frames are written to the connection, to help
+        // diagnose slow cancels.
+        match &frame {
+            Frame::Terminal(terminal) => {
+                tracing::info!(job_id = %terminal.job_id, outcome = ?terminal.outcome, "runner terminal written to client")
+            }
+            Frame::CancelReply(reply) => {
+                tracing::info!(job_id = %reply.job_id, "runner cancel reply written to client")
+            }
+            _ => {}
+        }
     }
 }
 
@@ -754,7 +765,10 @@ async fn session(
             }
             Frame::Cancel(request) => {
                 let id = request.job_id;
+                let received = std::time::Instant::now();
+                tracing::info!(job_id = %id, "runner cancel frame received");
                 locked(&runner, move |r| r.cancel(id)).await?;
+                tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
                 send(tx, Frame::CancelReply(CancelReply::new(request.job_id))).await?;
                 if tenant.is_some() {
                     continue;
@@ -937,7 +951,10 @@ async fn attach(
             frame = next(rx) => match frame {
                 None => return Ok(()),
                 Some(Frame::Cancel(_)) => {
+                    let received = std::time::Instant::now();
+                    tracing::info!(job_id = %id, "runner cancel frame received on job stream");
                     locked(runner, move |r| r.cancel(id)).await?;
+                    tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
                     if tenant { send(tx, Frame::CancelReply(CancelReply::new(id))).await?; }
                 },
                 Some(Frame::Attach(request)) if tenant => from = request.from_seq,

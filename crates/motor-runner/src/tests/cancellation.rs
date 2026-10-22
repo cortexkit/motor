@@ -386,3 +386,45 @@ fn overdue_deadline_keeps_its_origin_when_an_output_writer_delays_enforcement() 
         "a deadline past its grace must hard-stop a TERM-ignoring group"
     );
 }
+
+/// A job printing faster than its output can be committed keeps its monitor
+/// taking the job log lock back to back, one commit after another. A cancel
+/// waiting for that lock must get it before the next output commit;
+/// otherwise the unit stop waits until the job's output pauses.
+#[test]
+fn cancel_takes_the_job_log_ahead_of_the_next_output_commit() {
+    let f = CancellationFixture::new();
+    let id = f.id;
+    fs::create_dir_all(f.runner.record_path(id).parent().unwrap()).unwrap();
+    let log = f.runner.job_log(id);
+    // The test thread plays the output monitor, in the middle of one commit.
+    let commit = log.write_for_output();
+    let runner = f.runner.clone();
+    let cancel = std::thread::spawn(move || runner.cancel(id));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while *log.cancels_waiting.lock().unwrap() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the cancel never queued for the job log lock"
+        );
+        std::thread::yield_now();
+    }
+    // Finish that commit and start the next one straight away, as the
+    // monitor does while its output file has unread bytes.
+    drop(commit);
+    f.runner
+        .output(id, OutputStream::Stdout, b"more output")
+        .unwrap();
+    assert_eq!(
+        *f.events.lock().unwrap(),
+        ["cancel"],
+        "the unit stop must be issued before the next output commit"
+    );
+    cancel.join().unwrap().unwrap();
+    let job = &f.runner.core.inner.lock().unwrap().jobs[&id];
+    assert!(matches!(job.kill, Some((Killed::Cancel, _))));
+    assert_eq!(
+        job.next_seq, 1,
+        "the output commit still happens after the cancel"
+    );
+}

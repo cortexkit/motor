@@ -650,7 +650,17 @@ const REPLAY_PAGE_CHUNKS: usize = 64;
 struct JobLog {
     /// Acquire before the state lock, never while waiting under it. Serializes
     /// output/index commits with cancellation, deadlines and terminal commits.
+    /// Output commits take it through `write_for_output` and cancellation
+    /// through `write_ahead_of_output`; other callers lock it directly.
     write: Mutex<()>,
+    /// How many cancels are waiting for `write`. An output commit waits for
+    /// this to reach zero before it takes `write`. Without that, a job whose
+    /// output arrives faster than it can be committed keeps a cancel waiting
+    /// indefinitely: the monitor thread releases `write` after one commit
+    /// (three fsyncs) and takes it again for the next within microseconds,
+    /// long before the woken cancel thread is scheduled on a busy host.
+    cancels_waiting: Mutex<usize>,
+    cancels_admitted: std::sync::Condvar,
     retention: Mutex<ReplayRetention>,
 }
 
@@ -675,6 +685,29 @@ fn delete_retired_chunks(paths: Vec<PathBuf>) {
 }
 
 impl JobLog {
+    /// Take `write` for a cancel. Output commits that have not started yet
+    /// wait until this cancel holds the lock; one already committing
+    /// finishes first.
+    fn write_ahead_of_output(&self) -> std::sync::MutexGuard<'_, ()> {
+        *self.cancels_waiting.lock().unwrap() += 1;
+        let write = self.write.lock();
+        let mut waiting = self.cancels_waiting.lock().unwrap();
+        *waiting -= 1;
+        if *waiting == 0 {
+            self.cancels_admitted.notify_all();
+        }
+        drop(waiting);
+        write.unwrap()
+    }
+    /// Take `write` for an output commit, after every waiting cancel.
+    fn write_for_output(&self) -> std::sync::MutexGuard<'_, ()> {
+        let mut waiting = self.cancels_waiting.lock().unwrap();
+        while *waiting > 0 {
+            waiting = self.cancels_admitted.wait(waiting).unwrap();
+        }
+        drop(waiting);
+        self.write.lock().unwrap()
+    }
     fn lease(self: &Arc<Self>, paths: Vec<PathBuf>) -> ReplayLease {
         let mut retention = self.retention.lock().unwrap();
         retention.readers += 1;
@@ -3047,16 +3080,24 @@ impl Runner {
         })
     }
     pub fn cancel(&self, id: Uuid) -> io::Result<()> {
+        // Each later step until the unit stop logs the time since the cancel
+        // started, so a slow cancel shows which wait it spent time in.
+        let started = std::time::Instant::now();
+        let elapsed_ms = || started.elapsed().as_millis() as u64;
+        tracing::info!(job_id = %id, "cancel received");
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
-        let write = log.write.lock().unwrap();
+        let write = log.write_ahead_of_output();
+        tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel acquired job log lock");
         let mut inner = self.core.inner.lock().unwrap();
+        tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel acquired state lock");
         if self.core.config.windows_instance() && inner.starting.contains(&id) {
             self.core
                 .backend
                 .cancel(&self.core.config, &inner.jobs[&id], true)?;
         }
         if inner.finalizing.contains(&id) {
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
             return Ok(());
         }
         let job = inner
@@ -3064,6 +3105,7 @@ impl Runner {
             .entry(id)
             .or_insert_with(|| Job::new(id, None, self.now(), 0, 0));
         if job.terminal.is_some() {
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finished");
             return Ok(());
         }
         if job.state == JobState::Running {
@@ -3072,13 +3114,16 @@ impl Runner {
                 updated.kill = Some((Killed::Cancel, self.now()));
                 drop(inner);
                 self.save(&updated)?;
+                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded");
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
                 if inner.finalizing.contains(&id) {
+                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
                     return Ok(());
                 }
                 let job = &inner.jobs[&id];
                 if job.process.is_none() || self.unit_alive(job.process)? == Some(false) {
+                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
                     drop(inner);
                     drop(write);
                     return self.finish(
@@ -3086,13 +3131,18 @@ impl Runner {
                         Err(io::Error::other("cancel recorded after unit exited")),
                     );
                 } else {
+                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
                     self.core.backend.cancel(&self.core.config, job, false)?;
+                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel issued unit stop");
                 }
+            } else {
+                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel already recorded; stop retries belong to the scheduler");
             }
         } else {
             job.terminal(Outcome::Cancelled, self.now());
             job.state = JobState::Tombstone;
             self.save(job)?;
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded before start");
         }
         Ok(())
     }
@@ -4737,6 +4787,7 @@ impl Runner {
             // Output is tailed frequently, but spawning systemctl for
             // every tail read would turn quiet jobs into a busy polling load.
             if std::time::Instant::now() >= inspect_at {
+                let was_alive = alive;
                 alive = match self.unit_alive(process) {
                     Ok(alive) => alive == Some(true),
                     Err(error) => {
@@ -4750,6 +4801,13 @@ impl Runner {
                 #[cfg(not(target_os = "linux"))]
                 let delay = Duration::from_millis(500);
                 inspect_at = std::time::Instant::now() + delay;
+                if was_alive && !alive {
+                    let kill = self.core.inner.lock().unwrap().jobs[&id].kill.clone();
+                    if let Some((killed, at)) = kill {
+                        tracing::info!(job_id = %id, killed = ?killed,
+                            since_kill_ms = self.now().saturating_sub(at), "killed job's unit exit observed");
+                    }
+                }
             }
             if durable {
                 for (name, stream) in [
@@ -5037,7 +5095,7 @@ impl Runner {
         offset: Option<u64>,
     ) -> io::Result<()> {
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.write_for_output();
         let directory = self.record_path(id).parent().unwrap().to_owned();
         let mut consumed = 0usize;
         for bytes_part in bytes.chunks(REPLAY_PAGE_BYTES as usize) {
@@ -5162,6 +5220,7 @@ impl Runner {
         // that lock so neither cancel nor the scheduler can signal the exited
         // job during collection or persistence retries. It still occupies its
         // workspace until the terminal is committed.
+        let finish_started = std::time::Instant::now();
         let job = {
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
@@ -5175,12 +5234,14 @@ impl Runner {
             }
             inner.jobs[&id].clone()
         };
+        self.finish_step(id, &job.kill, "finalization claimed", finish_started);
         let ended_ms = self.now();
         let oom_stopped = self
             .core
             .backend
             .oom_stopped(&self.core.config, job.process)
             .unwrap_or(false);
+        self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
             oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.capacity())
         });
@@ -5217,6 +5278,7 @@ impl Runner {
                 None
             }
         };
+        self.finish_step(id, &job.kill, "workspace changes collected", finish_started);
         let mut status = status;
         let lock_check = if job.base {
             let r = job.request.as_ref().unwrap();
@@ -5309,10 +5371,17 @@ impl Runner {
             .as_ref()
             .filter(|r| !r.return_paths.is_empty() && r.return_chunked)
             .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
+        self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
         let (mut inner, success) = loop {
             let write = log.write.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
+            self.finish_step(
+                id,
+                &job.kill,
+                "job log and state locks acquired",
+                finish_started,
+            );
             if inner.jobs[&id].terminal.is_some() {
                 if let Some(returned) = &returned {
                     // Another finisher committed the terminal; these bytes
@@ -5370,6 +5439,7 @@ impl Runner {
             }
             drop(inner);
             let saved = self.save(&finished);
+            self.finish_step(id, &job.kill, "terminal record written", finish_started);
             inner = self.core.inner.lock().unwrap();
             if saved.is_ok()
                 && inner
@@ -5408,10 +5478,12 @@ impl Runner {
                 }
             }
         };
+        let kill = job.kill.clone();
         let job = &inner.jobs[&id];
         let request = job.request.as_ref().unwrap().clone();
         let base = job.base;
-        tracing::info!(job_id = %id, outcome = ?job.terminal.as_ref().unwrap().outcome, base, "job finished");
+        tracing::info!(job_id = %id, outcome = ?job.terminal.as_ref().unwrap().outcome, base,
+            finish_ms = finish_started.elapsed().as_millis() as u64, "job finished");
         if base {
             if !status.as_ref().is_ok_and(|s| s.success()) {
                 fill_failure.push(format!(
@@ -5449,8 +5521,36 @@ impl Runner {
             self.catalog(&inner)?;
         }
         drop(inner);
+        // Replay waits for the state lock, so the terminal reaches clients
+        // only after this point.
+        self.finish_step(id, &kill, "state lock released", finish_started);
         self.prune_refs()?;
         Ok(())
+    }
+
+    /// Log one step of finishing a job, with the time since finishing began.
+    /// A job stopped by a cancel or deadline logs at INFO, with the time since
+    /// that kill was recorded, so the interval between a kill and its
+    /// terminal can be split into steps; other jobs log at DEBUG.
+    fn finish_step(
+        &self,
+        id: Uuid,
+        kill: &Option<(Killed, u64)>,
+        step: &'static str,
+        started: std::time::Instant,
+    ) {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match kill {
+            Some((killed, at)) => tracing::info!(
+                job_id = %id,
+                killed = ?killed,
+                step,
+                elapsed_ms,
+                since_kill_ms = self.now().saturating_sub(*at),
+                "job finishing step"
+            ),
+            None => tracing::debug!(job_id = %id, step, elapsed_ms, "job finishing step"),
+        }
     }
 
     fn finish_base(

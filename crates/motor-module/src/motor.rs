@@ -63,8 +63,30 @@ pub struct Motor {
     #[cfg(test)]
     shadow_deadline: Option<Duration>,
     windows_slots: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
+    /// Build-server jobs whose cancel `cancel` is delivering on its own
+    /// connection right now. The job's stream leaves that delivery alone and
+    /// keeps reading. If it sent a second cancel instead, it would wait for
+    /// that reply and then reattach before it could read the terminal.
+    cancels_in_flight: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
 }
 mod agent_run;
+
+/// Marks one `Motor::cancel` call delivering a build-server job's cancel.
+struct CancelInFlight {
+    cancels: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
+    id: Uuid,
+}
+impl Drop for CancelInFlight {
+    fn drop(&mut self) {
+        let mut cancels = self.cancels.lock().unwrap();
+        if let Some(count) = cancels.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                cancels.remove(&self.id);
+            }
+        }
+    }
+}
 #[cfg(test)]
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;
@@ -100,6 +122,7 @@ impl Motor {
             #[cfg(test)]
             shadow_deadline: None,
             windows_slots,
+            cancels_in_flight: Arc::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -1283,20 +1306,42 @@ impl Motor {
         self.storage.job(id).is_some_and(|j| j.pending_cancel)
     }
     async fn send_cancel(&self, id: Uuid) -> io::Result<()> {
+        let started = tokio::time::Instant::now();
+        let elapsed_ms = || started.elapsed().as_millis() as u64;
         let build_server_id = self.build_server_id(id);
         let mut channel = self
             .open_job_channel(id)
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel connection opened");
         channel
             .send(Frame::Cancel(CancelRequest::new(build_server_id)))
             .await?;
+        tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel frame sent to runner");
         match channel.next().await? {
             Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == build_server_id => {
+                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "runner acknowledged cancel");
                 self.storage.cancel(id, false)
             }
             _ => Err(io::Error::other("expected cancel_reply")),
         }
+    }
+    /// Record that `cancel` is delivering this job's cancel itself, until the
+    /// returned guard drops.
+    fn deliver_cancel(&self, id: Uuid) -> CancelInFlight {
+        *self
+            .cancels_in_flight
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default() += 1;
+        CancelInFlight {
+            cancels: self.cancels_in_flight.clone(),
+            id,
+        }
+    }
+    fn cancel_in_flight(&self, id: Uuid) -> bool {
+        self.cancels_in_flight.lock().unwrap().contains_key(&id)
     }
     pub fn hosted_state(&self, id: Uuid) -> Option<crate::HostedJobState> {
         self.storage.job(id).and_then(|j| j.hosted_route())
@@ -1531,7 +1576,10 @@ impl Motor {
                 self.log_hosted_failure(id, "follow", "caller detached");
                 return Err(io::Error::other("caller detached"));
             }
-            if self.pending(id) {
+            // A cancel that `cancel` is still delivering on its own connection
+            // needs nothing from this stream, which keeps reading so the
+            // terminal arrives without a reconnect.
+            if self.pending(id) && (hosted || !self.cancel_in_flight(id)) {
                 if hosted && channel.is_some() {
                     if channel
                         .as_ref()
@@ -1544,6 +1592,7 @@ impl Motor {
                         channel = None;
                     }
                 } else {
+                    tracing::info!(job_id = %id, "job stream sending pending cancel on a new connection");
                     let cancel = tokio::select! {
                         result = self.send_cancel(id) => result,
                         _ = tx.closed() => {
@@ -1611,8 +1660,9 @@ impl Motor {
                     return self.finish_hosted(id, true, tx).await.map(|_| false);
                 }
                 if let Ok(c) = opened {
-                    // A persisted cancellation may arrive while the connection opens.
-                    if self.pending(id) {
+                    // A persisted cancellation may arrive while the connection
+                    // opens. Send it first, unless `cancel` is delivering it.
+                    if self.pending(id) && (hosted || !self.cancel_in_flight(id)) {
                         drop(c);
                         continue;
                     }
@@ -1888,13 +1938,21 @@ impl Motor {
     /// a retry task sends it without depending on an attach caller staying alive.
     pub async fn cancel(&self, request: CancelRequest) -> io::Result<CancelReply> {
         let id = request.job_id;
-        if self.hosted_state(id).is_none() {
+        let started = tokio::time::Instant::now();
+        let elapsed_ms = || started.elapsed().as_millis() as u64;
+        tracing::info!(job_id = %id, "job cancel received from caller");
+        let build_server = self.hosted_state(id).is_none();
+        if build_server {
             self.connector_for_job(id)?;
         }
         if self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
             return Ok(CancelReply::new(id));
         }
+        // Mark the delivery before the intent is persisted, so the job's
+        // stream never acts on a pending cancel this call is about to send.
+        let _delivering = build_server.then(|| self.deliver_cancel(id));
         self.storage.cancel(id, true)?;
+        tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel intent persisted");
         if self.hosted_state(id).is_some() {
             tracing::info!(job_id = %id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
         }
@@ -1910,6 +1968,7 @@ impl Motor {
             .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
             .is_err()
         {
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel not delivered; retrying in the background");
             let motor = self.clone();
             tokio::spawn(async move {
                 let mut delay = 1;
@@ -1921,6 +1980,8 @@ impl Motor {
                     delay = (delay * 2).min(30);
                 }
             });
+        } else {
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel delivered to runner");
         }
         Ok(CancelReply::new(id))
     }
@@ -2443,6 +2504,10 @@ mod resubmit_tests;
 #[cfg(test)]
 #[path = "post_connect_tests.rs"]
 mod post_connect_tests;
+
+#[cfg(test)]
+#[path = "cancel_delivery_tests.rs"]
+mod cancel_delivery_tests;
 
 fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
     match incoming {
