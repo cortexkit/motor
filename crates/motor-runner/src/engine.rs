@@ -3373,7 +3373,9 @@ impl Runner {
             // A job held back only so that an earlier queued workspace job can
             // use their shared checkout first is waiting on a workspace
             // conflict, not on capacity, so its clock pauses as it would
-            // behind that workspace's running owner, which holds no permits.
+            // behind a running owner of its own workspace. Unlike that owner,
+            // the queued job holds no permits, so none are counted as about
+            // to be freed when checking that this job would otherwise fit.
             let held = owner.is_none()
                 && is_workspace_head
                 && !index.occupied(job.key())

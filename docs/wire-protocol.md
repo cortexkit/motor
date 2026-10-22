@@ -357,8 +357,8 @@ changes it. Tests:
 measured from when its bundles were verified and pinned. It counts time waiting
 for capacity or another shared scheduler blocker, but excludes time when an
 earlier job owning the same workspace is the only blocker, and time when the
-job is held back only for an earlier queued job whose main workspace is one of
-this job's sibling checkouts (the two share one directory). The runner resumes
+job is held back only for an earlier queued job whose main workspace overlaps
+one of this job's sibling checkout paths (both use the same host directory). The runner resumes
 the clock if another blocker appears. Upload, fetch, setup and execution are
 excluded. Cancellation still removes a queued job, and the request's execution
 timeout starts when its command starts. The `queue_wait_ms` in `started` and in
