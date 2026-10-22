@@ -130,8 +130,11 @@ if ($LASTEXITCODE -ne 0) { throw "Offline Cargo diagnostic failed; preserve $evi
 
 Pinned Cargo first attempts to fetch the locked `cfg-if 1.0.4` fixture as SYSTEM.
 The report records the crate archive path and checksum and the registry-configuration
-contents. For each observed `cfg-if` sparse-index entry, it also records the size
-and SHA-256, up to 64 KiB of hex bytes, and an escaped rendering of the first 96 bytes. It then runs pinned Cargo offline as
+contents. For each observed `cfg-if` sparse-index entry, it records a read error
+if the entry cannot be opened; otherwise it records the full size and SHA-256, the
+first 64 KiB of original entry bytes as hex (up to 128 KiB of hex text), and an
+escaped rendering of the first 96 original bytes. The report marks entries whose
+hex capture is truncated. It then runs pinned Cargo offline as
 SYSTEM in fresh homes containing (1) only the `.crate` archive, (2) that archive
 plus the observed registry configuration but no `.cache` entry, and (3) the full
 Cargo-generated cache. Each cell records Cargo's exit status and output. This

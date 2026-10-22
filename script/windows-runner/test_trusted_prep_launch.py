@@ -162,6 +162,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
 
     def test_offline_cargo_diagnostic_captures_real_index_bytes_and_tests_three_cache_layouts(self):
         self.assertCodeIn('"sparse_index_cache_entries_named_cfg_if": sparse_entries', self.prep)
+        self.assertCodeIn('part.as_os_str() == ".cache"', self.prep)
         self.assertCodeIn('"contents_hex_up_to_64_kib": hex_evidence(&bytes)', self.prep)
         self.assertCodeIn('"prefix_escaped_first_96_bytes": format!', self.prep)
         self.assertCodeIn('"crate_archive_only", false, false', self.prep)

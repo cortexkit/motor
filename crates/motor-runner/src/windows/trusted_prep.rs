@@ -522,27 +522,47 @@ fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
     const EXPECTED_CHECKSUM: &str =
         "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801";
 
-    fn files_below(root: &Path) -> Vec<PathBuf> {
+    fn files_below(root: &Path) -> (Vec<PathBuf>, Vec<serde_json::Value>) {
         let mut pending = vec![root.to_path_buf()];
         let mut files = Vec::new();
+        let mut errors = Vec::new();
         while let Some(directory) = pending.pop() {
-            let Ok(entries) = fs::read_dir(directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(kind) = entry.file_type() else {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    errors.push(serde_json::json!({
+                        "path": directory,
+                        "error": error.to_string()
+                    }));
                     continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        errors.push(serde_json::json!({
+                            "path": directory,
+                            "error": error.to_string()
+                        }));
+                        continue;
+                    }
                 };
-                if kind.is_dir() {
-                    pending.push(path);
-                } else if kind.is_file() {
-                    files.push(path);
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => pending.push(path),
+                    Ok(kind) if kind.is_file() => files.push(path),
+                    Ok(_) => {}
+                    Err(error) => errors.push(serde_json::json!({
+                        "path": path,
+                        "error": error.to_string()
+                    })),
                 }
             }
         }
         files.sort();
-        files
+        (files, errors)
     }
 
     fn relative(root: &Path, path: &Path) -> String {
@@ -562,31 +582,46 @@ fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
 
     let index_root = cargo_home.join("registry/index");
     let archive_root = cargo_home.join("registry/cache");
-    let index_files = files_below(&index_root);
-    let archive_files = files_below(&archive_root);
+    let (index_files, mut discovery_errors) = files_below(&index_root);
+    let (archive_files, archive_errors) = files_below(&archive_root);
+    discovery_errors.extend(archive_errors);
     let sparse_entries = index_files
         .iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "cfg-if"))
-        .map(|path| {
-            let bytes = fs::read(path).unwrap_or_default();
-            serde_json::json!({
+        .filter(|path| {
+            path.file_name().is_some_and(|name| name == "cfg-if")
+                && path
+                    .components()
+                    .any(|part| part.as_os_str() == ".cache")
+        })
+        .map(|path| match fs::read(path) {
+            Ok(bytes) => serde_json::json!({
                 "path": relative(cargo_home, path),
+                "readable": true,
                 "bytes": bytes.len(),
                 "sha256": format!("{:x}", Sha256::digest(&bytes)),
                 "contents_hex_up_to_64_kib": hex_evidence(&bytes),
                 "contents_truncated": bytes.len() > 65_536,
                 "prefix_escaped_first_96_bytes": format!("{:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(96)]))
-            })
+            }),
+            Err(error) => serde_json::json!({
+                "path": relative(cargo_home, path),
+                "readable": false,
+                "read_error": error.to_string()
+            }),
         })
         .collect::<Vec<_>>();
     let registry_config = index_files
         .iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "config.json"))
-        .map(|path| {
-            serde_json::json!({
+        .map(|path| match fs::read_to_string(path) {
+            Ok(contents) => serde_json::json!({
                 "path": relative(cargo_home, path),
-                "contents": fs::read_to_string(path).ok()
-            })
+                "contents": contents
+            }),
+            Err(error) => serde_json::json!({
+                "path": relative(cargo_home, path),
+                "read_error": error.to_string()
+            }),
         })
         .collect::<Vec<_>>();
     let archives = archive_files
@@ -595,16 +630,22 @@ fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
             path.file_name()
                 .is_some_and(|name| name == "cfg-if-1.0.4.crate")
         })
-        .map(|path| {
-            let checksum = fs::read(path)
-                .ok()
-                .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
-            let matches = checksum.as_deref() == Some(EXPECTED_CHECKSUM);
-            serde_json::json!({
+        .map(|path| match fs::read(path) {
+            Ok(bytes) => {
+                let checksum = format!("{:x}", Sha256::digest(bytes));
+                let matches = checksum == EXPECTED_CHECKSUM;
+                serde_json::json!({
+                    "path": relative(cargo_home, path),
+                    "sha256": checksum,
+                    "checksum_matches_lockfile": matches
+                })
+            }
+            Err(error) => serde_json::json!({
                 "path": relative(cargo_home, path),
-                "sha256": checksum,
-                "checksum_matches_lockfile": matches
-            })
+                "sha256": null,
+                "checksum_matches_lockfile": false,
+                "read_error": error.to_string()
+            }),
         })
         .collect::<Vec<_>>();
     let archive_ready = archives
@@ -612,6 +653,7 @@ fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
         .any(|entry| entry["checksum_matches_lockfile"] == true);
     serde_json::json!({
         "cargo_home": cargo_home,
+        "file_discovery_errors": discovery_errors,
         "registry_config_files": registry_config,
         "sparse_index_cache_entries_named_cfg_if": sparse_entries,
         "crate_archives_named_cfg_if_1_0_4": archives,
@@ -620,7 +662,7 @@ fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
         "lockfile_crates_io_dependencies": [{
             "name": "cfg-if", "version": "1.0.4", "sha256": EXPECTED_CHECKSUM
         }],
-        "sparse_cache_format_evidence": "Actual bytes, size and SHA-256 captured from pinned Cargo output; prefix fields are observations, not synthesized Cargo cache data"
+        "sparse_cache_format_evidence": "Cargo-created bytes are reported as found; read failures are explicit and no cache bytes are synthesized"
     })
 }
 
