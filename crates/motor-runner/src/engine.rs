@@ -2465,9 +2465,11 @@ impl Runner {
         let mut job = inner.jobs[&id].clone();
         // Each record below is saved without the state lock, and published
         // only once saved: until then the job stays AwaitingBundles in memory,
-        // so neither dispatch nor status runs ahead of the disk. Every other
-        // writer of this job's record holds `log.write`, so the in-memory job
-        // is still the one read here when the saved record replaces it.
+        // so neither dispatch nor status runs ahead of the disk. Cancel,
+        // withdraw, refuse and `forget_unadmitted`, the paths that change an
+        // AwaitingBundles job, all take `log.write`, held here, so the
+        // in-memory job is still the one read here when the saved record
+        // replaces it.
         if let Err(error) = fetched {
             let detail = self.safe_refusal_detail(
                 transfer_refusal_detail(&error),

@@ -535,8 +535,8 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
 }
 
 /// `atomic_json` for a value already serialized, so a caller can serialize
-/// under a lock and write after releasing it. `private` creates the file
-/// readable by its owner only, as `atomic_json_private` does.
+/// under a lock and write after releasing it. `private` writes it as
+/// `atomic_json_private` does (on Unix, readable by its owner only).
 pub(crate) fn atomic_bytes(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let parent = path
         .parent()
