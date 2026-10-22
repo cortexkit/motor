@@ -51,7 +51,10 @@
 //!    touches the snapshot and returns a `Pending` record update;
 //! 4. applies each `Pending` to the catalog under the state lock, after
 //!    `note_workspace` has recorded W, only when the whole setup completed.
-//!    A failed or refused setup drops them and leaves the record unchanged.
+//!    A setup that fails or is refused before that point drops them and
+//!    leaves the record unchanged. Once applied, a record stays correct even
+//!    if saving the catalog then fails, because the touch it describes has
+//!    already happened.
 //!
 //! `prepare_siblings` does steps 2 and 3 for every sibling of a request.
 

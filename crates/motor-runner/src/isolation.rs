@@ -690,11 +690,12 @@ fn javascript_executable(manager: &str) -> PathBuf {
     }
 }
 
-/// The `--version` output of every package manager installs can use, by
-/// manager name, and of Node, for the sibling snapshot key. A manager that
-/// is missing or fails is left out and a missing Node gives empty output, so
-/// installing one changes the key without making snapshot setup fail here;
-/// an install that needs it still fails as it does today.
+/// For the sibling snapshot key: the `--version` output of each JavaScript
+/// package manager (bun, npm, pnpm) that runs here, by manager name, and of
+/// Node. A manager that is missing or fails is left out and a missing Node
+/// gives empty output, so installing one changes the key without making
+/// snapshot setup fail here; an install that needs it still fails as it does
+/// today.
 pub(crate) fn javascript_runner_versions() -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
     let version = |executable: PathBuf| {
         Command::new(executable)

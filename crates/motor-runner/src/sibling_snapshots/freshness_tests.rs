@@ -398,8 +398,9 @@ fn new_snapshot_copied_from_a_third_tree_rebuilds_what_differs_from_the_last_bui
     let w = f.workspace("w");
     f.setup(&w, &b1);
     assert_eq!(f.build(&w).output, "x1 y1");
-    // Another workspace uses b3, so it is the most recently used snapshot
-    // and the creation of b2 copies it: x keeps b3's file and its old mtime.
+    // Resolving b3 again, as another workspace's setup would, makes it the
+    // most recently used snapshot, so the creation of b2 copies it: x keeps
+    // b3's file and its old mtime.
     f.create(&b3);
     f.copies.lock().unwrap().clear();
     f.setup(&w, &b2);
@@ -428,8 +429,7 @@ fn retry_after_refused_setups_at_the_new_tree_rebuilds() {
     assert!(error.to_string().contains("refusing it"), "{error}");
     assert_eq!(f.record(&w), before);
 
-    // This attempt touched b2 and was refused afterwards, so its update is
-    // dropped.
+    // A setup refused after its touch of b2: its pending update is dropped.
     let refused = f.touch(&w, &b2, SystemTime::now()).unwrap();
     assert!(refused.touched() > 0);
     drop(refused);
@@ -537,7 +537,8 @@ fn workspace_built_before_any_record_starts_from_an_unknown_tree() {
     f.create(&b);
     f.create(&c);
     let w = f.workspace("w");
-    // Built against a with in-place siblings: catalogued, but no record.
+    // As after a build with in-place siblings at a: the workspace is
+    // catalogued but has no freshness record.
     f.note(&w);
     f.point(&w, &sa);
     assert_eq!(f.build(&w).output, "x1 y1");

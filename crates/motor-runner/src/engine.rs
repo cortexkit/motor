@@ -3180,8 +3180,10 @@ impl Runner {
             prior.is_none(),
             r.workspace_kind,
         );
-        // Only a Prepare that completed its touch updates the freshness
-        // record; a failed one leaves it as it was.
+        // Only a Prepare whose checkout and touch completed updates the
+        // freshness record; a failure before this point leaves it as it was.
+        // A record applied here stays correct even if the catalog write below
+        // fails: the touch it describes has already happened.
         let populated = populated.map(|freshness| {
             for pending in freshness {
                 if !pending.apply(&mut inner.catalog, &r.workspace_key) {
