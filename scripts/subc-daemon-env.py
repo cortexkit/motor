@@ -26,10 +26,14 @@ under motor's crates/; no local helper source is exempt:
 
 Untracked Rust files are checked too, so adding a suite cannot bypass the gate.
 """
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Python 3.11 or newer is required; run: python3.11 scripts/subc-daemon-env.py")
+
 from pathlib import Path
 import re
 import runpy
-import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 # The same 58-file Rust census as test-scratch.py; keep at least 50 files.
