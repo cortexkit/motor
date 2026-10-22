@@ -673,6 +673,8 @@ struct Inner {
     exit_statuses: BTreeMap<Uuid, backend::ExecutionOutcome>,
     cpu_times: BTreeMap<Uuid, u64>,
     pending_start_refusals: BTreeSet<Uuid>,
+    /// The sibling fences scheduling applies; fixed by the configuration.
+    sibling_fences: crate::sibling_snapshots::SiblingFences,
 }
 
 fn nested_workspace_detail(
@@ -1714,6 +1716,7 @@ impl Runner {
         } else {
             None
         };
+        let sibling_fences = config.sibling_fences();
         let runner = Self {
             core: Arc::new(Core {
                 tenant_events,
@@ -1757,6 +1760,7 @@ impl Runner {
                     exit_statuses: BTreeMap::new(),
                     cpu_times: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
+                    sibling_fences,
                 }),
                 job_logs: Mutex::new(BTreeMap::new()),
                 ref_mutation: Mutex::new(()),
@@ -2386,20 +2390,40 @@ impl Runner {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
     }
-    /// A running job, or a setup in flight, owns this workspace key.
+    /// A running job, or a setup in flight, owns this workspace key. With
+    /// in-place siblings, so does a running or reserved job that checks out
+    /// an overlapping path as a sibling. With snapshot siblings, only a
+    /// running job started with its siblings bound from their host paths
+    /// still does (see `legacy_sibling_user`).
     fn occupied(inner: &Inner, key: &str) -> bool {
+        use crate::sibling_snapshots::SiblingFences;
+        let in_place = inner.sibling_fences == SiblingFences::InPlace;
         inner.reserved.contains_key(key)
-            || inner
-                .reserved
-                .values()
-                .any(|r| Self::workspace_uses_sibling(key, &r.siblings))
+            || (in_place
+                && inner
+                    .reserved
+                    .values()
+                    .any(|r| Self::workspace_uses_sibling(key, &r.siblings)))
             || Self::scheduler_jobs(inner).any(|j| {
                 j.state == JobState::Running
                     && (j.key() == key
-                        || j.request
-                            .as_ref()
-                            .is_some_and(|r| Self::workspace_uses_sibling(key, &r.siblings)))
+                        || ((in_place || Self::legacy_sibling_user(inner, j))
+                            && j.request
+                                .as_ref()
+                                .is_some_and(|r| Self::workspace_uses_sibling(key, &r.siblings))))
             })
+    }
+
+    /// In snapshot mode, whether `job` still binds its siblings from their
+    /// host paths: it has no `sibling_sources`, so an older runner, or one
+    /// with in-place siblings, started it. Warm builds never mount siblings.
+    /// This term only matters until the jobs started before the switch to
+    /// snapshots have ended.
+    fn legacy_sibling_user(inner: &Inner, job: &Job) -> bool {
+        inner.sibling_fences == crate::sibling_snapshots::SiblingFences::Legacy
+            && job.state == JobState::Running
+            && !job.base
+            && job.sibling_sources.is_none()
     }
 
     // A head checkout can also be a different repository's canonical sibling.
@@ -2785,6 +2809,13 @@ impl Runner {
         if inner.dropping.is_empty() {
             return false;
         }
+        // A drop deletes a host path. Only an in-place sibling lives at one;
+        // a snapshot cannot be affected by it.
+        let siblings = if inner.sibling_fences == crate::sibling_snapshots::SiblingFences::InPlace {
+            siblings
+        } else {
+            &[]
+        };
         let paths: Vec<_> = std::iter::once(PathBuf::from(key))
             .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
             .flat_map(|p| {
@@ -3027,6 +3058,10 @@ impl Runner {
         self.write_catalog(catalog)
     }
     fn siblings_blocked(inner: &Inner, siblings: &[SiblingSnapshot]) -> bool {
+        // Snapshot siblings never share a checkout with anything.
+        if inner.sibling_fences != crate::sibling_snapshots::SiblingFences::InPlace {
+            return false;
+        }
         Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Running)
             .any(|j| {
@@ -5409,12 +5444,24 @@ impl Runner {
         let rotation = inner
             .rotation
             .insert(r.workspace_key.clone(), inner.dispatch);
+        // In snapshot mode no sibling is checked out in place, so the
+        // in-place sibling commits are not needed; the freshness record and
+        // the start time the switch touch needs are taken here instead,
+        // while the workspace is reserved. A warm build mounts no siblings.
+        let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let setup = Setup {
             id,
             cpus,
-            request: r,
             base: job.base,
-            recorded: inner.catalog.sibling_commits.clone(),
+            recorded: if snapshot_mode {
+                BTreeMap::new()
+            } else {
+                inner.catalog.sibling_commits.clone()
+            },
+            snapshots: (snapshot_mode && !job.base).then(|| {
+                crate::sibling_snapshots::JobSiblings::reserve(&inner.catalog, &r.workspace_key)
+            }),
+            request: r,
         };
         // The undo reaches the setup thread as plain data and becomes a
         // `PendingStart` only there. If the thread cannot be created, the
@@ -5429,6 +5476,7 @@ impl Runner {
         let runner = self.clone();
         let thread_workspace = workspace.clone();
         let spawned = self.spawn_setup(move || {
+            let mut setup = setup;
             let mut pending = PendingStart {
                 runner: runner.clone(),
                 id,
@@ -5439,7 +5487,7 @@ impl Runner {
             if !runner.persist_setup(&setup, &mut pending) {
                 return;
             }
-            let prepared = runner.setup(&setup);
+            let prepared = runner.setup(&mut setup);
             if let Err(error) = runner.launch(setup, prepared, &mut pending) {
                 tracing::error!(job_id = %id, %error, "job launch failed");
             }
@@ -5513,8 +5561,11 @@ impl Runner {
         );
         false
     }
-    /// The long part of starting a job, run without the state lock.
-    fn setup(&self, s: &Setup) -> io::Result<Prepared> {
+    /// The long part of starting a job, run without the state lock. In
+    /// snapshot mode it resolves and touches the job's sibling snapshots
+    /// before materializing the workspace, holding the workspace's
+    /// reservation and no lock.
+    fn setup(&self, s: &mut Setup) -> io::Result<Prepared> {
         crate::setup_log::materialize(s.id, s.base, self.core.tenant_events.clone(), || {
             if let Some(full) =
                 crate::setup_log::phase("disk admission", || self.ensure_disk_space())?
@@ -5523,6 +5574,27 @@ impl Runner {
                     "runner_disk_full: free_bytes={} floor_bytes={}",
                     full.free_bytes, full.floor_bytes
                 )));
+            }
+            if let Some(snapshots) = &mut s.snapshots {
+                let r = &s.request;
+                // Validated before a sibling's mirror is read for it.
+                workspace::validate_destinations(
+                    &self.core.config.owned_workspace_roots,
+                    &r.workspace_key,
+                    Some(&r.cwd),
+                    &r.siblings,
+                )?;
+                setup_step(
+                    "prepare sibling snapshots",
+                    crate::setup_log::phase("prepare sibling snapshots", || {
+                        snapshots.resolve(
+                            &self.core.config,
+                            &self.core.snapshots,
+                            &self.core.trees,
+                            &r.siblings,
+                        )
+                    }),
+                )?;
             }
             self.materialize(s)
         })
@@ -5581,7 +5653,7 @@ impl Runner {
     /// lock, held throughout.
     fn launch(
         &self,
-        s: Setup,
+        mut s: Setup,
         prepared: io::Result<Prepared>,
         pending: &mut PendingStart,
     ) -> io::Result<()> {
@@ -5589,9 +5661,13 @@ impl Runner {
         let log = self.job_log(id);
         let _write = log.lock_write();
         let r = s.request.clone();
+        let snapshots = s.snapshots.take();
+        let sibling_sources = snapshots.as_ref().map(|snapshots| snapshots.sources());
         let mut inner = self.core.inner.lock().unwrap();
         if s.base {
-            if prepared.is_ok() {
+            // A warm build never checks its siblings out, and in snapshot
+            // mode nothing records in-place sibling commits any more.
+            if prepared.is_ok() && !self.core.config.sibling_snapshot_mode() {
                 workspace::record_siblings(&mut inner.catalog, &r.siblings);
             }
         } else {
@@ -5602,9 +5678,14 @@ impl Runner {
                 &r.snapshot_commit,
                 &r.siblings,
                 prepared.is_ok(),
-                true,
+                snapshots.is_none(),
                 r.workspace_kind,
             );
+            // Only a setup that completed, and so completed its switch
+            // touch, updates the workspace's sibling freshness record.
+            if let Some(snapshots) = snapshots.filter(|_| prepared.is_ok()) {
+                snapshots.apply(&mut inner.catalog, &r.workspace_key);
+            }
         }
         let live = inner
             .jobs
@@ -5735,6 +5816,10 @@ impl Runner {
         job.state = JobState::Running;
         job.process = launch.process;
         job.durable_output = launch.durable_output;
+        // Saved with the process and Started below, before the execution gate
+        // opens: a job with this field mounts no sibling host path, so no
+        // sibling fence applies to it, even after a restart.
+        job.sibling_sources = sibling_sources;
         let started_ms = self.now();
         job.started_ms = Some(started_ms);
         // Persist start progress with the timeout origin before opening the
@@ -7093,8 +7178,13 @@ struct DispatchIndex {
     workspace_owners: BTreeMap<String, (Uuid, u32)>,
     /// Running/setup jobs that check out each sibling path, with their permit
     /// weights. A sibling is checked out in place at its canonical path, so
-    /// these jobs also hold any workspace at an overlapping path.
+    /// these jobs also hold any workspace at an overlapping path. With
+    /// snapshot siblings only running legacy sibling users are listed (see
+    /// `Runner::legacy_sibling_user`).
     sibling_users: BTreeMap<String, BTreeMap<Uuid, u32>>,
+    /// Whether siblings are checked out in place, so that sibling users and
+    /// main-workspace jobs of one path exclude each other.
+    in_place: bool,
 }
 
 impl DispatchIndex {
@@ -7104,7 +7194,10 @@ impl DispatchIndex {
     /// The index as it would be if the `excluded` running or setup jobs had
     /// finished, their setup reservations included.
     fn build_without(inner: &Inner, excluded: &BTreeSet<Uuid>) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            in_place: inner.sibling_fences == crate::sibling_snapshots::SiblingFences::InPlace,
+            ..Self::default()
+        };
         let mut excluded_reservations = BTreeSet::new();
         for job in Runner::scheduler_jobs(inner) {
             if excluded.contains(&job.id) {
@@ -7118,7 +7211,9 @@ impl DispatchIndex {
                 index
                     .workspace_owners
                     .insert(job.key().to_owned(), (job.id, job.weight));
-                index.add_sibling_user(job);
+                if index.in_place || Runner::legacy_sibling_user(inner, job) {
+                    index.add_sibling_user(job);
+                }
             }
             if !job.base && job.pending() {
                 index.foreground_pending += 1;
@@ -7142,12 +7237,16 @@ impl DispatchIndex {
                         request.workspace_key.clone()
                     });
                     for sibling in &request.siblings {
-                        index.sibling_paths.insert(sibling.canonical_path.clone());
-                        index
-                            .running_siblings
-                            .entry(sibling.canonical_path.clone())
-                            .or_default()
-                            .insert(sibling.commit.clone());
+                        if index.in_place || Runner::legacy_sibling_user(inner, job) {
+                            index.sibling_paths.insert(sibling.canonical_path.clone());
+                        }
+                        if index.in_place {
+                            index
+                                .running_siblings
+                                .entry(sibling.canonical_path.clone())
+                                .or_default()
+                                .insert(sibling.commit.clone());
+                        }
                     }
                 }
             }
@@ -7168,6 +7267,10 @@ impl DispatchIndex {
     fn reserve(&mut self, key: &str, siblings: &[SiblingSnapshot]) {
         self.workspaces.insert(key.to_owned());
         self.reserved_paths.insert(key.to_owned());
+        // A setup in flight in snapshot mode never touches a sibling's path.
+        if !self.in_place {
+            return;
+        }
         for sibling in siblings {
             self.sibling_paths.insert(sibling.canonical_path.clone());
             self.reserved_siblings
@@ -7208,23 +7311,27 @@ impl DispatchIndex {
         siblings: &[SiblingSnapshot],
         catalog: &BTreeMap<String, String>,
     ) -> bool {
-        siblings.iter().any(|sibling| {
-            self.running_paths
-                .iter()
-                .chain(&self.reserved_paths)
-                .any(|path| Self::overlap(path, &sibling.canonical_path))
-                || self
-                    .running_siblings
-                    .get(&sibling.canonical_path)
-                    .is_some_and(|commits| commits.iter().any(|commit| commit != &sibling.commit))
-                || self
-                    .reserved_siblings
-                    .get(&sibling.canonical_path)
-                    .is_some_and(|commits| {
-                        catalog.get(&sibling.canonical_path) != Some(&sibling.commit)
-                            || commits.iter().any(|commit| commit != &sibling.commit)
-                    })
-        })
+        // Snapshot siblings never share a checkout with anything.
+        self.in_place
+            && siblings.iter().any(|sibling| {
+                self.running_paths
+                    .iter()
+                    .chain(&self.reserved_paths)
+                    .any(|path| Self::overlap(path, &sibling.canonical_path))
+                    || self
+                        .running_siblings
+                        .get(&sibling.canonical_path)
+                        .is_some_and(|commits| {
+                            commits.iter().any(|commit| commit != &sibling.commit)
+                        })
+                    || self
+                        .reserved_siblings
+                        .get(&sibling.canonical_path)
+                        .is_some_and(|commits| {
+                            catalog.get(&sibling.canonical_path) != Some(&sibling.commit)
+                                || commits.iter().any(|commit| commit != &sibling.commit)
+                        })
+            })
     }
     /// Whether a queued workspace job holds `job` back from starting.
     ///
@@ -7237,8 +7344,12 @@ impl DispatchIndex {
     /// declares an overlapping sibling and was accepted after it. Holding
     /// only later arrivals keeps the waits acyclic: two repositories that
     /// name each other as siblings cannot hold each other back. Cache-fill
-    /// jobs and jobs that can never fit the runner do not hold anyone.
+    /// jobs and jobs that can never fit the runner do not hold anyone. With
+    /// snapshot siblings there is no shared checkout, so nobody is held.
     fn held_by_queued_workspace(&self, inner: &Inner, job: &Job, max_weight: u32) -> bool {
+        if !self.in_place {
+            return false;
+        }
         let Some(request) = job.request.as_ref() else {
             return false;
         };
@@ -7307,7 +7418,11 @@ impl DispatchIndex {
             self.weight = self.weight.saturating_add(job.weight);
             self.workspace_owners
                 .insert(key.to_owned(), (job.id, job.weight));
-            self.add_sibling_user(job);
+            // A job just started is set up by this runner, so it is never a
+            // legacy sibling user.
+            if self.in_place {
+                self.add_sibling_user(job);
+            }
             let request = job.request.as_ref().unwrap();
             self.reserve(key, &request.siblings);
         }

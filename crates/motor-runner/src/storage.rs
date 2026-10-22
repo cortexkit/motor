@@ -215,6 +215,14 @@ pub(crate) struct Job {
     /// Fixed execution end, independent of delayed launcher-accounting delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ended_ms: Option<u64>,
+    /// The sibling snapshot directories this job's unit binds at its
+    /// siblings' paths, set in the save that records its process and start.
+    /// A running job without it was started with each sibling bound from its
+    /// host path, by an older runner or in in-place mode, so a main-workspace
+    /// job must not check that path out until it ends. Older runners ignore
+    /// the field, and a record they rewrite loses it, which only fences more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sibling_sources: Option<Vec<String>>,
 }
 
 /// A sidecar preserves damaged records and any independently readable ownership.
@@ -306,6 +314,7 @@ impl Job {
             memory_limit_detail: None,
             reservation_use: None,
             execution_ended_ms: None,
+            sibling_sources: None,
         }
     }
     pub fn pending(&self) -> bool {

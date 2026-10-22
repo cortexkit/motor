@@ -19,6 +19,9 @@ fn runner(f: &Fixture) -> Runner {
     config.max_weight = 64;
     config.cpu_topology = Some(CpuTopology::new((0..65).map(|cpu| vec![cpu]).collect()).unwrap());
     config.disable_warm_builds = true;
+    // The sibling fences below exist only while siblings are checked out in
+    // place at their host paths.
+    config.sibling_snapshot_mode_override = Some(false);
     Runner::open(config).unwrap()
 }
 
@@ -502,6 +505,9 @@ fn manual_runner(f: &Fixture) -> Runner {
     config.cpu_topology = Some(CpuTopology::new((0..65).map(|cpu| vec![cpu]).collect()).unwrap());
     config.disable_warm_builds = true;
     config.manual_tick = true;
+    // The sibling fences below exist only while siblings are checked out in
+    // place at their host paths.
+    config.sibling_snapshot_mode_override = Some(false);
     Runner::open(config).unwrap()
 }
 

@@ -8,7 +8,8 @@
 //! A snapshot is built under a temporary name, from a copy of the most
 //! recently used ready snapshot of the same repository (its predecessor) or
 //! from a fresh clone of the mirror. Its tree is verified against the
-//! requested `tree_hash`, its JavaScript dependencies are installed from its
+//! requested `tree_hash`, its Git directory is made independent of the
+//! mirror, its JavaScript dependencies are installed from its
 //! lockfiles, group and other write access is removed, and the
 //! job account gets read-only access. Then its metadata, which records the
 //! verified tree, is written and fsynced beside the directory, and a rename
@@ -352,6 +353,7 @@ impl SnapshotStore {
             let mismatch = Trees::tree_hash_mismatch(temporary, tree_hash, &computed);
             return Err(invalid(format!("sibling {}: {mismatch}", key.repository)));
         }
+        dissociate(temporary)?;
         install_javascript(config, key, tree_hash, temporary)?;
         remove_group_and_other_write(temporary)?;
         restrict_job_access(config, temporary)?;
@@ -514,6 +516,22 @@ pub(crate) fn remove_group_and_other_write(_root: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "sibling snapshots need a Unix runner",
     ))
+}
+
+/// Copies every object the snapshot's Git directory borrows from the mirror
+/// into its own pack and drops the link to the mirror. Jobs cannot read the
+/// mirror, so Git inside a job needs the snapshot to stand alone. Both a
+/// fresh clone (`clone --shared`) and a copied predecessor (re-linked by the
+/// sync) borrow from the mirror at this point.
+fn dissociate(temporary: &Path) -> io::Result<()> {
+    let alternates = temporary.join(".git/objects/info/alternates");
+    if !alternates.is_file() {
+        return Ok(());
+    }
+    crate::setup_log::phase("dissociate sibling snapshot", || {
+        crate::workspace::git(temporary, &["repack", "-a", "-d", "-q"])
+    })?;
+    fs::remove_file(alternates)
 }
 
 /// Installs the snapshot's JavaScript dependencies from its lockfiles, once,

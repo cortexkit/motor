@@ -80,6 +80,7 @@ fn prepare(runner: &Runner, f: &Fixture, command: &str) -> (Setup, Prepared) {
         cpus: vec![12, 13, 14, 15],
         base: false,
         recorded: BTreeMap::new(),
+        snapshots: None,
     };
     let prepared = WindowsBackend
         .materialize(runner.config(), &runner.core.trees, &setup)
@@ -636,6 +637,7 @@ fn windows_qualification_one_vm_slot_lock_refuses_without_boot() {
         cpus: vec![12, 13, 14, 15],
         base: false,
         recorded: BTreeMap::new(),
+        snapshots: None,
     };
     let error = WindowsBackend
         .materialize(runner.config(), &runner.core.trees, &setup)

@@ -138,6 +138,7 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
                     request: setup.clone(),
                     base: false,
                     recorded: BTreeMap::new(),
+                    snapshots: None,
                 },
                 Err(io::Error::other("sandbox ownership denied")),
             )

@@ -154,13 +154,15 @@ async fn isolated_workspace_prepare_preserves_job_owned_target_and_starts_new_ta
 /// A sibling checkout can also be another repository's own workspace, which
 /// that repository's jobs leave owned by the job account. Git then refuses the
 /// runner's sibling sync with "detected dubious ownership", so preparing a job
-/// that names the path as a sibling must take it back first.
+/// that names the path as a sibling must take it back first. Only in-place
+/// siblings are checked out at that path; snapshot mode never touches it.
 #[tokio::test]
 #[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
 async fn isolated_sibling_left_job_owned_by_its_own_workspace_job_still_populates() {
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
+    config.sibling_snapshot_mode_override = Some(false);
     let runner = Runner::open(config).unwrap();
     let (first, bytes) = f.run("cat ../commons/source");
     f.submit(&runner, &first, &bytes);

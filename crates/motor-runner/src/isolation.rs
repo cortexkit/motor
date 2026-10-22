@@ -1903,16 +1903,17 @@ fn run_cargo_fetch_on_host(command: &mut Command, fetch: CargoFetch) -> io::Resu
     }
 }
 
-/// In sibling snapshot mode the prefetch runs in helper units that show each
-/// sibling's snapshot at the sibling's path, as the job will see it, rather
-/// than whatever checkout is on the host at that path.
-pub(crate) struct SnapshotPrefetch<'a> {
+/// In sibling snapshot mode the job's unit binds each sibling's snapshot at
+/// the sibling's path (and at the worktree alias), and the Cargo prefetch runs
+/// in helper units that show the same view, rather than whatever checkout is
+/// on the host at that path.
+pub(crate) struct SnapshotSiblings<'a> {
     pub(crate) config: &'a crate::engine::Config,
     /// Each sibling's snapshot directory and canonical path.
     pub(crate) siblings: Vec<(PathBuf, PathBuf)>,
 }
 
-impl SnapshotPrefetch<'_> {
+impl SnapshotSiblings<'_> {
     /// Runs one fetch in a helper unit. Its limit is the configured prefetch
     /// limit, or the fetch's own bound when that is shorter.
     fn run(
@@ -2010,7 +2011,7 @@ fn prefetch_cargo_dependencies(
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
-    snapshots: Option<&SnapshotPrefetch<'_>>,
+    snapshots: Option<&SnapshotSiblings<'_>>,
 ) -> io::Result<()> {
     let stage = if writer {
         "fetch integration-tip dependencies (Cargo.lock)"
@@ -2079,6 +2080,56 @@ fn fetch_failure(stage: &str, error: &str) -> String {
     }
 }
 
+/// The read-only mounts that show each sibling to a job, as (systemd mount
+/// spec, destination): one at the sibling's canonical path P and, when the
+/// workspace's parent is not P's parent, one at the alias
+/// `<workspace parent>/<name>` that `../<name>` resolves to. The source of
+/// both is the sibling's snapshot when `snapshots` is given, otherwise the
+/// in-place checkout at P.
+fn sibling_mounts(
+    workspace: &Path,
+    siblings: &[SiblingSnapshot],
+    snapshots: Option<&SnapshotSiblings<'_>>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut mounts = Vec::new();
+    for sibling in siblings {
+        let path = Path::new(&sibling.canonical_path);
+        let source = match snapshots {
+            Some(snapshots) => snapshots
+                .siblings
+                .iter()
+                .find(|(_, canonical)| canonical == path)
+                .map(|(snapshot, _)| snapshot.as_path())
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "sibling {} has no resolved snapshot",
+                        path.display()
+                    ))
+                })?,
+            None => path,
+        };
+        mounts.push((
+            if source == path {
+                word(path)?
+            } else {
+                bind(source, path)?
+            },
+            path.to_path_buf(),
+        ));
+        let alias = workspace
+            .parent()
+            .ok_or_else(|| io::Error::other("workspace parent"))?
+            .join(
+                path.file_name()
+                    .ok_or_else(|| io::Error::other("sibling name"))?,
+            );
+        if alias != path {
+            mounts.push((bind(source, &alias)?, alias));
+        }
+    }
+    Ok(mounts)
+}
+
 impl Sandbox {
     pub(crate) fn tracking_cleanup(
         self,
@@ -2134,8 +2185,9 @@ impl Sandbox {
         )
     }
 
-    /// `snapshot_prefetch` is given in sibling snapshot mode: the Cargo
-    /// prefetch then sees each sibling's snapshot at the sibling's path.
+    /// `snapshots` is given in sibling snapshot mode: the job then sees each
+    /// sibling's snapshot at the sibling's path, and so does the Cargo
+    /// prefetch.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_with_dependencies(
         id: Uuid,
@@ -2151,7 +2203,7 @@ impl Sandbox {
         repository: &str,
         tenant_vm: bool,
         shared_compile_cache: bool,
-        snapshot_prefetch: Option<&SnapshotPrefetch<'_>>,
+        snapshots: Option<&SnapshotSiblings<'_>>,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2168,7 +2220,7 @@ impl Sandbox {
             false,
             tenant_vm,
             shared_compile_cache,
-            snapshot_prefetch,
+            snapshots,
         )
     }
 
@@ -2219,7 +2271,7 @@ impl Sandbox {
         writer: bool,
         tenant_vm: bool,
         shared_compile_cache: bool,
-        snapshot_prefetch: Option<&SnapshotPrefetch<'_>>,
+        snapshots: Option<&SnapshotSiblings<'_>>,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -2252,9 +2304,14 @@ impl Sandbox {
                 dependency_routes,
                 &cargo,
                 &rustup,
-                snapshot_prefetch,
+                snapshots,
             )?;
         }
+        // A snapshot's JavaScript dependencies were installed and its Git
+        // directory made independent when it was created, so in snapshot mode
+        // both steps below cover the workspace alone and never touch a
+        // sibling's host path.
+        let in_place_siblings = if snapshots.is_some() { &[] } else { siblings };
         // Offline jobs have no route to package registries. Resolve only from
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
@@ -2264,7 +2321,7 @@ impl Sandbox {
                     workspace,
                     repository,
                     tree,
-                    siblings,
+                    in_place_siblings,
                     |checkout, repository, checkout_tree| {
                         prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
                     },
@@ -2273,9 +2330,11 @@ impl Sandbox {
         }
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
-        for path in std::iter::once(workspace.to_path_buf())
-            .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
-        {
+        for path in std::iter::once(workspace.to_path_buf()).chain(
+            in_place_siblings
+                .iter()
+                .map(|s| PathBuf::from(&s.canonical_path)),
+        ) {
             if path.join(".git/objects/info/alternates").is_file() {
                 crate::setup_log::phase("dissociate checkout", || {
                     workspace::git(&path, &["repack", "-a", "-d"])
@@ -2426,21 +2485,9 @@ impl Sandbox {
             read_only.push(word(&git)?);
             mount_destinations.push(git);
         }
-        for sibling in siblings {
-            let path = Path::new(&sibling.canonical_path);
-            read_only.push(word(path)?);
-            mount_destinations.push(path.to_path_buf());
-            let alias = workspace
-                .parent()
-                .ok_or_else(|| io::Error::other("workspace parent"))?
-                .join(
-                    path.file_name()
-                        .ok_or_else(|| io::Error::other("sibling name"))?,
-                );
-            if alias != path {
-                read_only.push(bind(path, &alias)?);
-                mount_destinations.push(alias);
-            }
+        for (mount, destination) in sibling_mounts(workspace, siblings, snapshots)? {
+            read_only.push(mount);
+            mount_destinations.push(destination);
         }
         let tools = runtime.0.join("tools");
         if cached_rust || wrapper.is_some() {

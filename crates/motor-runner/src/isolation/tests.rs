@@ -2308,7 +2308,7 @@ fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
             .join(".rustup")
             .into_os_string()
     }));
-    let fetch = |snapshots: Option<&SnapshotPrefetch<'_>>| {
+    let fetch = |snapshots: Option<&SnapshotSiblings<'_>>| {
         prefetch_cargo_dependencies(
             false,
             false,
@@ -2323,9 +2323,73 @@ fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
     };
     // Today's in-place prefetch reads the host checkout and fails.
     assert!(fetch(None).is_err());
-    fetch(Some(&SnapshotPrefetch {
+    fetch(Some(&SnapshotSiblings {
         config: &config,
         siblings: vec![(snapshot.clone(), host.clone())],
     }))
     .unwrap();
+}
+
+/// A job sees each sibling at its canonical path and, from a worktree in
+/// another directory, at the `../<name>` alias. With in-place siblings both
+/// mounts show the checkout at the canonical path; in snapshot mode both show
+/// the sibling's snapshot, never the host checkout at that path.
+#[test]
+fn sibling_mounts_bind_the_snapshot_at_the_sibling_path_and_its_alias() {
+    let config = crate::engine::Config::new("/state-root", "main");
+    let sibling = |path: &str| SiblingSnapshot {
+        canonical_path: path.into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    };
+    let worktree = Path::new("/w/worktrees/a");
+    let beside = Path::new("/w/source/a");
+    let siblings = [sibling("/w/source/commons")];
+    let snapshot = PathBuf::from("/state-root/main/sibling-snapshots/commons/s1");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot, PathBuf::from("/w/source/commons"))],
+    };
+    let mounts = |workspace: &Path, snapshots: Option<&SnapshotSiblings<'_>>| {
+        sibling_mounts(workspace, &siblings, snapshots).unwrap()
+    };
+
+    assert_eq!(
+        mounts(worktree, None),
+        [
+            (
+                "/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/w/source/commons:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    assert_eq!(
+        mounts(worktree, Some(&snapshots)),
+        [
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    // Beside the sibling, `../commons` is its canonical path: one mount.
+    assert_eq!(
+        mounts(beside, Some(&snapshots)),
+        [(
+            "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+            PathBuf::from("/w/source/commons")
+        )]
+    );
+    // A sibling without a resolved snapshot is refused rather than mounted
+    // from the host.
+    assert!(sibling_mounts(worktree, &[sibling("/w/source/other")], Some(&snapshots)).is_err());
 }

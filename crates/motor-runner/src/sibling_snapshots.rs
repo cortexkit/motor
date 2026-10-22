@@ -5,10 +5,12 @@
 //! that use it as a sibling exclude each other. With snapshots, isolated Linux
 //! jobs mount a read-only copy at P, and P is only ever a main workspace.
 //!
-//! This module holds the parts that change no behaviour yet: the mode
-//! predicates, the snapshot key and the store that creates snapshots. Nothing
-//! creates, mounts or removes snapshots while `Config::sibling_snapshot_mode`
-//! is false, and production builds keep it false; only tests override it.
+//! This module holds the mode predicates, the snapshot key, the store that
+//! creates snapshots, the switch touch that keeps Cargo's freshness checks
+//! correct across snapshots, and the per-job setup state that ties them
+//! together. Nothing creates or mounts snapshots while
+//! `Config::sibling_snapshot_mode` is false: on non-isolated runners and on
+//! the Windows instance.
 
 pub(crate) mod freshness;
 #[cfg(any(target_os = "linux", test))]
@@ -18,18 +20,30 @@ pub(crate) mod store;
 #[cfg(test)]
 pub(crate) use store::AccessHook;
 
-use crate::engine::Config;
+use crate::{engine::Config, storage::Catalog, workspace::Trees};
+use motor_protocol::SiblingSnapshot;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, ffi::OsString, io, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsString, io, path::PathBuf, time::SystemTime};
 
 /// Directory under the instance state that holds sibling snapshots, one
 /// subdirectory per repository named like its mirror.
 pub(crate) const SNAPSHOTS_DIRECTORY: &str = "sibling-snapshots";
 
-/// Whether this build mounts siblings from snapshots on isolated Linux runners.
-/// It turns on only together with the fencing changes and snapshot eviction,
-/// so no deployed runner creates snapshots it cannot also bound and remove.
-const SNAPSHOT_MOUNTS_ENABLED: bool = false;
+/// Which sibling fences scheduling applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SiblingFences {
+    /// Siblings are checked out at their host path P, which may also be that
+    /// repository's main workspace: every sibling fence applies.
+    InPlace,
+    /// Siblings are mounted from snapshots and never touch P. Only a running
+    /// job whose record has no `sibling_sources` still holds its siblings'
+    /// paths: an older runner started it with P itself bound into its unit,
+    /// so a main-workspace job must not check P out until it ends.
+    Legacy,
+    /// No sibling fence applies: the Windows instance gives each job its own
+    /// staging export of every sibling and never uses a host path.
+    None,
+}
 
 impl Config {
     /// True when jobs see each sibling from a snapshot directory instead of a
@@ -41,7 +55,7 @@ impl Config {
         if let Some(mode) = self.sibling_snapshot_mode_override {
             return mode;
         }
-        SNAPSHOT_MOUNTS_ENABLED && self.isolate_jobs && !self.windows_instance()
+        self.isolate_jobs && !self.windows_instance()
     }
 
     /// True when siblings are checked out at their host path P, which may also
@@ -55,6 +69,18 @@ impl Config {
             return in_place;
         }
         !self.sibling_snapshot_mode() && !self.windows_instance()
+    }
+
+    /// The sibling fences this runner applies. The legacy term is never
+    /// evaluated on the Windows instance, whose jobs never bind a host path.
+    pub(crate) fn sibling_fences(&self) -> SiblingFences {
+        if self.in_place_siblings() {
+            SiblingFences::InPlace
+        } else if self.windows_instance() {
+            SiblingFences::None
+        } else {
+            SiblingFences::Legacy
+        }
     }
 
     /// `<state>/sibling-snapshots`, the root of every repository's snapshots.
@@ -224,6 +250,94 @@ fn full_object_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The sibling snapshot part of one job's setup in snapshot mode, from the
+/// workspace reservation to the launch. It follows the setup contract of
+/// `freshness`: the workspace's prior record and the wall-clock start are
+/// taken when the workspace is reserved, the snapshots are resolved and
+/// touched in the setup thread, and the record updates are applied only once
+/// the setup has completed.
+pub(crate) struct JobSiblings {
+    prior: freshness::Prior,
+    started: SystemTime,
+    /// One per declared sibling, in request order, once resolved.
+    resolved: Vec<freshness::Pending>,
+}
+
+impl JobSiblings {
+    /// Called under the state lock when the job's workspace is reserved.
+    pub(crate) fn reserve(catalog: &Catalog, workspace: &str) -> Self {
+        Self {
+            prior: freshness::Prior::of(catalog, workspace),
+            // Wall clock, not the runner clock: the switch touch compares it
+            // with file mtimes.
+            started: SystemTime::now(),
+            resolved: Vec::new(),
+        }
+    }
+
+    /// Resolves or creates each sibling's snapshot and touches it for this
+    /// workspace. The caller holds the workspace's reservation and no lock.
+    pub(crate) fn resolve(
+        &mut self,
+        config: &Config,
+        store: &store::SnapshotStore,
+        trees: &Trees,
+        siblings: &[SiblingSnapshot],
+    ) -> io::Result<()> {
+        if siblings.is_empty() {
+            return Ok(());
+        }
+        let environment = JavascriptEnvironment::current(config)?;
+        self.resolved = freshness::prepare_siblings(
+            config,
+            store,
+            trees,
+            &self.prior,
+            self.started,
+            siblings,
+            &environment,
+        )?;
+        Ok(())
+    }
+
+    /// Each resolved sibling as (snapshot directory, canonical path), the
+    /// pairs the sandbox and the Cargo prefetch mount.
+    pub(crate) fn mounts(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.resolved
+            .iter()
+            .map(|pending| {
+                (
+                    pending.snapshot().to_path_buf(),
+                    PathBuf::from(pending.sibling()),
+                )
+            })
+            .collect()
+    }
+
+    /// The snapshot directories the job's unit binds, for its record's
+    /// `sibling_sources`.
+    pub(crate) fn sources(&self) -> Vec<String> {
+        self.resolved
+            .iter()
+            .map(|pending| pending.snapshot().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Stores the touched siblings' freshness records in the workspace's
+    /// catalog entry. Call this only for a completed setup, after the
+    /// workspace was recorded.
+    pub(crate) fn apply(self, catalog: &mut Catalog, workspace: &str) {
+        for pending in self.resolved {
+            if !pending.apply(catalog, workspace) {
+                tracing::warn!(
+                    workspace,
+                    "set-up workspace has no catalog entry for its sibling freshness record"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
