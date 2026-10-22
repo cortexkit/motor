@@ -408,7 +408,7 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     other_job.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcdf".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &other_job, 1, NOW).body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcdf"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcdf"],"closed_subjects":[]})
     );
     let key = SigningKey::from_bytes(&[9; 32]);
     b.register_host("other-host".into(), key.verifying_key());
@@ -428,7 +428,7 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     );
     assert_eq!(
         reply.body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"],"closed_subjects":[]})
     );
     b.settle_due(lease.token_expires_at_ms + 60000);
     assert_eq!(
@@ -801,7 +801,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
         (
             "heartbeat",
             serde_json::to_vec(&heartbeat(JobState::Started, 999)).unwrap(),
-            json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]}),
+            json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"],"closed_subjects":[]}),
         ),
     ] {
         let path = format!("/v1/hosts/other-host/{route}");
@@ -832,7 +832,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
     hb.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcd0".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &hb, 1, NOW).body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcd0"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcd0"],"closed_subjects":[]})
     );
 }
 
@@ -1002,7 +1002,7 @@ fn heartbeat_elapsed_is_monotonic_capped_and_refreshes_do_not_move_loss_deadline
             deadline
         )
         .body,
-        json!({"ignored":[]})
+        json!({"ignored":[],"closed_subjects":[]})
     );
     let mut b = broker();
     issued(&mut b, &request, NOW);
