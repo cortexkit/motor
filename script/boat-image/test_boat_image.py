@@ -1025,8 +1025,12 @@ class BoatBaseLayoutTests(unittest.TestCase):
         return patch.object(Path, "lstat", lstat)
 
     def check(self):
+        # The report keeps only the first few offenders, in directory walk
+        # order, which differs between filesystems; ask for all of them so a
+        # named offender is found wherever the walk meets it.
         with self.simulated():
-            return install.root_paths.check(install.root_paths.BOAT_ROOTS, self.image, 0)
+            return install.root_paths.check(install.root_paths.BOAT_ROOTS, self.image, 0,
+                                            limit=None)
 
     def apply(self, **options):
         with self.simulated():
