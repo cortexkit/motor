@@ -33,8 +33,8 @@ async fn main() -> io::Result<()> {
             "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND [VCPUS]",
         ));
     }
-    // The probe passes the vCPUs the sandbox really has, so a job fits every Boat size;
-    // 8 (a whole large sandbox) keeps older probe invocations unchanged.
+    // The probe passes the sandbox's measured vCPU count as the job weight, so a job fits
+    // every Boat size; without it the weight stays 8 (a whole large sandbox), as before.
     let vcpus: u32 = match args.get(4) {
         Some(text) => text.parse().map_err(io::Error::other)?,
         None => 8,

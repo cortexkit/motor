@@ -223,7 +223,7 @@ class RecipeTests(unittest.TestCase):
     def test_host_unit_has_explicit_boat_profile_and_no_enabled_bridge(self):
         unit = (HERE / "motor-boat.service").read_text()
         self.assertIn("--boat-profile", unit)
-        # The CPU count is measured at start (sized_runner_args), never baked into the image.
+        # The runner's CPU counts are set at start (sandbox_cpus feeds sized_runner_args), not in the unit.
         self.assertNotIn("--max-weight", unit)
         self.assertNotIn("--rustc-slots", unit)
         self.assertNotIn("@VCPUS@", unit)

@@ -8,8 +8,8 @@ Recover an interrupted run: same credentials, --cleanup DIR/results.json.
 Render evidence without credentials: --render DIR/results.json --findings FILE.
 Exit status: 0 when the verdict passed (cleanup complete, or Boat accepted every deletion and
 only its final purge is pending), 1 when the verdict failed, 3 when resources may still exist
-and need --cleanup, 4 when Boat refused to create the requested --size from a snapshot taken on
-a larger size (verdict outcome snapshot_size_bound). JSON `verdict` and `cleanup_state` report
+and need --cleanup, 4 when Boat refused the requested --size for a snapshot taken on a larger
+size, at create or while restoring it (verdict outcome snapshot_size_bound). JSON `verdict` and `cleanup_state` report
 the two separately.
 """
 from __future__ import annotations
@@ -41,7 +41,8 @@ READY = {"ready", "idle", "running"}
 SIZES = {"small": {"vcpu": 2, "memoryGB": 4},
          "default": {"vcpu": 4, "memoryGB": 8},
          "large": {"vcpu": 8, "memoryGB": 16}}
-# Every prepared image and snapshot the operator holds so far was saved from a large sandbox.
+# The size an operator's prepared image is assumed to have been saved from; every prepared
+# image built so far came from a large sandbox.
 SNAPSHOT_SOURCE_SIZE = "large"
 
 
@@ -50,7 +51,8 @@ class ProbeError(Exception):
 
 
 class SnapshotSizeBound(ProbeError):
-    """Boat refused to create a smaller sandbox from a snapshot saved on a larger one."""
+    """Boat rejected a smaller size for a snapshot saved on a larger one: it refused the
+    create, or accepted it and then failed restoring the snapshot as too small."""
 
     def __init__(self, evidence):
         self.evidence = evidence
@@ -70,8 +72,9 @@ def sizing_error(size):
 
 
 # HTTP statuses that say nothing about the requested size: a bad key, a missing snapshot, a
-# timeout or rate limiting. Any other 4xx refusal of a create whose only difference from a
-# working large create is the smaller type is attributed to that type.
+# timeout or rate limiting. A 403 counts only when its body names too_small. Any other 4xx
+# refusal of a smaller-from-larger create is attributed to the size, because the request
+# differs from the large create the image was made with only in its type.
 NOT_SIZE_STATUSES = {401, 404, 408, 429}
 SIZE_REFUSAL_TEXT = re.compile(r"too[_ ]small", re.IGNORECASE)
 
@@ -561,9 +564,9 @@ def required_checks_passed(checks):
 def verdict(data):
     """Require all required checks to pass, listing unproven idle-reclaim checks separately.
 
-    `outcome` is "passed", "failed" or "snapshot_size_bound": Boat refused to create the
-    requested size from a snapshot saved on a larger one, which answers the measurement
-    (that image cannot serve this size) rather than failing it.
+    `outcome` is "passed", "failed" or "snapshot_size_bound": Boat rejected the requested
+    size for a snapshot saved on a larger one (at create, or while restoring it), which
+    answers the measurement (that image cannot serve this size) rather than failing it.
     """
     bound = data.get("snapshot_size_bound")
     if bound:
