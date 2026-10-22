@@ -24,11 +24,12 @@
 //! **When.** At most `Config::sibling_snapshot_cap` unreferenced snapshots of
 //! each repository are kept, the most recently used. The cap is enforced
 //! after each setup or Prepare that resolved snapshots, at startup and at
-//! every maintenance; a reference released between creations is so caught
-//! within one maintenance interval. Maintenance also deletes unreferenced
-//! snapshots unused for `Config::sibling_snapshot_idle`. Pressure eviction
-//! deletes unreferenced snapshots before any other candidate (`disk.rs`), and
-//! retirement deletes a repository's whole snapshot directory with its mirror
+//! every maintenance, so a snapshot that becomes unreferenced with no
+//! creation after it is trimmed within one maintenance interval. Maintenance
+//! also deletes unreferenced snapshots unused for
+//! `Config::sibling_snapshot_idle`. Pressure eviction deletes unreferenced
+//! snapshots before any other candidate (`disk.rs`), and retirement deletes
+//! a repository's whole snapshot directory with its mirror
 //! (`retirement.rs`).
 //!
 //! **Legacy sibling checkouts.** A runner with in-place siblings checked each

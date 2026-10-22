@@ -307,6 +307,13 @@ fn pressure_deletes_unreferenced_snapshots_before_workspaces_and_before_probing(
             Ok(if newer.exists() || trashed { 10 } else { 200 })
         });
     }
+    // A background purge waits here, so a probe that ran before the snapshot
+    // was really deleted would see it in the trash.
+    config.long_work = Some(Arc::new(|label| {
+        if label == "remove" {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }));
     let runner = manual_runner(config);
     let workspace = f.scratch.join("remote/worktrees/idle");
     idle_workspace(&runner, &workspace, runner.now() - 5 * 60 * 60 * 1000);
@@ -688,4 +695,104 @@ fn in_place_runners_keep_their_sibling_checkouts() {
     runner.maintenance().unwrap();
     assert!(Path::new(&unused).join("source").exists());
     assert!(recorded(&runner, &unused));
+}
+
+/// Creates a real snapshot of the fixture sibling at its current commit, so
+/// that a later creation can copy it as its predecessor, then commits a new
+/// sibling commit for the next request to declare.
+fn snapshot_of_current_sibling(
+    f: &Fixture,
+    runner: &Runner,
+    environment: &JavascriptEnvironment,
+) -> PathBuf {
+    let head = git(&f.sibling, &["rev-parse", "HEAD"]);
+    let tree = git(&f.sibling, &["rev-parse", "HEAD^{tree}"]);
+    let mirror = runner.core.trees.ensure_mirror(&f.canonical).unwrap();
+    git(
+        &mirror,
+        &[
+            "fetch",
+            "-q",
+            text(&f.sibling),
+            &format!("HEAD:refs/tips/{head}"),
+        ],
+    );
+    let key = SnapshotKey::new(&f.canonical, &head, &head, environment).unwrap();
+    let directory = runner
+        .core
+        .snapshots
+        .resolve(&runner.core.config, &runner.core.trees, &key, &tree)
+        .unwrap();
+    commit(&f.sibling, "second\n");
+    directory
+}
+
+/// A job's setup enforces the cap as soon as it has resolved its sibling
+/// snapshots, without waiting for maintenance, and keeps the snapshot it
+/// just created for itself.
+#[tokio::test]
+async fn job_setup_enforces_the_cap_after_resolving_its_snapshots() {
+    let f = Fixture::new();
+    let (mut config, environment) = snapshot_config(&f);
+    config.sibling_snapshot_cap = 0;
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let unreferenced = snapshot_of_current_sibling(&f, &runner, &environment);
+    let (run, bytes) = f.run("true");
+    let created = SnapshotKey::new(
+        &f.canonical,
+        &run.siblings[0].commit,
+        &run.siblings[0].commit,
+        &environment,
+    )
+    .unwrap()
+    .directory(&runner.core.config);
+    f.submit(&runner, &run, &bytes);
+    let t = terminal(&runner, run.job_id).await;
+    assert_eq!(
+        t.outcome,
+        Outcome::Exit { code: 0 },
+        "{:?}",
+        t.refusal_detail
+    );
+    assert!(!published(&unreferenced));
+    assert!(published(&created));
+}
+
+/// A Prepare enforces the cap once it has resolved its sibling snapshots.
+#[tokio::test]
+async fn prepare_enforces_the_cap_after_resolving_its_snapshots() {
+    let f = Fixture::new();
+    let (mut config, environment) = snapshot_config(&f);
+    config.sibling_snapshot_cap = 0;
+    let runner = Runner::open(config).unwrap();
+    let unreferenced = snapshot_of_current_sibling(&f, &runner, &environment);
+    let (run, bytes) = f.run("true");
+    let created = SnapshotKey::new(
+        &f.canonical,
+        &run.siblings[0].commit,
+        &run.siblings[0].commit,
+        &environment,
+    )
+    .unwrap()
+    .directory(&runner.core.config);
+    let spool = f.spool(&runner, &run, &bytes);
+    runner
+        .core
+        .trees
+        .fetch(
+            &spool.directory,
+            &run.bundles,
+            &run.repository_root,
+            &run.snapshot_commit,
+            "",
+            &run.siblings,
+        )
+        .unwrap();
+    spawn_prepare(&runner, &prepare_for(&run))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!published(&unreferenced));
+    assert!(published(&created));
 }
