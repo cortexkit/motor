@@ -414,7 +414,7 @@ fn creation_never_copies_a_snapshot_claimed_for_deletion() {
             .iter()
             .map(|(source, _)| source.clone())
             .collect::<Vec<_>>(),
-        [older.clone()]
+        std::slice::from_ref(&older)
     );
     assert_eq!(
         fs::read_to_string(third_directory.join("source")).unwrap(),
@@ -563,7 +563,9 @@ fn snapshot_without_readable_metadata_is_recreated() {
     other_version.version = METADATA_VERSION + 1;
     let mut other_key = read_metadata(&directory).unwrap();
     other_key.caller = "f".repeat(40);
-    let damages: [(&str, Box<dyn Fn() + '_>); 4] = [
+    // Each entry names a way the metadata can be damaged and applies it.
+    type Damage<'a> = (&'a str, Box<dyn Fn() + 'a>);
+    let damages: [Damage; 4] = [
         ("missing", Box::new(|| fs::remove_file(&metadata).unwrap())),
         (
             "unparsable",
@@ -669,6 +671,25 @@ fn failed_access_step_publishes_nothing() {
         "{:?}",
         entries(&f.snapshots())
     );
+}
+
+#[test]
+fn failed_metadata_write_publishes_no_directory() {
+    let f = Fixture::new("motor-snapshot-store-metadata-fails");
+    let (commit, tree) = f.commit(&[("source", "one\n")]);
+    let key = f.key(&commit, &commit);
+    let directory = key.directory(&f.config);
+    // A non-empty directory where the metadata file goes makes its atomic
+    // rename fail. The snapshot directory is renamed into place only after
+    // its metadata is written, so nothing may be published.
+    let blocker = metadata_path(&directory);
+    fs::create_dir_all(blocker.join("occupied")).unwrap();
+    f.resolve(&SnapshotStore::default(), &key, &tree)
+        .unwrap_err();
+    assert!(!directory.exists());
+    assert!(!entries(&f.snapshots())
+        .iter()
+        .any(|name| name.contains(TEMPORARY_MARKER)));
 }
 
 /// The real ACL step: an entry that a copy left writable by everyone, with a
