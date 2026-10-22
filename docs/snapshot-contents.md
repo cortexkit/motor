@@ -213,6 +213,18 @@ Tests: `an_empty_mirror_ref_file_is_removed_after_the_fetch_it_breaks`,
 `a_mirror_ref_at_a_missing_commit_is_removed_after_the_fetch_it_breaks`,
 `startup_removes_unusable_mirror_refs` (same file).
 
+7.1.3. The have reply lists only the newest held commits: a held commit whose
+child is also held is left out, so a default-branch tip behind a held snapshot,
+or a snapshot behind a later held commit, is not named. `ck-motor` therefore
+sends a repository's bundle only when its snapshot commit or tip is not
+reachable from the reported commits. When everything is reachable it sends no
+bundle for that repository, because the runner needs the commits as objects in
+its mirror, not a bundle for each repository; an empty bundle would be refused
+by Git. Tests: `no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it`,
+`no_bundle_when_runner_holds_a_descendant_of_snapshot_and_tip`,
+`sibling_and_main_bundles_are_skipped_independently`
+(`crates/motor-module/src/snapshot.rs`).
+
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
 the runner advertises support; older runners receive none. Tests:
 `run_and_prepare_lockfile_source_is_commit_not_worktree`,
