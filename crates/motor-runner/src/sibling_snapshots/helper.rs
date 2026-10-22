@@ -9,9 +9,9 @@
 //! are the daemon's effective uid and gid (`--uid`/`--gid`), the identity
 //! with which the in-place Cargo prefetch and JavaScript install run today,
 //! as plain children of the daemon. systemd gives the unit that user's
-//! supplementary groups from the account database. Only the mount namespace
-//! differs: the parent directory of every mounted path is replaced by an
-//! empty read-only tmpfs, and only the declared paths are bound into it, so
+//! supplementary groups from the account database. The mount namespace is
+//! the helper's own: the parent directory of every mounted path is replaced
+//! by an empty read-only tmpfs, and only the declared paths are bound into it, so
 //! the helper sees the same tree at P that a job will see and cannot read
 //! the host checkout at P at all. Directories the helper itself needs (the
 //! runner state, Cargo and rustup homes, the executables on PATH) stay
@@ -72,7 +72,8 @@ const END_GRACE: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long after asking systemd to stop a helper the runner sends SIGKILL
-/// to its cgroup itself. systemd escalates to SIGKILL after `STOP_TIMEOUT`.
+/// to its cgroup itself, if the unit is still not inactive. systemd itself
+/// escalates to SIGKILL after `STOP_TIMEOUT`.
 const KILL_AFTER: Duration = Duration::from_secs(4);
 
 /// How long setup waits for a stopped helper unit to become inactive.
@@ -691,8 +692,9 @@ fn classify(observed: &Observed, elapsed: Duration, limit: Duration) -> Verdict 
         Observed::Ended(exit) => exit,
     };
     let result = exit.result.as_deref().unwrap_or("unknown");
-    // A stop from outside that needed SIGKILL also reports `timeout`; only a
-    // unit that ran for its whole limit ran out of time.
+    // A stop from outside that needed SIGKILL also reports `timeout`. It
+    // counts as a time-out only once the time since `run` started the helper
+    // has reached the limit; a stop before that is a failure.
     if result == "timeout" && elapsed >= limit {
         return Verdict::TimedOut;
     }
@@ -897,13 +899,13 @@ struct Settled {
     result: Option<String>,
 }
 
-/// Waits until `unit` is inactive, and unloads it if it failed. A unit still
-/// active is stopped, which sends SIGTERM to its whole cgroup and SIGKILL
+/// Waits until `unit` is inactive or failed; for a failed unit it then runs
+/// `reset-failed`, so systemd can unload it. A unit still active is stopped, which sends SIGTERM to its whole cgroup and SIGKILL
 /// after `STOP_TIMEOUT`; if it is still not inactive a little later, the
 /// runner sends SIGKILL to the cgroup itself.
 fn settle(config: &Config, unit: &str) -> io::Result<Settled> {
     let started = Instant::now();
-    let mut stopped = false;
+    let mut stop_requested: Option<Instant> = None;
     let mut killed = false;
     loop {
         let state = unit_state(config, unit)?;
@@ -939,10 +941,10 @@ fn settle(config: &Config, unit: &str) -> io::Result<Settled> {
                 ),
             ));
         }
-        let command: Option<&[&str]> = if !stopped {
-            stopped = true;
+        let command: Option<&[&str]> = if stop_requested.is_none() {
+            stop_requested = Some(Instant::now());
             Some(&["stop", "--no-block", unit])
-        } else if !killed && started.elapsed() >= KILL_AFTER {
+        } else if !killed && stop_requested.is_some_and(|at| at.elapsed() >= KILL_AFTER) {
             killed = true;
             Some(&["kill", "--kill-whom=all", "--signal=KILL", unit])
         } else {
