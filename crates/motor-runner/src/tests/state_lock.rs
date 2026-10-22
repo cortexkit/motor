@@ -1,11 +1,13 @@
 use super::*;
+use std::os::unix::process::ExitStatusExt;
 
 /// Pauses whichever long step its `Hold` is labelled for: the unit query or
 /// stop command of this backend, or any runner `long_work` step or job record
 /// save the fixture routes to it.
 struct HeldBackend {
     hold: Arc<Hold>,
-    stops: Arc<Mutex<Vec<Uuid>>>,
+    /// Unit stops ("stop") and change collections ("collect"), in order.
+    events: Arc<Mutex<Vec<(&'static str, Uuid)>>>,
     /// Process start times, standing in for units, of the jobs stopped so
     /// far. A stopped job's unit has exited, so teardown can finish it.
     stopped: Mutex<BTreeSet<u64>>,
@@ -29,7 +31,7 @@ impl Backend for HeldBackend {
 
     fn cancel(&self, _: &Config, job: &Job, _: bool) -> io::Result<()> {
         self.hold.hook()("stop_unit");
-        self.stops.lock().unwrap().push(job.id);
+        self.events.lock().unwrap().push(("stop", job.id));
         if let Some(process) = job.process {
             self.stopped.lock().unwrap().insert(process.start);
         }
@@ -47,7 +49,8 @@ impl Backend for HeldBackend {
         Ok(stopped.then_some(false))
     }
 
-    fn collect_changes(&self, _: &Trees, _: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(&self, _: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+        self.events.lock().unwrap().push(("collect", job.id));
         Ok(Some(Vec::new()))
     }
 
@@ -60,7 +63,7 @@ struct LockFixture {
     runner: Runner,
     fixture: Fixture,
     hold: Arc<Hold>,
-    stops: Arc<Mutex<Vec<Uuid>>>,
+    events: Arc<Mutex<Vec<(&'static str, Uuid)>>>,
     /// The job record whose next save pauses on the `record_save` hold.
     held_record: Arc<Mutex<Option<PathBuf>>>,
     /// Kill retries scheduled here are only due for explicit
@@ -72,7 +75,7 @@ impl LockFixture {
     fn new(label: &'static str) -> Self {
         let fixture = Fixture::new();
         let hold = Hold::new(label);
-        let stops = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         let held_record = Arc::new(Mutex::new(None::<PathBuf>));
         let mut config = fixture.config();
         config.long_work = Some(hold.hook());
@@ -90,7 +93,7 @@ impl LockFixture {
             config,
             Box::new(HeldBackend {
                 hold: hold.clone(),
-                stops: stops.clone(),
+                events: events.clone(),
                 stopped: Mutex::default(),
             }),
         )
@@ -99,7 +102,7 @@ impl LockFixture {
             runner,
             fixture,
             hold,
-            stops,
+            events,
             held_record,
             retry_at: std::time::Instant::now() + Duration::from_secs(3600),
         }
@@ -179,7 +182,7 @@ impl LockFixture {
             self.hold.label
         );
         cancel.join().unwrap().unwrap();
-        assert!(self.stops.lock().unwrap().contains(&id));
+        assert!(self.events.lock().unwrap().contains(&("stop", id)));
         assert!(self.hold.held(), "the held step is still in progress");
     }
 }
@@ -249,6 +252,32 @@ fn cancel_proceeds_while_another_cancel_waits_for_systemctl() {
         let _release = f.hold_in(move |runner| runner.cancel(first).unwrap());
         f.assert_cancel_completes(second);
     }
+}
+
+/// A cancel queries and stops its unit without the state lock. The job's
+/// monitor must not claim finalization in between: once finalization is
+/// claimed, the exited job's unit is never signalled.
+#[test]
+fn finalization_waits_for_a_cancel_signalling_without_the_state_lock() {
+    let f = LockFixture::new("unit_alive");
+    let id = f.running();
+    f.hold.arm();
+    let held = f.hold_in(move |runner| runner.cancel(id).unwrap());
+    let runner = f.runner.clone();
+    let monitor =
+        std::thread::spawn(move || runner.finish(id, Ok(std::process::ExitStatus::from_raw(0))));
+    // A finalization that did not wait for the cancel would claim the job and
+    // collect its changes in this window, before the cancel's stop.
+    poll(Duration::from_millis(500), || {
+        f.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(event, _)| *event == "collect")
+    });
+    drop(held);
+    monitor.join().unwrap().unwrap();
+    assert_eq!(*f.events.lock().unwrap(), [("stop", id), ("collect", id)]);
 }
 
 /// A job expired after `RETENTION_MS` takes its output and returned files
