@@ -191,6 +191,10 @@ pub(crate) enum Error {
 /// image up to about 3 minutes, so a shorter wait abandons most shadows that
 /// don't land on a warm sandbox.
 pub(crate) const SHADOW_PROVISIONING_BUDGET: Duration = Duration::from_secs(300);
+/// A spill has already surrendered its build-server queue slot. Healthy Boat
+/// starts take about 110 seconds; allow some headroom, but return a stuck start
+/// to the build server instead of spending the entire remaining queue budget.
+const SPILL_PROVISIONING_BUDGET: Duration = Duration::from_secs(180);
 const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
 const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
 /// How long a repository-routed job waits before asking again after the
@@ -364,9 +368,19 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
         .as_ref()
         .and_then(|state| state.spill_wait_ms)
         .unwrap_or(0);
-    job.queue_wait_limit_s
+    let remaining = job
+        .queue_wait_limit_s
         .saturating_mul(1000)
-        .saturating_sub(waited_ms)
+        .saturating_sub(waited_ms);
+    if job
+        .hosted
+        .as_ref()
+        .is_some_and(|state| state.spill_wait_ms.is_some())
+    {
+        remaining.min(SPILL_PROVISIONING_BUDGET.as_millis() as u64)
+    } else {
+        remaining
+    }
 }
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states

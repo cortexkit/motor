@@ -248,6 +248,31 @@ fn stored(scratch: &Scratch, id: Uuid, route: HostedJobState) -> Arc<Storage> {
     storage
 }
 
+#[test]
+fn spill_provisioning_budget_caps_only_spills_and_respects_remaining_wait() {
+    let scratch = Scratch::new();
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    for (limit_s, spill_wait_ms, expected_ms) in [
+        (300, Some(45_000), 180_000),
+        (120, Some(45_000), 75_000),
+        (30, Some(45_000), 0),
+        (300, None, 300_000),
+    ] {
+        let id = Uuid::now_v7();
+        storage.create(id, limit_s, None, None, false).unwrap();
+        storage
+            .hosted_route(
+                id,
+                HostedJobState {
+                    spill_wait_ms,
+                    ..HostedJobState::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(spill_wait_budget_ms(&storage.job(id).unwrap()), expected_ms);
+    }
+}
+
 #[tokio::test]
 async fn hosted_self_signed_pin_challenge_and_protocol_work() {
     let h = Harness::new(Behavior::Normal).await;

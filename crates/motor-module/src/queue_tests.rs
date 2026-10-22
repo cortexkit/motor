@@ -1053,12 +1053,231 @@ async fn spilled_provisioning_budget_resubmits_to_build_server() {
     )
     .unwrap();
     let id = Uuid::now_v7();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
     // A one-second queue-wait limit leaves the lease one second to provision.
     let records = run_spilled(&motor, id, &repo, 1, Duration::from_secs(30)).await;
     assert_one_build_server_job(id, &records);
     assert_resubmitted_once(id, &log.lock().unwrap(), 1);
     assert!(lease_requests(&broker.requests) >= 1);
     assert!(motor.hosted_state(id).is_none());
+    let text = captured.text();
+    let exhausted: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("spill provisioning budget exhausted"))
+        .collect();
+    assert_eq!(exhausted.len(), 1, "{text}");
+    assert!(exhausted[0].contains(&format!("job_id={id}")), "{text}");
+    let waited_ms: u64 = exhausted[0]
+        .split("waited_ms=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(waited_ms >= 1000, "{text}");
+    assert_eq!(
+        text.matches("outcome=returned_to_build_server").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("broker_code=hosted_provisioning"), "{text}");
+}
+
+#[tokio::test]
+async fn spilled_deliberate_refusals_stay_final() {
+    for (status, code, reason, detail) in [
+        (
+            403,
+            "account_closed",
+            RefusalReason::RequestRejected,
+            "hosted_account_closed",
+        ),
+        (
+            400,
+            "bad_request",
+            RefusalReason::RequestRejected,
+            "lease_mismatch",
+        ),
+        (
+            409,
+            "job_conflict",
+            RefusalReason::RequestRejected,
+            "lease_mismatch",
+        ),
+        (
+            422,
+            "platform_unsupported",
+            RefusalReason::PlatformUnsupported,
+            "hosted_platform_unsupported",
+        ),
+    ] {
+        let broker = crate::hosted::test_http::Http::new(move |path, _| {
+            if path == "/v1/leases" {
+                (status, serde_json::json!({"error": code}))
+            } else {
+                (404, serde_json::json!({"error": "job_unknown"}))
+            }
+        })
+        .await;
+        let scratch = ScratchDir::new("motor-spill-final-refusal");
+        let repo = fixture_repo(&scratch);
+        let peer = ResubmitPeer::new();
+        let log = peer.log.clone();
+        let motor = Motor::with_connector(
+            spill_config(&broker.url),
+            &scratch.join("state"),
+            Arc::new(peer),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        let captured = crate::logging::Captured::default();
+        let _log = crate::logging::scoped(captured.clone());
+        let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+        let terminal = match records.last().unwrap() {
+            StreamRecord::Terminal(terminal) => terminal,
+            other => panic!("expected terminal, got {other:?}"),
+        };
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart { reason },
+            "{code}"
+        );
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert!(terminal.refusal_detail.as_deref().unwrap().contains(detail));
+        assert_eq!(
+            log.lock().unwrap().runs,
+            [(id, 0)],
+            "{code}: no resubmission"
+        );
+        assert_eq!(lease_requests(&broker.requests), 1);
+        assert!(!broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with("/reattach")));
+        let text = captured.text();
+        let outcomes: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("spill outcome"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{text}");
+        assert!(
+            outcomes[0].contains("outcome=refused") && outcomes[0].contains(detail),
+            "{text}"
+        );
+        assert!(!text.contains("outcome=returned_to_build_server"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn spilled_sandbox_lost_before_run_returns_to_build_server() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (409, serde_json::json!({"error": "sandbox_lost"}))
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-sandbox-lost");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    assert!(motor.hosted_state(id).is_none());
+}
+
+#[tokio::test]
+async fn spilled_lost_run_ack_reattaches_without_resubmitting() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    let hosted = Harness::new(Behavior::DropRunAck).await;
+    let scratch = ScratchDir::new("motor-spill-lost-run-ack");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        Config {
+            spill_after_s: 0,
+            ..hosted.config()
+        },
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    let terminal = match records.last().unwrap() {
+        StreamRecord::Terminal(terminal) => terminal,
+        other => panic!("expected terminal, got {other:?}"),
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(motor.hosted_state(id).unwrap().run_sent);
+    assert_eq!(log.lock().unwrap().runs, [(id, 0)]);
+    assert_eq!(hosted.runs.load(Ordering::SeqCst), 1);
+    assert!(hosted
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Attach(_))));
+    assert!(!hosted
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.ends_with("/release")));
+    let text = captured.text();
+    assert_eq!(text.matches("outcome=reattaching").count(), 1, "{text}");
+    assert!(!text.contains("outcome=returned_to_build_server"), "{text}");
+}
+
+#[tokio::test]
+async fn spilled_success_logs_placed_once() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    let hosted = Harness::new(Behavior::CompleteRun).await;
+    let scratch = ScratchDir::new("motor-spill-placed");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        Config {
+            spill_after_s: 0,
+            ..hosted.config()
+        },
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(terminal)) if terminal.outcome == Outcome::Exit { code: 23 })
+    );
+    assert_eq!(log.lock().unwrap().runs, [(id, 0)]);
+    let text = captured.text();
+    let placed: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("outcome=placed"))
+        .collect();
+    assert_eq!(placed.len(), 1, "{text}");
+    assert!(placed[0].contains(&format!("job_id={id}")), "{text}");
 }
 
 fn boat_paths(boat: &crate::hosted::boat_tests::Boat) -> Vec<String> {
