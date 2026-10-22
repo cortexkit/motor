@@ -17,21 +17,34 @@ fn environment(node: &str) -> JavascriptEnvironment {
     )
 }
 
+/// Snapshot mode is on exactly where a job has a mount namespace to put a
+/// snapshot at the sibling's path: isolated runners that are not the Windows
+/// instance. Each runner kind applies its own set of sibling fences.
 #[test]
-fn snapshot_mode_is_off_and_siblings_stay_in_place_on_every_runner_kind() {
+fn snapshot_mode_is_on_only_for_isolated_runners_other_than_windows() {
     let portable = config();
     let mut isolated = config();
     isolated.isolate_jobs = true;
     let mut windows = config();
     windows.backend = BackendKind::WindowsVm;
     windows.isolate_jobs = true;
-    for config in [&portable, &isolated, &windows] {
-        assert!(!config.sibling_snapshot_mode());
-    }
+    let mut windows_portable = config();
+    windows_portable.backend = BackendKind::WindowsVm;
+
+    assert!(!portable.sibling_snapshot_mode());
+    assert!(isolated.sibling_snapshot_mode());
+    assert!(!windows.sibling_snapshot_mode());
+    assert!(!windows_portable.sibling_snapshot_mode());
+
     assert!(portable.in_place_siblings());
-    assert!(isolated.in_place_siblings());
+    assert!(!isolated.in_place_siblings());
     // The Windows instance stages per-job exports and never checks out at P.
     assert!(!windows.in_place_siblings());
+
+    assert_eq!(portable.sibling_fences(), SiblingFences::InPlace);
+    assert_eq!(isolated.sibling_fences(), SiblingFences::Legacy);
+    assert_eq!(windows.sibling_fences(), SiblingFences::None);
+    assert_eq!(windows_portable.sibling_fences(), SiblingFences::None);
 }
 
 #[test]

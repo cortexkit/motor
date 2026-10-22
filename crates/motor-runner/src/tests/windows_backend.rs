@@ -845,6 +845,7 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
             request: r,
             base: false,
             recorded: BTreeMap::new(),
+            snapshots: None,
         };
         let prepared = WindowsBackend
             .materialize(runner.config(), &runner.core.trees, &setup)
@@ -1793,6 +1794,7 @@ async fn windows_backend_unreleased_prepared_and_execution_drop_each_clean_once(
             cpus: vec![12, 13, 14, 15],
             base: false,
             recorded: BTreeMap::new(),
+            snapshots: None,
         };
         let prepared = WindowsBackend
             .materialize(runner.config(), &runner.core.trees, &setup)

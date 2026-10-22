@@ -2308,7 +2308,7 @@ fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
             .join(".rustup")
             .into_os_string()
     }));
-    let fetch = |snapshots: Option<&SnapshotPrefetch<'_>>| {
+    let fetch = |snapshots: Option<&SnapshotSiblings<'_>>| {
         prefetch_cargo_dependencies(
             false,
             false,
@@ -2323,9 +2323,277 @@ fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
     };
     // Today's in-place prefetch reads the host checkout and fails.
     assert!(fetch(None).is_err());
-    fetch(Some(&SnapshotPrefetch {
+    fetch(Some(&SnapshotSiblings {
         config: &config,
         siblings: vec![(snapshot.clone(), host.clone())],
     }))
     .unwrap();
+}
+
+/// A job sees each sibling at its canonical path and, from a worktree in
+/// another directory, at the `../<name>` alias. With in-place siblings both
+/// mounts show the checkout at the canonical path; in snapshot mode both show
+/// the sibling's snapshot, never the host checkout at that path.
+#[test]
+fn sibling_mounts_bind_the_snapshot_at_the_sibling_path_and_its_alias() {
+    let config = crate::engine::Config::new("/state-root", "main");
+    let sibling = |path: &str| SiblingSnapshot {
+        canonical_path: path.into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    };
+    let worktree = Path::new("/w/worktrees/a");
+    let beside = Path::new("/w/source/a");
+    let siblings = [sibling("/w/source/commons")];
+    let snapshot = PathBuf::from("/state-root/main/sibling-snapshots/commons/s1");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot, PathBuf::from("/w/source/commons"))],
+    };
+    let mounts = |workspace: &Path, snapshots: Option<&SnapshotSiblings<'_>>| {
+        sibling_mounts(workspace, &siblings, snapshots).unwrap()
+    };
+
+    assert_eq!(
+        mounts(worktree, None),
+        [
+            (
+                "/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/w/source/commons:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    assert_eq!(
+        mounts(worktree, Some(&snapshots)),
+        [
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    // Beside the sibling, `../commons` is its canonical path: one mount.
+    assert_eq!(
+        mounts(beside, Some(&snapshots)),
+        [(
+            "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+            PathBuf::from("/w/source/commons")
+        )]
+    );
+    // A sibling without a resolved snapshot is refused rather than mounted
+    // from the host.
+    assert!(sibling_mounts(worktree, &[sibling("/w/source/other")], Some(&snapshots)).is_err());
+}
+
+/// The job's Git config names the workspace and every place a sibling is
+/// mounted, the canonical path and the `../<name>` alias, exactly and without
+/// a wildcard.
+#[test]
+fn job_git_config_lists_the_workspace_and_both_sibling_mounts_as_safe() {
+    let scratch = cortexkit_test_support::ScratchDir::new("safe-directories");
+    let config = crate::engine::Config::new("/state-root", "main");
+    let workspace = Path::new("/w/worktrees/a");
+    let siblings = [SiblingSnapshot {
+        canonical_path: "/w/source/commons".into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(
+            PathBuf::from("/state-root/main/sibling-snapshots/commons/s1"),
+            PathBuf::from("/w/source/commons"),
+        )],
+    };
+    for snapshots in [None, Some(&snapshots)] {
+        let file = scratch.join(format!("gitconfig-{}", snapshots.is_some()));
+        let mounts = sibling_mounts(workspace, &siblings, snapshots).unwrap();
+        write_safe_directories(&file, &safe_directories(workspace, &mounts)).unwrap();
+        let listed = workspace::git(
+            &scratch,
+            &[
+                "config",
+                "--file",
+                file.to_str().unwrap(),
+                "--get-all",
+                "safe.directory",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            [
+                "/w/worktrees/a",
+                "/w/source/commons",
+                "/w/worktrees/commons"
+            ],
+            "snapshots: {}",
+            snapshots.is_some()
+        );
+    }
+}
+
+/// Git inside a job reads a sibling owned by another account, through a
+/// read-only mount, at both the sibling's path and its alias. Bind mounts
+/// need root, so the test stands in for each mount with a read-only copy of a
+/// dissociated snapshot, and Git's own test switch
+/// makes it treat every repository as owned by someone else. With the job's
+/// Git config, `rev-parse`, `log` and `status` work and print no warning; a
+/// directory the config does not list is refused, as the alias was before it
+/// was listed.
+#[test]
+fn job_git_reads_a_sibling_owned_by_another_account_at_its_path_and_alias() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = cortexkit_test_support::ScratchDir::new("safe-sibling-git");
+    let root = fs::canonicalize(&*scratch).unwrap();
+    let git_in = |directory: &Path, args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_in(&source, &["init", "-q"]);
+    fs::write(source.join("source"), "first\n").unwrap();
+    git_in(&source, &["add", "."]);
+    git_in(
+        &source,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "first",
+        ],
+    );
+    let head = workspace::git(&source, &["rev-parse", "HEAD"]).unwrap();
+    // A snapshot as creation leaves it: a shared clone, dissociated from the
+    // repository it was cloned from.
+    let snapshot = root.join("snapshot");
+    git_in(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            source.to_str().unwrap(),
+            snapshot.to_str().unwrap(),
+        ],
+    );
+    assert!(snapshot.join(".git/objects/info/alternates").is_file());
+    crate::sibling_snapshots::store::dissociate(&snapshot).unwrap();
+    fs::remove_dir_all(&source).unwrap();
+
+    let workspace = root.join("w/worktrees/a");
+    let canonical = root.join("w/source/commons");
+    let alias = root.join("w/worktrees/commons");
+    let unlisted = root.join("w/worktrees/unlisted");
+    let siblings = [SiblingSnapshot {
+        canonical_path: canonical.to_string_lossy().into_owned(),
+        commit: head.clone(),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    let config = crate::engine::Config::new("/state-root", "main");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot.clone(), canonical.clone())],
+    };
+    let mounts = sibling_mounts(&workspace, &siblings, Some(&snapshots)).unwrap();
+    let gitconfig = root.join("gitconfig");
+    write_safe_directories(&gitconfig, &safe_directories(&workspace, &mounts)).unwrap();
+    for (_, destination) in &mounts {
+        copy_read_only(&snapshot, destination);
+    }
+    copy_read_only(&snapshot, &unlisted);
+    for path in [&canonical, &alias, &unlisted] {
+        let mode = fs::metadata(path.join("source"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o222, 0, "{} is read-only", path.display());
+    }
+
+    let run = |directory: &Path, args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    for path in [&canonical, &alias] {
+        for (args, expected) in [
+            (&["rev-parse", "HEAD"][..], format!("{head}\n")),
+            (&["log", "-1", "--format=%H"][..], format!("{head}\n")),
+            (&["status", "--porcelain"][..], String::new()),
+        ] {
+            let output = run(path, args);
+            assert!(
+                output.status.success() && output.stderr.is_empty(),
+                "git {args:?} at {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+    }
+    let refused = run(&unlisted, &["rev-parse", "HEAD"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("dubious ownership"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    for path in [&canonical, &alias, &unlisted] {
+        make_writable(path);
+    }
+}
+
+/// Copies `source` to `target` and removes every write bit, as a read-only
+/// mount of a snapshot shows it.
+fn copy_read_only(source: &Path, target: &Path) {
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let status = Command::new("cp")
+        .arg("-pR")
+        .arg(source)
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("chmod")
+        .args(["-R", "a-w"])
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Gives the owner write access again, so the scratch directory can go.
+fn make_writable(path: &Path) {
+    let status = Command::new("chmod")
+        .args(["-R", "u+w"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

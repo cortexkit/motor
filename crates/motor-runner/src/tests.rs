@@ -5066,6 +5066,7 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
                 request: request.clone(),
                 base: false,
                 recorded: BTreeMap::new(),
+                snapshots: None,
             },
             Err(error),
         )

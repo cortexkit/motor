@@ -201,6 +201,7 @@ impl Prior {
 #[derive(Debug)]
 pub(crate) struct Pending {
     sibling: String,
+    snapshot: PathBuf,
     record: Record,
     touched: usize,
 }
@@ -209,6 +210,18 @@ impl Pending {
     /// How many paths the touch raised the mtime of.
     pub(crate) fn touched(&self) -> usize {
         self.touched
+    }
+
+    /// The sibling's canonical path.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sibling(&self) -> &str {
+        &self.sibling
+    }
+
+    /// The snapshot directory that was touched, which the setup mounts at
+    /// the sibling's path.
+    pub(crate) fn snapshot(&self) -> &Path {
+        &self.snapshot
     }
 
     /// Stores the record in the workspace's catalog entry. Returns false,
@@ -305,6 +318,7 @@ pub(crate) fn switch(
     }
     Ok(Pending {
         sibling: sibling.to_string(),
+        snapshot: snapshot.to_path_buf(),
         record: Record::after(closed, tree, config.sibling_freshness_entries),
         touched,
     })

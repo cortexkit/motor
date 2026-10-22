@@ -73,7 +73,12 @@ pub(crate) struct Setup {
     pub base: bool,
     /// Sibling checkout paths mapped to their commits when setup was reserved.
     /// Checkout compares these with the requested commits before reusing files.
+    /// Empty in sibling snapshot mode, which never checks a sibling out.
     pub recorded: BTreeMap<String, String>,
+    /// In sibling snapshot mode, for a job that is not a warm build: its
+    /// siblings' snapshots, resolved by the setup thread before
+    /// materialization. `None` when siblings are checked out in place.
+    pub snapshots: Option<crate::sibling_snapshots::JobSiblings>,
 }
 
 pub(crate) struct Prepared {
@@ -433,9 +438,10 @@ impl Backend for HostBackend {
         // separate from the workspace check because a job's first run has no
         // workspace yet while its siblings can already exist. Admission never
         // lets a sibling be prepared while a job is running in it, so no job is
-        // affected.
+        // affected. A job that mounts its siblings from snapshots never reads
+        // or writes their host paths, so it leaves them alone.
         #[cfg(target_os = "linux")]
-        if config.isolate_jobs {
+        if config.isolate_jobs && s.snapshots.is_none() {
             for sibling in &r.siblings {
                 let sibling = std::path::Path::new(&sibling.canonical_path);
                 if !sibling.is_dir() {
@@ -476,8 +482,18 @@ impl Backend for HostBackend {
             });
             setup_step(
                 "populate workspace",
-                crate::setup_log::phase("populate workspace", || {
-                    trees.populate(
+                crate::setup_log::phase("populate workspace", || match &s.snapshots {
+                    // Each sibling comes from its snapshot, mounted at the
+                    // sibling's path by the sandbox: only the main workspace
+                    // is checked out on the host.
+                    Some(_) => trees.populate_main(
+                        &r.workspace_key,
+                        &r.repository_root,
+                        &r.snapshot_commit,
+                        &r.tree_hash,
+                        &caller_commit,
+                    ),
+                    None => trees.populate(
                         &r.workspace_key,
                         &r.repository_root,
                         &r.snapshot_commit,
@@ -485,7 +501,7 @@ impl Backend for HostBackend {
                         &s.recorded,
                         &r.tree_hash,
                         &caller_commit,
-                    )
+                    ),
                 }),
             )?;
         }
@@ -587,6 +603,15 @@ impl Backend for HostBackend {
                 })
                 .collect();
             trees.refresh_dependency_aliases(&lockfile, &routes)?;
+            // In snapshot mode the sandbox mounts each sibling's snapshot at
+            // the sibling's path, and the Cargo prefetch sees the same view.
+            let snapshots =
+                s.snapshots
+                    .as_ref()
+                    .map(|snapshots| crate::isolation::SnapshotSiblings {
+                        config,
+                        siblings: snapshots.mounts(),
+                    });
             let sandbox = setup_step(
                 "prepare isolated job sandbox",
                 crate::setup_log::phase("prepare isolated sandbox", || {
@@ -617,10 +642,7 @@ impl Backend for HostBackend {
                             &r.repository_root,
                             config.tenant_vm,
                             config.shared_compile_cache(),
-                            // Siblings are not mounted from snapshots yet:
-                            // jobs see each sibling's in-place checkout at its
-                            // path, and the prefetch reads the same checkout.
-                            None,
+                            snapshots.as_ref(),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its

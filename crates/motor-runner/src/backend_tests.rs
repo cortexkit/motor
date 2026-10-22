@@ -96,6 +96,7 @@ fn setup(cwd: &Path) -> Setup {
         },
         base: false,
         recorded: BTreeMap::new(),
+        snapshots: None,
     }
 }
 
