@@ -143,11 +143,42 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         qualify = (HERE / "qualify.ps1").read_text()
         self.assertCodeIn("[switch]$PrepLaunchMatrix", wrapper)
         self.assertCodeIn("if ($PrepLaunchMatrix)", qualify)
-        matrix = qualify.split("if ($PrepLaunchMatrix)", 1)[1].split('$parent = "$Root', 1)[0]
+        matrix = qualify.split("if ($PrepLaunchMatrix)", 1)[1].split("if ($OfflineCargoOnly)", 1)[0]
         self.assertCodeIn("Runner-Check 'qualify-prep-matrix'", matrix)
         self.assertCodeIn("Copy-QualificationEvidence", matrix)
         self.assertCodeIn("return", matrix)
         self.assertNotIn("Get-FileHash", matrix)
+
+    def test_offline_cargo_diagnostic_is_separate_and_keeps_lowbox_out(self):
+        wrapper = (HERE / "run-system.ps1").read_text()
+        qualify = (HERE / "qualify.ps1").read_text()
+        main = (ROOT / "crates/motor-runner/src/main.rs").read_text()
+        library = (ROOT / "crates/motor-runner/src/lib.rs").read_text()
+        windows = (ROOT / "crates/motor-runner/src/windows.rs").read_text()
+        self.assertCodeIn("[switch]$OfflineCargoOnly", wrapper)
+        self.assertCodeIn("$PrepLaunchMatrix -or $AccessChecksOnly -or $LowboxLaunch", wrapper)
+        self.assertCodeIn('"qualify-prep-offline-cargo" => motor_runner::hyperv_qualify_prep_offline_cargo(config)', main)
+        self.assertCodeIn("pub fn hyperv_qualify_prep_offline_cargo", library)
+        self.assertCodeIn("trusted_prep::offline_cargo_entry(config)", windows)
+        offline = qualify.split("if ($OfflineCargoOnly)", 1)[1].split('$parent = "$Root', 1)[0]
+        self.assertCodeIn("Runner-Check 'qualify-prep-offline-cargo'", offline)
+        self.assertCodeIn("Copy-QualificationEvidence", offline)
+        self.assertNotIn("LowboxLaunch", offline)
+
+    def test_offline_cargo_probe_reports_the_sparse_index_and_lockfile_archive(self):
+        self.assertCodeIn('"registry/index/<registry-id>/.cache/3/c/cfg-if"', self.prep)
+        self.assertCodeIn('"registry/cache/<registry-id>/cfg-if-1.0.4.crate"', self.prep)
+        self.assertCodeIn('"checksum_matches_lockfile": matches', self.prep)
+        self.assertCodeIn('"CARGO_NET_OFFLINE": "true"', self.prep)
+        self.assertCodeIn('"fetch", "--locked", "--offline", "--manifest-path"', self.prep)
+        self.assertCodeIn('"fetch", "--locked", "--manifest-path"', self.prep)
+        self.assertCodeIn('launch::DiagnosticPolicy::OfflineCargo', self.prep)
+        self.assertCodeIn("cargo did not start", self.prep)
+        self.assertCodeIn("output_mentions_ksecdd", self.prep)
+        self.assertCodeIn("exit_code_looks_like_ntstatus", self.prep)
+        self.assertCodeIn("&& policy != DiagnosticPolicy::OfflineCargo", self.launch)
+        self.assertCodeIn("CARGO_NET_OFFLINE", self.launch)
+        self.assertCodeIn("offline-cargo-home", self.launch)
 
     def test_default_dacl_change_is_diagnostic_only_with_actual_readbacks(self):
         self.assertCodeIn("if plan.diagnostic_policy.changes_default_dacl()", self.session)

@@ -26,6 +26,8 @@ pub(super) enum DiagnosticPolicy {
     RestrictedCode,
     DefaultDaclRestrictedCode,
     FetchDefaultDaclRestrictedCode,
+    /// Fixed offline Cargo fixture under the ordinary write-restricted token.
+    OfflineCargo,
     DefaultDaclProbeFirst,
     DefaultDaclCargoTwice,
     DefaultDaclSafeCwdPair,
@@ -232,8 +234,10 @@ fn run_plan(
             .collect(),
         restricted,
         diagnostic_policy: policy,
-        // Preserve failure reports without adding debugger creation flags to the lowbox cells.
-        diagnostic_loader_trace: retain_failure && policy.lowbox().is_none(),
+        // Lowbox and offline-startup probes need an uninstrumented launch.
+        diagnostic_loader_trace: retain_failure
+            && policy.lowbox().is_none()
+            && policy != DiagnosticPolicy::OfflineCargo,
         // Keep the lowbox variants on the production staging working directory so
         // the baseline cell does not hide a cwd-related CreateProcessAsUserW failure.
         diagnostic_safe_cwd: policy.rng_mode().is_some(),
@@ -323,8 +327,8 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         ));
     }
     session::no_reparse(&plan.root, &plan.cwd)?;
-    // Token controls cannot be used by production fetch. Only the fixed offline
-    // diagnostic fixture may use the fetch variant; all other controls are --version.
+    // Token controls cannot be used by production fetch. Only fixed offline
+    // diagnostic fixtures may use the fetch variant; all other controls are --version.
     let rng_mode = plan.diagnostic_policy.rng_mode();
     if let Some(mode) = rng_mode {
         if !plan.restricted
@@ -364,6 +368,17 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
                             .cwd
                             .join("fetch-manifests/matrix-fixture")
                             .join("Cargo.toml")
+            } else if plan.diagnostic_policy == DiagnosticPolicy::OfflineCargo {
+                let cargo_home = plan.cwd.join("fetch-temp/offline-cargo-home");
+                plan.args.len() != 5
+                    || plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]
+                    || Path::new(&plan.args[4])
+                        != plan.cwd.join("fetch-manifests/offline-cargo/Cargo.toml")
+                    || plan.env.get("CARGO_NET_OFFLINE") != Some(&Some("true".to_owned()))
+                    || plan.env.get("CARGO_REGISTRIES_CRATES_IO_PROTOCOL")
+                        != Some(&Some("sparse".to_owned()))
+                    || plan.env.get("CARGO_HOME")
+                        != Some(&Some(cargo_home.to_string_lossy().into_owned()))
             } else {
                 plan.args != ["--version"]
             })

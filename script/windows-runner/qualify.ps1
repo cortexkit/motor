@@ -1,9 +1,10 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$LowboxLaunch)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$LowboxLaunch, [switch]$OfflineCargoOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
 if ($LowboxLaunch -and (-not $PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'LowboxLaunch requires PrepLaunchMatrix and excludes AccessChecksOnly' }
+if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly -or $LowboxLaunch)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\qualify-peer.ps1"
@@ -57,6 +58,16 @@ if ($PrepLaunchMatrix) {
         }
     } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Matrix evidence copy failed: $_" -WarningAction Continue }
+    }
+    return
+}
+if ($OfflineCargoOnly) {
+    $service = Get-Service MotorRunner
+    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
+    try {
+        $null = Runner-Check 'qualify-prep-offline-cargo'
+    } finally {
+        try { Copy-QualificationEvidence } catch { Write-Warning "Offline Cargo evidence copy failed: $_" -WarningAction Continue }
     }
     return
 }

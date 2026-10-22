@@ -116,6 +116,33 @@ The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enable
 a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;
 qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
+To check whether offline Cargo still starts under the existing write-restricted
+`motor-prep` token, use the dedicated diagnostic lane (not the AppContainer/lowbox
+probe). After installing a bundle built from the reviewed source commit, run this
+from elevated PowerShell 5.1:
+
+```powershell
+$python = (Get-Command python.exe -ErrorAction Stop).Source
+$evidence = 'C:\motor-runner-evidence\offline-cargo-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
+  -Python $python -Evidence $evidence -OfflineCargoOnly
+if ($LASTEXITCODE -ne 0) { throw "Offline Cargo diagnostic failed; preserve $evidence" }
+```
+
+The runner first uses pinned Cargo as SYSTEM with `fetch --locked` to populate a
+per-job Cargo home, then launches `fetch --locked --offline` with
+`CARGO_NET_OFFLINE=true` under the normal write-restricted token. The fixture locks
+`cfg-if 1.0.4`; its sparse-registry layout is
+`registry/index/<registry-id>/config.json`,
+`registry/index/<registry-id>/.cache/3/c/cfg-if`, and
+`registry/cache/<registry-id>/cfg-if-1.0.4.crate`. The report records whether those
+files exist, independently checks the archive SHA-256 against Cargo.lock, and
+preserves Cargo's exit status, output, and whether it mentions `\Device\KsecDD`.
+This is evidence collection only: it makes no AppContainer/lowbox launch and does
+not change production fetching. The diagnostic does not mark a nonzero Cargo
+result as a qualification failure; inspect the copied `prep-offline-cargo-*.json`
+report and nested launch report. Leave the service stopped for evidence review.
+
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
 This stops MotorRunner and runs sixteen probe/Cargo/rustc token comparisons without

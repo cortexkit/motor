@@ -111,6 +111,11 @@ pub fn hyperv_qualify_prep_matrix(config: Config) -> std::io::Result<()> {
 }
 #[cfg(windows)]
 #[doc(hidden)]
+pub fn hyperv_qualify_prep_offline_cargo(config: Config) -> std::io::Result<()> {
+    windows::qualify_prep_offline_cargo(config)
+}
+#[cfg(windows)]
+#[doc(hidden)]
 pub fn hyperv_qualify_prep_lowbox(config: Config) -> std::io::Result<()> {
     windows::qualify_prep_lowbox(config)
 }

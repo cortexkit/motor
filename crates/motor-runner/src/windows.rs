@@ -63,6 +63,10 @@ pub(crate) fn qualify_prep_matrix(config: Config) -> io::Result<()> {
     trusted_prep::matrix_entry(config)
 }
 #[cfg(windows)]
+pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {
+    trusted_prep::offline_cargo_entry(config)
+}
+#[cfg(windows)]
 pub(crate) fn qualify_prep_lowbox(config: Config) -> io::Result<()> {
     trusted_prep::lowbox_entry(config)
 }
