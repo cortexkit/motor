@@ -66,13 +66,13 @@ pub enum Behavior {
     /// drops the connection before the rest of the output and the terminal
     /// reach ck-motor. An attach replays everything from its cursor.
     SettleThenDrop,
-    /// Like `CompleteRun`, but the runner ends the job as outcome_unknown,
-    /// with `UNKNOWN_DETAIL` and `UNKNOWN_WALL_MS`, on the live connection.
+    /// Like `CompleteRun`, but the runner ends the job as outcome_unknown on
+    /// the live connection after `UNKNOWN_WALL_MS`, with no detail, as
+    /// motor-runner does.
     UnknownTerminal,
 }
 
-/// Detail and wall time of the `UnknownTerminal` job's terminal.
-pub const UNKNOWN_DETAIL: &str = "runner lost track of the command";
+/// Wall time of the `UnknownTerminal` job's terminal.
 pub const UNKNOWN_WALL_MS: u64 = 794_950;
 
 /// The host key the harness registers with its fake broker, so the fake host
@@ -365,7 +365,6 @@ impl Harness {
                                                     0,
                                                     0,
                                                 )
-                                                .with_refusal_detail(UNKNOWN_DETAIL)
                                             } else {
                                                 TerminalRecord::new(
                                                     id,

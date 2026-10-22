@@ -1511,12 +1511,18 @@ impl Motor {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
-            // Every route to an unknown outcome names its cause here, whether
-            // the runner reported it or ck-motor gave up on the job itself.
+            // Every route to an unknown outcome logs here: the terminal's
+            // detail when it has one, otherwise whether a terminal was
+            // recorded at all (motor-runner sends none with its own unknown
+            // outcomes, so its terminal arrives without a detail).
             let cause = terminal
                 .refusal_detail
                 .as_deref()
-                .unwrap_or("no terminal received from the hosted runner");
+                .unwrap_or(if state.terminal.is_some() {
+                    "terminal recorded without a detail"
+                } else {
+                    "no terminal received from the hosted runner"
+                });
             tracing::warn!(job_id = %id, step = "finish", hosted_code = ?state.hosted_code,
                 cause, wall_ms = terminal.wall_ms, "hosted job outcome unknown");
         }

@@ -1,16 +1,16 @@
-//! A hosted job that ends with an unknown outcome always logs why: the
-//! runner's own detail when it reported the unknown outcome, or the reason
-//! ck-motor gave up when no terminal arrived.
+//! A hosted job that ends with an unknown outcome always logs a cause: the
+//! terminal's detail when it has one, otherwise whether a terminal arrived.
 use super::*;
 use crate::hosted::{
     boat_tests::{committed_repo, records},
-    tests::harness::{Behavior, Harness, NoSsh, UNKNOWN_DETAIL, UNKNOWN_WALL_MS},
+    tests::harness::{Behavior, Harness, NoSsh, UNKNOWN_WALL_MS},
 };
 use std::sync::atomic::AtomicUsize;
 
-/// The runner ends a running job as outcome_unknown on a live connection: no
-/// disconnect or reattach happens, so the terminal's own detail is the only
-/// cause there is, and it must reach the log before the lease is settled.
+/// The runner ends a running job as outcome_unknown on a live connection,
+/// with no detail, as motor-runner does: no disconnect or reattach happens,
+/// so the runner's terminal must itself reach the log, before the lease is
+/// settled, and the settlement must not claim that no terminal arrived.
 #[tokio::test]
 async fn runner_reported_outcome_unknown_logs_its_cause() {
     let h = Harness::new(Behavior::UnknownTerminal).await;
@@ -46,7 +46,7 @@ async fn runner_reported_outcome_unknown_logs_its_cause() {
         .find(|line| line.contains(&job) && line.contains("hosted runner reported outcome unknown"))
         .unwrap_or_else(|| panic!("no runner terminal line: {text}"));
     assert!(reported.contains("WARN"), "{reported}");
-    assert!(reported.contains(UNKNOWN_DETAIL), "{reported}");
+    assert!(reported.contains("no detail from the runner"), "{reported}");
     assert!(
         reported.contains(&format!("wall_ms={UNKNOWN_WALL_MS}")),
         "{reported}"
@@ -55,7 +55,10 @@ async fn runner_reported_outcome_unknown_logs_its_cause() {
         .lines()
         .find(|line| line.contains(&job) && line.contains("hosted job outcome unknown"))
         .unwrap_or_else(|| panic!("no outcome-unknown line: {text}"));
-    assert!(settled.contains(UNKNOWN_DETAIL), "{settled}");
+    assert!(
+        settled.contains("terminal recorded without a detail"),
+        "{settled}"
+    );
 }
 
 /// ck-motor ends a hosted job itself when no terminal ever arrived; the log
