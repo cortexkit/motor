@@ -66,8 +66,8 @@ struct LockFixture {
     events: Arc<Mutex<Vec<(&'static str, Uuid)>>>,
     /// The job record whose next save pauses on the `record_save` hold.
     held_record: Arc<Mutex<Option<PathBuf>>>,
-    /// Kill retries scheduled here are only due for explicit
-    /// `enforce_kills` calls, never for the background scheduler.
+    /// Keep new jobs' kill retries out of the background scheduler until a
+    /// test makes them due or cancellation reschedules them.
     retry_at: std::time::Instant,
 }
 
@@ -225,18 +225,24 @@ fn cancel_proceeds_while_a_kill_retry_waits_for_systemctl() {
         let f = LockFixture::new(label);
         let killed = f.running();
         let other = f.running();
-        f.runner
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .jobs
-            .get_mut(&killed)
-            .unwrap()
-            .kill = Some((Killed::Cancel, f.runner.now()));
-        let retry_at = f.retry_at;
         f.hold.arm();
-        let _release = f.hold_in(move |runner| runner.enforce_kills(retry_at).unwrap());
+        {
+            let mut inner = f.runner.core.inner.lock().unwrap();
+            inner.jobs.get_mut(&killed).unwrap().kill = Some((Killed::Cancel, f.runner.now()));
+            // A background pass can own the job's write lock even before its
+            // retry is due, making the explicit pass skip it. Make the retry
+            // due for both passes so the scheduler reaches the hold if it wins.
+            inner
+                .kill_retries
+                .insert(killed, (0, std::time::Instant::now()));
+        }
+        let _release = f.hold_in(move |runner| {
+            // Hold this job's write lock while calling enforce_kills so it
+            // skips the job and leaves its due retry for the scheduler.
+            let log = runner.job_log(killed);
+            let _write = log.lock_write();
+            runner.enforce_kills(std::time::Instant::now()).unwrap();
+        });
         f.assert_cancel_completes(other);
     }
 }

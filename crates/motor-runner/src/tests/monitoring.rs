@@ -1125,18 +1125,19 @@ fn slow_replay_reads_leave_unrelated_control_operations_responsive() {
         let runner = runner.clone();
         move || runner.replay(id, 0)
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv().unwrap();
     let (request, _) = f.run("true");
     let (control, reply) = responsive_controls(&runner, request);
-    let responsive = reply.recv_timeout(Duration::from_secs(1));
-    drop(release);
-    let frames = reader.join().unwrap().unwrap();
-    control.join().unwrap();
-    assert_eq!(
-        responsive.ok(),
-        Some(true),
+    // Complete every control before releasing storage. Host scheduling delay
+    // is not evidence that the controls waited for the replay read.
+    assert!(
+        reply.recv().unwrap(),
         "replay storage stalled unrelated controls"
     );
+    assert!(!reader.is_finished(), "replay must still be held");
+    control.join().unwrap();
+    drop(release);
+    let frames = reader.join().unwrap().unwrap();
     assert!(matches!(frames.first(), Some(Frame::Output(o)) if o.bytes.0 == b"replayed output"));
 }
 
@@ -1508,6 +1509,9 @@ fn slow_ref_pruning_leaves_unrelated_control_operations_responsive() {
     let release = ReleaseIo(pause.clone());
     let armed = Arc::new(AtomicBool::new(false));
     let mut config = f.config();
+    // Disable background ticks so the runner.maintenance() call below, not the
+    // scheduler, enters the one-shot pruning hold.
+    config.manual_tick = true;
     config.long_work = Some({
         let armed = armed.clone();
         Arc::new(move |label| {
@@ -1528,18 +1532,19 @@ fn slow_ref_pruning_leaves_unrelated_control_operations_responsive() {
         let runner = runner.clone();
         move || runner.maintenance()
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv().unwrap();
     let (request, _) = f.run("true");
     let (control, reply) = responsive_controls(&runner, request);
-    let responsive = reply.recv_timeout(Duration::from_secs(1));
-    drop(release);
-    pruner.join().unwrap().unwrap();
-    control.join().unwrap();
-    assert_eq!(
-        responsive.ok(),
-        Some(true),
+    // The Git step remains paused until all controls complete, irrespective of
+    // how long the host takes to schedule their worker.
+    assert!(
+        reply.recv().unwrap(),
         "ref pruning stalled unrelated controls"
     );
+    assert!(!pruner.is_finished(), "ref pruning must still be held");
+    control.join().unwrap();
+    drop(release);
+    pruner.join().unwrap().unwrap();
     assert!(git(
         &mirror,
         &[
