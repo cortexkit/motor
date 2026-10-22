@@ -5057,7 +5057,7 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
         .state = JobState::Queued;
     let error = io::Error::other(format!("{secret}: {}", "é".repeat(1024)));
     runner
-        .launch(
+        .launch_without_dispatch(
             Setup {
                 id: request.job_id,
                 cpus: vec![1, 17],

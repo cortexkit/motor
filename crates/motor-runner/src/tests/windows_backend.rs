@@ -548,6 +548,33 @@ fn cleaned(c: &Config, id: Uuid, agent: &Agent) {
     assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
 }
 
+/// A setup attempt for a job whose earlier attempt is not cleaned up yet
+/// (its staging directory still exists) fails, and must not delete that
+/// earlier attempt's overlay, socket directory or staging: its VM may still
+/// be using them.
+#[test]
+fn windows_backend_failed_attempt_keeps_an_earlier_attempt_s_files() {
+    let f = Fixture::new();
+    let (c, _) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let id = Uuid::now_v7();
+    let [overlay, sockets, staging] = job_artifacts(runner.config(), id);
+    fs::write(&overlay, b"earlier overlay").unwrap();
+    fs::create_dir_all(&sockets).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("tree"), b"earlier staging").unwrap();
+    let error =
+        crate::windows::prepare_and_drop_resources(runner.config(), id, "workspace").unwrap_err();
+    assert!(error.to_string().contains("staging"), "{error}");
+    for path in [&overlay, &sockets, &staging] {
+        assert!(
+            path.exists(),
+            "{} of the earlier attempt was deleted",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn windows_backend_recovery_notice_describes_only_automatic_retry_policy() {
     let f = Fixture::new();

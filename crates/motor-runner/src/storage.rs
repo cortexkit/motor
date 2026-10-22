@@ -529,6 +529,27 @@ pub(crate) fn atomic_json_private(path: &Path, value: &impl Serialize) -> io::Re
 }
 
 fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    write_json(&mut bytes, value)?;
+    atomic_bytes(path, &bytes, private)
+}
+
+/// `atomic_json` for a value already serialized, so a caller can serialize
+/// under a lock and write after releasing it. `private` writes it as
+/// `atomic_json_private` does (on Unix, readable by its owner only).
+pub(crate) fn atomic_bytes(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    atomic_bytes_and(path, bytes, private, || Ok(()))
+}
+
+/// `atomic_bytes`, calling `renamed` as soon as the new file has replaced
+/// the old one, before the directory is synced. From then on a reader of
+/// `path` sees the new bytes, even when this returns an error.
+pub(crate) fn atomic_bytes_and(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+    renamed: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("record has no parent"))?;
@@ -555,11 +576,12 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
         // This directory inherits the installer's SYSTEM/Administrators DACL.
         File::create(&tmp)?
     };
-    write_json(&mut file, value)?;
+    file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
     drop(file);
     crate::filesystem::rename(&tmp, path)?;
+    renamed()?;
     crate::filesystem::sync_directory(parent)
 }
 

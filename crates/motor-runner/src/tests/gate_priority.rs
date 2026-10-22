@@ -709,3 +709,49 @@ fn sibling_user_accepted_before_the_workspace_job_starts_first() {
     assert_eq!(started, BTreeSet::from([user_id]));
     assert_eq!(main_phase.as_deref(), Some("sibling user of this checkout"));
 }
+
+/// A workspace job whose withdrawal is still being saved stays in the queue
+/// as an ordering fence until the withdrawal is published: it does not start,
+/// and it still holds back the sibling users accepted after it, even one that
+/// dispatch reaches before it. Once the withdrawal is published, they start.
+#[test]
+fn workspace_job_being_withdrawn_still_holds_later_sibling_users() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let main = workspace_job(&f, &request, 1, false, now);
+    let main_id = main.id;
+    inner.jobs.insert(main_id, main);
+    // Queued past the backfill grace, so dispatch reaches it first.
+    let mut user = sibling_user(&f, &request, "later", 2, now);
+    user.queued_ms = Some(now - BACKFILL_GRACE_MS);
+    let user_id = user.id;
+    inner.jobs.insert(user_id, user);
+    inner.terminal_saves.insert(main_id);
+    runner.dispatch(&mut inner, now).unwrap();
+    let started = inner.starting.clone();
+    let phase = runner
+        .queue_wait_phase(&inner, &DispatchIndex::build(&inner), user_id)
+        .map(str::to_owned);
+    // The withdrawal is saved and published.
+    inner.terminal_saves.remove(&main_id);
+    let withdrawn = inner.jobs.get_mut(&main_id).unwrap();
+    withdrawn.terminal(
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded,
+        },
+        now,
+    );
+    withdrawn.state = JobState::Tombstone;
+    runner.dispatch(&mut inner, now).unwrap();
+    let after = inner.starting.clone();
+    drop(inner);
+    assert!(
+        started.is_empty(),
+        "a job started while a workspace job's withdrawal was pending: {started:?}"
+    );
+    assert_eq!(phase.as_deref(), Some("queued workspace job"));
+    assert_eq!(after, BTreeSet::from([user_id]));
+}

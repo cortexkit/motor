@@ -40,6 +40,16 @@ impl Runtime {
     pub(crate) fn cleanup_pending(&self, id: Uuid) -> bool {
         self.cleanup_ids.lock().unwrap().contains(&id)
     }
+    /// Mark `id`'s cleanup pending, or done, as a failed VM stop would.
+    #[cfg(test)]
+    pub(crate) fn set_cleanup_pending(&self, id: Uuid, pending: bool) {
+        let mut ids = self.cleanup_ids.lock().unwrap();
+        if pending {
+            ids.insert(id);
+        } else {
+            ids.remove(&id);
+        }
+    }
     pub(crate) fn retry_cleanups(&self) {
         // Give each queued job at most one attempt per pass, and cap the work
         // so a broken unit cannot monopolize maintenance or starve later jobs.
