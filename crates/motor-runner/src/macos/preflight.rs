@@ -369,7 +369,7 @@ pub(super) fn validate(
                     let text = dir.text(&name)?;
                     lock(&text)?;
                     let (found, missing) =
-                        trees.dependency_fetch_routes_checked(deps, &text, &|| control.check())?;
+                        trees.dependency_fetch_routes_checked(deps, &text, Some(&|| control.check()))?;
                     if !missing.is_empty() {
                         return Err(invalid(missing.join("; ")));
                     }

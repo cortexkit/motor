@@ -215,30 +215,36 @@ impl Trees {
         &self,
         dependencies: &[GitDependency],
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
-        self.dependency_routes_checked(dependencies, &|| Ok(()))
+        self.dependency_routes_checked(dependencies, None)
     }
     fn dependency_routes_checked(
         &self,
         dependencies: &[GitDependency],
-        check: &impl Fn() -> io::Result<()>,
+        check: Option<&dyn Fn() -> io::Result<()>>,
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
         validate_dependencies(dependencies)?;
         let grouped = dependency_commits(dependencies);
         let mut routes = BTreeMap::new();
         let mut missing = Vec::new();
         for (url, commits) in &grouped {
-            check()?;
+            if let Some(check) = check {
+                check()?;
+            }
             let mirror = self.dependency_mirror(url);
             let lock = self.dependency_lock(&mirror);
-            let _guard = loop {
-                check()?;
-                match lock.try_lock() {
-                    Ok(guard) => break guard,
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        std::thread::park_timeout(std::time::Duration::from_millis(10))
+            let _guard = if let Some(check) = check {
+                crate::setup_log::lock_wait("dependency_mirror", || loop {
+                    check()?;
+                    match lock.try_lock() {
+                        Ok(guard) => break Ok(guard),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            std::thread::park_timeout(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => break Err(invalid(e)),
                     }
-                    Err(e) => return Err(invalid(e)),
-                }
+                })?
+            } else {
+                crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap())
             };
             let absent: Vec<_> = commits
                 .iter()
@@ -392,13 +398,13 @@ impl Trees {
         dependencies: &[GitDependency],
         lockfile: &str,
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
-        self.dependency_fetch_routes_checked(dependencies, lockfile, &|| Ok(()))
+        self.dependency_fetch_routes_checked(dependencies, lockfile, None)
     }
     pub(crate) fn dependency_fetch_routes_checked(
         &self,
         dependencies: &[GitDependency],
         lockfile: &str,
-        check: &impl Fn() -> io::Result<()>,
+        check: Option<&dyn Fn() -> io::Result<()>>,
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
         let mut declarations = dependencies.to_vec();
         for (url, commit, _) in locked_sources(lockfile)? {
