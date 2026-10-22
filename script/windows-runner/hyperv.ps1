@@ -1,9 +1,9 @@
 # Trusted control plane. Only installed, ACL-protected copies run as SYSTEM.
 param(
-    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','GrantPrep','RevokePrep','Harvest','QualifyInspect')][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','Harvest','QualifyInspect')][string]$Operation,
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
-    [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960, [string]$Staging,
+    [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960,
     [switch]$LightweightHarvest
 )
 $ErrorActionPreference = 'Stop'
@@ -12,11 +12,15 @@ Set-StrictMode -Version Latest
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\parent-identity.ps1"
 . "$PSScriptRoot\guest-evidence.ps1"
-. "$PSScriptRoot\prep-acl.ps1"
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or -not (Test-Path -LiteralPath "$Root\.motor-runner-root")) { throw 'Unowned runner root' }
-foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state")) {
+foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state", "$Root\staging")) {
     if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse root refused: $path" }
 }
+foreach ($path in @($Root, "$Root\state", "$Root\state\ally", "$Root\staging")) {
+    if (Test-Path -LiteralPath $path) { Assert-RunnerPrivateDirectory $path }
+}
+$crateCache = "$Root\state\ally\local-registry-cache"
+if (Test-Path -LiteralPath $crateCache) { Assert-RunnerPrivateDirectory $crateCache }
 Import-Module Hyper-V
 $prefix = 'motor-ally-'
 $owner = "MotorRunner:$Root"
@@ -136,9 +140,6 @@ function Remove-Job([string]$Id, [switch]$LightweightHarvest) {
     if ((Owned-VM $Id) -or (Test-Path -LiteralPath $directory)) { throw 'Job VM or disk remains after removal' }
     Evidence $Id 'nothing-left-behind' @{vm_absent=$true; job_directory_absent=$true}
 }
-function Grant([string]$Path, [string]$Role, [string]$Sid) {
-    Grant-RunnerPrepPath $Path $Sid $Role
-}
 if ($Operation -in @('Prepare','Id','Run','Remove','Harvest','QualifyInspect')) {
     if ($Job -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Invalid job UUID' }
 }
@@ -162,13 +163,8 @@ switch ($Operation) {
         if ($foreign.Count) { throw 'Additional host hvsock registrations require an isolation review; no foreign registration was changed' }
         $registration = Get-ItemProperty -LiteralPath $key
         if ($registration.MotorOwner -ne 'motor-runner-hyperv' -or $registration.MotorRoot -cne $Root) { throw 'hvsock registration not owned by runner' }
-        $prep = Get-LocalUser -Name motor-prep
-        if (-not $prep.Enabled) { throw 'Prep account disabled' }
-        $admins = Get-LocalGroup -SID 'S-1-5-32-544'
-        if (@(Get-LocalGroupMember -Group $admins | Where-Object SID -eq $prep.SID).Count) { throw 'Prep account is an administrator' }
         # Every service-owned path has a protected SYSTEM/Administrators DACL.
-        # Explicit batch-account grants are added only to staging and fetch cache.
-        foreach ($path in @($Root, "$Root\bin", "$Root\state", "$Root\prep-secret.dpapi")) {
+        foreach ($path in @($Root, "$Root\bin", "$Root\state")) {
             $acl = Get-Acl -LiteralPath $path
             foreach ($rule in $acl.Access) {
                 $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
@@ -186,26 +182,6 @@ switch ($Operation) {
         } finally { $started.Stop() }
         Evidence 'parent-verification' 'startup-parent-verification' $verification
         Write-Output "PASS native-host-validation cache_hit=$($verification.cache_hit) hash_duration_ms=$($verification.hash_duration_ms)"
-    }
-    { $_ -in @('GrantPrep','RevokePrep') } {
-        $parentStage = [IO.Path]::GetFullPath("$Root\staging")
-        $full = [IO.Path]::GetFullPath($Staging)
-        if ([IO.Path]::GetDirectoryName($full) -cne $parentStage -or [IO.Path]::GetFileName($full) -notmatch '^[0-9a-f-]{36}$') { throw 'Staging must name one owned job' }
-        $sid = (Get-LocalUser motor-prep).SID.Value
-        if ($Operation -eq 'RevokePrep') {
-            foreach ($path in @($full, "$full\fetch-manifests", "$full\fetch-git-deps", "$full\home", "$full\fetch-temp")) {
-                if (Test-Path -LiteralPath $path) {
-                    & icacls.exe $path /remove:g "*$sid" /Q | Out-Null
-                    if ($LASTEXITCODE -ne 0) { throw "Prep ACL revocation failed at $path" }
-                }
-            }
-            break
-        }
-        Grant $full Stage $sid
-        foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" Read $sid }
-        Grant "$full\fetch-temp" Modify $sid
-        Grant "$Root\state\ally\prep-cargo" Read $sid
-        Grant "$Root\prep-toolchain" Read $sid
     }
     'Prepare' {
         if ($Nonce -notmatch '\A[0-9a-f]{32}\z') { throw 'Nonce must be exactly 32 hexadecimal characters, without hyphens, BOM or newline' }

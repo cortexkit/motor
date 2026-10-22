@@ -28,8 +28,7 @@ pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
             "Hyper-V parent must be a sealed read-only regular file",
         ));
     }
-    // The hyperv.ps1 Validate operation checks the protected identity record and
-    // hashes only when it needs refreshing. Configuration loading reads no bytes.
+    // Startup Validate hashes and records the parent. Configuration loading reads no bytes.
     Ok(vm)
 }
 pub(super) fn validate(config: &Config) -> io::Result<()> {
@@ -82,6 +81,36 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
     )?)?;
     if let Some(file) = guard {
         *lifetime = Some((parent, file));
+    }
+    Ok(())
+}
+pub(super) fn ensure_parent_guard(config: &Config) -> io::Result<()> {
+    let vm = config
+        .windows
+        .as_ref()
+        .ok_or_else(|| invalid("Windows VM configuration is missing"))?;
+    let parent = vm.baseline_path();
+    let lifetime = config.windows_runtime.parent_guard.lock().unwrap();
+    let (guarded_path, file) = lifetime.as_ref().ok_or_else(|| {
+        invalid("Windows parent verification guard is missing; restart the service to re-verify")
+    })?;
+    if guarded_path != &parent {
+        return Err(invalid(
+            "Windows parent verification guard is for a different parent",
+        ));
+    }
+    let metadata = file.metadata().map_err(|error| {
+        invalid(format!(
+            "Windows parent verification guard was lost; restart the service: {error}"
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & 0x400 != 0
+        || !metadata.permissions().readonly()
+    {
+        return Err(invalid(
+            "Windows parent verification guard no longer identifies a sealed regular file",
+        ));
     }
     Ok(())
 }

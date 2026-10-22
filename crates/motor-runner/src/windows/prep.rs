@@ -19,9 +19,13 @@ struct Plan {
     routes: BTreeMap<String, PathBuf>,
     workspace: String,
     tree_hash: String,
+    #[cfg(any(unix, test))]
     cargo: PathBuf,
+    #[cfg(any(unix, test))]
     rustup: PathBuf,
+    #[cfg(any(unix, test))]
     toolchain_bin: PathBuf,
+    #[cfg(any(unix, test))]
     toolchain_source: PathBuf,
 }
 fn mapped(path: &str) -> io::Result<PathBuf> {
@@ -35,6 +39,8 @@ pub(super) fn prepare(
     setup: &Setup,
     staging: &Path,
 ) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    super::ensure_parent_guard(config)?;
     let request = &setup.request;
     mapped(&request.workspace_key)?;
     mapped(&request.cwd)?;
@@ -120,6 +126,7 @@ pub(super) fn prepare(
     };
     #[cfg(windows)]
     let plan = {
+        #[cfg(test)]
         let toolchain = config
             .windows
             .as_ref()
@@ -133,9 +140,13 @@ pub(super) fn prepare(
             routes,
             workspace: request.workspace_key.clone(),
             tree_hash: request.tree_hash.clone(),
+            #[cfg(test)]
             cargo: toolchain.join("bin/cargo.exe"),
+            #[cfg(test)]
             rustup: toolchain.clone(),
+            #[cfg(test)]
             toolchain_bin: toolchain.join("bin"),
+            #[cfg(test)]
             toolchain_source: toolchain,
         }
     };
@@ -166,8 +177,9 @@ pub(super) fn prepare(
         super::vm::restore_staging_access(config, staging)?;
     }
     #[cfg(windows)]
-    execute_with_fetch(&plan_path, |cmd| {
-        super::trusted_prep::prepare_fetch(config, staging, cmd)
+    execute_with_registry(&plan_path, |job_staging, workspace, routes| {
+        let lockfile = fs::read_to_string(workspace.join("Cargo.lock"))?;
+        super::trusted_prep::prepare_local_registry(config, job_staging, &lockfile, routes)
     })?;
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
@@ -344,6 +356,7 @@ fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
 
 /// Entry point for the credential-free motor-prep transient unit. Only the
 /// runner constructs its plan; the job's command is never evaluated on the host.
+#[cfg(any(unix, test))]
 pub(crate) fn execute(plan_path: &Path) -> io::Result<()> {
     execute_with_fetch(plan_path, |cmd| {
         let output = cmd.output()?;
@@ -354,6 +367,7 @@ pub(crate) fn execute(plan_path: &Path) -> io::Result<()> {
     })
 }
 
+#[cfg(any(unix, test))]
 fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
     // Cargo reads repository configuration from its working directory's ancestors,
     // not from the manifest path, so trusted commands run outside extracted trees.
@@ -379,11 +393,7 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-pub(crate) fn execute_with_fetch(
-    plan_path: &Path,
-    fetch: impl FnOnce(&mut Command) -> io::Result<()>,
-) -> io::Result<()> {
-    let plan: Plan = read_json(plan_path)?;
+fn stage_snapshots(plan: &Plan) -> io::Result<PathBuf> {
     let mut roots = Vec::new();
     let mut cases = BTreeMap::new();
     let mut members = BTreeSet::new();
@@ -439,10 +449,8 @@ pub(crate) fn execute_with_fetch(
             }
             let kind = entry.header().entry_type();
             if kind.is_symlink() {
-                // Stage a tracked symlink as a regular file holding its target
-                // text, as Git for Windows checks it out by default
-                // (core.symlinks=false). The staged tree then holds only files
-                // and directories, so nothing in it can point outside the job.
+                // Git for Windows checks out symlinks as files by default. Stage the
+                // target text instead, so transferred snapshots contain no links.
                 let target = entry
                     .link_name_bytes()
                     .ok_or_else(|| invalid(format!("snapshot link without target: {transferred}")))?
@@ -480,27 +488,51 @@ pub(crate) fn execute_with_fetch(
     }
     fs::create_dir_all(plan.staging.join("cargo-home"))?;
     fs::create_dir_all(plan.staging.join("home"))?;
-    let mut cmd = cargo_command(
+    fs::create_dir_all(plan.staging.join("fetch-temp"))?;
+    Ok(workspace)
+}
+
+#[cfg(any(unix, test))]
+pub(crate) fn execute_with_fetch(
+    plan_path: &Path,
+    fetch: impl FnOnce(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
+    let plan: Plan = read_json(plan_path)?;
+    let workspace = stage_snapshots(&plan)?;
+    let mut command = cargo_command(
         &plan,
         &workspace.join("Cargo.toml"),
         &["fetch", "--locked", "--target", "x86_64-pc-windows-msvc"],
     );
-    cmd.args(["--config", "net.git-fetch-with-cli=true"]);
+    command.args(["--config", "net.git-fetch-with-cli=true"]);
     crate::workspace::dependencies::configure_fetch_git(
-        &mut cmd,
+        &mut command,
         &plan.staging.join("home"),
         &plan.routes,
     )?;
-    let mut n = plan.routes.len();
+    let mut count = plan.routes.len();
     for mirror in plan.routes.values() {
-        cmd.env(format!("GIT_CONFIG_KEY_{n}"), "safe.directory")
-            .env(format!("GIT_CONFIG_VALUE_{n}"), mirror);
-        n += 1;
+        command
+            .env(format!("GIT_CONFIG_KEY_{count}"), "safe.directory")
+            .env(format!("GIT_CONFIG_VALUE_{count}"), mirror);
+        count += 1;
     }
-    cmd.env("GIT_CONFIG_COUNT", n.to_string());
-    fetch(&mut cmd)?;
+    command.env("GIT_CONFIG_COUNT", count.to_string());
+    fetch(&mut command)?;
     build_tar(&plan.staging)
 }
+
+#[cfg(any(windows, test))]
+pub(crate) fn execute_with_registry(
+    plan_path: &Path,
+    prepare_registry: impl FnOnce(&Path, &Path, &BTreeMap<String, PathBuf>) -> io::Result<()>,
+) -> io::Result<()> {
+    let plan: Plan = read_json(plan_path)?;
+    let workspace = stage_snapshots(&plan)?;
+    prepare_registry(&plan.staging, &workspace, &plan.routes)?;
+    build_tar(&plan.staging)
+}
+
 
 fn check_case(path: &str, cases: &mut BTreeMap<String, String>) -> io::Result<()> {
     let mut prefix = String::new();
@@ -606,6 +638,11 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     let mut seen = BTreeSet::new();
     append(&mut builder, staging, &staging.join("m"), &mut seen)?;
     for name in [
+        "config.toml",
+        "gitconfig",
+        "git-rewrites.json",
+        "local-registry",
+        "git-mirrors",
         "registry/index",
         "registry/cache",
         "git/db",

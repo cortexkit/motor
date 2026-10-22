@@ -58,13 +58,13 @@ if ($record.PSObject.Properties['ssh_home']) {
         Remove-Item -LiteralPath $record.ssh_home -Recurse -Force
     }
 }
-foreach ($name in @('motor-prep','motor-ssh')) {
-    $expected = $record.accounts.PSObject.Properties[$name]
-    if (-not $expected) { continue }
-    $account = Get-LocalUser $name -ErrorAction SilentlyContinue
-    if ($account -and $account.SID.Value -ne $expected.Value) { throw "Account SID changed: $name; refusing deletion" }
-    if ($name -eq 'motor-prep') { Set-RunnerBatchRights $Root $expected.Value -Remove }
-    if ($account) { Remove-LocalUser $name }
+$prepAccount = $record.accounts.PSObject.Properties['motor-prep']
+if ($prepAccount) { Remove-RunnerPrepAccount $Root $prepAccount.Value }
+$sshAccount = $record.accounts.PSObject.Properties['motor-ssh']
+if ($sshAccount) {
+    $account = Get-LocalUser motor-ssh -ErrorAction SilentlyContinue
+    if ($account -and $account.SID.Value -ne $sshAccount.Value) { throw 'Account SID changed: motor-ssh; refusing deletion' }
+    if ($account) { Remove-LocalUser motor-ssh }
 }
 if ($record.PSObject.Properties['power']) {
     foreach ($setting in $record.power.ac.PSObject.Properties) {

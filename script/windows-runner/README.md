@@ -24,22 +24,15 @@ the host.
   password, TCP/agent forwarding, PTY and forced-command settings. It also
   configures X11 forwarding off where Windows OpenSSH supports that option. It
   prints sshd's public host key for the client pin. No ambient client SSH configuration is required.
-- VM management is a boot-start SCM service running as SYSTEM. Trusted Cargo
-  **fetch only** uses a separate batch-only `motor-prep` account, a write-restricted
-  token, a kill-on-close/process-limited Job Object and allow-listed staging stdio
-  handles only. A one-shot SYSTEM broker creates a private non-interactive window
-  station/desktop for the fetch logon session, loads its profile and builds its
-  user environment; Cargo itself never runs as SYSTEM or an administrator.
-  The fetch view contains copied manifests/lockfiles and empty target
-  placeholders, not the job's source files. Runner keys remain under the private
-  runner-state ACL. A serialized fetch section revokes each job's grants
-  before another prep begins. The runner's Cargo cache is the only persistent
-  preparation cache, seeded/published by SYSTEM. The fetch token's distinct logon
-  SID grants writes only inside its staging temp tree, not the loaded profile,
-  shared host temp or persistent cache. Only selected registry/git results are staged.
-  Native prep qualification also executes the pinned `cargo --version` through
-  this broker; launch diagnostics name the desktop/profile setup and unsigned
-  hex exit status, including `0xC0000142 STATUS_DLL_INIT_FAILED` for loader failure.
+ - VM management is a boot-start SCM service running as SYSTEM. Production preparation
+   does not run Cargo or Rustup on the Ally host. The runner reads the copied Cargo.lock,
+   downloads only allowlisted crates.io index records and `.crate` archives, verifies
+   each locked checksum before publication, and maintains a SYSTEM/Administrators-only
+   local-registry cache. Git sources are assembled from the job's validated bundles.
+   Each VM receives a per-job local registry and Cargo-home source replacement; Cargo
+   runs only inside the offline VM. The `OfflineCargoOnly` and `LocalRegistryOnly`
+   qualification lanes use pinned Cargo as SYSTEM in disposable fixtures; they do not
+   change production fetching. Runner state and cache remain under the private root ACL.
 - Each job gets a fresh differencing OS disk and nonce. A tiny read-only DVD
   delivers boot metadata without mounting a job disk on the host. It is not a
   host filesystem share or a live guest/host service. The real workspace cache
@@ -123,6 +116,13 @@ elevated PowerShell 5.1:
 ```powershell
 $python = (Get-Command python.exe -ErrorAction Stop).Source
 $evidence = 'C:\motor-runner-evidence\offline-cargo-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+To measure the offline cache inputs Cargo needs, use the SYSTEM-only diagnostic lane.
+After installing a bundle built from the reviewed source commit, run this from
+elevated PowerShell 5.1:
+
+```powershell
+$python = (Get-Command python.exe -ErrorAction Stop).Source
+$evidence = 'C:\motor-runner-evidence\offline-cargo-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
   -Python $python -Evidence $evidence -OfflineCargoOnly
 if ($LASTEXITCODE -ne 0) { throw "Offline Cargo diagnostic failed; preserve $evidence" }
@@ -134,15 +134,15 @@ contents. For each observed `cfg-if` sparse-index entry, it records a read error
 if the entry cannot be opened; otherwise it records the full size and SHA-256, the
 first 64 KiB of original entry bytes as hex (up to 128 KiB of hex text), and an
 escaped rendering of the first 96 original bytes. The report marks entries whose
-hex capture is truncated. It then runs pinned Cargo offline as
-SYSTEM in fresh homes containing (1) only the `.crate` archive, (2) that archive
-plus the observed registry configuration but no `.cache` entry, and (3) the full
-Cargo-generated cache. Each cell records Cargo's exit status and output. This
-distinguishes whether the lockfile and crate archive suffice and, if not, which
-actual index files Cargo requires; no sparse-cache bytes are synthesized by the
-runner. No restricted `motor-prep` Cargo process is launched. The diagnostic is
-evidence collection only and does not change production fetching. Inspect the
-copied `prep-offline-cargo-*.json` report; leave the service stopped for review.
+hex capture is truncated. It then runs pinned Cargo offline as SYSTEM in fresh
+homes containing (1) only the `.crate` archive, (2) that archive plus the observed
+registry configuration but no `.cache` entry, and (3) the full Cargo-generated
+cache. Each cell records Cargo's exit status and output. This distinguishes
+whether the lockfile and crate archive suffice and, if not, which actual index
+files Cargo requires; no sparse-cache bytes are synthesized by the runner. No
+restricted Cargo process is launched. The diagnostic is evidence collection only
+and does not change production fetching. Inspect the copied
+`prep-offline-cargo-*.json` report; leave the service stopped for review.
 
 Before using local Cargo registry source replacement in production, run its
 SYSTEM-only proof lane from elevated PowerShell 5.1:
@@ -155,58 +155,21 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\M
 if ($LASTEXITCODE -ne 0) { throw "Local registry proof failed; preserve $evidence" }
 ```
 
-This disposable diagnostic downloads only the crates.io index config, the raw
-`cfg-if` index record, and its checksum-pinned `.crate` file from their allowlisted
-HTTPS hosts with redirects disabled and response-size limits. It assembles the
-standard `index/` plus `.crate` local-registry layout, then uses a fresh Cargo home
-whose only initial file is the source-replacement config. The pinned Cargo runs
+This disposable diagnostic directly fetches the index config, raw `cfg-if` index
+record, and checksum-pinned `.crate` from the allowlisted HTTPS hosts, refusing
+redirects and responses above their size caps. It builds a protected persistent
+cache and assembles two fresh job registries; the second job must make zero
+network requests. Each Cargo home starts with a runner-written source-replacement
+config and local-registry data, but no Cargo sparse cache. Pinned Cargo runs
 `fetch --locked --offline` and `build --locked --offline`; the report records both
 results and confirms Cargo.lock stayed byte-identical. A one-byte archive mutation
 must be refused before writing by the runner's checksum gate, and Cargo must reject
 the same changed archive when that gate is bypassed. A fixture repository
 `.cargo/config.toml` selects an empty source to show whether project config overrides
-the Cargo-home replacement; if it does, production jobs must refuse such a config
-rather than silently using a different source. This is evidence collection only;
-it does not alter production fetching. Inspect `$evidence\host-evidence\prep-local-registry-*.json`
+the Cargo-home replacement; repository replacements are allowed, and Cargo remains
+offline and verifies Cargo.lock checksums. This is evidence collection only; it does
+not alter production fetching. Inspect `$evidence\host-evidence\prep-local-registry-*.json`
 and leave the service stopped for review.
-
-For a pre-main trusted-fetch failure, collect only the launch matrix with
-`run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
-This stops MotorRunner and runs fifteen probe/Cargo/rustc token comparisons without
-VM qualification. It records requested token flags separately from actual
-`IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
-The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
-restricted to pinned `cargo --version`; production continues to use flags `0x9`
-and only the logon SID. Additional diagnostic cells compare token-default-DACL
-updates and the RESTRICTED SID (`S-1-5-12`); they do not change the production
-token. Controlled write probes reuse one created token/profile/desktop per cell.
-Readbacks retain default DACLs before/after and actual writes to selected
-staging/outside/profile/cache paths.
-Matrix completion is evidence collection, not a pass or
-permission to enable fleet routing. Leave the service stopped for evidence review.
-This diagnostic lane temporarily ORs `FLG_SHOW_LDR_SNAPS` (`0x2`) into the
-64-bit Image File Execution Options (IFEO) `GlobalFlag` values for `cargo.exe`
-and `rustc.exe`, and restores the
-exact original value kinds/contents (or absence) in `finally`. It records the
-snapshot and verified restoration in `loader-snaps-registry.json`; do not kill
-the wrapper while it is restoring these settings. The release includes its own
-native debug-event collector, so no gflags, WinDbg or new host installation is
-required. Protected `*.loader.jsonl` evidence contains Windows DLL-load events,
-loader debug strings and exceptions. Process/thread security-descriptor readbacks
-and actual Cargo/Rustup-home values accompany each diagnostic launch. Cells 11–12
-isolate runner-before-Cargo and repeated-Cargo ordering on one token.
-Cell 13 compares the traverse-only root cwd with the already-authorized staging
-temp cwd on the same token/desktop, then calls both RNG probes on that session.
-Cells 14–15 independently call dynamically resolved `ProcessPrng` (BOOL) and
-`BCryptGenRandom` (NTSTATUS, system-preferred RNG) in a restricted probe with safe
-cwd; random bytes are never logged. These cells additionally trace selected x64
-ntdll object API entries/returns with decoded object names when available, target
-metadata, requested access and NTSTATUS. Breakpoint bytes are patched only in the
-disposable debuggee's private memory; one-instruction stepping briefly changes its
-thread context and pauses other debuggee threads. Neither affects host DLL files
-or production launches. An interrupted step/unwound call aborts collection with
-an explicit instrumentation error instead of assigning a later return to it.
-Production launches do not enable loader snaps or debugger creation flags.
 
 
 Peer qualification starts the victim alone and records its VM-matched Hyper-V
@@ -345,21 +308,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunn
 if ($LASTEXITCODE -ne 0) { throw 'Qualification failed; return the complete evidence directory' }
 ```
 
-Qualification checks the real restricted batch token's denied credential-file
-open and write outside staging/the runner's Cargo cache, with an unrestricted
-batch-token outside-write control
-and a successful restricted staging write; a deliberately partial
-agent frame and the guest's matching EOF byte count; native loopback and foreign
-VM rejection while the target guest agent's listener is still active (a connect
-failure alone cannot pass); five full runner jobs with multi-frame trees, cold then warm real cache,
-large stdout and source-output collection, the non-admin `motor-job` guest
-account, and a check
-that a canary in the host prep cache is absent from the guest's Cargo home. The
-configured default commands are `cargo test --locked --offline -- --nocapture`
-and `cargo clippy --all-targets --locked --offline -- -D warnings`. It retains
-host VM-lifecycle samples, parent hashes and guest logs. Any failure stops the
-service and does not count as a skip. Return the complete external evidence
-directory, plus provisioning logs and `sealed.json`, before enabling routing.
+Qualification checks the startup-only parent hash and per-job identity guard; the
+SYSTEM local-registry cache and the job VM's offline Cargo fetch/build; a deliberately
+partial agent frame and the guest's matching EOF byte count; native loopback and
+foreign-VM rejection while the target guest agent's listener is still active (a
+connect failure alone cannot pass); five full runner jobs with multi-frame trees,
+cold then warm registry/cache paths, large stdout and source-output collection,
+the non-admin `motor-job` guest account, and that host cache bytes do not leak into
+the guest's unrelated paths. The configured default commands are `cargo test
+--locked --offline -- --nocapture` and `cargo clippy --all-targets --locked --offline --
+-D warnings`. It retains host VM-lifecycle samples, startup hash timing, and guest
+logs. Any failure stops the service and does not count as a skip. Return the complete
+external evidence directory, plus provisioning logs and `sealed.json`, before
+enabling routing.
 
 ## Diagnose an agent connection failure
 
@@ -387,8 +348,10 @@ guest EOF. No guest passwords, DPAPI files, registry hives or disk images are co
 
 ## One removal
 
-Copy evidence out first. Copy removal scripts outside the root because the root,
-sealed parent, caches and every retained job record will be deleted:
+Copy evidence out first. Upgrades use this uninstall/reinstall path; install.ps1 refuses
+an existing root, so a fresh sealed parent must be provisioned before reinstalling.
+Copy removal scripts outside the root because the root, sealed parent, caches and
+every retained job record will be deleted:
 
 ```powershell
 New-Item C:\motor-runner-remove -ItemType Directory -Force | Out-Null
@@ -397,11 +360,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\motor-runner-remove\u
 if ($LASTEXITCODE -ne 0) { throw 'Removal stopped safely; preserve the ownership record and inspect the error' }
 ```
 
-Removal stops/deletes the service, reconciles/removes owned job VMs and disks,
-removes only the owned hvsock key, removes the SSH block/account/key and prep
-account/rights, restores saved host settings, and deletes the parent and runner
-root. It refuses foreign accounts/VMs/registry keys and reparse roots. The
-provisioning scratch parent/logs under `C:\motor-spike\hyperv-ally` are also
-removed when explicitly adopted with `-AdoptProvisioningRoot` as above. Archive
-those logs before uninstalling. Historical or unadopted spike roots are never
-deleted implicitly. Hyper-V itself is left installed.
+Removal stops/deletes the service, reconciles/removes owned job VMs and disks, removes only the
+owned hvsock key, removes the SSH block/account/key and any legacy motor-prep account, rights,
+profile and DPAPI secret, restores saved host settings, and deletes the parent and runner root.
+It refuses foreign accounts/VMs/registry keys and reparse roots.
+
+Rebuilding the sealed parent requires the fresh Windows-image provisioning steps above.
+`provision.ps1` budgets 1–3 hours for the VM and update phase, with Windows updates dominating;
+this is planning guidance, not a measured rebuild time or duration guarantee. Its timer excludes
+host-side preparation and final sealing, so record end-to-end duration when upgrading.
+
+The provisioning scratch parent/logs under `C:\motor-spike\hyperv-ally` are also removed when
+explicitly adopted with `-AdoptProvisioningRoot` as above. Archive those logs before uninstalling.
+Historical or unadopted spike roots are never deleted implicitly. Hyper-V itself is left installed.

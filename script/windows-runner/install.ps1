@@ -16,7 +16,7 @@ $admin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Pri
 if ($identity.User.Value -eq 'S-1-5-18') { throw 'Run install.ps1 from an elevated administrator shell, not a SYSTEM scheduled task; setting the parent owner requires that context' }
 if (-not $admin -or -not $LicenseAcknowledged) { throw 'Elevation and an explicit image licence acknowledgement are required' }
 if (Test-Path -LiteralPath $Root) { throw 'Root already exists; use the documented uninstall before reinstalling, preserving wanted evidence first' }
-foreach ($name in @('motor-prep','motor-ssh')) { if (Get-LocalUser $name -ErrorAction SilentlyContinue) { throw "Refusing to adopt pre-existing account $name" } }
+foreach ($name in @('motor-prep','motor-ssh')) { if (Get-LocalUser $name -ErrorAction SilentlyContinue) { throw "Refusing to adopt pre-existing account $name; run the owned uninstaller first" } }
 if (Get-Service MotorRunner -ErrorAction SilentlyContinue) { throw 'MotorRunner service already exists' }
 $Bundle = (Resolve-Path -LiteralPath $Bundle).Path
 $ParentPath = (Resolve-Path -LiteralPath $ParentPath).Path
@@ -40,10 +40,11 @@ Set-Content "$Root\.motor-runner-root" 'motor-runner-hyperv-v1' -Encoding ascii
 $installation = @{ schema=1; root=$Root; accounts=@{}; enhanced_session_before=(Get-VMHost).EnableEnhancedSessionMode; created_utc=[DateTime]::UtcNow.ToString('o') }
 function Save-Installation { $installation | ConvertTo-Json -Depth 6 | Set-Content "$Root\installation.json" -Encoding UTF8 }
 Save-Installation
-foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks','staging','state\ally','evidence','service-home')) { New-Item "$Root\$directory" -ItemType Directory -Force | Out-Null }
+foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks','staging','state\ally','state\ally\local-registry-cache','evidence','service-home')) { New-Item "$Root\$directory" -ItemType Directory -Force | Out-Null }
+Protect-RunnerPath "$Root\state\ally\local-registry-cache"
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
-foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','prep-acl.ps1','prep-access-check.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','loader-snaps.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
+foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
 foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\hyperv-spike\$name" "$Root\bin" }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
@@ -58,7 +59,7 @@ if ($AdoptProvisioningRoot) {
     $installation.provision_parent_sha256 = $parentHash
     Save-Installation
 }
-# Host passwords are independent of the guest's standard-job account.
+# The SSH bridge is the only runner-owned local account. Cargo preparation runs as SYSTEM.
 function New-OwnedUser([string]$Name) {
     $bytes = New-Object byte[] 48
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -72,11 +73,6 @@ function New-OwnedUser([string]$Name) {
     Save-Installation
     return $secret
 }
-$secret = New-OwnedUser 'motor-prep'
-Set-RunnerBatchRights $Root $installation.accounts['motor-prep']
-Add-Type -AssemblyName System.Security
-[IO.File]::WriteAllBytes("$Root\prep-secret.dpapi", [Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::ASCII.GetBytes($secret), $null, [Security.Cryptography.DataProtectionScope]::LocalMachine))
-$secret = $null
 $null = New-OwnedUser 'motor-ssh'
 $sshSid = $installation.accounts['motor-ssh']
 Set-Content "$Root\ssh-sid.txt" $sshSid -Encoding ascii

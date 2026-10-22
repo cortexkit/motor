@@ -87,6 +87,8 @@ where
 }
 
 #[doc(hidden)]
+#[cfg(unix)]
+#[cfg(unix)]
 pub fn windows_prepare(path: &std::path::Path) -> std::io::Result<()> {
     windows::prepare_entry(path)
 }
@@ -101,16 +103,6 @@ pub fn hyperv_probe_peers() -> std::io::Result<()> {
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_qualify_prep(config: &Config) -> std::io::Result<()> {
-    windows::qualify_prep(config)
-}
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn hyperv_qualify_prep_matrix(config: Config) -> std::io::Result<()> {
-    windows::qualify_prep_matrix(config)
-}
-#[cfg(windows)]
-#[doc(hidden)]
 pub fn hyperv_qualify_prep_offline_cargo(config: Config) -> std::io::Result<()> {
     windows::qualify_prep_offline_cargo(config)
 }
@@ -118,21 +110,6 @@ pub fn hyperv_qualify_prep_offline_cargo(config: Config) -> std::io::Result<()> 
 #[doc(hidden)]
 pub fn hyperv_qualify_prep_local_registry(config: Config) -> std::io::Result<()> {
     windows::qualify_prep_local_registry(config)
-}
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn hyperv_prep_probe(args: &[String]) -> std::io::Result<()> {
-    windows::prep_probe(args)
-}
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn hyperv_prep_launch(args: &[String]) -> std::io::Result<()> {
-    windows::prep_launch(args)
-}
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn hyperv_prep_access_check(args: &[String]) -> std::io::Result<()> {
-    windows::prep_access_check(args)
 }
 #[cfg(windows)]
 #[doc(hidden)]

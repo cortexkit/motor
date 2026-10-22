@@ -337,6 +337,7 @@ impl Resources {
         PathBuf::from(format!("hvsock:{}", self.id))
     }
     pub(super) fn boot(&mut self, config: &Config, nonce: &str) -> io::Result<()> {
+        super::ensure_parent_guard(config)?;
         let vm = config.windows.as_ref().unwrap();
         let cache = vm.caches().disk(&self.workspace);
         checked_setup(
@@ -369,6 +370,7 @@ impl Resources {
                 .parse()
                 .map_err(invalid)?,
         );
+        super::ensure_parent_guard(config)?;
         self.child.0 = Some(Child::spawn(
             control(config, "Run", Some(self.id), &[])?
                 .stdout(Stdio::null())

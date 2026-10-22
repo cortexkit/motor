@@ -1,4 +1,4 @@
-# Parent verification uses one locked handle for both the digest and identity.
+# Service startup hashes the parent through the same guarded handle used for its identity record.
 if (-not ('Motor.ParentFile' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -129,6 +129,37 @@ function Assert-RunnerFileAcl([IO.FileStream]$Guard, [switch]$ParentFile) {
     }
 }
 
+function Assert-RunnerPrivateDirectory([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $current -Force
+    if (-not $item.PSIsContainer) { throw "Runner path is not a directory: $current" }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse runner directory refused: $current" }
+    $acl = Get-Acl -LiteralPath $current
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) {
+        throw "Runner directory owner must be SYSTEM or Administrators: $current"
+    }
+    $writeMask = [int]([Security.AccessControl.FileSystemRights]::Write -bor
+        [Security.AccessControl.FileSystemRights]::Modify -bor
+        [Security.AccessControl.FileSystemRights]::FullControl -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+        [Security.AccessControl.FileSystemRights]::CreateFiles -bor
+        [Security.AccessControl.FileSystemRights]::CreateDirectories)
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($sid -notin @('S-1-5-18','S-1-5-32-544') -and ([int]$rule.FileSystemRights -band $writeMask)) {
+            throw "Runner directory grants write access outside SYSTEM/Administrators: $current ($sid)"
+        }
+    }
+    for ($parent = [IO.Directory]::GetParent($current); $null -ne $parent; $parent = $parent.Parent) {
+        if ((Get-Item -LiteralPath $parent.FullName -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Reparse ancestor refused for runner directory: $($parent.FullName)"
+        }
+    }
+}
+
 function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record, [string]$HashEvidence) {
     $temporary = "$Record.$([Guid]::NewGuid()).tmp"
     $guard = $null
@@ -140,17 +171,19 @@ function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, 
         Assert-RunnerFileAcl $guard -ParentFile
         $identity = Get-RunnerParentIdentity $guard
         if ($identity.read_only -cne 'True') { throw 'Parent must be sealed read-only' }
+        $changeTimeEvidence = [Motor.ParentFile]::ChangeTime($guard).ToString([Globalization.CultureInfo]::InvariantCulture)
         $sha = [Security.Cryptography.SHA256]::Create()
         $timer = [Diagnostics.Stopwatch]::StartNew()
         $hash = $null
         try { $hash = -join ($sha.ComputeHash($guard) | ForEach-Object { $_.ToString('x2') }) } finally {
             $timer.Stop(); $sha.Dispose()
             if ($HashEvidence) {
-                @{utc=[DateTime]::UtcNow.ToString('o'); event='parent-sha256'; hash_duration_ms=$timer.Elapsed.TotalMilliseconds; hash_matches_configuration=($hash -ieq $ParentSha256)} | ConvertTo-Json -Compress | Add-Content -LiteralPath $HashEvidence -Encoding UTF8
+                @{utc=[DateTime]::UtcNow.ToString('o'); event='parent-sha256'; hash_duration_ms=$timer.Elapsed.TotalMilliseconds; hash_matches_configuration=($hash -ieq $ParentSha256); change_time_filetime=$changeTimeEvidence} | ConvertTo-Json -Compress | Add-Content -LiteralPath $HashEvidence -Encoding UTF8
             }
         }
         if ($hash -ine $ParentSha256) { throw 'Hyper-V parent SHA-256 mismatch' }
-        $recordData = [ordered]@{schema=1; parent=[IO.Path]::GetFullPath($Parent); sha256=$hash; identity=$identity}
+        $changeTime = [Motor.ParentFile]::ChangeTime($guard).ToString([Globalization.CultureInfo]::InvariantCulture)
+        $recordData = [ordered]@{schema=2; parent=[IO.Path]::GetFullPath($Parent); sha256=$hash; change_time_filetime=$changeTime; identity=$identity}
         # Create the temporary file with its final protected DACL, before publishing.
         $security = [Security.AccessControl.FileSecurity]::new()
         $security.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
@@ -161,7 +194,7 @@ function Write-RunnerParentVerification([string]$Parent, [string]$ParentSha256, 
             $output.Flush($true)
         } finally { $output.Dispose() }
         [IO.File]::Move($temporary, $Record)
-        return @{cache_hit=$false; hash_duration_ms=$timer.Elapsed.TotalMilliseconds}
+        return @{cache_hit=$false; hash_duration_ms=$timer.Elapsed.TotalMilliseconds; change_time_filetime=$changeTime}
     } finally {
         if ($guard) { $guard.Dispose() }
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
@@ -176,7 +209,7 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
         Assert-RunnerFileAcl $recordGuard
         $reader = [IO.StreamReader]::new($recordGuard, [Text.Encoding]::UTF8)
         try { $verified = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-        if ($verified.schema -ne 1 -or $verified.parent -cne [IO.Path]::GetFullPath($Parent) -or $verified.sha256 -ine $ParentSha256) { throw 'Verification record does not match configured parent' }
+        if ($verified.schema -ne 2 -or $verified.parent -cne [IO.Path]::GetFullPath($Parent) -or $verified.sha256 -ine $ParentSha256) { throw 'Verification record does not match configured parent' }
         $guard = [Motor.ParentFile]::Open($Parent)
         Assert-RunnerFileAcl $guard -ParentFile
         $identity = Get-RunnerParentIdentity $guard
@@ -184,15 +217,10 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
         foreach ($key in $identity.Keys) {
             if ($identity[$key] -cne $verified.identity.$key) { throw "Parent identity differs: $key" }
         }
-        # Skipping the digest is safe only with the sealed parent ACL and protected
-        # record. Startup trusts this record exactly as the per-job check does.
-        # SYSTEM and Administrators remain trusted: they can change the
-        # scripts, configuration and record too. The runner process holds a parent
-        # guard for its entire lifetime. When no runner holds a guard, SYSTEM or
-        # an Administrator can rewrite equal-length content and restore LastWrite;
-        # that maintenance window is accepted, not detected by this identity set.
-        # Per-job callers keep this read-sharing, write/delete-denying guard until
-        # the VM is off; startup reuses the same identity and trust checks.
+        # Skipping the per-job digest is safe because the service retains a
+        # read-sharing, write/delete-denying handle. ChangeTime is evidence only:
+        # Hyper-V can rewrite an identical ACL and advance it. Each service start
+        # hashes again before any job can boot.
         return $guard
     } catch {
         if ($guard) { $guard.Dispose() }
@@ -203,15 +231,6 @@ function Open-RunnerVerifiedParent([string]$Parent, [string]$ParentSha256, [stri
 }
 
 function Confirm-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record, [string]$HashEvidence) {
-    $guard = $null
-    try {
-        $guard = Open-RunnerVerifiedParent $Parent $ParentSha256 $Record
-        return @{cache_hit=$true; hash_duration_ms=0}
-    } catch {
-        # Only startup can refresh a missing or changed record. Prepare and Run
-        # still fail closed instead of accepting a changed parent between jobs.
-    } finally {
-        if ($guard) { $guard.Dispose() }
-    }
+    # Every service start rehashes, even if the previous start left a record.
     return Write-RunnerParentVerification $Parent $ParentSha256 $Record $HashEvidence
 }

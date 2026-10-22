@@ -109,9 +109,18 @@ Test: `ordered_windows_runners_prefer_first_and_persist_full_binding_across_rest
 ## 3. What a Windows job sees
 
 3.1. Every job boots its own VM from a copy-on-write overlay of the sealed
-baseline image. The overlay is deleted after the job; nothing a job writes to
-the system disk reaches a later job. Tests (operator-only):
-`windows_qualification_no_persistence_offline_overlay_canaries`.
+baseline image. The Windows service hashes the baseline once at each startup,
+compares the configured SHA-256, and stores its file identity in a protected
+`state\parent-verified.json` record. A read-only service handle stays open for
+the service lifetime; Prepare and Run compare the recorded identity before any VM
+boot, and refuse if the record is missing or the parent changed. Restarting the
+service rehashes the parent before another job can start. ChangeTime is recorded
+for diagnosis but is not an identity gate because Hyper-V may update it while
+reapplying an identical ACL. The overlay is deleted after the job; nothing a job
+writes to the system disk reaches a later job. Tests: the native fixture in
+`script/windows-runner/test_scripts.ps1` covers service-start hashing, the
+lifetime write/delete guard, a same-size rewrite with restored LastWriteTime, and
+identity/record changes; the full Hyper-V qualification is operator-only.
 
 3.2. The VM has no network device. The command can use loopback inside the
 guest and nothing else. A request for outbound network is refused with
@@ -130,15 +139,19 @@ request's filtered variables are applied over this base (the same predicate as
 Linux; see [job-isolation.md](job-isolation.md#5-environment-from-the-caller)),
 with the agent's values forced, case-insensitively, for `PATH`, `RUSTUP_HOME`,
 `HOME`, `USERPROFILE`, `CARGO_HOME`, `TMP`, `TEMP`, `SystemRoot`, `SystemDrive`,
-`CK_REMOTE_SOURCE_COMMIT`, and `CARGO_NET_OFFLINE=true`. Standard Windows values
-such as `PATHEXT`, `APPDATA` and `LOCALAPPDATA` survive. The agent does not
+`CK_REMOTE_SOURCE_COMMIT`, `CARGO_NET_OFFLINE=true`, and
+`CARGO_NET_GIT_FETCH_WITH_CLI=true`. The agent sets `GIT_CONFIG_GLOBAL` to the
+job Cargo home's runner-owned config, disables system Git config and interactive
+prompts, permits only the `file` protocol, and supplies Git URL rewrites from the
+job's bundled mirrors. Request Git-config overrides are ignored. Standard Windows
+values such as `PATHEXT`, `APPDATA` and `LOCALAPPDATA` survive. The agent does not
 synthesize `HOMEDRIVE` or `HOMEPATH` if Windows omits them. Tests:
 `standard_user_environment_survives_job_overrides`,
 `request_overrides_base_but_not_agent_owned_values`,
 `environment_source_failure_propagates_and_owned_blocks_are_always_released`,
 `forced_environment_wins_case_insensitively_and_thread_counts_survive`
-(`crates/motor-winagent`), and `windows_qualification_standard_user_environment`
-(operator-only).
+(`crates/motor-winagent`), plus the Git bundle rewrite fixture in the same crate,
+and `windows_qualification_standard_user_environment` (operator-only).
 
 The initial native `PATH` puts Rust's `cargo\bin`, Git's `cmd`, the installed
 Git `ucrt64\bin` (or `mingw64\bin`), Git's `usr\bin`, and PowerShell 7 before
@@ -225,21 +238,35 @@ returned links onto the host. Staging still forbids link archive entries. Tests:
 
 ## 5. What a Windows job may build
 
-5.1. A trusted preparation step, run on the host as the `motor-prep` account,
-fetches the repository's locked Cargo dependencies for
-`x86_64-pc-windows-msvc` before the VM boots. The job then builds offline.
-Test: `windows_qualification_qemu_and_preparation_accounts_are_confined`
-(operator-only).
+5.1. The Windows runner does not run Cargo on the host for production
+preparation. As SYSTEM, it reads the copied Cargo.lock, downloads the raw
+crates.io index records and each locked `.crate` archive from the allowlisted
+index/static crates.io hosts, and checks archive SHA-256 values against the lock
+before cache publication. The persistent per-Ally cache contains one verified
+archive per name/version and one raw index record per crate. Each job receives a
+local registry plus a runner-written Cargo-home source replacement; Cargo
+fetch/build then runs only inside the offline VM. Tests:
+`windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config`, the
+local-registry cache tests, and the operator-only `-LocalRegistryOnly` proof.
 
-5.2. The workspace must have a `Cargo.lock`. Path dependencies outside the
-transferred checkouts, Git dependencies over SSH, and registries other than
-crates.io are refused before start. A repository's own `.cargo/config.toml` is
-accepted. Test: `windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config`.
+5.2. The workspace must have a Cargo.lock. Crates.io registry packages must have
+a locked checksum. Git dependencies must be present in the job's uploaded bundles
+and are rewritten to their local mirror inside the VM. Path dependencies must
+resolve inside the transferred snapshots. An alternate registry, undeclared Git
+source, or outside path dependency is refused before VM start with its source
+named. A repository's own `.cargo/config.toml` is allowed: Cargo's project config
+has higher precedence than the runner's Cargo-home source replacement, so a repo
+may use its own vendored or replacement source. Cargo remains offline, and
+`--locked` keeps Cargo.lock unchanged and verifies package checksums. Test:
+`windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config` and the
+operator-only local-registry qualification.
 
-5.3. Only the snapshot (`m/`) and the selected parts of the Cargo home
-(`registry/index`, `registry/cache`, `git/db`, `git/checkouts`) enter the VM,
-as a tar stream over the agent channel. Test:
-`windows_backend_tar_contains_only_m_and_selected_cargo_home_members`.
+5.3. Only the snapshot (`m/`) and selected Cargo-home members (`config.toml`,
+`local-registry/`, bundled `git-mirrors/` and its rewrite manifest) enter the VM,
+as a tar stream over the agent channel. The guest's Cargo home is the job user's
+profile `.cargo` directory. Tests:
+`windows_backend_tar_contains_only_m_and_selected_cargo_home_members` and the
+Git-bundle rewrite fixture in `crates/motor-winagent`.
 
 5.4. `prepare` (workspace preparation without a command) is not supported on a
 Windows instance and is refused before any work. Background warm builds do not

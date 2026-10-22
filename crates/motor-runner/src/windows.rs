@@ -15,12 +15,8 @@ use std::{
 #[cfg(unix)]
 use std::{os::unix::fs::PermissionsExt, path::Component};
 
-#[cfg(any(windows, test))]
-mod access_screen;
 mod agent;
 mod caches;
-#[cfg(any(windows, test))]
-mod debug_text;
 #[cfg(unix)]
 mod host;
 #[cfg(windows)]
@@ -28,11 +24,7 @@ mod host;
 mod host;
 #[cfg(windows)]
 mod hvsock;
-#[cfg(any(all(windows, target_arch = "x86_64"), test))]
-mod native_call_trace;
 pub(crate) mod prep;
-#[cfg(any(windows, test))]
-mod process_status;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -45,20 +37,13 @@ pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
 
+#[cfg(unix)]
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
     prep::execute(path)
 }
 #[cfg(windows)]
 pub(crate) fn probe_peers() -> io::Result<()> {
     hvsock::probe_peers()
-}
-#[cfg(windows)]
-pub(crate) fn qualify_prep(config: &Config) -> io::Result<()> {
-    trusted_prep::qualify(config)
-}
-#[cfg(windows)]
-pub(crate) fn qualify_prep_matrix(config: Config) -> io::Result<()> {
-    trusted_prep::matrix_entry(config)
 }
 #[cfg(windows)]
 pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {
@@ -69,20 +54,12 @@ pub(crate) fn qualify_prep_local_registry(config: Config) -> io::Result<()> {
     trusted_prep::local_registry_entry(config)
 }
 #[cfg(windows)]
-pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {
-    trusted_prep::probe(args)
-}
-#[cfg(windows)]
-pub(crate) fn prep_launch(args: &[String]) -> io::Result<()> {
-    trusted_prep::launch_entry(args)
-}
-#[cfg(windows)]
-pub(crate) fn prep_access_check(args: &[String]) -> io::Result<()> {
-    trusted_prep::access_check_entry(args)
-}
-#[cfg(windows)]
 pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
     vm::qualify_disconnect(config)
+}
+#[cfg(windows)]
+pub(crate) fn ensure_parent_guard(config: &Config) -> io::Result<()> {
+    host::ensure_parent_guard(config)
 }
 
 #[cfg(test)]

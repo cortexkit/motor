@@ -497,6 +497,7 @@ impl Command {
         git_bin: &str,
     ) -> io::Result<BTreeMap<String, String>> {
         self.validate()?;
+        let cargo_home = format!("{profile}\\.cargo");
         let mut env: BTreeMap<_, _> = base
             .into_iter()
             .map(|(key, value)| (key.to_uppercase(), value))
@@ -509,17 +510,25 @@ impl Command {
             ("RUSTUP_HOME", "C:\\rust\\rustup".into()),
             ("HOME", profile.into()),
             ("USERPROFILE", profile.into()),
-            ("CARGO_HOME", format!("{profile}\\.cargo")),
+            ("CARGO_HOME", cargo_home.clone()),
             ("TMP", format!("{profile}\\AppData\\Local\\Temp")),
             ("TEMP", format!("{profile}\\AppData\\Local\\Temp")),
             ("CARGO_NET_OFFLINE", "true".into()),
+            ("CARGO_NET_GIT_FETCH_WITH_CLI", "true".into()),
+            ("GIT_CONFIG_GLOBAL", format!("{cargo_home}\\gitconfig")),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("GIT_CONFIG_COUNT", "0".into()),
+            ("GIT_ALLOW_PROTOCOL", "file".into()),
+            ("GIT_TERMINAL_PROMPT", "0".into()),
             ("CK_REMOTE_SOURCE_COMMIT", self.source_commit.clone()),
             ("SYSTEMROOT", "C:\\Windows".into()),
             ("SYSTEMDRIVE", "C:".into()),
         ];
         let mut request = BTreeMap::new();
         for (key, value) in &self.env {
-            if !forced
+            if key.to_ascii_uppercase().starts_with("GIT_CONFIG_")
+                || key.eq_ignore_ascii_case("GIT_CONFIG")
+                || !forced
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(key))
             {
@@ -543,8 +552,117 @@ impl Command {
         for (key, value) in forced {
             env.insert(key.into(), value);
         }
+        #[cfg(windows)]
+        match git_rewrite_environment(std::path::Path::new(&cargo_home)) {
+            Ok(git) => env.extend(git),
+            Err(error) if cfg!(test) && error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         Ok(env)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitRewriteManifest {
+    schema: u32,
+    routes: Vec<GitRewrite>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitRewrite {
+    url: String,
+    mirror: String,
+}
+
+fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| invalid("Git mirror path is not UTF-8"))?
+        .replace('\\', "/");
+    if path.starts_with("//") {
+        return Err(invalid("UNC Git mirror path is not supported"));
+    }
+    let absolute = if path.starts_with('/') {
+        path
+    } else if path.as_bytes().get(1) == Some(&b':') {
+        format!("/{path}")
+    } else {
+        return Err(invalid("Git mirror path is not absolute"));
+    };
+    let mut encoded = String::with_capacity(absolute.len());
+    for byte in absolute.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
+        {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Ok(format!("file://{encoded}"))
+}
+
+fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<String, String>> {
+    safe_directory(cargo_home)?;
+    let path = cargo_home.join("git-rewrites.json");
+    let manifest_metadata = std::fs::symlink_metadata(&path)?;
+    if !manifest_metadata.is_file() || is_reparse(&manifest_metadata) {
+        return Err(invalid("job Git rewrite manifest is not a regular file"));
+    }
+    let manifest: GitRewriteManifest = serde_json::from_slice(&std::fs::read(&path)?).map_err(invalid)?;
+    if manifest.schema != 1 {
+        return Err(invalid("unsupported job Git rewrite manifest schema"));
+    }
+    let global = cargo_home.join("gitconfig");
+    let global_metadata = std::fs::symlink_metadata(&global)?;
+    if !global_metadata.is_file() || is_reparse(&global_metadata) {
+        return Err(invalid("job Git config is not a regular file"));
+    }
+    let mut env = BTreeMap::from([
+        ("GIT_CONFIG_GLOBAL".to_owned(), global.to_string_lossy().into_owned()),
+        ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+        ("GIT_ALLOW_PROTOCOL".to_owned(), "file".to_owned()),
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("CARGO_NET_GIT_FETCH_WITH_CLI".to_owned(), "true".to_owned()),
+        ("GIT_CONFIG_COUNT".to_owned(), manifest.routes.len().to_string()),
+    ]);
+    for (index, route) in manifest.routes.into_iter().enumerate() {
+        if !(route.url.starts_with("https://") || route.url.starts_with("http://"))
+            || route.url.contains('@')
+            || route.url.chars().any(char::is_control)
+        {
+            return Err(invalid("job Git rewrite URL is not an allowed credential-free URL"));
+        }
+        let relative = std::path::Path::new(&route.mirror);
+        if relative.is_absolute()
+            || relative.components().next()
+                != Some(std::path::Component::Normal(std::ffi::OsStr::new("git-mirrors")))
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(invalid("job Git rewrite path is outside cargo-home/git-mirrors"));
+        }
+        let mut mirror = cargo_home.to_path_buf();
+        for component in relative.components() {
+            mirror.push(component);
+            let metadata = std::fs::symlink_metadata(&mirror)?;
+            if !metadata.is_dir() || is_reparse(&metadata) {
+                return Err(invalid(format!(
+                    "job Git mirror is not a real directory: {}",
+                    mirror.display()
+                )));
+            }
+        }
+        let local = local_git_file_url(&mirror)?;
+        env.insert(
+            format!("GIT_CONFIG_KEY_{index}"),
+            format!("url.{local}.insteadOf"),
+        );
+        env.insert(format!("GIT_CONFIG_VALUE_{index}"), route.url);
+    }
+    Ok(env)
 }
 
 /// Preflight the complete archive before writing any files. Directory prefixes
@@ -1502,6 +1620,95 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn git_source_rewrite_fetches_from_the_packaged_bundle_mirror() {
+        use std::{fs, process::Command as ProcessCommand};
+
+        fn git(root: &std::path::Path, config: &std::path::Path, args: &[&str]) {
+            let output = ProcessCommand::new("git")
+                .current_dir(root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_AUTHOR_NAME", "Motor Test")
+                .env("GIT_AUTHOR_EMAIL", "motor@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Motor Test")
+                .env("GIT_COMMITTER_EMAIL", "motor@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let scratch = Scratch::new();
+        let config = scratch.0.join("gitconfig");
+        fs::write(&config, "").unwrap();
+        let source = scratch.0.join("source");
+        fs::create_dir_all(&source).unwrap();
+        git(&source, &config, &["init", "--quiet"]);
+        fs::write(source.join("dependency.txt"), "from bundled git source\n").unwrap();
+        git(&source, &config, &["add", "dependency.txt"]);
+        git(&source, &config, &["commit", "--quiet", "-m", "fixture"]);
+        let bundle = scratch.0.join("dependency.bundle");
+        git(
+            &source,
+            &config,
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+        );
+
+        let cargo_home = scratch.0.join("cargo-home");
+        let mirror = cargo_home.join("git-mirrors/0");
+        fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        git(
+            &scratch.0,
+            &config,
+            &["clone", "--bare", bundle.to_str().unwrap(), mirror.to_str().unwrap()],
+        );
+        fs::write(cargo_home.join("gitconfig"), "").unwrap();
+        fs::write(
+            cargo_home.join("git-rewrites.json"),
+            serde_json::to_vec(&serde_json::json!({"schema":1,"routes":[{
+                "url":"https://example.invalid/dependency.git",
+                "mirror":"git-mirrors/0"
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let env = git_rewrite_environment(&cargo_home).unwrap();
+        assert_eq!(env["GIT_ALLOW_PROTOCOL"], "file");
+        assert_eq!(env["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(env["GIT_CONFIG_VALUE_0"], "https://example.invalid/dependency.git");
+        let checkout = scratch.0.join("checkout");
+        let output = ProcessCommand::new("git")
+            .current_dir(&scratch.0)
+            .env("GIT_CONFIG_NOSYSTEM", &env["GIT_CONFIG_NOSYSTEM"])
+            .env("GIT_CONFIG_GLOBAL", &env["GIT_CONFIG_GLOBAL"])
+            .env("GIT_ALLOW_PROTOCOL", &env["GIT_ALLOW_PROTOCOL"])
+            .env("GIT_CONFIG_COUNT", &env["GIT_CONFIG_COUNT"])
+            .env("GIT_CONFIG_KEY_0", &env["GIT_CONFIG_KEY_0"])
+            .env("GIT_CONFIG_VALUE_0", &env["GIT_CONFIG_VALUE_0"])
+            .args([
+                "clone",
+                "https://example.invalid/dependency.git",
+                checkout.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git bundle rewrite: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("dependency.txt")).unwrap(),
+            "from bundled git source\n"
+        );
     }
 
     #[test]

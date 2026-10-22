@@ -1,9 +1,7 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$OfflineCargoOnly, [switch]$LocalRegistryOnly)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$OfflineCargoOnly, [switch]$LocalRegistryOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
-if (($OfflineCargoOnly -or $LocalRegistryOnly) -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'Cargo cache diagnostics are separate lanes' }
 if ($OfflineCargoOnly -and $LocalRegistryOnly) { throw 'Choose one Cargo cache diagnostic lane' }
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
@@ -41,22 +39,6 @@ function Copy-QualificationEvidence {
     Get-ChildItem -LiteralPath "$Root\evidence" -Force | Copy-Item -Destination "$Evidence\host-evidence" -Recurse -Force -ErrorAction Stop
     Copy-Item -LiteralPath "$Root\vm.toml" -Destination "$Evidence\vm.toml" -Force -ErrorAction Stop
 }
-if ($PrepLaunchMatrix) {
-    $service = Get-Service MotorRunner
-    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
-    try {
-        if ($AccessChecksOnly) {
-            . "$PSScriptRoot\prep-access-check.ps1"
-            Invoke-RunnerPrepAccessMatrix $Root $exe $Evidence
-        } else {
-            . "$PSScriptRoot\loader-snaps.ps1"
-            Invoke-RunnerLoaderSnaps $Evidence { $null = Runner-Check 'qualify-prep-matrix' }
-        }
-    } finally {
-        try { Copy-QualificationEvidence } catch { Write-Warning "Matrix evidence copy failed: $_" -WarningAction Continue }
-    }
-    return
-}
 if ($OfflineCargoOnly) {
     $service = Get-Service MotorRunner
     if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
@@ -83,7 +65,6 @@ $service = Get-Service MotorRunner
 if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
 $evidenceCopied = $false
 try {
-    $null = Runner-Check 'qualify-prep'
     $disconnect = Runner-Check 'qualify-disconnect'
     $match = [regex]::Match($disconnect, 'job=([0-9a-f-]{36}) announced=(\d+) written=(\d+)')
     if (-not $match.Success -or [int]$match.Groups[3].Value -ge [int]$match.Groups[2].Value) { throw 'Disconnect did not stop in the middle of an announced agent frame' }

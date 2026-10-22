@@ -86,15 +86,32 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertLess(host.index(".share_mode(1)"), host.index("checked_validation("))
         self.assertLess(host.index("checked_validation("), host.index("*lifetime = Some((parent, file))"))
         self.assertIn("parent_guard: Mutex<Option<(PathBuf, fs::File)>>", (windows / "agent.rs").read_text())
+        guard_check = host.split("pub(super) fn ensure_parent_guard", 1)[1]
+        self.assertIn("Windows parent verification guard is missing", guard_check)
+        self.assertIn("file.metadata()", guard_check)
+        prep = (windows / "prep.rs").read_text()
+        boot = (windows / "hyperv.rs").read_text().split("pub(super) fn boot(", 1)[1]
+        self.assertIn("super::ensure_parent_guard(config)?", prep)
+        self.assertGreaterEqual(boot.count("super::ensure_parent_guard(config)?"), 2)
 
-    def test_startup_accepts_matching_record_before_hashing(self):
+    def test_every_startup_hashes_and_records_changetime_as_evidence_only(self):
         helper = (HERE / "parent-identity.ps1").read_text()
         startup = helper.split("function Confirm-RunnerParentVerification", 1)[1]
-        self.assertLess(startup.index("Open-RunnerVerifiedParent"), startup.index("Write-RunnerParentVerification"))
+        self.assertIn("return Write-RunnerParentVerification", startup)
+        self.assertNotIn("Open-RunnerVerifiedParent", startup)
+        self.assertIn("change_time_filetime=$changeTimeEvidence", helper)
+        self.assertIn("change_time_filetime=$changeTime", helper)
+        self.assertNotIn("change_time_filetime", helper.split("function Get-RunnerParentIdentity", 1)[1].split("function Assert-RunnerFileAcl", 1)[0])
         script = (HERE / "hyperv.ps1").read_text()
         validate = script.split("    'Validate' {", 1)[1].split("    { $_ -in", 1)[0]
         self.assertIn("Confirm-RunnerParentVerification", validate)
         self.assertNotIn("Remove-Item", validate)
+
+    def test_same_size_rewrite_restoring_lastwrite_is_blocked_or_rehashed_on_restart(self):
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("parent-lifetime-guard-blocks-same-size-content-rewrite", fixture)
+        self.assertIn("Set-FixtureParent 'modified' $lastWrite", fixture)
+        self.assertIn("parent-identity-startup-rehash-catches-same-size-rewrite-restored-lastwrite", fixture)
 
     def test_startup_validation_has_a_separate_fifteen_minute_budget(self):
         windows = HERE.parents[1] / "crates/motor-runner/src/windows"

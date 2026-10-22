@@ -22,9 +22,8 @@ foreach ($file in $files) {
 . "$PSScriptRoot\accounts.ps1"
 $root = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-script-tests-' + [Guid]::NewGuid())
 New-Item $root -ItemType Directory | Out-Null
-$script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = *S-1-5-32-544','SeDenyInteractiveLogonRight = *S-1-5-32-546')
-# Like the real secedit, the export names a resolvable local account instead of
-# listing its SID, so the policy code must resolve names before comparing.
+$script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = motor-prep,*S-1-5-32-544','SeDenyInteractiveLogonRight = *S-1-5-32-546')
+# The old installation's policy export names motor-prep, so resolve it to the recorded SID.
 $script:RunnerResolveTrusteeName = { param($name) if ($name -eq 'motor-prep') { 'S-1-5-21-111-222-333-1001' } else { throw "unknown account $name" } }
 function global:secedit.exe {
     $cfg = $args[[array]::IndexOf($args,'/cfg') + 1]
@@ -33,539 +32,37 @@ function global:secedit.exe {
     else { throw 'Unexpected secedit operation in fixture' }
     $global:LASTEXITCODE = 0
 }
+$script:prepPresent = $true
+$script:prepRemoved = $false
+function global:Get-LocalUser { if ($script:prepPresent) { return [pscustomobject]@{ SID=[pscustomobject]@{Value='S-1-5-21-111-222-333-1001'} } }; return $null }
+function global:Get-CimInstance { return @() }
+function global:Remove-LocalUser { $script:prepRemoved = $true }
 if ((Get-Command secedit.exe).CommandType -ne 'Function') { throw 'Policy fixture mock is not installed; refusing to run a real secedit command' }
 try {
     $sid = 'S-1-5-21-111-222-333-1001'
-    Set-RunnerBatchRights $root $sid
-    foreach ($right in @('SeBatchLogonRight','SeDenyInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeDenyNetworkLogonRight','SeDenyServiceLogonRight')) {
-        if (@($script:effective | Where-Object { $_ -match "^$right = .*\*$sid" }).Count -ne 1) { throw "Missing exact SID assignment $right" }
-    }
-    if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544,\*S-1-5-21-111-222-333-1001') { throw 'Existing administrator trustee was lost' }
-    Set-RunnerBatchRights $root $sid -Remove
-    if (($script:effective -join "`n") -match ([regex]::Escape($sid) + '|motor-prep')) { throw 'Uninstall retained owned SID rights' }
-    if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544') { throw 'Uninstall lost unrelated administrator rights' }
-    Write-Host 'PASS rights-add-remove-preserves-unrelated-trustees'
+    [IO.File]::WriteAllText((Join-Path $root 'prep-secret.dpapi'), 'test-only-secret-marker')
+    Remove-RunnerPrepAccount $root $sid
+    if (-not $script:prepRemoved -or (Test-Path -LiteralPath (Join-Path $root 'prep-secret.dpapi'))) { throw 'Legacy install retained its prep account or secret' }
+    if (($script:effective -join "`n") -match ([regex]::Escape($sid) + '|motor-prep')) { throw 'Legacy install retained prep batch rights' }
+    if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544') { throw 'Cleanup lost unrelated administrator rights' }
+    Write-Host 'PASS legacy-install-removes-prep-account-rights-and-secret'
+    $count++
+    $script:prepPresent = $false
+    $script:prepRemoved = $false
+    $script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = *S-1-5-32-544')
+    Remove-RunnerPrepAccount $root $sid
+    if ($script:prepRemoved -or (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544')) { throw 'Cleanup of an already-removed prep account was not idempotent' }
+    Write-Host 'PASS already-removed-prep-account-cleanup-is-idempotent'
     $count++
     $rejected = $false
-    try { Set-RunnerBatchRights $root 'S-1-5-32-545' } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Policy accepted a broad Users group SID' }
-    Write-Host 'PASS rights-rejects-broad-group-sid'
+    try { Remove-RunnerBatchRights $root 'S-1-5-32-545' } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Policy cleanup accepted a broad Users group SID' }
+    Write-Host 'PASS legacy-prep-cleanup-rejects-broad-group-sid'
     $count++
 } finally {
-    Remove-Item Function:\secedit.exe
+    Remove-Item Function:\secedit.exe,Function:\Get-LocalUser,Function:\Get-CimInstance,Function:\Remove-LocalUser
     Remove-Item $root -Recurse -Force
 }
-& {
-    . "$PSScriptRoot\prep-access-check.ps1"
-    # Each check prints RUN before it starts and wraps any throw with its name,
-    # the exception type and the script line, so a failure always names its test.
-    function Invoke-PrepAclCheck([string]$Name, [scriptblock]$Body) {
-        Write-Host "RUN $Name"
-        try { $detail = & $Body } catch { throw "FAIL ${Name}: $($_.Exception.GetType().FullName): $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim()))" }
-        Write-Host "PASS $Name$(if ($detail) { ': ' + ($detail -join ',') })"; $script:count++
-    }
-    # Formats an ACE without PowerShell enum conversions: AceFlags is a
-    # byte-backed enum, so read its raw value__ field instead of casting.
-    function Format-FixtureAce($Ace) {
-        if ($Ace -isnot [Security.AccessControl.CommonAce]) { return "other/$($Ace.AceType.ToString())" }
-        return '{0}/{1}/{2}/{3}' -f $Ace.AceQualifier.ToString(), $Ace.SecurityIdentifier.Value, $Ace.AccessMask.ToString('x8'), $Ace.AceFlags.value__.ToString('x2')
-    }
-    function Get-FixtureRawAcl([string]$Path) {
-        return ,([Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $Path).GetSecurityDescriptorBinaryForm(),0))
-    }
-    function Get-FixtureTrusteeAces([string]$Path, [bool]$ExplicitOnly) {
-        $raw = Get-FixtureRawAcl $Path
-        return @($raw.DiscretionaryAcl | Where-Object { $_ -is [Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -eq $sid -and $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and (-not $ExplicitOnly -or -not $_.IsInherited) } | ForEach-Object { Format-FixtureAce $_ } | Sort-Object)
-    }
-    # Owner plus every ACE in stored order, inherited ones included: the whole
-    # descriptor a later access check would evaluate.
-    function Get-FixtureDescriptor([string]$Path) {
-        $raw = Get-FixtureRawAcl $Path
-        return "owner=$($raw.Owner.Value);" + (@($raw.DiscretionaryAcl | ForEach-Object { Format-FixtureAce $_ }) -join ';')
-    }
-    # Informational only: records whether this PowerShell rejects the enum
-    # expressions the prep rule builder used to contain. It never fails the run.
-    try { $legacy = [Security.AccessControl.AceFlags]::ObjectInherit -bor [Security.AccessControl.AceFlags]::ContainerInherit; Write-Host "INFO prep-acl-legacy-aceflags-bor: ok $($legacy.value__)" }
-    catch { Write-Host "INFO prep-acl-legacy-aceflags-bor: threw $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
-    try { $legacy = [int][Security.AccessControl.AceFlags]::ObjectInherit; Write-Host "INFO prep-acl-legacy-aceflags-int-cast: ok $legacy" }
-    catch { Write-Host "INFO prep-acl-legacy-aceflags-int-cast: threw $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
-    $sid = 'S-1-5-11'
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    # Earlier runs may have left fixtures whose descriptor denies the caller
-    # access; remove them first so every run starts clean.
-    Invoke-PrepAclCheck 'prep-acl-fixture-leftovers-removed' {
-        $removed = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Force -Filter 'motor-prep-acl-*' | ForEach-Object { Remove-RunnerAccessFixture $_.FullName })
-        "$($removed.Count) ($($removed -join ' '))"
-    }
-    # Pure in-memory check of the shared builder: the expected masks and flags
-    # are the icacls (X), (OI)(CI)RX and (OI)(CI)M encodings, written out here.
-    Invoke-PrepAclCheck 'prep-acl-rule-builds-in-memory-for-every-role' {
-        $expected = @{Stage='AccessAllowed/S-1-5-11/00000020/00'; Read='AccessAllowed/S-1-5-11/001200a9/03'; Modify='AccessAllowed/S-1-5-11/001301bf/03'}
-        foreach ($role in @('Stage','Read','Modify')) {
-            $acl = [Security.AccessControl.DirectorySecurity]::new()
-            $acl.SetSecurityDescriptorSddlForm('O:SYG:SYD:AI(A;OICIID;FA;;;SY)')
-            $built = New-RunnerPrepAcl $acl $sid $role
-            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($built.GetSecurityDescriptorBinaryForm(),0)
-            $got = @($raw.DiscretionaryAcl | ForEach-Object { Format-FixtureAce $_ }) -join ';'
-            $want = $expected[$role] + ';AccessAllowed/S-1-5-18/001f01ff/13'
-            if ($got -cne $want) { throw "$role built [$got], expected [$want]" }
-        }
-    }
-    $aclRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-prep-acl-' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $aclRoot | Out-Null
-    $failure = $null
-    try {
-        # The independent oracle is the former production icacls command, not
-        # masks computed from the new builder's expected values. Production is
-        # create-then-Grant; the creation-time descriptor must equal it whole,
-        # inherited rules and owner included, not only for the prep trustee.
-        foreach ($row in @(@('Stage','(X)'),@('Read','(OI)(CI)RX'),@('Modify','(OI)(CI)M'))) {
-            Invoke-PrepAclCheck "prep-creation-descriptor-matches-icacls-and-production-create-then-grant: $($row[0])" {
-                $created = Join-Path $aclRoot ('created-' + $row[0])
-                $oracle = Join-Path $aclRoot ('oracle-' + $row[0])
-                $production = Join-Path $aclRoot ('production-' + $row[0])
-                $null = New-RunnerPrepDirectory $created $sid $row[0]
-                New-Item -ItemType Directory -Path $oracle | Out-Null
-                New-Item -ItemType Directory -Path $production | Out-Null
-                foreach ($dir in @($created,$oracle,$production)) { [IO.File]::WriteAllText((Join-Path $dir 'child.txt'),'fixture') }
-                & icacls.exe $oracle /grant:r ("*${sid}:" + $row[1]) /Q | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw 'icacls oracle failed' }
-                Grant-RunnerPrepPath $production $sid $row[0]
-                $oracleAces = (Get-FixtureTrusteeAces $oracle $true) -join ','
-                $oracleChild = (Get-FixtureTrusteeAces (Join-Path $oracle 'child.txt') $false) -join ','
-                foreach ($dir in @($created,$production)) {
-                    $aces = (Get-FixtureTrusteeAces $dir $true) -join ','
-                    if ($aces -cne $oracleAces) { throw "$dir prep rule [$aces] differs from icacls [$oracleAces]" }
-                    $child = (Get-FixtureTrusteeAces (Join-Path $dir 'child.txt') $false) -join ','
-                    if ($child -cne $oracleChild) { throw "$dir child prep rules [$child] differ from icacls [$oracleChild]" }
-                }
-                foreach ($pair in @(@($created,$production), @((Join-Path $created 'child.txt'),(Join-Path $production 'child.txt')))) {
-                    $got = Get-FixtureDescriptor $pair[0]; $want = Get-FixtureDescriptor $pair[1]
-                    if ($got -cne $want) { throw "$($pair[0]) created=[$got] production=[$want]" }
-                }
-            }
-        }
-        Invoke-PrepAclCheck 'prep-creation-only-fixture-never-rewrites-an-existing-acl' {
-            $path = Join-Path $aclRoot 'created-Stage'
-            $before = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
-            $denied = $false
-            try { $null = New-RunnerPrepDirectory $path $sid Modify } catch { if (($_.Exception.GetBaseException().NativeErrorCode) -ne 183) { throw }; $denied = $true }
-            $after = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
-            if (-not $denied -or $before -cne $after) { throw "denied=$denied; descriptor changed=$($before -cne $after)" }
-        }
-        # Reproduce the tree that once broke cleanup: the caller may add entries
-        # but not list or delete them, so a plain recursive delete fails.
-        Invoke-PrepAclCheck 'prep-acl-fixture-cleanup-recovers-unlistable-tree' {
-            $locked = Join-Path $aclRoot 'locked'
-            foreach ($item in @(@($locked, "O:${me}G:${me}D:P(A;;0x20;;;AU)(A;;0x6;;;$me)"), @((Join-Path $locked 'inner'), "O:${me}G:${me}D:P(A;;0x20;;;AU)"))) {
-                $raw = [Security.AccessControl.RawSecurityDescriptor]::new($item[1])
-                $bytes = [byte[]]::new($raw.BinaryLength); $raw.GetBinaryForm($bytes,0)
-                [Motor.PrepDirectoryCreation]::Create($item[0], $bytes)
-            }
-            $method = Remove-RunnerAccessFixture $locked
-            if ($method -ne 'removed-after-acl-reset' -or (Test-Path -LiteralPath $locked)) { throw "cleanup method $method" }
-        }
-    } catch { $failure = $_; throw } finally {
-        # Reported as its own result, and never allowed to hide an earlier failure.
-        try { Invoke-PrepAclCheck 'prep-acl-fixture-cleanup' { Remove-RunnerAccessFixture $aclRoot } }
-        catch { Write-Host "$_"; if ($null -eq $failure) { throw } }
-    }
-}
-
-# Parse the actual Prepare/Run guard assignment, not a test-only approximation.
-$tokens = $null; $errors = $null
-$control = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\hyperv.ps1", [ref]$tokens, [ref]$errors)
-$guards = @($control.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$parentGuard' -and $node.Right.Extent.Text -match '^Open-RunnerVerifiedParent ' }, $true))
-if ($guards.Count -ne 2) { throw 'FAIL parent-identity-production-guards: Prepare and Run must both acquire the verified guard' }
-Write-Host 'PASS parent-identity-production-guards'
-$count++
-
-& {
-    . "$PSScriptRoot\guest-evidence.ps1"
-    $path = Join-Path ([IO.Path]::GetTempPath()) ('motor-identity-json-' + [Guid]::NewGuid().ToString('N') + '.json')
-    try {
-        Save-Json $path @{matched=$true}
-        $bytes = [IO.File]::ReadAllBytes($path)
-        if ($bytes.Length -lt 2 -or ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) { throw 'FAIL qualification-identity-json-is-bom-free' }
-        $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
-        if (-not $value.matched) { throw 'FAIL qualification-identity-json-is-bom-free' }
-        Write-Host 'PASS qualification-identity-json-is-bom-free'
-        $script:count++
-    } finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
-}
-
-& {
-    . "$PSScriptRoot\qualify-peer.ps1"
-    $nonce = '0123456789abcdef0123456789abcdef'
-    $victimVm = [Guid]'01234567-89ab-cdef-0123-456789abcdef'
-    $attackerVm = [Guid]'fedcba98-7654-3210-fedc-ba9876543210'
-    $proof = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$false})
-    function New-PeerFixtureTimeline {
-        return @{victim_start_ms=0; boot_observed_ms=1000; attacker_start_ms=21000; proof_observed_ms=60000; host_connect_ms=60001; hello_ms=60010; settled_ms=120010;
-            victim_start_utc='2026-01-01T00:00:00Z'; boot_utc='2026-01-01T00:00:00.500Z'; boot_observed_utc='2026-01-01T00:00:01Z'; attacker_start_utc='2026-01-01T00:00:21Z'; proof_observed_utc='2026-01-01T00:01:00Z'; host_connect_utc='2026-01-01T00:01:00.001Z'; hello_utc='2026-01-01T00:01:00.010Z';
-            hello_validated=$true; hello_nonce=$nonce; victim_vm_id=$victimVm.ToString('D'); attacker_vm_id=$attackerVm.ToString('D'); boot_event_id=18601; boot_record_id=123; boot_vm_id=$victimVm.ToString('D')}
-    }
-    $log = "boot nonce=$nonce`nhvsock listening vm_id=00000000000000000000000000000000`nhvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838`nhvsock accepted peer vm_id=a42e7cdad03f480c9cc2a4de20abb878 listen=All`n"
-    function Assert-PeerFixtureRejected([string]$Name, [scriptblock]$Action, [string]$Expected) {
-        $denied = $false
-        try { $null = & $Action } catch {
-            if ([string]$_ -notlike "*$Expected*") { throw }
-            $denied = $true
-        }
-        if (-not $denied) { throw "FAIL $Name" }
-        Write-Host "PASS $Name"
-        $script:count++
-    }
-    $timeline = New-PeerFixtureTimeline
-    $result = Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline $log
-    if ($result -ne 'cross-vm-attempt-did-not-consume-single-listener') { throw 'FAIL peer-false-with-final-hello-and-single-parent-accept' }
-    Write-Host 'PASS peer-false-with-final-hello-and-single-parent-accept'
-    $script:count++
-    Assert-PeerFixtureRejected 'peer-host-hello-failure-is-unproven' {
-        $changed = New-PeerFixtureTimeline; $changed.hello_validated = $false
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
-    } 'Victim unavailable; isolation not proven'
-    Assert-PeerFixtureRejected 'peer-attacker-before-boot-margin-is-unproven' {
-        $changed = New-PeerFixtureTimeline; $changed.attacker_start_ms = 20999
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
-    } 'Attacker started before victim boot event plus 20-second margin'
-    $connected = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$true})
-    Assert-PeerFixtureRejected 'peer-connected-attacker-needs-native-refusal' {
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $connected $timeline $log
-    } 'Connected attacker has no native refusal'
-    $refusedLog = $log.Replace('hvsock accepted peer', "hvsock refused peer vm_id=$($attackerVm.ToString('N'))`nhvsock accepted peer")
-    if ((Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $connected $timeline $refusedLog) -ne 'native-foreign-vm-refused') { throw 'FAIL peer-connected-attacker-with-native-refusal' }
-    Write-Host 'PASS peer-connected-attacker-with-native-refusal'
-    $script:count++
-    Assert-PeerFixtureRejected 'peer-requires-native-loopback-refusal' {
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ($log -replace 'hvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838','unrelated message')
-    } 'Parent accept was not preceded by listening and native loopback refusal'
-    Assert-PeerFixtureRejected 'peer-rejects-non-parent-accept' {
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ($log.Replace('a42e7cdad03f480c9cc2a4de20abb878', $attackerVm.ToString('N')))
-    } 'Victim accepted a non-parent peer'
-    Assert-PeerFixtureRejected 'peer-rejects-stale-or-restarted-listener' {
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $timeline ("boot nonce=$nonce`n" + $log)
-    } 'Victim must show one current-nonce listener'
-    Assert-PeerFixtureRejected 'peer-requires-full-settle-window' {
-        $changed = New-PeerFixtureTimeline; $changed.settled_ms--
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
-    } 'full 60-second settle window'
-    Assert-PeerFixtureRejected 'peer-host-hello-must-follow-completed-attempt' {
-        $changed = New-PeerFixtureTimeline; $changed.host_connect_ms = 59999
-        Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $proof $changed $log
-    } 'Invalid host peer attempt/Hello ordering'
-
-    $since = ([DateTimeOffset]'2026-01-01T00:00:00Z').UtcDateTime
-    # Match the real Chipset provider's namespaced UserData shape, including
-    # uppercase GUID spelling, rather than inventing EventData/Properties fields.
-    $bootXml = @"
-<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Hyper-V-Chipset'/><EventID>18601</EventID><TimeCreated SystemTime='2026-01-01T00:00:02Z'/><EventRecordID>429</EventRecordID><Channel>Microsoft-Windows-Hyper-V-Worker-Admin</Channel></System><UserData><VmlEventLog xmlns='http://www.microsoft.com/Windows/Virtualization/Events'><VmName>motor-peer-fixture</VmName><VmId>$($victimVm.ToString('D').ToUpperInvariant())</VmId></VmlEventLog></UserData></Event>
-"@
-    $boot = Get-RunnerPeerBootMatch $bootXml $victimVm $since
-    if (-not $boot -or $boot.vm_id -cne $victimVm.ToString('D') -or $boot.record_id -ne 429) { throw 'FAIL peer-boot-uppercase-userdata-guid-matches' }
-    Write-Host 'PASS peer-boot-uppercase-userdata-guid-matches'; $script:count++
-    $otherXml = $bootXml.Replace($victimVm.ToString('D').ToUpperInvariant(), $attackerVm.ToString('D').ToUpperInvariant())
-    if ($null -ne (Get-RunnerPeerBootMatch $otherXml $victimVm $since)) { throw 'FAIL peer-boot-different-vm-is-rejected' }
-    Write-Host 'PASS peer-boot-different-vm-is-rejected'; $script:count++
-    $oldXml = $bootXml.Replace('2026-01-01T00:00:02Z', '2025-12-31T23:59:57Z')
-    if ($null -ne (Get-RunnerPeerBootMatch $oldXml $victimVm $since)) { throw 'FAIL peer-boot-event-before-start-is-rejected' }
-    Write-Host 'PASS peer-boot-event-before-start-is-rejected'; $script:count++
-    $tolerated = $bootXml.Replace('2026-01-01T00:00:02Z', '2025-12-31T23:59:59Z')
-    if (-not (Get-RunnerPeerBootMatch $tolerated $victimVm $since)) { throw 'FAIL peer-boot-host-clock-tolerance-is-bounded' }
-    Write-Host 'PASS peer-boot-host-clock-tolerance-is-bounded'; $script:count++
-
-    $peerFixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-peer-events-' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $peerFixture | Out-Null
-    $script:RunnerBootFixtureCalls = 0
-    $script:RunnerBootFixtureXml = @($otherXml, $bootXml)
-    function Get-WinEvent {
-        param($FilterHashtable, $ErrorAction)
-        $index = [Math]::Min($script:RunnerBootFixtureCalls, 1)
-        $script:RunnerBootFixtureCalls++
-        $event = [pscustomobject]@{RecordId=$script:RunnerBootFixtureCalls; xml=$script:RunnerBootFixtureXml[$index]}
-        $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value { return $this.xml }
-        return $event
-    }
-    function New-MonitorFixture([int]$Id, [bool]$Exited, [int]$Code, [bool]$Stubborn = $false) {
-        $process = [pscustomobject]@{Id=$Id; exited=$Exited; code=$Code; stubborn=$Stubborn}
-        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Timeout) return $this.exited }
-        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { if (-not $this.stubborn) { $this.exited = $true } }
-        return [pscustomobject]@{job='peer-fixture'; process=$process}
-    }
-    function Complete-SpikeNativeProcess($Running, [string]$StdoutPath, [string]$StderrPath) {
-        [IO.File]::WriteAllText($StdoutPath, '')
-        [IO.File]::WriteAllText($StderrPath, '')
-        return [pscustomobject]@{exitCode=$Running.process.code; stdout=''; stderr=''}
-    }
-    $fixtureStderr = [Console]::Error
-    try {
-        $eventPath = Join-Path $peerFixture 'boot.xml'
-        $matched = Wait-RunnerPeerBoot $victimVm $since $eventPath
-        $queries = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($eventPath + '.queries.json'))
-        if ($script:RunnerBootFixtureCalls -ne 2 -or $queries.queries.Count -ne 2 -or $matched.vm_id -cne $victimVm.ToString('D')) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
-        Write-Host 'PASS peer-boot-polls-past-unrelated-event-and-retains-queries'; $script:count++
-        # These negative cases retain reasons in files without printing expected
-        # failures to the calling shell's native stderr error stream.
-        [Console]::SetError([IO.TextWriter]::Null)
-        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 1 $false 1) $peerFixture 'Boot gate timeout'
-        if (-not $status.forced -or -not $status.terminated -or $status.failure -or [IO.File]::ReadAllText((Join-Path $peerFixture 'peer-monitor-1.stderr')) -notlike '*Boot gate timeout*') { throw 'FAIL peer-monitor-intentional-kill-retains-reason-with-empty-output' }
-        Write-Host 'PASS peer-monitor-intentional-kill-retains-reason-with-empty-output'; $script:count++
-        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 2 $true 1) $peerFixture ''
-        if ($status.forced -or -not $status.failure -or $status.reason -notlike '*exited nonzero: exit=1*') { throw 'FAIL peer-monitor-unexpected-nonzero-has-explicit-reason' }
-        Write-Host 'PASS peer-monitor-unexpected-nonzero-has-explicit-reason'; $script:count++
-        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 3 $true 0) $peerFixture ''
-        Assert-RunnerPeerCleanup $null @()
-        if ($status.failure -or $status.reason -notlike '*normally after VM off*') { throw 'FAIL peer-monitor-normal-off-has-explicit-reason' }
-        Write-Host 'PASS peer-monitor-normal-off-has-explicit-reason'; $script:count++
-        $status = Stop-RunnerPeerMonitor (New-MonitorFixture 4 $false 1 $true) $peerFixture 'Boot gate timeout'
-        if ($status.terminated -or $status.failure -notlike '*preserving VM disks*') { throw 'FAIL peer-monitor-unreaped-preserves-disks' }
-        Write-Host 'PASS peer-monitor-unreaped-preserves-disks'; $script:count++
-        Assert-PeerFixtureRejected 'peer-cleanup-preserves-primary-boot-gate-error' {
-            Assert-RunnerPeerCleanup 'Original boot gate timeout' @('Run monitor exit=1')
-        } 'Original boot gate timeout'
-    } finally {
-        [Console]::SetError($fixtureStderr)
-        Remove-Item Function:\Get-WinEvent
-        Remove-Item Function:\Complete-SpikeNativeProcess
-        Remove-Variable -Name RunnerBootFixtureCalls,RunnerBootFixtureXml -Scope Script -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $peerFixture -Recurse -Force
-    }
-
-    & {
-        # Execute the production Run catch with failing evidence/stop mocks: the
-        # first reason and thrown error must still identify the sample failure.
-        $tries = @($control.FindAll({ param($node) $node -is [Management.Automation.Language.TryStatementAst] -and $node.Body.Extent.Text.Contains('Start-VM -VM $vm') }, $true))
-        if ($tries.Count -ne 1) { throw 'Production Run try/catch fixture is ambiguous' }
-        $body = $tries[0].CatchClauses[0].Body.Extent.Text
-        $catchSource = $body.Substring(1, $body.Length - 2)
-        function Evidence([string]$Id, [string]$Event, $Detail) { throw 'Fixture evidence write failed' }
-        function Stop-VM { throw 'Fixture VM stop failed' }
-        if ((Get-Command Stop-VM).CommandType -ne 'Function') { throw 'Run catch fixture refuses a real Stop-VM' }
-        $vm = [pscustomobject]@{State='Running'}
-        $Job = 'peer-run-fixture'
-        $writer = [IO.StringWriter]::new()
-        $previous = [Console]::Error
-        $retained = $false
-        try {
-            [Console]::SetError($writer)
-            try {
-                try { throw 'Original monitor sample failure' } catch { . ([scriptblock]::Create($catchSource)) }
-            } catch { $retained = [string]$_ -like '*Original monitor sample failure*' }
-        } finally { [Console]::SetError($previous) }
-        $text = $writer.ToString()
-        if (-not $retained -or -not $text.StartsWith('Hyper-V Run monitor job=peer-run-fixture failed: Original monitor sample failure') -or -not $text.Contains('Monitor failure evidence write failed') -or -not $text.Contains('Monitor failure VM stop failed')) { throw 'FAIL peer-run-monitor-catch-retains-original-error-and-writes-reason' }
-        Write-Host 'PASS peer-run-monitor-catch-retains-original-error-and-writes-reason'; $script:count++
-    }
-
-    & {
-        $tokens = $null; $errors = $null
-        $qualifier = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\qualify.ps1", [ref]$tokens, [ref]$errors)
-        $capture = @($qualifier.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$timeline.hello_ms' }, $true))
-        $wait = @($qualifier.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$timeline.settled_ms' }, $true))
-        if ($errors.Count -or $capture.Count -ne 1 -or $wait.Count -ne 1) { throw 'FAIL peer-settle-production-window-is-anchored-to-recorded-hello' }
-        $peerClock = [pscustomobject]@{ElapsedMilliseconds=[long]100974}
-        $timeline = @{attacker_settled_ms=[long]100000; boot_observed_ms=[long]100000}
-        $script:RunnerWindowFixture = @{clock=$peerClock; sleeps=0}
-        function Start-Sleep([int]$Milliseconds) {
-            $script:RunnerWindowFixture.sleeps++
-            # Model an early wake that advances no time, followed by a real wait.
-            if ($script:RunnerWindowFixture.sleeps -gt 1) { $script:RunnerWindowFixture.clock.ElapsedMilliseconds += $Milliseconds }
-        }
-        try {
-            # Execute the actual call-site assignments, not a test-only start
-            # value. An earlier timeline field must not shorten the Hello window.
-            . ([scriptblock]::Create($capture[0].Extent.Text))
-            $peerClock.ElapsedMilliseconds = [long]160969
-            . ([scriptblock]::Create($wait[0].Extent.Text))
-            if ($timeline.hello_ms -ne 100974 -or $timeline.settled_ms - $timeline.hello_ms -lt 60000 -or $script:RunnerWindowFixture.sleeps -ne 2) { throw 'FAIL peer-settle-production-window-is-anchored-to-recorded-hello' }
-            Write-Host 'PASS peer-settle-production-window-is-anchored-to-recorded-hello'; $script:count++
-        } finally {
-            Remove-Item Function:\Start-Sleep
-            Remove-Variable -Name RunnerWindowFixture -Scope Script -ErrorAction SilentlyContinue
-        }
-    }
-
-    & {
-        . "$PSScriptRoot\loader-snaps.ps1"
-        if (-not ('Motor.LoaderRegistryFixture' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using Microsoft.Win32;
-namespace Motor {
-    public sealed class LoaderKeyFixture {
-        public readonly Dictionary<string, object> Values = new Dictionary<string, object>();
-        public readonly Dictionary<string, RegistryValueKind> Kinds = new Dictionary<string, RegistryValueKind>();
-        public string[] GetValueNames() { var names = new string[Values.Count]; Values.Keys.CopyTo(names, 0); return names; }
-        public string[] GetSubKeyNames() { return new string[0]; }
-        public object GetValue(string name) { return Values.ContainsKey(name) ? Values[name] : null; }
-        public object GetValue(string name, object fallback, RegistryValueOptions options) { return Values.ContainsKey(name) ? Values[name] : fallback; }
-        public RegistryValueKind GetValueKind(string name) { return Kinds[name]; }
-        public void SetValue(string name, object value, RegistryValueKind kind) { Values[name] = value; Kinds[name] = kind; }
-        public void DeleteValue(string name, bool missing) { Values.Remove(name); Kinds.Remove(name); }
-        public void Dispose() { }
-    }
-    public sealed class LoaderRegistryFixture {
-        public readonly Dictionary<string, LoaderKeyFixture> Keys = new Dictionary<string, LoaderKeyFixture>();
-        public LoaderKeyFixture OpenSubKey(string path, bool writable) { return Keys.ContainsKey(path) ? Keys[path] : null; }
-        public LoaderKeyFixture CreateSubKey(string path) { if (!Keys.ContainsKey(path)) Keys[path] = new LoaderKeyFixture(); return Keys[path]; }
-        public void DeleteSubKey(string path, bool missing) { Keys.Remove(path); }
-    }
-}
-'@
-        }
-        $directory = Join-Path ([IO.Path]::GetTempPath()) ('motor-loader-registry-' + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $directory | Out-Null
-        $prefix = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\'
-        $fake = [Motor.LoaderRegistryFixture]::new()
-        $cargoKey = $fake.CreateSubKey($prefix + 'cargo.exe')
-        $cargoKey.SetValue('GlobalFlag', 256, [Microsoft.Win32.RegistryValueKind]::DWord)
-        try {
-            Invoke-RunnerLoaderSnaps $directory {
-                if ($fake.OpenSubKey($prefix + 'cargo.exe',$true).GetValue('GlobalFlag') -cne '00000102' -or $fake.OpenSubKey($prefix + 'rustc.exe',$true).GetValue('GlobalFlag') -cne '00000002') { throw 'Fixture did not enable exactly the loader-snaps bit' }
-            } $fake
-            $saved = [IO.File]::ReadAllText((Join-Path $directory 'loader-snaps-registry.json')) | ConvertFrom-Json
-            if ($cargoKey.GetValue('GlobalFlag') -ne 256 -or $cargoKey.GetValueKind('GlobalFlag') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $null -ne $fake.OpenSubKey($prefix + 'rustc.exe',$true) -or $saved.restore_errors.Count -ne 0 -or @($saved.entries | Where-Object { -not $_.restored }).Count) { throw 'FAIL loader-snaps-restores-original-type-and-missing-key' }
-            Write-Host 'PASS loader-snaps-restores-original-type-and-missing-key'; $script:count++
-            Remove-Item -LiteralPath (Join-Path $directory 'loader-snaps-registry.json')
-            $cargoKey.SetValue('GlobalFlag','00000400',[Microsoft.Win32.RegistryValueKind]::String)
-            $rustcKey = $fake.CreateSubKey($prefix + 'rustc.exe')
-            $rustcKey.SetValue('OtherValue','preserve',[Microsoft.Win32.RegistryValueKind]::String)
-            $denied = $false
-            try { Invoke-RunnerLoaderSnaps $directory { throw 'Fixture loader trace action failed' } $fake } catch { if ([string]$_ -notlike '*Fixture loader trace action failed*') { throw }; $denied = $true }
-            if (-not $denied -or $cargoKey.GetValue('GlobalFlag') -cne '00000400' -or $cargoKey.GetValueKind('GlobalFlag') -ne [Microsoft.Win32.RegistryValueKind]::String -or $rustcKey.GetValueNames() -contains 'GlobalFlag' -or $rustcKey.GetValue('OtherValue') -cne 'preserve') { throw 'FAIL loader-snaps-restores-after-failed-native-action' }
-            Write-Host 'PASS loader-snaps-restores-after-failed-native-action'; $script:count++
-        } finally { Remove-Item -LiteralPath $directory -Recurse -Force }
-    }
-
-    # The fixed header independently pins the big-endian Hello wire format.
-    $payload = [Text.Encoding]::UTF8.GetBytes('{"kind":"hello","version":4,"nonce":"0123456789abcdef0123456789abcdef"}')
-    if ($payload.Length -ne 71) { throw 'Hello wire fixture length changed' }
-    $frame = [byte[]]([byte[]]@(0,0,0,71) + $payload)
-    if ((Convert-RunnerPeerHello $frame $nonce).nonce -cne $nonce) { throw 'FAIL peer-hello-validates-current-wire-version-and-nonce' }
-    Write-Host 'PASS peer-hello-validates-current-wire-version-and-nonce'
-    $script:count++
-    $badFrames = @($frame.Clone(), $frame.Clone(), $frame.Clone())
-    $badFrames[0][3] = 70
-    $badFrames[1][30] = [byte][char]'5'
-    $badFrames[2][42] = [byte][char]'f'
-    foreach ($bad in $badFrames) {
-        $denied = $false
-        try { $null = Convert-RunnerPeerHello $bad $nonce } catch { $denied = $true }
-        if (-not $denied) { throw 'FAIL peer-hello-rejects-bad-length-version-or-nonce' }
-    }
-    Write-Host 'PASS peer-hello-rejects-bad-length-version-or-nonce'
-    $script:count++
-    Initialize-RunnerPeerSocket
-    Write-Host 'PASS peer-native-socket-helper-compiles-without-dialing'
-    $script:count++
-}
-
-$switch = $control.Find({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true)
-$prepare = @($switch.Clauses | Where-Object { $_.Item1 -is [Management.Automation.Language.StringConstantExpressionAst] -and $_.Item1.Value -eq 'Prepare' })
-if ($prepare.Count -ne 1) { throw 'FAIL boot-nonce-production-contract: Prepare clause missing' }
-$prepareBody = $prepare[0].Item2
-$nonceRules = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if ($Nonce -notmatch') }, $false))
-$nonceWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\nonce.txt"' }, $false))
-$peerFormatter = $control.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Convert-RunnerPeerTargets' }, $true)
-$peerWrites = @($prepareBody.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Expression.Extent.Text -eq '[IO.File]' -and $node.Member.Extent.Text -eq 'WriteAllText' -and $node.Arguments[0].Extent.Text -eq '"$directory\nonce\peer-targets.json"' }, $false))
-if ($nonceRules.Count -ne 1 -or $nonceWrites.Count -ne 1 -or -not $peerFormatter -or $peerWrites.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements.Count -ne 1 -or $nonceRules[0].Clauses[0].Item2.Statements[0] -isnot [Management.Automation.Language.ThrowStatementAst]) { throw 'FAIL boot-nonce-production-contract: unsafe or missing validation/write fixture' }
-& {
-    param($rule, $writer, $formatter, $targetWriter)
-    $directory = Join-Path ([IO.Path]::GetTempPath()) ('motor-nonce-tests-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        New-Item -ItemType Directory -Path "$directory\nonce" -Force | Out-Null
-        $Nonce = '0123456789abcdef0123456789abcdef'
-        . ([scriptblock]::Create($rule))
-        . ([scriptblock]::Create($writer))
-        $bytes = [IO.File]::ReadAllBytes("$directory\nonce\nonce.txt")
-        if ($bytes.Length -ne 32 -or [Text.Encoding]::ASCII.GetString($bytes) -cne $Nonce) { throw 'FAIL boot-nonce-production-contract: media bytes differ from the compact nonce' }
-        . ([scriptblock]::Create($formatter))
-        foreach ($case in @(
-            @{Json='["01234567-89ab-cdef-0123-456789abcdef"]'; Expected='["01234567-89ab-cdef-0123-456789abcdef"]'},
-            @{Json='[]'; Expected='[]'},
-            @{Json='["01234567-89ab-cdef-0123-456789abcdef","ABCDEF01-2345-4789-ABCD-EF0123456789"]'; Expected='["01234567-89ab-cdef-0123-456789abcdef","abcdef01-2345-4789-abcd-ef0123456789"]'}
-        )) {
-            $PeerTargetsJson = $case.Json
-            . ([scriptblock]::Create($targetWriter))
-            $peerBytes = [IO.File]::ReadAllBytes("$directory\nonce\peer-targets.json")
-            $actual = [Text.Encoding]::UTF8.GetString($peerBytes)
-            if ($actual -cne $case.Expected) { throw "FAIL boot-nonce-production-contract: peer metadata differs; actual=$actual hex=$([BitConverter]::ToString($peerBytes))" }
-        }
-        foreach ($badPeer in @('"01234567-89ab-cdef-0123-456789abcdef"','[["01234567-89ab-cdef-0123-456789abcdef"]]','[1]','["not-a-guid"]','{"value":["01234567-89ab-cdef-0123-456789abcdef"],"Count":1}')) {
-            $PeerTargetsJson = $badPeer
-            $rejected = $false
-            try { . ([scriptblock]::Create($targetWriter)) } catch { $rejected = $true }
-            if (-not $rejected) { throw 'FAIL boot-nonce-production-contract: incompatible peer schema accepted' }
-        }
-        foreach ($bad in @([Guid]::NewGuid().ToString(), '', ($Nonce + "`n"), ([string][char]0xfeff + $Nonce), ('z' * 32))) {
-            $Nonce = $bad
-            $rejected = $false
-            try { . ([scriptblock]::Create($rule)) } catch { $rejected = $true }
-            if (-not $rejected) { throw 'FAIL boot-nonce-production-contract: incompatible nonce accepted' }
-        }
-        Write-Host 'PASS boot-nonce-production-contract'
-        $script:count++
-    } finally { if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force } }
-} $nonceRules[0].Extent.Text $nonceWrites[0].Extent.Text $peerFormatter.Extent.Text $peerWrites[0].Extent.Text
-
-$remover = $control.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-Job' }, $true)
-if (-not $remover) { throw 'FAIL removal-harvest-order: production function missing' }
-& {
-    param($source)
-    $Root = Join-Path ([IO.Path]::GetTempPath()) ('motor-remove-tests-' + [Guid]::NewGuid().ToString('N'))
-    function Job-Path([string]$Id) { Join-Path $script:RunnerRemovalFixture.root $Id }
-    function Owned-VM([string]$Id) { $script:RunnerRemovalFixture.vm }
-    function Assert-JobDiskBinding([string]$Id) { $script:RunnerRemovalFixture.calls.Add('binding') }
-    function Stop-VM($VM, [switch]$TurnOff, [switch]$Force) {
-        $script:RunnerRemovalFixture.calls.Add('stop')
-        $script:RunnerRemovalFixture.vm.State = 'Off'
-    }
-    function Harvest-Job([string]$Id, [switch]$Lightweight) {
-        if ($script:RunnerRemovalFixture.vm.State -ne 'Off') { throw 'Fixture attempted a live-disk harvest' }
-        if (-not (Test-Path -LiteralPath (Job-Path $Id))) { throw 'Fixture directory was deleted before harvest' }
-        $script:RunnerRemovalFixture.calls.Add('harvest')
-        if ($Lightweight) { $script:RunnerRemovalFixture.calls.Add('lightweight') }
-        else { $script:RunnerRemovalFixture.calls.Add('full'); throw 'Fixture collection error must not skip removal' }
-    }
-    function Remove-VM($VM, [switch]$Force) {
-        $script:RunnerRemovalFixture.calls.Add('remove-vm')
-        $script:RunnerRemovalFixture.vm = $null
-    }
-    function Evidence([string]$Id, [string]$Event, $Detail) { $script:RunnerRemovalFixture.calls.Add($Event) }
-    foreach ($name in @('Stop-VM','Remove-VM')) {
-        if ((Get-Command $name).CommandType -ne 'Function') { throw 'Removal fixture mock is missing; refusing real Hyper-V control' }
-    }
-    . ([scriptblock]::Create($source))
-    try {
-        New-Item -ItemType Directory -Path $Root | Out-Null
-        $script:RunnerRemovalFixture = [pscustomobject]@{root=$Root; vm=$null; calls=[Collections.Generic.List[string]]::new()}
-        foreach ($lightweight in @($false, $true)) {
-            $id = [Guid]::NewGuid().ToString()
-            $script:RunnerRemovalFixture.vm = [pscustomobject]@{State='Running'}
-            $script:RunnerRemovalFixture.calls.Clear()
-            New-Item -ItemType Directory -Path (Job-Path $id) | Out-Null
-            Remove-Job $id -LightweightHarvest:$lightweight 3>$null
-            $calls = $script:RunnerRemovalFixture.calls.ToArray()
-            $stopIndex = [array]::IndexOf($calls, 'stop')
-            $harvestIndex = [array]::IndexOf($calls, 'harvest')
-            $removeIndex = [array]::IndexOf($calls, 'remove-vm')
-            if ($stopIndex -lt 0 -or $removeIndex -lt 0 -or (Test-Path -LiteralPath (Job-Path $id))) { throw 'FAIL removal-harvest-order: cleanup did not complete' }
-            if ($harvestIndex -le $stopIndex -or $removeIndex -le $harvestIndex) { throw 'FAIL removal-harvest-order: evidence was not attempted before VM destruction' }
-            if ($lightweight) {
-                if ($calls -notcontains 'lightweight' -or $calls -contains 'full') { throw 'FAIL known-clean-removal-collects-lightweight-logs' }
-                Write-Host 'PASS known-clean-removal-collects-lightweight-logs'
-            } else {
-                if ($calls -notcontains 'full') { throw 'FAIL failed-removal-requires-full-diagnostics' }
-                Write-Host 'PASS failed-removal-harvests-before-destruction-even-if-collection-fails'
-            }
-            $script:count++
-        }
-    } finally {
-        if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }
-        Remove-Variable -Name RunnerRemovalFixture -Scope Script -ErrorAction SilentlyContinue
-    }
-} $remover.Extent.Text
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     . "$PSScriptRoot\parent-identity.ps1"
@@ -616,16 +113,18 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS parent-identity-record-written'
         $count++
         $hashEvent = Get-Content -LiteralPath $hashLog -Raw | ConvertFrom-Json
-        if ($hashEvent.event -ne 'parent-sha256' -or -not $hashEvent.hash_matches_configuration -or $hashEvent.hash_duration_ms -lt 0) { throw 'FAIL parent-identity-startup-hash-duration-logged' }
+        if ($hashEvent.event -ne 'parent-sha256' -or -not $hashEvent.hash_matches_configuration -or $hashEvent.hash_duration_ms -lt 0 -or -not $hashEvent.change_time_filetime) { throw 'FAIL parent-identity-startup-hash-duration-logged' }
+        $recordData = Get-Content -LiteralPath $record -Raw | ConvertFrom-Json
+        if ($recordData.schema -ne 2 -or -not $recordData.change_time_filetime) { throw 'FAIL parent-identity-change-time-recorded' }
+        Write-Host 'PASS parent-identity-change-time-recorded'
+        $count++
         Write-Host 'PASS parent-identity-startup-hash-duration-logged'
         $count++
-        $savedWriter = (Get-Item Function:\Write-RunnerParentVerification).ScriptBlock
-        Set-Item Function:\Write-RunnerParentVerification -Value { throw 'FAIL parent-identity-startup-cache-hit-without-hashing: unexpected digest' }
-        try {
-            $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record
-            if (-not $verification.cache_hit -or $verification.hash_duration_ms -ne 0) { throw 'FAIL parent-identity-startup-cache-hit-without-hashing' }
-        } finally { Set-Item Function:\Write-RunnerParentVerification -Value $savedWriter }
-        Write-Host 'PASS parent-identity-startup-cache-hit-without-hashing'
+        $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $record $hashLog
+        if ($verification.cache_hit -or $verification.hash_duration_ms -lt 0 -or -not $verification.change_time_filetime) { throw 'FAIL parent-identity-startup-rehashes-existing-record' }
+        $hashEvents = @(Get-Content -LiteralPath $hashLog | ForEach-Object { $_ | ConvertFrom-Json })
+        if ($hashEvents.Count -ne 2 -or -not $hashEvents[1].hash_matches_configuration -or -not $hashEvents[1].change_time_filetime) { throw 'FAIL parent-identity-startup-rehashes-existing-record' }
+        Write-Host 'PASS parent-identity-startup-rehashes-existing-record'
         $count++
         # Run the exact assignment from Prepare against the tiny sealed file.
         . ([scriptblock]::Create($guards[0].Extent.Text))
@@ -707,7 +206,21 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $count++
         $lifetimeGuard.Dispose(); $lifetimeGuard = $null
 
-        # Without a lifetime guard, LastWrite still detects an ordinary rewrite.
+        # The active service guard blocks in-place writes. After service stop,
+        # the next startup hash catches a same-size rewrite that restores LastWrite.
+        Set-FixtureParent 'modified' $lastWrite
+        $denied = $false
+        try { $null = Confirm-RunnerParentVerification $Parent $ParentSha256 $record $hashLog } catch {
+            if ([string]$_ -notlike '*parent SHA-256 mismatch*') { throw }
+            $denied = $true
+        }
+        if (-not $denied -or (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-startup-rehash-catches-same-size-rewrite-restored-lastwrite' }
+        Write-Host 'PASS parent-identity-startup-rehash-catches-same-size-rewrite-restored-lastwrite'
+        $count++
+
+        Set-FixtureParent 'original' $lastWrite
+        $ParentSha256 = (Get-FileHash -LiteralPath $Parent -Algorithm SHA256).Hash
+        $null = Write-RunnerParentVerification $Parent $ParentSha256 $record
         Set-FixtureParent 'modified' $lastWrite.AddMinutes(1)
         Assert-FixtureRejected 'parent-identity-rejects-same-size-rewrite-with-changed-lastwrite'
         $metadata = @{parent=$Parent; sha256=$ParentSha256}
