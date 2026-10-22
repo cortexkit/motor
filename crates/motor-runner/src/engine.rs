@@ -3681,8 +3681,9 @@ impl Runner {
         self.retire_unused_repositories()
     }
     /// Move an expired job's directory into the trash directory, so the
-    /// caller can delete it after releasing the state lock. Anything but a
-    /// directory is refused, as deleting it in place would be.
+    /// caller can delete it after releasing the state lock. Only directories
+    /// are moved; for anything else this fails and `maintain_state` tries to
+    /// delete the path in place, which refuses a non-directory as before.
     fn set_aside_job_directory(&self, id: Uuid, directory: &Path) -> io::Result<PathBuf> {
         if !directory.symlink_metadata()?.is_dir() {
             return Err(io::Error::other("expired job path is not a directory"));
@@ -3694,8 +3695,9 @@ impl Runner {
     }
     /// The part of `maintenance` that runs under the state lock. Returns
     /// whether repository maintenance may follow (not while quarantined).
-    /// Expired job directories it removes from the state are pushed to
-    /// `set_aside` for deletion once the lock is released.
+    /// Expired job directories it moves aside are pushed to `set_aside` for
+    /// deletion once the lock is released; one that cannot be moved is
+    /// deleted in place, under the lock, as before.
     fn maintain_state(&self, set_aside: &mut Vec<PathBuf>) -> io::Result<bool> {
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);

@@ -299,8 +299,9 @@ fn cancel_proceeds_while_maintenance_deletes_an_expired_job() {
     );
     let release = f.hold_in(|runner| runner.maintenance().unwrap());
     f.assert_cancel_completes(running);
-    // The record left the state and the directory its place before the
-    // deletion started, so no replay can read a half-deleted job.
+    // The job record was removed from the state and its directory moved
+    // aside before the deletion began, so no replay can read a half-deleted
+    // job.
     assert!(!f.runner.has_job_record(expired));
     assert!(!directory.exists());
     drop(release);
