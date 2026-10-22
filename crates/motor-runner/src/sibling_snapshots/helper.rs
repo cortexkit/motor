@@ -277,15 +277,20 @@ pub(crate) fn unit_name(instance: &str, id: Uuid) -> String {
 /// runner writes. A helper of instance `main-2` is not one of `main`'s,
 /// because `2-<uuid>` is not a UUID.
 pub(crate) fn belongs_to(instance: &str, unit: &str) -> bool {
-    let Some(id) = unit
+    helper_id(instance, unit).is_some()
+}
+
+/// The UUID in the name of a helper unit of runner `instance`, as
+/// `belongs_to` reads it.
+fn helper_id(instance: &str, unit: &str) -> Option<Uuid> {
+    let id = unit
         .strip_prefix(UNIT_PREFIX)
         .and_then(|rest| rest.strip_prefix(instance))
         .and_then(|rest| rest.strip_prefix('-'))
-        .and_then(|rest| rest.strip_suffix(".service"))
-    else {
-        return false;
-    };
-    Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+        .and_then(|rest| rest.strip_suffix(".service"))?;
+    Uuid::try_parse(id)
+        .ok()
+        .filter(|parsed| parsed.hyphenated().to_string() == id)
 }
 
 /// Runs `command` in a helper unit with the mount namespace `view`, and
@@ -371,10 +376,15 @@ pub(crate) fn run(
     }
 }
 
-/// Stops every helper unit this runner instance left behind, for example
-/// when it was killed during a setup, and removes their files.
-/// Units of other instances on the same host are left alone, even when their
-/// instance name starts with this one's.
+/// Stops every helper unit this runner left behind, for example when it was
+/// killed during a setup, and removes their files. Units of other instances
+/// on the same host are left alone, even when their instance name starts
+/// with this one's. So are units of another runner that uses the same
+/// instance name with a different state directory, as test fixtures do: a
+/// helper's files are written to the state directory before its unit
+/// starts and removed only once it has stopped, so a unit this runner
+/// started always has them there, and the daemon lock on that directory
+/// means no other live runner uses it.
 pub(crate) fn stop_stale(config: &Config) -> io::Result<()> {
     let pattern = format!("{UNIT_PREFIX}{}-*", config.instance);
     let output = crate::backend::systemctl(
@@ -396,11 +406,18 @@ pub(crate) fn stop_stale(config: &Config) -> io::Result<()> {
         )));
     }
     let listing = String::from_utf8_lossy(&output.stdout);
-    for unit in listing
+    for (unit, id) in listing
         .lines()
         .filter_map(|line| line.split_whitespace().next())
-        .filter(|unit| belongs_to(&config.instance, unit))
+        .filter_map(|unit| helper_id(&config.instance, unit).map(|id| (unit, id)))
     {
+        if !Files::new(config, id).exist() {
+            tracing::info!(
+                unit,
+                "leaving a snapshot helper of another runner's state directory alone"
+            );
+            continue;
+        }
         tracing::warn!(unit, "stopping a snapshot helper left by an earlier run");
         settle(config, unit)
             .map_err(|error| io::Error::other(format!("stop stale helper {unit}: {error}")))?;
@@ -433,6 +450,13 @@ impl Files {
             environment: directory.join(format!("{id}.env")),
             output: directory.join(format!("{id}.log")),
         }
+    }
+
+    /// Whether either file is present, as from the moment the helper's unit
+    /// may start until it has stopped.
+    fn exist(&self) -> bool {
+        fs::symlink_metadata(&self.environment).is_ok()
+            || fs::symlink_metadata(&self.output).is_ok()
     }
 
     fn create(&self, command: &Command) -> io::Result<()> {

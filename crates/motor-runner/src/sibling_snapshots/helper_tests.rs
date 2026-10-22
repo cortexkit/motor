@@ -474,7 +474,8 @@ fn snapshot_helper_returns_only_after_its_unit_is_inactive() {
 fn snapshot_helper_startup_stops_only_this_instances_units() {
     let scratch = ScratchDir::new("snapshot-helper-startup");
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let main = unit_name("main", Uuid::now_v7());
+    let main_id = Uuid::now_v7();
+    let main = unit_name("main", main_id);
     let other = unit_name("main-2", Uuid::now_v7());
     let listing: &'static str = Box::leak(
         format!(
@@ -509,6 +510,10 @@ fn snapshot_helper_startup_stops_only_this_instances_units() {
     let stale = config.state_dir().join(ENVIRONMENT_DIRECTORY);
     fs::create_dir_all(&stale).unwrap();
     fs::write(stale.join("left.env"), "A=\"b\"\n").unwrap();
+    // The files an earlier run of this runner wrote for its helper before
+    // starting the unit, as every helper of this runner has while it runs.
+    fs::write(stale.join(format!("{main_id}.env")), "A=\"b\"\n").unwrap();
+    fs::write(stale.join(format!("{main_id}.log")), "").unwrap();
     let runner = crate::engine::Runner::open(config).unwrap();
     let calls = calls.lock().unwrap();
     assert_eq!(calls[0].last().unwrap(), "motor-snaphelper-main-*");
@@ -548,6 +553,52 @@ fn snapshot_helper_startup_does_nothing_outside_snapshot_mode() {
         .iter()
         .any(|call| call.iter().any(|arg| arg.contains("snaphelper"))));
     drop(runner);
+}
+
+/// Two runners on one host with the same instance name but different state
+/// directories, as concurrent test fixtures are: one opening must not stop
+/// the other's in-flight helper, which would fail that runner's setup. The
+/// helper's files live in its own runner's state directory only.
+#[test]
+fn snapshot_helper_startup_leaves_helpers_of_another_state_directory_running() {
+    let scratch = ScratchDir::new("snapshot-helper-startup-shared-instance");
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let id = Uuid::now_v7();
+    let unit = unit_name("main", id);
+    let busy = Config::new(scratch.join("busy"), "main");
+    let files = busy.state_dir().join(ENVIRONMENT_DIRECTORY);
+    fs::create_dir_all(&files).unwrap();
+    fs::write(files.join(format!("{id}.env")), "A=\"b\"\n").unwrap();
+    fs::write(files.join(format!("{id}.log")), "").unwrap();
+    let listing: &'static str =
+        Box::leak(format!("{unit} loaded active running in-flight helper\n").into_boxed_str());
+    let mut config = Config::new(scratch.join("opening"), "main");
+    config.free_space_floor_bytes = 0;
+    config.cpu_topology =
+        Some(crate::cpu::CpuTopology::new((0..4).map(|cpu| vec![cpu]).collect()).unwrap());
+    config.disable_warm_builds = true;
+    config.manual_tick = true;
+    config.sibling_snapshot_mode_override = Some(true);
+    let recorded = calls.clone();
+    config.systemd_command = Some(Arc::new(move |args| {
+        recorded
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|arg| arg.to_string()).collect());
+        Ok(output(
+            0,
+            match args[0] {
+                "list-units" => listing,
+                _ => "LoadState=loaded\nActiveState=active\nResult=success\n",
+            },
+        ))
+    }));
+    let runner = crate::engine::Runner::open(config).unwrap();
+    let calls = calls.lock().unwrap().clone();
+    drop(runner);
+    assert_eq!(calls.len(), 1, "only the listing: {calls:?}");
+    assert_eq!(calls[0][0], "list-units");
+    assert_eq!(fs::read_dir(&files).unwrap().count(), 2);
 }
 
 /// A runner config that starts real helper units through sudo and systemd.

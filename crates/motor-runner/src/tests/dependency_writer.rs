@@ -349,6 +349,23 @@ async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_h
     }
 }
 
+/// Waits for job `id` to end and asserts that it exited 0. A failure prints
+/// the whole terminal record, including any refusal detail, the job's
+/// output and the writer diagnostics, so an intermittent failure explains
+/// itself.
+#[cfg(target_os = "linux")]
+async fn assert_exited(f: &Fixture, runner: &Runner, id: Uuid) {
+    let terminal = terminal(runner, id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::Exit { code: 0 },
+        "terminal: {terminal:?}\nrefusal detail: {:?}\noutput:\n{}\n{}",
+        terminal.refusal_detail(),
+        replay_text(runner, id),
+        writer_diagnostics(f, runner)
+    );
+}
+
 #[cfg(target_os = "linux")]
 pub(super) async fn isolated_graph_fixture() {
     let f = Fixture::new();
@@ -458,10 +475,7 @@ pub(super) async fn isolated_graph_fixture() {
     r.git_dependencies = vec![declaration.clone()];
     bytes.push(dep_bytes.clone());
     f.submit(&runner, &r, &bytes);
-    assert_eq!(
-        terminal(&runner, r.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
-    );
+    assert_exited(&f, &runner, r.job_id).await;
     base_done(&runner).await;
     assert_eq!(
         repository(&f, &runner).result,
@@ -481,10 +495,7 @@ pub(super) async fn isolated_graph_fixture() {
         job.git_dependencies = vec![declaration.clone()];
         bytes.push(dep_bytes.clone());
         f.submit(&runner, &job, &bytes);
-        assert_eq!(
-            terminal(&runner, job.job_id).await.outcome,
-            Outcome::Exit { code: 0 }
-        );
+        assert_exited(&f, &runner, job.job_id).await;
         let output = replay_text(&runner, job.job_id);
         assert!(
             counter(&output, "Cache hits") >= 4,
@@ -530,10 +541,7 @@ pub(super) async fn isolated_graph_fixture() {
     branch.git_dependencies = vec![declaration];
     bytes.push(dep_bytes);
     f.submit(&runner, &branch, &bytes);
-    assert_eq!(
-        terminal(&runner, branch.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
-    );
+    assert_exited(&f, &runner, branch.job_id).await;
     base_done(&runner).await;
     assert_eq!(writer_count(&runner), count);
     assert!(!runner.config().sccache_dir().join("poison").exists());
