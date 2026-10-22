@@ -359,6 +359,8 @@ enum Saved {
     Queued,
     /// Set up, not started: next is the Started save.
     SetUp,
+    /// Running: next is the terminal record (or a kill record).
+    Started,
 }
 
 fn saved(path: &Path) -> Option<Saved> {
@@ -368,22 +370,38 @@ fn saved(path: &Path) -> Option<Saved> {
             JobState::AwaitingBundles => Some(Saved::Admitted),
             JobState::Queued if job.setup_ms.is_none() => Some(Saved::Queued),
             JobState::Queued if job.started.is_none() => Some(Saved::SetUp),
+            JobState::Running => Some(Saved::Started),
             _ => None,
         },
         _ => None,
     }
 }
 
+/// Faults a `SaveFixture` injects. Each record fault names a record and the
+/// stage it was last saved at, and applies once, to that record's next save.
+#[derive(Default)]
+struct SaveFaults {
+    /// Wait on the `record_save` hold.
+    hold: Option<(PathBuf, Saved)>,
+    /// Fail, after any hold.
+    fail: Option<(PathBuf, Saved)>,
+    /// Panic.
+    panic: Option<(PathBuf, Saved)>,
+    /// Fail every catalog write at this step until cleared.
+    catalog: Option<CatalogWrite>,
+    /// Catalog writes failed so far.
+    catalog_failures: usize,
+}
+
 /// A runner with the host backend whose scheduler runs only when a test
-/// calls `tick`, and which can hold one chosen job record save, or a long
-/// step labelled with its hold's label (such as `catalog_save`), open.
+/// calls `tick`, which can hold one chosen job record save, or a long step
+/// labelled with its hold's label (such as `catalog_save`), open, and which
+/// injects `SaveFaults`.
 struct SaveFixture {
     runner: Runner,
     fixture: Fixture,
     hold: Arc<Hold>,
-    /// The record, and the stage it was saved at, whose next save waits on
-    /// the `record_save` hold.
-    held: Arc<Mutex<Option<(PathBuf, Saved)>>>,
+    faults: Arc<Mutex<SaveFaults>>,
 }
 
 impl SaveFixture {
@@ -394,24 +412,54 @@ impl SaveFixture {
     fn with(label: &'static str, configure: impl FnOnce(&mut Config)) -> Self {
         let fixture = Fixture::new();
         let hold = Hold::new(label);
-        let held = Arc::new(Mutex::new(None::<(PathBuf, Saved)>));
+        let faults = Arc::new(Mutex::new(SaveFaults::default()));
         let mut config = fixture.config();
         config.manual_tick = true;
         config.disable_warm_builds = true;
         config.long_work = Some(hold.hook());
         config.before_job_write = Some({
             let hold = hold.clone();
-            let held = held.clone();
+            let faults = faults.clone();
             Arc::new(move |path| {
-                let next = held
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|(record, stage)| record == path && saved(path) == Some(*stage));
-                if next {
+                let stage = saved(path);
+                let due = |fault: &mut Option<(PathBuf, Saved)>| {
+                    let due = fault
+                        .as_ref()
+                        .is_some_and(|(record, at)| record == path && stage == Some(*at));
+                    if due {
+                        *fault = None;
+                    }
+                    due
+                };
+                let (held, failed, panicked) = {
+                    let mut faults = faults.lock().unwrap();
+                    (
+                        due(&mut faults.hold),
+                        due(&mut faults.fail),
+                        due(&mut faults.panic),
+                    )
+                };
+                if held {
                     hold.hook()("record_save");
                 }
+                if panicked {
+                    panic!("injected panic in a record save");
+                }
+                if failed {
+                    return Err(io::Error::other("injected record save failure"));
+                }
                 Ok(())
+            })
+        });
+        config.catalog_write = Some({
+            let faults = faults.clone();
+            Arc::new(move |step| {
+                let mut faults = faults.lock().unwrap();
+                if faults.catalog != Some(step) {
+                    return Ok(());
+                }
+                faults.catalog_failures += 1;
+                Err(io::Error::other("injected catalog write failure"))
             })
         });
         configure(&mut config);
@@ -420,14 +468,33 @@ impl SaveFixture {
             runner,
             fixture,
             hold,
-            held,
+            faults,
         }
     }
 
     /// Hold the next save of `id`'s record made after a save at `stage`.
     fn hold_save(&self, id: Uuid, stage: Saved) {
-        *self.held.lock().unwrap() = Some((self.runner.record_path(id), stage));
+        self.faults.lock().unwrap().hold = Some((self.runner.record_path(id), stage));
         self.hold.arm();
+    }
+
+    /// Fail the next save of `id`'s record made after a save at `stage`.
+    fn fail_save(&self, id: Uuid, stage: Saved) {
+        self.faults.lock().unwrap().fail = Some((self.runner.record_path(id), stage));
+    }
+
+    /// Panic in the next save of `id`'s record made after a save at `stage`.
+    fn panic_save(&self, id: Uuid, stage: Saved) {
+        self.faults.lock().unwrap().panic = Some((self.runner.record_path(id), stage));
+    }
+
+    /// Fail catalog writes at `step` until called again with `None`.
+    fn fail_catalog(&self, step: Option<CatalogWrite>) {
+        self.faults.lock().unwrap().catalog = step;
+    }
+
+    fn catalog_failures(&self) -> usize {
+        self.faults.lock().unwrap().catalog_failures
     }
 
     /// As `LockFixture::hold_in`: run `work` until something reaches the
@@ -824,6 +891,395 @@ fn an_older_catalog_snapshot_never_overwrites_a_newer_one() {
     let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
     assert!(saved.workspaces.contains_key("/older"));
     assert!(saved.workspaces.contains_key("/newer"));
+}
+
+/// A catalog write can rename its file into place and still fail (the
+/// directory sync after the rename). The newer bytes are then on disk, and
+/// an older snapshot written later must not replace them.
+#[test]
+fn a_renamed_catalog_is_never_replaced_by_an_older_snapshot() {
+    let f = SaveFixture::new("catalog_save");
+    let (older, newer) = {
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert("/older".into(), Workspace::default());
+        let older = f.runner.catalog_snapshot(&inner).unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert("/newer".into(), Workspace::default());
+        (older, f.runner.catalog_snapshot(&inner).unwrap())
+    };
+    f.fail_catalog(Some(CatalogWrite::Renamed));
+    assert!(f.runner.write_catalog(newer).is_err());
+    f.fail_catalog(None);
+    f.runner.write_catalog(older).unwrap();
+    let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
+    assert!(saved.workspaces.contains_key("/newer"));
+}
+
+/// A command that runs until `release` exists, so a test can finish it at a
+/// moment of its choosing.
+fn waits_for(release: &Path) -> String {
+    format!("while [ ! -e {} ]; do sleep 0.01; done", release.display())
+}
+
+/// A finishing job's catalog update is durable before its terminal record
+/// is: a crash between the two saves leaves the workspace's last use
+/// recorded, never a finished job whose workspace looks long unused.
+#[test]
+fn finish_writes_the_catalog_before_the_terminal_record() {
+    let f = SaveFixture::new("record_save");
+    let release = f.fixture.scratch.join("release");
+    let request = f.queued("finishing", &waits_for(&release));
+    let id = request.job_id;
+    f.tick_until("the job runs", |f| {
+        f.job(id).is_some_and(|job| job.state == JobState::Running)
+    });
+    let finished_ms = f.fixture.clock.fetch_add(1000, Ordering::SeqCst) + 1000;
+    f.hold_save(id, Saved::Started);
+    let held = f.hold_in(move |_| fs::write(release, b"").unwrap());
+    let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
+    assert_eq!(
+        saved.workspaces[&request.workspace_key].used_ms, finished_ms,
+        "the terminal record is being saved before the catalog records the finish"
+    );
+    assert!(f.terminal(id).is_none());
+    drop(held);
+    assert!(poll(Duration::from_secs(30), || f.terminal(id).is_some()));
+}
+
+/// A failed catalog write at finish keeps the job being finalized: its
+/// terminal is neither saved nor published, and both saves are retried.
+#[test]
+fn failed_finish_catalog_write_is_retried_before_the_terminal() {
+    let f = SaveFixture::new("record_save");
+    let release = f.fixture.scratch.join("release");
+    let request = f.queued("finishing", &waits_for(&release));
+    let id = request.job_id;
+    f.tick_until("the job runs", |f| {
+        f.job(id).is_some_and(|job| job.state == JobState::Running)
+    });
+    let finished_ms = f.fixture.clock.fetch_add(1000, Ordering::SeqCst) + 1000;
+    f.fail_catalog(Some(CatalogWrite::Starting));
+    fs::write(&release, b"").unwrap();
+    assert!(
+        poll(Duration::from_secs(30), || f.catalog_failures() >= 2),
+        "the finish did not retry its catalog write"
+    );
+    assert!(f.terminal(id).is_none(), "published without its catalog");
+    assert!(f.runner.core.inner.lock().unwrap().finalizing.contains(&id));
+    assert_eq!(
+        saved(&f.runner.record_path(id)),
+        Some(Saved::Started),
+        "terminal record saved before its catalog"
+    );
+    f.fail_catalog(None);
+    assert!(poll(Duration::from_secs(30), || f.terminal(id).is_some()));
+    let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
+    assert_eq!(
+        saved.workspaces[&request.workspace_key].used_ms,
+        finished_ms
+    );
+}
+
+/// Startup finds a finished job's terminal record with a catalog that last
+/// saw its workspace in use long before, as an older runner could leave
+/// after a crash between the two saves. The workspace's last use is raised
+/// to the job's finish before startup maintenance looks for expired
+/// workspaces.
+#[test]
+fn restart_counts_a_finished_job_as_its_workspace_last_use() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    let now = (config.clock)();
+    let (request, _) = f.run("true");
+    let id = request.job_id;
+    let mut job = Job::new(id, Some(request.clone()), now - 20_000, 1, 2);
+    job.started_ms = Some(now - 10_000);
+    job.terminal(Outcome::Exit { code: 0 }, now - 1000);
+    let state = config.state_dir();
+    atomic_json(
+        &state.join("jobs").join(id.to_string()).join("record.json"),
+        &job,
+    )
+    .unwrap();
+    let mut catalog = Catalog::default();
+    catalog.workspaces.insert(
+        request.workspace_key.clone(),
+        Workspace {
+            repository: request.repository_root.clone(),
+            used_ms: now - RETENTION_MS - 5000,
+            ..Workspace::default()
+        },
+    );
+    atomic_json(&state.join("catalog.json"), &catalog).unwrap();
+    fs::create_dir_all(&request.workspace_key).unwrap();
+    let runner = Runner::open(config).unwrap();
+    let used_ms = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .workspaces
+        .get(&request.workspace_key)
+        .map(|workspace| workspace.used_ms);
+    assert_eq!(used_ms, Some(now - 1000), "startup expired the workspace");
+    assert!(Path::new(&request.workspace_key).exists());
+}
+
+/// The state a dispatch attempt changes, to compare before and after one
+/// that is undone: the job's CPUs, setup time and queue clock, and its
+/// workspace's rotation.
+fn dispatch_state(
+    f: &SaveFixture,
+    id: Uuid,
+) -> (Vec<u32>, Option<u64>, Option<u64>, (u64, u64, bool)) {
+    let inner = f.runner.core.inner.lock().unwrap();
+    let job = &inner.jobs[&id];
+    let clock = QueueClock::of(job);
+    (
+        job.cpus.clone(),
+        job.setup_ms,
+        inner.rotation.get(job.key()).copied(),
+        (clock.entry, clock.elapsed, clock.initialized),
+    )
+}
+
+/// Fail the catalog write of `id`'s next launch, then return its state, the
+/// warm-build writer slot and whether its workspace is still reserved.
+fn fail_launch_catalog_write(f: &SaveFixture, id: Uuid) -> (JobState, Option<Uuid>, bool) {
+    let failures = f.catalog_failures();
+    f.fail_catalog(Some(CatalogWrite::Starting));
+    f.runner.tick().unwrap();
+    assert!(
+        poll(Duration::from_secs(60), || {
+            f.catalog_failures() > failures
+                && !f.runner.core.inner.lock().unwrap().starting.contains(&id)
+        }),
+        "the launch did not fail on its catalog write"
+    );
+    f.fail_catalog(None);
+    let inner = f.runner.core.inner.lock().unwrap();
+    (
+        inner.jobs[&id].state,
+        inner.writer,
+        inner.reserved.contains_key(inner.jobs[&id].key()),
+    )
+}
+
+/// A failed catalog write at launch puts the job back in the queue exactly
+/// as dispatch found it: no CPUs, setup time or rotation of the attempt are
+/// left behind and its queue clock is as it was, so it runs on a later pass.
+#[test]
+fn failed_launch_catalog_write_requeues_the_job_as_dispatch_found_it() {
+    let f = SaveFixture::new("catalog_save");
+    let id = f.queued("launched", "true").job_id;
+    // The fetch started the job's queue clock; a dispatch pass leaves it
+    // alone until it starts the job.
+    let expected = dispatch_state(&f, id);
+    let (state, _, reserved) = fail_launch_catalog_write(&f, id);
+    assert_eq!(state, JobState::Queued);
+    assert!(!reserved, "the job kept its workspace reservation");
+    assert_eq!(dispatch_state(&f, id), expected, "the job was not restored");
+    f.tick_until("the job runs after the failed launch", |f| {
+        f.terminal(id).is_some()
+    });
+    assert_eq!(f.terminal(id).unwrap().outcome, Outcome::Exit { code: 0 });
+}
+
+/// The same for a warm build, which must also give back the writer slot:
+/// while it is held, no warm build is dispatched at all.
+#[test]
+fn failed_launch_catalog_write_gives_back_the_warm_build_writer() {
+    let f = SaveFixture::with("catalog_save", |config| {
+        config.disable_warm_builds = false;
+    });
+    // The default-branch fetch queues a warm build. Cancelling the job
+    // itself leaves the warm build as the only queued job.
+    let id = f.queued("launched", "true").job_id;
+    f.runner.cancel(id).unwrap();
+    let warm = {
+        let inner = f.runner.core.inner.lock().unwrap();
+        inner.jobs.values().find(|job| job.base).map(|job| job.id)
+    }
+    .expect("the default-branch fetch queued a warm build");
+    let (cpus, setup_ms, rotation, _) = dispatch_state(&f, warm);
+    let (state, writer, reserved) = fail_launch_catalog_write(&f, warm);
+    assert_eq!(state, JobState::Queued);
+    assert_eq!(writer, None, "the warm build kept the writer slot");
+    assert!(!reserved, "the warm build kept its reservation");
+    let (cpus_after, setup_after, rotation_after, _) = dispatch_state(&f, warm);
+    assert_eq!(
+        (cpus_after, setup_after, rotation_after),
+        (cpus, setup_ms, rotation)
+    );
+    f.tick_until("the warm build runs after the failed launch", |f| {
+        f.terminal(warm).is_some()
+    });
+}
+
+/// A prepare that fails after reserving its workspace (here, at a base
+/// commit the mirror does not have) releases the reservation.
+#[test]
+fn failed_prepare_releases_its_workspace_reservation() {
+    let f = SaveFixture::new("catalog_save");
+    // The mirror a prepare checks out from is filled by a fetched job.
+    f.queued("seed", "true");
+    let (request, _) = job_at(&f.fixture, "prepared", "true");
+    let mut prepare = prepare_for(&request);
+    let key = prepare.workspace_key.clone();
+    let valid = prepare.base_commit.clone();
+    prepare.base_commit = "1".repeat(40);
+    assert!(f.runner.prepare(&prepare, false).is_err());
+    assert!(
+        !Runner::occupied(&f.runner.core.inner.lock().unwrap(), &key),
+        "the failed prepare kept its workspace reserved"
+    );
+    prepare.base_commit = valid;
+    f.runner.prepare(&prepare, false).unwrap();
+}
+
+/// A withdrawal whose save fails leaves the job exactly as it was: its
+/// accrued queue wait intact and its place in the queue kept. While the
+/// save is pending, a younger job in the same workspace does not start.
+#[test]
+fn failed_withdrawal_keeps_the_queue_clock_and_the_job_s_place() {
+    let f = SaveFixture::new("record_save");
+    let (mut first, bytes) = job_at(&f.fixture, "shared", "true");
+    first.queue_wait_limit_s = 0;
+    let id = first.job_id;
+    f.fixture.submit(&f.runner, &first, &bytes);
+    let younger = f.queued("shared", "true");
+    f.fixture.clock.fetch_add(5000, Ordering::SeqCst);
+    let waited = |f: &SaveFixture| f.job(id).unwrap().queue_wait_ms(f.runner.now());
+    assert_eq!(waited(&f), 5000);
+    f.hold_save(id, Saved::Queued);
+    f.fail_save(id, Saved::Queued);
+    let (sender, outcome) = std::sync::mpsc::channel();
+    let held = f.hold_in(move |runner| sender.send(runner.withdraw(id).is_err()).unwrap());
+    let runner = f.runner.clone();
+    completes("a dispatch pass", move || runner.tick().unwrap());
+    assert!(
+        f.runner.core.inner.lock().unwrap().starting.is_empty(),
+        "a job started past the job being withdrawn"
+    );
+    drop(held);
+    assert!(outcome.recv().unwrap(), "the withdrawal did not fail");
+    assert_eq!(f.job(id).unwrap().state, JobState::Queued);
+    assert_eq!(
+        waited(&f),
+        5000,
+        "the failed withdrawal changed the queue wait"
+    );
+    f.runner.tick().unwrap();
+    assert_eq!(
+        f.runner.core.inner.lock().unwrap().starting,
+        BTreeSet::from([id]),
+        "the job lost its place to {}",
+        younger.job_id
+    );
+}
+
+/// A save that unwinds still clears the markers set around it: the
+/// admission's queue slot, the withdrawal's dispatch fence and the setup's
+/// reservation.
+#[test]
+fn unwinding_saves_release_their_markers() {
+    let f = SaveFixture::with("record_save", |config| config.max_queue_depth = 2);
+    // Admission.
+    let (admitted, _) = job_at(&f.fixture, "admitted", "true");
+    f.panic_save(admitted.job_id, Saved::Nothing);
+    let runner = f.runner.clone();
+    let admission = admitted.clone();
+    assert!(std::thread::spawn(move || runner.accept(admission))
+        .join()
+        .is_err());
+    f.runner.job_log(admitted.job_id).write.clear_poison();
+    assert!(f
+        .runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .admission_saves
+        .is_empty());
+
+    // Withdrawal.
+    let (mut withdrawn, bytes) = job_at(&f.fixture, "withdrawn", "true");
+    withdrawn.queue_wait_limit_s = 0;
+    let id = withdrawn.job_id;
+    f.fixture.submit(&f.runner, &withdrawn, &bytes);
+    f.fixture.clock.fetch_add(5000, Ordering::SeqCst);
+    f.panic_save(id, Saved::Queued);
+    let runner = f.runner.clone();
+    assert!(std::thread::spawn(move || runner.withdraw(id))
+        .join()
+        .is_err());
+    f.runner.job_log(id).write.clear_poison();
+    assert!(f
+        .runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .terminal_saves
+        .is_empty());
+    let job = f.job(id).unwrap();
+    assert_eq!(job.state, JobState::Queued);
+    assert_eq!(job.queue_wait_ms(f.runner.now()), 5000);
+
+    // Setup: the panic is on the setup thread.
+    f.panic_save(id, Saved::Queued);
+    f.runner.tick().unwrap();
+    assert!(
+        poll(Duration::from_secs(30), || {
+            let inner = f.runner.core.inner.lock().unwrap();
+            inner.starting.is_empty() && inner.reserved.is_empty()
+        }),
+        "the unwound setup kept its reservation"
+    );
+    assert_eq!(f.job(id).unwrap().setup_ms, None);
+    f.runner.job_log(id).write.clear_poison();
+    f.tick_until("the job runs once its setup can be saved", |f| {
+        f.terminal(id).is_some()
+    });
+}
+
+/// A workspace drop that finds an admission still saving its record
+/// cancels it once saved; if that save fails, nothing is left for the ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_drop_leaves_nothing_for_an_admission_whose_save_failed() {
+    let f = SaveFixture::new("record_save");
+    let (request, _) = f.fixture.run("true");
+    let id = request.job_id;
+    let key = request.workspace_key.clone();
+    f.hold_save(id, Saved::Nothing);
+    f.fail_save(id, Saved::Nothing);
+    let held = f.hold_in(move |runner| assert!(runner.accept(request).is_err()));
+    let dropping = {
+        let runner = f.runner.clone();
+        let key = key.clone();
+        tokio::spawn(async move { runner.drop_workspace(&key).await })
+    };
+    assert!(poll(Duration::from_secs(10), || f
+        .runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .dropping
+        .contains(&key)));
+    drop(held);
+    let reply = dropping.await.unwrap().unwrap();
+    assert!(!reply.cancelled_jobs.contains(&id));
+    assert!(!f.runner.has_job_record(id));
+    assert!(!f.runner.record_path(id).exists());
 }
 
 /// Ranks the call sites that hold the runner's state lock while real jobs

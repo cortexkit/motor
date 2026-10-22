@@ -808,6 +808,44 @@ fn quarantine_without_unaccounted_units_allows_unrelated_admission() {
     assert!(runner.ensure_reconciled().is_err());
 }
 
+/// A job being launched has a live unit before its record names it. While
+/// such a launch is in flight, an unmatched unit may be its own, so it does
+/// not close the admission fence; once no launch is in flight, it does.
+#[test]
+fn quarantine_does_not_fence_on_the_unit_of_a_job_being_launched() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    assert!(runner.ensure_admission_ownership().is_ok());
+    let launching = Uuid::now_v7();
+    let name = backend::host_unit_name(Uuid::now_v7());
+    state.lock().unwrap().listing = format!("{name} loaded activating start waiting\n");
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .insert(launching);
+    runner.refresh_quarantine_admission(true);
+    assert!(
+        runner.ensure_admission_ownership().is_ok(),
+        "a launching job's unit closed the admission fence"
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .remove(&launching);
+    runner.refresh_quarantine_admission(true);
+    assert!(runner
+        .ensure_admission_ownership()
+        .unwrap_err()
+        .to_string()
+        .contains(&name));
+}
+
 #[test]
 fn quarantine_unaccounted_unit_fences_until_it_exits() {
     let f = Fixture::new();
