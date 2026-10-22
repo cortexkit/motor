@@ -185,6 +185,10 @@ becomes `C:\m\Users\me\project`. The workspace, siblings and `cwd` are
 mapped the same way. Test: `every_invalid_windows_path_rule_is_refused`
 (`crates/motor-winagent/src/lib.rs`).
 
+Windows does not advertise `hello.sibling_paths`: its staging-export backend
+retains the rule that siblings share the repository root's parent directory.
+Test: `in_place_and_windows_siblings_still_require_neighbours`.
+
 4.2. The `started` record carries `path_mapping: {host_prefix: "/",
 guest_prefix: "C:\\m"}` so the caller can translate paths in output back.
 `ck-motor` forwards it unchanged. Linux jobs omit the field. Tests:

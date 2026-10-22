@@ -177,6 +177,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
         &Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started,
             default_branch_tip: false,

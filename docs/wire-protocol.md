@@ -107,6 +107,7 @@ the original bytes. Test: `hello_without_started_capability_keeps_legacy_wire_by
 | `started: true` | The client accepts `started` records (section 6). |
 | `default_branch_tip: true` | The client distinguishes the default-branch fill tip from the submitted snapshot. The runner may use a nonempty integration tip for cache fills. Test: `hello_default_branch_tip_capability_is_additive`. |
 | `gate_jobs: true` | The peer understands `run.gate_job`; see [scheduling.md](scheduling.md#queue-order). Test: `gate_capability_and_mark_are_additive_motor_only_fields`. |
+| `sibling_paths: true` | The runner mounts sibling snapshots at any authorized workspace path, not only beside the repository root. Only snapshot-mode Linux runners advertise it; absence retains the neighbour rule for Run and Prepare. Tests: `hello_sibling_paths_capability_is_additive_and_defaults_false`, `sibling_paths_capability_tracks_snapshot_mode`. |
 | `platforms: ["windows"]` | The runner serves Windows jobs; see [windows-jobs.md](windows-jobs.md). Test: `windows_hello_advertises_explicit_platforms`. |
 
 Current `ck-motor` clients report a nonempty `run.integration_tip` or

@@ -917,6 +917,18 @@ impl Motor {
                         .map(|_| false);
                 }
             };
+            if let Err(error) = snapshots.validate_sibling_paths(channel.sibling_paths) {
+                return self
+                    .refused(
+                        id,
+                        RefusalReason::WorkspaceKeyRejected,
+                        Some(snapshots.main.tree_hash.clone()),
+                        Some(error.to_string()),
+                        tx,
+                    )
+                    .await
+                    .map(|_| false);
+            }
             if !returns.return_paths.is_empty() && !channel.return_paths {
                 if self
                     .return_spill(id, "return_paths_unsupported", spill_started)
@@ -2306,6 +2318,10 @@ impl Motor {
                 return Ok(reply);
             }
         };
+        if let Err(error) = snapshots.validate_sibling_paths(channel.sibling_paths) {
+            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
+                .with_refusal_detail(bounded_detail(error.to_string())));
+        }
         let held = match self
             .have(
                 &mut channel,
@@ -2647,6 +2663,7 @@ mod delivery_tests {
                         &Frame::Hello {
                             return_paths: false,
                             return_chunked: false,
+                            sibling_paths: false,
                             protocol_version: PROTOCOL_VERSION,
                             started: false,
                             default_branch_tip: false,

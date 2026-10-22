@@ -116,6 +116,7 @@ impl Boat {
                             default_branch_tip: false,
                             return_paths: false,
                             return_chunked: false,
+                            sibling_paths: false,
                         },
                     )
                     .await

@@ -102,15 +102,15 @@ fn head_workspace_is_lru_evictable_outside_task_roots() {
 
 #[test]
 fn runner_still_rejects_strict_workspace_ancestors_and_invalid_siblings() {
-    assert!(workspace::validate("/source/repo", "/source/repo", &[]).is_ok());
-    assert!(workspace::validate("/source", "/source/repo", &[]).is_err());
+    assert!(workspace::validate("/source/repo", "/source/repo", &[], false).is_ok());
+    assert!(workspace::validate("/source", "/source/repo", &[], false).is_err());
     let sibling = SiblingSnapshot {
         canonical_path: "/source/repo".into(),
         commit: "a".repeat(40),
         tree_hash: "b".repeat(40),
         base_commit: None,
     };
-    assert!(workspace::validate("/source/repo", "/source/repo", &[sibling]).is_err());
+    assert!(workspace::validate("/source/repo", "/source/repo", &[sibling], false).is_err());
 }
 
 #[tokio::test]

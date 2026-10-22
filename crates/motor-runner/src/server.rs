@@ -442,6 +442,7 @@ async fn session(
         Frame::Hello {
             return_paths: !runner.config().windows_instance(),
             return_chunked: !runner.config().windows_instance(),
+            sibling_paths: runner.config().sibling_snapshot_mode(),
             protocol_version: PROTOCOL_VERSION,
             started: supports_started,
             default_branch_tip: supports_default_branch_tip,

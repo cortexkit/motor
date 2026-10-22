@@ -9,6 +9,232 @@
 //! paths still fences them. The Windows instance applies no sibling fence.
 use super::*;
 
+#[tokio::test]
+async fn sibling_paths_capability_tracks_snapshot_mode() {
+    for mode in ["snapshot", "in-place", "windows"] {
+        let f = Fixture::new();
+        let mut config = match mode {
+            "windows" => super::windows_instance::config(&f),
+            "snapshot" => snapshot_config(&f).0,
+            _ => f.config(),
+        };
+        config.manual_tick = true;
+        config.disable_warm_builds = true;
+        assert_eq!(config.windows_instance(), mode == "windows");
+        let runner = Runner::open_with_backend(config, Box::new(NoWindowsSetup)).unwrap();
+        let (socket, server) = listener(&f, &runner);
+        let mut stream = UnixStream::connect(&*socket).await.unwrap();
+        write_frame_async(
+            &mut stream,
+            &serde_json::from_value(
+                serde_json::json!({"type": "hello", "protocol_version": PROTOCOL_VERSION}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read_next(&mut stream).await, Frame::Hello { sibling_paths, .. } if sibling_paths == (mode == "snapshot"))
+        );
+        server.abort();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_sibling_in_another_allowed_root_is_prepared() {
+    let mut f = Fixture::new();
+    let side_root = f.scratch.join("side-checkouts");
+    f.canonical = text(&side_root.join("commons")).into();
+    let (mut config, _) = snapshot_config(&f);
+    config.owned_workspace_roots.push(side_root);
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let (run, bytes) = f.run("true");
+    f.submit(&runner, &run, &bytes);
+    let terminal = terminal(&runner, run.job_id).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 }, "{terminal:?}");
+    spawn_prepare(&runner, &prepare_for(&run))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!Path::new(&f.canonical).exists());
+    let job = runner.core.inner.lock().unwrap().jobs[&run.job_id].clone();
+    let source = job.sibling_sources.unwrap();
+    assert_eq!(source.len(), 1);
+    assert_eq!(
+        fs::read_to_string(Path::new(&source[0]).join("source")).unwrap(),
+        "first\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_sibling_path_authorization_refuses_roots_nesting_and_symlink_escape() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let (config, _) = snapshot_config(&f);
+    let roots = format!("{:?}", config.owned_workspace_roots);
+    let runner = manual_runner(config);
+    let (original, _) = f.run("true");
+    let outside = f.scratch.join("outside/commons");
+    let escape = f.scratch.join("remote/escape");
+    fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    fs::create_dir_all(escape.parent().unwrap()).unwrap();
+    symlink(outside.parent().unwrap(), &escape).unwrap();
+    for path in [outside, escape.join("commons")] {
+        let mut run = original.clone();
+        run.job_id = Uuid::now_v7();
+        run.siblings[0].canonical_path = text(&path).into();
+        assert!(matches!(
+            runner.accept(run.clone()).unwrap(),
+            Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+        ));
+        let detail = runner.core.inner.lock().unwrap().jobs[&run.job_id]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .refusal_detail
+            .clone()
+            .unwrap();
+        assert!(detail.contains(&roots), "{detail}");
+        assert!(detail.contains("outside runner-owned roots"), "{detail}");
+        let refused = runner
+            .admit_prepare(&prepare_for(&run))
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(refused.detail.unwrap().contains(&roots));
+    }
+    for path in [
+        PathBuf::from(&f.key).join("nested"),
+        PathBuf::from(&f.root).join("nested"),
+        PathBuf::from(&f.key).parent().unwrap().to_path_buf(),
+    ] {
+        let mut run = original.clone();
+        run.siblings[0].canonical_path = text(&path).into();
+        assert!(workspace::validate(
+            &run.workspace_key,
+            &run.repository_root,
+            &run.siblings,
+            true
+        )
+        .is_err());
+    }
+    let mut siblings = original.siblings.clone();
+    siblings.push(sibling(&format!("{}/nested", f.canonical), &"1".repeat(40)));
+    assert!(workspace::validate(&f.key, &f.root, &siblings, true).is_err());
+    siblings[1].canonical_path = text(&f.scratch.join("remote/another/commons")).into();
+    assert!(
+        workspace::validate(&f.key, &f.root, &siblings, true).is_err(),
+        "aliases must not collide"
+    );
+    let inside = f.scratch.join("remote/inside");
+    fs::create_dir_all(&f.key).unwrap();
+    symlink(&f.key, &inside).unwrap();
+    assert!(workspace::validate(
+        &f.key,
+        &f.root,
+        &[sibling(text(&inside.join("nested")), &"1".repeat(40))],
+        true,
+    )
+    .is_err());
+}
+
+#[test]
+fn in_place_and_windows_siblings_still_require_neighbours() {
+    let f = Fixture::new();
+    let (mut run, _) = f.run("true");
+    run.siblings[0].canonical_path = text(&f.scratch.join("remote/elsewhere/commons")).into();
+    for windows in [false, true] {
+        let mut config = if windows {
+            super::windows_instance::config(&f)
+        } else {
+            f.config()
+        };
+        config.manual_tick = true;
+        config.disable_warm_builds = true;
+        assert_eq!(config.windows_instance(), windows);
+        assert!(!config.sibling_snapshot_mode());
+        run.platform = windows.then_some(Platform::Windows);
+        let runner = Runner::open_with_backend(config, Box::new(NoWindowsSetup)).unwrap();
+        assert!(matches!(
+            runner.accept(run.clone()).unwrap(),
+            Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_sibling_refuses_nesting_in_known_workspace_or_sibling_by_canonical_path() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let (config, _) = snapshot_config(&f);
+    let runner = manual_runner(config);
+    let known = f.scratch.join("remote/known");
+    let alias = f.scratch.join("remote/alias");
+    fs::create_dir_all(&known).unwrap();
+    symlink(&known, &alias).unwrap();
+    for as_sibling in [false, true] {
+        let record = if as_sibling {
+            Workspace {
+                siblings: vec![sibling(text(&known), &"1".repeat(40))],
+                ..Workspace::default()
+            }
+        } else {
+            Workspace::default()
+        };
+        let key = if as_sibling {
+            f.scratch.join("remote/other")
+        } else {
+            known.clone()
+        };
+        runner.core.inner.lock().unwrap().catalog.workspaces.clear();
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .workspaces
+            .insert(text(&key).into(), record);
+        let (mut run, _) = f.run("true");
+        run.siblings[0].canonical_path = text(&alias.join("nested")).into();
+        assert!(matches!(
+            runner.accept(run.clone()).unwrap(),
+            Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+        ));
+        assert!(runner.admit_prepare(&prepare_for(&run)).unwrap().is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+async fn isolated_snapshot_sibling_in_another_allowed_root_is_read_only_at_its_path() {
+    let mut f = Fixture::new();
+    let side_root = f.scratch.join("side-checkouts");
+    f.canonical = text(&side_root.join("commons")).into();
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    config.disable_warm_builds = true;
+    config.owned_workspace_roots.push(side_root);
+    let runner = Runner::open(config).unwrap();
+    let (run, bytes) = f.run(&format!(
+        "set -eu; cat '{0}/source'; cat ../commons/source; if printf changed > '{0}/source'; then exit 41; fi; if touch ../commons/new-file; then exit 42; fi; cat '{0}/source'", f.canonical
+    ));
+    f.submit(&runner, &run, &bytes);
+    let terminal = terminal(&runner, run.job_id).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 }, "{terminal:?}");
+    let output = job_output(&runner, run.job_id);
+    assert!(output.starts_with("first\nfirst\n"), "{output}");
+    assert!(output.ends_with("first\n"), "{output}");
+    assert!(!Path::new(&f.canonical).exists());
+    drop(runner);
+    crate::isolation::restore_runner_access(&f.scratch).unwrap();
+}
+
 /// A configuration in sibling snapshot mode that portable fixtures can run:
 /// no job isolation, no job-account ACLs, a fixed JavaScript environment, and
 /// no systemd. Returns the environment too, which is part of each snapshot's

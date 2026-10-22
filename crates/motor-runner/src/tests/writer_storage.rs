@@ -87,6 +87,7 @@ fn writer_path_exclusion_blocks_run_and_prepare_before_mutation() {
             &request.workspace_key,
             &request.repository_root,
             &request.siblings,
+            false,
         )
         .unwrap();
         assert!(Path::new(&request.cwd).starts_with(&request.workspace_key));

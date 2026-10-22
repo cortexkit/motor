@@ -708,6 +708,60 @@ fn nested_workspace_detail(
     repository: &str,
     siblings: &[SiblingSnapshot],
 ) -> Option<String> {
+    if inner.sibling_fences == crate::sibling_snapshots::SiblingFences::Legacy {
+        // Snapshot mounts must not hide a subtree of another checkout, even
+        // when an existing symlink gives the two paths different spellings.
+        let candidates = std::iter::once(workspace)
+            .chain(std::iter::once(repository))
+            .chain(siblings.iter().map(|s| s.canonical_path.as_str()));
+        let mut known: Vec<&str> = inner
+            .catalog
+            .workspaces
+            .iter()
+            .flat_map(|(key, record)| {
+                std::iter::once(key.as_str())
+                    .chain(record.siblings.iter().map(|s| s.canonical_path.as_str()))
+            })
+            .collect();
+        for request in inner
+            .jobs
+            .values()
+            .filter_map(|j| j.request.as_ref())
+            .chain(inner.admitting.values())
+        {
+            known.push(&request.workspace_key);
+            known.extend(request.siblings.iter().map(|s| s.canonical_path.as_str()));
+        }
+        for request in inner.preparing.values() {
+            known.push(&request.workspace_key);
+            known.extend(request.siblings.iter().map(|s| s.canonical_path.as_str()));
+        }
+        for candidate in candidates {
+            let path = match workspace::destination(Path::new(candidate)) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Some(format!(
+                        "cannot resolve workspace or sibling {candidate}: {error}"
+                    ))
+                }
+            };
+            for known in &known {
+                let other = match workspace::destination(Path::new(known)) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return Some(format!(
+                            "cannot resolve known workspace or sibling {known}: {error}"
+                        ))
+                    }
+                };
+                if path != other && (path.starts_with(&other) || other.starts_with(&path)) {
+                    return Some(format!(
+                        "path {candidate} overlaps runner workspace or sibling {known}; nested workspaces aren't supported"
+                    ));
+                }
+            }
+        }
+    }
     // Prepared checkouts may be owned by a job account; compare path components
     // so similarly named sibling directories remain independent workspaces.
     let mut candidates = std::iter::once(("workspace", workspace))
@@ -2720,6 +2774,7 @@ impl Runner {
             &request.workspace_key,
             &request.repository_root,
             &request.siblings,
+            self.core.config.sibling_snapshot_mode(),
         ) {
             Some((RefusalReason::WorkspaceKeyRejected, error.to_string()))
         } else if !workspace::absolute(&request.cwd)
@@ -2776,6 +2831,14 @@ impl Runner {
         if self.core.config.windows_instance() {
             return Ok(());
         }
+        if self.core.config.sibling_snapshot_mode() {
+            workspace::validate_destinations(
+                &self.core.config.owned_workspace_roots,
+                key,
+                cwd,
+                &workspace::sibling_aliases(key, siblings)?,
+            )?;
+        }
         workspace::validate_destinations(
             &self.core.config.owned_workspace_roots,
             key,
@@ -2831,6 +2894,15 @@ impl Runner {
             known.push(PathBuf::from(&request.cwd));
         }
         crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
+        if self.core.config.sibling_snapshot_mode() {
+            crate::writer::validate_paths(
+                &self.core.config,
+                workspace,
+                cwd,
+                &workspace::sibling_aliases(workspace, siblings)?,
+                &known,
+            )?;
+        }
         self.validate_destinations(workspace, cwd, siblings)
     }
 
@@ -3126,7 +3198,12 @@ impl Runner {
     /// of prepares cannot hold up transfers and job starts.
     pub(crate) fn prepare(&self, r: &Prepare, default_branch_tip: bool) -> io::Result<()> {
         self.allow_prepare()?;
-        workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings)?;
+        workspace::validate(
+            &r.workspace_key,
+            &r.repository_root,
+            &r.siblings,
+            self.core.config.sibling_snapshot_mode(),
+        )?;
         self.validate_writer_paths(&r.workspace_key, None, &r.siblings)?;
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let (recorded, prior) = {

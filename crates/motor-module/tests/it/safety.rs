@@ -326,6 +326,7 @@ fn transport_spy_bundle_base64_name_collision_is_not_environment_metadata() {
     let structured = [Frame::Hello {
         return_paths: false,
         return_chunked: false,
+        sibling_paths: false,
         protocol_version: PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -568,6 +569,7 @@ impl Connector for DisconnectDuringHave {
                     &Frame::Hello {
                         return_paths: false,
                         return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -901,6 +903,7 @@ impl Connector for FutureRecords {
                     &Frame::Hello {
                         return_paths: false,
                         return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1014,6 +1017,7 @@ impl Connector for UnknownCursorRecovery {
                     &Frame::Hello {
                         return_paths: false,
                         return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1173,6 +1177,7 @@ impl Connector for WireRecords {
                     &Frame::Hello {
                         return_paths: false,
                         return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

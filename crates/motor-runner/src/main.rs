@@ -119,7 +119,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
                     let mut socket = motor_runner::local_transport::connect(&config.socket_path()).await?;
                     write_frame_async(
                         &mut socket,
-                        &Frame::Hello { return_paths: false, return_chunked: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
+                        &Frame::Hello { return_paths: false, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
                     )
                     .await?;
                     loop {

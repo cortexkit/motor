@@ -6,6 +6,7 @@ async fn connect_tip(socket: &Path, capable: bool) -> UnixStream {
         Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: true,
