@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = ["crates/motor-winagent"]
 members = [
+    "crates/motor-macvm",
     "crates/motor-macagent",
     "crates/motor-host",
     "crates/motor-lease",
