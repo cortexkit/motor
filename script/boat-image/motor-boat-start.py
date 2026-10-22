@@ -43,6 +43,49 @@ ENDPOINT_READY = Path('/run/motor/endpoint-ready')
 STORAGE_HEALTH = Path('/run/motor-boat-storage/health.json')
 STORAGE_LOCK = Path('/run/motor-boat-storage/lock')
 STORAGE_HEALTH_TTL_NS = 5_000_000_000
+# The endpoint's configuration with vcpu_ceiling set to this sandbox's CPU count, rewritten
+# on every endpoint start. RuntimeDirectory=motor in motor-boat-host.service owns /run/motor.
+SIZED_SANDBOX = Path('/run/motor/sandbox.json')
+
+
+def sandbox_cpus():
+    """The CPUs this sandbox really has, measured on every start (what nproc prints).
+
+    The image is built once, on one Boat size, and sandboxes of other sizes are created
+    from it, so a CPU count written at build time would be wrong on every other size."""
+    return len(os.sched_getaffinity(0))
+
+
+def sized_runner_args(args, cpus):
+    """The runner's arguments with its job capacity and rustc slots set to `cpus`.
+    Any count already present (an older unit file) is replaced, never trusted."""
+    kept = []
+    words = iter(args)
+    for word in words:
+        if word in ('--max-weight', '--rustc-slots'):
+            next(words, None)
+            continue
+        kept.append(word)
+    return [*kept, '--max-weight', str(cpus), '--rustc-slots', str(cpus)]
+
+
+def sized_host_args(args, cpus, output=None):
+    """The endpoint's arguments, with `--sandbox PATH` replaced by a copy of that
+    configuration whose vcpu_ceiling (the most vCPUs it admits at once) is `cpus`."""
+    args = list(args)
+    if '--sandbox' not in args or args.index('--sandbox') + 1 >= len(args):
+        return args
+    index = args.index('--sandbox') + 1
+    config = json.loads(Path(args[index]).read_text())
+    config['vcpu_ceiling'] = cpus
+    output = SIZED_SANDBOX if output is None else output
+    temporary = output.with_suffix('.tmp')
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), 'w') as stream:
+        json.dump(config, stream, indent=2)
+        stream.write('\n')
+    temporary.replace(output)
+    args[index] = str(output)
+    return args
 
 
 def budget(available, overhead, margin=MARGIN):
@@ -357,7 +400,8 @@ def main():
         return
     if sys.argv[1:2] == ['--host-exec']:
         check_storage()
-        os.execv('/usr/local/bin/motor-host', ['/usr/local/bin/motor-host', *sys.argv[2:]])
+        args = sized_host_args(sys.argv[2:], sandbox_cpus())
+        os.execv('/usr/local/bin/motor-host', ['/usr/local/bin/motor-host', *args])
     if sys.argv[1:] == ['--wait-restored']:
         return wait_restored()
     if sys.argv[1:] == ['--watch-identity']:
@@ -382,7 +426,7 @@ def main():
     check_storage()
     baseline = json.loads(Path('/run/motor-boat-memory.json').read_text())
     available = baseline['mem_available_bytes']
-    command = ['/usr/local/bin/motor-runner', *sys.argv[1:]]
+    command = ['/usr/local/bin/motor-runner', *sized_runner_args(sys.argv[1:], sandbox_cpus())]
     child = subprocess.Popen([*command, '--boat-memory-max-bytes', str(budget(available, 0))])
     try:
         until = time.monotonic() + BOOTSTRAP_DEADLINE_S

@@ -68,6 +68,43 @@ exec, stop, resume, **delete/delete-own**, snapshot read/write, and provider usa
 access. An archive/stop-only key is not sufficient. No vault enrollment is created
 by this probe; the operator supplies their existing authorized reader.
 
+### Sandbox size (`--size`)
+
+`--size large|default|small` (default `large`) is the Boat type of **every** sandbox a
+run creates, including the `--verify-prepared-image` and `--from-prepared-image`
+clones. Boat publishes large as 8 vCPU / 16 GB, default as 4 vCPU / 8 GB and small
+as 2 vCPU / 4 GB (<https://docs.boat.dev/machines>); the probe checks that Boat
+reports the requested size, but every job limit comes from what the sandbox
+measured. A runner-host run records, per size and phase, under `sizing.<size>` in
+`results.json` and the "Sandbox sizing" table in `results.md`: usable vCPUs
+(`nproc`), the runner's `--max-weight`/`--rustc-slots`, the endpoint's
+`vcpu_ceiling`, MemTotal, MemAvailable before the runner started, and the job
+`memory.max` the runner was given. Probe jobs ask for the sandbox's measured vCPUs
+(the client's optional fifth argument); `isolation.cpu_limit` expects `cpu.max`
+for that request and `nproc` equal to the measured count. `runner_vcpus_follow_sandbox`
+fails when the runner or endpoint still uses another size's CPU count (an image
+recipe from before the start wrapper measured CPUs bakes in the build sandbox's
+count), and `runner_memory_from_measurement` requires the runner's
+`--boat-memory-max-bytes` to equal the budget measured in that sandbox. A job
+listed in `runner_host.JOB_VCPUS` with more vCPUs than the sandbox has is skipped
+and recorded under `phases[].skipped_jobs` with the reason, not failed; no current
+job has a fixed request.
+
+Every prepared image so far was saved on `large`. When Boat refuses to create a
+smaller size from such a snapshot (any 4xx except 401/404/408/429, a 403 naming
+`too_small`, or a sandbox that fails while restoring with `too_small`), the run
+records `snapshot_size_bound` with Boat's HTTP status and error text, the verdict
+outcome is `snapshot_size_bound` and the exit status is 4, instead of a generic
+failure. Qualify the prepared image on `default`:
+
+```sh
+<key reader> | python3 script/boat-probe/probe.py --key-stdin --runner-host \
+  --verify-prepared-image motor-boat-prepared-09f9365aa9a8 --size default \
+  --cargo-seed-manifest /secure-input/cargo-seed.json --cargo-seed-sha256 "$CARGO_SEED_SHA256" \
+  --acknowledge-tenant-one-private-cache \
+  --output .cortexkit/internal-docs/research/boat-default-verify --max-minutes 30
+```
+
 ### Runner host prerequisites (no installs)
 
 For the full toolchain recipe, real motor-client jobs and named-snapshot timing,
@@ -82,7 +119,7 @@ produce, then verifies invalid-token refusal and root-private tenant sockets.
   --output .cortexkit/internal-docs/research/boat-runner-prerequisites --max-minutes 5
 ```
 
-Allow about **one minute**, plus cleanup. Creates one `large`, records
+Allow about **one minute**, plus cleanup. Creates one sandbox of `--size` (default `large`), records
 `/etc/os-release`, systemd version and an actual `PrivatePIDs=yes` transient
 unit, effective SSH policy/configuration, and root open plus
 `KVM_GET_API_VERSION` on `/dev/kvm`. Nested-module flags are recorded separately;
@@ -107,7 +144,7 @@ evidence was collected, not that all runner capabilities passed.
   --output .cortexkit/internal-docs/research/boat-ssh --max-minutes 10
 ```
 
-It creates one fresh `large`, generates throwaway Ed25519 tested/witness keys in
+It creates one fresh sandbox of `--size` (default `large`), generates throwaway Ed25519 tested/witness keys in
 an owner-only temporary directory, and authorizes only their public keys through
 `POST /sandboxes/{id}/sshkey`. It records `sshEndpoint` versus `machineIp`, prefers
 the returned endpoint, and forces an IPv4 SSH connection. Known-hosts contains
@@ -166,7 +203,7 @@ python3 script/boat-probe/probe.py \
 
 ## What it measures
 
-- One fresh `large` (provider-reported 8 vCPU, 16 GB), no inherited account
+- One fresh sandbox of `--size` (default `large`, provider-reported 8 vCPU, 16 GB), no inherited account
   environment/logins (`noEnv: true`). Records raw uid, sudo, process capabilities,
   kernel, PID 1, systemctl, transient systemd unit, cgroup controllers and child
   cgroup writes; each namespace separately with noninteractive sudo if available;
@@ -186,7 +223,7 @@ python3 script/boat-probe/probe.py \
   The result flags whether at least 2 GiB really installed; no sparse-file padding
   substitutes for installed tools. This deliberately downloads rustup and official
   Rust distributions in a disposable guest, not a production image build recipe.
-- Named snapshot save through ready, stop original, create a second `large` from
+- Named snapshot save through ready, stop original, create a second sandbox of the same size from
   that snapshot, check marker/toolchain availability, then one loaded stop/resume.
   Ready timings do not imply all files hydrated; toolchain-ready timings execute
   the installed compilers after waiting for full hydration. Marker checks also
@@ -249,6 +286,7 @@ The exit status reports the measurement verdict, and cleanup separately:
 | 0 | Verdict passed (JSON `verdict.passed`); cleanup is `complete` or `purge_pending` |
 | 1 | Verdict failed: measurements incomplete, an error, or a required check did not pass (`verdict.reasons`) |
 | 3 | `cleanup_state: "incomplete"`: resources may still exist; retry `--cleanup` (checked before the verdict) |
+| 4 | `verdict.outcome: "snapshot_size_bound"`: Boat refused to create the requested `--size` from a snapshot saved on a larger size |
 
 `--cleanup` exits 0 unless cleanup is still incomplete. A Boat purge pending after
 accepted deletes never fails a run: nothing is left running and retrying cannot

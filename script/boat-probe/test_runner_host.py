@@ -348,6 +348,7 @@ class RunnerHostTests(unittest.TestCase):
     def baseline(self):
         return {"namespaces": {"net": "net:[1]", "pid": "pid:[1]"}, "systemd_version":255,
                 "job_security_reference": json.loads(Path(__file__).with_name('fixtures').joinpath('pid-namespace.json').read_text())['reference'],
+                "sizing": {"nproc": 8},
                 "memory_budget": {"mem_available_bytes": 16*(1<<30), "runner_idle_bytes": 1<<30,
                                   "margin_bytes": 512*(1<<20), "memory_max_bytes": 15569256448}}
 
@@ -365,6 +366,71 @@ class RunnerHostTests(unittest.TestCase):
         job = self.fixture()
         job["provider_environment"]["ASCII_TOKEN"] = True
         self.assertFalse(host.isolation_checks(job, baseline)["no_provider_job_environment"])
+
+    def test_cpu_limit_follows_the_measured_sandbox_and_requested_vcpus(self):
+        default = dict(self.baseline(), sizing={"nproc": 4})
+        job = self.fixture()
+        job["nproc"], job["limits"]["cpu.max"] = "4", "400000 100000"
+        self.assertTrue(host.isolation_checks(job, default)["cpu_limit"])
+        job["limits"]["cpu.max"] = "200000 100000"
+        self.assertTrue(host.isolation_checks(job, default, 2)["cpu_limit"])
+        # A job sized for large on a default sandbox, or a host CPU count never measured.
+        large_job = self.fixture()
+        self.assertFalse(host.isolation_checks(large_job, default)["cpu_limit"])
+        job["limits"]["cpu.max"] = "400000 100000"
+        self.assertFalse(host.isolation_checks(job, dict(self.baseline(), sizing={}))["cpu_limit"])
+
+    def sized_host(self, nproc, max_weight, ceiling, memory_max=6979321856, flag=6979321856):
+        return {"sizing": {"nproc": nproc, "affinity_cpus": nproc,
+                           "runner_argv": ["/usr/local/bin/motor-runner", "serve", "--max-weight", str(max_weight),
+                                           "--rustc-slots", str(max_weight), "--boat-memory-max-bytes", str(flag)],
+                           "endpoint_config_path": "/run/motor/sandbox.json", "endpoint_config": {"vcpu_ceiling": ceiling},
+                           "state_disk": {"total_bytes": 50 << 30, "free_bytes": 30 << 30}},
+                "memory_budget": {"mem_available_bytes": 7612203008, "runner_idle_bytes": 120 << 20,
+                                  "margin_bytes": 512 << 20, "memory_max_bytes": memory_max},
+                "meminfo_at_idle": "MemTotal:        8127932 kB\nMemFree:  100 kB\nMemAvailable:    7300000 kB\n"}
+
+    def test_sizing_record_reads_what_the_sandbox_measured(self):
+        record = host.sizing_record(self.sized_host(4, 4, 4), 4)
+        self.assertEqual({key: record[key] for key in ("usable_vcpus", "runner_max_weight", "runner_rustc_slots",
+                                                       "endpoint_vcpu_ceiling", "job_vcpus", "runner_memory_max_bytes",
+                                                       "runner_memory_flag_bytes", "mem_total_bytes",
+                                                       "mem_available_before_runner_bytes", "mem_available_at_idle_bytes")},
+                         {"usable_vcpus": 4, "runner_max_weight": 4, "runner_rustc_slots": 4, "endpoint_vcpu_ceiling": 4,
+                          "job_vcpus": 4, "runner_memory_max_bytes": 6979321856, "runner_memory_flag_bytes": 6979321856,
+                          "mem_total_bytes": 8127932 * 1024, "mem_available_before_runner_bytes": 7612203008,
+                          "mem_available_at_idle_bytes": 7300000 * 1024})
+        self.assertTrue(all(host.sizing_checks(record).values()))
+
+    def test_runner_sized_for_the_build_sandbox_fails_on_a_smaller_one(self):
+        # An image built on large still starting the runner or endpoint with 8 on a 4-vCPU default.
+        for runner, ceiling in ((8, 4), (4, 8), (8, 8)):
+            with self.subTest(runner=runner, ceiling=ceiling):
+                record = host.sizing_record(self.sized_host(4, runner, ceiling), 4)
+                self.assertFalse(host.sizing_checks(record)["runner_vcpus_follow_sandbox"])
+                self.assertIn("sandbox has 4 usable vCPUs", host.sizing_reason("runner_vcpus_follow_sandbox", record))
+        record = host.sizing_record(self.sized_host(4, 4, 4, flag=15569256448), 4)
+        self.assertFalse(host.sizing_checks(record)["runner_memory_from_measurement"])
+        record = host.sizing_record(self.sized_host(4, 4, 4, memory_max=16 << 30, flag=16 << 30), 4)
+        self.assertFalse(host.sizing_checks(record)["runner_memory_from_measurement"])
+
+    def test_job_asking_for_more_vcpus_than_the_size_has_is_skipped(self):
+        self.assertEqual(host.job_vcpus(None, 4, "default"), (4, None))
+        self.assertEqual(host.job_vcpus(2, 4, "default"), (2, None))
+        weight, reason = host.job_vcpus(8, 4, "default")
+        self.assertIsNone(weight)
+        self.assertEqual(reason, "skipped: the job asks for 8 vCPUs and this default sandbox has 4 usable vCPUs")
+        self.assertEqual(host.JOB_VCPUS, {})
+
+    def test_verify_prepared_refuses_a_sandbox_of_the_wrong_size(self):
+        probe = Mock()
+        probe.data = {}
+        probe.size = 'default'
+        probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
+        probe.create.return_value = ({'id':'bx_test', 'vcpu':8, 'memoryGB':16}, {})
+        runner = host.RunnerHost(probe)
+        with self.assertRaisesRegex(ValueError, 'default sizing'):
+            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
 
     def test_policy_uses_effective_sshd_values(self):
         sample = {"sshd": {"exit_code": 0, "stdout": "\n".join(k+" "+v for k, v in host.POLICY.items())}}
@@ -777,8 +843,9 @@ class RunnerHostTests(unittest.TestCase):
     def test_verify_prepared_hydrates_before_identity_phase_without_recipe_or_restart(self):
         probe = Mock()
         probe.data = {}
+        probe.size = 'default'
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
-        probe.create.return_value = ({'id':'bx_test'}, {})
+        probe.create.return_value = ({'id':'bx_test', 'vcpu':4, 'memoryGB':8}, {})
         runner = host.RunnerHost(probe)
         order = []
         probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')

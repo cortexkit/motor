@@ -592,10 +592,12 @@ UNITS = ("motor-boat-restored.service", "motor-boat-storage.service", "motor-boa
 RETIRED_UNITS = ("motor-boat-host.path",)
 
 
-def install_units(cpus, systemd=Path("/etc/systemd/system")):
+def install_units(systemd=Path("/etc/systemd/system")):
     """Write the unit files and their helper scripts. Runs only while the image
     is built; nothing rewrites units at runtime, so the snapshot holds exactly
-    what systemd verified here. The caller reloads systemd afterwards."""
+    what systemd verified here. The caller reloads systemd afterwards. The units
+    carry no CPU count: the image is built on one Boat size and cloned onto
+    others, so motor-boat-start.py measures the CPUs on every start."""
     for name in ("motor-boat-network", "motor-boat-bridge.py", "motor-boat-start.py", "motor-boat-credentials.py"):
         run("install", "-m", "0755", str(HERE / name), "/usr/local/libexec/" + name)
     run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
@@ -605,7 +607,7 @@ def install_units(cpus, systemd=Path("/etc/systemd/system")):
             subprocess.run(["systemctl", "disable", "--now", name], check=False)
             (systemd / name).unlink(missing_ok=True)
     for name in UNITS:
-        (systemd / name).write_text((HERE / name).read_text().replace("@VCPUS@", str(cpus)))
+        (systemd / name).write_text((HERE / name).read_text())
 
 
 def accounts():
@@ -620,7 +622,7 @@ def configure(pins, revision):
     accounts()
     cpus = int(run("nproc", capture=True))
     # The runner-disk mount written by state() requires motor-boat-restored.service.
-    install_units(cpus)
+    install_units()
     state(pins)
     config = Path("/etc/ssh/sshd_config").read_text()
     if not re.search(r"(?im)^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf\s*$", config):
@@ -635,6 +637,8 @@ def configure(pins, revision):
         'job_socket': '/run/motor-tenant/jobs.sock',
         'event_socket': '/run/motor-tenant/events.sock',
         'admin_socket': '/run/motor-tenant/admin.sock',
+        # The build sandbox's CPU count. motor-boat-start.py --host-exec replaces it with
+        # the running sandbox's own count on every endpoint start (/run/motor/sandbox.json).
         'vcpu_ceiling': cpus,
         'ready_marker': '/run/motor/endpoint-ready',
         'storage_health': {

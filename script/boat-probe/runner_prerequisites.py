@@ -6,6 +6,7 @@ import re
 import shlex
 import urllib.request
 from credential_audit import SOURCE
+from probe import provider_sizing_matches, sizing_error
 
 GUEST = r'''
 import fcntl, json, os, pathlib, subprocess
@@ -86,8 +87,8 @@ def run(probe):
         probe.data["boat_create_schema"] = create_schema(response.read().decode())
     probe.checkpoint()
     item, probe.data["create"] = probe.create()
-    if item.get("vcpu") != 8 or item.get("memoryGB") != 16:
-        raise ValueError("provider did not report requested large sizing")
+    if not provider_sizing_matches(item, probe.size):
+        raise ValueError(sizing_error(probe.size))
     probe.data["runner_prerequisites"] = parse(probe.execute(
         item["id"], "sudo -n -E python3 -c " + shlex.quote(GUEST), poll_seconds=120))
     probe.checkpoint()

@@ -28,11 +28,17 @@ async fn main() -> io::Result<()> {
         eprintln!("boat_probe +{:.3}s {text}", began.elapsed().as_secs_f64());
     };
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 4 {
+    if !(4..=5).contains(&args.len()) {
         return Err(io::Error::other(
-            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND",
+            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND [VCPUS]",
         ));
     }
+    // The probe passes the sandbox's measured vCPU count as the job weight, so a job fits
+    // every Boat size; without it the weight stays 8 (a whole large sandbox), as before.
+    let vcpus: u32 = match args.get(4) {
+        Some(text) => text.parse().map_err(io::Error::other)?,
+        None => 8,
+    };
     let address: std::net::SocketAddr = args[0].parse().map_err(io::Error::other)?;
     if !address.ip().is_loopback() {
         return Err(io::Error::other("probe requires a loopback SSH forward"));
@@ -44,7 +50,7 @@ async fn main() -> io::Result<()> {
     )?;
     let request = RunRequest::new(&args[1], &args[1], &args[1], &args[3])
         .with_timeout(120)
-        .with_weight_hint(8);
+        .with_weight_hint(vcpus);
     let mut stream = motor.run(request)?;
     stage(format_args!("job submitted"));
     let mut stdout = Vec::new();

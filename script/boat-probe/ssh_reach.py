@@ -13,6 +13,7 @@ import tempfile
 import time
 
 from reach import tcp_probe
+from probe import provider_sizing_matches
 
 RESTRICTION = 'restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false"'
 OTHER_PORT = 9444
@@ -396,7 +397,7 @@ class SSHReach:
         self.data["ssh_version"] = process(["ssh", "-V"])
         item, self.runner.data["create"] = self.runner.create()
         sid = item["id"]
-        self.check("create_large", item.get("vcpu") == 8 and item.get("memoryGB") == 16, item)
+        self.check("create_" + self.runner.size, provider_sizing_matches(item, self.runner.size), item)
         temporary = tempfile.TemporaryDirectory(prefix="boat-ssh-probe-")
         directory = Path(temporary.name)
         directory.chmod(0o700)
