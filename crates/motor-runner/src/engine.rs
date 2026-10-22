@@ -3318,8 +3318,10 @@ impl Runner {
         }
         Some(if inner.dropping.contains(job.key()) {
             "workspace drop"
-        } else if index.occupied(job.key()) {
+        } else if index.workspaces.contains(job.key()) {
             "workspace owner"
+        } else if index.occupied(job.key()) {
+            SIBLING_USER_WAIT
         } else if job
             .request
             .as_ref()
@@ -3366,40 +3368,58 @@ impl Runner {
             let job = &inner.jobs[&id];
             let is_workspace_head =
                 index.queued.get(job.key()).and_then(|queue| queue.first()) == Some(&id);
-            let owner = is_workspace_head
-                .then(|| index.workspace_owners.get(job.key()).copied())
-                .flatten()
-                .filter(|(owner_id, _)| *owner_id != id);
+            // The running or setup jobs that hold this job's checkout: the
+            // owner of the same workspace, and jobs that check out an
+            // overlapping path as a sibling (the same host directory).
+            let mut holders = BTreeMap::new();
+            if is_workspace_head {
+                holders.extend(index.workspace_owners.get(job.key()).copied());
+                holders.extend(index.checkout_sibling_users(job.key()));
+                holders.remove(&id);
+            }
             // A job held back only so that an earlier queued workspace job can
             // use their shared checkout first is waiting on a workspace
             // conflict, not on capacity, so its clock pauses as it would
-            // behind a running owner of its own workspace. Unlike that owner,
+            // behind a running holder of its own checkout. Unlike that holder,
             // the queued job holds no permits, so none are counted as about
             // to be freed when checking that this job would otherwise fit.
-            let held = owner.is_none()
+            let held = holders.is_empty()
                 && is_workspace_head
                 && !index.occupied(job.key())
                 && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
             let pause = job.queued_ms.is_some()
-                && owner
-                    .map(|(_, owner_weight)| owner_weight)
-                    .or(held.then_some(0))
-                    .is_some_and(|owner_weight| {
-                        let Some(request) = job.request.as_ref() else {
-                            return false;
-                        };
-                        let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
-                        !blocked_by_head
-                            && !Self::deleting(inner, job.key(), &request.siblings)
-                            && !index
-                                .siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
-                            && job.weight <= self.core.config.max_weight
-                            && index
-                                .weight
-                                .saturating_sub(owner_weight)
-                                .saturating_add(job.weight)
-                                <= self.core.config.max_weight
-                    });
+                && (!holders.is_empty() || held)
+                && job.request.as_ref().is_some_and(|request| {
+                    let holder_weight = holders
+                        .values()
+                        .fold(0u32, |sum, weight| sum.saturating_add(*weight));
+                    let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
+                    !blocked_by_head
+                        && !Self::deleting(inner, job.key(), &request.siblings)
+                        && job.weight <= self.core.config.max_weight
+                        && index
+                            .weight
+                            .saturating_sub(holder_weight)
+                            .saturating_add(job.weight)
+                            <= self.core.config.max_weight
+                        // The job's own sibling checkouts must be free too,
+                        // except where the conflict is with one of the
+                        // holders above: two repositories that name each
+                        // other as siblings block each other in both roles,
+                        // and that is still one checkout conflict. Rebuild
+                        // the index without the holders only in that case.
+                        && (!index
+                            .siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
+                            || (!holders.is_empty()
+                                && !DispatchIndex::build_without(
+                                    inner,
+                                    &holders.keys().copied().collect(),
+                                )
+                                .siblings_blocked(
+                                    &request.siblings,
+                                    &inner.catalog.sibling_commits,
+                                )))
+                });
             let initialized = job
                 .queue_wait_clock_initialized
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -3498,7 +3518,24 @@ impl Runner {
                 )
             })
             .unwrap_or_default();
-        format!("waiting_on={phase}{blocking}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
+        // The jobs holding this checkout as a sibling run in other workspaces,
+        // so name them: the holders list alone does not say which one it is.
+        let sibling_users = if phase == SIBLING_USER_WAIT {
+            let users: Vec<_> = index
+                .checkout_sibling_users(job.key())
+                .into_iter()
+                .map(|(user, weight)| {
+                    format!(
+                        "job={user} workspace={} permits={weight}",
+                        inner.jobs.get(&user).map_or("unknown", |j| j.key())
+                    )
+                })
+                .collect();
+            format!("; sibling_users=[{}]", users.join("; "))
+        } else {
+            String::new()
+        };
+        format!("waiting_on={phase}{blocking}{sibling_users}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
             job.weight, index.weight, self.core.config.max_weight, job.accepted_ms,
             holders.join("; "), reservations.join("; "), pending_ahead.join("; "))
     }
@@ -5787,6 +5824,13 @@ impl Runner {
     }
 }
 
+/// The `waiting_on` value for a job whose own workspace has no job of its own
+/// running, but whose directory jobs in other workspaces have checked out in
+/// place as a sibling. It is kept apart from `workspace owner`, which means a
+/// job in this same workspace, so a client can tell an earlier job of its own
+/// from another repository's job that uses this checkout.
+const SIBLING_USER_WAIT: &str = "sibling user of this checkout";
+
 /// Build from retained state once per dispatch, then update only the selected
 /// job's weight, checkout reservations and CPU claims after each start.
 #[derive(Default)]
@@ -5803,17 +5847,34 @@ struct DispatchIndex {
     queued: BTreeMap<String, Vec<Uuid>>,
     /// Current running/setup holder and permit weight for each exact workspace.
     workspace_owners: BTreeMap<String, (Uuid, u32)>,
+    /// Running/setup jobs that check out each sibling path, with their permit
+    /// weights. A sibling is checked out in place at its canonical path, so
+    /// these jobs also hold any workspace at an overlapping path.
+    sibling_users: BTreeMap<String, BTreeMap<Uuid, u32>>,
 }
 
 impl DispatchIndex {
     fn build(inner: &Inner) -> Self {
+        Self::build_without(inner, &BTreeSet::new())
+    }
+    /// The index as it would be if the `excluded` running or setup jobs had
+    /// finished, their setup reservations included.
+    fn build_without(inner: &Inner, excluded: &BTreeSet<Uuid>) -> Self {
         let mut index = Self::default();
+        let mut excluded_reservations = BTreeSet::new();
         for job in Runner::scheduler_jobs(inner) {
+            if excluded.contains(&job.id) {
+                if inner.starting.contains(&job.id) {
+                    excluded_reservations.insert(job.key().to_owned());
+                }
+                continue;
+            }
             if job.state == JobState::Running || inner.starting.contains(&job.id) {
                 index.weight = index.weight.saturating_add(job.weight);
                 index
                     .workspace_owners
                     .insert(job.key().to_owned(), (job.id, job.weight));
+                index.add_sibling_user(job);
             }
             if !job.base && job.pending() {
                 index.foreground_pending += 1;
@@ -5848,7 +5909,9 @@ impl DispatchIndex {
             }
         }
         for (key, reservation) in &inner.reserved {
-            index.reserve(key, &reservation.siblings);
+            if !excluded_reservations.contains(key) {
+                index.reserve(key, &reservation.siblings);
+            }
         }
         for queue in index.queued.values_mut() {
             queue.sort_by_key(|id| {
@@ -5869,8 +5932,25 @@ impl DispatchIndex {
                 .insert(sibling.commit.clone());
         }
     }
+    fn add_sibling_user(&mut self, job: &Job) {
+        for sibling in job.request.iter().flat_map(|request| &request.siblings) {
+            self.sibling_users
+                .entry(sibling.canonical_path.clone())
+                .or_default()
+                .insert(job.id, job.weight);
+        }
+    }
     fn overlap(a: &str, b: &str) -> bool {
         Path::new(a).starts_with(b) || Path::new(b).starts_with(a)
+    }
+    /// Running/setup jobs that hold `key` because one of their sibling
+    /// checkouts overlaps it, with their permit weights.
+    fn checkout_sibling_users(&self, key: &str) -> BTreeMap<Uuid, u32> {
+        self.sibling_users
+            .iter()
+            .filter(|(path, _)| Self::overlap(key, path))
+            .flat_map(|(_, users)| users.iter().map(|(id, weight)| (*id, *weight)))
+            .collect()
     }
     fn occupied(&self, key: &str) -> bool {
         self.workspaces.contains(key)
@@ -5983,6 +6063,7 @@ impl DispatchIndex {
             self.weight = self.weight.saturating_add(job.weight);
             self.workspace_owners
                 .insert(key.to_owned(), (job.id, job.weight));
+            self.add_sibling_user(job);
             let request = job.request.as_ref().unwrap();
             self.reserve(key, &request.siblings);
         }

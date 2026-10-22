@@ -1703,6 +1703,9 @@ impl Motor {
                     withdraw_sent = true;
                     queue_deadline = None;
                     let spill = spill_watch.as_ref().is_some_and(|watch| watch.ready());
+                    if let Some(watch) = spill_watch.as_mut() {
+                        watch.withdraw_sent(spill);
+                    }
                     if c.send(Frame::Withdraw { job_id: build_server_id, reason: None, spill }).await.is_err() { channel = None; }
                     None
                 },
@@ -1823,7 +1826,7 @@ impl Motor {
                             .as_ref()
                             .is_some_and(|watch| watch.withdrawn(&terminal))
                     {
-                        let wait_ms = spill_watch.as_ref().unwrap().wait_ms();
+                        let wait_ms = spill_watch.as_ref().unwrap().spill_wait_ms();
                         tracing::info!(job_id = %id, wait_ms, "capacity permit wait spilled to hosted runner");
                         let mut route = crate::HostedJobState::new(&self.config);
                         route.spill_wait_ms = Some(wait_ms);

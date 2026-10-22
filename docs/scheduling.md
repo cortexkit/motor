@@ -93,7 +93,10 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   `upload_fetch_and_setup_do_not_spend_queue_wait_budget`.
 - While the job is queued, its heartbeats carry `queue_wait_ms`. The clock
   advances for capacity and other shared scheduler blockers, but pauses while
-  the only blocker is an earlier job that owns the same workspace. If another
+  the only blocker is an earlier job that owns the same workspace, or a job in
+  another workspace that checks this workspace's directory out as a sibling
+  (`waiting_on` = `sibling user of this checkout`). It still advances if the
+  job would not fit even once that holder frees its permits. If another
   blocker appears, queue time resumes from its accumulated value. Cancellation
   still removes a queued job; the request's execution timeout still starts when
   its command starts. Job status reports the current scheduler blocker in
@@ -107,6 +110,8 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`,
   `workspace_owner_wait_does_not_spend_queue_wait_budget`,
   `queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes`,
+  `sibling_user_wait_is_named_with_its_holder_and_does_not_spend_queue_wait_budget`,
+  `sibling_user_wait_still_spends_budget_when_capacity_would_also_block`,
   `cancelled_workspace_waiter_is_removed_from_the_queue`,
   `jobs_waiting_on_a_workspace_keep_fifo_order`
   (`crates/motor-runner/src/tests.rs`),
