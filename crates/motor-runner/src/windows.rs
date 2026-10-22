@@ -37,6 +37,24 @@ pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
 
+/// Prepare a QEMU job's resources for `id` and drop them at once, as a setup
+/// attempt that fails right after `Resources::prepare` would.
+#[cfg(all(test, unix))]
+pub(crate) fn prepare_and_drop_resources(
+    config: &crate::engine::Config,
+    id: uuid::Uuid,
+    workspace: &str,
+) -> std::io::Result<()> {
+    let staging = config
+        .windows
+        .as_ref()
+        .expect("validated Windows config")
+        .layout_root
+        .join("staging")
+        .join(id.to_string());
+    vm::Resources::prepare(config, staging, id, workspace).map(drop)
+}
+
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
     prep::execute(path)
 }

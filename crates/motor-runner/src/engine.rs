@@ -55,6 +55,9 @@ pub(crate) enum CatalogWrite {
     Starting,
     /// The new file has replaced the old one; the directory is not synced.
     Renamed,
+    /// A snapshot covered by a newer rename whose directory sync failed is
+    /// about to retry that sync.
+    SyncRetry,
 }
 #[cfg(test)]
 type AccountingReportHook = Arc<dyn Fn(Uuid, &[u8]) + Send + Sync>;
@@ -593,6 +596,8 @@ struct Inner {
     /// Jobs whose unit is being spawned and is not yet recorded in the job,
     /// so the quarantine fence cannot yet match the unit to its job.
     launching: BTreeSet<Uuid>,
+    /// Queued jobs whose last start attempt failed and was undone.
+    start_retries: BTreeMap<Uuid, StartRetry>,
     last_eviction: Option<DiskEviction>,
     eviction_retry_after: BTreeMap<PathBuf, u64>,
     kill_retries: BTreeMap<Uuid, (u32, std::time::Instant)>,
@@ -655,8 +660,10 @@ struct FillInputs {
 /// Clears an in-memory marker that was set under the state lock. Its owner
 /// normally clears it with `clear`, under a state lock it already holds; if
 /// the owner returns early or unwinds first, dropping this takes the state
-/// lock and clears it. It must therefore be created after, and so dropped
-/// before, any state guard held in the same scope.
+/// lock and clears it. It must therefore never be dropped while its thread
+/// holds the state lock: create it while no state guard is held, so every
+/// guard taken later in the same scope is dropped before it, and clear it
+/// with `clear` rather than letting it drop where a guard is held.
 struct Marker<F: FnOnce(&mut Inner)> {
     runner: Runner,
     clear: Option<F>,
@@ -741,7 +748,11 @@ impl PendingStart {
     /// Undo the dispatch: release the reservation and put the job back in
     /// the queue with its CPUs, setup time, queue clock and workspace
     /// rotation as they were, giving back the writer slot of a warm build.
-    fn requeue(&mut self, inner: &mut Inner) {
+    /// `reason` is why the start failed. The job is not dispatched again
+    /// before a delay that doubles with each consecutive failure (see
+    /// `StartRetry`), so a failure that persists (a full disk, say) does not
+    /// redo the whole setup on every scheduler pass.
+    fn requeue(&mut self, inner: &mut Inner, reason: &str) {
         let Some((job, clock, rotation)) = self.undo.take() else {
             return;
         };
@@ -760,6 +771,23 @@ impl PendingStart {
         }
         clock.restore(&job);
         inner.jobs.insert(self.id, job);
+        let now = self.runner.now();
+        let retry = inner.start_retries.entry(self.id).or_default();
+        let first = retry.delay_ms == 0;
+        retry.delay_ms = if first {
+            START_RETRY_MS
+        } else {
+            retry.delay_ms.saturating_mul(2).min(START_RETRY_MAX_MS)
+        };
+        retry.not_before_ms = now.saturating_add(retry.delay_ms);
+        // One warning when the job starts failing and whenever the reason
+        // changes; repeats of the same failure are logged at debug.
+        if first || retry.reason != reason {
+            tracing::warn!(job_id = %self.id, reason, retry_in_ms = retry.delay_ms, "job start failed; the job stays queued and is retried");
+            retry.reason = reason.to_owned();
+        } else {
+            tracing::debug!(job_id = %self.id, reason, retry_in_ms = retry.delay_ms, "job start failed again");
+        }
     }
     /// The start is settled; there is nothing left to undo.
     fn settled(&mut self) {
@@ -778,21 +806,59 @@ impl Drop for PendingStart {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Only a job still waiting for its start is put back. Once its unit
-        // may have been spawned (`launching`), requeuing it could run it
-        // twice, so its reservation is kept instead.
+        if !inner.starting.contains(&self.id) {
+            return;
+        }
+        // Once its unit may have been spawned (`launching`), requeuing the
+        // job could run it twice, so its reservation is kept instead.
         if inner.launching.contains(&self.id) {
             tracing::error!(job_id = %self.id, "job start unwound during launch; its reservation is kept");
-        } else if inner.starting.contains(&self.id)
-            && inner
-                .jobs
-                .get(&self.id)
-                .is_some_and(|job| job.state == JobState::Queued)
+            return;
+        }
+        if inner
+            .jobs
+            .get(&self.id)
+            .is_some_and(|job| job.state == JobState::Queued)
         {
-            tracing::error!(job_id = %self.id, "job start unwound; the job is queued again");
-            self.requeue(&mut inner);
+            self.requeue(&mut inner, "job start unwound");
+            return;
+        }
+        // Cancelled or withdrawn while being set up (its terminal is saved),
+        // then the setup unwound: there is nothing to requeue, but its
+        // reservation goes, as when a launch finds the job ended.
+        tracing::error!(job_id = %self.id, "job start unwound after the job ended; its reservation is released");
+        inner.starting.remove(&self.id);
+        inner.reserved.remove(&self.workspace);
+        let request = self.undo.take().and_then(|(job, ..)| job.request);
+        if let (true, Some(request)) = (self.base, request) {
+            if let Err(error) = runner.finish_base(&mut inner, &request, false, None) {
+                tracing::error!(job_id = %self.id, %error, "warm build bookkeeping failed");
+            }
         }
     }
+}
+
+/// The first delay before a job whose start failed is dispatched again; it
+/// doubles with each consecutive failure up to `START_RETRY_MAX_MS`.
+const START_RETRY_MS: u64 = 1000;
+const START_RETRY_MAX_MS: u64 = 60_000;
+
+/// Retry state of a queued job whose last start attempt failed.
+#[derive(Default)]
+struct StartRetry {
+    /// Runner clock time before which dispatch does not start the job.
+    not_before_ms: u64,
+    delay_ms: u64,
+    reason: String,
+}
+
+/// How far catalog writes got, by snapshot generation.
+#[derive(Default)]
+struct CatalogWritten {
+    /// The newest snapshot renamed into place: the bytes the path holds.
+    renamed: u64,
+    /// The newest snapshot known durable (its directory synced too).
+    synced: u64,
 }
 
 /// The catalog as serialized under the state lock, for `Runner::write_catalog`
@@ -840,10 +906,10 @@ struct Core {
     /// state lock (see `Runner::catalog_snapshot`).
     catalog_generation: std::sync::atomic::AtomicU64,
     /// Held while a catalog snapshot is written, so writes never overlap
-    /// (they share one temporary file); holds the generation last written.
-    /// The state lock may be held when taking this lock, but must never be
-    /// taken while holding it.
-    catalog_written: Mutex<u64>,
+    /// (they share one temporary file); records how far writes got. The
+    /// state lock may be held when taking this lock, but must never be taken
+    /// while holding it.
+    catalog_written: Mutex<CatalogWritten>,
     health: Mutex<health::Health>,
     repository_usage: Mutex<health::RepositoryUsage>,
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
@@ -900,19 +966,44 @@ fn delete_retired_chunks(paths: Vec<PathBuf>) {
 }
 
 impl JobLog {
+    /// Take `write`. Neither `write` nor `signalling` guards data of its
+    /// own: a job's state lives in its record and under the state lock. So
+    /// a panic while one was held (for instance during a record save)
+    /// leaves nothing behind it inconsistent, and a poisoned lock is taken
+    /// like a healthy one. Without that, every later step for the job
+    /// (cancel, withdraw, setup, finish) would panic too.
+    fn lock_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// `lock_write` without waiting: `None` while another holder has it.
+    fn try_lock_write(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.write.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+    /// Take `signalling`, recovering from poison as `lock_write` does.
+    fn lock_signalling(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.signalling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     /// Take `write` for a cancel. Output commits that have not started yet
     /// wait until this cancel holds the lock; one already committing
     /// finishes first.
     fn write_ahead_of_output(&self) -> std::sync::MutexGuard<'_, ()> {
         *self.cancels_waiting.lock().unwrap() += 1;
-        let write = self.write.lock();
+        let write = self.lock_write();
         let mut waiting = self.cancels_waiting.lock().unwrap();
         *waiting -= 1;
         if *waiting == 0 {
             self.cancels_admitted.notify_all();
         }
         drop(waiting);
-        write.unwrap()
+        write
     }
     /// Take `write` for an output commit, after every waiting cancel.
     fn write_for_output(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -921,7 +1012,7 @@ impl JobLog {
             waiting = self.cancels_admitted.wait(waiting).unwrap();
         }
         drop(waiting);
-        self.write.lock().unwrap()
+        self.lock_write()
     }
     fn lease(self: &Arc<Self>, paths: Vec<PathBuf>) -> ReplayLease {
         let mut retention = self.retention.lock().unwrap();
@@ -1553,6 +1644,7 @@ impl Runner {
                     admission_saves: BTreeMap::new(),
                     terminal_saves: BTreeSet::new(),
                     launching: BTreeSet::new(),
+                    start_retries: BTreeMap::new(),
                     evicting_dependencies: BTreeSet::new(),
                     evicting_caches: BTreeSet::new(),
                     last_eviction: None,
@@ -1574,7 +1666,7 @@ impl Runner {
                 quarantined,
                 disk: Mutex::new(()),
                 catalog_generation: std::sync::atomic::AtomicU64::new(0),
-                catalog_written: Mutex::new(0),
+                catalog_written: Mutex::new(CatalogWritten::default()),
                 health,
                 repository_usage: Mutex::new(repository_usage),
                 _lock: lock,
@@ -1673,9 +1765,8 @@ impl Runner {
                 // A job being launched has a unit it does not name yet. While
                 // as many launches are in flight as there are unmatched units,
                 // those units may be theirs: keep the previous decision and
-                // look again on the next refresh.
+                // look again on the next refresh, a second later.
                 if !unknown.is_empty() && unknown.len() <= inner.launching.len() {
-                    *probe = None;
                     return;
                 }
                 (!unknown.is_empty())
@@ -1933,7 +2024,7 @@ impl Runner {
         // state lock but with its job log lock held; taking that lock here
         // keeps this from deleting the directory during such a save.
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let mut inner = self.core.inner.lock().unwrap();
         if inner
             .jobs
@@ -1980,13 +2071,25 @@ impl Runner {
         })
     }
     /// Write a catalog snapshot (write, fsync, rename, directory fsync),
-    /// with or without the state lock held. A snapshot older than one
-    /// already written is skipped: the newer one was taken later under the
-    /// state lock, so it already holds this one's changes, and writing the
-    /// older one would undo them on disk.
+    /// with or without the state lock held, and return Ok only once a
+    /// snapshot at least this new is durable. A snapshot older than one
+    /// already renamed into place is not written: the newer one was taken
+    /// later under the state lock, so it already holds this one's changes,
+    /// and writing the older one would undo them on disk. If that newer
+    /// write's directory sync failed, this one retries the sync instead.
     fn write_catalog(&self, snapshot: CatalogSnapshot) -> io::Result<()> {
         let mut written = self.core.catalog_written.lock().unwrap();
-        if *written >= snapshot.generation {
+        if written.synced >= snapshot.generation {
+            return Ok(());
+        }
+        let path = self.core.trees.state.join("catalog.json");
+        if written.renamed >= snapshot.generation {
+            #[cfg(test)]
+            if let Some(hook) = &self.core.config.catalog_write {
+                hook(CatalogWrite::SyncRetry)?;
+            }
+            crate::filesystem::sync_directory(path.parent().unwrap())?;
+            written.synced = written.renamed;
             return Ok(());
         }
         self.long_work("catalog_save");
@@ -1996,21 +2099,23 @@ impl Runner {
         }
         let written = &mut *written;
         atomic_bytes_and(
-            &self.core.trees.state.join("catalog.json"),
+            &path,
             &snapshot.bytes,
             self.core.config.windows_instance(),
             || {
-                // Once renamed into place these bytes are on disk even if the
-                // directory sync below fails, so no older snapshot may be
-                // written over them from here on.
-                *written = snapshot.generation;
+                // Once renamed into place these bytes are what the path holds
+                // even if the directory sync below fails, so no older snapshot
+                // may be written over them from here on.
+                written.renamed = snapshot.generation;
                 #[cfg(test)]
                 if let Some(hook) = &self.core.config.catalog_write {
                     hook(CatalogWrite::Renamed)?;
                 }
                 Ok(())
             },
-        )
+        )?;
+        written.synced = snapshot.generation;
+        Ok(())
     }
     fn unit_alive(&self, process: Option<platform::ProcessIdentity>) -> io::Result<Option<bool>> {
         self.core.backend.unit_alive(&self.core.config, process)
@@ -2247,7 +2352,7 @@ impl Runner {
         // admission's record is being saved below. A duplicate Run for this
         // ID also waits here, and then finds the job.
         let log = self.job_log(request.job_id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let mut inner = self.core.inner.lock().unwrap();
         if inner.jobs.contains_key(&request.job_id)
             || inner.pending_replays.contains(&request.job_id)
@@ -2572,7 +2677,7 @@ impl Runner {
     ) -> io::Result<()> {
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let mut inner = self.core.inner.lock().unwrap();
         if let Some(job) = inner
             .jobs
@@ -2664,7 +2769,7 @@ impl Runner {
         // none of them can save a terminal between that save and its
         // publication, which would leave memory and disk disagreeing.
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let inner = self.core.inner.lock().unwrap();
         // A cancel or withdraw during the fetch already wrote the terminal.
         if !awaiting(&inner) {
@@ -2706,7 +2811,9 @@ impl Runner {
         job.start_queue_wait(queued_ms);
         inner.jobs.insert(id, job);
         let index = DispatchIndex::build(&inner);
-        self.update_queue_wait_clocks(&inner, queued_ms, &index);
+        // The clocks change at the current time, not at `queued_ms`, which
+        // was taken before the save.
+        self.update_queue_wait_clocks(&inner, self.now(), &index);
         tracing::info!(job_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "bundles fetched; job queued");
         let Some(plan) = plan else {
             return Ok(());
@@ -3322,7 +3429,7 @@ impl Runner {
                 return Ok(vec![Frame::Terminal(terminal)]);
             }
             drop(inner);
-            let _write = log.write.lock().unwrap();
+            let _write = log.lock_write();
             inner = self.core.inner.lock().unwrap();
             if inner.jobs.contains_key(&id) {
                 continue;
@@ -3551,7 +3658,7 @@ impl Runner {
                 drop(inner);
                 self.save(&updated)?;
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded");
-                let signalling = log.signalling.lock().unwrap();
+                let signalling = log.lock_signalling();
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
                 if inner.finalizing.contains(&id) {
@@ -3599,7 +3706,7 @@ impl Runner {
             let log = self.job_log(id);
             // The admission holds this lock until its job is inserted or
             // its save has failed.
-            let _write = log.write.lock().unwrap();
+            let _write = log.lock_write();
             self.core.inner.lock().unwrap().jobs.contains_key(&id)
         };
         if admitted {
@@ -3619,7 +3726,7 @@ impl Runner {
     ) -> io::Result<WithdrawOutcome> {
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let mut inner = self.core.inner.lock().unwrap();
         let now = self.now();
         let index = DispatchIndex::build(&inner);
@@ -4146,7 +4253,7 @@ impl Runner {
             let log = self.job_log(id);
             // Every writer of a finished job's record holds this lock, so the
             // record cannot change between the mark below and its save.
-            let Ok(_write) = log.write.try_lock() else {
+            let Some(_write) = log.try_lock_write() else {
                 continue;
             };
             let (job, directory) = {
@@ -4254,7 +4361,7 @@ impl Runner {
             .collect();
         for id in expired {
             let log = self.job_log(id);
-            let Ok(_write) = log.write.try_lock() else {
+            let Some(_write) = log.try_lock_write() else {
                 continue;
             };
             if log.retention.lock().unwrap().readers != 0 {
@@ -4281,6 +4388,12 @@ impl Runner {
                 }
             }
         }
+        let Inner {
+            jobs,
+            start_retries,
+            ..
+        } = &mut *inner;
+        start_retries.retain(|id, _| jobs.get(id).is_some_and(Job::pending));
         self.core.job_logs.lock().unwrap().retain(|id, log| {
             inner.jobs.contains_key(id)
                 || inner.pending_replays.contains(id)
@@ -4666,10 +4779,10 @@ impl Runner {
             let log = self.job_log(id);
             // A pending output commit owns this record. Retry next tick instead
             // of waiting for its storage while holding the shared state lock.
-            let Ok(_write) = log.write.try_lock() else {
+            let Some(_write) = log.try_lock_write() else {
                 continue;
             };
-            let _signalling = log.signalling.lock().unwrap();
+            let _signalling = log.lock_signalling();
             let mut inner = self.core.inner.lock().unwrap();
             let Some(job) = inner
                 .jobs
@@ -4766,7 +4879,7 @@ impl Runner {
         self.enforce_kills(std::time::Instant::now())?;
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
-        let now = self.now();
+        let mut now = self.now();
         if now.saturating_sub(inner.maintained_ms) >= 60_000 {
             inner.maintained_ms = now;
             drop(inner);
@@ -4783,6 +4896,8 @@ impl Runner {
             }
             self.maintenance()?;
             inner = self.core.inner.lock().unwrap();
+            // Maintenance ran without the state lock; take the time again.
+            now = self.now();
         }
         if inner.drain_deadline.is_some() {
             // Do not start queued commands during a deploy. Refuse them durably
@@ -4830,6 +4945,7 @@ impl Runner {
         let mut queued = Ok(false);
         if !desired.is_empty() {
             drop(inner);
+            self.long_work("base_plan");
             let plans: Vec<_> = desired
                 .into_iter()
                 .map(|(root, desired)| {
@@ -4838,6 +4954,9 @@ impl Runner {
                 })
                 .collect();
             inner = self.core.inner.lock().unwrap();
+            // Dispatch below changes queue clocks at the current time, not at
+            // one taken before the mirror reads.
+            now = self.now();
             if inner.drain_deadline.is_some() {
                 // A drain began meanwhile. Start nothing: the next tick
                 // refuses the queued jobs first.
@@ -4936,6 +5055,19 @@ impl Runner {
                     || index.held_by_queued_workspace(inner, job, self.core.config.max_weight)
                 {
                     // A checkout conflict cannot be resolved by idling unrelated CPUs.
+                    continue;
+                }
+                // Not yet: the job's last start failed and its retry delay
+                // has not passed, or that attempt is still being cleaned up
+                // (a Windows VM whose stop maintenance retries) and owns
+                // paths named by the job's ID, which a new attempt would
+                // reuse.
+                if inner
+                    .start_retries
+                    .get(&id)
+                    .is_some_and(|retry| now < retry.not_before_ms)
+                    || self.core.config.windows_runtime.cleanup_pending(id)
+                {
                     continue;
                 }
                 if job.weight > self.core.config.max_weight {
@@ -5088,7 +5220,7 @@ impl Runner {
     /// `PendingStart::requeue`), so a later pass can retry.
     fn persist_setup(&self, s: &Setup, pending: &mut PendingStart) -> bool {
         let log = self.job_log(s.id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let record = {
             let mut inner = self.core.inner.lock().unwrap();
             match inner.jobs.get(&s.id) {
@@ -5111,8 +5243,10 @@ impl Runner {
         let Err(error) = self.save(&record) else {
             return true;
         };
-        tracing::error!(job_id = %s.id, %error, "setup record not saved; the job stays queued");
-        pending.requeue(&mut self.core.inner.lock().unwrap());
+        pending.requeue(
+            &mut self.core.inner.lock().unwrap(),
+            &format!("setup record not saved: {error}"),
+        );
         false
     }
     /// The long part of starting a job, run without the state lock.
@@ -5189,7 +5323,7 @@ impl Runner {
     ) -> io::Result<()> {
         let id = s.id;
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let r = s.request.clone();
         let mut inner = self.core.inner.lock().unwrap();
         if s.base {
@@ -5297,7 +5431,7 @@ impl Runner {
             self.release_prepared(prepared);
             let mut inner = self.core.inner.lock().unwrap();
             inner.launching.remove(&id);
-            pending.requeue(&mut inner);
+            pending.requeue(&mut inner, &format!("catalog not saved: {error}"));
             return Err(error);
         }
         tracing::info!(job_id = %id, cache_fill = s.base, "handing materialized job to execution");
@@ -5370,6 +5504,7 @@ impl Runner {
             return self.failed_launch(id, launch.execution, error, true, "start_not_persisted");
         }
         inner.starting.remove(&id);
+        inner.start_retries.remove(&id);
         inner.jobs.insert(id, job);
         tracing::info!(job_id = %id, cache_fill = s.base, "job Started recorded");
         self.core
@@ -5820,7 +5955,7 @@ impl Runner {
         let mut finished = {
             // As in `finish_execution`: wait out a stop signalling this unit.
             let log = self.job_log(id);
-            let _signalling = log.signalling.lock().unwrap();
+            let _signalling = log.lock_signalling();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
                 return Ok(());
@@ -5851,7 +5986,7 @@ impl Runner {
         let log = self.job_log(id);
         let mut delay = Duration::from_millis(50);
         loop {
-            let write = log.write.lock().unwrap();
+            let write = log.lock_write();
             match self.save(&finished) {
                 Ok(()) => {
                     let mut inner = self.core.inner.lock().unwrap();
@@ -6007,7 +6142,7 @@ impl Runner {
     fn retry_start_refusals(&self, inner: &mut Inner) {
         inner.pending_start_refusals.retain(|id| {
             let log = self.job_log(*id);
-            let Ok(_write) = log.write.try_lock() else {
+            let Some(_write) = log.try_lock_write() else {
                 return true;
             };
             self.save(&inner.jobs[id]).is_err()
@@ -6047,7 +6182,7 @@ impl Runner {
 
     fn record_cpu_time(&self, id: Uuid, cpu_time_ns: u64) -> io::Result<()> {
         let log = self.job_log(id);
-        let _write = log.write.lock().unwrap();
+        let _write = log.lock_write();
         let mut inner = self.core.inner.lock().unwrap();
         let Some(job) = inner.jobs.get(&id) else {
             return Ok(());
@@ -6082,7 +6217,7 @@ impl Runner {
             // signalling the unit without the state lock (see
             // `JobLog::signalling`) before claiming finalization.
             let log = self.job_log(id);
-            let _signalling = log.signalling.lock().unwrap();
+            let _signalling = log.lock_signalling();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
                 return Ok(());
@@ -6234,8 +6369,10 @@ impl Runner {
             .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
         self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
+        // The last persistence error, logged at WARN only when it changes.
+        let mut failing: Option<String> = None;
         let (mut inner, success) = loop {
-            let write = log.write.lock().unwrap();
+            let write = log.lock_write();
             let mut inner = self.core.inner.lock().unwrap();
             self.finish_step(
                 id,
@@ -6350,10 +6487,19 @@ impl Runner {
                     inner.finalizing.remove(&id);
                     inner.exit_statuses.remove(&id);
                     inner.cpu_times.remove(&id);
+                    if failing.is_some() {
+                        tracing::info!(%id, "terminal persisted after failed attempts");
+                    }
                     break (inner, success);
                 }
                 Err(error) => {
-                    tracing::warn!(%id, %error, "terminal persistence failed; retrying");
+                    let message = error.to_string();
+                    if failing.as_ref() != Some(&message) {
+                        tracing::warn!(%id, %error, "terminal persistence failed; the job stays finalizing and is retried");
+                        failing = Some(message);
+                    } else {
+                        tracing::debug!(%id, %error, "terminal persistence failed again");
+                    }
                     // Backoff belongs to this job's monitor, never the scheduler
                     // or the state lock used by admission and other jobs.
                     drop(inner);

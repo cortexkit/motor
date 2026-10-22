@@ -168,11 +168,18 @@ impl Resources {
             attached: false,
             cleaned: false,
             cleanup_attempted: false,
-            cleanup_on_drop: true,
+            // Not armed until this attempt owns the paths: if the staging
+            // directory already exists, an earlier attempt for the same job
+            // is not cleaned up yet, and its overlay, socket and staging must
+            // not be deleted by this one's failure.
+            cleanup_on_drop: false,
             child: Box::new(NotBooted),
         };
         fs::create_dir(&resources.staging)
             .map_err(|error| path_error("create staging directory", &resources.staging, error))?;
+        // The staging directory is removed last when an attempt is cleaned
+        // up, so creating it proves no earlier attempt's files remain.
+        resources.cleanup_on_drop = true;
         fs::set_permissions(&resources.staging, fs::Permissions::from_mode(0o700))
             .map_err(|error| path_error("chmod staging directory", &resources.staging, error))?;
         acl(config, "u:motor-prep:rwx", &resources.staging)?;
