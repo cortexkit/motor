@@ -1830,3 +1830,81 @@ fn javascript_cache_entries_name_the_repository_that_owns_them() {
         );
     }
 }
+
+/// A sibling snapshot is built in a temporary directory but installed as jobs
+/// will see it, at the sibling's path. An absolute local dependency under
+/// that path is accepted, and a tracked absolute symlink into that path is
+/// followed inside the snapshot. The host directory at the sibling's path,
+/// which here lacks the package entirely, is never consulted.
+#[test]
+fn javascript_snapshot_local_dependencies_resolve_inside_the_snapshot() {
+    let f = Fixture::new();
+    let sibling = f.scratch.join("source/b");
+    fs::create_dir_all(&sibling).unwrap();
+    write_js_pair(&f.workspace, "install", "package-lock.json");
+    write_local_package_fixture(&f.workspace);
+    std::os::unix::fs::symlink(
+        sibling.join("vendor/fixture-dep"),
+        f.workspace.join("linked"),
+    )
+    .unwrap();
+    let manifest = serde_json::json!({"dependencies": {
+        "fixture-dep": format!("file:{}/vendor/fixture-dep", sibling.display()),
+        "linked": "file:../linked",
+    }});
+    fs::write(
+        f.workspace.join("install/package.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let mut tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
+    let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
+    let error = javascript_cache_inputs(&f.workspace, &tracked, install)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outside the repository"), "{error}");
+    tracked.logical_root = Some(sibling.clone());
+    let (inputs, has_local) = javascript_cache_inputs(&f.workspace, &tracked, install).unwrap();
+    assert!(has_local);
+    for path in [
+        "vendor/fixture-dep",
+        "vendor/fixture-dep/package.json",
+        "linked",
+    ] {
+        assert!(
+            inputs.contains(Path::new(path)),
+            "{path} missing from {inputs:?}"
+        );
+    }
+}
+
+/// Inside a snapshot, a link out of the sibling's path still escapes the
+/// repository, whether absolute or through too many `..`.
+#[test]
+fn javascript_snapshot_local_dependency_links_cannot_escape() {
+    let f = Fixture::new();
+    let sibling = f.scratch.join("source/b");
+    write_js_pair(&f.workspace, "install", "package-lock.json");
+    write_local_package_fixture(&f.workspace);
+    for (link, target) in [
+        ("absolute", f.scratch.join("outside")),
+        ("climbing", PathBuf::from("../../outside")),
+        ("sideways", sibling.join("../c/vendor/fixture-dep")),
+    ] {
+        std::os::unix::fs::symlink(&target, f.workspace.join(link)).unwrap();
+        fs::write(
+            f.workspace.join("install/package.json"),
+            format!(r#"{{"dependencies":{{"x":"file:../{link}"}}}}"#),
+        )
+        .unwrap();
+        let tree = tracked_tree(&f.workspace);
+        let mut tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
+        tracked.logical_root = Some(sibling.clone());
+        let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
+        let error = javascript_cache_inputs(&f.workspace, &tracked, install)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the repository"), "{link}: {error}");
+    }
+}

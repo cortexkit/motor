@@ -408,6 +408,12 @@ struct JavascriptTree {
     paths: Vec<PathBuf>,
     objects: BTreeMap<PathBuf, JavascriptObject>,
     manifests: BTreeMap<PathBuf, io::Result<serde_json::Value>>,
+    /// The path at which the install sees this checkout, when that is not
+    /// the checkout's own path: a sibling snapshot built in a temporary
+    /// directory is installed as it will be seen, at the sibling's path.
+    /// Local dependencies are then resolved against that path, and their
+    /// symbolic links inside the snapshot, never on the host at that path.
+    logical_root: Option<PathBuf>,
 }
 
 fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<JavascriptTree> {
@@ -478,6 +484,7 @@ fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<Javascrip
         paths,
         objects,
         manifests,
+        logical_root: None,
     })
 }
 
@@ -540,6 +547,48 @@ fn prepare_javascript_dependencies(
     let tracked = javascript_tracked_tree(workspace, tree)?;
     prepare_javascript_with(workspace, &tracked.paths, |install, command| {
         cache_javascript_install(state, repository, workspace, &tracked, install, command)
+    })
+}
+
+/// Installs the JavaScript dependencies of a sibling snapshot being built
+/// at `snapshot`, for the sibling whose canonical path is `path`. The install
+/// sees the snapshot as jobs will: each package manager runs in a helper unit
+/// that shows the snapshot at `path`, and local dependencies are checked and
+/// resolved against `path` inside the snapshot. The host checkout at `path`,
+/// which may be that repository's own workspace at another commit, is never
+/// read. The install cache is keyed by `path`, as for an in-place sibling.
+pub(crate) fn prepare_snapshot_javascript(
+    config: &crate::engine::Config,
+    path: &Path,
+    snapshot: &Path,
+    tree: &str,
+) -> io::Result<()> {
+    use crate::sibling_snapshots::helper::{self, Helper, View};
+    let state = config.state_dir();
+    let repository = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("non-UTF-8 sibling path"))?;
+    let mut tracked = javascript_tracked_tree(snapshot, tree)?;
+    tracked.logical_root = Some(path.to_path_buf());
+    let view = View::javascript(snapshot, path);
+    prepare_javascript_with(snapshot, &tracked.paths, |install, command| {
+        cache_javascript_install_via(
+            &state,
+            repository,
+            snapshot,
+            &tracked,
+            install,
+            command,
+            |command| {
+                helper::run(
+                    config,
+                    Helper::JavascriptInstall,
+                    Helper::JavascriptInstall.limit(config),
+                    command,
+                    &view,
+                )
+            },
+        )
     })
 }
 
@@ -721,11 +770,12 @@ fn javascript_local_dependency(
         ))
     };
     let target = Path::new(spec.split_once(':').expect("local dependency scheme").1);
+    let root = tracked.logical_root.as_deref().unwrap_or(workspace);
     let (base, target) = if target.is_absolute() {
         (
             Path::new(""),
             target
-                .strip_prefix(workspace)
+                .strip_prefix(root)
                 .map_err(|_| refuse("path resolves outside the repository"))?,
         )
     } else {
@@ -751,15 +801,21 @@ fn javascript_local_dependency(
     }
     // A tracked symlink must not turn an apparently local reference into an
     // unkeyed dependency outside the checkout, or into an untracked target.
-    let canonical = workspace
-        .join(&relative)
-        .canonicalize()
-        .map_err(|error| refuse(&format!("cannot resolve tracked path: {error}")))?;
-    let root = workspace.canonicalize()?;
-    let resolved = canonical
-        .strip_prefix(root)
-        .map_err(|_| refuse("path resolves outside the repository"))?
-        .to_path_buf();
+    let resolved = if let Some(logical) = &tracked.logical_root {
+        resolve_within(workspace, logical, &relative)
+            .map_err(|error| refuse(&format!("cannot resolve tracked path: {error}")))?
+            .ok_or_else(|| refuse("path resolves outside the repository"))?
+    } else {
+        let canonical = workspace
+            .join(&relative)
+            .canonicalize()
+            .map_err(|error| refuse(&format!("cannot resolve tracked path: {error}")))?;
+        let root = workspace.canonicalize()?;
+        canonical
+            .strip_prefix(root)
+            .map_err(|_| refuse("path resolves outside the repository"))?
+            .to_path_buf()
+    };
     let resolved_object = tracked
         .objects
         .get(&resolved)
@@ -770,6 +826,72 @@ fn javascript_local_dependency(
         ));
     }
     Ok(vec![relative, resolved])
+}
+
+/// Resolves the symbolic links in `relative` inside the checkout at `root`,
+/// which the install sees at `logical`, and returns the resolved path
+/// relative to the checkout, or `None` when it leads outside it. An absolute
+/// link target counts as inside only when it lies under `logical`, and is
+/// then followed inside `root`: nothing outside `root` is ever read, so a
+/// different checkout on the host at `logical` cannot change the answer.
+fn resolve_within(root: &Path, logical: &Path, relative: &Path) -> io::Result<Option<PathBuf>> {
+    use std::collections::VecDeque;
+    /// The kernel's limit on links followed in one path lookup.
+    const MAX_LINKS: usize = 40;
+    /// Queues the components of `path` ahead of the pending ones. Refuses
+    /// a path with a root, which only an absolute link target can have.
+    fn push(pending: &mut VecDeque<std::ffi::OsString>, path: &Path) -> bool {
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(name) => parts.push(name.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir => parts.push("..".into()),
+                Component::RootDir | Component::Prefix(_) => return false,
+            }
+        }
+        for part in parts.into_iter().rev() {
+            pending.push_front(part);
+        }
+        true
+    }
+    let mut pending: VecDeque<std::ffi::OsString> = VecDeque::new();
+    if !push(&mut pending, relative) {
+        return Ok(None);
+    }
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            if !resolved.pop() {
+                return Ok(None);
+            }
+            continue;
+        }
+        let candidate = root.join(&resolved).join(&part);
+        if !fs::symlink_metadata(&candidate)?.file_type().is_symlink() {
+            resolved.push(part);
+            continue;
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            return Err(io::Error::other("too many levels of symbolic links"));
+        }
+        let target = fs::read_link(&candidate)?;
+        let target = if target.is_absolute() {
+            let Ok(inside) = target.strip_prefix(logical) else {
+                return Ok(None);
+            };
+            resolved = PathBuf::new();
+            inside.to_path_buf()
+        } else {
+            target
+        };
+        if !push(&mut pending, &target) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(resolved))
 }
 
 fn javascript_cache_key(
@@ -976,6 +1098,23 @@ fn cache_javascript_install(
     install: &JavascriptInstall,
     command: &mut Command,
 ) -> io::Result<()> {
+    cache_javascript_install_via(
+        state, repository, workspace, tracked, install, command, checked,
+    )
+}
+
+/// Like `cache_javascript_install`, with `run` running the package manager
+/// when the cache has no entry, for example in a sibling snapshot helper
+/// unit.
+fn cache_javascript_install_via(
+    state: &Path,
+    repository: &str,
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+    command: &mut Command,
+    run: impl FnOnce(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
     let manager_version = javascript_version(command, command.get_program())?;
     let node_version = if javascript_manager(install.lockfile) == "bun" {
         Vec::new()
@@ -1019,11 +1158,12 @@ fn cache_javascript_install(
     File::open(&manager_cache)?
         .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
     javascript_manager_cache_command(command, manager, &manager_cache);
-    run_javascript_install(
+    run_javascript_install_via(
         &workspace.join(&install.directory),
         javascript_manager(install.lockfile),
         &install.directory.join(install.lockfile).to_string_lossy(),
         command,
+        run,
     )?;
     // A workspace install can also write node_modules inside member packages
     // (bun's isolated linker, pnpm, npm version conflicts), but a cache entry
@@ -1085,13 +1225,24 @@ fn javascript_install_wrote_member_modules(
     })
 }
 
+#[cfg(test)]
 fn run_javascript_install(
     workspace: &Path,
     manager: &str,
     lockfile: &str,
     command: &mut Command,
 ) -> io::Result<()> {
-    checked(command).map_err(|error| {
+    run_javascript_install_via(workspace, manager, lockfile, command, checked)
+}
+
+fn run_javascript_install_via(
+    workspace: &Path,
+    manager: &str,
+    lockfile: &str,
+    command: &mut Command,
+    run: impl FnOnce(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
+    run(command).map_err(|error| {
         let detail = if error.kind() == io::ErrorKind::NotFound {
             format!("{manager} not installed on the build server: {error}")
         } else {
@@ -1703,13 +1854,82 @@ fn bounded_cargo_fetch(command: &mut Command, limit: Duration) -> io::Result<()>
     )))
 }
 
+/// One trusted Cargo fetch of the prefetch, with the bound it runs under.
+#[derive(Clone, Copy, Debug)]
+enum CargoFetch {
+    /// The workspace's root graph on the build server: no bound of its own.
+    Root,
+    /// One online or offline attempt of a tenant runner's root fetch.
+    TenantAttempt(Duration),
+    /// A nested lockfile's fetch, which is skipped when it fails.
+    Nested(Duration),
+}
+
+/// Runs one fetch as a plain child of the daemon, on the host's paths.
+fn run_cargo_fetch_on_host(command: &mut Command, fetch: CargoFetch) -> io::Result<()> {
+    match fetch {
+        CargoFetch::Root => checked(command),
+        CargoFetch::TenantAttempt(limit) => cargo_fetch::bounded(command, limit),
+        CargoFetch::Nested(limit) => bounded_cargo_fetch(command, limit),
+    }
+}
+
+/// In sibling snapshot mode the prefetch runs in helper units that show each
+/// sibling's snapshot at the sibling's path, as the job will see it, rather
+/// than whatever checkout is on the host at that path.
+pub(crate) struct SnapshotPrefetch<'a> {
+    pub(crate) config: &'a crate::engine::Config,
+    /// Each sibling's snapshot directory and canonical path.
+    pub(crate) siblings: Vec<(PathBuf, PathBuf)>,
+}
+
+impl SnapshotPrefetch<'_> {
+    /// Runs one fetch in a helper unit. Its limit is the configured prefetch
+    /// limit, or the fetch's own bound when that is shorter.
+    fn run(
+        &self,
+        view: &crate::sibling_snapshots::helper::View,
+        command: &mut Command,
+        fetch: CargoFetch,
+    ) -> io::Result<()> {
+        use crate::sibling_snapshots::helper::{self, Helper};
+        let configured = Helper::CargoPrefetch.limit(self.config);
+        let limit = match fetch {
+            CargoFetch::Root => configured,
+            CargoFetch::TenantAttempt(limit) | CargoFetch::Nested(limit) => limit.min(configured),
+        };
+        helper::run(self.config, Helper::CargoPrefetch, limit, command, view)
+    }
+}
+
+#[cfg(test)]
 fn prefetch_cargo_with(
+    workspace: &Path,
+    tree: &str,
+    tenant_vm: bool,
+    nested_limit: Duration,
+    command: impl FnMut(&Path) -> io::Result<Command>,
+    skip: impl FnMut(&Path, &str),
+) -> io::Result<()> {
+    prefetch_cargo_in(
+        workspace,
+        tree,
+        tenant_vm,
+        nested_limit,
+        command,
+        skip,
+        run_cargo_fetch_on_host,
+    )
+}
+
+fn prefetch_cargo_in(
     workspace: &Path,
     tree: &str,
     tenant_vm: bool,
     nested_limit: Duration,
     mut command: impl FnMut(&Path) -> io::Result<Command>,
     mut skip: impl FnMut(&Path, &str),
+    mut run: impl FnMut(&mut Command, CargoFetch) -> io::Result<()>,
 ) -> io::Result<()> {
     // Only the root graph is an admission requirement. Experimental nested
     // crates may have stale locks or unavailable dependencies without breaking
@@ -1719,9 +1939,12 @@ fn prefetch_cargo_with(
             // The daemon alone resolves and downloads sources into persistent
             // tenant storage. A cache-only fallback can still run a warm job
             // during an outage; both attempts bound tool and cache-lock waits.
-            cargo_fetch::prepare(|| command(workspace))?;
+            cargo_fetch::prepare_via(
+                || command(workspace),
+                |command, limit| run(command, CargoFetch::TenantAttempt(limit)),
+            )?;
         } else {
-            checked(&mut command(workspace)?)?;
+            run(&mut command(workspace)?, CargoFetch::Root)?;
         }
     }
     let locks = match cargo_lockfiles(workspace, tree, &mut skip) {
@@ -1736,7 +1959,7 @@ fn prefetch_cargo_with(
     };
     for lockfile in locks {
         let fetched = command(&workspace.join(lockfile.parent().unwrap_or(Path::new(""))))
-            .and_then(|mut command| bounded_cargo_fetch(&mut command, nested_limit));
+            .and_then(|mut command| run(&mut command, CargoFetch::Nested(nested_limit)));
         if let Err(error) = fetched {
             skip(&lockfile, &error.to_string());
         }
@@ -1746,6 +1969,8 @@ fn prefetch_cargo_with(
 
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
+/// With `snapshots`, every fetch runs in a helper unit that shows the job's
+/// sibling snapshots at the siblings' paths.
 #[allow(clippy::too_many_arguments)]
 fn prefetch_cargo_dependencies(
     writer: bool,
@@ -1756,14 +1981,28 @@ fn prefetch_cargo_dependencies(
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
+    snapshots: Option<&SnapshotPrefetch<'_>>,
 ) -> io::Result<()> {
     let stage = if writer {
         "fetch integration-tip dependencies (Cargo.lock)"
     } else {
         "fetch job dependencies (Cargo.lock)"
     };
+    let view = snapshots
+        .map(|snapshots| {
+            crate::sibling_snapshots::helper::View::prefetch(workspace, &snapshots.siblings).map(
+                |view| {
+                    let mut view = view.keep(cargo, true).keep(rustup, false);
+                    for mirror in dependency_routes.values() {
+                        view = view.keep(mirror, false);
+                    }
+                    view
+                },
+            )
+        })
+        .transpose()?;
     crate::setup_log::phase("fetch cargo dependencies", || {
-        prefetch_cargo_with(
+        prefetch_cargo_in(
             workspace,
             tree,
             tenant_vm,
@@ -1784,6 +2023,10 @@ fn prefetch_cargo_dependencies(
                 Ok(command)
             },
             crate::setup_log::cargo_skip,
+            |command, fetch| match (snapshots, &view) {
+                (Some(snapshots), Some(view)) => snapshots.run(view, command, fetch),
+                _ => run_cargo_fetch_on_host(command, fetch),
+            },
         )
     })
     .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
@@ -1858,9 +2101,12 @@ impl Sandbox {
             &workspace.to_string_lossy(),
             false,
             true,
+            None,
         )
     }
 
+    /// `snapshot_prefetch` is given in sibling snapshot mode: the Cargo
+    /// prefetch then sees each sibling's snapshot at the sibling's path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_with_dependencies(
         id: Uuid,
@@ -1876,6 +2122,7 @@ impl Sandbox {
         repository: &str,
         tenant_vm: bool,
         shared_compile_cache: bool,
+        snapshot_prefetch: Option<&SnapshotPrefetch<'_>>,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -1892,6 +2139,7 @@ impl Sandbox {
             false,
             tenant_vm,
             shared_compile_cache,
+            snapshot_prefetch,
         )
     }
 
@@ -1922,6 +2170,7 @@ impl Sandbox {
             true,
             false,
             true,
+            None,
         )
     }
 
@@ -1941,6 +2190,7 @@ impl Sandbox {
         writer: bool,
         tenant_vm: bool,
         shared_compile_cache: bool,
+        snapshot_prefetch: Option<&SnapshotPrefetch<'_>>,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -1973,6 +2223,7 @@ impl Sandbox {
                 dependency_routes,
                 &cargo,
                 &rustup,
+                snapshot_prefetch,
             )?;
         }
         // Offline jobs have no route to package registries. Resolve only from

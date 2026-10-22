@@ -140,6 +140,13 @@ pub struct Config {
     pub owned_workspace_roots: Vec<PathBuf>,
     /// Maximum time Drop waits for existing workspace ownership to end.
     pub drop_timeout: Duration,
+    /// Time limit of one sibling snapshot helper unit running the trusted
+    /// Cargo prefetch. systemd stops the unit and its whole cgroup when it is
+    /// exceeded, and the setup fails.
+    pub snapshot_prefetch_timeout: Duration,
+    /// Time limit of one sibling snapshot helper unit running a JavaScript
+    /// install while a snapshot is created.
+    pub snapshot_javascript_timeout: Duration,
     /// Probe available bytes on the filesystem containing the supplied path.
     pub free_space_probe: FreeSpaceProbe,
     /// Linux production uses systemd services under motor-job. The portable
@@ -201,6 +208,10 @@ pub struct Config {
     /// create snapshots.
     #[cfg(test)]
     pub(crate) sibling_snapshot_access: Option<crate::sibling_snapshots::AccessHook>,
+    /// Replaces the `systemd-run` call that starts a sibling snapshot helper
+    /// unit, which needs sudo and systemd.
+    #[cfg(test)]
+    pub(crate) snapshot_helper_launcher: Option<crate::sibling_snapshots::helper::Launcher>,
     #[cfg(test)]
     pub(crate) accounting_report: Option<AccountingReportHook>,
     #[cfg(test)]
@@ -273,6 +284,11 @@ pub(crate) const REDACTED_ENV_VALUE_MIN_BYTES: usize = 8;
 /// vCPUs a background warm build claims when the host has them.
 const WARM_BUILD_VCPUS: u32 = 4;
 
+/// Default time limit of each sibling snapshot helper unit. A cold Cargo
+/// registry or JavaScript package cache can take minutes to fill; a helper
+/// still running after this is stuck.
+const DEFAULT_SNAPSHOT_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 fn refuse_before_start(
     health: &Mutex<health::Health>,
     job: &mut Job,
@@ -341,6 +357,8 @@ impl Config {
             workspace_roots: vec![PathBuf::from("/Users")],
             owned_workspace_roots: vec![PathBuf::from("/Users")],
             drop_timeout: Duration::from_secs(60),
+            snapshot_prefetch_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
+            snapshot_javascript_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
             job_network: None,
@@ -385,6 +403,8 @@ impl Config {
             in_place_siblings_override: None,
             #[cfg(test)]
             sibling_snapshot_access: None,
+            #[cfg(test)]
+            snapshot_helper_launcher: None,
             #[cfg(test)]
             accounting_report: None,
             #[cfg(test)]
@@ -1209,6 +1229,8 @@ impl Runner {
             || config.max_weight == 0
             || config.rustc_slots == 0
             || config.sccache_size_gib == 0
+            || config.snapshot_prefetch_timeout.is_zero()
+            || config.snapshot_javascript_timeout.is_zero()
             || config
                 .sccache_size_gib
                 .checked_mul(1024 * 1024 * 1024)
@@ -1354,6 +1376,12 @@ impl Runner {
             .write(true)
             .open(state.join("daemon.lock"))?;
         lock.try_lock_exclusive()?;
+        // Holding the daemon lock, this is the only runner of this instance,
+        // so any helper unit of this instance belongs to an earlier run.
+        #[cfg(any(target_os = "linux", test))]
+        if config.sibling_snapshot_mode() {
+            crate::sibling_snapshots::helper::stop_stale(&config)?;
+        }
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
             // A bad cache account must not take the foreground runner down.

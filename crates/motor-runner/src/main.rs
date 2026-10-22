@@ -365,6 +365,14 @@ fn configure_options(
                 config.free_space_eviction_bytes = Some(value.parse().map_err(io::Error::other)?)
             }
             "--workspace-root" => config.workspace_roots.push(value.into()),
+            "--snapshot-prefetch-timeout-s" => {
+                config.snapshot_prefetch_timeout =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
+            "--snapshot-javascript-timeout-s" => {
+                config.snapshot_javascript_timeout =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),

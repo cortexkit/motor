@@ -1963,6 +1963,7 @@ fn cargo_prefetch_fixture(nested: bool) {
         &BTreeMap::new(),
         &cargo,
         &rustup,
+        None,
     )
     .unwrap();
     let missing = metadata();
@@ -1981,7 +1982,7 @@ fn cargo_prefetch_fixture(nested: bool) {
     );
     let routes = BTreeMap::from([(url, mirror)]);
     prefetch_cargo_dependencies(
-        true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup,
+        true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup, None,
     )
     .unwrap();
     let ready = metadata();
@@ -2255,4 +2256,76 @@ fn tenant_job_unit_does_not_inherit_daemon_dns_or_network_authority() {
             || word.contains("JoinsNamespaceOf")
             || word.contains("CARGO_HOME=/tenant/cargo-home"))
     );
+}
+
+/// The trusted prefetch resolves a `../b/crate` path dependency from the
+/// sibling's snapshot, not from the host checkout at the sibling's path. The
+/// host checkout's crate declares a dependency that the workspace's
+/// Cargo.lock lacks, so a `--locked` fetch reading it fails; the snapshot's
+/// crate matches the lock.
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
+    let scratch = cortexkit_test_support::ScratchDir::new("snapshot-prefetch-view");
+    let mut config = crate::engine::Config::new(
+        scratch.join("runner"),
+        format!("isotest{}", &Uuid::now_v7().simple().to_string()[24..]),
+    );
+    config.isolate_jobs = true;
+    let state = config.state_dir();
+    fs::create_dir_all(&state).unwrap();
+    let workspace = scratch.join("source/a");
+    let host = scratch.join("source/b");
+    let snapshot = config.sibling_snapshots_dir().join("b/1");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nb-crate={path='../b/crate'}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.lock"),
+        "version=4\n[[package]]\nname='a'\nversion='0.1.0'\ndependencies=['b-crate']\n[[package]]\nname='b-crate'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let package = "[package]\nname='b-crate'\nversion='0.1.0'\nedition='2021'\n";
+    for (root, manifest) in [
+        (&snapshot, package.to_string()),
+        (
+            &host,
+            format!("{package}[dependencies]\nmotor_missing_probe='=0.1.0'\n"),
+        ),
+    ] {
+        fs::create_dir_all(root.join("crate/src")).unwrap();
+        fs::write(root.join("crate/src/lib.rs"), "pub fn b() {}\n").unwrap();
+        fs::write(root.join("crate/Cargo.toml"), manifest).unwrap();
+    }
+    let cargo = scratch.join("cargo-home");
+    fs::create_dir_all(&cargo).unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".rustup")
+            .into_os_string()
+    }));
+    let fetch = |snapshots: Option<&SnapshotPrefetch<'_>>| {
+        prefetch_cargo_dependencies(
+            false,
+            false,
+            &state,
+            &workspace,
+            "HEAD",
+            &BTreeMap::new(),
+            &cargo,
+            &rustup,
+            snapshots,
+        )
+    };
+    // Today's in-place prefetch reads the host checkout and fails.
+    assert!(fetch(None).is_err());
+    fetch(Some(&SnapshotPrefetch {
+        config: &config,
+        siblings: vec![(snapshot.clone(), host.clone())],
+    }))
+    .unwrap();
 }
