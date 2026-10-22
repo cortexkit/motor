@@ -19,9 +19,10 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors ten canonical files
-verbatim: the contract, `lease.json`, `boat-lease.json`, `shadow-lease.json`
-and `settled-reattach.json` at commit `e483f20`, `no-host-fits-lease.json` at
+`test-vectors/runners/`. `contracts/cloud/` mirrors eleven canonical files
+verbatim: the contract and `account-closure.json` at commit `e961a71`,
+`lease.json`, `boat-lease.json`, `shadow-lease.json` and
+`settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
 `916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
 `00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
@@ -50,6 +51,16 @@ It is the only error body with a member besides `error`. The refusal is final
 for that request body; with spill allowed and Boat on, a job that fits a Boat
 size still spills, and `max_vcpus` then counts Boat sizes too. A host with no
 recorded per-job ceiling never produces it.
+
+`account-closure.json` records a closed account. Its new lease is refused with
+the final HTTP 403 `{"error":"account_closed"}` and no `Retry-After`; a
+re-request of a job already placed or provisioning keeps its normal answer, and
+reattach, release, finish and host reports still work. A signed heartbeat whose
+snapshot has warm entries for the closed account and an open one gets exactly
+`{"ignored":[],"closed_subjects":["acct:<closed account>"]}`. Since `e961a71`
+`closed_subjects` is always present in a heartbeat reply: sorted `acct:<ULID>`
+subjects, empty when none of the host's reported tenants is closed. Closure is
+permanent.
 
 `settled-reattach.json` records a reattach for a registered-host job that its
 host already settled by usage report: HTTP 200 with a `purpose: "attach"` token

@@ -159,6 +159,10 @@ pub(crate) enum Error {
     /// succeed. Carries the broker's `max_vcpus`, the largest count it could
     /// place, when the reply included a valid one.
     NoHostFits(Option<u64>),
+    /// The broker refused a new lease with 403 `account_closed`: the hosted
+    /// account was closed for good, so no job of it may run anywhere. Final:
+    /// never retried, never sent back to the build server, never run locally.
+    AccountClosed,
     InternalFailure,
     Connect,
     Broker,
@@ -212,6 +216,7 @@ impl Error {
             Self::HostFull => "hosted_host_full",
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
             Self::NoHostFits(_) => "hosted_no_host_fits",
+            Self::AccountClosed => "hosted_account_closed",
             Self::InternalFailure => "hosted_internal_failure",
             Self::Connect => "hosted_connect_failed",
             Self::Broker => "hosted_broker_unreachable",
@@ -247,12 +252,17 @@ impl Error {
                 RefusalReason::Unreachable
             }
             Self::Platform => RefusalReason::PlatformUnsupported,
+            // RequestRejected tells the caller to avoid the request rather
+            // than repeat it, which is what a closed account needs.
+            Self::AccountClosed => RefusalReason::RequestRejected,
             _ => RefusalReason::RequestRejected,
         }
     }
     pub(crate) fn detail(self) -> String {
         if self == Self::AccountAuthRequired {
             format!("{}: a person must run `ck account login`", self.code())
+        } else if self == Self::AccountClosed {
+            format!("{}: hosted account closed", self.code())
         } else {
             self.code().into()
         }
@@ -549,6 +559,19 @@ impl Client {
             *self.broker_code.lock().unwrap() = broker_code.map(str::to_owned);
             *self.broker_failure.lock().unwrap() =
                 Some(format!("HTTP {status}, broker_code={broker_code:?}"));
+            // A closed account's new lease is the one 403 that is not an
+            // authentication failure. The contract sends it on lease creation
+            // only; anywhere else a 403 stays an authentication failure.
+            if status == 403
+                && path == "/v1/leases"
+                && code
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.as_str())
+                    == Some("account_closed")
+            {
+                return Err(Error::AccountClosed);
+            }
             if matches!(status, 401 | 403) {
                 return Err(Error::Auth);
             }
@@ -762,6 +785,9 @@ impl Client {
                         // request would be refused again. The caller decides
                         // where the job goes instead.
                         Error::NoHostFits(_) => return Err(error),
+                        // The account is closed for good; asking again is
+                        // refused the same way.
+                        Error::AccountClosed => return Err(error),
                         // A broker without capacity for a spilled job will not
                         // gain it within seconds (its Boat start cap is hourly);
                         // the build server is the better place to retry.

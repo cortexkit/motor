@@ -191,6 +191,71 @@ fn unknown_subjects_are_ignored_and_malformed_lists_yield_nothing() {
         .is_empty());
 }
 
+/// CLOUD's recorded account-closure vector, shared with motor-lease's mirror.
+pub(crate) const ACCOUNT_CLOSURE: &str =
+    include_str!("../../../motor-lease/contracts/cloud/account-closure.json");
+
+/// The broker's real heartbeat reply from the account-closure vector: of the
+/// two accounts the heartbeat reported as warm, only the closed one is listed,
+/// and it closes exactly the tenant bound to it. The open account's tenant
+/// stays open. A reply from a broker that predates closure (no
+/// `closed_subjects` member) and an empty list both close nothing.
+#[test]
+fn cloud_closure_reply_closes_the_closed_accounts_tenant_and_not_the_open_one() {
+    let v: Value = serde_json::from_str(ACCOUNT_CLOSURE).unwrap();
+    let closed_sub = format!("acct:{}", v["closed_account"].as_str().unwrap());
+    let open_sub = format!("acct:{}", v["open_account"].as_str().unwrap());
+    let template = tenants()["vm"].clone();
+    // Bind each warm VM the vector's heartbeat reported to the account its
+    // warm entry names, as provisioning would have.
+    let mut bound = std::collections::BTreeMap::new();
+    for warm in v["heartbeat"]["request"]["body"]["warm"]
+        .as_array()
+        .unwrap()
+    {
+        let sub = warm["tenant"].as_str().unwrap().to_owned();
+        let name = if sub == closed_sub {
+            "tenant-closed"
+        } else {
+            "tenant-open"
+        };
+        bound.insert(
+            warm["vm"].as_str().unwrap().to_owned(),
+            Tenant {
+                tenant: name.into(),
+                sub,
+                ..template.clone()
+            },
+        );
+    }
+    assert_eq!(
+        bound.values().map(|t| t.sub.clone()).collect::<Vec<_>>(),
+        [closed_sub.clone(), open_sub.clone()]
+    );
+    let mut h = Host::new(bound, Default::default(), Box::<MemoryJournal>::default());
+
+    let reply = &v["heartbeat"]["reply"]["body"];
+    assert_eq!(v["heartbeat"]["reply"]["status"], 200);
+    // Pre-closure brokers omit the member; current ones send an empty list.
+    for quiet in [
+        json!({"ignored": []}),
+        json!({"ignored": [], "closed_subjects": []}),
+    ] {
+        assert!(closed_subjects(&quiet).is_empty(), "{quiet}");
+    }
+    let subjects = closed_subjects(reply);
+    assert_eq!(subjects, std::slice::from_ref(&closed_sub));
+    assert!(!subjects.contains(&format!(
+        "acct:{}",
+        v["unreported_closed_account"].as_str().unwrap()
+    )));
+    assert_eq!(h.close_subjects(&subjects, MS).unwrap(), ["tenant-closed"]);
+    assert!(h.is_closed("tenant-closed"));
+    assert!(!h.is_closed("tenant-open"));
+    assert_eq!(h.snapshot.closed["tenant-closed"].sub, closed_sub);
+    assert_eq!(h.snapshot.closed.len(), 1);
+}
+
 #[test]
 fn failed_removal_backs_off_retries_and_is_logged_overdue_once_after_seven_days() {
     let mut h = host();

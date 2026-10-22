@@ -243,7 +243,7 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
     let hb = heartbeat(JobState::Started, 3000);
     assert_eq!(
         server.host_post("heartbeat", &hb, 1, now_ms()),
-        (200, json!({"ignored":[]}))
+        (200, json!({"ignored":[],"closed_subjects":[]}))
     );
     assert_eq!(
         server.host_post("heartbeat", &hb, 1, now_ms()),

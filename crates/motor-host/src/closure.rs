@@ -2,9 +2,14 @@
 //! their jobs, and once their last job has drained it has the VM helper
 //! remove the tenant (see motor-vm-helper's `removal` module).
 //!
-//! The broker's heartbeat reply may carry `closed_subjects`, the account
-//! subjects (`acct:<ULID>` or `org:<ULID>`) of closed accounts this host has
-//! reported. The host maps a subject to a tenant only through its own binding
+//! The broker's heartbeat reply carries `closed_subjects`, the account
+//! subjects (`acct:<ULID>`) of the closed accounts among the tenants this
+//! host's heartbeat reported, sorted, and an empty array when none is closed.
+//! A broker older than account closure omits the member; that reads as no
+//! closed accounts, never as a failed heartbeat. Closure is permanent, so a
+//! subject once listed is never reopened. `org:<ULID>` subjects are accepted
+//! too, matching the grammar provisioning accepts for a tenant's subject.
+//! The host maps a subject to a tenant only through its own binding
 //! map, which provisioning writes; a subject naming no tenant here is ignored.
 use crate::state::{Error, Host, LeaseState};
 use serde::{Deserialize, Serialize};

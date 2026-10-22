@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "e483f20",
+    "revision": "e961a71",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "4879abb9d7e90bb301c6e2f8abf2d37a16f127792a3065ee78eee62e39a897b7",
+      "sha256": "6b6211c80e6e2babdc8dcd4b95dc213a312d3e52e6b8bdcf8772dde6aef2985c",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "e483f20",
+      "source_commit": "e961a71",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -85,6 +85,14 @@
       "source_repository": "cortexkit-cloud",
       "source_commit": "e483f20",
       "source_path": "test-vectors/runners/shadow-lease.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/account-closure.json",
+      "sha256": "8e3ce5eae03d06e985194f02bd817b7b45a0340e65a4bda8193969cbb3b0569e",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "e961a71",
+      "source_path": "test-vectors/runners/account-closure.json",
       "canonical": true
     }
   ]

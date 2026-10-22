@@ -1,5 +1,5 @@
 //! In-memory broker state machine for tests. HTTP transport lives in the binary.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde_json::{json, Value};
@@ -29,6 +29,11 @@ pub struct Knobs {
     /// lease asking for more is answered 422 `no_host_fits` with this number
     /// as `max_vcpus`, before any reservation is made.
     pub max_vcpus: Option<u32>,
+    /// Account subjects (`acct:<ULID>`) whose accounts are closed. A new lease
+    /// for the configured subject is then refused 403 `account_closed`, while
+    /// jobs it already holds keep their normal answers; heartbeat replies list
+    /// the closed subjects among the tenants the host reports.
+    pub closed_subjects: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +255,11 @@ impl FakeBroker {
                 return BrokerReply::error(409, "job_conflict");
             }
         } else {
+            // A closed account gets no new job; one it already holds (the
+            // branch above) keeps its answer so it can run to its end.
+            if self.knobs.closed_subjects.contains(&self.config.subject) {
+                return BrokerReply::error(403, "account_closed");
+            }
             if let Some((status, code)) = &self.knobs.refusal {
                 return BrokerReply::error(*status, code);
             }
@@ -449,6 +459,24 @@ impl FakeBroker {
         {
             return BrokerReply::error(400, "bad_request");
         }
+        // The closed accounts among the tenants this heartbeat reports: each
+        // warm entry's tenant, and the owner of each running job the broker
+        // knows, whether or not that job is ignored. Sorted and unique.
+        let mut closed: BTreeSet<&String> = heartbeat
+            .warm
+            .iter()
+            .map(|vm| &vm.tenant)
+            .filter(|tenant| self.knobs.closed_subjects.contains(*tenant))
+            .collect();
+        if self.knobs.closed_subjects.contains(&self.config.subject)
+            && heartbeat
+                .running
+                .iter()
+                .any(|job| self.jobs.contains_key(&job.job_id))
+        {
+            closed.insert(&self.config.subject);
+        }
+        let closed_subjects: Vec<String> = closed.into_iter().cloned().collect();
         let mut ignored = Vec::new();
         for running in heartbeat.running {
             if host != self.config.placement.host {
@@ -471,7 +499,10 @@ impl FakeBroker {
                 None => ignored.push(running.job_id),
             }
         }
-        BrokerReply::json(200, json!({"ignored": ignored}))
+        BrokerReply::json(
+            200,
+            json!({"ignored": ignored, "closed_subjects": closed_subjects}),
+        )
     }
 
     fn usage(&mut self, host: &str, usage: Usage, now_ms: u64) -> BrokerReply {
