@@ -2,13 +2,13 @@
 //! isolated Linux jobs will mount read-only at the sibling's canonical path P.
 //! Today a sibling is checked out in place at P, which is also that
 //! repository's own main workspace, so the repository's own jobs and the jobs
-//! that use it as a sibling exclude each other. With snapshots, P is only ever
-//! a main workspace. See the design notes on sibling snapshots.
+//! that use it as a sibling exclude each other. With snapshots, isolated Linux
+//! jobs mount a read-only copy at P, and P is only ever a main workspace.
 //!
 //! This module holds the parts that change no behaviour yet: the mode
 //! predicates and the snapshot key. Nothing creates, mounts or removes
-//! snapshots while `Config::sibling_snapshot_mode` is false, and it is false on
-//! every runner built from this source.
+//! snapshots while `Config::sibling_snapshot_mode` is false, and production
+//! builds keep it false; only tests override it.
 
 use crate::engine::Config;
 use sha2::{Digest, Sha256};

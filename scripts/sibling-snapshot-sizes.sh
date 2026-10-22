@@ -3,9 +3,9 @@
 #
 # A sibling snapshot is a read-only copy of a repository checkout at one
 # commit: its working tree, its JavaScript installs and a self-contained .git,
-# but no target/ directory (see the design notes on sibling snapshots, section
-# Q4). Before the snapshot cap is chosen, the owner runs this on the build
-# server for commons, subconscious, insula and broca and records the output.
+# but no target/ directory. Before choosing how many snapshots to keep per
+# repository, run this on the build server for the repositories other jobs use
+# as siblings (commons, subconscious, insula and broca) and record the output.
 #
 # Usage: scripts/sibling-snapshot-sizes.sh <checkout>...
 #
@@ -18,8 +18,9 @@
 # under a target directory, are not listed separately.
 #
 # The report starts with the UTC date and the host name, and each checkout's
-# block names its HEAD commit, so a recorded measurement says when, where and at
-# which revision it was taken. It reads only; it never changes a checkout.
+# block names its HEAD commit (or `unknown` when git cannot resolve it), so a
+# recorded measurement says when, where and at which revision it was taken.
+# It reads only; it never changes a checkout.
 #
 # Requires GNU du (for --exclude); the build server's Linux has it.
 
