@@ -1519,7 +1519,8 @@ async fn cli_streams_both_outputs_in_order_and_exits_with_the_commands_code() {
     let mut lines = err.lines();
     let credential = lines.next().unwrap();
     assert!(credential.starts_with("ck motor run: job_id="));
-    assert!(credential.contains(" secret="));
+    assert!(credential.contains(" secret-file="));
+    assert!(!credential.contains(" secret="));
     assert_eq!(lines.collect::<Vec<_>>(), ["err1", "err2"]);
     let log = captured.text();
     let submitted = log

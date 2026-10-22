@@ -116,7 +116,7 @@ other job changes route.
 - The lease avoids no host (`avoid_host` is null) and is not retried for
   capacity: a `no_capacity` or `host_full` answer refuses at once.
 - The result returns as for any direct job: the command's exit code, with the
-  job ID and reattach secret on stderr. A lease that can't be granted or
+  job ID and secret-file path on stderr. A lease that can't be granted or
   connected is a before-start refusal, exit 200, whose detail is the hosted code
   followed by the broker's error code, for example
   `hosted_capacity: broker no_capacity`. It never falls back to the build

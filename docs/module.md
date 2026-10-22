@@ -445,10 +445,12 @@ it exits 204 and submits nothing. See
 ### Reattaching after a disconnect
 
 At submission `ck-motor` generates 32 random bytes with the OS CSPRNG, encoded
-as 64 lowercase hex characters. `run` prints one stderr line with the job ID
-and secret. Keep the secret private: possession grants attach, status and cancel for
-that job, not submission or access to any other job. For scripts, prefer a new
-file outside the checkout and captured command logs:
+as 64 lowercase hex characters. Keep the secret private: possession grants
+attach, status and cancel for that job, not submission or access to any other
+job. Without `--secret-file`, `run` saves the secret in a new file named by job
+ID under a per-user `0700` directory in ck-motor's data root, and prints only
+the job ID and file path to stderr. `attach JOB_ID` discovers that default file
+automatically. For scripts that need a caller-selected path, use:
 
 ```sh
 ck motor run --secret-file /private/job.key -- 'cargo test'
@@ -457,10 +459,12 @@ ck motor attach JOB_ID --secret-file /private/job.key --status
 ```
 
 `--secret-file` on `run` creates a new file with mode `0600`, refuses an existing
-file (including a symlink), and prints its path instead of the secret. Without
-`--secret-file`, `attach` reads one line from stdin. Never place the secret in
-argv or an environment variable; neither is an accepted input channel. Do not
-enable shell tracing while handling it. Delete the file when no longer needed.
+file (including a symlink), and prints its path instead of the secret. Default
+files are created exclusively with mode `0600`, removed when a terminal record is
+received, and swept once they exceed the 24-hour job retention. If no default
+file exists, `attach` reads one line from stdin; `--secret-file PATH` selects an
+explicit file. Never place the secret in argv or an environment variable; neither
+is an accepted input channel. Do not enable shell tracing while handling it.
 
 `attach` replays output from the start in order, then follows a still-running
 job to its terminal outcome. It has the same exit-code contract as `run`.
