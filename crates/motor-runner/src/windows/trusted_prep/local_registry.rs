@@ -20,8 +20,6 @@ const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 const ERROR_WINHTTP_HEADER_NOT_FOUND: u32 = 12150;
-const MAX_PROOF_INDEX_BYTES: usize = 64 * 1024;
-const MAX_PROOF_ARCHIVE_BYTES: usize = 1024 * 1024;
 const MAX_CRATE_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CRATE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 
@@ -106,16 +104,16 @@ fn handle(raw: HInternet, call: &str) -> io::Result<Internet> {
 
 fn valid_crate_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 fn valid_crate_version(version: &str) -> bool {
     !version.is_empty()
-        && version.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-        })
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
 }
 
 fn crates_io_index_path(name: &str) -> io::Result<String> {
@@ -175,7 +173,9 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
     let maximum = allowlisted_download_limit(host, path)
         .ok_or_else(|| invalid("local-registry download target is not allowlisted"))?;
     if size_limit == 0 || size_limit > maximum {
-        return Err(invalid("local-registry download size limit exceeds its host policy"));
+        return Err(invalid(
+            "local-registry download size limit exceeds its host policy",
+        ));
     }
     let expected_host = host;
     let user_agent = wide("MotorRunner local-registry qualification");
@@ -230,10 +230,7 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
         )
     })?;
     require_success_status(status).map_err(|error| {
-        io::Error::other(format!(
-            "{} from https://{expected_host}{path}",
-            error
-        ))
+        io::Error::other(format!("{} from https://{expected_host}{path}", error))
     })?;
 
     let mut declared_size = 0u32;
@@ -393,35 +390,6 @@ fn write_verified_archive(
     Ok(checksum)
 }
 
-fn verify_index_checksum(
-    bytes: &[u8],
-    name: &str,
-    version: &str,
-    expected_checksum: &str,
-) -> io::Result<()> {
-    let mut matching_records = 0;
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let record: Value = serde_json::from_slice(line).map_err(invalid)?;
-        if record["name"] == name && record["vers"] == version {
-            matching_records += 1;
-            if record["cksum"].as_str() != Some(expected_checksum) {
-                return Err(invalid(format!(
-                    "{name} {version} sparse-index checksum differs from Cargo.lock"
-                )));
-            }
-        }
-    }
-    if matching_records != 1 {
-        return Err(invalid(format!(
-            "expected one {name} {version} sparse-index record, found {matching_records}"
-        )));
-    }
-    Ok(())
-}
-
 fn source_config(local_registry: &Path, source_name: &str) -> String {
     let path = local_registry
         .to_string_lossy()
@@ -489,22 +457,31 @@ fn verify_locked_index_records(
     packages: &[RegistryPackage],
 ) -> io::Result<bool> {
     let mut records = BTreeMap::new();
-    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
         let record: Value = serde_json::from_slice(line).map_err(invalid)?;
         if record["name"].as_str() != Some(name) {
-            return Err(invalid(format!("sparse-index record name mismatch for {name}")));
+            return Err(invalid(format!(
+                "sparse-index record name mismatch for {name}"
+            )));
         }
         let version = record["vers"]
             .as_str()
             .ok_or_else(|| invalid(format!("sparse-index record for {name} has no version")))?;
-        let checksum = record["cksum"]
-            .as_str()
-            .ok_or_else(|| invalid(format!("sparse-index record for {name} {version} has no checksum")))?;
+        let checksum = record["cksum"].as_str().ok_or_else(|| {
+            invalid(format!(
+                "sparse-index record for {name} {version} has no checksum"
+            ))
+        })?;
         if records
             .insert(version.to_owned(), checksum.to_owned())
             .is_some_and(|previous| previous != checksum)
         {
-            return Err(invalid(format!("duplicate sparse-index version for {name} {version}")));
+            return Err(invalid(format!(
+                "duplicate sparse-index version for {name} {version}"
+            )));
         }
     }
     for package in packages {
@@ -522,19 +499,6 @@ fn verify_locked_index_records(
     Ok(true)
 }
 
-fn crates_io_config(bytes: &[u8]) -> io::Result<Value> {
-    let config: Value = serde_json::from_slice(bytes).map_err(invalid)?;
-    let download = config["dl"]
-        .as_str()
-        .ok_or_else(|| invalid("crates.io index config has no download URL"))?;
-    if !download.starts_with("https://static.crates.io/")
-        && download != "https://static.crates.io"
-    {
-        return Err(invalid("crates.io index config names a non-allowlisted download host"));
-    }
-    Ok(config)
-}
-
 fn write_report(path: &Path, report: &Value) -> io::Result<()> {
     super::system::write_diagnostic_update(path, report)
 }
@@ -544,14 +508,18 @@ fn reject_reparse_under(root: &Path, path: &Path) -> io::Result<()> {
 
     let relative = path.strip_prefix(root).map_err(invalid)?;
     let mut current = root.to_path_buf();
-    if fs::symlink_metadata(&current)
-        .is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
+    if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
     {
-        return Err(invalid(format!("reparse point in runner root: {}", current.display())));
+        return Err(invalid(format!(
+            "reparse point in runner root: {}",
+            current.display()
+        )));
     }
     for component in relative.components() {
         if !matches!(component, std::path::Component::Normal(_)) {
-            return Err(invalid("local-registry path contains a non-normal component"));
+            return Err(invalid(
+                "local-registry path contains a non-normal component",
+            ));
         }
         current.push(component);
         match fs::symlink_metadata(&current) {
@@ -590,17 +558,16 @@ fn write_new_file(root: &Path, relative: &Path, bytes: &[u8]) -> io::Result<Path
     Ok(target)
 }
 
-
-
 fn valid_crates_io_config(bytes: &[u8]) -> io::Result<()> {
     let config: Value = serde_json::from_slice(bytes).map_err(invalid)?;
     let download = config["dl"]
         .as_str()
         .ok_or_else(|| invalid("crates.io index config has no download URL"))?;
-    if !download.starts_with("https://static.crates.io/")
-        && download != "https://static.crates.io"
+    if !download.starts_with("https://static.crates.io/") && download != "https://static.crates.io"
     {
-        return Err(invalid("crates.io index config names a non-allowlisted download host"));
+        return Err(invalid(
+            "crates.io index config names a non-allowlisted download host",
+        ));
     }
     Ok(())
 }
@@ -617,10 +584,7 @@ fn write_job_cargo_config(cargo_home: &Path, has_crates_io: bool) -> io::Result<
     Ok(())
 }
 
-fn write_git_rewrites(
-    cargo_home: &Path,
-    routes: &BTreeMap<String, PathBuf>,
-) -> io::Result<()> {
+fn write_git_rewrites(cargo_home: &Path, routes: &BTreeMap<String, PathBuf>) -> io::Result<()> {
     let mut mappings = Vec::new();
     for (url, mirror) in routes {
         let parsed = url::Url::parse(url).map_err(invalid)?;
@@ -631,14 +595,21 @@ fn write_git_rewrites(
             return Err(invalid(format!("unsupported Git bundle source URL: {url}")));
         }
         let relative = mirror.strip_prefix(cargo_home).map_err(|_| {
-            invalid(format!("Git bundle path is outside Cargo home: {}", mirror.display()))
+            invalid(format!(
+                "Git bundle path is outside Cargo home: {}",
+                mirror.display()
+            ))
         })?;
-        if relative.components().next() != Some(std::path::Component::Normal("git-mirrors".as_ref()))
+        if relative.components().next()
+            != Some(std::path::Component::Normal("git-mirrors".as_ref()))
             || relative
                 .components()
                 .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
-            return Err(invalid(format!("invalid Git bundle path: {}", relative.display())));
+            return Err(invalid(format!(
+                "invalid Git bundle path: {}",
+                relative.display()
+            )));
         }
         reject_reparse_under(cargo_home, mirror)?;
         mappings.push(json!({
@@ -662,18 +633,15 @@ pub(super) struct FetchStats {
     pub archives_downloaded: Vec<String>,
     pub downloaded_bytes: u64,
     pub downloads: Vec<Value>,
-    pub downloads: Vec<Value>,
 }
 
 impl FetchStats {
-pub(super) fn total_downloads(&self) -> usize {
+    pub(super) fn total_downloads(&self) -> usize {
         usize::from(self.config_downloaded)
             + self.index_files_downloaded.len()
             + self.archives_downloaded.len()
+    }
 }
-}
-
-
 
 fn write_new_staged_file(staging: &Path, relative: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -716,7 +684,10 @@ fn publish_cached_file(
     if target.exists() && !replace {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("local-registry cache entry already exists: {}", target.display()),
+            format!(
+                "local-registry cache entry already exists: {}",
+                target.display()
+            ),
         ));
     }
     let temporary = write_new_staged_file(
@@ -805,11 +776,8 @@ pub(super) fn prepare_for_job(
         let config_bytes = if let Some(bytes) = cached_config {
             bytes
         } else {
-            let bytes = download_allowlisted(
-                "index.crates.io",
-                "/config.json",
-                MAX_CRATE_INDEX_BYTES,
-            )?;
+            let bytes =
+                download_allowlisted("index.crates.io", "/config.json", MAX_CRATE_INDEX_BYTES)?;
             valid_crates_io_config(&bytes)?;
             write_cache_file(staging, cache_root, &config_relative, &bytes)?;
             stats.config_downloaded = true;
@@ -824,12 +792,7 @@ pub(super) fn prepare_for_job(
         let job_registry = cargo_home.join("local-registry");
         reject_reparse_under(cargo_home, &job_registry)?;
         fs::create_dir_all(job_registry.join("index"))?;
-        copy_cache_file(
-            cache_root,
-            &config_relative,
-            &job_registry,
-            Path::new("index/config.json"),
-        )?;
+        write_new_file(&job_registry, Path::new("index/config.json"), &config_bytes)?;
 
         let mut by_name: BTreeMap<String, Vec<RegistryPackage>> = BTreeMap::new();
         for package in &packages {
@@ -839,8 +802,8 @@ pub(super) fn prepare_for_job(
                 .push(package.clone());
         }
         for (name, locked) in by_name {
-            let index_relative = PathBuf::from("index")
-                .join(crates_io_index_path(&name)?.trim_start_matches('/'));
+            let index_relative =
+                PathBuf::from("index").join(crates_io_index_path(&name)?.trim_start_matches('/'));
             let index_path = cache_root.join(&index_relative);
             reject_reparse_under(cache_root, &index_path)?;
             let cached_index = match fs::read(&index_path) {
@@ -857,11 +820,7 @@ pub(super) fn prepare_for_job(
                 bytes
             } else {
                 let path = crates_io_index_path(&name)?;
-                let bytes = download_allowlisted(
-                    "index.crates.io",
-                    &path,
-                    MAX_CRATE_INDEX_BYTES,
-                )?;
+                let bytes = download_allowlisted("index.crates.io", &path, MAX_CRATE_INDEX_BYTES)?;
                 if !verify_locked_index_records(&bytes, &name, &locked)? {
                     return Err(invalid(format!(
                         "crates.io index for {name} lacks a version locked by Cargo.lock"
@@ -878,8 +837,8 @@ pub(super) fn prepare_for_job(
                 }));
                 bytes
             };
-            let job_index_relative = PathBuf::from("index")
-                .join(crates_io_index_path(&name)?.trim_start_matches('/'));
+            let job_index_relative =
+                PathBuf::from("index").join(crates_io_index_path(&name)?.trim_start_matches('/'));
             write_new_file(&job_registry, &job_index_relative, &index_bytes)?;
 
             for package in locked {
@@ -919,17 +878,15 @@ pub(super) fn prepare_for_job(
                         "/crates/{}/{}-{}.crate",
                         package.name, package.name, package.version
                     );
-                    let bytes = download_allowlisted(
-                        "static.crates.io",
-                        &path,
-                        MAX_CRATE_ARCHIVE_BYTES,
-                    )?;
-                    let checksum = verify_archive_checksum(&bytes, &package.checksum).map_err(|_| {
-                        invalid(format!(
-                            "{} {} archive checksum mismatch before writing",
-                            package.name, package.version
-                        ))
-                    })?;
+                    let bytes =
+                        download_allowlisted("static.crates.io", &path, MAX_CRATE_ARCHIVE_BYTES)?;
+                    let checksum =
+                        verify_archive_checksum(&bytes, &package.checksum).map_err(|_| {
+                            invalid(format!(
+                                "{} {} archive checksum mismatch before writing",
+                                package.name, package.version
+                            ))
+                        })?;
                     write_cache_file(staging, cache_root, &archive_relative, &bytes)?;
                     write_cache_file(
                         staging,
@@ -977,7 +934,8 @@ pub(super) fn prove(
     let second_home = stage.join("fetch-temp/local-registry-second-job");
     let no_git_routes = BTreeMap::new();
     let first_stats = prepare_for_job(&proof_cache, stage, &first_home, lockfile, &no_git_routes)?;
-    let second_stats = prepare_for_job(&proof_cache, stage, &second_home, lockfile, &no_git_routes)?;
+    let second_stats =
+        prepare_for_job(&proof_cache, stage, &second_home, lockfile, &no_git_routes)?;
     let local_registry = second_home.join("local-registry");
     let index_config = fs::read(local_registry.join("index/config.json"))?;
     let index_entry = fs::read(local_registry.join("index/cf/g-/cfg-if"))?;
@@ -985,7 +943,9 @@ pub(super) fn prove(
     let archive_bytes = fs::read(&archive_path)?;
     let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
     if archive_sha256 != CFG_IF_CHECKSUM {
-        return Err(invalid("prepared local-registry archive does not match Cargo.lock"));
+        return Err(invalid(
+            "prepared local-registry archive does not match Cargo.lock",
+        ));
     }
 
     let target = stage.join("cargo-target/local-registry");
@@ -1055,7 +1015,10 @@ pub(super) fn prove(
     fs::create_dir_all(&corrupt_home)?;
     let corrupt_registry = corrupt_home.join("local-registry");
     super::copy_tree(&local_registry, &corrupt_registry)?;
-    fs::write(corrupt_registry.join("cfg-if-1.0.4.crate"), &changed_archive)?;
+    fs::write(
+        corrupt_registry.join("cfg-if-1.0.4.crate"),
+        &changed_archive,
+    )?;
     write_job_cargo_config(&corrupt_home, true)?;
     write_git_rewrites(&corrupt_home, &no_git_routes)?;
     let cargo_rejected_corrupt_archive = run_cargo(
@@ -1069,8 +1032,12 @@ pub(super) fn prove(
     );
     let cargo_checksum_text = format!(
         "{}\n{}",
-        cargo_rejected_corrupt_archive["stdout"].as_str().unwrap_or(""),
-        cargo_rejected_corrupt_archive["stderr"].as_str().unwrap_or("")
+        cargo_rejected_corrupt_archive["stdout"]
+            .as_str()
+            .unwrap_or(""),
+        cargo_rejected_corrupt_archive["stderr"]
+            .as_str()
+            .unwrap_or("")
     )
     .to_ascii_lowercase();
     let cargo_rejected_checksum = cargo_rejected_corrupt_archive["success"] == false
@@ -1130,8 +1097,10 @@ pub(super) fn prove(
             && report["lockfile_unchanged_after_fetch"] == true
             && report["lockfile_unchanged_after_build"] == true
             && report["checksum_negative_controls"]["runner_refused_before_write"] == true
-            && report["checksum_negative_controls"]["cargo_rejected_changed_archive_checksum"] == true
-            && report["network_policy_negative_controls"]["disallowed_host_refused_before_request"] == true
+            && report["checksum_negative_controls"]["cargo_rejected_changed_archive_checksum"]
+                == true
+            && report["network_policy_negative_controls"]["disallowed_host_refused_before_request"]
+                == true
             && report["network_policy_negative_controls"]["redirect_status_refused"] == true
             && report["repository_source_override_test"]["check_started"] == true
             && report["repository_source_override_test"]["lockfile_unchanged"] == true
@@ -1139,5 +1108,3 @@ pub(super) fn prove(
     write_report(report_path, &report)?;
     Ok(report)
 }
-
-

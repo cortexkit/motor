@@ -529,8 +529,8 @@ impl Command {
             if key.to_ascii_uppercase().starts_with("GIT_CONFIG_")
                 || key.eq_ignore_ascii_case("GIT_CONFIG")
                 || !forced
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(key))
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(key))
             {
                 let canonical = key.to_uppercase();
                 if request.insert(canonical, value.clone()).is_some() {
@@ -593,8 +593,7 @@ fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
     };
     let mut encoded = String::with_capacity(absolute.len());
     for byte in absolute.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
@@ -610,7 +609,8 @@ fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<
     if !manifest_metadata.is_file() || is_reparse(&manifest_metadata) {
         return Err(invalid("job Git rewrite manifest is not a regular file"));
     }
-    let manifest: GitRewriteManifest = serde_json::from_slice(&std::fs::read(&path)?).map_err(invalid)?;
+    let manifest: GitRewriteManifest = serde_json::from_slice(&std::fs::read(&path)?)
+        .map_err(|error| invalid(error.to_string()))?;
     if manifest.schema != 1 {
         return Err(invalid("unsupported job Git rewrite manifest schema"));
     }
@@ -620,29 +620,41 @@ fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<
         return Err(invalid("job Git config is not a regular file"));
     }
     let mut env = BTreeMap::from([
-        ("GIT_CONFIG_GLOBAL".to_owned(), global.to_string_lossy().into_owned()),
+        (
+            "GIT_CONFIG_GLOBAL".to_owned(),
+            global.to_string_lossy().into_owned(),
+        ),
         ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
         ("GIT_ALLOW_PROTOCOL".to_owned(), "file".to_owned()),
         ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
         ("CARGO_NET_GIT_FETCH_WITH_CLI".to_owned(), "true".to_owned()),
-        ("GIT_CONFIG_COUNT".to_owned(), manifest.routes.len().to_string()),
+        (
+            "GIT_CONFIG_COUNT".to_owned(),
+            manifest.routes.len().to_string(),
+        ),
     ]);
     for (index, route) in manifest.routes.into_iter().enumerate() {
         if !(route.url.starts_with("https://") || route.url.starts_with("http://"))
             || route.url.contains('@')
             || route.url.chars().any(char::is_control)
         {
-            return Err(invalid("job Git rewrite URL is not an allowed credential-free URL"));
+            return Err(invalid(
+                "job Git rewrite URL is not an allowed credential-free URL",
+            ));
         }
         let relative = std::path::Path::new(&route.mirror);
         if relative.is_absolute()
             || relative.components().next()
-                != Some(std::path::Component::Normal(std::ffi::OsStr::new("git-mirrors")))
+                != Some(std::path::Component::Normal(std::ffi::OsStr::new(
+                    "git-mirrors",
+                )))
             || relative
                 .components()
                 .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
-            return Err(invalid("job Git rewrite path is outside cargo-home/git-mirrors"));
+            return Err(invalid(
+                "job Git rewrite path is outside cargo-home/git-mirrors",
+            ));
         }
         let mut mirror = cargo_home.to_path_buf();
         for component in relative.components() {
@@ -1667,7 +1679,12 @@ mod tests {
         git(
             &scratch.0,
             &config,
-            &["clone", "--bare", bundle.to_str().unwrap(), mirror.to_str().unwrap()],
+            &[
+                "clone",
+                "--bare",
+                bundle.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
         );
         fs::write(cargo_home.join("gitconfig"), "").unwrap();
         fs::write(
@@ -1683,7 +1700,10 @@ mod tests {
         let env = git_rewrite_environment(&cargo_home).unwrap();
         assert_eq!(env["GIT_ALLOW_PROTOCOL"], "file");
         assert_eq!(env["GIT_CONFIG_COUNT"], "1");
-        assert_eq!(env["GIT_CONFIG_VALUE_0"], "https://example.invalid/dependency.git");
+        assert_eq!(
+            env["GIT_CONFIG_VALUE_0"],
+            "https://example.invalid/dependency.git"
+        );
         let checkout = scratch.0.join("checkout");
         let output = ProcessCommand::new("git")
             .current_dir(&scratch.0)

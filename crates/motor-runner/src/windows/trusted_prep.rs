@@ -76,8 +76,6 @@ pub(super) fn copy_routes(
     Ok(result)
 }
 
-
-
 const OFFLINE_CARGO_MANIFEST: &str = "[package]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"=1.0.4\"\n";
 const OFFLINE_CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
 
@@ -329,7 +327,7 @@ pub(super) fn prepare_local_registry(
     staging: &Path,
     lockfile: &str,
     routes: &BTreeMap<String, PathBuf>,
-) -> io::Result<local_registry::FetchStats> {
+) -> io::Result<()> {
     use fs2::FileExt;
 
     system::require_system()?;
@@ -350,7 +348,7 @@ pub(super) fn prepare_local_registry(
         bytes_downloaded = stats.downloaded_bytes,
         "prepared Windows local Cargo registry"
     );
-    Ok(stats)
+    Ok(())
 }
 
 pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
@@ -600,4 +598,3 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
     result?;
     cleanup
 }
-

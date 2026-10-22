@@ -116,13 +116,6 @@ elevated PowerShell 5.1:
 ```powershell
 $python = (Get-Command python.exe -ErrorAction Stop).Source
 $evidence = 'C:\motor-runner-evidence\offline-cargo-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-To measure the offline cache inputs Cargo needs, use the SYSTEM-only diagnostic lane.
-After installing a bundle built from the reviewed source commit, run this from
-elevated PowerShell 5.1:
-
-```powershell
-$python = (Get-Command python.exe -ErrorAction Stop).Source
-$evidence = 'C:\motor-runner-evidence\offline-cargo-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
   -Python $python -Evidence $evidence -OfflineCargoOnly
 if ($LASTEXITCODE -ne 0) { throw "Offline Cargo diagnostic failed; preserve $evidence" }

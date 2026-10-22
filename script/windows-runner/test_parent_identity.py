@@ -103,7 +103,7 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("change_time_filetime=$changeTime", helper)
         self.assertNotIn("change_time_filetime", helper.split("function Get-RunnerParentIdentity", 1)[1].split("function Assert-RunnerFileAcl", 1)[0])
         script = (HERE / "hyperv.ps1").read_text()
-        validate = script.split("    'Validate' {", 1)[1].split("    { $_ -in", 1)[0]
+        validate = script.split("    'Validate' {", 1)[1].split("    'Prepare' {", 1)[0]
         self.assertIn("Confirm-RunnerParentVerification", validate)
         self.assertNotIn("Remove-Item", validate)
 

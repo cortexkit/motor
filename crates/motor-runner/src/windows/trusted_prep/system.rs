@@ -4,18 +4,21 @@ use std::{
     io::{self, Write},
     os::windows::io::{FromRawHandle, RawHandle},
     path::Path,
-    ptr::{null, null_mut},
+    ptr::null_mut,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, LocalFree, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
-        GetTokenInformation, OpenProcessToken, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
     },
-    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GENERIC_WRITE, CREATE_ALWAYS},
-    System::Threading::GetCurrentProcess,
+    Storage::FileSystem::{
+        CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    },
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
 struct Handle(HANDLE);
@@ -94,7 +97,9 @@ pub(super) fn require_system() -> io::Result<()> {
     let user = token_user(token.0)?;
     let user = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     if sid_text(user.cast())? != "S-1-5-18" {
-        return Err(io::Error::other("SYSTEM is required for this Windows operation"));
+        return Err(io::Error::other(
+            "SYSTEM is required for this Windows operation",
+        ));
     }
     Ok(())
 }
@@ -114,7 +119,7 @@ pub(super) fn write_diagnostic_update(path: &Path, value: &Value) -> io::Result<
         return Err(io::Error::last_os_error());
     }
     let security_descriptor = Local(security_descriptor.cast());
-    let mut attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+    let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: security_descriptor.0,
         bInheritHandle: 0,
@@ -124,7 +129,7 @@ pub(super) fn write_diagnostic_update(path: &Path, value: &Value) -> io::Result<
             wide(&path.to_string_lossy()).as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ,
-            &mut attributes,
+            &attributes,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
