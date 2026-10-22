@@ -116,10 +116,9 @@ The Hyper-V guest diagnostics are selected at build time (`hyperv-runner` enable
 a nonce-disc flag is present. Host identity JSON is emitted without a UTF-8 BOM;
 qualification readers also accept older PowerShell 5.1 BOM-prefixed artifacts.
 
-To check whether offline Cargo still starts under the existing write-restricted
-`motor-prep` token, use the dedicated diagnostic lane (not the AppContainer/lowbox
-probe). After installing a bundle built from the reviewed source commit, run this
-from elevated PowerShell 5.1:
+To measure the offline cache inputs Cargo needs, use the SYSTEM-only diagnostic lane.
+After installing a bundle built from the reviewed source commit, run this from
+elevated PowerShell 5.1:
 
 ```powershell
 $python = (Get-Command python.exe -ErrorAction Stop).Source
@@ -129,32 +128,31 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\M
 if ($LASTEXITCODE -ne 0) { throw "Offline Cargo diagnostic failed; preserve $evidence" }
 ```
 
-The runner first uses pinned Cargo as SYSTEM with `fetch --locked` to populate a
-per-job Cargo home, then launches `fetch --locked --offline` with
-`CARGO_NET_OFFLINE=true` under the normal write-restricted token. The fixture locks
-`cfg-if 1.0.4`; its sparse-registry layout is
-`registry/index/<registry-id>/config.json`,
-`registry/index/<registry-id>/.cache/3/c/cfg-if`, and
-`registry/cache/<registry-id>/cfg-if-1.0.4.crate`. The report records whether those
-files exist, independently checks the archive SHA-256 against Cargo.lock, and
-preserves Cargo's exit status, output, and whether it mentions `\Device\KsecDD`.
-This is evidence collection only: it makes no AppContainer/lowbox launch and does
-not change production fetching. The diagnostic does not mark a nonzero Cargo
-result as a qualification failure; inspect the copied `prep-offline-cargo-*.json`
-report and nested launch report. Leave the service stopped for evidence review.
+Pinned Cargo first attempts to fetch the locked `cfg-if 1.0.4` fixture as SYSTEM.
+The report records the crate archive path and checksum and the registry-configuration
+contents. For each observed `cfg-if` sparse-index entry, it also records the size
+and SHA-256, up to 64 KiB of hex bytes, and an escaped rendering of the first 96 bytes. It then runs pinned Cargo offline as
+SYSTEM in fresh homes containing (1) only the `.crate` archive, (2) that archive
+plus the observed registry configuration but no `.cache` entry, and (3) the full
+Cargo-generated cache. Each cell records Cargo's exit status and output. This
+distinguishes whether the lockfile and crate archive suffice and, if not, which
+actual index files Cargo requires; no sparse-cache bytes are synthesized by the
+runner. No restricted `motor-prep` Cargo process is launched. The diagnostic is
+evidence collection only and does not change production fetching. Inspect the
+copied `prep-offline-cargo-*.json` report; leave the service stopped for review.
 
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
-This stops MotorRunner and runs sixteen probe/Cargo/rustc token comparisons without
+This stops MotorRunner and runs fifteen probe/Cargo/rustc token comparisons without
 VM qualification. It records requested token flags separately from actual
 `IsTokenRestricted`, restricting-SID, integrity and UI-object DACL readbacks.
 The Everyone-SID and explicit-desktop-write controls are diagnostic-only and
 restricted to pinned `cargo --version`; production continues to use flags `0x9`
 and only the logon SID. Additional diagnostic cells compare token-default-DACL
 updates and the RESTRICTED SID (`S-1-5-12`); they do not change the production
-token. The fixed offline Cargo-fetch cell and follow-up controlled write probes
-reuse one created token/profile/desktop per cell. Readbacks retain default DACLs
-before/after and actual writes to selected staging/outside/profile/cache paths.
+token. Controlled write probes reuse one created token/profile/desktop per cell.
+Readbacks retain default DACLs before/after and actual writes to selected
+staging/outside/profile/cache paths.
 Matrix completion is evidence collection, not a pass or
 permission to enable fleet routing. Leave the service stopped for evidence review.
 This diagnostic lane temporarily ORs `FLG_SHOW_LDR_SNAPS` (`0x2`) into the
@@ -166,11 +164,11 @@ the wrapper while it is restoring these settings. The release includes its own
 native debug-event collector, so no gflags, WinDbg or new host installation is
 required. Protected `*.loader.jsonl` evidence contains Windows DLL-load events,
 loader debug strings and exceptions. Process/thread security-descriptor readbacks
-and actual Cargo/Rustup-home values accompany each diagnostic launch. Cells 12–13
+and actual Cargo/Rustup-home values accompany each diagnostic launch. Cells 11–12
 isolate runner-before-Cargo and repeated-Cargo ordering on one token.
-Cell 14 compares the traverse-only root cwd with the already-authorized staging
+Cell 13 compares the traverse-only root cwd with the already-authorized staging
 temp cwd on the same token/desktop, then calls both RNG probes on that session.
-Cells 15–16 independently call dynamically resolved `ProcessPrng` (BOOL) and
+Cells 14–15 independently call dynamically resolved `ProcessPrng` (BOOL) and
 `BCryptGenRandom` (NTSTATUS, system-preferred RNG) in a restricted probe with safe
 cwd; random bytes are never logged. These cells additionally trace selected x64
 ntdll object API entries/returns with decoded object names when available, target
@@ -181,57 +179,6 @@ or production launches. An interrupted step/unwound call aborts collection with
 an explicit instrumentation error instead of assigning a later return to it.
 Production launches do not enable loader snaps or debugger creation flags.
 
-For the AppContainer network failure, collect the lowbox-only diagnostic with
-`run-system.ps1 -PrepLaunchMatrix -LowboxLaunch`. It records no-launch prechecks
-for the session's `AppContainerNamedObjects` directory, the `motor-prep` profile
-hive/mapping, and the batch-token session. SYSTEM resolves an index.crates.io
-address once so token name resolution can be distinguished from raw TCP/Windows
-Filtering Platform (WFP) access.
-It then compares two variants that create the AppContainer profile under
-`motor-prep` impersonation with its hive loaded, but launch through the same
-self-created object directory and `NtCreateLowBoxToken` path. The variants are
-Less Privileged AppContainer (LPAC) with `internetClient`, `registryRead` and
-`lpacCryptoServices`, and plain AppContainer with `internetClient`. This combines profile registration/storage with
-the self-created-token launch method. The filesystem-write checks also attempt
-writes to the AppContainer profile folder and registry storage. See [Microsoft's AppContainer profile
-guidance](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer),
-[`NtCreateLowBoxToken`](https://learn.microsoft.com/en-us/windows/win32/secauthz/ntcreatelowboxtoken),
-[WinHTTP SSL](https://learn.microsoft.com/en-us/windows/win32/winhttp/ssl-in-winhttp),
-and [DNS client RPC behavior](https://projectzero.google/2021/08/understanding-network-access-windows-app.html).
-
-Each token runs the same filesystem-write checks and calls in-token `getaddrinfo`
-to record whether name resolution succeeds; this does not test direct reachability
-of a DNS server. Raw TCP is separately attempted against the SYSTEM-resolved
-index.crates.io address, and WinHTTP tests HTTPS using Schannel TLS. Microsoft's
-[WinHttpOpen documentation](https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpopen)
-lists `ERROR_NOT_ENOUGH_MEMORY` as a generic allocation failure; Win32 14 is
-`ERROR_OUTOFMEMORY` (not enough storage), with no documented AppContainer-specific
-meaning. It fails before a request or Schannel handshake, so the probe records the
-startup error without treating it as a network result. See [system error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
-`LsaConnectUntrusted` is reported separately; it does not gate the transport
-result or Cargo fetch. If a probe child starts, Cargo fetch uses the first token
-passing DNS/TCP/Schannel; if none passes all three, it uses the started token with
-the most transport progress. If no probe child starts, Cargo fetch is skipped.
-Each report records all token capabilities, Local Security Authority (LSA) status,
-network stages, failing API/Win32 error, write attempts and cleanup paths. Per-cell
-cleanup records profile deletion, profile-folder/registry state, user-hive unload,
-token closure and object-directory disappearance; a final precheck reports leftovers.
-The diagnostic attempts to revert persistent grants and records whether their
-before/after discretionary access control lists (DACLs) match. It also attempts
-to remove staging; an unreaped child defers that cleanup, and the report records
-any leftover path. This remains diagnostic evidence, not qualification or a
-production policy change.
-
-Run the operator-only lowbox lane from an elevated PowerShell 5.1 prompt after
-installing a bundle built from the reviewed source commit:
-
-```powershell
-$python = (Get-Command python.exe -ErrorAction Stop).Source
-$evidence = 'C:\motor-runner-evidence\lowbox-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\MotorRunner\bin\run-system.ps1 `
-  -Python $python -Evidence $evidence -PrepLaunchMatrix -LowboxLaunch
-if ($LASTEXITCODE -ne 0) { throw "Lowbox diagnostic failed; preserve $evidence" }
-```
 
 Peer qualification starts the victim alone and records its VM-matched Hyper-V
 Worker/Admin OS-boot event 18601, then waits at least 20 seconds before starting

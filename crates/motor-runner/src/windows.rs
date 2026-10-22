@@ -33,8 +33,6 @@ mod native_call_trace;
 pub(crate) mod prep;
 #[cfg(any(windows, test))]
 mod process_status;
-#[cfg(any(windows, test))]
-mod sddl_model;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -65,10 +63,6 @@ pub(crate) fn qualify_prep_matrix(config: Config) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {
     trusted_prep::offline_cargo_entry(config)
-}
-#[cfg(windows)]
-pub(crate) fn qualify_prep_lowbox(config: Config) -> io::Result<()> {
-    trusted_prep::lowbox_entry(config)
 }
 #[cfg(windows)]
 pub(crate) fn prep_probe(args: &[String]) -> io::Result<()> {

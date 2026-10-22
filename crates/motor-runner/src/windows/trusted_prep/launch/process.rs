@@ -25,18 +25,13 @@ struct Attributes {
     pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 impl Attributes {
-    /// `extra` holds further (attribute, value, size) entries, such as the
-    /// AppContainer security capabilities; their values must outlive the list.
-    fn new(
-        handles: &mut [HANDLE],
-        extra: &[(usize, *const std::ffi::c_void, usize)],
-    ) -> io::Result<Self> {
+    fn new(handles: &mut [HANDLE]) -> io::Result<Self> {
         fn win32_failure(call: &str) -> io::Error {
             let error = io::Error::last_os_error();
             let code = error.raw_os_error().unwrap_or(0) as u32;
             step(call, format!("{error}; Win32 {code} (0x{code:08X})"))
         }
-        let count = 1 + extra.len() as u32;
+        let count = 1;
         let mut size = 0;
         unsafe {
             InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size);
@@ -68,24 +63,6 @@ impl Attributes {
         } == 0
         {
             return Err(win32_failure("UpdateProcThreadAttribute(handle-list)"));
-        }
-        for (attribute, value, size) in extra {
-            if unsafe {
-                UpdateProcThreadAttribute(
-                    pointer,
-                    0,
-                    *attribute,
-                    *value,
-                    *size,
-                    null_mut(),
-                    null_mut(),
-                )
-            } == 0
-            {
-                return Err(win32_failure(&format!(
-                    "UpdateProcThreadAttribute(0x{attribute:08X})"
-                )));
-            }
         }
         Ok(result)
     }
@@ -186,8 +163,7 @@ pub(super) fn run(
     let output = stdio(&plan.stdout.to_string_lossy(), false)?;
     let error = stdio(&plan.stderr.to_string_lossy(), false)?;
     let mut handles = [input.0, output.0, error.0];
-    let extra = session.attributes();
-    let attributes = Attributes::new(&mut handles, &extra)?;
+    let attributes = Attributes::new(&mut handles)?;
     let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
     if job.0.is_null() {
         return Err(step("create-prep-job", io::Error::last_os_error()));

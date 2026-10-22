@@ -1,10 +1,9 @@
 <# Operator-only qualification. run-system.ps1 supplies the SYSTEM token. #>
-param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$LowboxLaunch, [switch]$OfflineCargoOnly)
+param([Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Evidence, [switch]$PrepLaunchMatrix, [switch]$AccessChecksOnly, [switch]$OfflineCargoOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
-if ($LowboxLaunch -and (-not $PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'LowboxLaunch requires PrepLaunchMatrix and excludes AccessChecksOnly' }
-if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly -or $LowboxLaunch)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
+if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\qualify-peer.ps1"
@@ -48,10 +47,6 @@ if ($PrepLaunchMatrix) {
         if ($AccessChecksOnly) {
             . "$PSScriptRoot\prep-access-check.ps1"
             Invoke-RunnerPrepAccessMatrix $Root $exe $Evidence
-        } elseif ($LowboxLaunch) {
-            # Diagnostic AppContainer launch cells; they revert their own
-            # persistent package grants and remove their staging job.
-            $null = Runner-Check 'qualify-prep-lowbox'
         } else {
             . "$PSScriptRoot\loader-snaps.ps1"
             Invoke-RunnerLoaderSnaps $Evidence { $null = Runner-Check 'qualify-prep-matrix' }

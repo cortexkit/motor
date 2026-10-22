@@ -27,7 +27,6 @@ use windows_sys::Win32::{
     },
 };
 mod access_checks;
-mod appcontainer;
 pub(super) fn access_check_run(
     vm: &crate::windows::VmConfig,
     fixture: &Path,
@@ -135,19 +134,6 @@ fn identity(token: HANDLE) -> io::Result<(String, String)> {
         ));
     }
     Ok((user_sid, logon))
-}
-pub(super) fn lowbox_prechecks(token: HANDLE) -> io::Result<Value> {
-    let (user_sid, _) = identity(token)?;
-    let session = token_info(token, TokenSessionId)?;
-    let session_id = unsafe { std::ptr::read_unaligned(session.as_ptr().cast::<u32>()) };
-    let (_, package_sid) = appcontainer::package_sid()?;
-    Ok(json!({
-        "session_id":session_id,
-        "batch_token_session_id":session_id,
-        "named_object_directories":appcontainer::precheck_directories(session_id, &package_sid),
-        "motor_prep_profile":appcontainer::precheck_profile_registry(&user_sid, &package_sid),
-        "package_sid":package_sid
-    }))
 }
 pub(super) fn require_system() -> io::Result<()> {
     let mut token = null_mut();
@@ -421,9 +407,7 @@ struct Desktop {
     name: String,
 }
 impl Desktop {
-    /// `package` adds an AppContainer package SID beside the logon SID and
-    /// labels the objects Low, so a lowbox child (Low integrity) can use them.
-    fn new(logon_sid: &str, explicit_writes: bool, package: Option<&str>) -> io::Result<Self> {
+    fn new(logon_sid: &str, explicit_writes: bool) -> io::Result<Self> {
         let name = format!("MotorPrep-{}", uuid::Uuid::now_v7().simple());
         let station_name = wide(&name);
         let desktop_name = wide("Fetch");
@@ -503,20 +487,13 @@ impl Desktop {
             } else {
                 String::new()
             };
-            let package_ace = package.map_or_else(String::new, |sid| format!("(A;;GA;;;{sid})"));
-            let final_acl = descriptor(&format!(
-                "O:SYG:SYD:P(A;;GA;;;{logon_sid}){extra}{package_ace}"
-            ))?;
+            let final_acl = descriptor(&format!("O:SYG:SYD:P(A;;GA;;;{logon_sid}){extra}"))?;
             check("private-desktop-dacl", unsafe {
                 SetUserObjectSecurity(object, &DACL_SECURITY_INFORMATION, final_acl.0)
             })?;
             // Do not depend on the SYSTEM creator's default mandatory label.
             // Label-only updates use WRITE_OWNER, not an extra security privilege.
-            let label = descriptor(if package.is_some() {
-                "S:(ML;;NW;;;LW)"
-            } else {
-                "S:(ML;;NW;;;ME)"
-            })?;
+            let label = descriptor("S:(ML;;NW;;;ME)")?;
             let mut present = 0;
             let mut defaulted = 0;
             let mut sacl = null_mut();
@@ -611,12 +588,6 @@ pub(super) struct Session {
     grant: StagingGrant,
     desktop: Desktop,
     restricted: Option<Handle>,
-    /// Diagnostic lowbox cells only: the child starts as an AppContainer
-    /// process from the privilege-filtered token in `restricted`.
-    pub(super) lowbox: Option<appcontainer::Launch>,
-    lowbox_self_token: bool,
-    object_directory: Option<appcontainer::ObjectDirectory>,
-    user_sid: String,
     cleanup_report: Value,
     _diagnostic_default_dacl: Option<Local>,
     profile: Profile,
@@ -646,7 +617,7 @@ impl Session {
             })?;
         }
         let restricted_code = Local(restricted_code);
-        let mut restricted = if plan.restricted {
+        let restricted = if plan.restricted {
             let mut restrictions = vec![SID_AND_ATTRIBUTES {
                 Sid: sid.0,
                 Attributes: 0,
@@ -680,71 +651,9 @@ impl Session {
                 )
             })?;
             Some(Handle(result))
-        } else if plan.diagnostic_policy.lowbox().is_some() {
-            // No restricting SIDs: the AppContainer check is the write boundary
-            // here. A write-restricted token cannot open \Device\KsecDD (the
-            // kernel crypto device bcrypt uses) for write, because only the
-            // logon SID would count in its second, restricted access check.
-            let mut result = null_mut();
-            check("CreateRestrictedToken-lowbox-base", unsafe {
-                CreateRestrictedToken(
-                    profile.token.0,
-                    DISABLE_MAX_PRIVILEGE,
-                    0,
-                    null(),
-                    0,
-                    null(),
-                    0,
-                    null(),
-                    &mut result,
-                )
-            })?;
-            Some(Handle(result))
         } else {
             None
         };
-        let session_id_bytes = token_info(profile.token.0, TokenSessionId)?;
-        let session_id =
-            unsafe { std::ptr::read_unaligned(session_id_bytes.as_ptr().cast::<u32>()) };
-        let lowbox = plan
-            .diagnostic_policy
-            .lowbox()
-            .map(|lpac| {
-                if plan.diagnostic_policy.lowbox_profile() {
-                    appcontainer::Launch::with_profile(lpac, profile.token.0)
-                } else {
-                    appcontainer::Launch::new(lpac)
-                }
-            })
-            .transpose()?;
-        let lowbox_self_token = plan.diagnostic_policy.lowbox_self_token();
-        let mut object_directory = None;
-        if lowbox_self_token {
-            let launch = lowbox
-                .as_ref()
-                .ok_or_else(|| step("lowbox-token", "missing AppContainer capability data"))?;
-            let directory =
-                appcontainer::ObjectDirectory::create(session_id, &launch.package_text)?;
-            let base = restricted
-                .as_ref()
-                .ok_or_else(|| step("lowbox-token", "missing privilege-filtered token"))?;
-            let token = match launch.create_token(base.0, directory.handle()) {
-                Ok(token) => token,
-                Err(error) => {
-                    let mut directory = directory;
-                    let cleanup = directory
-                        .close()
-                        .map(|report| report.to_string())
-                        .unwrap_or_else(|cleanup| cleanup.to_string());
-                    return Err(step(
-                        "NtCreateLowBoxToken",
-                        format!("{error}; object-directory-cleanup={cleanup}"),
-                    ));
-                }
-            };
-            restricted = Some(token);
-            object_directory = Some(directory);
-        }
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let default_dacl_before = token_default_dacl(actual_token)?;
         let diagnostic_default_dacl = if plan.diagnostic_policy.changes_default_dacl() {
@@ -759,7 +668,6 @@ impl Session {
         let desktop = Desktop::new(
             &logon_sid,
             plan.diagnostic_policy == DiagnosticPolicy::ExplicitDesktopWrites,
-            lowbox.as_ref().map(|launch| launch.package_text.as_str()),
         )?;
         let temp = plan.cwd.join("fetch-temp");
         no_reparse(&plan.root, &temp)?;
@@ -838,12 +746,11 @@ impl Session {
         let actual_token = restricted.as_ref().map_or(profile.token.0, |token| token.0);
         let info = json!({"user_sid":user_sid, "logon_sid":logon_sid, "restricting_sid":if plan.restricted { Some(logon_sid.clone()) } else { None },
             "token_default_dacl_before":default_dacl_before,
-            "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else if lowbox.is_some() { DISABLE_MAX_PRIVILEGE } else { 0 })?,
-            "lowbox":lowbox.as_ref().map(|launch| launch.info.clone()),
+            "token":token_details(actual_token, if plan.restricted { FETCH_TOKEN_FLAGS } else { 0 })?,
             "window_station_readback":{"name":object_name(desktop.station)?, "dacl":object_dacl(desktop.station)?},
             "desktop_readback":{"name":object_name(desktop.desktop)?, "dacl":object_dacl(desktop.desktop)?},
             "diagnostic_policy":plan.diagnostic_policy,
-            "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":if lowbox.is_some() { "low" } else { "medium" },
+            "lp_desktop":desktop.name, "window_station_visible":false, "desktop_heap_kib":4096, "desktop_integrity":"medium",
             "desktop_dacl":format!("D:P(A;;GA;;;{logon_sid})"), "profile_loaded":true, "user_environment_block":true,
             "environment_keys":env.keys().collect::<Vec<_>>(), "temp":env["TEMP"], "tmp":env["TMP"], "userprofile":env["USERPROFILE"],
             "diagnostic_environment":if plan.diagnostic_loader_trace { Some(json!({"CARGO_HOME":env.get("CARGO_HOME"),"RUSTUP_HOME":env.get("RUSTUP_HOME"),"RUSTC":env.get("RUSTC")})) } else { None }});
@@ -852,11 +759,7 @@ impl Session {
             grant,
             desktop,
             restricted,
-            user_sid: user_sid.clone(),
-            cleanup_report: json!({"profile_loaded":true,"restricted_token_closed":false,"prep_profile_token_closed":false,"object_directory":null,"appcontainer_profile_deleted":false,"prep_profile_unloaded":false}),
-            lowbox_self_token,
-            object_directory,
-            lowbox,
+            cleanup_report: json!({"profile_loaded":true,"restricted_token_closed":false,"prep_profile_token_closed":false,"prep_profile_unloaded":false}),
             _diagnostic_default_dacl: diagnostic_default_dacl,
             profile,
             environment,
@@ -868,17 +771,6 @@ impl Session {
             .as_ref()
             .map_or(self.profile.token.0, |token| token.0)
     }
-    pub(super) fn attributes(&self) -> Vec<(usize, *const c_void, usize)> {
-        if self.lowbox_self_token {
-            self.lowbox
-                .as_ref()
-                .map_or_else(Vec::new, |launch| launch.policy_attribute())
-        } else {
-            self.lowbox
-                .as_ref()
-                .map_or_else(Vec::new, |launch| launch.attributes())
-        }
-    }
     pub(super) fn desktop(&self) -> Vec<u16> {
         wide(&self.desktop.name)
     }
@@ -887,61 +779,6 @@ impl Session {
         if let Some(token) = &mut self.restricted {
             match token.close() {
                 Ok(()) => self.cleanup_report["restricted_token_closed"] = json!(true),
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        if let Some(launch) = &mut self.lowbox {
-            if let Some(name) = launch.info["profile_name"].as_str() {
-                self.cleanup_report["appcontainer_profile_name"] = json!(name);
-                self.cleanup_report["appcontainer_profile_folder"] =
-                    launch.info["profile_folder"].clone();
-                self.cleanup_report["appcontainer_profile_folder_error"] =
-                    launch.info["profile_folder_error"].clone();
-                match launch.delete_profile() {
-                    Ok(deleted) => {
-                        self.cleanup_report["appcontainer_profile_deleted"] = json!(deleted)
-                    }
-                    Err(error) => errors.push(error.to_string()),
-                }
-                let registry_check =
-                    appcontainer::precheck_profile_registry(&self.user_sid, &launch.package_text);
-                self.cleanup_report["profile_registry_after_delete"] = registry_check.clone();
-                for key in ["mapping", "storage"] {
-                    let path = registry_check[format!("{key}_path").as_str()]
-                        .as_str()
-                        .unwrap_or("<unknown registry path>");
-                    let status = registry_check[format!("{key}_open_status").as_str()]
-                        .as_i64()
-                        .unwrap_or(-1);
-                    if registry_check[format!("{key}_exists").as_str()] == json!(true)
-                        || !matches!(status, 2 | 3)
-                    {
-                        errors.push(format!(
-                            "AppContainer {key} remains or cannot be verified at {path} (open status {status})"
-                        ));
-                    }
-                }
-                if let Some(folder) = launch.info["profile_folder"].as_str() {
-                    let folder_path = Path::new(folder);
-                    let folder_state = match fs::symlink_metadata(folder_path) {
-                        Ok(_) => json!({"path":folder,"exists":true}),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            json!({"path":folder,"exists":false})
-                        }
-                        Err(error) => {
-                            json!({"path":folder,"exists":null,"error":error.to_string()})
-                        }
-                    };
-                    if folder_state["exists"] != json!(false) {
-                        errors.push(format!("AppContainer profile folder remains or cannot be verified: {folder_state}"));
-                    }
-                    self.cleanup_report["appcontainer_profile_folder_after_delete"] = folder_state;
-                }
-            }
-        }
-        if let Some(directory) = &mut self.object_directory {
-            match directory.close() {
-                Ok(report) => self.cleanup_report["object_directory"] = report,
                 Err(error) => errors.push(error.to_string()),
             }
         }
@@ -969,69 +806,6 @@ impl Session {
     }
 }
 
-pub(super) fn appcontainer_context() -> Value {
-    appcontainer::current_context()
-}
-pub(super) fn appcontainer_package_sid() -> io::Result<String> {
-    appcontainer::package_sid().map(|(_, text)| text)
-}
-pub(super) fn appcontainer_profile_folder(package_sid: &str) -> io::Result<String> {
-    appcontainer::profile_folder(package_sid)
-}
-pub(super) fn appcontainer_registry_probe(package_sid: &str, leaf: &str) -> Value {
-    appcontainer::profile_registry_probe(package_sid, leaf)
-}
-pub(super) fn current_appcontainer_package_sid() -> io::Result<String> {
-    appcontainer::current_package_sid()
-}
-/// A path's DACL as SDDL, read through a handle that does not follow reparse
-/// points, so grant/revoke round trips can be compared exactly.
-pub(super) fn path_dacl_sddl(path: &Path) -> io::Result<String> {
-    let raw = unsafe {
-        CreateFileW(
-            wide(&path.to_string_lossy()).as_ptr(),
-            READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
-    };
-    if raw == INVALID_HANDLE_VALUE {
-        return Err(step(
-            "path-dacl",
-            format!("{}: {}", path.display(), io::Error::last_os_error()),
-        ));
-    }
-    let handle = Handle(raw);
-    let mut security = null_mut();
-    win32_code("path-dacl", unsafe {
-        GetSecurityInfo(
-            handle.0,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut security,
-        )
-    })?;
-    let security = Local(security);
-    let mut text = null_mut();
-    check("path-dacl-sddl", unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            security.0,
-            1,
-            DACL_SECURITY_INFORMATION,
-            &mut text,
-            null_mut(),
-        )
-    })?;
-    let text = Local(text.cast());
-    unsafe { read_wide(text.0.cast()) }
-}
 pub(super) fn probe_context() -> io::Result<Value> {
     let mut token = null_mut();
     check("probe-token", unsafe {

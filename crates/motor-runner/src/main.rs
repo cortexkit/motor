@@ -95,8 +95,6 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         #[cfg(windows)]
         "qualify-prep-offline-cargo" => motor_runner::hyperv_qualify_prep_offline_cargo(config),
         #[cfg(windows)]
-        "qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config),
-        #[cfg(windows)]
         "qualify-prep" => {
             let runner = Runner::open(config)?;
             motor_runner::hyperv_qualify_prep(runner.config())?;

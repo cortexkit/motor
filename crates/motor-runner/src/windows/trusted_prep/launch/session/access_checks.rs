@@ -1,7 +1,6 @@
 //! Read-only descriptor/token screening. This module never sets an ACL or
 //! impersonates a service thread; AccessCheck receives an explicit token handle.
 use super::*;
-mod lowbox;
 use crate::windows::{access_screen, VmConfig};
 use serde_json::{json, Value};
 use std::{
@@ -765,19 +764,10 @@ pub(super) fn run(vm: &VmConfig, fixture: &Path, output: &Path) -> io::Result<()
             .unwrap()
             .is_empty()
         {
-            json!("No tested enabled account-group SID both grants KsecDD access and denies every listed write right; retain policy and compare AppContainer/lowbox or a documented pre-opened-handle broker design")
+            json!("No tested enabled account-group SID both grants KsecDD access and denies every listed write right; retain the current token policy pending an approved alternative")
         } else {
             json!("Listed-path candidates exist; see table. Adding an ambient group is NOT a path-independent staging-only boundary. Review the in-memory counterexample and obtain explicit policy approval before any production change")
         };
-        report["lowbox"] = lowbox::screen(
-            base.0,
-            &user,
-            vm,
-            fixture,
-            (&sd, &description),
-            &paths,
-            descriptor_complete && path_complete,
-        );
         Ok(())
     })();
     if let Err(error) = &collection {
@@ -790,6 +780,10 @@ pub(super) fn run(vm: &VmConfig, fixture: &Path, output: &Path) -> io::Result<()
         &serde_json::to_vec_pretty(&report).map_err(io::Error::other)?,
         true,
     )?;
-    println!("DIAG read-only KsecDD access screen complete={} lowbox_passing={} report={}; this is not a qualification pass",report["screen_complete"],report["lowbox"]["passing_variants"],output.display());
+    println!(
+        "DIAG read-only KsecDD access screen complete={} report={}; this is not a qualification pass",
+        report["screen_complete"],
+        output.display()
+    );
     collection
 }

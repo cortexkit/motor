@@ -12,7 +12,6 @@ use windows_sys::Win32::{
     Security::{LogonUserW, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT},
 };
 mod launch;
-mod lowbox;
 struct Handle(HANDLE);
 impl Handle {
     fn close(&mut self) -> io::Result<()> {
@@ -411,9 +410,6 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     if matches!(mode, "rng-process-prng" | "rng-bcrypt-gen-random") {
         return launch::rng_probe(mode, output);
     }
-    if mode == "lowbox" {
-        return lowbox::probe(credential, outside, output);
-    }
     let profile =
         std::env::var_os("USERPROFILE").ok_or_else(|| invalid("prep probe has no USERPROFILE"))?;
     let profile = PathBuf::from(profile).join(format!("motor-prep-probe-{}.txt", Uuid::now_v7()));
@@ -517,85 +513,210 @@ pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
     fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
 }
 
-/// Diagnostic-only AppContainer launch cells; see `lowbox`.
-pub(super) fn lowbox_entry(config: Config) -> io::Result<()> {
-    lowbox::entry(config)
-}
-
-const OFFLINE_CARGO_MANIFEST: &str = "[package]\nname = \"motor-prep-offline-cargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"=1.0.4\"\n";
-const OFFLINE_CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"motor-prep-offline-cargo\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
+const OFFLINE_CARGO_MANIFEST: &str = "[package]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"=1.0.4\"\n";
+const OFFLINE_CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
 
 fn offline_cargo_layout(cargo_home: &Path) -> serde_json::Value {
     use sha2::{Digest, Sha256};
 
     const EXPECTED_CHECKSUM: &str =
         "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801";
-    fn directories(path: &Path) -> Vec<PathBuf> {
-        fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
+
+    fn files_below(root: &Path) -> Vec<PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn relative(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn hex_evidence(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .take(65_536)
+            .map(|byte| format!("{byte:02x}"))
             .collect()
     }
 
-    let index_layout = directories(&cargo_home.join("registry/index"))
-        .into_iter()
-        .map(|root| {
-            let config = root.join("config.json");
-            let sparse_entry = root.join(".cache/3/c/cfg-if");
+    let index_root = cargo_home.join("registry/index");
+    let archive_root = cargo_home.join("registry/cache");
+    let index_files = files_below(&index_root);
+    let archive_files = files_below(&archive_root);
+    let sparse_entries = index_files
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "cfg-if"))
+        .map(|path| {
+            let bytes = fs::read(path).unwrap_or_default();
             serde_json::json!({
-                "registry_index_root": root,
-                "config_json": {"path": config, "present": config.is_file()},
-                "cfg_if_sparse_index_entry": {"path": sparse_entry, "present": sparse_entry.is_file()}
+                "path": relative(cargo_home, path),
+                "bytes": bytes.len(),
+                "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                "contents_hex_up_to_64_kib": hex_evidence(&bytes),
+                "contents_truncated": bytes.len() > 65_536,
+                "prefix_escaped_first_96_bytes": format!("{:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(96)]))
             })
         })
         .collect::<Vec<_>>();
-    let archive_layout = directories(&cargo_home.join("registry/cache"))
-        .into_iter()
-        .map(|root| {
-            let archive = root.join("cfg-if-1.0.4.crate");
-            let checksum = fs::read(&archive)
+    let registry_config = index_files
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "config.json"))
+        .map(|path| {
+            serde_json::json!({
+                "path": relative(cargo_home, path),
+                "contents": fs::read_to_string(path).ok()
+            })
+        })
+        .collect::<Vec<_>>();
+    let archives = archive_files
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "cfg-if-1.0.4.crate")
+        })
+        .map(|path| {
+            let checksum = fs::read(path)
                 .ok()
                 .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
             let matches = checksum.as_deref() == Some(EXPECTED_CHECKSUM);
             serde_json::json!({
-                "registry_cache_root": root,
-                "crate_archive": archive,
+                "path": relative(cargo_home, path),
                 "sha256": checksum,
                 "checksum_matches_lockfile": matches
             })
         })
         .collect::<Vec<_>>();
-    let index_ready = index_layout.iter().any(|entry| {
-        entry["config_json"]["present"] == true
-            && entry["cfg_if_sparse_index_entry"]["present"] == true
-    });
-    let archive_ready = archive_layout
+    let archive_ready = archives
         .iter()
         .any(|entry| entry["checksum_matches_lockfile"] == true);
     serde_json::json!({
         "cargo_home": cargo_home,
-        "required_layout_relative_to_cargo_home": {
-            "sparse_registry_config": "registry/index/<registry-id>/config.json",
-            "cfg_if_sparse_index_cache_entry": "registry/index/<registry-id>/.cache/3/c/cfg-if",
-            "locked_crate_archive": "registry/cache/<registry-id>/cfg-if-1.0.4.crate"
-        },
+        "registry_config_files": registry_config,
+        "sparse_index_cache_entries_named_cfg_if": sparse_entries,
+        "crate_archives_named_cfg_if_1_0_4": archives,
+        "sparse_index_entry_present": !sparse_entries.is_empty(),
+        "locked_crate_archive_present_and_verified": archive_ready,
         "lockfile_crates_io_dependencies": [{
             "name": "cfg-if", "version": "1.0.4", "sha256": EXPECTED_CHECKSUM
         }],
-        "observed_sparse_index_roots": index_layout,
-        "observed_crate_cache_roots": archive_layout,
-        "sparse_index_entries_present": index_ready,
-        "locked_crate_archive_present_and_verified": archive_ready,
-        "layout_complete_for_fixture": index_ready && archive_ready,
-        "checksum_validation": "Cargo fetch --locked checks the crate against Cargo.lock; the runner independently hashes the cached archive"
+        "sparse_cache_format_evidence": "Actual bytes, size and SHA-256 captured from pinned Cargo output; prefix fields are observations, not synthesized Cargo cache data"
     })
 }
 
-/// Diagnostic only: seed one locked crates.io package as SYSTEM, then ask the
-/// ordinary write-restricted prep token to resolve and fetch it with Cargo offline.
+fn copy_cargo_cache(
+    source: &Path,
+    destination: &Path,
+    include_index: bool,
+    include_sparse_cache: bool,
+) -> io::Result<()> {
+    for subtree in ["registry/cache", "registry/index"] {
+        if subtree == "registry/index" && !include_index {
+            continue;
+        }
+        let from = source.join(subtree);
+        if !from.is_dir() {
+            continue;
+        }
+        for path in {
+            let mut paths = vec![from.clone()];
+            let mut files = Vec::new();
+            while let Some(directory) = paths.pop() {
+                for entry in fs::read_dir(directory)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let kind = entry.file_type()?;
+                    if kind.is_dir() {
+                        paths.push(path);
+                    } else if kind.is_file() {
+                        files.push(path);
+                    }
+                }
+            }
+            files
+        } {
+            let relative = path.strip_prefix(source).map_err(invalid)?;
+            if subtree == "registry/index"
+                && !include_sparse_cache
+                && !path.file_name().is_some_and(|name| name == "config.json")
+            {
+                continue;
+            }
+            let target = destination.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(path, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_offline_cargo(
+    cargo: &Path,
+    rustc: &Path,
+    fixture: &Path,
+    cargo_home: &Path,
+    stage: &Path,
+) -> serde_json::Value {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(fixture)
+        .env_clear()
+        .env("SYSTEMROOT", r"C:\Windows")
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
+        .env("RUSTC", rustc)
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("TEMP", stage.join("fetch-temp"))
+        .env("TMP", stage.join("fetch-temp"))
+        .args(["fetch", "--locked", "--offline", "--manifest-path"])
+        .arg(fixture.join("Cargo.toml"));
+    match crate::native_process::output_with_timeout(
+        &mut command,
+        std::time::Duration::from_secs(20),
+        || false,
+    ) {
+        Ok(output) => serde_json::json!({
+            "process_started": true,
+            "success": output.status.success(),
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "network_mode": "offline; CARGO_NET_OFFLINE=true"
+        }),
+        Err(error) => serde_json::json!({
+            "process_started": null,
+            "completed": false,
+            "success": false,
+            "error": error.to_string(),
+            "network_mode": "offline; CARGO_NET_OFFLINE=true"
+        }),
+    }
+}
+
 pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
     use fs2::FileExt;
     use sha2::{Digest, Sha256};
@@ -613,7 +734,7 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
         .map_err(io::Error::other)?;
     if status.current_state != ServiceState::Stopped {
         return Err(invalid(
-            "Stop MotorRunner before the offline Cargo startup diagnostic",
+            "Stop MotorRunner before the offline Cargo cache diagnostic",
         ));
     }
     let runner = crate::Runner::open(config)?;
@@ -639,54 +760,43 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
     let id = Uuid::now_v7();
     let stage = root.join("staging").join(id.to_string());
     let fixture = stage.join("fetch-manifests/offline-cargo");
-    let cargo_home = stage.join("fetch-temp/offline-cargo-home");
+    let seed_home = stage.join("fetch-temp/seed-cargo-home");
     let report_path = root
         .join("evidence")
         .join(format!("prep-offline-cargo-{id}.json"));
     let mut report = serde_json::json!({
         "diagnostic_only": true,
         "production_policy_unchanged": true,
-        "appcontainer_or_lowbox_used": false,
-        "restricted_launch": "existing write-restricted motor-prep token; no additional restricting SID or AppContainer",
-        "prefetch_actor": "SYSTEM runner",
+        "actor": "SYSTEM runner; Cargo runs only as SYSTEM in this diagnostic",
+        "restricted_motor_prep_cargo_launch_attempted": false,
         "offline_child_network_mode": {"cargo_argument": "--offline", "CARGO_NET_OFFLINE": "true"},
         "fixture": {"manifest": fixture.join("Cargo.toml"), "lockfile": fixture.join("Cargo.lock"), "dependency": "cfg-if 1.0.4 from crates.io"},
         "toolchain": {"cargo": cargo, "cargo_sha256": cargo_sha256, "rustc": rustc,
             "rustc_sha256": rustc_sha256, "cargo_pin": vm.prep_cargo_sha256},
-        "cargo_home": cargo_home,
+        "seed_cargo_home": seed_home,
         "cells": {},
         "staging": stage,
-        "revoke_error": null,
         "staging_removed": false
     });
     launch::write_diagnostic_update(&report_path, &report)?;
 
-    let mut granted = false;
     let result: io::Result<()> = (|| {
         fs::create_dir_all(fixture.join("src"))?;
-        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&seed_home)?;
+        fs::create_dir_all(stage.join("fetch-temp"))?;
         fs::write(fixture.join("Cargo.toml"), OFFLINE_CARGO_MANIFEST)?;
         fs::write(fixture.join("Cargo.lock"), OFFLINE_CARGO_LOCK)?;
         fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n")?;
-        super::vm::checked(super::vm::control(
-            config,
-            "GrantPrep",
-            None,
-            &["-Staging".into(), stage.to_string_lossy().into()],
-        )?)?;
-        granted = true;
 
-        // Cargo's locked fetch both downloads the archive and builds the sparse
-        // registry cache. No project build script or package code runs here.
         let mut prefetch = Command::new(&cargo);
         prefetch
             .current_dir(&fixture)
             .env_clear()
             .env("SYSTEMROOT", r"C:\Windows")
-            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_HOME", &seed_home)
             .env("CARGO_NET_OFFLINE", "false")
             .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
-            .env("CARGO_HTTP_TIMEOUT", "60")
+            .env("CARGO_HTTP_TIMEOUT", "20")
             .env("RUSTC", &rustc)
             .env("RUSTC_WRAPPER", "")
             .env("CARGO_BUILD_RUSTC_WRAPPER", "")
@@ -696,17 +806,16 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
             .arg(fixture.join("Cargo.toml"));
         let prefetch = crate::native_process::output_with_timeout(
             &mut prefetch,
-            std::time::Duration::from_secs(90),
+            std::time::Duration::from_secs(45),
             || false,
         );
-        let prefetch_report = match prefetch {
+        report["cells"]["system_locked_prefetch"] = match prefetch {
             Ok(output) => serde_json::json!({
                 "process_started": true,
                 "success": output.status.success(),
                 "exit_code": output.status.code(),
                 "stdout": String::from_utf8_lossy(&output.stdout),
                 "stderr": String::from_utf8_lossy(&output.stderr),
-                "lockfile_mode": "--locked",
                 "network_mode": "SYSTEM Cargo fetch; no --offline flag"
             }),
             Err(error) => serde_json::json!({
@@ -714,86 +823,32 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
                 "completed": false,
                 "success": false,
                 "error": error.to_string(),
-                "lockfile_mode": "--locked",
                 "network_mode": "SYSTEM Cargo fetch; no --offline flag"
             }),
         };
-        report["cells"]["system_locked_prefetch"] = prefetch_report;
-        report["offline_layout_after_prefetch"] = offline_cargo_layout(&cargo_home);
+        report["observed_seed_layout"] = offline_cargo_layout(&seed_home);
         launch::write_diagnostic_update(&report_path, &report)?;
 
-        let mut offline = Command::new(&cargo);
-        offline
-            .env_clear()
-            .env("SYSTEMROOT", r"C:\Windows")
-            .env("CARGO_HOME", &cargo_home)
-            .env("CARGO_NET_OFFLINE", "true")
-            .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
-            .env("RUSTC", &rustc)
-            .env("RUSTC_WRAPPER", "")
-            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-            .args(["fetch", "--locked", "--offline", "--manifest-path"])
-            .arg(fixture.join("Cargo.toml"));
-        let offline_report = match launch::diagnostic(
-            config,
-            &offline,
-            &stage,
-            true,
-            launch::DiagnosticPolicy::OfflineCargo,
-        ) {
-            Ok(mut child) => {
-                let output = format!(
-                    "{}\n{}",
-                    child["stdout"].as_str().unwrap_or(""),
-                    child["stderr"].as_str().unwrap_or("")
-                );
-                let child_started = child["child_started"] == true;
-                let output_mentions_ksecdd = output.contains("\\Device\\KsecDD");
-                let exit_status = child["exit_status"].as_str().unwrap_or("");
-                let exit_code_looks_like_ntstatus = exit_status.starts_with("0xC000");
-                let assessment = if !child_started {
-                    "cargo did not start; inspect launch phase and Win32/NTSTATUS error"
-                } else if child["exit_code"] == 0 {
-                    "cargo started and the locked offline fetch succeeded"
-                } else if output_mentions_ksecdd {
-                    "cargo started but its output mentions \\Device\\KsecDD; inspect status and stderr"
-                } else if exit_code_looks_like_ntstatus {
-                    "cargo started and exited with a Windows NTSTATUS-looking code; inspect any system error evidence"
-                } else {
-                    "cargo started; inspect its exit status and stderr to distinguish offline resolution from a startup failure"
-                };
-                child["startup_assessment"] = serde_json::json!(assessment);
-                child["output_mentions_ksecdd"] = serde_json::json!(output_mentions_ksecdd);
-                child["exit_code_looks_like_ntstatus"] =
-                    serde_json::json!(exit_code_looks_like_ntstatus);
-                child
-            }
-            Err(error) => serde_json::json!({
-                "phase": "diagnostic-launch-error",
-                "child_started": false,
-                "error": error.to_string(),
-                "startup_assessment": "cargo did not start; inspect the broker error"
-            }),
-        };
-        report["cells"]["write_restricted_offline_fetch"] = offline_report;
-        report["offline_layout_after_child"] = offline_cargo_layout(&cargo_home);
-        launch::write_diagnostic_update(&report_path, &report)?;
+        let cases = [
+            ("crate_archive_only", false, false),
+            ("archive_plus_registry_config_no_sparse_cache", true, false),
+            ("complete_cargo_seed", true, true),
+        ];
+        for (name, include_index, include_sparse_cache) in cases {
+            let home = stage.join("fetch-temp").join(name);
+            fs::create_dir_all(&home)?;
+            copy_cargo_cache(&seed_home, &home, include_index, include_sparse_cache)?;
+            let layout = offline_cargo_layout(&home);
+            let outcome = run_offline_cargo(&cargo, &rustc, &fixture, &home, &stage);
+            report["cells"][name] = serde_json::json!({
+                "layout": layout,
+                "offline_fetch": outcome
+            });
+            launch::write_diagnostic_update(&report_path, &report)?;
+        }
         Ok(())
     })();
 
-    let revoke = if granted {
-        super::vm::control(
-            config,
-            "RevokePrep",
-            None,
-            &["-Staging".into(), stage.to_string_lossy().into()],
-        )
-        .and_then(super::vm::checked)
-        .map(|_| ())
-    } else {
-        Ok(())
-    };
-    report["revoke_error"] = serde_json::json!(revoke.as_ref().err().map(ToString::to_string));
     let cleanup = remove_staging(config, &stage);
     report["staging_removed"] = serde_json::json!(cleanup.is_ok() && !stage.exists());
     report["staging_leftover"] = if stage.exists() {
@@ -806,12 +861,11 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
     }
     launch::write_diagnostic_update(&report_path, &report)?;
     println!(
-        "DIAG offline-cargo report={} staging_removed={}",
+        "DIAG offline-cargo-cache report={} staging_removed={}",
         report_path.display(),
         report["staging_removed"]
     );
     result?;
-    revoke?;
     cleanup
 }
 
@@ -851,20 +905,8 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
     let stage = root.join("staging").join(id.to_string());
     fs::create_dir_all(stage.join("fetch-manifests"))?;
     fs::create_dir_all(stage.join("fetch-temp"))?;
-    fs::create_dir_all(config.state_dir().join("prep-cargo"))?;
     let probe = stage.join("fetch-manifests/probe.exe");
     fs::copy(std::env::current_exe()?, &probe)?;
-    let fixture = stage.join("fetch-manifests/matrix-fixture");
-    fs::create_dir_all(fixture.join("src"))?;
-    fs::write(
-        fixture.join("Cargo.toml"),
-        "[package]\nname=\"trusted-fetch-matrix\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )?;
-    fs::write(
-        fixture.join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"trusted-fetch-matrix\"\nversion = \"0.1.0\"\n",
-    )?;
-    fs::write(fixture.join("src/lib.rs"), "")?;
     let cargo = root.join("prep-toolchain/bin/cargo.exe");
     let cargo_sha256 = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
     if cargo_sha256 != vm.prep_cargo_sha256.to_ascii_lowercase() {
@@ -890,8 +932,7 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
         use launch::DiagnosticPolicy::{
             DefaultDacl, DefaultDaclBCryptRng, DefaultDaclCargoTwice, DefaultDaclProbeFirst,
             DefaultDaclProcessPrng, DefaultDaclRestrictedCode, DefaultDaclSafeCwdPair, Everyone,
-            ExplicitDesktopWrites, FetchDefaultDaclRestrictedCode, None as Production,
-            RestrictedCode,
+            ExplicitDesktopWrites, None as Production, RestrictedCode,
         };
         for (index, name, program, restricted, policy) in [
             (1, "probe-base", &probe, false, Production),
@@ -948,41 +989,34 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
             ),
             (
                 11,
-                "cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only",
-                &cargo,
-                true,
-                FetchDefaultDaclRestrictedCode,
-            ),
-            (
-                12,
                 "default-dacl-runner-first-then-cargo",
                 &cargo,
                 true,
                 DefaultDaclProbeFirst,
             ),
             (
-                13,
+                12,
                 "default-dacl-cargo-twice-same-token",
                 &cargo,
                 true,
                 DefaultDaclCargoTwice,
             ),
             (
-                14,
+                13,
                 "default-dacl-cargo-cwd-pair-same-token",
                 &cargo,
                 true,
                 DefaultDaclSafeCwdPair,
             ),
             (
-                15,
+                14,
                 "default-dacl-probe-ProcessPrng-safe-cwd",
                 &probe,
                 true,
                 DefaultDaclProcessPrng,
             ),
             (
-                16,
+                15,
                 "default-dacl-probe-BCryptGenRandom-safe-cwd",
                 &probe,
                 true,
@@ -995,12 +1029,12 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 stage.join(format!("fetch-temp/cargo-{index}")),
             );
             command.env("RUSTC", &rustc);
-            if index <= 2 || index >= 15 {
+            if index <= 2 || index >= 14 {
                 command
                     .arg("prep-probe")
-                    .arg(if index == 15 {
+                    .arg(if index == 14 {
                         "rng-process-prng"
-                    } else if index == 16 {
+                    } else if index == 15 {
                         "rng-bcrypt-gen-random"
                     } else if restricted {
                         "restricted"
@@ -1010,10 +1044,6 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                     .arg(root.join("prep-secret.dpapi"))
                     .arg(&outside)
                     .arg(stage.join(format!("fetch-temp/matrix-probe-{index}.json")));
-            } else if index == 11 {
-                command
-                    .args(["fetch", "--locked", "--offline", "--manifest-path"])
-                    .arg(fixture.join("Cargo.toml"));
             } else {
                 command.arg("--version");
             }
@@ -1031,7 +1061,7 @@ pub(super) fn matrix_entry(config: Config) -> io::Result<()> {
                 report["launch"]["lp_desktop"]
             );
             let deferred = report.get("cleanup_deferred").is_some();
-            if index >= 15 {
+            if index >= 14 {
                 eprintln!(
                     "DIAG direct-rng cell={index} result={}",
                     report["rng_probe"]

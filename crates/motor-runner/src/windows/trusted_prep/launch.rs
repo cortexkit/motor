@@ -25,71 +25,18 @@ pub(super) enum DiagnosticPolicy {
     DefaultDacl,
     RestrictedCode,
     DefaultDaclRestrictedCode,
-    FetchDefaultDaclRestrictedCode,
-    /// Fixed offline Cargo fixture under the ordinary write-restricted token.
-    OfflineCargo,
     DefaultDaclProbeFirst,
     DefaultDaclCargoTwice,
     DefaultDaclSafeCwdPair,
     DefaultDaclProcessPrng,
     DefaultDaclBCryptRng,
-    /// Less Privileged AppContainer child with internetClient, registryRead
-    /// and lpacCryptoServices; no restricting SIDs.
-    LowboxLpac,
-    /// Plain AppContainer child with internetClient; the fallback design.
-    LowboxAppContainer,
-    /// LPAC token built with NtCreateLowBoxToken and a caller-created object directory.
-    LowboxSelfToken,
-    /// Plain AppContainer token built through the same self-created directory.
-    LowboxSelfTokenPlain,
-    /// LPAC profile created under motor-prep impersonation with the self-created token path.
-    LowboxSelfTokenProfileLpac,
-    /// Plain AppContainer profile created under motor-prep impersonation with the self-token path.
-    LowboxSelfTokenProfileAppContainer,
-    /// LPAC profile created under the prep user's loaded hive before attribute launch.
-    LowboxProfileLpac,
-    /// Plain AppContainer profile created under the prep user's loaded hive.
-    LowboxProfileAppContainer,
 }
 impl DiagnosticPolicy {
-    /// Some(true) for LPAC, Some(false) for plain AppContainer, None otherwise.
-    pub(super) fn lowbox(self) -> Option<bool> {
-        match self {
-            Self::LowboxLpac
-            | Self::LowboxSelfToken
-            | Self::LowboxSelfTokenProfileLpac
-            | Self::LowboxProfileLpac => Some(true),
-            Self::LowboxAppContainer
-            | Self::LowboxSelfTokenPlain
-            | Self::LowboxSelfTokenProfileAppContainer
-            | Self::LowboxProfileAppContainer => Some(false),
-            _ => None,
-        }
-    }
-    pub(super) fn lowbox_self_token(self) -> bool {
-        matches!(
-            self,
-            Self::LowboxSelfToken
-                | Self::LowboxSelfTokenPlain
-                | Self::LowboxSelfTokenProfileLpac
-                | Self::LowboxSelfTokenProfileAppContainer
-        )
-    }
-    pub(super) fn lowbox_profile(self) -> bool {
-        matches!(
-            self,
-            Self::LowboxProfileLpac
-                | Self::LowboxProfileAppContainer
-                | Self::LowboxSelfTokenProfileLpac
-                | Self::LowboxSelfTokenProfileAppContainer
-        )
-    }
     pub(super) fn changes_default_dacl(self) -> bool {
         matches!(
             self,
             Self::DefaultDacl
                 | Self::DefaultDaclRestrictedCode
-                | Self::FetchDefaultDaclRestrictedCode
                 | Self::DefaultDaclProbeFirst
                 | Self::DefaultDaclCargoTwice
                 | Self::DefaultDaclSafeCwdPair
@@ -98,12 +45,7 @@ impl DiagnosticPolicy {
         )
     }
     pub(super) fn adds_restricted_code(self) -> bool {
-        matches!(
-            self,
-            Self::RestrictedCode
-                | Self::DefaultDaclRestrictedCode
-                | Self::FetchDefaultDaclRestrictedCode
-        )
+        matches!(self, Self::RestrictedCode | Self::DefaultDaclRestrictedCode)
     }
     fn checks_writes(self) -> bool {
         self.changes_default_dacl() || self.adds_restricted_code()
@@ -234,12 +176,7 @@ fn run_plan(
             .collect(),
         restricted,
         diagnostic_policy: policy,
-        // Lowbox and offline-startup probes need an uninstrumented launch.
-        diagnostic_loader_trace: retain_failure
-            && policy.lowbox().is_none()
-            && policy != DiagnosticPolicy::OfflineCargo,
-        // Keep the lowbox variants on the production staging working directory so
-        // the baseline cell does not hide a cwd-related CreateProcessAsUserW failure.
+        diagnostic_loader_trace: retain_failure,
         diagnostic_safe_cwd: policy.rng_mode().is_some(),
         diagnostic_native_calls: retain_failure
             && matches!(
@@ -327,8 +264,8 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
         ));
     }
     session::no_reparse(&plan.root, &plan.cwd)?;
-    // Token controls cannot be used by production fetch. Only fixed offline
-    // diagnostic fixtures may use the fetch variant; all other controls are --version.
+    // Diagnostic token controls accept only restricted Cargo `--version` or the
+    // fixed, hash-verified RNG probe below; they never authorize arbitrary commands.
     let rng_mode = plan.diagnostic_policy.rng_mode();
     if let Some(mode) = rng_mode {
         if !plan.restricted
@@ -353,40 +290,15 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
             ));
         }
     }
-    if plan.diagnostic_policy.lowbox().is_some() {
-        lowbox_plan_allowed(&plan)?;
-    }
     if rng_mode.is_none()
-        && plan.diagnostic_policy.lowbox().is_none()
         && plan.diagnostic_policy != DiagnosticPolicy::None
         && (Path::new(&plan.program) != plan.root.join("prep-toolchain/bin/cargo.exe")
-            || (if plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode {
-                plan.args.len() != 5
-                    || plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]
-                    || Path::new(&plan.args[4])
-                        != plan
-                            .cwd
-                            .join("fetch-manifests/matrix-fixture")
-                            .join("Cargo.toml")
-            } else if plan.diagnostic_policy == DiagnosticPolicy::OfflineCargo {
-                let cargo_home = plan.cwd.join("fetch-temp/offline-cargo-home");
-                plan.args.len() != 5
-                    || plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]
-                    || Path::new(&plan.args[4])
-                        != plan.cwd.join("fetch-manifests/offline-cargo/Cargo.toml")
-                    || plan.env.get("CARGO_NET_OFFLINE") != Some(&Some("true".to_owned()))
-                    || plan.env.get("CARGO_REGISTRIES_CRATES_IO_PROTOCOL")
-                        != Some(&Some("sparse".to_owned()))
-                    || plan.env.get("CARGO_HOME")
-                        != Some(&Some(cargo_home.to_string_lossy().into_owned()))
-            } else {
-                plan.args != ["--version"]
-            })
+            || plan.args != ["--version"]
             || !plan.restricted)
     {
         return Err(step(
             "diagnostic-policy",
-            format!("controls are limited to restricted Cargo version or the fixed offline fixture; actual_args={:?}; expected_manifest={:?}",plan.args,plan.cwd.join("fetch-manifests/matrix-fixture").join("Cargo.toml")),
+            format!("token diagnostic controls are limited to restricted Cargo --version; actual_args={:?}", plan.args),
         ));
     }
     let mut report = json!({"phase":"session-setup", "program":plan.program, "arguments":plan.args,
@@ -610,68 +522,6 @@ pub(super) fn entry(arguments: &[String]) -> io::Result<()> {
 
 pub(super) fn probe_context() -> io::Result<Value> {
     session::probe_context()
-}
-/// Lowbox diagnostics may run only the trusted probe copy in its fixed lowbox
-/// mode, or a real online Cargo fetch (production arguments) of the fixed lowbox fixture.
-fn lowbox_plan_allowed(plan: &Plan) -> io::Result<()> {
-    let probe = plan.cwd.join("fetch-manifests/probe.exe");
-    let manifest = plan.cwd.join("fetch-manifests/lowbox-fixture/Cargo.toml");
-    let probe_ok = Path::new(&plan.program) == probe
-        && plan.args.len() == 5
-        && plan.args[..2] == ["prep-probe", "lowbox"]
-        && Path::new(&plan.args[4]).parent() == Some(plan.cwd.join("fetch-temp").as_path());
-    let fetch_ok = Path::new(&plan.program) == plan.root.join("prep-toolchain/bin/cargo.exe")
-        && plan.args.len() == 6
-        && plan.args[..5]
-            == [
-                "fetch",
-                "--locked",
-                "--target",
-                "x86_64-pc-windows-msvc",
-                "--manifest-path",
-            ]
-        && Path::new(&plan.args[5]) == manifest;
-    if plan.restricted || !(probe_ok || fetch_ok) {
-        return Err(step(
-            "lowbox-diagnostic-policy",
-            format!("only the trusted lowbox probe or the fixed lowbox fixture fetch may use this variant; actual_args={:?}", plan.args),
-        ));
-    }
-    if probe_ok {
-        use sha2::{Digest, Sha256};
-        if Sha256::digest(fs::read(&plan.program)?)
-            != Sha256::digest(fs::read(std::env::current_exe()?)?)
-        {
-            return Err(step(
-                "lowbox-diagnostic-policy",
-                "probe does not match trusted runner",
-            ));
-        }
-    }
-    Ok(())
-}
-pub(super) fn appcontainer_context() -> Value {
-    session::appcontainer_context()
-}
-pub(super) fn appcontainer_package_sid() -> io::Result<String> {
-    session::appcontainer_package_sid()
-}
-pub(super) fn lowbox_prechecks(config: &Config) -> io::Result<Value> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let token = token(root)?;
-    session::lowbox_prechecks(token.0)
-}
-pub(super) fn appcontainer_profile_folder(package_sid: &str) -> io::Result<String> {
-    session::appcontainer_profile_folder(package_sid)
-}
-pub(super) fn appcontainer_registry_probe(package_sid: &str, leaf: &str) -> Value {
-    session::appcontainer_registry_probe(package_sid, leaf)
-}
-pub(super) fn current_appcontainer_package_sid() -> io::Result<String> {
-    session::current_appcontainer_package_sid()
-}
-pub(super) fn path_dacl_sddl(path: &Path) -> io::Result<String> {
-    session::path_dacl_sddl(path)
 }
 pub(super) fn check_path(root: &Path, path: &Path) -> io::Result<()> {
     session::no_reparse(root, path)

@@ -2,14 +2,12 @@
 param([string]$Root = 'C:\ProgramData\MotorRunner', [Parameter(Mandatory)][string]$Python,
       [switch]$PrepLaunchMatrix,
       [switch]$AccessChecksOnly,
-      [switch]$LowboxLaunch,
       [switch]$OfflineCargoOnly,
       [string]$Evidence = ('C:\motor-runner-evidence\' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($AccessChecksOnly -and -not $PrepLaunchMatrix) { throw 'AccessChecksOnly requires PrepLaunchMatrix' }
-if ($LowboxLaunch -and (-not $PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'LowboxLaunch requires PrepLaunchMatrix and excludes AccessChecksOnly' }
-if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly -or $LowboxLaunch)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
+if ($OfflineCargoOnly -and ($PrepLaunchMatrix -or $AccessChecksOnly)) { throw 'OfflineCargoOnly is a separate diagnostic lane' }
 if ($Root -cne 'C:\ProgramData\MotorRunner' -or $Evidence -notmatch '^C:\\motor-runner-evidence\\[A-Za-z0-9-]+$') { throw 'Use the owned runner root and a dedicated external evidence directory' }
 $Python = (Resolve-Path -LiteralPath $Python).Path
 if (Test-Path -LiteralPath $Evidence) { throw 'Fresh evidence directory required' }
@@ -19,7 +17,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot protect evidence directory' }
 $wrapper = "$Evidence\run.cmd"
 $diagnosticArgument = if ($PrepLaunchMatrix) { ' -PrepLaunchMatrix' } else { '' }
 if ($AccessChecksOnly) { $diagnosticArgument += ' -AccessChecksOnly' }
-if ($LowboxLaunch) { $diagnosticArgument += ' -LowboxLaunch' }
 if ($OfflineCargoOnly) { $diagnosticArgument += ' -OfflineCargoOnly' }
 @"
 @echo off

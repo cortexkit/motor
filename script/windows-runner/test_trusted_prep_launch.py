@@ -51,9 +51,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("CloseWindowStation", self.session)
         self.assertCodeIn("window station must be non-interactive", self.session)
         self.assertCodeIn("LABEL_SECURITY_INFORMATION", self.session)
-        # Production desktops stay Medium; only a lowbox diagnostic (package SID
-        # present) labels them Low for its Low-integrity child.
-        self.assertCodeIn('descriptor(if package.is_some() { "S:(ML;;NW;;;LW)" } else { "S:(ML;;NW;;;ME)" })', self.session)
+        self.assertCodeIn('let label = descriptor("S:(ML;;NW;;;ME)")?', self.session)
         self.assertCodeIn("logon == user_sid", self.session)
 
     def test_profile_and_noninherited_user_environment_have_cleanup(self):
@@ -75,10 +73,7 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("copy_tree(&source, &cache.join(name))", self.prep)
         self.assertCodeIn("launch::check_path(&vm.layout_root, &source)", self.prep)
         control = (HERE / "hyperv.ps1").read_text()
-        # The grants loop over the account SID and, for lowbox diagnostics only,
-        # the package SID; the persistent cache stays Read for both.
-        self.assertCodeIn('$trustees = @($sid) + @($PackageSid | Where-Object { $_ })', control)
-        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" Read $trustee', control)
+        self.assertCodeIn('Grant "$Root\\state\\ally\\prep-cargo" Read $sid', control)
         self.assertNotIn('prep-cargo" Modify', control)
 
     def test_explicit_stdio_handle_list_and_suspended_job_assignment(self):
@@ -149,36 +144,35 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn("return", matrix)
         self.assertNotIn("Get-FileHash", matrix)
 
-    def test_offline_cargo_diagnostic_is_separate_and_keeps_lowbox_out(self):
+    def test_offline_cache_diagnostic_compares_archive_and_index_inputs_as_system(self):
         wrapper = (HERE / "run-system.ps1").read_text()
         qualify = (HERE / "qualify.ps1").read_text()
         main = (ROOT / "crates/motor-runner/src/main.rs").read_text()
         library = (ROOT / "crates/motor-runner/src/lib.rs").read_text()
         windows = (ROOT / "crates/motor-runner/src/windows.rs").read_text()
         self.assertCodeIn("[switch]$OfflineCargoOnly", wrapper)
-        self.assertCodeIn("$PrepLaunchMatrix -or $AccessChecksOnly -or $LowboxLaunch", wrapper)
+        self.assertCodeIn("$PrepLaunchMatrix -or $AccessChecksOnly", wrapper)
         self.assertCodeIn('"qualify-prep-offline-cargo" => motor_runner::hyperv_qualify_prep_offline_cargo(config)', main)
         self.assertCodeIn("pub fn hyperv_qualify_prep_offline_cargo", library)
         self.assertCodeIn("trusted_prep::offline_cargo_entry(config)", windows)
         offline = qualify.split("if ($OfflineCargoOnly)", 1)[1].split('$parent = "$Root', 1)[0]
         self.assertCodeIn("Runner-Check 'qualify-prep-offline-cargo'", offline)
         self.assertCodeIn("Copy-QualificationEvidence", offline)
-        self.assertNotIn("LowboxLaunch", offline)
+        self.assertNotIn("motor-prep", offline)
 
-    def test_offline_cargo_probe_reports_the_sparse_index_and_lockfile_archive(self):
-        self.assertCodeIn('"registry/index/<registry-id>/.cache/3/c/cfg-if"', self.prep)
-        self.assertCodeIn('"registry/cache/<registry-id>/cfg-if-1.0.4.crate"', self.prep)
-        self.assertCodeIn('"checksum_matches_lockfile": matches', self.prep)
-        self.assertCodeIn('"CARGO_NET_OFFLINE": "true"', self.prep)
+    def test_offline_cargo_diagnostic_captures_real_index_bytes_and_tests_three_cache_layouts(self):
+        self.assertCodeIn('"sparse_index_cache_entries_named_cfg_if": sparse_entries', self.prep)
+        self.assertCodeIn('"contents_hex_up_to_64_kib": hex_evidence(&bytes)', self.prep)
+        self.assertCodeIn('"prefix_escaped_first_96_bytes": format!', self.prep)
+        self.assertCodeIn('"crate_archive_only", false, false', self.prep)
+        self.assertCodeIn('"archive_plus_registry_config_no_sparse_cache", true, false', self.prep)
+        self.assertCodeIn('"complete_cargo_seed", true, true', self.prep)
+        self.assertCodeIn('"actor": "SYSTEM runner; Cargo runs only as SYSTEM in this diagnostic"', self.prep)
+        self.assertCodeIn('"restricted_motor_prep_cargo_launch_attempted": false', self.prep)
         self.assertCodeIn('"fetch", "--locked", "--offline", "--manifest-path"', self.prep)
         self.assertCodeIn('"fetch", "--locked", "--manifest-path"', self.prep)
-        self.assertCodeIn('launch::DiagnosticPolicy::OfflineCargo', self.prep)
-        self.assertCodeIn("cargo did not start", self.prep)
-        self.assertCodeIn("output_mentions_ksecdd", self.prep)
-        self.assertCodeIn("exit_code_looks_like_ntstatus", self.prep)
-        self.assertCodeIn("&& policy != DiagnosticPolicy::OfflineCargo", self.launch)
-        self.assertCodeIn("CARGO_NET_OFFLINE", self.launch)
-        self.assertCodeIn("offline-cargo-home", self.launch)
+        self.assertNotIn('DiagnosticPolicy::OfflineCargo', self.launch)
+        self.assertNotIn('offline-cargo-home', self.launch)
 
     def test_default_dacl_change_is_diagnostic_only_with_actual_readbacks(self):
         self.assertCodeIn("if plan.diagnostic_policy.changes_default_dacl()", self.session)
@@ -191,14 +185,13 @@ class TrustedPrepLaunchTests(unittest.TestCase):
         self.assertCodeIn('wide("S-1-5-12")', self.session)
         self.assertCodeIn("plan.diagnostic_policy.adds_restricted_code()", self.session)
 
-    def test_fetch_matrix_cell_is_fixed_offline_fixture_not_arbitrary_fetch(self):
-        for name in ("cargo-version-logon-default-dacl-diagnostic-only", "cargo-version-logon-and-restricted-code-diagnostic-only", "cargo-version-logon-restricted-code-default-dacl-diagnostic-only", "cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only"):
+    def test_prep_matrix_does_not_try_an_offline_restricted_token_fetch(self):
+        for name in ("cargo-version-logon-default-dacl-diagnostic-only", "cargo-version-logon-and-restricted-code-diagnostic-only", "cargo-version-logon-restricted-code-default-dacl-diagnostic-only"):
             self.assertCodeIn(name, self.prep)
-        self.assertCodeIn("plan.diagnostic_policy == DiagnosticPolicy::FetchDefaultDaclRestrictedCode", self.launch)
-        self.assertCodeIn('plan.args[..4] != ["fetch", "--locked", "--offline", "--manifest-path"]', self.launch)
-        self.assertCodeIn('Path::new(&plan.args[4]) != plan.cwd.join("fetch-manifests/matrix-fixture").join("Cargo.toml")', self.launch)
-        self.assertCodeIn('command.args(["fetch", "--locked", "--offline", "--manifest-path"])', self.prep)
-        self.assertCodeIn('command.env("RUSTC", &rustc)', self.prep)
+        matrix = self.prep.split("pub(super) fn matrix_entry(", 1)[1]
+        self.assertNotIn("cargo-fetch-logon-restricted-code-default-dacl-diagnostic-only", matrix)
+        self.assertNotIn('args(["fetch", "--locked", "--offline", "--manifest-path"])', matrix)
+        self.assertCodeIn('command.env("RUSTC", &rustc)', matrix)
 
     def test_write_probe_uses_the_same_session_and_records_allowed_writes_too(self):
         self.assertCodeIn("diagnostic_write_probe(&plan, &context", self.launch)

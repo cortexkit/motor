@@ -4,11 +4,7 @@ param(
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
     [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960, [string]$Staging,
-    [switch]$LightweightHarvest,
-    # Diagnostic lowbox cells only: an AppContainer package SID that receives
-    # the same prep roles as the account, and whether RevokePrep also removes
-    # its persistent Read grants on the Cargo inputs and toolchain.
-    [string]$PackageSid, [switch]$IncludePersistentPackage
+    [switch]$LightweightHarvest
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -196,36 +192,20 @@ switch ($Operation) {
         $full = [IO.Path]::GetFullPath($Staging)
         if ([IO.Path]::GetDirectoryName($full) -cne $parentStage -or [IO.Path]::GetFileName($full) -notmatch '^[0-9a-f-]{36}$') { throw 'Staging must name one owned job' }
         $sid = (Get-LocalUser motor-prep).SID.Value
-        # An AppContainer package SID is S-1-15-2 followed by seven sub-authorities.
-        if ($PackageSid -and $PackageSid -notmatch '\AS-1-15-2(-\d+){7}\z') { throw 'PackageSid must be one AppContainer package SID' }
-        if ($IncludePersistentPackage -and (-not $PackageSid -or $Operation -ne 'RevokePrep')) { throw 'IncludePersistentPackage needs RevokePrep and PackageSid' }
-        $trustees = @($sid) + @($PackageSid | Where-Object { $_ })
         if ($Operation -eq 'RevokePrep') {
-            foreach ($trustee in $trustees) {
-                foreach ($path in @($full, "$full\fetch-manifests", "$full\fetch-git-deps", "$full\home", "$full\fetch-temp")) {
-                    if (Test-Path -LiteralPath $path) {
-                        & icacls.exe $path /remove:g "*$trustee" /Q | Out-Null
-                        if ($LASTEXITCODE -ne 0) { throw "Prep ACL revocation failed at $path" }
-                    }
-                }
-            }
-            if ($IncludePersistentPackage) {
-                foreach ($path in @("$Root\state\ally\prep-cargo", "$Root\prep-toolchain")) {
-                    if (Test-Path -LiteralPath $path) {
-                        & icacls.exe $path /remove:g "*$PackageSid" /Q | Out-Null
-                        if ($LASTEXITCODE -ne 0) { throw "Package ACL revocation failed at $path" }
-                    }
+            foreach ($path in @($full, "$full\fetch-manifests", "$full\fetch-git-deps", "$full\home", "$full\fetch-temp")) {
+                if (Test-Path -LiteralPath $path) {
+                    & icacls.exe $path /remove:g "*$sid" /Q | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "Prep ACL revocation failed at $path" }
                 }
             }
             break
         }
-        foreach ($trustee in $trustees) {
-            Grant $full Stage $trustee
-            foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" Read $trustee }
-            Grant "$full\fetch-temp" Modify $trustee
-            Grant "$Root\state\ally\prep-cargo" Read $trustee
-            Grant "$Root\prep-toolchain" Read $trustee
-        }
+        Grant $full Stage $sid
+        foreach ($name in @('fetch-manifests','fetch-git-deps','home')) { Grant "$full\$name" Read $sid }
+        Grant "$full\fetch-temp" Modify $sid
+        Grant "$Root\state\ally\prep-cargo" Read $sid
+        Grant "$Root\prep-toolchain" Read $sid
     }
     'Prepare' {
         if ($Nonce -notmatch '\A[0-9a-f]{32}\z') { throw 'Nonce must be exactly 32 hexadecimal characters, without hyphens, BOM or newline' }
