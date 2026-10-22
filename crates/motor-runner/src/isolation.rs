@@ -320,6 +320,36 @@ fn grant_read_only_tree_as(path: &Path, inherit: bool, user: &str) -> io::Result
     Ok(())
 }
 
+/// Leaves the job account read and search access to a sibling snapshot tree,
+/// and no write access through any ACL entry or mode bit. Unlike
+/// `grant_read_only_tree_as`, this always rewrites the ACLs: that function
+/// only adds a read grant, keeps any write grant already present, and skips
+/// the grant entirely when mode bits allow reading, even on a 0666 entry.
+/// Every extended entry, including default ACLs, is removed first, since
+/// nothing adds content to a published snapshot. Group and other write bits
+/// are then cleared: with no ACL left, the group bits are the owning group's
+/// real permissions rather than an ACL mask. Last, the job account gets `rX`
+/// and the mask caps every named and group entry at `rX`.
+pub(crate) fn restrict_sibling_snapshot_access(path: &Path) -> io::Result<()> {
+    if !path_is_directory_without_following(path)? {
+        return Err(io::Error::other(format!(
+            "sibling snapshot directory is missing: {}",
+            path.display()
+        )));
+    }
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-b", "-k", "--"])
+            .arg(path),
+    )?;
+    crate::sibling_snapshots::store::remove_group_and_other_write(path)?;
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-m", &format!("u:{USER}:rX,m::rX"), "--"])
+            .arg(path),
+    )
+}
+
 fn optional_regular_file(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::other(format!(

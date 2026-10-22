@@ -6,9 +6,14 @@
 //! jobs mount a read-only copy at P, and P is only ever a main workspace.
 //!
 //! This module holds the parts that change no behaviour yet: the mode
-//! predicates and the snapshot key. Nothing creates, mounts or removes
-//! snapshots while `Config::sibling_snapshot_mode` is false, and production
-//! builds keep it false; only tests override it.
+//! predicates, the snapshot key and the store that creates snapshots. Nothing
+//! creates, mounts or removes snapshots while `Config::sibling_snapshot_mode`
+//! is false, and production builds keep it false; only tests override it.
+
+pub(crate) mod store;
+
+#[cfg(test)]
+pub(crate) use store::AccessHook;
 
 use crate::engine::Config;
 use sha2::{Digest, Sha256};

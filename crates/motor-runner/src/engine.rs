@@ -187,6 +187,11 @@ pub struct Config {
     /// Replaces `in_place_siblings()`, independently of the snapshot mode.
     #[cfg(test)]
     pub(crate) in_place_siblings_override: Option<bool>,
+    /// Replaces the job-account ACL step of sibling snapshot creation, which
+    /// needs setfacl and the motor-job account, so portable fixtures can
+    /// create snapshots.
+    #[cfg(test)]
+    pub(crate) sibling_snapshot_access: Option<crate::sibling_snapshots::AccessHook>,
     #[cfg(test)]
     pub(crate) accounting_report: Option<AccountingReportHook>,
     #[cfg(test)]
@@ -368,6 +373,8 @@ impl Config {
             sibling_snapshot_mode_override: None,
             #[cfg(test)]
             in_place_siblings_override: None,
+            #[cfg(test)]
+            sibling_snapshot_access: None,
             #[cfg(test)]
             accounting_report: None,
             #[cfg(test)]
