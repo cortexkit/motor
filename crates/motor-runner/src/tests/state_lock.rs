@@ -472,7 +472,14 @@ impl SaveFixture {
     }
 
     fn job(&self, id: Uuid) -> Option<Job> {
-        self.runner.core.inner.lock().unwrap().jobs.get(&id).cloned()
+        self.runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .cloned()
     }
 
     /// Tick until `done` holds, as the background scheduler would.
@@ -557,10 +564,7 @@ fn admission_save_holds_no_lock_and_keeps_its_queue_slot() {
     };
     assert!(f.hold.held());
     drop(held);
-    assert!(matches!(
-        duplicate.join().unwrap(),
-        Admission::Duplicate
-    ));
+    assert!(matches!(duplicate.join().unwrap(), Admission::Duplicate));
     let saved: Job = read_json(&f.runner.record_path(id)).unwrap();
     assert_eq!(saved.state, JobState::AwaitingBundles);
     assert_eq!(f.job(id).unwrap().state, JobState::AwaitingBundles);
@@ -579,8 +583,7 @@ fn queued_save_holds_no_lock_and_publishes_only_once_durable() {
     let upload = f.fixture.spool(&f.runner, &request, &bytes);
     let directory = upload.directory.clone();
     f.hold_save(id, Saved::Admitted);
-    let held =
-        f.hold_in(move |runner| runner.fetch_run(&request, &directory, true).unwrap());
+    let held = f.hold_in(move |runner| runner.fetch_run(&request, &directory, true).unwrap());
     f.assert_unrelated_requests_complete();
     let runner = f.runner.clone();
     completes("a dispatch pass", move || runner.tick().unwrap());
@@ -619,12 +622,21 @@ fn setup_save_holds_no_lock_and_keeps_the_reservation() {
     let runner = f.runner.clone();
     completes("a dispatch pass", move || runner.tick().unwrap());
     {
-        let inner = f.runner.core.inner.lock().unwrap();
-        assert_eq!(inner.starting, BTreeSet::from([first.job_id]));
-        assert!(inner.reserved.contains_key(&first.workspace_key));
+        // Read under the lock, but assert after releasing it: a failed
+        // assertion must not poison the lock for the teardown.
+        let (starting, reserved, held_weight, weight) = {
+            let inner = f.runner.core.inner.lock().unwrap();
+            (
+                inner.starting.clone(),
+                inner.reserved.contains_key(&first.workspace_key),
+                Runner::held_weight(&inner),
+                inner.jobs[&first.job_id].weight,
+            )
+        };
+        assert_eq!(starting, BTreeSet::from([first.job_id]));
+        assert!(reserved);
         assert_eq!(
-            Runner::held_weight(&inner),
-            inner.jobs[&first.job_id].weight,
+            held_weight, weight,
             "the held job's permits were granted once"
         );
     }
@@ -658,10 +670,17 @@ fn started_save_holds_no_lock_and_keeps_the_gate_closed() {
     let runner = f.runner.clone();
     completes("a dispatch pass", move || runner.tick().unwrap());
     {
-        let inner = f.runner.core.inner.lock().unwrap();
-        assert_eq!(inner.starting, BTreeSet::from([id]));
-        assert!(inner.reserved.contains_key(&first.workspace_key));
-        assert_eq!(inner.jobs[&id].state, JobState::Queued);
+        let (starting, reserved, state) = {
+            let inner = f.runner.core.inner.lock().unwrap();
+            (
+                inner.starting.clone(),
+                inner.reserved.contains_key(&first.workspace_key),
+                inner.jobs[&id].state,
+            )
+        };
+        assert_eq!(starting, BTreeSet::from([id]));
+        assert!(reserved);
+        assert_eq!(state, JobState::Queued);
     }
     assert!(
         !f.runner
@@ -673,7 +692,10 @@ fn started_save_holds_no_lock_and_keeps_the_gate_closed() {
     );
     // Only Linux launches hold the command behind a gate.
     #[cfg(target_os = "linux")]
-    assert!(!marker.exists(), "the command ran before its start was durable");
+    assert!(
+        !marker.exists(),
+        "the command ran before its start was durable"
+    );
     drop(held);
     f.tick_until("both jobs finish in turn", |f| {
         f.terminal(id).is_some() && f.terminal(second.job_id).is_some()
@@ -739,7 +761,10 @@ fn finish_catalog_save_holds_no_lock_and_precedes_the_terminal() {
     drop(held);
     assert!(poll(Duration::from_secs(30), || f.terminal(id).is_some()));
     let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
-    assert_eq!(saved.workspaces[&request.workspace_key].used_ms, finished_ms);
+    assert_eq!(
+        saved.workspaces[&request.workspace_key].used_ms,
+        finished_ms
+    );
 }
 
 /// Maintenance writes the catalog without the state lock.
@@ -766,10 +791,7 @@ fn prepare_catalog_save_holds_no_lock_and_keeps_the_reservation() {
     f.hold.arm();
     let held = f.hold_in(move |runner| runner.prepare(&prepare, true).unwrap());
     f.assert_unrelated_requests_complete();
-    assert!(Runner::occupied(
-        &f.runner.core.inner.lock().unwrap(),
-        &key
-    ));
+    assert!(Runner::occupied(&f.runner.core.inner.lock().unwrap(), &key));
     drop(held);
     assert!(!Runner::occupied(
         &f.runner.core.inner.lock().unwrap(),
