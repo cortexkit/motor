@@ -82,10 +82,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         #[cfg(windows)]
         "qualify-prep-local-registry" => motor_runner::hyperv_qualify_prep_local_registry(config),
         #[cfg(windows)]
-        "qualify-disconnect" => {
-            let runner = Runner::open(config)?;
-            motor_runner::hyperv_qualify_disconnect(runner.config())
-        }
+        "qualify-disconnect" => motor_runner::hyperv_qualify_disconnect(config),
         "drain" | "resume" => {
             use motor_protocol::*;
             let resume = operation == "resume";

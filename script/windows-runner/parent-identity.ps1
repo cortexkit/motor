@@ -228,3 +228,35 @@ function Confirm-RunnerParentVerification([string]$Parent, [string]$ParentSha256
     # Every service start rehashes, even if the previous start left a record.
     return Write-RunnerParentVerification $Parent $ParentSha256 $Record $HashEvidence
 }
+
+function Reuse-RunnerParentVerification([string]$Parent, [string]$ParentSha256, [string]$Record) {
+    $recordGuard = $null
+    $parentGuard = $null
+    try {
+        $recordGuard = [Motor.ParentFile]::Open($Record)
+        Assert-RunnerFileAcl $recordGuard
+        $reader = [IO.StreamReader]::new($recordGuard, [Text.Encoding]::UTF8)
+        try { $verified = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        if ($verified.schema -ne 2 -or $verified.parent -cne [IO.Path]::GetFullPath($Parent) -or $verified.sha256 -ine $ParentSha256) {
+            throw 'Verification record does not match configured parent'
+        }
+        $parentGuard = [Motor.ParentFile]::Open($Parent)
+        Assert-RunnerFileAcl $parentGuard -ParentFile
+        $identity = Get-RunnerParentIdentity $parentGuard
+        if ($identity.read_only -cne 'True') { throw 'Parent is no longer read-only' }
+        foreach ($key in $identity.Keys) {
+            if ($identity[$key] -cne $verified.identity.$key) { throw "Parent identity differs: $key" }
+        }
+        # Qualification runs with the service stopped, so it uses ChangeTime to
+        # detect a same-size rewrite that restores LastWriteTime. Normal per-job
+        # checks omit it because Hyper-V may rewrite an identical ACL.
+        $changeTime = [Motor.ParentFile]::ChangeTime($parentGuard).ToString([Globalization.CultureInfo]::InvariantCulture)
+        if ($changeTime -cne [string]$verified.change_time_filetime) { throw 'Parent ChangeTime changed after verification' }
+        return @{cache_hit=$true; hash_duration_ms=0; change_time_filetime=$changeTime}
+    } catch {
+        throw "parent changed since verification; restart the service to re-verify: $_"
+    } finally {
+        if ($parentGuard) { $parentGuard.Dispose() }
+        if ($recordGuard) { $recordGuard.Dispose() }
+    }
+}

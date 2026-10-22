@@ -122,6 +122,12 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             $rejected = $true
         }
         if (-not $rejected) { throw "FAIL $Name : changed parent was accepted" }
+        $reuseRejected = $false
+        try { $null = Reuse-RunnerParentVerification $Parent $ParentSha256 $record } catch {
+            if ([string]$_ -notlike '*parent changed since verification; restart the service to re-verify*') { throw }
+            $reuseRejected = $true
+        }
+        if (-not $reuseRejected) { throw "FAIL $Name : reused parent record accepted" }
         Write-Host "PASS $Name"
         $script:count++
     }
@@ -134,6 +140,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         if ($verification.cache_hit) { throw 'FAIL parent-identity-record-written: missing record did not require verification' }
         if (-not (Test-Path -LiteralPath $record)) { throw 'FAIL parent-identity-record-written' }
         Write-Host 'PASS parent-identity-record-written'
+        $count++
+        $verification = Reuse-RunnerParentVerification $Parent $ParentSha256 $record
+        if (-not $verification.cache_hit -or $verification.hash_duration_ms -ne 0) { throw 'FAIL parent-identity-reuses-valid-record-without-hashing' }
+        Write-Host 'PASS parent-identity-reuses-valid-record-without-hashing'
         $count++
         $hashEvent = Get-Content -LiteralPath $hashLog -Raw | ConvertFrom-Json
         if ($hashEvent.event -ne 'parent-sha256' -or -not $hashEvent.hash_matches_configuration -or $hashEvent.hash_duration_ms -lt 0 -or -not $hashEvent.change_time_filetime) { throw 'FAIL parent-identity-startup-hash-duration-logged' }
@@ -227,11 +237,41 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $parentGuard.Dispose(); $parentGuard = $null
         Write-Host 'PASS parent-identity-accepts-changetime-only-update'
         $count++
+
+        $changeProbe = Join-Path $fixture 'same-size-change-probe.bin'
+        [IO.File]::WriteAllText($changeProbe, 'original', [Text.UTF8Encoding]::new($false))
+        $probe = [Motor.ParentFile]::Open($changeProbe)
+        $probeBefore = [Motor.ParentFile]::ChangeTime($probe)
+        $probe.Dispose()
+        $probeLastWrite = [IO.File]::GetLastWriteTimeUtc($changeProbe)
+        $probeAfter = $probeBefore
+        $probeClock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $contents = if (([IO.File]::ReadAllText($changeProbe) -ceq 'original')) { 'modified' } else { 'original' }
+            [IO.File]::WriteAllText($changeProbe, $contents, [Text.UTF8Encoding]::new($false))
+            [IO.File]::SetLastWriteTimeUtc($changeProbe, $probeLastWrite)
+            $probe = [Motor.ParentFile]::Open($changeProbe)
+            $probeAfter = [Motor.ParentFile]::ChangeTime($probe)
+            $probe.Dispose()
+            if ($probeAfter -gt $probeBefore) { break }
+            Start-Sleep -Milliseconds 25
+        } while ($probeClock.ElapsedMilliseconds -lt 2000)
+        if ($probeAfter -le $probeBefore) { throw 'FAIL parent-identity-change-time-detects-same-size-rewrite-restored-lastwrite' }
+        Write-Host 'PASS parent-identity-change-time-detects-same-size-rewrite-restored-lastwrite'
+        $count++
         $lifetimeGuard.Dispose(); $lifetimeGuard = $null
 
         # The active service guard blocks in-place writes. After service stop,
-        # the next startup hash catches a same-size rewrite that restores LastWrite.
+        # record reuse also checks ChangeTime before trusting the saved digest.
         Set-FixtureParent 'modified' $lastWrite
+        $denied = $false
+        try { $null = Reuse-RunnerParentVerification $Parent $ParentSha256 $record } catch {
+            if ([string]$_ -notlike '*parent changed since verification; restart the service to re-verify*') { throw }
+            $denied = $true
+        }
+        if (-not $denied) { throw 'FAIL parent-identity-reuse-rejects-same-size-rewrite-restored-lastwrite' }
+        Write-Host 'PASS parent-identity-reuse-rejects-same-size-rewrite-restored-lastwrite'
+        $count++
         $denied = $false
         try { $null = Confirm-RunnerParentVerification $Parent $ParentSha256 $record $hashLog } catch {
             if ([string]$_ -notlike '*parent SHA-256 mismatch*') { throw }

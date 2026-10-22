@@ -119,6 +119,7 @@ pub fn hyperv_qualify_prep_local_registry(config: Config) -> std::io::Result<()>
 }
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_qualify_disconnect(config: &Config) -> std::io::Result<()> {
-    windows::qualify_disconnect(config)
+pub fn hyperv_qualify_disconnect(config: Config) -> std::io::Result<()> {
+    let runner = Runner::open_for_qualification(config)?;
+    windows::qualify_disconnect(runner.config())
 }

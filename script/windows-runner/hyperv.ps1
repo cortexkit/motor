@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
     [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960,
-    [switch]$LightweightHarvest
+    [switch]$LightweightHarvest, [switch]$ReuseVerifiedParent
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -176,11 +176,19 @@ switch ($Operation) {
         }
         if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
         $started = [Diagnostics.Stopwatch]::StartNew()
-        try { $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $parentRecord "$Root\evidence\parent-verification.jsonl" } catch {
-            Evidence 'parent-verification' 'startup-parent-verification-failed' @{elapsed_ms=$started.Elapsed.TotalMilliseconds; error=[string]$_}
+        try {
+            if ($ReuseVerifiedParent) {
+                $verification = Reuse-RunnerParentVerification $Parent $ParentSha256 $parentRecord
+            } else {
+                $verification = Confirm-RunnerParentVerification $Parent $ParentSha256 $parentRecord "$Root\evidence\parent-verification.jsonl"
+            }
+        } catch {
+            Evidence 'parent-verification' 'startup-parent-verification-failed' @{elapsed_ms=$started.Elapsed.TotalMilliseconds; reused_record=[bool]$ReuseVerifiedParent; error=[string]$_}
             throw
         } finally { $started.Stop() }
-        Evidence 'parent-verification' 'startup-parent-verification' $verification
+        $verificationEvent = 'startup-parent-verification'
+        if ($ReuseVerifiedParent) { $verificationEvent = 'startup-parent-verification-reused' }
+        Evidence 'parent-verification' $verificationEvent $verification
         Write-Output "PASS native-host-validation cache_hit=$($verification.cache_hit) hash_duration_ms=$($verification.hash_duration_ms)"
     }
     'Prepare' {

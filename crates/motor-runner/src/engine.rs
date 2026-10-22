@@ -752,6 +752,16 @@ fn private_state_directory(path: &Path) -> io::Result<()> {
 }
 
 impl Runner {
+    #[cfg(windows)]
+    pub(crate) fn open_for_qualification(config: Config) -> io::Result<Self> {
+        // The qualification command runs with the service stopped. Its protected
+        // record is checked against identity and ChangeTime while Runner::open
+        // holds a no-write/delete parent handle, avoiding a second large hash.
+        config
+            .windows_runtime
+            .reuse_parent_verification_for_qualification();
+        Self::open(config)
+    }
     /// Opening a table performs crash recovery before any channel is served.
     /// An exclusive instance lock prevents a second daemon from recovering live jobs.
     pub fn open(config: Config) -> io::Result<Self> {

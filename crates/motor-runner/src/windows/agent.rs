@@ -22,6 +22,8 @@ pub(crate) struct Runtime {
     // deny parent writes/deletion even between their individual control calls.
     #[cfg(windows)]
     pub(super) parent_guard: Mutex<Option<(PathBuf, fs::File)>>,
+    #[cfg(windows)]
+    reuse_parent_verification: AtomicBool,
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
@@ -29,6 +31,15 @@ pub(crate) struct Runtime {
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    #[cfg(windows)]
+    pub(crate) fn reuse_parent_verification_for_qualification(&self) {
+        self.reuse_parent_verification
+            .store(true, Ordering::Release);
+    }
+    #[cfg(windows)]
+    pub(crate) fn reuses_parent_verification(&self) -> bool {
+        self.reuse_parent_verification.load(Ordering::Acquire)
+    }
     #[cfg(test)]
     pub(crate) fn output_blocked(&self, id: Uuid) -> bool {
         self.jobs
