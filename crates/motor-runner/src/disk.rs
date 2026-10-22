@@ -22,6 +22,9 @@ struct Candidate {
     workspace: Option<String>,
     last_used_ms: u64,
     cache_disk: bool,
+    /// An unreferenced sibling snapshot, deleted by the snapshot deletion
+    /// protocol rather than removed in place.
+    snapshot: bool,
 }
 
 // Caches used in the last half hour are likely to be reused; deleting them costs a cold rebuild.
@@ -425,6 +428,7 @@ impl Runner {
                 workspace: Some(key.clone()),
                 last_used_ms: workspace.used_ms,
                 cache_disk: false,
+                snapshot: false,
             });
         }
         // These are the runner's actual upload, deletion and launch staging
@@ -486,6 +490,7 @@ impl Runner {
                         workspace: None,
                         last_used_ms,
                         cache_disk: false,
+                        snapshot: false,
                     });
                 }
             }
@@ -498,6 +503,7 @@ impl Runner {
                         path: fleet,
                         workspace: None,
                         cache_disk: false,
+                        snapshot: false,
                         last_used_ms: metadata
                             .modified()?
                             .duration_since(UNIX_EPOCH)
@@ -508,7 +514,142 @@ impl Runner {
             }
         }
         candidates.sort_by(|a, b| (a.last_used_ms, &a.path).cmp(&(b.last_used_ms, &b.path)));
-        Ok(candidates)
+        // Unreferenced sibling snapshots go first, least recently used
+        // first: a snapshot is rebuilt from the mirror in one setup, while a
+        // workspace loses its build target.
+        let mut snapshots = self.snapshot_disk_candidates(inner);
+        snapshots.extend(candidates);
+        Ok(snapshots)
+    }
+
+    /// Every sibling snapshot that nothing references, least recently used
+    /// first. A listing failure leaves snapshots out rather than stopping
+    /// the rest of the pass.
+    fn snapshot_disk_candidates(&self, inner: &Inner) -> Vec<Candidate> {
+        let references = super::sibling_eviction::SnapshotReferences::of(inner);
+        let root = self.core.config.sibling_snapshots_dir();
+        let listed =
+            crate::sibling_snapshots::store::repositories(&root).and_then(|repositories| {
+                let mut listed = Vec::new();
+                for repository in repositories {
+                    listed.extend(crate::sibling_snapshots::store::list(&repository)?);
+                }
+                Ok(listed)
+            });
+        let listed = listed.unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot list sibling snapshots for disk eviction");
+            Vec::new()
+        });
+        let mut candidates: Vec<_> = listed
+            .into_iter()
+            .filter(|snapshot| !references.covers(&snapshot.directory))
+            .map(|snapshot| Candidate {
+                last_used_ms: snapshot
+                    .used
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                path: snapshot.directory,
+                workspace: None,
+                cache_disk: false,
+                snapshot: true,
+            })
+            .collect();
+        candidates.sort_by(|a, b| (a.last_used_ms, &a.path).cmp(&(b.last_used_ms, &b.path)));
+        candidates
+    }
+
+    /// Deletes an unreferenced sibling snapshot for pressure eviction, by the
+    /// snapshot deletion protocol, and frees its space before returning, so
+    /// the next free-space probe sees it. Returns the bytes it held, or
+    /// `None` when the recheck found it referenced or being copied.
+    fn evict_sibling_snapshot(&self, directory: &Path, device: u64) -> io::Result<Option<u64>> {
+        let Some(aside) = self.delete_sibling_snapshot(directory)? else {
+            return Ok(None);
+        };
+        self.long_work("disk_remove");
+        let bytes = allocated_bytes(&aside, device);
+        #[cfg(target_os = "linux")]
+        if self.core.config.isolate_jobs {
+            crate::isolation::restore_runner_access(&aside)?;
+        }
+        fs::remove_dir_all(&aside)?;
+        bytes.map(Some)
+    }
+
+    /// Records the outcome of one pressure deletion: the eviction and its
+    /// catalog changes, or a failure, which holds the path back from
+    /// eviction for a while. A failed deletion of a path that no longer
+    /// exists is not a failure.
+    fn record_disk_removal(&self, candidate: &Candidate, deleted: io::Result<u64>) {
+        let disappeared = deleted.is_err()
+            && matches!(
+                fs::symlink_metadata(&candidate.path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            );
+        let mut inner = self.core.inner.lock().unwrap();
+        let mut catalog = None;
+        inner.evicting_dependencies.remove(&candidate.path);
+        inner.evicting_caches.remove(&candidate.path);
+        if let Some(key) = &candidate.workspace {
+            inner.dropping.remove(key);
+        }
+        match deleted {
+            Ok(bytes) => {
+                if candidate.path == self.core.config.sccache_dir() {
+                    for repository in inner.catalog.repositories.values_mut() {
+                        repository.filled_descriptor = None;
+                        repository.filled_descriptors.clear();
+                        repository.recorded_without_writer.clear();
+                        repository.miss_refills.clear();
+                    }
+                }
+                if let Some(key) = &candidate.workspace {
+                    inner.catalog.workspaces.remove(key);
+                }
+                let eviction = DiskEviction {
+                    path: candidate.path.to_string_lossy().into_owned(),
+                    bytes,
+                    last_used_ms: candidate.last_used_ms,
+                    evicted_ms: self.now(),
+                };
+                tracing::info!(path = %eviction.path, bytes, last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
+                self.core
+                    .health
+                    .lock()
+                    .unwrap()
+                    .record(eviction.evicted_ms, |c| {
+                        c.evictions += 1;
+                        c.eviction_bytes += bytes;
+                    });
+                inner.last_eviction = Some(eviction);
+                // Saved after the state lock is released, below.
+                catalog = Some(self.catalog_snapshot(&inner));
+            }
+            Err(_) if disappeared => {}
+            Err(error) => {
+                // Permission and filesystem failures rarely change between
+                // admissions. Retry later rather than hammering the same tree.
+                let retry_after_ms = self.now().saturating_add(5 * 60 * 1000);
+                self.core
+                    .health
+                    .lock()
+                    .unwrap()
+                    .record(self.now(), |c| c.eviction_failures += 1);
+                inner
+                    .eviction_retry_after
+                    .insert(candidate.path.clone(), retry_after_ms);
+                tracing::warn!(path = %candidate.path.display(), %error, retry_after_ms, "runner disk eviction failed")
+            }
+        }
+        drop(inner);
+        if let Some(catalog) = catalog {
+            if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
+                // Metadata writes can still fail when deleting reflinks
+                // freed no blocks. Preserve the typed admission refusal.
+                tracing::error!(%error, "cannot persist pressure cleanup catalog");
+            }
+        }
     }
 
     fn live_cache_disks(&self, inner: &Inner) -> BTreeSet<PathBuf> {
@@ -541,6 +682,7 @@ impl Runner {
                 workspace: None,
                 last_used_ms: c.last_used_ms,
                 cache_disk: true,
+                snapshot: false,
             })
             .collect();
         // On the Windows instance every deletable tree lives under these fixed
@@ -586,6 +728,7 @@ impl Runner {
                         .unwrap_or_default()
                         .as_millis() as u64,
                     cache_disk: false,
+                    snapshot: false,
                 });
             }
         }
@@ -681,6 +824,11 @@ impl Runner {
                     if free >= soft {
                         return false;
                     }
+                    // Nothing uses an unreferenced snapshot; the next setup
+                    // that needs it builds it again.
+                    if c.snapshot {
+                        return true;
+                    }
                     // Only caches are worth keeping for reuse. A dead job's private
                     // tree and pending deletions are garbage at any age.
                     let garbage = c.path.parent().is_some_and(|parent| {
@@ -713,6 +861,23 @@ impl Runner {
                 next
             };
             let Some(candidate) = candidate else { break };
+            if candidate.snapshot {
+                attempted.insert(candidate.path.clone());
+                let deleted = match self.evict_sibling_snapshot(&candidate.path, device) {
+                    Ok(None) => continue,
+                    Ok(Some(bytes)) => Ok(bytes),
+                    Err(error) => Err(error),
+                };
+                self.record_disk_removal(&candidate, deleted);
+                free = probe()?;
+                if free >= soft && !sweep_idle_workspaces {
+                    self.core.health.lock().unwrap().record(self.now(), |c| {
+                        c.skipped_recent += skipped_recent.len() as u64;
+                    });
+                    return Ok(None);
+                }
+                continue;
+            }
             let caches = self.core.config.windows.as_ref().map(|vm| vm.caches());
             let _cache_lock = if candidate.cache_disk {
                 let caches = caches.as_ref().unwrap();
@@ -828,74 +993,7 @@ impl Runner {
                 }
                 Ok(bytes)
             });
-            let disappeared = deleted.is_err()
-                && matches!(
-                    fs::symlink_metadata(&candidate.path),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound
-                );
-            let mut inner = self.core.inner.lock().unwrap();
-            let mut catalog = None;
-            inner.evicting_dependencies.remove(&candidate.path);
-            inner.evicting_caches.remove(&candidate.path);
-            if let Some(key) = &candidate.workspace {
-                inner.dropping.remove(key);
-            }
-            match deleted {
-                Ok(bytes) => {
-                    if candidate.path == self.core.config.sccache_dir() {
-                        for repository in inner.catalog.repositories.values_mut() {
-                            repository.filled_descriptor = None;
-                            repository.filled_descriptors.clear();
-                            repository.recorded_without_writer.clear();
-                            repository.miss_refills.clear();
-                        }
-                    }
-                    if let Some(key) = &candidate.workspace {
-                        inner.catalog.workspaces.remove(key);
-                    }
-                    let eviction = DiskEviction {
-                        path: candidate.path.to_string_lossy().into_owned(),
-                        bytes,
-                        last_used_ms: candidate.last_used_ms,
-                        evicted_ms: self.now(),
-                    };
-                    tracing::info!(path = %eviction.path, bytes, last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
-                    self.core
-                        .health
-                        .lock()
-                        .unwrap()
-                        .record(eviction.evicted_ms, |c| {
-                            c.evictions += 1;
-                            c.eviction_bytes += bytes;
-                        });
-                    inner.last_eviction = Some(eviction);
-                    // Saved after the state lock is released, below.
-                    catalog = Some(self.catalog_snapshot(&inner));
-                }
-                Err(_) if disappeared => {}
-                Err(error) => {
-                    // Permission and filesystem failures rarely change between
-                    // admissions. Retry later rather than hammering the same tree.
-                    let retry_after_ms = self.now().saturating_add(5 * 60 * 1000);
-                    self.core
-                        .health
-                        .lock()
-                        .unwrap()
-                        .record(self.now(), |c| c.eviction_failures += 1);
-                    inner
-                        .eviction_retry_after
-                        .insert(candidate.path.clone(), retry_after_ms);
-                    tracing::warn!(path = %candidate.path.display(), %error, retry_after_ms, "runner disk eviction failed")
-                }
-            }
-            drop(inner);
-            if let Some(catalog) = catalog {
-                if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
-                    // Metadata writes can still fail when deleting reflinks
-                    // freed no blocks. Preserve the typed admission refusal.
-                    tracing::error!(%error, "cannot persist pressure cleanup catalog");
-                }
-            }
+            self.record_disk_removal(&candidate, deleted);
             free = probe()?;
             if free >= soft && !sweep_idle_workspaces {
                 self.core.health.lock().unwrap().record(self.now(), |c| {

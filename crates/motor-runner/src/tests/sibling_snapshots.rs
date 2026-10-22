@@ -14,7 +14,9 @@ use super::*;
 /// no systemd. Returns the environment too, which is part of each snapshot's
 /// directory name.
 #[cfg(unix)]
-fn snapshot_config(f: &Fixture) -> (Config, crate::sibling_snapshots::JavascriptEnvironment) {
+pub(super) fn snapshot_config(
+    f: &Fixture,
+) -> (Config, crate::sibling_snapshots::JavascriptEnvironment) {
     let environment =
         crate::sibling_snapshots::JavascriptEnvironment::digest(&BTreeMap::new(), b"", &[]);
     let mut config = f.config();
@@ -36,7 +38,7 @@ fn snapshot_config(f: &Fixture) -> (Config, crate::sibling_snapshots::Javascript
 
 /// Clones the fixture sibling at its current commit to its canonical host
 /// path, as that repository's own main checkout, and returns that commit.
-fn host_checkout(f: &Fixture) -> String {
+pub(super) fn host_checkout(f: &Fixture) -> String {
     let host = Path::new(&f.canonical);
     fs::create_dir_all(host.parent().unwrap()).unwrap();
     git(
@@ -249,7 +251,7 @@ async fn job_in_snapshot_mode_records_its_snapshots_and_leaves_the_host_path_alo
 
 /// A runner whose scheduler runs only when a test calls `dispatch`.
 #[cfg(unix)]
-fn manual_runner(mut config: Config) -> Runner {
+pub(super) fn manual_runner(mut config: Config) -> Runner {
     config.max_weight = 8;
     config.manual_tick = true;
     config.disable_warm_builds = true;
@@ -258,7 +260,13 @@ fn manual_runner(mut config: Config) -> Runner {
 
 /// A job of the fixture's repository in its own workspace `name`, which
 /// declares the fixture sibling, in `state`.
-fn sibling_user_job(f: &Fixture, name: &str, now: u64, order: u64, state: JobState) -> Job {
+pub(super) fn sibling_user_job(
+    f: &Fixture,
+    name: &str,
+    now: u64,
+    order: u64,
+    state: JobState,
+) -> Job {
     let (request, _) = job_at(f, name, "true");
     assert_eq!(request.siblings[0].canonical_path, f.canonical);
     let mut job = Job::new(request.job_id, Some(request), now, order, 2);
@@ -272,7 +280,7 @@ fn sibling_user_job(f: &Fixture, name: &str, now: u64, order: u64, state: JobSta
 
 /// A job whose main workspace is the fixture sibling's canonical path, the
 /// directory the sibling user's sibling is checked out at in in-place mode.
-fn main_workspace_job(f: &Fixture, now: u64, order: u64, state: JobState) -> Job {
+pub(super) fn main_workspace_job(f: &Fixture, now: u64, order: u64, state: JobState) -> Job {
     let (mut request, _) = f.run("true");
     request.workspace_key = f.canonical.clone();
     request.cwd = f.canonical.clone();
@@ -621,8 +629,8 @@ impl backend::Backend for NoWindowsSetup {
 
 /// A job of the fixture sibling's own repository in its main workspace, the
 /// sibling's canonical path, at the sibling repository's current commit.
-#[cfg(target_os = "linux")]
-fn sibling_repository_job(f: &Fixture, command: &str) -> (Run, Vec<Vec<u8>>) {
+#[cfg(unix)]
+pub(super) fn sibling_repository_job(f: &Fixture, command: &str) -> (Run, Vec<Vec<u8>>) {
     let (mut run, _) = f.run(command);
     let (bundle, bytes) = f.bundle(&f.sibling, &f.canonical, 0);
     let head = git(&f.sibling, &["rev-parse", "HEAD"]);

@@ -38,6 +38,8 @@ mod health;
 mod migration;
 #[path = "retirement.rs"]
 mod retirement;
+#[path = "sibling_eviction.rs"]
+mod sibling_eviction;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -151,6 +153,13 @@ pub struct Config {
     /// closed entries are folded into one `unknown` entry beyond it (see
     /// `sibling_snapshots::freshness`). At least 2.
     pub sibling_freshness_entries: usize,
+    /// Most unreferenced sibling snapshots kept per repository; the least
+    /// recently used beyond it are deleted after each creation, at startup
+    /// and at maintenance.
+    pub sibling_snapshot_cap: usize,
+    /// How long an unreferenced sibling snapshot may go unused before
+    /// maintenance deletes it.
+    pub sibling_snapshot_idle: Duration,
     /// Probe available bytes on the filesystem containing the supplied path.
     pub free_space_probe: FreeSpaceProbe,
     /// Linux production uses systemd services under motor-job. The portable
@@ -298,6 +307,14 @@ const WARM_BUILD_VCPUS: u32 = 4;
 /// still running after this is stuck.
 const DEFAULT_SNAPSHOT_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Default of `Config::sibling_snapshot_cap`. With the 24-hour idle expiry
+/// it bounds snapshot disk use at about 3 GiB in the worst case for the four
+/// repositories used as siblings on the build server, as measured there.
+const DEFAULT_SIBLING_SNAPSHOT_CAP: usize = 4;
+
+/// Default of `Config::sibling_snapshot_idle`.
+const DEFAULT_SIBLING_SNAPSHOT_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+
 fn refuse_before_start(
     health: &Mutex<health::Health>,
     job: &mut Job,
@@ -369,6 +386,8 @@ impl Config {
             snapshot_prefetch_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
             snapshot_javascript_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
             sibling_freshness_entries: crate::sibling_snapshots::freshness::DEFAULT_RECORD_ENTRIES,
+            sibling_snapshot_cap: DEFAULT_SIBLING_SNAPSHOT_CAP,
+            sibling_snapshot_idle: DEFAULT_SIBLING_SNAPSHOT_IDLE,
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
             job_network: None,
@@ -1790,6 +1809,7 @@ impl Runner {
                     runner.purge(entry.path());
                 }
             }
+            runner.clean_sibling_snapshot_leftovers();
             runner.migrate_legacy_storage()?;
         }
         let scratch = runner.core.config.writer_scratch_dir();
@@ -3218,6 +3238,11 @@ impl Runner {
         } else {
             populated
         };
+        if prior.is_some() {
+            // A snapshot may have been created; this Prepare's reservation
+            // keeps its own snapshots.
+            self.cap_sibling_snapshots(&r.siblings);
+        }
         // What a warm build of the tip needs from the mirror is read before
         // the state lock is taken: each read runs git.
         let plan = (default_branch_tip
@@ -4589,6 +4614,8 @@ impl Runner {
         if !maintained? {
             return Ok(());
         }
+        // Also enforces the snapshot cap at startup, which runs maintenance.
+        self.maintain_sibling_snapshots();
         self.prune_refs()?;
         self.retire_unused_repositories()
     }
@@ -5585,7 +5612,7 @@ impl Runner {
                     Some(&r.cwd),
                     &r.siblings,
                 )?;
-                setup_step(
+                let resolved = setup_step(
                     "prepare sibling snapshots",
                     crate::setup_log::phase("prepare sibling snapshots", || {
                         snapshots.resolve(
@@ -5595,7 +5622,11 @@ impl Runner {
                             &r.siblings,
                         )
                     }),
-                )?;
+                );
+                // Whatever the outcome, a snapshot may have been created;
+                // this setup's reservation keeps its own snapshots.
+                self.cap_sibling_snapshots(&r.siblings);
+                resolved?;
             }
             self.materialize(s)
         })

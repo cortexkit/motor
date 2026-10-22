@@ -43,6 +43,9 @@ mod refusals;
 mod repository_retirement;
 #[path = "tests/return_paths.rs"]
 mod return_paths;
+#[cfg(unix)]
+#[path = "tests/sibling_eviction.rs"]
+mod sibling_eviction;
 #[path = "tests/sibling_snapshots.rs"]
 mod sibling_snapshots;
 #[path = "tests/started.rs"]
