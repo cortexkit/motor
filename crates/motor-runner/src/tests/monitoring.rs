@@ -846,6 +846,31 @@ fn quarantine_does_not_fence_on_the_unit_of_a_job_being_launched() {
         .contains(&name));
 }
 
+/// The deferral counts: with more unmatched units than launches in flight,
+/// at least one unit belongs to no launch, and the fence closes.
+#[test]
+fn quarantine_fences_on_more_unmatched_units_than_launches() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    let first = backend::host_unit_name(Uuid::now_v7());
+    let second = backend::host_unit_name(Uuid::now_v7());
+    state.lock().unwrap().listing = format!(
+        "{first} loaded activating start waiting\n{second} loaded activating start waiting\n"
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .insert(Uuid::now_v7());
+    runner.refresh_quarantine_admission(true);
+    assert!(
+        runner.ensure_admission_ownership().is_err(),
+        "two unmatched units were taken for one launch"
+    );
+}
+
 #[test]
 fn quarantine_unaccounted_unit_fences_until_it_exits() {
     let f = Fixture::new();

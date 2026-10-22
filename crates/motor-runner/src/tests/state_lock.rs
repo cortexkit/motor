@@ -389,6 +389,8 @@ struct SaveFaults {
     panic: Option<(PathBuf, Saved)>,
     /// Fail every catalog write at this step until cleared.
     catalog: Option<CatalogWrite>,
+    /// Panic in the long step with this label, after any hold on it.
+    panic_work: Option<&'static str>,
     /// Catalog writes failed so far.
     catalog_failures: usize,
 }
@@ -416,7 +418,24 @@ impl SaveFixture {
         let mut config = fixture.config();
         config.manual_tick = true;
         config.disable_warm_builds = true;
-        config.long_work = Some(hold.hook());
+        config.long_work = Some({
+            let hold = hold.hook();
+            let faults = faults.clone();
+            Arc::new(move |label| {
+                hold(label);
+                let panic = {
+                    let mut faults = faults.lock().unwrap();
+                    let due = faults.panic_work == Some(label);
+                    if due {
+                        faults.panic_work = None;
+                    }
+                    due
+                };
+                if panic {
+                    panic!("injected panic in {label}");
+                }
+            })
+        });
         config.before_job_write = Some({
             let hold = hold.clone();
             let faults = faults.clone();
@@ -491,6 +510,17 @@ impl SaveFixture {
     /// Fail catalog writes at `step` until called again with `None`.
     fn fail_catalog(&self, step: Option<CatalogWrite>) {
         self.faults.lock().unwrap().catalog = step;
+    }
+
+    /// Panic in the next long step labelled `label`, after any hold on it.
+    fn panic_work(&self, label: &'static str) {
+        self.faults.lock().unwrap().panic_work = Some(label);
+    }
+
+    /// Let a job whose start failed be dispatched again: its first retry
+    /// delay passes on the runner's clock.
+    fn pass_start_retry_delay(&self, ms: u64) {
+        self.fixture.clock.fetch_add(ms, Ordering::SeqCst);
     }
 
     fn catalog_failures(&self) -> usize {
@@ -1089,6 +1119,7 @@ fn failed_launch_catalog_write_requeues_the_job_as_dispatch_found_it() {
     assert_eq!(state, JobState::Queued);
     assert!(!reserved, "the job kept its workspace reservation");
     assert_eq!(dispatch_state(&f, id), expected, "the job was not restored");
+    f.pass_start_retry_delay(START_RETRY_MS);
     f.tick_until("the job runs after the failed launch", |f| {
         f.terminal(id).is_some()
     });
@@ -1121,6 +1152,7 @@ fn failed_launch_catalog_write_gives_back_the_warm_build_writer() {
         (cpus_after, setup_after, rotation_after),
         (cpus, setup_ms, rotation)
     );
+    f.pass_start_retry_delay(START_RETRY_MS);
     f.tick_until("the warm build runs after the failed launch", |f| {
         f.terminal(warm).is_some()
     });
@@ -1190,7 +1222,8 @@ fn failed_withdrawal_keeps_the_queue_clock_and_the_job_s_place() {
 
 /// A save that unwinds still clears the markers set around it: the
 /// admission's queue slot, the withdrawal's dispatch fence and the setup's
-/// reservation.
+/// reservation. It also poisons the job's log lock; every later step for
+/// the job (admission, withdrawal, setup, the run itself) still works.
 #[test]
 fn unwinding_saves_release_their_markers() {
     let f = SaveFixture::with("record_save", |config| config.max_queue_depth = 2);
@@ -1202,7 +1235,12 @@ fn unwinding_saves_release_their_markers() {
     assert!(std::thread::spawn(move || runner.accept(admission))
         .join()
         .is_err());
-    f.runner.job_log(admitted.job_id).write.clear_poison();
+    // The panic poisoned the job log lock; the ID can still be admitted.
+    assert!(matches!(
+        f.runner.accept(admitted.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    f.runner.cancel(admitted.job_id).unwrap();
     assert!(f
         .runner
         .core
@@ -1223,7 +1261,6 @@ fn unwinding_saves_release_their_markers() {
     assert!(std::thread::spawn(move || runner.withdraw(id))
         .join()
         .is_err());
-    f.runner.job_log(id).write.clear_poison();
     assert!(f
         .runner
         .core
@@ -1247,7 +1284,7 @@ fn unwinding_saves_release_their_markers() {
         "the unwound setup kept its reservation"
     );
     assert_eq!(f.job(id).unwrap().setup_ms, None);
-    f.runner.job_log(id).write.clear_poison();
+    f.pass_start_retry_delay(START_RETRY_MS);
     f.tick_until("the job runs once its setup can be saved", |f| {
         f.terminal(id).is_some()
     });
@@ -1282,6 +1319,233 @@ async fn workspace_drop_leaves_nothing_for_an_admission_whose_save_failed() {
     assert!(!reply.cancelled_jobs.contains(&id));
     assert!(!f.runner.has_job_record(id));
     assert!(!f.runner.record_path(id).exists());
+}
+
+/// A catalog write skipped because a newer snapshot was renamed into place
+/// is acknowledged only once that newer snapshot is durable: if the newer
+/// write's directory sync failed, the skipped write retries the sync, and
+/// fails if that fails.
+#[test]
+fn a_skipped_catalog_write_is_acknowledged_only_once_durable() {
+    let f = SaveFixture::new("catalog_save");
+    let (older, newer) = {
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert("/older".into(), Workspace::default());
+        let older = f.runner.catalog_snapshot(&inner).unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert("/newer".into(), Workspace::default());
+        (older, f.runner.catalog_snapshot(&inner).unwrap())
+    };
+    let (again, latest) = {
+        let inner = f.runner.core.inner.lock().unwrap();
+        (
+            f.runner.catalog_snapshot(&inner).unwrap(),
+            f.runner.catalog_snapshot(&inner).unwrap(),
+        )
+    };
+    f.fail_catalog(Some(CatalogWrite::Renamed));
+    assert!(f.runner.write_catalog(newer).is_err());
+    f.fail_catalog(Some(CatalogWrite::SyncRetry));
+    assert!(
+        f.runner.write_catalog(older).is_err(),
+        "acknowledged a catalog whose directory sync had failed"
+    );
+    f.fail_catalog(None);
+    f.runner.write_catalog(again).unwrap();
+    f.runner.write_catalog(latest).unwrap();
+    let saved: Catalog = read_json(&f.runner.core.trees.state.join("catalog.json")).unwrap();
+    assert!(saved.workspaces.contains_key("/older"));
+    assert!(saved.workspaces.contains_key("/newer"));
+}
+
+/// Dispatch does not start a job while an earlier attempt to start it is
+/// still being cleaned up (a Windows VM whose stop maintenance retries):
+/// that attempt's files are named by the job's ID.
+#[test]
+fn dispatch_waits_for_an_earlier_attempt_s_cleanup() {
+    let f = SaveFixture::new("record_save");
+    let id = f.queued("cleaning", "true").job_id;
+    let runtime = f.runner.config().windows_runtime.clone();
+    runtime.set_cleanup_pending(id, true);
+    f.runner.tick().unwrap();
+    assert!(
+        !f.runner.core.inner.lock().unwrap().starting.contains(&id),
+        "started while an earlier attempt's cleanup was pending"
+    );
+    runtime.set_cleanup_pending(id, false);
+    f.runner.tick().unwrap();
+    assert!(f.runner.core.inner.lock().unwrap().starting.contains(&id));
+}
+
+/// A cancel can end a job after its setup record is saved and before its
+/// setup completes. If the setup then unwinds, its reservation is released
+/// even though there is no queued job left to put back.
+#[test]
+fn a_start_unwinding_after_its_job_was_cancelled_releases_the_reservation() {
+    let f = SaveFixture::new("materialize");
+    let id = f.queued("cancelled", "true").job_id;
+    f.hold.arm();
+    f.panic_work("materialize");
+    let held = f.hold_in(|runner| runner.tick().unwrap());
+    f.runner.cancel(id).unwrap();
+    assert_eq!(f.terminal(id).unwrap().outcome, Outcome::Cancelled);
+    drop(held);
+    assert!(
+        poll(Duration::from_secs(30), || {
+            let inner = f.runner.core.inner.lock().unwrap();
+            inner.starting.is_empty() && inner.reserved.is_empty()
+        }),
+        "the unwound start kept the cancelled job's reservation"
+    );
+}
+
+/// A job whose start keeps failing is not set up again on every scheduler
+/// pass: each failure doubles the delay before it is dispatched again.
+#[test]
+fn a_failing_start_is_retried_after_a_growing_delay() {
+    let f = SaveFixture::new("catalog_save");
+    let id = f.queued("failing", "true").job_id;
+    f.fail_catalog(Some(CatalogWrite::Starting));
+    let failed_once = |f: &SaveFixture, failures: usize| {
+        poll(Duration::from_secs(60), || {
+            f.catalog_failures() == failures
+                && !f.runner.core.inner.lock().unwrap().starting.contains(&id)
+        })
+    };
+    let starts = |f: &SaveFixture| {
+        f.runner.tick().unwrap();
+        f.runner.core.inner.lock().unwrap().starting.contains(&id)
+    };
+    assert!(starts(&f));
+    assert!(failed_once(&f, 1));
+    for _ in 0..5 {
+        assert!(!starts(&f), "set up again before the retry delay passed");
+    }
+    f.pass_start_retry_delay(START_RETRY_MS);
+    assert!(starts(&f));
+    assert!(failed_once(&f, 2));
+    // The delay doubled: one more first delay is not enough.
+    f.pass_start_retry_delay(START_RETRY_MS);
+    assert!(!starts(&f), "the retry delay did not grow");
+    f.fail_catalog(None);
+    f.pass_start_retry_delay(START_RETRY_MS);
+    f.tick_until("the job runs once its catalog can be saved", |f| {
+        f.terminal(id).is_some()
+    });
+}
+
+/// Queue clocks change at the time after a section run without the state
+/// lock, not at a time taken before it: a job paused behind a workspace
+/// owner that finishes during another job's Queued save resumes then, and
+/// is not credited with the wait that passed before.
+#[test]
+fn queue_clocks_resume_at_the_time_after_a_fetch_save() {
+    let f = SaveFixture::new("record_save");
+    let (owner_request, _) = job_at(&f.fixture, "owned", "true");
+    let owner = owner_request.job_id;
+    {
+        let now = f.runner.now();
+        let mut job = Job::new(owner, Some(owner_request), now, 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(now);
+        f.runner.core.inner.lock().unwrap().jobs.insert(owner, job);
+    }
+    let paused = f.queued("owned", "true").job_id;
+    assert_eq!(
+        f.job(paused).unwrap().queue_entry.load(Ordering::Acquire),
+        PAUSED_QUEUE,
+        "the job behind the running owner was not paused"
+    );
+    let (other, bytes) = job_at(&f.fixture, "other", "true");
+    assert_run_accepted(&f.runner, &other);
+    let upload = f.fixture.spool(&f.runner, &other, &bytes);
+    let directory = upload.directory.clone();
+    f.hold_save(other.job_id, Saved::Admitted);
+    let held = f.hold_in(move |runner| runner.fetch_run(&other, &directory, false).unwrap());
+    f.fixture.clock.fetch_add(10_000, Ordering::SeqCst);
+    {
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&owner).unwrap();
+        job.terminal(Outcome::Exit { code: 0 }, f.runner.now());
+    }
+    drop(held);
+    drop(upload);
+    assert_eq!(
+        f.job(paused).unwrap().queue_wait_ms(f.runner.now()),
+        0,
+        "the job was credited with wait from before the save"
+    );
+}
+
+/// The same for a scheduler pass that reads warm-build inputs from a mirror
+/// without the state lock before dispatching.
+#[test]
+fn queue_clocks_change_at_the_time_after_a_pass_s_mirror_reads() {
+    let f = SaveFixture::with("base_plan", |config| {
+        config.disable_warm_builds = false;
+    });
+    let (owner_request, _) = job_at(&f.fixture, "owned", "true");
+    let owner = owner_request.job_id;
+    {
+        let now = f.runner.now();
+        let mut job = Job::new(owner, Some(owner_request), now, 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(now);
+        f.runner.core.inner.lock().unwrap().jobs.insert(owner, job);
+    }
+    // Fetched as a non-default tip, so it queues no warm build itself.
+    let (request, bytes) = job_at(&f.fixture, "owned", "true");
+    let paused = request.job_id;
+    assert_run_accepted(&f.runner, &request);
+    let upload = f.fixture.spool(&f.runner, &request, &bytes);
+    f.runner
+        .fetch_run(&request, &upload.directory, false)
+        .unwrap();
+    assert_eq!(
+        f.job(paused).unwrap().queue_entry.load(Ordering::Acquire),
+        PAUSED_QUEUE
+    );
+    {
+        // A repository that wants a warm build makes the pass read the mirror.
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        let repository = inner
+            .catalog
+            .repositories
+            .entry(request.repository_root.clone())
+            .or_default();
+        repository.desired = Some(BaseRequest {
+            tip: request.integration_tip.clone(),
+            workspace: request.workspace_key.clone(),
+            siblings: vec![],
+            git_dependencies: vec![],
+            command: None,
+        });
+        repository.requested_descriptor = Some("wanted".into());
+    }
+    f.hold.arm();
+    let held = f.hold_in(|runner| runner.tick().unwrap());
+    f.fixture.clock.fetch_add(10_000, Ordering::SeqCst);
+    {
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&owner).unwrap();
+        job.terminal(Outcome::Exit { code: 0 }, f.runner.now());
+    }
+    drop(held);
+    drop(upload);
+    // The pass resumed the job's clock and then started it, stopping the
+    // clock again at the current time.
+    let job = f.job(paused).unwrap();
+    assert!(job.setup_ms.is_some(), "the job was not started");
+    assert_eq!(
+        job.queue_wait_ms(f.runner.now()),
+        0,
+        "the job was credited with wait from before the mirror reads"
+    );
 }
 
 /// Ranks the call sites that hold the runner's state lock while real jobs
