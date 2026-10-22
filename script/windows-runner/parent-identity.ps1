@@ -247,12 +247,10 @@ function Reuse-RunnerParentVerification([string]$Parent, [string]$ParentSha256, 
         foreach ($key in $identity.Keys) {
             if ($identity[$key] -cne $verified.identity.$key) { throw "Parent identity differs: $key" }
         }
-        # Qualification runs with the service stopped, so it uses ChangeTime to
-        # detect a same-size rewrite that restores LastWriteTime. Normal per-job
-        # checks omit it because Hyper-V may rewrite an identical ACL.
-        $changeTime = [Motor.ParentFile]::ChangeTime($parentGuard).ToString([Globalization.CultureInfo]::InvariantCulture)
-        if ($changeTime -cne [string]$verified.change_time_filetime) { throw 'Parent ChangeTime changed after verification' }
-        return @{cache_hit=$true; hash_duration_ms=0; change_time_filetime=$changeTime}
+        # Hyper-V may advance ChangeTime while leaving the parent contents and
+        # security descriptor unchanged, so this guard uses the same stable file
+        # identity as Prepare/Run. The caller holds its own no-write/delete handle.
+        return @{cache_hit=$true; hash_duration_ms=0; record_reused=$true}
     } catch {
         throw "parent changed since verification; restart the service to re-verify: $_"
     } finally {

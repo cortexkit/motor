@@ -754,9 +754,11 @@ fn private_state_directory(path: &Path) -> io::Result<()> {
 impl Runner {
     #[cfg(windows)]
     pub(crate) fn open_for_qualification(config: Config) -> io::Result<Self> {
-        // The qualification command runs with the service stopped. Its protected
-        // record is checked against identity and ChangeTime while Runner::open
-        // holds a no-write/delete parent handle, avoiding a second large hash.
+        // The qualification command runs with the service stopped. Reuse the
+        // service's protected record and the same stable identity checks used
+        // for jobs; this Runner::open call holds a no-write/delete parent handle too.
+        // A privileged writer during the stop gap is trusted; the next service
+        // startup hashes the full parent before admitting jobs.
         config
             .windows_runtime
             .reuse_parent_verification_for_qualification();

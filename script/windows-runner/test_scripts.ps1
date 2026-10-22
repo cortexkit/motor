@@ -237,6 +237,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $parentGuard.Dispose(); $parentGuard = $null
         Write-Host 'PASS parent-identity-accepts-changetime-only-update'
         $count++
+        $verification = Reuse-RunnerParentVerification $Parent $ParentSha256 $record
+        if (-not $verification.cache_hit -or $verification.hash_duration_ms -ne 0) { throw 'FAIL parent-identity-reuse-ignores-changetime-only-update' }
+        Write-Host 'PASS parent-identity-reuse-ignores-changetime-only-update'
+        $count++
 
         $changeProbe = Join-Path $fixture 'same-size-change-probe.bin'
         [IO.File]::WriteAllText($changeProbe, 'original', [Text.UTF8Encoding]::new($false))
@@ -261,16 +265,13 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $count++
         $lifetimeGuard.Dispose(); $lifetimeGuard = $null
 
-        # The active service guard blocks in-place writes. After service stop,
-        # record reuse also checks ChangeTime before trusting the saved digest.
+        # The service is stopped here. Reuse applies the same identity-only
+        # rule as Prepare/Run; the next service start's full hash rejects content
+        # rewritten with the original size and LastWriteTime.
         Set-FixtureParent 'modified' $lastWrite
-        $denied = $false
-        try { $null = Reuse-RunnerParentVerification $Parent $ParentSha256 $record } catch {
-            if ([string]$_ -notlike '*parent changed since verification; restart the service to re-verify*') { throw }
-            $denied = $true
-        }
-        if (-not $denied) { throw 'FAIL parent-identity-reuse-rejects-same-size-rewrite-restored-lastwrite' }
-        Write-Host 'PASS parent-identity-reuse-rejects-same-size-rewrite-restored-lastwrite'
+        $verification = Reuse-RunnerParentVerification $Parent $ParentSha256 $record
+        if (-not $verification.cache_hit -or $verification.hash_duration_ms -ne 0) { throw 'FAIL parent-identity-reuse-uses-stable-identity-only' }
+        Write-Host 'PASS parent-identity-reuse-uses-stable-identity-only'
         $count++
         $denied = $false
         try { $null = Confirm-RunnerParentVerification $Parent $ParentSha256 $record $hashLog } catch {

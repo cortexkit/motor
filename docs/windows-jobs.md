@@ -116,11 +116,16 @@ the service lifetime; Prepare and Run compare the recorded identity before any V
 boot, and refuse if the record is missing or the parent changed. Restarting the
 service rehashes the parent before another job can start. ChangeTime is recorded
 for diagnosis but is not an identity gate because Hyper-V may update it while
-reapplying an identical ACL. The overlay is deleted after the job; nothing a job
-writes to the system disk reaches a later job. Tests: the native fixture in
+reapplying an identical ACL. The operator-only `qualify-disconnect` path runs with
+the service stopped and reuses this protected record using the same identity
+fields while holding its own no-write/delete handle; a privileged writer during
+that stop gap is trusted, and a later service start performs a fresh full hash.
+The overlay is deleted after the job; nothing a job writes to the system disk
+reaches a later job. Tests: the native fixture in
 `script/windows-runner/test_scripts.ps1` covers service-start hashing, the
-lifetime write/delete guard, a same-size rewrite with restored LastWriteTime, and
-identity/record changes; the full Hyper-V qualification is operator-only.
+lifetime write/delete guard, a same-size rewrite with restored LastWriteTime,
+ChangeTime-only qualification reuse, and identity/record changes; the full
+Hyper-V qualification is operator-only.
 
 3.2. The VM has no network device. The command can use loopback inside the
 guest and nothing else. A request for outbound network is refused with
