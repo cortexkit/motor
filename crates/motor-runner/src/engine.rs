@@ -722,9 +722,11 @@ impl QueueClock {
 
 /// What `start` reserved for a job, owned by the job's setup thread until
 /// the start is settled: the job is Running or refused, or its reservation
-/// was released. If the thread unwinds before that, dropping this puts the
+/// was released. If the thread unwinds before that and before the job's
+/// unit may have been spawned (`Inner::launching`), dropping this puts the
 /// job back in the queue, so a panic cannot hold a workspace, permits and
-/// CPUs until restart.
+/// CPUs until restart. Once a unit may exist it keeps the reservation
+/// instead, since requeuing could run the job twice.
 struct PendingStart {
     runner: Runner,
     id: Uuid,
@@ -5171,9 +5173,10 @@ impl Runner {
     }
 
     /// Finish a job's start: record its workspace, and launch it unless setup
-    /// failed or it was cancelled or withdrawn meanwhile. The catalog saves,
-    /// the launch itself (a process spawn) and the Started record save run
-    /// without the state lock. The job stays in `starting`, and keeps its
+    /// failed or it was cancelled or withdrawn meanwhile. On the launch path
+    /// the catalog write, the launch itself (a process spawn) and the Started
+    /// record save run without the state lock; a warm build that does not
+    /// launch still saves the catalog under it, in `finish_base`. The job stays in `starting`, and keeps its
     /// workspace reservation, until it is Running in memory or its start is
     /// given up, so no dispatch pass starts it again and no other job takes
     /// its workspace meanwhile. Cancel and withdraw wait for this job's log

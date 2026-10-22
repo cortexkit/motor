@@ -893,9 +893,10 @@ fn an_older_catalog_snapshot_never_overwrites_a_newer_one() {
     assert!(saved.workspaces.contains_key("/newer"));
 }
 
-/// A catalog write can rename its file into place and still fail (the
-/// directory sync after the rename). The newer bytes are then on disk, and
-/// an older snapshot written later must not replace them.
+/// A catalog write can rename its file into place and still fail, in the
+/// directory sync that follows. The test injects its failure at that point,
+/// after the rename and before the sync: the newer bytes are then what the
+/// path holds, and an older snapshot written later must not replace them.
 #[test]
 fn a_renamed_catalog_is_never_replaced_by_an_older_snapshot() {
     let f = SaveFixture::new("catalog_save");
