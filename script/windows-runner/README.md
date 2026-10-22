@@ -167,8 +167,8 @@ the same changed archive when that gate is bypassed. A fixture repository
 `.cargo/config.toml` selects an empty source to show whether project config overrides
 the Cargo-home replacement; if it does, production jobs must refuse such a config
 rather than silently using a different source. This is evidence collection only;
-it does not alter production fetching. Inspect `prep-local-registry-*.json` and leave
-the service stopped for review.
+it does not alter production fetching. Inspect `$evidence\host-evidence\prep-local-registry-*.json`
+and leave the service stopped for review.
 
 For a pre-main trusted-fetch failure, collect only the launch matrix with
 `run-system.ps1 -Python $python -Evidence $freshEvidence -PrepLaunchMatrix`.
