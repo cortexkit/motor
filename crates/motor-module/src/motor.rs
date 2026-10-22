@@ -569,9 +569,14 @@ impl Motor {
                 )
                 .await;
         }
-        if let Some(code) = connector.as_ref().and_then(|c| c.refusal()) {
-            let (reason, detail) = request_refusal_fields(RefusalReason::Unknown(code.into()));
-            return self.refused(id, reason, None, detail, tx).await;
+        if let Some(connector) = &connector {
+            if let Some(code) = connector.refusal() {
+                let (reason, detail) = request_refusal_fields(RefusalReason::Unknown(code.into()));
+                let retry_after_ms = connector.retry_after_ms(code);
+                return self
+                    .refused_with_retry(id, reason, None, detail, retry_after_ms, tx)
+                    .await;
+            }
         }
         let config = self.config.clone();
         let r = request.clone();
@@ -811,7 +816,7 @@ impl Motor {
                         channel
                             .send(Frame::Status)
                             .await
-                            .map_err(|e| (RefusalReason::Unreachable, Some(e.to_string())))?;
+                            .map_err(|e| (RefusalReason::Unreachable, Some(e.to_string()), None))?;
                         match channel.next().await {
                             Ok(Incoming::Frame(Frame::StatusReply(status))) => {
                                 let runner =
@@ -820,6 +825,7 @@ impl Motor {
                                     return Err((
                                         RefusalReason::RunnerFull,
                                         Some("windows_slots_busy".into()),
+                                        None,
                                     ));
                                 }
                             }
@@ -827,6 +833,7 @@ impl Motor {
                                 return Err((
                                     RefusalReason::Unreachable,
                                     Some("Windows runner status unavailable".into()),
+                                    None,
                                 ))
                             }
                         }
@@ -844,12 +851,12 @@ impl Motor {
                             Err((
                                 RefusalReason::Unreachable,
                                 Some("Windows runner handshake/status timed out after 3s".into()),
+                                None,
                             ))
                         })
                 } else {
                     opened.await
                 }
-                .map_err(|(reason, detail)| (reason, detail, None))
             };
             let mut channel = match opened {
                 Ok(c) => c,
@@ -2162,9 +2169,10 @@ impl Motor {
         };
         let mut channel = match open_for_request(self.connector.as_ref(), id).await {
             Ok(c) => c,
-            Err((reason, detail)) => {
+            Err((reason, detail, retry_after_ms)) => {
                 let mut reply = prepare_refused(id, reason);
                 reply.refusal_detail = detail.map(bounded_detail);
+                reply.retry_after_ms = retry_after_ms;
                 return Ok(reply);
             }
         };
@@ -2303,13 +2311,20 @@ fn request_refusal_fields(reason: RefusalReason) -> (RefusalReason, Option<Strin
     }
 }
 
+/// Open a job's runner channel. A refusal comes back as its reason, its
+/// caller-facing detail code and the connector's `retry_after_ms` hint for
+/// that code, which only a transient signing failure carries.
 async fn open_for_request(
     connector: &dyn Connector,
     id: Uuid,
-) -> Result<Channel, (RefusalReason, Option<String>)> {
-    Channel::open(connector, id)
-        .await
-        .map_err(request_refusal_fields)
+) -> Result<Channel, (RefusalReason, Option<String>, Option<u64>)> {
+    Channel::open(connector, id).await.map_err(|reason| {
+        let (reason, detail) = request_refusal_fields(reason);
+        let retry_after_ms = detail
+            .as_deref()
+            .and_then(|code| connector.retry_after_ms(code));
+        (reason, detail, retry_after_ms)
+    })
 }
 
 fn prepare_refused(id: Uuid, reason: RefusalReason) -> PrepareReply {

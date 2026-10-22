@@ -146,13 +146,44 @@ recovery continue to distinguish the codes below.
 | `runner_agent_start_failed` | The agent could not start. Retried the same way. |
 | `runner_ssh_config_invalid` | The SSH alias could not be resolved. Not retried. |
 | `runner_agent_stopped` | The agent stopped. |
-| `runner_sign_missing`, `runner_sign_grant_refused`, `runner_sign_invalid_response`, `runner_sign_unavailable` | A signature was refused. Latched until `ck-motor` restarts. |
+| `runner_sign_missing`, `runner_sign_grant_refused` | The vault had no signing credential, or refused the grant. New jobs are refused for 30 seconds, then the next sign request asks the vault again; re-creating the credential or re-approving the grant does not need a restart. |
+| `runner_sign_invalid_response`, `runner_sign_unavailable` | The vault sent a reply the agent could not use, or was unavailable. New jobs are refused for 2 seconds, then the next sign request asks the vault again. |
 
 Tests: `missing_key_fails_health_and_run_before_snapshot_or_ssh`,
 `refused_grant_fails_health_and_run_before_snapshot_or_ssh`,
 `missing_enrollment_recovers_health_without_restart`,
 `credential_backoff_doubles_caps_and_stops_on_shutdown`,
-`agent_start_failure_recovers_without_restart`.
+`agent_start_failure_recovers_without_restart`,
+`transient_sign_failure_is_retried_after_backoff_and_health_recovers`,
+`refused_sign_grant_is_retried_after_longer_backoff_once_reapproved`.
+
+### Retry hints on credential refusals
+
+Only a transient signing failure (`runner_sign_unavailable`,
+`runner_sign_invalid_response`) puts the terminal record's optional
+`retry_after_ms` on its refusal. The hint is the time left in the agent's
+backoff for that failure: once it passes, the next job's sign request asks the
+vault again, so a caller can wait and retry remotely instead of running the job
+somewhere else. It does not promise the vault has recovered. Prepare replies
+carry the same hint.
+
+| Code | `retry_after_ms` |
+| --- | --- |
+| `runner_sign_unavailable`, `runner_sign_invalid_response` | The milliseconds left in the agent's 2-second backoff for that failure, rounded up: at least 1, at most 2000. |
+| `runner_sign_missing`, `runner_sign_grant_refused` | Absent. An operator must re-create the credential or re-approve the grant; a wait-and-retry hint would make a caller retry in a loop. |
+| `runner_credential_*`, `runner_agent_start_failed`, `runner_agent_stopped`, `runner_ssh_config_invalid` | Absent. Most need an operator to fix the vault, the agent or the SSH alias; the background retries above have no fixed time a caller could wait for. |
+
+The hint is set wherever a connector refusal becomes a refusal: the check
+before the snapshot, and a refusal found while opening the runner channel. Both
+the agent route and `ck motor run` receive it, and `ck motor run` prints it in
+its refusal line as `(retry after N ms)`. The field is omitted, not `null`,
+when there is no hint, and older callers that know it read it as written. Tests:
+`transient_sign_failures_hint_the_time_left_in_their_backoff`,
+`repairable_sign_failures_carry_no_hint`,
+`transient_sign_refusal_hints_the_backoff_left_and_the_hint_shrinks`,
+`connector_retry_hint_reaches_run_and_prepare_refusals`,
+`a_refusal_line_names_its_retry_hint_only_when_it_has_one`,
+`oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
 
 ## Storage
 

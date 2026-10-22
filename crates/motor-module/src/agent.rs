@@ -124,6 +124,28 @@ impl SignState {
             .filter(|fault| now < fault.retry_at)
             .map(|fault| fault.code)
     }
+    /// How many milliseconds a caller refused with `code` should wait before
+    /// trying again: the time left until the current failure's backoff ends,
+    /// at least 1 and at most `TRANSIENT_SIGN_BACKOFF`. Only an unavailable
+    /// vault or an unusable vault reply clears on its own, so only those two
+    /// codes get a hint. A missing credential or a refused grant waits for an
+    /// operator, and a hint would invite a caller to retry it in a loop.
+    /// `None` too when `code` is no longer the current failure.
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        if !matches!(
+            code,
+            "runner_sign_unavailable" | "runner_sign_invalid_response"
+        ) {
+            return None;
+        }
+        let now = self.now();
+        let fault = self.fault.lock().unwrap();
+        let fault = fault.as_ref().filter(|fault| fault.code == code)?;
+        let left = fault.retry_at.saturating_duration_since(now);
+        // Round up, so a hint never ends before the backoff does.
+        let left_ms = u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+        Some(left_ms.clamp(1, TRANSIENT_SIGN_BACKOFF.as_millis() as u64))
+    }
     /// The failure health reports: held until a sign succeeds.
     fn current(&self) -> Option<&'static str> {
         self.fault.lock().unwrap().as_ref().map(|fault| fault.code)
@@ -227,6 +249,11 @@ impl VaultAgent {
     /// succeeds, even after its backoff has passed.
     pub fn health_refusal(&self) -> Option<&'static str> {
         self.signing.current().or_else(|| self.stopped_refusal())
+    }
+    /// The `retry_after_ms` hint for a job refused with `code`; see
+    /// `SignState::retry_after_ms`.
+    pub fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        self.signing.retry_after_ms(code)
     }
     fn stopped_refusal(&self) -> Option<&'static str> {
         (!self.alive.load(Ordering::Acquire)).then_some("runner_agent_stopped")
@@ -358,6 +385,71 @@ async fn serve(
         .await;
         if !matches!(sent, Ok(Ok(()))) {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_hint_tests {
+    use super::*;
+
+    // The hint is the time left in the failure's own backoff, read from the
+    // sign clock, so it shrinks as the clock moves and never drops below 1 ms.
+    #[test]
+    fn transient_sign_failures_hint_the_time_left_in_their_backoff() {
+        for (code, class) in [
+            ("runner_sign_unavailable", CredentialErrorClass::Unavailable),
+            (
+                "runner_sign_invalid_response",
+                CredentialErrorClass::InvalidResponse,
+            ),
+        ] {
+            let state = SignState::new();
+            state.pause();
+            assert_eq!(state.retry_after_ms(code), None, "no failure yet");
+            state.failed(code, class);
+            assert_eq!(state.retry_after_ms(code), Some(2000), "{code}");
+            state.advance(Duration::from_millis(750));
+            assert_eq!(state.retry_after_ms(code), Some(1250), "{code}");
+            // A partial millisecond rounds up, so the hint never ends early.
+            state.advance(Duration::from_micros(1_249_500));
+            assert_eq!(state.retry_after_ms(code), Some(1), "{code}");
+            // Past the backoff the failure still holds until a sign succeeds,
+            // so the hint stays at its 1 ms floor rather than disappearing.
+            state.advance(TRANSIENT_SIGN_BACKOFF);
+            assert_eq!(state.retry_after_ms(code), Some(1), "{code}");
+            // A hint is only for the failure that is current.
+            let other = if code == "runner_sign_unavailable" {
+                "runner_sign_invalid_response"
+            } else {
+                "runner_sign_unavailable"
+            };
+            assert_eq!(state.retry_after_ms(other), None, "{code}");
+            state.succeeded();
+            assert_eq!(state.retry_after_ms(code), None, "{code}");
+        }
+    }
+
+    // A missing credential or a refused grant waits for an operator. A hint
+    // would tell a caller to retry in a loop, so neither carries one, even
+    // inside its backoff.
+    #[test]
+    fn repairable_sign_failures_carry_no_hint() {
+        for (code, class) in [
+            (
+                "runner_sign_missing",
+                CredentialErrorClass::CredentialAbsent,
+            ),
+            (
+                "runner_sign_grant_refused",
+                CredentialErrorClass::Unauthorized,
+            ),
+        ] {
+            let state = SignState::new();
+            state.pause();
+            state.failed(code, class);
+            assert_eq!(state.refusal(), Some(code));
+            assert_eq!(state.retry_after_ms(code), None, "{code}");
         }
     }
 }

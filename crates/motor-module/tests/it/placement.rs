@@ -1243,7 +1243,9 @@ async fn refused_sign_returns_agent_failure_typed_run_refusal_and_failing_health
     let health = rig.handler.health().await;
     assert_eq!(health.status, HealthStatus::Failing);
     assert_failing_detail_and_counters(&health, "runner_sign_grant_refused");
-    let terminal: StreamRecord = serde_json::from_value(rig.run("any").await).unwrap();
+    let refused = rig.run("any").await;
+    assert_eq!(refused.get("retry_after_ms"), None, "{refused}");
+    let terminal: StreamRecord = serde_json::from_value(refused).unwrap();
     let StreamRecord::Terminal(terminal) = terminal else {
         panic!("expected refusal")
     };
@@ -1345,6 +1347,51 @@ async fn transient_sign_failure_is_retried_after_backoff_and_health_recovers() {
     rig.stop().await;
 }
 
+// A job refused for a transient sign failure tells its caller how much of the
+// agent's backoff is left, so the caller can wait and retry remotely instead of
+// running the job somewhere else. The hint comes from the agent's sign clock,
+// so it shrinks as that clock moves.
+#[tokio::test]
+async fn transient_sign_refusal_hints_the_backoff_left_and_the_hint_shrinks() {
+    let vault = FakeVault::new();
+    vault.unavailable.store(true, Ordering::SeqCst);
+    let mut rig = Rig::with_resolver(vault.resolver()).await;
+    assert_eq!(
+        rig.bind(aft(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    let ssh = rig.handler.ssh_connector().unwrap();
+    let agent = ssh.agent().unwrap();
+    agent.signing().pause();
+    let key = identity(&agent.socket).await;
+    assert!(!signs_through(&agent.socket, &key).await);
+    let hint = |record: &Value| {
+        let StreamRecord::Terminal(terminal) = serde_json::from_value(record.clone()).unwrap()
+        else {
+            panic!("expected refusal")
+        };
+        let hint = terminal
+            .retry_after_ms()
+            .expect("transient refusal has a hint");
+        assert!((1..=2000).contains(&hint), "{record}");
+        // The agent route sends the hint as a plain JSON number.
+        assert_eq!(record["retry_after_ms"], hint, "{record}");
+        hint
+    };
+
+    let first = rig.run("any").await;
+    assert_refused_run(first.clone(), "runner_sign_unavailable");
+    assert_eq!(hint(&first), 2000);
+
+    agent.signing().advance(Duration::from_millis(1500));
+    let later = rig.run("any").await;
+    assert_refused_run(later.clone(), "runner_sign_unavailable");
+    assert_eq!(hint(&later), 500);
+    assert!(!rig.root.join("spools").exists());
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+    rig.stop().await;
+}
+
 // A refused grant is repaired by re-approving it, without a restart, so it is
 // retried too, on the longer backoff.
 #[tokio::test]
@@ -1371,7 +1418,11 @@ async fn refused_sign_grant_is_retried_after_longer_backoff_once_reapproved() {
     assert_eq!(ssh.refusal(), Some("runner_sign_grant_refused"));
     assert!(!signs_through(&agent.socket, &key).await);
     assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
-    assert_refused_run(rig.run("any").await, "runner_sign_grant_refused");
+    let refused = rig.run("any").await;
+    assert_refused_run(refused.clone(), "runner_sign_grant_refused");
+    // A refused grant waits for an operator, so its refusal carries no retry
+    // hint, and the agent route omits the field rather than sending null.
+    assert_eq!(refused.get("retry_after_ms"), None, "{refused}");
 
     agent
         .signing()
