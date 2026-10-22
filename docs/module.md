@@ -486,6 +486,19 @@ repository-selected jobs sent to the build server after `no_host_fits` in the
 last hour (these are not in `hosted_routed_jobs_1h`); stored route decisions
 survive restart.
 
+A lease refused with HTTP 403 `{"error":"account_closed"}` means the hosted
+account was closed for good: none of its jobs may run anywhere. On every route
+(configured, repository-routed, spilled, shadow or a direct hosted test) the
+lease is not retried and the job is refused before start with
+`RequestRejected` and detail `hosted_account_closed: hosted account closed`,
+with no retry delay and no local or direct fallback. A spilled job is not sent
+back to the build server either, unlike after `no_capacity`. Only lease
+creation carries this code; a 403 elsewhere stays `hosted_auth`. A job the
+broker placed before the closure keeps its normal answers. Tests:
+`cloud_account_closed_lease_is_one_final_request_on_every_route`,
+`closed_account_rerequest_of_a_placed_job_still_runs_but_a_new_job_is_refused`,
+`spilled_account_closed_is_refused_and_never_resubmitted`.
+
 Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding_a_host`,
 `unlisted_and_windows_jobs_keep_the_direct_path`,
 `stage1_pre_run_failures_are_typed_and_never_submit_directly`,

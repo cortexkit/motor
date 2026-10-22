@@ -1115,3 +1115,154 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     }
 }
+
+/// The broker's recorded refusal of a closed account's new lease.
+pub(crate) fn cloud_account_closed_reply() -> (u16, serde_json::Value) {
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/account-closure.json"
+    ))
+    .unwrap();
+    let reply = &v["lease"]["reply"];
+    assert_eq!(reply["retry_after"], serde_json::Value::Null);
+    assert_eq!(
+        serde_json::to_string(&reply["body"]).unwrap(),
+        r#"{"error":"account_closed"}"#
+    );
+    (
+        reply["status"].as_u64().unwrap() as u16,
+        reply["body"].clone(),
+    )
+}
+
+/// A 403 `account_closed` lease refusal is final whatever routed the job
+/// hosted (configuration, a spill, repository routing or a direct hosted
+/// test): one lease request, a typed refusal that tells the caller not to
+/// repeat the request, no retry delay. A 403 on any other broker route is
+/// still an authentication failure, since the contract sends `account_closed`
+/// only on lease creation.
+#[tokio::test]
+async fn cloud_account_closed_lease_is_one_final_request_on_every_route() {
+    let (status, body) = cloud_account_closed_reply();
+    let broker = super::test_http::Http::new(move |path, _| {
+        if path == "/v1/leases" || path.ends_with("/reattach") {
+            (status, body.clone())
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let h = Harness::new(Behavior::Normal).await;
+    for kind in ["configured", "spilled", "repository_routed", "hosted_test"] {
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let mut route = h.route.clone();
+        route.broker_url = broker.url.clone();
+        match kind {
+            "spilled" => route.spill_wait_ms = Some(0),
+            "repository_routed" => route.repository_routed = true,
+            "hosted_test" => route.hosted_test = true,
+            _ => {}
+        }
+        let storage = stored(&scratch, id, route.clone());
+        let before = broker.requests.lock().unwrap().len();
+        let client = Client::new(route);
+        let error = client
+            .run(id, &Harness::request(&scratch.0), &storage)
+            .await
+            .err();
+        assert_eq!(error, Some(Error::AccountClosed), "{kind}");
+        let requests = broker.requests.lock().unwrap()[before..].to_vec();
+        assert_eq!(requests.len(), 1, "{kind}: {requests:?}");
+        assert_eq!(requests[0].0, "/v1/leases", "{kind}");
+        assert_eq!(client.broker_code().as_deref(), Some("account_closed"));
+        assert_eq!(
+            client
+                .post::<_, serde_json::Value>(
+                    &format!("/v1/leases/{id}/reattach"),
+                    &serde_json::json!({})
+                )
+                .await,
+            Err(Error::Auth),
+            "{kind}"
+        );
+    }
+    let error = Error::AccountClosed;
+    assert_eq!(error.reason(), RefusalReason::RequestRejected);
+    assert_eq!(error.code(), "hosted_account_closed");
+    assert_eq!(
+        error.detail(),
+        "hosted_account_closed: hosted account closed"
+    );
+    assert_eq!(error.retry_after_ms(), None);
+    assert!(!error.replaceable());
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 0);
+}
+
+/// Closure refuses new jobs only. A job the broker placed before the account
+/// closed is asked for again with its stored lease body and runs, while a new
+/// job for the same account is refused `account_closed`.
+#[tokio::test]
+async fn closed_account_rerequest_of_a_placed_job_still_runs_but_a_new_job_is_refused() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let request = Harness::request(&scratch.0);
+    let id = Uuid::now_v7();
+    let path = scratch.0.to_str().unwrap();
+    let salt = [9; 32];
+    let body = lease_body(
+        id,
+        &request,
+        (
+            keyed_hash(&salt, "ck-ws-v1", path).unwrap(),
+            keyed_hash(&salt, "ck-repo-v1", path).unwrap(),
+        ),
+        None,
+        None,
+        RequesterJwk::from_key(&requester().unwrap().verifying_key()),
+        Some(true),
+    )
+    .unwrap();
+    let placed: motor_lease::LeaseResponse = Client::new(h.route.clone())
+        .post("/v1/leases", &body)
+        .await
+        .unwrap();
+    h.broker
+        .lock()
+        .unwrap()
+        .knobs
+        .closed_subjects
+        .insert("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+    let mut route = h.route.clone();
+    route.lease_request = Some(body);
+    let storage = stored(&scratch, id, route);
+    let (channel, lease) = Client::new(h.route.clone())
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    drop(channel);
+    assert_eq!(lease.lease_id, placed.lease_id);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+
+    let fresh = Uuid::now_v7();
+    storage
+        .create(fresh, 30, None, Some("test".into()), false)
+        .unwrap();
+    storage.hosted_route(fresh, h.route.clone()).unwrap();
+    assert_eq!(
+        Client::new(h.route.clone())
+            .run(fresh, &request, &storage)
+            .await
+            .err(),
+        Some(Error::AccountClosed)
+    );
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| *p == "/v1/leases")
+            .count(),
+        3
+    );
+}

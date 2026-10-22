@@ -45,7 +45,7 @@ an SSH connection or executes a local command.
 
 | Hosted condition | Existing `RefusalReason` | Detail code |
 | --- | --- | --- |
-| Broker 401/403, host authentication refusal | `RunnerAuthenticationFailed` | `hosted_auth` |
+| Broker 401/403 (except a lease's 403 `account_closed`), host authentication refusal | `RunnerAuthenticationFailed` | `hosted_auth` |
 | Expired lease | `RunnerAuthenticationFailed` | `hosted_expired` |
 | TLS SPKI mismatch | `RunnerAuthenticationFailed` | `hosted_spki_mismatch` |
 | No account grant/machine token (`not_found`) | `RunnerAuthenticationFailed` | `hosted_account_not_found` |
@@ -58,6 +58,7 @@ an SSH connection or executes a local command.
 | Connection failure before Run | `Unreachable` | `hosted_connect_failed` |
 | Broker unavailable | `Unreachable` | `hosted_broker_unreachable` |
 | Budget exhausted | `RequestRejected` | `hosted_budget_exhausted` |
+| Account closed (lease 403 `account_closed`); final, never retried and never sent back to the build server, spilled jobs included | `RequestRejected` | `hosted_account_closed` |
 | Broker platform unavailable | `PlatformUnsupported` | `hosted_platform_unsupported` |
 | No timeout or runtime cap below minimum | `RequestRejected` | `hosted_no_timeout`, `hosted_max_s_too_short` |
 | Path outside supported roots | `RequestRejected` | `hosted_path_outside_roots` |

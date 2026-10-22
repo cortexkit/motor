@@ -763,8 +763,12 @@ impl Motor {
                     }
                     Err(error) => {
                         // The hosted client never sends a Run frame, so this
-                        // failure proves the job did not start anywhere.
-                        if self.return_spill(id, error.code(), spill_started).await? {
+                        // failure proves the job did not start anywhere. A
+                        // closed account may not run anywhere, so its refusal
+                        // never sends a spilled job back to the build server.
+                        if error != crate::hosted::Error::AccountClosed
+                            && self.return_spill(id, error.code(), spill_started).await?
+                        {
                             return Ok(true);
                         }
                         match error {

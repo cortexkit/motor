@@ -262,3 +262,70 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
     assert_eq!(log.attaches, vec![before_run, after_run]);
     assert!(log.runs.is_empty(), "a restart never submits again");
 }
+
+/// A spilled job whose lease CLOUD refuses with 403 `account_closed` is not
+/// sent back to the build server: a closed account must not run anything
+/// anywhere. The caller gets one typed refusal that says not to repeat the
+/// request, and nothing falls back. (`no_capacity` still sends a spill back:
+/// `spilled_no_capacity_resubmits_to_build_server_as_one_stream`.)
+#[tokio::test]
+async fn spilled_account_closed_is_refused_and_never_resubmitted() {
+    let (status, body) = crate::hosted::tests::cloud_account_closed_reply();
+    let broker = crate::hosted::test_http::Http::new(move |path, _| {
+        if path == "/v1/leases" {
+            (status, body.clone())
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-account-closed");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    let Some(StreamRecord::Terminal(terminal)) = records.last() else {
+        panic!("{records:?}")
+    };
+    assert_eq!(terminal.job_id, id);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms, None);
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some("hosted_account_closed: hosted account closed")
+    );
+    // The build server saw only the first submission, which the spill
+    // withdrew; nothing was submitted again.
+    let log = log.lock().unwrap();
+    assert_eq!(log.runs, vec![(id, 0)]);
+    assert_eq!(log.withdraws, vec![id]);
+    let requests = broker.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(path, _)| path == "/v1/leases")
+            .count(),
+        1,
+        "{requests:?}"
+    );
+    assert!(!requests
+        .iter()
+        .any(|(path, _)| path.ends_with("/reattach") || path.ends_with("/finish")));
+    assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_no_fallback);
+    assert_eq!(state.hosted_code.as_deref(), Some("hosted_account_closed"));
+}
