@@ -148,6 +148,7 @@ impl Endpoint {
                 gate_jobs: true,
                 return_paths: false,
                 return_chunked: false,
+                sibling_paths: false,
                 platforms: Vec::new(),
             };
             write_frame(&mut runner, &serde_json::to_value(hello).unwrap())

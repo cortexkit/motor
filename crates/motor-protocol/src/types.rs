@@ -346,6 +346,10 @@ define_frames! {
         /// `ReturnChunk` and `ReturnManifest` frames.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         return_chunked: bool,
+        /// The runner mounts sibling snapshots below its configured workspace roots,
+        /// not just beside the repository root. Absent on in-place and Windows runners.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sibling_paths: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         platforms: Vec<String>,
     },

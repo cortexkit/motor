@@ -744,6 +744,7 @@ pub(crate) struct Channel {
     /// The runner's Hello advertised chunked returned files.
     pub return_chunked: bool,
     pub gate_jobs: bool,
+    pub sibling_paths: bool,
     pub platforms: Vec<String>,
     tx: mpsc::Sender<WriteRequest>,
     rx: mpsc::Receiver<io::Result<Incoming>>,
@@ -768,6 +769,7 @@ impl Channel {
             &Frame::Hello {
                 return_paths: false,
                 return_chunked: false,
+                sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -803,6 +805,7 @@ impl Channel {
                     gate_jobs,
                     return_paths,
                     return_chunked,
+                    sibling_paths,
                     ..
                 } => {
                     let mut channel = Self::new(pipe);
@@ -810,6 +813,7 @@ impl Channel {
                     channel.gate_jobs = gate_jobs;
                     channel.return_paths = return_paths;
                     channel.return_chunked = return_chunked;
+                    channel.sibling_paths = sibling_paths;
                     channel.enable_heartbeats();
                     return Ok(channel);
                 }
@@ -876,7 +880,7 @@ impl Channel {
                     advance(UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello { return_paths: false, return_chunked: false, protocol_version: PROTOCOL_VERSION,
+                        .send(Frame::Hello { return_paths: false, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: true,
                         gate_jobs: true,
@@ -889,13 +893,14 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, sibling_paths, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
                             channel.return_paths = return_paths;
                             channel.return_chunked = return_chunked;
+                            channel.sibling_paths = sibling_paths;
                             channel.enable_heartbeats();
                             tracing::info!(job_or_workspace_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake complete");
                             Ok(channel)
@@ -1046,6 +1051,7 @@ impl Channel {
             gate_jobs: false,
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             platforms: Vec::new(),
             tx,
             rx,
@@ -1126,6 +1132,7 @@ mod hello_tests {
                     gate_jobs: true,
                     return_paths: false,
                     return_chunked: false,
+                    sibling_paths: true,
                     platforms: vec!["linux".into()],
                 },
             )
@@ -1133,7 +1140,7 @@ mod hello_tests {
             .unwrap();
         };
         let (channel, ()) = tokio::join!(Channel::from_hosted(Box::new(client)), server);
-        assert!(channel.is_ok());
+        assert!(channel.unwrap().sibling_paths);
     }
 
     #[tokio::test]
@@ -1158,6 +1165,7 @@ mod hello_tests {
                 &Frame::Hello {
                     return_paths: false,
                     return_chunked: false,
+                    sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
                     default_branch_tip: false,
@@ -1190,6 +1198,7 @@ mod hello_tests {
                     &Frame::Hello {
                         return_paths: false,
                         return_chunked: false,
+                        sibling_paths: capable,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1201,7 +1210,9 @@ mod hello_tests {
                 .unwrap();
             };
             let (channel, ()) = tokio::join!(Channel::open(&connector, Uuid::now_v7()), server);
-            assert_eq!(channel.unwrap().gate_jobs, capable);
+            let channel = channel.unwrap();
+            assert_eq!(channel.gate_jobs, capable);
+            assert_eq!(channel.sibling_paths, capable);
         }
     }
 }

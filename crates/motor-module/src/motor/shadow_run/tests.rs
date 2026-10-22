@@ -30,6 +30,7 @@ impl Connector for PrimaryPeer {
                         platforms: vec!["linux".into()],
                         return_paths: true,
                         return_chunked: false,
+                        sibling_paths: false,
                     },
                 )
                 .await

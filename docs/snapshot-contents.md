@@ -29,6 +29,26 @@ workspace nested inside a known one, is refused before setup. Tests:
 `nested_workspace_is_refused_before_any_workspace_is_created`
 (`crates/motor-runner/src/tests/nested_workspaces.rs`).
 
+1.3. Isolated Linux runners advertising `hello.sibling_paths` accept siblings
+in any of their allowed workspace roots, not only beside the repository root.
+Existing path components are resolved before authorization and overlap checks;
+a symlink cannot escape an allowed root or hide nesting. A disallowed path's
+refusal names `allowed_roots`. Siblings, their worktree aliases and workspaces
+must not overlap, including siblings with colliding directory names. Tests:
+`snapshot_sibling_in_another_allowed_root_is_prepared`,
+`snapshot_sibling_path_authorization_refuses_roots_nesting_and_symlink_escape`,
+`snapshot_sibling_refuses_nesting_in_known_workspace_or_sibling_by_canonical_path`.
+
+1.4. Older runners, in-place runners and Windows runners still require siblings
+to share the repository root's parent directory. For a linked worktree this
+means beside its main checkout, not beside the worktree. In-place runners
+recreate and share host checkouts; Windows uses mapped staging exports rather
+than Linux snapshot mounts. The client checks the runner's Hello before sending
+Have, Run, Prepare or bundles, so an unsupported layout refuses before start.
+Tests: `in_place_and_windows_siblings_still_require_neighbours`,
+`legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare`,
+`new_direct_client_negotiates_gate_mark_with_pinned_runner` (mixed-version gate).
+
 ## 2. What goes in
 
 The optional cache-fill tip is separate from the submitted snapshot commit.

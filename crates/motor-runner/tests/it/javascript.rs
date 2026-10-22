@@ -102,6 +102,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
         Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -169,6 +170,7 @@ pub(super) async fn submit_with_capability(
         &Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip,

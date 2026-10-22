@@ -172,6 +172,7 @@ impl Connector for DirectPeer {
                         platforms: vec!["linux".into(), "windows".into()],
                         return_paths: true,
                         return_chunked: false,
+                        sibling_paths: false,
                     },
                 )
                 .await

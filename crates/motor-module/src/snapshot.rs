@@ -874,26 +874,11 @@ impl Snapshots {
             })?;
         }
         let mut snapshots = Vec::new();
-        let parent = fs::canonicalize(root)
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
         for (i, sibling) in siblings.iter().enumerate() {
             let path = fs::canonicalize(sibling).map_err(|error| Failure {
                 tree_hash: hash.clone(),
                 check: format!("sibling {sibling} cannot be resolved: {error}"),
             })?;
-            if path.parent() != parent.as_deref() {
-                // motor-runner recreates each sibling on the build host at this
-                // same absolute path and accepts only direct neighbours of the
-                // repository root, so it would refuse a sibling anywhere else.
-                return Err(Failure {
-                    tree_hash: hash,
-                    check: format!(
-                        "sibling {} must sit in the same folder as the repository root {root}; for a linked worktree, the repository root is its main checkout",
-                        path.display()
-                    ),
-                });
-            }
             snapshots.push(
                 snapshot(
                     &path,
@@ -944,6 +929,23 @@ impl Snapshots {
                 base_commit: Some(s.head.clone()),
             })
             .collect()
+    }
+    /// In-place and Windows runners still reconstruct siblings beside the main
+    /// checkout. Check their advertised mode before sending Have, Run or Prepare.
+    pub fn validate_sibling_paths(&self, arbitrary_paths: bool) -> io::Result<()> {
+        if arbitrary_paths {
+            return Ok(());
+        }
+        let root = Path::new(&self.main.repository);
+        for sibling in &self.siblings {
+            if Path::new(&sibling.repository).parent() != root.parent() {
+                return Err(io::Error::other(format!(
+                    "sibling {} must sit in the same folder as the repository root {}; this runner does not advertise sibling_paths; for a linked worktree, the repository root is its main checkout",
+                    sibling.repository, root.display()
+                )));
+            }
+        }
+        Ok(())
     }
     pub fn candidates(&self, previous: &BTreeMap<String, String>) -> Vec<RepositoryCandidates> {
         std::iter::once(&self.main)
@@ -1567,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn sibling_beside_a_linked_worktree_names_the_main_checkout_it_must_sit_beside() {
+    fn sibling_beside_a_linked_worktree_requires_snapshot_paths_capability() {
         let (scratch, checkout, spool, _) = repository();
         let gate = scratch.join("gate");
         fs::create_dir_all(&gate).unwrap();
@@ -1586,7 +1588,7 @@ mod tests {
         let sibling = fs::canonicalize(gate.join("sibling")).unwrap();
         let storage = Storage::open(&spool.join("store")).unwrap();
 
-        let failure = Snapshots::build(
+        let snapshots = Snapshots::build(
             &Config::default(),
             text(&linked).unwrap(),
             text(&root).unwrap(),
@@ -1596,13 +1598,13 @@ mod tests {
             None,
             &storage,
         )
-        .err()
-        .expect("a sibling beside the linked worktree, not its main checkout, must refuse");
+        .unwrap();
 
+        snapshots.validate_sibling_paths(true).unwrap();
         assert_eq!(
-            failure.check,
+            snapshots.validate_sibling_paths(false).unwrap_err().to_string(),
             format!(
-                "sibling {} must sit in the same folder as the repository root {}; for a linked worktree, the repository root is its main checkout",
+                "sibling {} must sit in the same folder as the repository root {}; this runner does not advertise sibling_paths; for a linked worktree, the repository root is its main checkout",
                 sibling.display(),
                 root.display()
             )

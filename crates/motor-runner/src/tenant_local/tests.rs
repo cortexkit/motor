@@ -33,6 +33,7 @@ fn hello() -> Frame {
     Frame::Hello {
         return_paths: false,
         return_chunked: false,
+        sibling_paths: false,
         protocol_version: 1,
         started: true,
         default_branch_tip: false,

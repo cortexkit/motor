@@ -185,6 +185,7 @@ pub(crate) fn validate(
     workspace: &str,
     repository: &str,
     siblings: &[SiblingSnapshot],
+    snapshot_paths: bool,
 ) -> io::Result<()> {
     if !absolute(workspace)
         || !absolute(repository)
@@ -194,11 +195,43 @@ pub(crate) fn validate(
     }
     for s in siblings {
         if !absolute(&s.canonical_path)
-            || Path::new(&s.canonical_path).parent() != Path::new(repository).parent()
+            || (!snapshot_paths
+                && Path::new(&s.canonical_path).parent() != Path::new(repository).parent())
             || s.canonical_path == repository
             || Path::new(workspace).starts_with(&s.canonical_path)
         {
             return Err(invalid("invalid sibling path"));
+        }
+    }
+    if snapshot_paths {
+        let mut paths = vec![
+            destination(Path::new(workspace))?,
+            destination(Path::new(repository))?,
+        ];
+        for sibling in siblings {
+            let path = destination(Path::new(&sibling.canonical_path))?;
+            let alias = destination(
+                &Path::new(workspace)
+                    .parent()
+                    .ok_or_else(|| invalid("workspace has no parent"))?
+                    .join(
+                        Path::new(&sibling.canonical_path)
+                            .file_name()
+                            .ok_or_else(|| invalid("sibling path has no name"))?,
+                    ),
+            )?;
+            for mount in [&path, &alias] {
+                if paths
+                    .iter()
+                    .any(|other| mount.starts_with(other) || other.starts_with(mount))
+                {
+                    return Err(invalid(
+                        "sibling or its worktree alias overlaps workspace, repository or another sibling",
+                    ));
+                }
+            }
+            paths.push(path);
+            paths.push(alias);
         }
     }
     Ok(())
@@ -274,6 +307,31 @@ pub(crate) fn validate_destinations(
         resolve(&sibling.canonical_path)?;
     }
     Ok(())
+}
+
+pub(crate) fn sibling_aliases(
+    key: &str,
+    siblings: &[SiblingSnapshot],
+) -> io::Result<Vec<SiblingSnapshot>> {
+    siblings
+        .iter()
+        .map(|sibling| {
+            let path = Path::new(key)
+                .parent()
+                .ok_or_else(|| invalid("workspace has no parent"))?
+                .join(
+                    Path::new(&sibling.canonical_path)
+                        .file_name()
+                        .ok_or_else(|| invalid("sibling path has no name"))?,
+                );
+            let mut alias = sibling.clone();
+            alias.canonical_path = path
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF8 sibling alias"))?
+                .into();
+            Ok(alias)
+        })
+        .collect()
 }
 
 pub(crate) struct Trees {

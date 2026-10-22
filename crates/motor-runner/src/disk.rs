@@ -139,7 +139,12 @@ impl Runner {
                 )),
             }));
         }
-        workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings)?;
+        workspace::validate(
+            &r.workspace_key,
+            &r.repository_root,
+            &r.siblings,
+            self.core.config.sibling_snapshot_mode(),
+        )?;
         let refusal = |reason: RefusalReason, disk_full, detail: String| Refusal {
             retry_after_ms: if reason == RefusalReason::RunnerDraining {
                 self.drain_retry_after_ms()

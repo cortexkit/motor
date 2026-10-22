@@ -57,7 +57,7 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | --- | --- | --- |
 | The workspace, at the caller's absolute path | Read-write | The runner's checkout of the snapshot |
 | The workspace's `.git` | Read-only | Same checkout |
-| Each sibling, at its own absolute path (and next to the workspace under its directory name) | Read-only | The runner's sibling checkout |
+| Each sibling, at its own absolute path (and next to the workspace under its directory name) | Read-only | Its immutable per-commit sibling snapshot; the host checkout only in legacy in-place mode |
 | `/run/motor/target` and the per-workspace target path | Read-write | The workspace's private build output |
 | `/motor-home` (`HOME`), with a private `CARGO_HOME` at `/motor-home/cargo` | Read-write | Per-job directory |
 | `/motor-home/cargo/registry`, `/motor-home/cargo/git` | Read-only | The shared Cargo registry and Git sources |
@@ -71,6 +71,12 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | `/motor-slots`, with its existing lock files writable | Read-only directory | Shared build-slot locks, when the build-slot supervisor is in use |
 | `/etc/resolv.conf` | Read-only, outbound jobs only | Generated; see 6.3 |
 | `/motor-output/{stdout,stderr,exit,cache-stats}` | Write to existing files only | The job's durable output |
+
+Sibling snapshot paths may be in a different allowed workspace root. The
+runner authorizes their resolved destinations just as it does the workspace;
+neither nesting nor colliding worktree aliases are supported. The mount remains
+at exactly the supplied canonical path, with a read-only worktree alias.
+Operator test: `isolated_snapshot_sibling_in_another_allowed_root_is_read_only_at_its_path`.
 
 Source: `Sandbox` construction in `crates/motor-runner/src/isolation.rs`.
 Test for the command shape: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`.

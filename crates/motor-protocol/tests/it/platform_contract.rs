@@ -64,6 +64,7 @@ fn hello_empty_platforms_keep_both_legacy_wire_shapes() {
                 protocol_version: 1,
                 return_paths: false,
                 return_chunked: false,
+                sibling_paths: false,
                 started,
                 default_branch_tip: false,
                 gate_jobs: false,
@@ -87,6 +88,7 @@ fn windows_hello_advertises_explicit_platforms() {
     let hello = Frame::Hello {
         return_paths: false,
         return_chunked: false,
+        sibling_paths: false,
         protocol_version: 1,
         started: true,
         default_branch_tip: false,

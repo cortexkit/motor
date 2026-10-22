@@ -59,6 +59,7 @@ impl Connector for HelloConnector {
                         &Frame::Hello {
                             return_paths: false,
                             return_chunked: false,
+                            sibling_paths: false,
                             protocol_version,
                             started: true,
                             default_branch_tip: false,

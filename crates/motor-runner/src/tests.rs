@@ -1738,6 +1738,7 @@ async fn connect(socket: &Path) -> UnixStream {
         &Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1752,6 +1753,7 @@ async fn connect(socket: &Path) -> UnixStream {
         Frame::Hello {
             return_paths: true,
             return_chunked: true,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1940,6 +1942,7 @@ fn blocking_hello(socket: &Path) -> io::Result<std::os::unix::net::UnixStream> {
         &Frame::Hello {
             return_paths: false,
             return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
