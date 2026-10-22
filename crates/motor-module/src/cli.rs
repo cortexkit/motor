@@ -338,8 +338,17 @@ fn default_secret_path(directory: &Path, job_id: Uuid) -> PathBuf {
     directory.join(job_id.to_string())
 }
 
+/// The module's data directory, named by the module id the daemon runs it under
+/// (`SUBC_MODULE_ID`, as the module itself uses), so the CLI's secret files sit
+/// beside the module's own data rather than under a legacy module name.
+fn cli_module_data_dir() -> std::io::Result<PathBuf> {
+    let module_id =
+        std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| crate::module::DEFAULT_MODULE_ID.into());
+    crate::module::module_data_dir(&module_id)
+}
+
 fn prepare_default_secret_directory() -> std::io::Result<PathBuf> {
-    let data_root = crate::module::module_data_dir("ck-motor")?;
+    let data_root = cli_module_data_dir()?;
     prepare_default_secret_directory_under(&data_root)
 }
 
@@ -363,7 +372,7 @@ fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<P
 }
 
 fn existing_default_secret_directory() -> std::io::Result<Option<PathBuf>> {
-    let directory = crate::module::module_data_dir("ck-motor")?.join(DEFAULT_SECRET_DIRECTORY);
+    let directory = cli_module_data_dir()?.join(DEFAULT_SECRET_DIRECTORY);
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {
             let handle = fs::OpenOptions::new()
