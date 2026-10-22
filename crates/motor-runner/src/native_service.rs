@@ -2,7 +2,10 @@ use motor_runner::Runner;
 use std::{
     ffi::OsString,
     io,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use windows_service::{
@@ -11,7 +14,7 @@ use windows_service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
         ServiceType,
     },
-    service_control_handler::{self, ServiceControlHandlerResult},
+    service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
     service_dispatcher,
 };
 use windows_sys::Win32::System::Power::{
@@ -24,19 +27,9 @@ define_windows_service!(service_entry, service_main);
 pub(super) fn dispatch() -> io::Result<()> {
     service_dispatcher::start(NAME, service_entry).map_err(io::Error::other)
 }
-fn service_main(_: Vec<OsString>) {
-    let handler = match service_control_handler::register(NAME, |event| match event {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            STOP.store(true, Ordering::Release);
-            ServiceControlHandlerResult::NoError
-        }
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        _ => ServiceControlHandlerResult::NotImplemented,
-    }) {
-        Ok(handler) => handler,
-        Err(_) => return,
-    };
-    let status = |state, code| ServiceStatus {
+fn service_status(state: ServiceState, code: u32) -> ServiceStatus {
+    let stopping = state == ServiceState::StopPending;
+    ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: if state == ServiceState::Running {
@@ -45,14 +38,61 @@ fn service_main(_: Vec<OsString>) {
             ServiceControlAccept::empty()
         },
         exit_code: ServiceExitCode::Win32(code),
-        checkpoint: 0,
-        wait_hint: Duration::from_secs(35),
+        checkpoint: if stopping { 1 } else { 0 },
+        wait_hint: Duration::from_secs(if stopping { 60 } else { 35 }),
         process_id: None,
-    };
-    if handler
-        .set_service_status(status(ServiceState::Running, 0))
-        .is_err()
-    {
+    }
+}
+fn service_main(_: Vec<OsString>) {
+    let status_slot = Arc::new(Mutex::new(None::<ServiceStatusHandle>));
+    let callback_status = Arc::clone(&status_slot);
+    let service_status_handle =
+        match service_control_handler::register(NAME, move |event| match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                // Runner::open can be hashing the parent on a synchronous control call.
+                // Publish StopPending and request cancellation before Runner::open returns.
+                STOP.store(true, Ordering::Release);
+                motor_runner::request_windows_service_stop();
+                if let Ok(slot) = callback_status.lock() {
+                    if let Some(handle) = slot.as_ref() {
+                        let _ =
+                            handle.set_service_status(service_status(ServiceState::StopPending, 0));
+                    }
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        };
+    if let Ok(mut slot) = status_slot.lock() {
+        *slot = Some(service_status_handle);
+    } else {
+        return;
+    }
+    if STOP.load(Ordering::Acquire) {
+        if let Ok(slot) = status_slot.lock() {
+            if let Some(handle) = slot.as_ref() {
+                let _ = handle.set_service_status(service_status(ServiceState::StopPending, 0));
+                let _ = handle.set_service_status(service_status(ServiceState::Stopped, 0));
+            }
+        }
+        return;
+    }
+    if let Ok(slot) = status_slot.lock() {
+        if let Some(handle) = slot.as_ref() {
+            if handle
+                .set_service_status(service_status(ServiceState::Running, 0))
+                .is_err()
+            {
+                return;
+            }
+        } else {
+            return;
+        }
+    } else {
         return;
     }
     let args = std::iter::once("serve".to_owned())
@@ -62,21 +102,26 @@ fn service_main(_: Vec<OsString>) {
         .enable_all()
         .build()
         .and_then(|runtime| runtime.block_on(super::run(args)));
+    let stopping = STOP.load(Ordering::Acquire);
     if let Err(error) = &result {
-        eprintln!("native runner service failed: {error}");
-        use std::io::Write;
-        if let Ok(mut log) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(r"C:\ProgramData\MotorRunner\evidence\service-errors.log")
-        {
-            let _ = writeln!(log, "native runner service failed: {error}");
+        if !stopping {
+            eprintln!("native runner service failed: {error}");
+            use std::io::Write;
+            if let Ok(mut log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"C:\ProgramData\MotorRunner\evidence\service-errors.log")
+            {
+                let _ = writeln!(log, "native runner service failed: {error}");
+            }
         }
     }
-    let _ = handler.set_service_status(status(
-        ServiceState::Stopped,
-        if result.is_ok() { 0 } else { 1 },
-    ));
+    let code = if result.is_ok() || stopping { 0 } else { 1 };
+    if let Ok(slot) = status_slot.lock() {
+        if let Some(handle) = slot.as_ref() {
+            let _ = handle.set_service_status(service_status(ServiceState::Stopped, code));
+        }
+    };
 }
 fn on_ac() -> io::Result<bool> {
     let mut power: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };

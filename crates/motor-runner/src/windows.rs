@@ -7,6 +7,8 @@ use motor_protocol::Uuid;
 use serde::Deserialize;
 #[cfg(any(unix, test))]
 use std::process::Output;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -36,6 +38,17 @@ pub(crate) use agent::{PreparedVm, Runtime};
 pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
+
+#[cfg(windows)]
+static SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+pub(crate) fn request_service_stop() {
+    SERVICE_STOP_REQUESTED.store(true, Ordering::Release);
+}
+#[cfg(windows)]
+pub(crate) fn service_stop_requested() -> bool {
+    SERVICE_STOP_REQUESTED.load(Ordering::Acquire)
+}
 
 #[cfg(unix)]
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {

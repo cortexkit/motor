@@ -12,12 +12,46 @@ $env:Path = 'C:\Windows\System32;C:\Windows;C:\Program Files\Git\cmd;C:\Program 
 $exe = "$Root\bin\motor-runner.exe"
 $config = @('--instance','ally','--state-root',"$Root\state",'--backend','windows-vm','--vm-config',"$Root\vm.toml")
 function Runner-Check([string]$Operation) {
+    Write-Host "RUN $Operation started_utc=$([DateTime]::UtcNow.ToString('o'))"
     $process = Start-SpikeNativeProcess $exe (@($Operation) + $config)
-    if (-not $process.process.WaitForExit(180000)) { $process.process.Kill(); throw "$Operation timed out" }
+    $finished = $process.process.WaitForExit(180000)
+    if (-not $finished) {
+        try { $process.process.Kill() } catch { }
+        if (-not $process.process.WaitForExit(5000)) { throw "$Operation did not terminate after the 180-second limit; preserve $Evidence" }
+    }
     $result = Complete-SpikeNativeProcess $process "$Evidence\$Operation.stdout" "$Evidence\$Operation.stderr"
     Get-Content "$Evidence\$Operation.stdout","$Evidence\$Operation.stderr" | Out-Host
+    if (-not $finished) { throw "$Operation timed out after 180 seconds; preserve $Evidence and inspect copied host progress logs" }
     if ($result.exitCode -ne 0) { throw "$Operation failed exit=$($result.exitCode)" }
     return $result.stdout
+}
+function Stop-RunnerServiceBounded([int]$TimeoutSeconds = 120) {
+    # SCM can temporarily refuse Stop while the startup parent digest is running;
+    # retry the control and bound the wait for the service to reach Stopped.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $stopSent = $false
+    $lastState = 'Unknown'
+    $lastStopError = ''
+    while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $service = Get-Service -Name MotorRunner -ErrorAction Stop
+        $lastState = [string]$service.Status
+        if ($service.Status -eq 'Stopped') { return }
+        if ($service.Status -eq 'StopPending') { $stopSent = $true }
+        if (-not $stopSent) {
+            try {
+                Stop-Service -Name MotorRunner -ErrorAction Stop
+                $stopSent = $true
+            } catch {
+                $lastStopError = [string]$_
+                $service = Get-Service -Name MotorRunner -ErrorAction Stop
+                $lastState = [string]$service.Status
+                if ($service.Status -eq 'Stopped') { return }
+                if ($service.Status -eq 'StopPending') { $stopSent = $true }
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "MotorRunner did not reach Stopped within $TimeoutSeconds seconds; last_state=$lastState stop_error=$lastStopError"
 }
 function Wait-RunnerQualificationService {
     # SCM Running is published before parent verification and named-pipe bind.
@@ -40,9 +74,8 @@ function Copy-QualificationEvidence {
     Copy-Item -LiteralPath "$Root\vm.toml" -Destination "$Evidence\vm.toml" -Force -ErrorAction Stop
 }
 if ($OfflineCargoOnly) {
-    $service = Get-Service MotorRunner
-    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
     try {
+        Stop-RunnerServiceBounded
         $null = Runner-Check 'qualify-prep-offline-cargo'
     } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Offline Cargo evidence copy failed: $_" -WarningAction Continue }
@@ -50,9 +83,8 @@ if ($OfflineCargoOnly) {
     return
 }
 if ($LocalRegistryOnly) {
-    $service = Get-Service MotorRunner
-    if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
     try {
+        Stop-RunnerServiceBounded
         $null = Runner-Check 'qualify-prep-local-registry'
     } finally {
         try { Copy-QualificationEvidence } catch { Write-Warning "Local registry evidence copy failed: $_" -WarningAction Continue }
@@ -61,10 +93,12 @@ if ($LocalRegistryOnly) {
 }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 $parentHash = (Get-FileHash -LiteralPath $parent -Algorithm SHA256).Hash
-$service = Get-Service MotorRunner
-if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40)) }
 $evidenceCopied = $false
+$stopInProgress = $false
 try {
+    $stopInProgress = $true
+    Stop-RunnerServiceBounded
+    $stopInProgress = $false
     $disconnect = Runner-Check 'qualify-disconnect'
     $match = [regex]::Match($disconnect, 'job=([0-9a-f-]{36}) announced=(\d+) written=(\d+)')
     if (-not $match.Success -or [int]$match.Groups[3].Value -ge [int]$match.Groups[2].Value) { throw 'Disconnect did not stop in the middle of an announced agent frame' }
@@ -216,8 +250,13 @@ try {
     $evidenceCopied = $true
     Set-Content "$Evidence\QUALIFIED-SINGLE-SLOT.txt" "Single slot only; parent SHA256=$parentHash; review raw evidence before enabling fleet routing" -Encoding ascii
 } catch {
-    Stop-Service MotorRunner -ErrorAction SilentlyContinue
-    throw
+    $failure = $_
+    if (-not $stopInProgress) {
+        try { Stop-RunnerServiceBounded } catch {
+            Write-Warning "MotorRunner stop after qualification failure did not complete: $_" -WarningAction Continue
+        }
+    }
+    throw $failure
 } finally {
     # Failed checks need the same external guest/host evidence as a passing run.
     if (-not $evidenceCopied) {

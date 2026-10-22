@@ -97,6 +97,12 @@ pub use motor_protocol::allowed_env;
 
 #[cfg(windows)]
 #[doc(hidden)]
+pub fn request_windows_service_stop() {
+    windows::request_service_stop();
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
 pub fn hyperv_probe_peers() -> std::io::Result<()> {
     windows::probe_peers()
 }

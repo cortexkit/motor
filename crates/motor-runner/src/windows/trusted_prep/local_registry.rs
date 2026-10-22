@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr::{null, null_mut},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type HInternet = *mut c_void;
@@ -20,8 +20,11 @@ const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 const ERROR_WINHTTP_HEADER_NOT_FOUND: u32 = 12150;
+const ERROR_WINHTTP_TIMEOUT: i32 = 12002;
 const MAX_CRATE_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CRATE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+const INDEX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const ARCHIVE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[link(name = "winhttp", kind = "raw-dylib")]
 unsafe extern "system" {
@@ -167,23 +170,79 @@ fn require_success_status(status: u32) -> io::Result<()> {
     }
 }
 
-/// Fetch only hard-coded allowlisted HTTPS host/path pairs; redirects are disabled
-/// so an HTTP response cannot send the runner to another host.
-fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result<Vec<u8>> {
-    let maximum = allowlisted_download_limit(host, path)
-        .ok_or_else(|| invalid("local-registry download target is not allowlisted"))?;
+fn download_timeout(host: &str) -> Duration {
+    if host == "static.crates.io" {
+        ARCHIVE_DOWNLOAD_TIMEOUT
+    } else {
+        INDEX_DOWNLOAD_TIMEOUT
+    }
+}
+
+fn check_download_deadline(
+    deadline: Instant,
+    timeout: Duration,
+    host: &str,
+    path: &str,
+    phase: &str,
+) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "local-registry HTTPS request timed out after {} seconds during {phase}: https://{host}{path}",
+                timeout.as_secs()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn download_error(host: &str, path: &str, phase: &str, error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(ERROR_WINHTTP_TIMEOUT) {
+        return io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("local-registry HTTPS request timed out during {phase}: https://{host}{path}"),
+        );
+    }
+    io::Error::new(
+        error.kind(),
+        format!("local-registry HTTPS {phase} failed for https://{host}{path}: {error}"),
+    )
+}
+
+fn download_allowlisted(
+    host: &str,
+    path: &str,
+    size_limit: usize,
+    mut phase: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
+    let maximum = allowlisted_download_limit(host, path).ok_or_else(|| {
+        invalid(format!(
+            "local-registry download target is not allowlisted: {host}{path}"
+        ))
+    })?;
     if size_limit == 0 || size_limit > maximum {
         return Err(invalid(
             "local-registry download size limit exceeds its host policy",
         ));
     }
-    let expected_host = host;
-    let user_agent = wide("MotorRunner local-registry qualification");
+    let timeout = download_timeout(host);
+    let deadline = Instant::now() + timeout;
+    let url = format!("https://{host}{path}");
+    phase(&format!("{url} open WinHTTP session"))?;
+    check_download_deadline(deadline, timeout, host, path, "open session")?;
+    let user_agent = wide("MotorRunner local-registry fetcher");
     let session = handle(
         unsafe { WinHttpOpen(user_agent.as_ptr(), 0, null(), null(), 0) },
         "WinHttpOpen",
-    )?;
-    checked(unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 10_000) })?;
+    )
+    .map_err(|error| download_error(host, path, "open session", error))?;
+    check_download_deadline(deadline, timeout, host, path, "set request timeouts")?;
+    phase(&format!("{url} set request timeouts"))?;
+    checked(unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 5_000) })
+        .map_err(|error| download_error(host, path, "set request timeouts", error))?;
+    check_download_deadline(deadline, timeout, host, path, "disable redirects")?;
+    phase(&format!("{url} disable redirects"))?;
     let mut redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     checked(unsafe {
         WinHttpSetOption(
@@ -192,12 +251,18 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
             (&mut redirect_policy as *mut u32).cast(),
             std::mem::size_of_val(&redirect_policy) as u32,
         )
-    })?;
-    let host_wide = wide(expected_host);
+    })
+    .map_err(|error| download_error(host, path, "disable redirects", error))?;
+    phase(&format!("{url} resolve and connect"))?;
+    check_download_deadline(deadline, timeout, host, path, "connect")?;
+    let host_wide = wide(host);
     let connection = handle(
         unsafe { WinHttpConnect(session.0, host_wide.as_ptr(), 443, 0) },
         "WinHttpConnect",
-    )?;
+    )
+    .map_err(|error| download_error(host, path, "connect", error))?;
+    phase(&format!("{url} open request"))?;
+    check_download_deadline(deadline, timeout, host, path, "open request")?;
     let get = wide("GET");
     let path_wide = wide(path);
     let request = handle(
@@ -213,9 +278,18 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
             )
         },
         "WinHttpOpenRequest",
-    )?;
-    checked(unsafe { WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) })?;
-    checked(unsafe { WinHttpReceiveResponse(request.0, null_mut()) })?;
+    )
+    .map_err(|error| download_error(host, path, "open request", error))?;
+    phase(&format!("{url} send request"))?;
+    check_download_deadline(deadline, timeout, host, path, "send request")?;
+    checked(unsafe { WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) })
+        .map_err(|error| download_error(host, path, "send request", error))?;
+    phase(&format!("{url} receive response"))?;
+    check_download_deadline(deadline, timeout, host, path, "receive response")?;
+    checked(unsafe { WinHttpReceiveResponse(request.0, null_mut()) })
+        .map_err(|error| download_error(host, path, "receive response", error))?;
+    phase(&format!("{url} query response status"))?;
+    check_download_deadline(deadline, timeout, host, path, "query status")?;
 
     let mut status = 0u32;
     let mut status_size = std::mem::size_of_val(&status) as u32;
@@ -228,10 +302,12 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
             &mut status_size,
             null_mut(),
         )
-    })?;
-    require_success_status(status).map_err(|error| {
-        io::Error::other(format!("{} from https://{expected_host}{path}", error))
-    })?;
+    })
+    .map_err(|error| download_error(host, path, "query status", error))?;
+    require_success_status(status)
+        .map_err(|error| io::Error::other(format!("{error} from {url}")))?;
+    phase(&format!("{url} query content length"))?;
+    check_download_deadline(deadline, timeout, host, path, "query content length")?;
 
     let mut declared_size = 0u32;
     let mut size_bytes = std::mem::size_of_val(&declared_size) as u32;
@@ -248,19 +324,29 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
     if !has_size {
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         if error != ERROR_WINHTTP_HEADER_NOT_FOUND {
+            if error as i32 == ERROR_WINHTTP_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "local-registry HTTPS request timed out during query content length: {url}"
+                    ),
+                ));
+            }
             return Err(io::Error::other(format!(
-                "WinHttpQueryHeaders(Content-Length) failed with Win32 {error}"
+                "local-registry HTTPS query Content-Length failed for {url} with Win32 {error}"
             )));
         }
     } else if declared_size as usize > size_limit {
         return Err(invalid(format!(
-            "local-registry response exceeds the {size_limit}-byte limit"
+            "local-registry HTTPS response from {url} exceeds the {size_limit}-byte limit"
         )));
     }
 
+    phase(&format!("{url} read response body"))?;
     let mut bytes = Vec::with_capacity(if has_size { declared_size as usize } else { 0 });
     let mut chunk = [0u8; 8192];
     loop {
+        check_download_deadline(deadline, timeout, host, path, "read response body")?;
         let mut count = 0u32;
         checked(unsafe {
             WinHttpReadData(
@@ -269,20 +355,22 @@ fn download_allowlisted(host: &str, path: &str, size_limit: usize) -> io::Result
                 chunk.len() as u32,
                 &mut count,
             )
-        })?;
+        })
+        .map_err(|error| download_error(host, path, "read response body", error))?;
+        check_download_deadline(deadline, timeout, host, path, "read response body")?;
         if count == 0 {
             break;
         }
         if bytes.len().saturating_add(count as usize) > size_limit {
             return Err(invalid(format!(
-                "local-registry response exceeds the {size_limit}-byte limit"
+                "local-registry HTTPS response from {url} exceeds the {size_limit}-byte limit"
             )));
         }
         bytes.extend_from_slice(&chunk[..count as usize]);
     }
     if has_size && bytes.len() != declared_size as usize {
         return Err(io::Error::other(format!(
-            "incomplete HTTPS response from {expected_host}: declared {declared_size} bytes, received {}",
+            "incomplete HTTPS response from {url}: declared {declared_size} bytes, received {}",
             bytes.len()
         )));
     }
@@ -745,7 +833,27 @@ pub(super) fn prepare_for_job(
     lockfile: &str,
     routes: &BTreeMap<String, PathBuf>,
 ) -> io::Result<FetchStats> {
+    prepare_for_job_with_progress(
+        cache_root,
+        staging,
+        cargo_home,
+        lockfile,
+        routes,
+        |_| Ok(()),
+    )
+}
+
+fn prepare_for_job_with_progress(
+    cache_root: &Path,
+    staging: &Path,
+    cargo_home: &Path,
+    lockfile: &str,
+    routes: &BTreeMap<String, PathBuf>,
+    mut phase: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<FetchStats> {
+    phase("parse Cargo.lock registry package list")?;
     let packages = locked_registry_packages(lockfile)?;
+    phase("validate staging and persistent-cache paths")?;
     let cache_parent = cache_root
         .parent()
         .ok_or_else(|| invalid("local-registry cache has no parent"))?;
@@ -770,11 +878,18 @@ pub(super) fn prepare_for_job(
             Err(error) => return Err(error),
         };
         let config_bytes = if let Some(bytes) = cached_config {
+            phase("reuse cached crates.io config")?;
             bytes
         } else {
-            let bytes =
-                download_allowlisted("index.crates.io", "/config.json", MAX_CRATE_INDEX_BYTES)?;
+            phase("download crates.io config https://index.crates.io/config.json")?;
+            let bytes = download_allowlisted(
+                "index.crates.io",
+                "/config.json",
+                MAX_CRATE_INDEX_BYTES,
+                |network_phase| phase(&format!("crates.io config: {network_phase}")),
+            )?;
             valid_crates_io_config(&bytes)?;
+            phase("publish validated crates.io config to persistent cache")?;
             write_cache_file(staging, cache_root, &config_relative, &bytes)?;
             stats.config_downloaded = true;
             stats.downloaded_bytes += bytes.len() as u64;
@@ -788,6 +903,7 @@ pub(super) fn prepare_for_job(
         let job_registry = cargo_home.join("local-registry");
         reject_reparse_under(cargo_home, &job_registry)?;
         fs::create_dir_all(job_registry.join("index"))?;
+        phase("copy crates.io config into per-job local registry")?;
         write_new_file(&job_registry, Path::new("index/config.json"), &config_bytes)?;
 
         let mut by_name: BTreeMap<String, Vec<RegistryPackage>> = BTreeMap::new();
@@ -806,6 +922,7 @@ pub(super) fn prepare_for_job(
                 Ok(bytes)
                     if verify_locked_index_records(&bytes, &name, &locked).unwrap_or(false) =>
                 {
+                    phase(&format!("reuse cached crates.io index entry for {name}"))?;
                     Some(bytes)
                 }
                 Ok(_) => None,
@@ -816,12 +933,23 @@ pub(super) fn prepare_for_job(
                 bytes
             } else {
                 let path = crates_io_index_path(&name)?;
-                let bytes = download_allowlisted("index.crates.io", &path, MAX_CRATE_INDEX_BYTES)?;
+                phase(&format!(
+                    "download crates.io index entry for {name}: https://index.crates.io{path}"
+                ))?;
+                let bytes = download_allowlisted(
+                    "index.crates.io",
+                    &path,
+                    MAX_CRATE_INDEX_BYTES,
+                    |network_phase| phase(&format!("crates.io index {name}: {network_phase}")),
+                )?;
                 if !verify_locked_index_records(&bytes, &name, &locked)? {
                     return Err(invalid(format!(
                         "crates.io index for {name} lacks a version locked by Cargo.lock"
                     )));
                 }
+                phase(&format!(
+                    "publish verified crates.io index entry for {name}"
+                ))?;
                 write_cache_file(staging, cache_root, &index_relative, &bytes)?;
                 stats.index_files_downloaded.push(name.clone());
                 stats.downloaded_bytes += bytes.len() as u64;
@@ -835,6 +963,9 @@ pub(super) fn prepare_for_job(
             };
             let job_index_relative =
                 PathBuf::from("index").join(crates_io_index_path(&name)?.trim_start_matches('/'));
+            phase(&format!(
+                "copy crates.io index entry for {name} into job registry"
+            ))?;
             write_new_file(&job_registry, &job_index_relative, &index_bytes)?;
 
             for package in locked {
@@ -845,16 +976,24 @@ pub(super) fn prepare_for_job(
                 let sidecar_path = cache_root.join(&sidecar_relative);
                 reject_reparse_under(cache_root, &archive_path)?;
                 reject_reparse_under(cache_root, &sidecar_path)?;
+                phase(&format!(
+                    "check persistent cache for locked crate {filename}"
+                ))?;
                 let cached = if archive_path.is_file() {
                     let recorded = fs::read_to_string(&sidecar_path)
                         .ok()
                         .map(|value| value.trim().to_owned());
                     if recorded.as_deref() == Some(package.checksum.as_str()) {
+                        phase(&format!("reuse checksum-recorded cached crate {filename}"))?;
                         true
                     } else {
+                        phase(&format!("rehash cached crate archive {filename}"))?;
                         let existing = fs::read(&archive_path)?;
                         let actual = format!("{:x}", Sha256::digest(&existing));
                         if actual == package.checksum {
+                            phase(&format!(
+                                "write checksum sidecar for verified cached crate {filename}"
+                            ))?;
                             write_cache_file(
                                 staging,
                                 cache_root,
@@ -874,8 +1013,17 @@ pub(super) fn prepare_for_job(
                         "/crates/{}/{}-{}.crate",
                         package.name, package.name, package.version
                     );
-                    let bytes =
-                        download_allowlisted("static.crates.io", &path, MAX_CRATE_ARCHIVE_BYTES)?;
+                    phase(&format!(
+                        "download locked crate archive {filename}: https://static.crates.io{path}"
+                    ))?;
+                    let bytes = download_allowlisted(
+                        "static.crates.io",
+                        &path,
+                        MAX_CRATE_ARCHIVE_BYTES,
+                        |network_phase| {
+                            phase(&format!("crate archive {filename}: {network_phase}"))
+                        },
+                    )?;
                     let checksum =
                         verify_archive_checksum(&bytes, &package.checksum).map_err(|_| {
                             invalid(format!(
@@ -883,7 +1031,9 @@ pub(super) fn prepare_for_job(
                                 package.name, package.version
                             ))
                         })?;
+                    phase(&format!("publish checksum-verified archive {filename}"))?;
                     write_cache_file(staging, cache_root, &archive_relative, &bytes)?;
+                    phase(&format!("publish checksum sidecar for {filename}"))?;
                     write_cache_file(
                         staging,
                         cache_root,
@@ -900,6 +1050,7 @@ pub(super) fn prepare_for_job(
                         "checksum_matches_lockfile": true
                     }));
                 }
+                phase(&format!("copy locked crate {filename} into job registry"))?;
                 copy_cache_file(
                     cache_root,
                     &archive_relative,
@@ -910,7 +1061,9 @@ pub(super) fn prepare_for_job(
         }
     }
 
+    phase("write runner-owned offline Cargo source configuration")?;
     write_job_cargo_config(cargo_home, !packages.is_empty())?;
+    phase("write runner-owned offline Git bundle rewrites")?;
     write_git_rewrites(cargo_home, routes)?;
     Ok(stats)
 }
@@ -921,7 +1074,9 @@ pub(super) fn prove(
     fixture: &Path,
     stage: &Path,
     report_path: &Path,
+    progress_path: &Path,
 ) -> io::Result<Value> {
+    super::log_phase(progress_path, "read-offline-fixture-lockfile")?;
     let lock_path = fixture.join("Cargo.lock");
     let lock_before = fs::read(&lock_path)?;
     let lockfile = std::str::from_utf8(&lock_before).map_err(invalid)?;
@@ -929,9 +1084,25 @@ pub(super) fn prove(
     let first_home = stage.join("fetch-temp/local-registry-first-job");
     let second_home = stage.join("fetch-temp/local-registry-second-job");
     let no_git_routes = BTreeMap::new();
-    let first_stats = prepare_for_job(&proof_cache, stage, &first_home, lockfile, &no_git_routes)?;
-    let second_stats =
-        prepare_for_job(&proof_cache, stage, &second_home, lockfile, &no_git_routes)?;
+    super::log_phase(progress_path, "first-job-registry-preparation")?;
+    let first_stats = prepare_for_job_with_progress(
+        &proof_cache,
+        stage,
+        &first_home,
+        lockfile,
+        &no_git_routes,
+        |phase| super::log_phase(progress_path, &format!("first-job-{phase}")),
+    )?;
+    super::log_phase(progress_path, "second-job-registry-preparation")?;
+    let second_stats = prepare_for_job_with_progress(
+        &proof_cache,
+        stage,
+        &second_home,
+        lockfile,
+        &no_git_routes,
+        |phase| super::log_phase(progress_path, &format!("second-job-{phase}")),
+    )?;
+    super::log_phase(progress_path, "read prepared local-registry artifacts")?;
     let local_registry = second_home.join("local-registry");
     let index_config = fs::read(local_registry.join("index/config.json"))?;
     let index_entry = fs::read(local_registry.join("index/cf/g-/cfg-if"))?;
@@ -946,12 +1117,14 @@ pub(super) fn prove(
 
     let target = stage.join("cargo-target/local-registry");
     let temp = stage.join("fetch-temp");
+    super::log_phase(progress_path, "run cargo fetch --locked --offline")?;
     let fetch = run_cargo(cargo, rustc, fixture, &second_home, &target, &temp, "fetch");
     let lock_unchanged_after_fetch = lockfile_matches(&lock_path, &lock_before);
     let mut report = json!({
         "schema": 1,
         "persistent_cache": proof_cache,
         "local_registry": local_registry,
+        "progress_log": progress_path,
         "first_job_downloads": {
             "total": first_stats.total_downloads(),
             "config": first_stats.config_downloaded,
@@ -992,7 +1165,10 @@ pub(super) fn prove(
     });
     write_report(report_path, &report)?;
 
-    let build = run_cargo(cargo, rustc, fixture, &second_home, &target, &temp, "build");
+    let build = {
+        super::log_phase(progress_path, "run cargo build --locked --offline")?;
+        run_cargo(cargo, rustc, fixture, &second_home, &target, &temp, "build")
+    };
     let lock_unchanged_after_build = lockfile_matches(&lock_path, &lock_before);
     report["cargo_build_locked_offline"] = build;
     report["lockfile_unchanged_after_build"] = json!(lock_unchanged_after_build);
@@ -1003,6 +1179,10 @@ pub(super) fn prove(
         return Err(invalid("downloaded cfg-if archive is empty"));
     }
     changed_archive[0] ^= 1;
+    super::log_phase(
+        progress_path,
+        "verify runner rejects altered crate archive before write",
+    )?;
     let refused_path = stage.join("checksum-refused-before-write.crate");
     let refused = write_verified_archive(&changed_archive, CFG_IF_CHECKSUM, &refused_path);
     let runner_refused_before_write = refused.is_err() && !refused_path.exists();
@@ -1017,6 +1197,10 @@ pub(super) fn prove(
     )?;
     write_job_cargo_config(&corrupt_home, true)?;
     write_git_rewrites(&corrupt_home, &no_git_routes)?;
+    super::log_phase(
+        progress_path,
+        "run cargo fetch with altered local-registry archive",
+    )?;
     let cargo_rejected_corrupt_archive = run_cargo(
         cargo,
         rustc,
@@ -1048,6 +1232,10 @@ pub(super) fn prove(
     });
     write_report(report_path, &report)?;
 
+    super::log_phase(
+        progress_path,
+        "test repository Cargo source override selection",
+    )?;
     let empty_registry = stage.join("empty-local-registry");
     fs::create_dir_all(empty_registry.join("index"))?;
     fs::write(empty_registry.join("index/config.json"), &index_config)?;
@@ -1062,6 +1250,10 @@ pub(super) fn prove(
     super::copy_tree(&local_registry, &override_home.join("local-registry"))?;
     write_job_cargo_config(&override_home, true)?;
     write_git_rewrites(&override_home, &no_git_routes)?;
+    super::log_phase(
+        progress_path,
+        "run cargo fetch with repository source override",
+    )?;
     let override_result = run_cargo(
         cargo,
         rustc,

@@ -114,6 +114,40 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
             self.assertNotIn("AccessChecksOnly", source)
             self.assertNotIn("CreateRestrictedToken", source)
 
+    def test_local_registry_proof_logs_durable_phases_and_skips_extra_parent_validation(self):
+        local_registry_entry = self.prep.split("pub(super) fn local_registry_entry", 1)[1]
+        self.assertCodeIn('"prep-local-registry-{id}.progress.jsonl"', local_registry_entry)
+        self.assertCodeIn('log_phase(&progress_path, "diagnostic-start")?', local_registry_entry)
+        self.assertLess(
+            local_registry_entry.index('log_phase(&progress_path, "diagnostic-start")?'),
+            local_registry_entry.index("system::require_system()?"),
+        )
+        self.assertLess(
+            local_registry_entry.index("system::write_diagnostic_update(&report_path, &report)?"),
+            local_registry_entry.index("system::require_system()?"),
+        )
+        self.assertCodeIn('log_phase(&progress_path, "wait-for-preparation-lock")?', local_registry_entry)
+        self.assertCodeIn("VmConfig::load(vm_config_path)?", local_registry_entry)
+        self.assertNotIn("Runner::open", local_registry_entry)
+        self.assertCodeIn("file.sync_all()", self.prep)
+        self.assertCodeIn('"timestamp_unix_ms": timestamp_unix_ms', self.prep)
+        self.assertCodeIn("lock_exclusive_bounded(&lock, \"local-registry proof prep.lock\")?", self.prep)
+        self.assertCodeIn('timed out waiting 30 seconds for {operation}', self.prep)
+        self.assertCodeIn('log_phase(progress_path, "first-job-registry-preparation")?', self.registry)
+        self.assertCodeIn('log_phase(progress_path, "run cargo fetch --locked --offline")?', self.registry)
+        self.assertCodeIn('log_phase(progress_path, "run cargo build --locked --offline")?', self.registry)
+        self.assertCodeIn('phase("download crates.io config https://index.crates.io/config.json")?', self.registry)
+        self.assertCodeIn('phase(&format!("download locked crate archive {filename}: https://static.crates.io{path}"))?', self.registry)
+        self.assertCodeIn('phase(&format!("{url} read response body"))?', self.registry)
+
+    def test_registry_http_requests_have_total_deadlines_and_named_errors(self):
+        self.assertCodeIn("INDEX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30)", self.registry)
+        self.assertCodeIn("ARCHIVE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90)", self.registry)
+        self.assertCodeIn("WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 5_000)", self.registry)
+        self.assertCodeIn("check_download_deadline(deadline, timeout, host, path", self.registry)
+        self.assertCodeIn("local-registry HTTPS request timed out after", self.registry)
+        self.assertCodeIn('download_error(host, path, "read response body", error)', self.registry)
+
     def test_local_registry_proof_checks_pinned_cargo_offline(self):
         self.assertCodeIn("[switch]$LocalRegistryOnly", self.wrapper)
         self.assertCodeIn("Runner-Check 'qualify-prep-local-registry'", self.qualify)

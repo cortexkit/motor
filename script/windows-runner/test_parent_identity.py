@@ -113,6 +113,24 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("Set-FixtureParent 'modified' $lastWrite", fixture)
         self.assertIn("parent-identity-startup-rehash-catches-same-size-rewrite-restored-lastwrite", fixture)
 
+    def test_native_service_stop_cancels_startup_validation_and_reports_stop_pending(self):
+        native_service = (HERE.parents[1] / "crates/motor-runner/src/native_service.rs").read_text()
+        library = (HERE.parents[1] / "crates/motor-runner/src/lib.rs").read_text()
+        windows = (HERE.parents[1] / "crates/motor-runner/src/windows.rs").read_text()
+        hyperv = (HERE.parents[1] / "crates/motor-runner/src/windows/hyperv.rs").read_text()
+        native_process = (HERE.parents[1] / "crates/motor-runner/src/native_process.rs").read_text()
+        service = native_service.split("fn service_main", 1)[1]
+        self.assertLess(
+            service.index("set_service_status(service_status(ServiceState::Running, 0))"),
+            service.index("runtime.block_on(super::run(args))"),
+        )
+        self.assertIn("ServiceState::StopPending", native_service)
+        self.assertIn("motor_runner::request_windows_service_stop()", native_service)
+        self.assertIn("pub fn request_windows_service_stop()", library)
+        self.assertIn("SERVICE_STOP_REQUESTED.store(true, Ordering::Release)", windows)
+        self.assertIn("super::service_stop_requested,", hyperv)
+        self.assertIn("if cancelled() || Instant::now() >= deadline", native_process)
+
     def test_startup_validation_has_a_separate_fifteen_minute_budget(self):
         windows = HERE.parents[1] / "crates/motor-runner/src/windows"
         self.assertIn("checked_validation(", (windows / "hyperv_host.rs").read_text())
@@ -137,6 +155,16 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertNotIn("Get-FileHash", run)
         self.assertLess(run.index("Open-RunnerVerifiedParent"), run.index("Start-VM"))
         self.assertIn("finally { if ($parentGuard) { $parentGuard.Dispose() } }", run)
+
+    def test_qualification_stop_waits_for_stopped_with_bounded_timeout(self):
+        script = (HERE / "qualify.ps1").read_text()
+        stop = script.split("function Stop-RunnerServiceBounded", 1)[1].split("function Wait-RunnerQualificationService", 1)[0]
+        self.assertIn("[int]$TimeoutSeconds = 120", stop)
+        self.assertIn("while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds)", stop)
+        self.assertIn("Stop-Service -Name MotorRunner -ErrorAction Stop", stop)
+        self.assertIn("Start-Sleep -Milliseconds 250", stop)
+        self.assertIn("did not reach Stopped", stop)
+        self.assertEqual(script.count("Stop-RunnerServiceBounded"), 5)
 
     def test_installer_deploys_identity_helper(self):
         self.assertIn("'parent-identity.ps1'", (HERE / "install.ps1").read_text())

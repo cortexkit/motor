@@ -1,4 +1,5 @@
-//! Credential-free fetch process. Only SYSTEM decrypts the batch account secret.
+//! Windows job preparation fetches lockfile-selected registry artifacts as SYSTEM.
+//! Cargo runs only in the offline guest or in explicitly selected diagnostics.
 use super::*;
 use std::collections::BTreeMap;
 mod local_registry;
@@ -14,6 +15,54 @@ fn checked(ok: i32) -> io::Result<()> {
 }
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+pub(super) fn log_phase(progress_path: &Path, phase: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let timestamp_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let entry = serde_json::json!({"timestamp_unix_ms": timestamp_unix_ms, "phase": phase});
+    let bytes = serde_json::to_vec(&entry).map_err(io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(progress_path)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(
+        stdout,
+        "DIAG local-registry phase={phase} timestamp_unix_ms={timestamp_unix_ms}"
+    );
+    let _ = stdout.flush();
+    Ok(())
+}
+
+fn lock_exclusive_bounded(lock: &fs::File, operation: &str) -> io::Result<()> {
+    use fs2::FileExt;
+
+    let timeout = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(lock) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out waiting 30 seconds for {operation}"),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
@@ -330,8 +379,6 @@ pub(super) fn prepare_local_registry(
     lockfile: &str,
     routes: &BTreeMap<String, PathBuf>,
 ) -> io::Result<()> {
-    use fs2::FileExt;
-
     system::require_system()?;
     let vm = config.windows.as_ref().unwrap();
     let lock = fs::OpenOptions::new()
@@ -340,7 +387,7 @@ pub(super) fn prepare_local_registry(
         .read(true)
         .write(true)
         .open(vm.layout_root.join("prep.lock"))?;
-    lock.lock_exclusive()?;
+    lock_exclusive_bounded(&lock, "Windows local-registry cache lock")?;
     let cache = config.state_dir().join(LOCAL_REGISTRY_CACHE_DIRECTORY);
     let cargo_home = staging.join("cargo-home");
     let stats = local_registry::prepare_for_job(&cache, staging, &cargo_home, lockfile, routes)?;
@@ -507,70 +554,127 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
 
 /// SYSTEM-only proof for building a Cargo local registry from direct downloads.
 pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
-    use fs2::FileExt;
     use sha2::{Digest, Sha256};
     use windows_service::{
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
 
-    system::require_system()?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(io::Error::other)?;
-    let status = manager
-        .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
-        .and_then(|service| service.query_status())
-        .map_err(io::Error::other)?;
-    if status.current_state != ServiceState::Stopped {
+    let root = config
+        .state_root
+        .parent()
+        .ok_or_else(|| invalid("native Windows state root has no parent"))?;
+    if root != Path::new(r"C:\ProgramData\MotorRunner") {
         return Err(invalid(
-            "Stop MotorRunner before the local-registry Cargo proof",
+            "local-registry diagnostic requires the installed runner root",
         ));
     }
-    let runner = crate::Runner::open(config)?;
-    let config = runner.config();
-    let vm = config.windows.as_ref().unwrap();
-    let root = &vm.layout_root;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(root.join("prep.lock"))?;
-    lock.lock_exclusive()?;
-
-    let cargo = root.join("prep-toolchain/bin/cargo.exe");
-    let rustc = root.join("prep-toolchain/bin/rustc.exe");
-    let cargo_sha256 = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
-    if cargo_sha256 != vm.prep_cargo_sha256.to_ascii_lowercase() {
-        return Err(invalid("local-registry proof prep cargo SHA-256 mismatch"));
-    }
-    let rustc_sha256 = format!("{:x}", Sha256::digest(fs::read(&rustc)?));
-
     let id = Uuid::now_v7();
     let stage = root.join("staging").join(id.to_string());
     let fixture = stage.join("fetch-manifests/offline-cargo");
     let report_path = root
         .join("evidence")
         .join(format!("prep-local-registry-{id}.json"));
+    let progress_path = root
+        .join("evidence")
+        .join(format!("prep-local-registry-{id}.progress.jsonl"));
     let mut report = serde_json::json!({
         "diagnostic_only": true,
         "production_policy_unchanged": true,
         "actor": "SYSTEM runner; pinned Cargo runs only in this disposable proof",
+        "phase_log": progress_path,
         "fixture": {"manifest": fixture.join("Cargo.toml"), "lockfile": fixture.join("Cargo.lock"), "dependency": "cfg-if 1.0.4 from crates.io"},
-        "toolchain": {"cargo": cargo, "cargo_sha256": cargo_sha256, "cargo_pin": vm.prep_cargo_sha256,
-            "rustc": rustc, "rustc_sha256": rustc_sha256},
+        "toolchain": null,
         "staging": stage,
         "staging_removed": false
     });
+    log_phase(&progress_path, "diagnostic-start")?;
     system::write_diagnostic_update(&report_path, &report)?;
 
     let result: io::Result<()> = (|| {
+        log_phase(&progress_path, "verify-system-token")?;
+        system::require_system()?;
+        if config.instance != "ally"
+            || config.backend != crate::BackendKind::WindowsVm
+            || config.state_root != root.join("state")
+        {
+            return Err(invalid(
+                "local-registry diagnostic requires the installed ally Windows runner configuration",
+            ));
+        }
+
+        log_phase(&progress_path, "load-pinned-vm-configuration")?;
+        // Opening a Runner would rerun Hyper-V Validate and hash the large parent
+        // even though this diagnostic only exercises the local Cargo registry.
+        let vm_config_path = config
+            .vm_config
+            .as_deref()
+            .ok_or_else(|| invalid("local-registry diagnostic requires --vm-config"))?;
+        let vm = super::VmConfig::load(vm_config_path)?;
+        if vm.layout_root.as_path() != root {
+            return Err(invalid(
+                "local-registry VM configuration names a different runner root",
+            ));
+        }
+
+        log_phase(&progress_path, "query-runner-service-state")?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(io::Error::other)?;
+        let status = manager
+            .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
+            .and_then(|service| service.query_status())
+            .map_err(io::Error::other)?;
+        if status.current_state != ServiceState::Stopped {
+            return Err(invalid(
+                "Stop MotorRunner before the local-registry Cargo proof",
+            ));
+        }
+
+        log_phase(&progress_path, "open-preparation-lock")?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("prep.lock"))?;
+        log_phase(&progress_path, "wait-for-preparation-lock")?;
+        lock_exclusive_bounded(&lock, "local-registry proof prep.lock")?;
+
+        let cargo = root.join("prep-toolchain/bin/cargo.exe");
+        let rustc = root.join("prep-toolchain/bin/rustc.exe");
+        log_phase(&progress_path, "hash-pinned-cargo-executable")?;
+        let cargo_sha256 = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
+        if cargo_sha256 != vm.prep_cargo_sha256.to_ascii_lowercase() {
+            return Err(invalid("local-registry proof prep cargo SHA-256 mismatch"));
+        }
+        log_phase(&progress_path, "hash-pinned-rustc-executable")?;
+        let rustc_sha256 = format!("{:x}", Sha256::digest(fs::read(&rustc)?));
+
+        report["toolchain"] = serde_json::json!({
+            "cargo": cargo,
+            "cargo_sha256": cargo_sha256,
+            "cargo_pin": vm.prep_cargo_sha256,
+            "rustc": rustc,
+            "rustc_sha256": rustc_sha256
+        });
+        system::write_diagnostic_update(&report_path, &report)?;
+
+        log_phase(&progress_path, "create-disposable-cargo-fixture")?;
         fs::create_dir_all(fixture.join("src"))?;
         fs::create_dir_all(stage.join("fetch-temp"))?;
         fs::write(fixture.join("Cargo.toml"), OFFLINE_CARGO_MANIFEST)?;
         fs::write(fixture.join("Cargo.lock"), OFFLINE_CARGO_LOCK)?;
         fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n")?;
-        let proof = local_registry::prove(&cargo, &rustc, &fixture, &stage, &report_path)?;
+
+        log_phase(&progress_path, "run-local-registry-cargo-proof")?;
+        let proof = local_registry::prove(
+            &cargo,
+            &rustc,
+            &fixture,
+            &stage,
+            &report_path,
+            &progress_path,
+        )?;
         let passed = proof["proof_passed"] == true;
         report["local_registry_proof"] = proof;
         if !passed {
@@ -581,7 +685,11 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
         Ok(())
     })();
 
-    let cleanup = remove_staging(config, &stage);
+    let cleanup_phase = log_phase(&progress_path, "cleanup-disposable-staging");
+    let cleanup = remove_staging(&config, &stage);
+    if let Err(error) = cleanup_phase {
+        report["progress_log_error"] = serde_json::json!(error.to_string());
+    }
     report["staging_removed"] = serde_json::json!(cleanup.is_ok() && !stage.exists());
     report["staging_leftover"] = if stage.exists() {
         serde_json::json!(stage)
@@ -591,10 +699,15 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
     if let Err(error) = &result {
         report["error"] = serde_json::json!(error.to_string());
     }
+    if let Err(error) = &cleanup {
+        report["cleanup_error"] = serde_json::json!(error.to_string());
+    }
     system::write_diagnostic_update(&report_path, &report)?;
+    log_phase(&progress_path, "diagnostic-finished")?;
     println!(
-        "DIAG local-registry report={} staging_removed={}",
+        "DIAG local-registry report={} progress={} staging_removed={}",
         report_path.display(),
+        progress_path.display(),
         report["staging_removed"]
     );
     result?;

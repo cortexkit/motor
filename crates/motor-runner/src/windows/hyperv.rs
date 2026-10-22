@@ -50,7 +50,7 @@ pub(super) fn checked_validation(command: Command) -> io::Result<std::process::O
     let output = checked_control(
         command,
         Some(std::time::Duration::from_secs(15 * 60)),
-        || false,
+        super::service_stop_requested,
     )?;
     tracing::info!(validation = %String::from_utf8_lossy(&output.stdout).trim(), "Hyper-V startup validation completed");
     Ok(output)
