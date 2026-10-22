@@ -2,7 +2,7 @@
   "accepted_os_differences": [
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: Boat builds the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of Ubuntu's git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
-    "wasm-opt is Binaryen 120 on the build server and both image roles. Boat and tenant install the official x86_64 Linux release archive pinned by SHA-256; distro binaryen packages are removed. The wasm-opt major version and executable path are checked exactly.",
+    "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
     "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
@@ -16,11 +16,13 @@
         "coreutils"
       ],
       "build-server": [
+        "binaryen",
         "gnu-coreutils"
       ]
     },
     "observed_build_server_versions": {
       "acl": "2.3.2-2",
+      "binaryen": "120-4build1",
       "build-essential": "12.12ubuntu2.26.04.2",
       "ca-certificates": "20260816ubuntu0.26.04.1",
       "clang": "1:21.1.6-71",

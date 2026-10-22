@@ -10,9 +10,11 @@
 # <bin> name. Mark at most one revision per crate as default.
 #
 # Optional prerequisites not managed here (OS packages or non-Cargo installs):
-# - wasm-opt: Binaryen 120 from the official upstream x86_64 Linux release,
-#   verified by the SHA-256 in toolchain.json and installed by install-binaryen.py.
-#   Image recipes purge distro binaryen so an older second wasm-opt cannot win PATH.
+# - wasm-opt: the build server uses apt binaryen; Boat and tenant install
+#   Binaryen 120 from the official upstream x86_64 Linux release pinned by
+#   SHA-256 in toolchain.json and installed by install-binaryen.py. Boat and
+#   tenant image recipes remove distro binaryen so its older wasm-opt cannot
+#   take precedence during PATH lookup.
 # - x86_64-w64-mingw32-gcc/g++: gcc-mingw-w64-x86-64 and g++-mingw-w64-x86-64
 #   with win32 threads, so crates with bundled C code (rusqlite, ring)
 #   can be checked for x86_64-pc-windows-gnu.

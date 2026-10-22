@@ -140,7 +140,8 @@ class ParityTests(unittest.TestCase):
         return {**{key: copy.deepcopy(manifest[key]) for key in ('rust_default', 'rust_profile', 'rust_toolchains', 'cargo_home', 'rustup_home')},
                 'rustup_version': 'rustup ' + manifest['rustup'], 'cargo_binaries': bins, 'tools': tools,
                 'rust_target_payloads': {name: {target: True for target in spec['targets']} for name, spec in manifest['rust_toolchains'].items()},
-                'apt_packages': {name: 'distro-version' for name in manifest['apt_packages']['required'] + ['coreutils', 'gnu-coreutils']},
+                'apt_packages': {name: 'distro-version' for name in manifest['apt_packages']['required']
+                                 + manifest['apt_packages']['by_role'][role] + ['coreutils', 'gnu-coreutils']},
                 'sccache_inputs_sha256': manifest['sccache']['inputs_sha256'],
                 'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
                 'compile_wrapper': {
@@ -264,6 +265,20 @@ class ParityTests(unittest.TestCase):
         actual = self.observed()
         del actual['apt_packages']['libsqlite3-dev']
         self.assertFalse(self.report(actual)['passed'])
+
+    def test_build_server_requires_apt_binaryen_but_boat_does_not(self):
+        manifest = self.manifest
+        self.assertIn('binaryen', manifest['apt_packages']['by_role']['build-server'])
+        self.assertNotIn('binaryen', manifest['apt_packages']['required'])
+        self.assertNotIn('binaryen', manifest['apt_packages']['by_role']['boat'])
+        setup = (parity.HERE / 'setup.sh').read_text()
+        self.assertIn('ca-certificates unzip xz-utils binaryen unattended-upgrades', setup)
+        server = self.observed('build-server')
+        server['apt_packages'].pop('binaryen')
+        self.assertIn('missing apt package: binaryen',
+                      parity.differences(manifest, server, role='build-server'))
+        boat_errors = parity.differences(manifest, self.observed('boat'), role='boat')
+        self.assertNotIn('missing apt package: binaryen', boat_errors)
 
     def test_build_server_job_visible_tools_are_in_the_catalogue(self):
         actual = self.observed()
