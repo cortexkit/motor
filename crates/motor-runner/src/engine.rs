@@ -45,6 +45,18 @@ pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 #[cfg(test)]
 type JobWriteHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 #[cfg(test)]
+type CatalogWriteHook = Arc<dyn Fn(CatalogWrite) -> io::Result<()> + Send + Sync>;
+
+/// A step of a catalog write, for `Config::catalog_write`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogWrite {
+    /// Before anything is written.
+    Starting,
+    /// The new file has replaced the old one; the directory is not synced.
+    Renamed,
+}
+#[cfg(test)]
 type AccountingReportHook = Arc<dyn Fn(Uuid, &[u8]) + Send + Sync>;
 pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 
@@ -153,6 +165,10 @@ pub struct Config {
     pub(crate) memory_floor_gib: Option<u64>,
     #[cfg(test)]
     pub(crate) before_job_write: Option<JobWriteHook>,
+    /// Called at each step of a catalog write; an error fails the write at
+    /// that step.
+    #[cfg(test)]
+    pub(crate) catalog_write: Option<CatalogWriteHook>,
     #[cfg(test)]
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
@@ -326,6 +342,8 @@ impl Config {
             memory_floor_gib: None,
             #[cfg(test)]
             before_job_write: None,
+            #[cfg(test)]
+            catalog_write: None,
             #[cfg(test)]
             before_replay_read: None,
             #[cfg(test)]
@@ -572,6 +590,9 @@ struct Inner {
     /// without the state lock. Dispatch and the drain refusal leave them
     /// alone: the job is about to become a tombstone.
     terminal_saves: BTreeSet<Uuid>,
+    /// Jobs whose unit is being spawned and is not yet recorded in the job,
+    /// so the quarantine fence cannot yet match the unit to its job.
+    launching: BTreeSet<Uuid>,
     last_eviction: Option<DiskEviction>,
     eviction_retry_after: BTreeMap<PathBuf, u64>,
     kill_retries: BTreeMap<Uuid, (u32, std::time::Instant)>,
@@ -629,6 +650,147 @@ struct FillInputs {
     git_dependencies: io::Result<Vec<GitDependency>>,
     /// Read only when `git_dependencies` is `Ok`.
     tree: Option<io::Result<String>>,
+}
+
+/// Clears an in-memory marker that was set under the state lock. Its owner
+/// normally clears it with `clear`, under a state lock it already holds; if
+/// the owner returns early or unwinds first, dropping this takes the state
+/// lock and clears it. It must therefore be created after, and so dropped
+/// before, any state guard held in the same scope.
+struct Marker<F: FnOnce(&mut Inner)> {
+    runner: Runner,
+    clear: Option<F>,
+}
+
+impl<F: FnOnce(&mut Inner)> Marker<F> {
+    fn new(runner: &Runner, clear: F) -> Self {
+        Self {
+            runner: runner.clone(),
+            clear: Some(clear),
+        }
+    }
+    fn clear(mut self, inner: &mut Inner) {
+        if let Some(clear) = self.clear.take() {
+            clear(inner);
+        }
+    }
+}
+
+impl<F: FnOnce(&mut Inner)> Drop for Marker<F> {
+    fn drop(&mut self) {
+        if let Some(clear) = self.clear.take() {
+            let mut inner = self
+                .runner
+                .core
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clear(&mut inner);
+        }
+    }
+}
+
+/// A job's queue-wait clock, which `Job` keeps in atomics shared by every
+/// copy of the job. Saved before a tentative stop so that undoing the stop
+/// restores the clock exactly, wait accrued meanwhile included.
+#[derive(Clone, Copy)]
+struct QueueClock {
+    entry: u64,
+    elapsed: u64,
+    initialized: bool,
+}
+
+impl QueueClock {
+    fn of(job: &Job) -> Self {
+        use std::sync::atomic::Ordering::Acquire;
+        Self {
+            entry: job.queue_entry.load(Acquire),
+            elapsed: job.queue_elapsed.load(Acquire),
+            initialized: job.queue_wait_clock_initialized.load(Acquire),
+        }
+    }
+    fn restore(self, job: &Job) {
+        use std::sync::atomic::Ordering::Release;
+        // The entry last: readers retry until the entry they read before and
+        // after the elapsed time agree.
+        job.queue_elapsed.store(self.elapsed, Release);
+        job.queue_wait_clock_initialized
+            .store(self.initialized, Release);
+        job.queue_entry.store(self.entry, Release);
+    }
+}
+
+/// What `start` reserved for a job, owned by the job's setup thread until
+/// the start is settled: the job is Running or refused, or its reservation
+/// was released. If the thread unwinds before that, dropping this puts the
+/// job back in the queue, so a panic cannot hold a workspace, permits and
+/// CPUs until restart.
+struct PendingStart {
+    runner: Runner,
+    id: Uuid,
+    workspace: String,
+    base: bool,
+    /// The job as dispatch found it, its queue clock then, and the
+    /// workspace's rotation before `start`. `None` once settled.
+    undo: Option<(Job, QueueClock, Option<u64>)>,
+}
+
+impl PendingStart {
+    /// Undo the dispatch: release the reservation and put the job back in
+    /// the queue with its CPUs, setup time, queue clock and workspace
+    /// rotation as they were, giving back the writer slot of a warm build.
+    fn requeue(&mut self, inner: &mut Inner) {
+        let Some((job, clock, rotation)) = self.undo.take() else {
+            return;
+        };
+        inner.starting.remove(&self.id);
+        inner.reserved.remove(&self.workspace);
+        match rotation {
+            Some(previous) => inner.rotation.insert(self.workspace.clone(), previous),
+            None => inner.rotation.remove(&self.workspace),
+        };
+        if self.base {
+            if inner.writer == Some(self.id) {
+                inner.writer = None;
+            }
+            #[cfg(target_os = "linux")]
+            inner.cache_fills.remove(&self.id);
+        }
+        clock.restore(&job);
+        inner.jobs.insert(self.id, job);
+    }
+    /// The start is settled; there is nothing left to undo.
+    fn settled(&mut self) {
+        self.undo = None;
+    }
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        if self.undo.is_none() {
+            return;
+        }
+        let runner = self.runner.clone();
+        let mut inner = runner
+            .core
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only a job still waiting for its start is put back. Once its unit
+        // may have been spawned (`launching`), requeuing it could run it
+        // twice, so its reservation is kept instead.
+        if inner.launching.contains(&self.id) {
+            tracing::error!(job_id = %self.id, "job start unwound during launch; its reservation is kept");
+        } else if inner.starting.contains(&self.id)
+            && inner
+                .jobs
+                .get(&self.id)
+                .is_some_and(|job| job.state == JobState::Queued)
+        {
+            tracing::error!(job_id = %self.id, "job start unwound; the job is queued again");
+            self.requeue(&mut inner);
+        }
+    }
 }
 
 /// The catalog as serialized under the state lock, for `Runner::write_catalog`
@@ -1318,6 +1480,21 @@ impl Runner {
                 repository.requested_descriptor = Some("restart".into());
             }
         }
+        // A workspace was last used no earlier than its jobs finished. A crash
+        // after a terminal record was saved but before the catalog recorded
+        // that use (possible with older runners, which saved the catalog
+        // second) would otherwise let the maintenance below expire the
+        // workspace of a job that has only just finished.
+        for job in jobs
+            .values()
+            .filter(|job| !job.base && job.started_ms.is_some())
+        {
+            if let (Some(finished_ms), Some(workspace)) =
+                (job.finished_ms, catalog.workspaces.get_mut(job.key()))
+            {
+                workspace.used_ms = workspace.used_ms.max(finished_ms);
+            }
+        }
         if config.windows_instance() {
             atomic_json_private(&state.join("catalog.json"), &catalog)?;
         } else {
@@ -1373,6 +1550,7 @@ impl Runner {
                     admitting: BTreeMap::new(),
                     admission_saves: BTreeMap::new(),
                     terminal_saves: BTreeSet::new(),
+                    launching: BTreeSet::new(),
                     evicting_dependencies: BTreeSet::new(),
                     evicting_caches: BTreeSet::new(),
                     last_eviction: None,
@@ -1490,6 +1668,14 @@ impl Runner {
                     .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
                     .collect();
                 let unknown: Vec<_> = units.difference(&accounted).cloned().collect();
+                // A job being launched has a unit it does not name yet. While
+                // as many launches are in flight as there are unmatched units,
+                // those units may be theirs: keep the previous decision and
+                // look again on the next refresh.
+                if !unknown.is_empty() && unknown.len() <= inner.launching.len() {
+                    *probe = None;
+                    return;
+                }
                 (!unknown.is_empty())
                     .then(|| format!("unaccounted live job units: {}", unknown.join(", ")))
             }
@@ -1802,13 +1988,27 @@ impl Runner {
             return Ok(());
         }
         self.long_work("catalog_save");
-        atomic_bytes(
+        #[cfg(test)]
+        if let Some(hook) = &self.core.config.catalog_write {
+            hook(CatalogWrite::Starting)?;
+        }
+        let written = &mut *written;
+        atomic_bytes_and(
             &self.core.trees.state.join("catalog.json"),
             &snapshot.bytes,
             self.core.config.windows_instance(),
-        )?;
-        *written = snapshot.generation;
-        Ok(())
+            || {
+                // Once renamed into place these bytes are on disk even if the
+                // directory sync below fails, so no older snapshot may be
+                // written over them from here on.
+                *written = snapshot.generation;
+                #[cfg(test)]
+                if let Some(hook) = &self.core.config.catalog_write {
+                    hook(CatalogWrite::Renamed)?;
+                }
+                Ok(())
+            },
+        )
     }
     fn unit_alive(&self, process: Option<platform::ProcessIdentity>) -> io::Result<Option<bool>> {
         self.core.backend.unit_alive(&self.core.config, process)
@@ -2104,9 +2304,13 @@ impl Runner {
                 .insert(job.id, request.workspace_key.clone());
         }
         drop(inner);
+        let id = job.id;
+        let saving = Marker::new(self, move |inner: &mut Inner| {
+            inner.admission_saves.remove(&id);
+        });
         let saved = self.save(&job);
         let mut inner = self.core.inner.lock().unwrap();
-        inner.admission_saves.remove(&job.id);
+        saving.clear(&mut inner);
         if let Err(error) = saved {
             if !disk_refused {
                 return Err(error);
@@ -2616,17 +2820,16 @@ impl Runner {
             );
             inner.catalog.sibling_commits.clone()
         };
+        // Released on every exit, including the early errors below.
+        let reservation = Marker::new(self, {
+            let key = r.workspace_key.clone();
+            move |inner: &mut Inner| {
+                inner.reserved.remove(&key);
+            }
+        });
         let started = std::time::Instant::now();
         self.long_work("materialize");
-        if let Err(error) = self.validate_destinations(&r.workspace_key, None, &r.siblings) {
-            self.core
-                .inner
-                .lock()
-                .unwrap()
-                .reserved
-                .remove(&r.workspace_key);
-            return Err(error);
-        }
+        self.validate_destinations(&r.workspace_key, None, &r.siblings)?;
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs {
             let workspace_path = Path::new(&r.workspace_key);
@@ -2700,7 +2903,7 @@ impl Runner {
         drop(inner);
         let written = catalog.and_then(|catalog| self.write_catalog(catalog));
         let mut inner = self.core.inner.lock().unwrap();
-        inner.reserved.remove(&r.workspace_key);
+        reservation.clear(&mut inner);
         written?;
         if let Err(error) = populated {
             tracing::warn!(workspace = %r.workspace_key, %error, "prepare failed");
@@ -3385,6 +3588,23 @@ impl Runner {
         }
         Ok(())
     }
+    /// Cancel a job whose admission was still saving its record when a
+    /// workspace drop chose it, once that save is over. An admission whose
+    /// save failed left no job, so nothing is cancelled or written for it.
+    /// Returns whether there was a job to cancel.
+    fn cancel_admitted(&self, id: Uuid) -> io::Result<bool> {
+        let admitted = {
+            let log = self.job_log(id);
+            // The admission holds this lock until its job is inserted or
+            // its save has failed.
+            let _write = log.write.lock().unwrap();
+            self.core.inner.lock().unwrap().jobs.contains_key(&id)
+        };
+        if admitted {
+            self.cancel(id)?;
+        }
+        Ok(admitted)
+    }
     #[cfg(test)]
     pub(crate) fn withdraw(&self, id: Uuid) -> io::Result<WithdrawOutcome> {
         self.withdraw_for(id, None, false)
@@ -3442,6 +3662,9 @@ impl Runner {
         let Some(mut job) = inner.jobs.get(&id).filter(|_| eligible).cloned() else {
             return Ok(WithdrawOutcome::Started);
         };
+        // The terminal below stops the queue-wait clock this copy shares
+        // with the queued job; kept to restore exactly if the save fails.
+        let clock = QueueClock::of(&job);
         let safe_detail = self.safe_refusal_detail(
             &detail,
             job.request
@@ -3485,21 +3708,28 @@ impl Runner {
         }
         job.state = JobState::Tombstone;
         // Saved without the state lock and published once saved. Meanwhile
-        // the job is in `terminal_saves`, so dispatch cannot start it and the
-        // drain refusal does not write over it; cancel and refuse wait for
-        // `log.write`, held here.
+        // the job is in `terminal_saves`: it stays queued in its place, so it
+        // still holds back the jobs behind it, but dispatch stops at it
+        // instead of starting it, and the drain refusal does not write over
+        // it. Cancel and refuse wait for `log.write`, held here.
         inner.terminal_saves.insert(id);
         drop(inner);
+        // Clears the marker, and gives back the queue clock unless the
+        // tombstone was published, also if the save unwinds.
+        let saving = Marker::new(self, move |inner: &mut Inner| {
+            inner.terminal_saves.remove(&id);
+            if let Some(queued) = inner.jobs.get(&id).filter(|job| job.terminal.is_none()) {
+                clock.restore(queued);
+            }
+        });
         let saved = self.save(&job);
         let mut inner = self.core.inner.lock().unwrap();
-        inner.terminal_saves.remove(&id);
         if let Err(error) = saved {
-            // The job stays as it was, but the terminal above stopped its
-            // queue-wait clock, which it shares with the copy.
-            inner.jobs[&id].resume_queue_wait(self.now());
+            saving.clear(&mut inner);
             return Err(error);
         }
         inner.jobs.insert(id, job);
+        saving.clear(&mut inner);
         Ok(WithdrawOutcome::Withdrawn)
     }
 
@@ -3783,7 +4013,7 @@ impl Runner {
         self.ensure_reconciled()?;
         self.validate_destinations(key, None, &[])?;
         let key = key.to_string();
-        let (guard, ids) = self
+        let (guard, mut ids, admitting) = self
             .off_runtime({
                 let key = key.clone();
                 move |runner| {
@@ -3794,28 +4024,35 @@ impl Runner {
                             "workspace drop already in progress",
                         ));
                     }
-                    // An admission still saving its record is cancelled too:
-                    // the cancel waits for that save, then finds the job.
+                    // An admission still saving its record is cancelled too,
+                    // once that save is over (see `cancel_admitted`).
                     let ids: Vec<_> = inner
                         .jobs
                         .values()
                         .filter(|j| j.key() == key && j.terminal.is_none())
                         .map(|j| j.id)
-                        .chain(
-                            inner
-                                .admission_saves
-                                .iter()
-                                .filter(|(_, workspace)| **workspace == key)
-                                .map(|(id, _)| *id),
-                        )
+                        .collect();
+                    let admitting: Vec<_> = inner
+                        .admission_saves
+                        .iter()
+                        .filter(|(_, workspace)| **workspace == key)
+                        .map(|(id, _)| *id)
                         .collect();
                     drop(inner);
-                    Ok((WorkspaceDrop { runner, key }, ids))
+                    Ok((WorkspaceDrop { runner, key }, ids, admitting))
                 }
             })
             .await?;
         for &id in &ids {
             self.off_runtime(move |runner| runner.cancel(id)).await?;
+        }
+        for id in admitting {
+            if self
+                .off_runtime(move |runner| runner.cancel_admitted(id))
+                .await?
+            {
+                ids.push(id);
+            }
         }
         let deadline = tokio::time::Instant::now() + self.core.config.drop_timeout;
         loop {
@@ -4672,6 +4909,13 @@ impl Runner {
         loop {
             let mut next = None;
             for id in index.heads(inner, now) {
+                if inner.terminal_saves.contains(&id) {
+                    // This head's withdrawal is being saved. Until it is
+                    // settled the job may yet stay queued, so it keeps its
+                    // place: nothing it would have held back starts, and
+                    // neither does it.
+                    return Ok(());
+                }
                 let job = &inner.jobs[&id];
                 let request = job.request.as_ref().unwrap();
                 if job.base
@@ -4778,6 +5022,8 @@ impl Runner {
         queued_job.cpus = placement.cpus;
         let setup_ms = self.now();
         queued_job.setup_ms = Some(setup_ms);
+        // Kept to restore exactly if the start is undone.
+        let clock = QueueClock::of(&job);
         queued_job.stop_queue_wait(setup_ms);
         queued_job
             .queue_entry
@@ -4810,15 +5056,23 @@ impl Runner {
             base: job.base,
             recorded: inner.catalog.sibling_commits.clone(),
         };
-        let runner = self.clone();
+        let mut pending = PendingStart {
+            runner: self.clone(),
+            id,
+            workspace: setup.request.workspace_key.clone(),
+            base: job.base,
+            undo: Some((job, clock, rotation)),
+        };
         std::thread::spawn(move || {
-            if !runner.persist_setup(&setup, job, rotation) {
+            let runner = pending.runner.clone();
+            if !runner.persist_setup(&setup, &mut pending) {
                 return;
             }
             let prepared = runner.setup(&setup);
-            if let Err(error) = runner.launch(setup, prepared) {
+            if let Err(error) = runner.launch(setup, prepared, &mut pending) {
                 tracing::error!(job_id = %id, %error, "job launch failed");
             }
+            pending.settled();
         });
         Ok(())
     }
@@ -4828,10 +5082,9 @@ impl Runner {
     /// and refuse take before writing this job's record, so none of them
     /// saves in between. A job one of them ended before this took that lock
     /// is not set up, and its reservation is released. If the save fails, the
-    /// reservation is undone and the job is queued again as `queued`, the job
-    /// before `start` changed it, so a later pass can retry; `rotation` is
-    /// the workspace's rotation before `start`.
-    fn persist_setup(&self, s: &Setup, queued: Job, rotation: Option<u64>) -> bool {
+    /// job is put back in the queue as dispatch found it (see
+    /// `PendingStart::requeue`), so a later pass can retry.
+    fn persist_setup(&self, s: &Setup, pending: &mut PendingStart) -> bool {
         let log = self.job_log(s.id);
         let _write = log.write.lock().unwrap();
         let record = {
@@ -4841,6 +5094,7 @@ impl Runner {
                 _ => {
                     // Cancelled or withdrawn since dispatch; that terminal
                     // is already saved.
+                    pending.settled();
                     inner.starting.remove(&s.id);
                     inner.reserved.remove(&s.request.workspace_key);
                     if s.base {
@@ -4856,26 +5110,7 @@ impl Runner {
             return true;
         };
         tracing::error!(job_id = %s.id, %error, "setup record not saved; the job stays queued");
-        let mut inner = self.core.inner.lock().unwrap();
-        inner.starting.remove(&s.id);
-        inner.reserved.remove(&s.request.workspace_key);
-        match rotation {
-            Some(previous) => inner
-                .rotation
-                .insert(s.request.workspace_key.clone(), previous),
-            None => inner.rotation.remove(&s.request.workspace_key),
-        };
-        if s.base {
-            if inner.writer == Some(s.id) {
-                inner.writer = None;
-            }
-            #[cfg(target_os = "linux")]
-            inner.cache_fills.remove(&s.id);
-        }
-        // `start` stopped the queue-wait clock, which this job shares with
-        // its clones.
-        queued.resume_queue_wait(self.now());
-        inner.jobs.insert(s.id, queued);
+        pending.requeue(&mut self.core.inner.lock().unwrap());
         false
     }
     /// The long part of starting a job, run without the state lock.
@@ -4906,15 +5141,49 @@ impl Runner {
             .materialize(&self.core.config, &self.core.trees, s)
     }
 
+    /// `launch` for a job that tests set up by hand, with no dispatch to undo.
+    #[cfg(test)]
+    pub(crate) fn launch_without_dispatch(
+        &self,
+        s: Setup,
+        prepared: io::Result<Prepared>,
+    ) -> io::Result<()> {
+        let mut pending = PendingStart {
+            runner: self.clone(),
+            id: s.id,
+            workspace: s.request.workspace_key.clone(),
+            base: s.base,
+            undo: None,
+        };
+        self.launch(s, prepared, &mut pending)
+    }
+
+    /// Give up a prepared job that will not run: shut down its Windows VM,
+    /// waiting for the VM's I/O thread, then drop the rest. Dropping a
+    /// `PreparedVm` alone only signals that thread to stop.
+    fn release_prepared(&self, prepared: Prepared) {
+        if let Some(vm) = &prepared.windows {
+            if let Some(vm) = vm.lock().unwrap().take() {
+                backend::Execution::reap(&vm);
+            }
+        }
+        drop(prepared);
+    }
+
     /// Finish a job's start: record its workspace, and launch it unless setup
-    /// failed or it was cancelled or withdrawn meanwhile. On the launch path
-    /// the catalog save, the launch itself (a process spawn) and the Started
-    /// record save run without the state lock. The job stays in `starting`,
-    /// and keeps its workspace reservation, until it is Running in memory, so
-    /// no dispatch pass starts it again and no other job takes its workspace
-    /// meanwhile. Cancel and withdraw wait for this job's log lock, held
-    /// throughout.
-    fn launch(&self, s: Setup, prepared: io::Result<Prepared>) -> io::Result<()> {
+    /// failed or it was cancelled or withdrawn meanwhile. The catalog saves,
+    /// the launch itself (a process spawn) and the Started record save run
+    /// without the state lock. The job stays in `starting`, and keeps its
+    /// workspace reservation, until it is Running in memory or its start is
+    /// given up, so no dispatch pass starts it again and no other job takes
+    /// its workspace meanwhile. Cancel and withdraw wait for this job's log
+    /// lock, held throughout.
+    fn launch(
+        &self,
+        s: Setup,
+        prepared: io::Result<Prepared>,
+        pending: &mut PendingStart,
+    ) -> io::Result<()> {
         let id = s.id;
         let log = self.job_log(id);
         let _write = log.write.lock().unwrap();
@@ -4964,67 +5233,68 @@ impl Runner {
             Ok(())
         };
         // A failed setup, or a job ended while it was being set up, gives
-        // back its reservation at once and finishes under the state lock.
+        // back its reservation and finishes here.
         if !live || prepared.is_err() {
+            pending.settled();
+            let prepared = match prepared {
+                Ok(prepared) => {
+                    // The Windows slot stays this job's (`starting`) until
+                    // its prepared VM has shut down.
+                    drop(inner);
+                    self.release_prepared(prepared);
+                    inner = self.core.inner.lock().unwrap();
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
             inner.starting.remove(&id);
             inner.reserved.remove(&r.workspace_key);
-            self.catalog(&inner)?;
+            let finished = match prepared {
+                Err(error) if live => {
+                    let (reason, detail) = if error.to_string() == "tree_hash_mismatch"
+                        || error.to_string().starts_with("tree_hash_mismatch:")
+                    {
+                        (RefusalReason::TreeHashMismatch, None)
+                    } else if error.to_string().starts_with("runner_disk_full:") {
+                        (RefusalReason::RunnerDiskFull, Some(error.to_string()))
+                    } else if error.to_string() == "windows_slot_busy" {
+                        (RefusalReason::RunnerFull, None)
+                    } else {
+                        (
+                            RefusalReason::WorkspaceSetupFailed,
+                            Some(workspace_setup_detail("prepare job workspace", &error)),
+                        )
+                    };
+                    refuse(&mut inner, reason, detail, &error)
+                }
+                _ if s.base => self.finish_base(&mut inner, &r, false, None),
+                _ => Ok(()),
+            };
+            // A warm build's `finish_base` saved the catalog already;
+            // otherwise it is written after the state lock is released.
+            let catalog = (!s.base).then(|| self.catalog_snapshot(&inner)).transpose();
+            drop(inner);
+            let written =
+                catalog.and_then(|catalog| catalog.map_or(Ok(()), |c| self.write_catalog(c)));
+            return written.and(finished);
         }
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let (reason, detail) = if error.to_string() == "tree_hash_mismatch"
-                    || error.to_string().starts_with("tree_hash_mismatch:")
-                {
-                    (RefusalReason::TreeHashMismatch, None)
-                } else if error.to_string().starts_with("runner_disk_full:") {
-                    (RefusalReason::RunnerDiskFull, Some(error.to_string()))
-                } else if error.to_string() == "windows_slot_busy" {
-                    (RefusalReason::RunnerFull, None)
-                } else {
-                    (
-                        RefusalReason::WorkspaceSetupFailed,
-                        Some(workspace_setup_detail("prepare job workspace", &error)),
-                    )
-                };
-                if live {
-                    return refuse(&mut inner, reason, detail, &error);
-                }
-                if s.base {
-                    self.finish_base(&mut inner, &r, false, None)?;
-                }
-                return Ok(());
-            }
+        let Ok(prepared) = prepared else {
+            unreachable!("a failed setup returned above");
         };
-        if !live {
-            if s.base {
-                self.finish_base(&mut inner, &r, false, None)?;
-            }
-            if self.core.config.windows_instance() {
-                inner.starting.insert(id);
-                drop(inner);
-                if let Some(vm) = &prepared.windows {
-                    if let Some(vm) = vm.lock().unwrap().take() {
-                        backend::Execution::reap(&vm);
-                    }
-                }
-                self.core.inner.lock().unwrap().starting.remove(&id);
-            }
-            return Ok(());
-        }
         let catalog = self.catalog_snapshot(&inner);
         let mut job = inner.jobs[&id].clone();
+        // From here until the job's process is recorded, a live unit of this
+        // job can exist that the job does not name yet.
+        inner.launching.insert(id);
         drop(inner);
-        // Until the job is Running, a failure gives back what dispatch
-        // reserved for it, as for a failed setup above.
-        let unreserve = || {
-            let mut inner = self.core.inner.lock().unwrap();
-            inner.starting.remove(&id);
-            inner.reserved.remove(&r.workspace_key);
-            inner
-        };
         if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
-            drop(unreserve());
+            // Nothing ran: put the job back in the queue as dispatch found
+            // it. The prepared workspace (and Windows VM) goes first, so it
+            // never outlives the reservation that covered it.
+            self.release_prepared(prepared);
+            let mut inner = self.core.inner.lock().unwrap();
+            inner.launching.remove(&id);
+            pending.requeue(&mut inner);
             return Err(error);
         }
         tracing::info!(job_id = %id, cache_fill = s.base, "handing materialized job to execution");
@@ -5037,8 +5307,14 @@ impl Runner {
         ) {
             Ok(l) => l,
             Err(error) => {
+                pending.settled();
+                self.release_prepared(prepared);
+                let mut inner = self.core.inner.lock().unwrap();
+                inner.launching.remove(&id);
+                inner.starting.remove(&id);
+                inner.reserved.remove(&r.workspace_key);
                 return refuse(
-                    &mut unreserve(),
+                    &mut inner,
                     RefusalReason::WorkspaceSetupFailed,
                     Some(workspace_setup_detail("launch isolated job", &error)),
                     &error,
@@ -5076,7 +5352,11 @@ impl Runner {
         // Started that is not durable.
         let saved = self.save(&job);
         let mut inner = self.core.inner.lock().unwrap();
+        // The start is settled either way: the job is published Running, or
+        // `failed_launch` stops its process and refuses it.
+        pending.settled();
         inner.reserved.remove(&r.workspace_key);
+        inner.launching.remove(&id);
         if let Err(error) = saved {
             // The job stays in `starting`, now with its launched process
             // recorded, while `failed_launch` stops that process.
@@ -5586,7 +5866,9 @@ impl Runner {
                             None,
                         )?;
                     }
-                    return self.catalog(&inner);
+                    let catalog = self.catalog_snapshot(&inner)?;
+                    drop(inner);
+                    return self.write_catalog(catalog);
                 }
                 Err(error) => {
                     tracing::warn!(job_id = %id, %error, "refusal record failed; retrying");
@@ -5949,7 +6231,7 @@ impl Runner {
             .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
         self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
-        let (mut inner, success, catalog) = loop {
+        let (mut inner, success) = loop {
             let write = log.write.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             self.finish_step(
@@ -6013,32 +6295,33 @@ impl Runner {
             if let Some(changes) = &changes {
                 finished.terminal.as_mut().unwrap().workspace_changes = Some(changes.clone());
             }
-            drop(inner);
-            let saved = self.save(&finished);
-            self.finish_step(id, &job.kill, "terminal record written", finish_started);
             // A job that is not a warm build, and whose workspace is in the
             // catalog, updates that workspace's last use (and any warm-cache
-            // miss). The catalog is written here, without the state lock and
-            // before the terminal is published, so whoever sees the terminal
-            // finds a durable catalog that includes this job. A failed write
-            // is returned after the terminal is published, as before. A later
-            // attempt only moves the last-use time forward.
-            let catalog = if saved.is_ok() && !job.base {
-                let mut inner = self.core.inner.lock().unwrap();
-                let snapshot = self
-                    .note_finished_workspace(
-                        &mut inner,
-                        job.request.as_ref().unwrap(),
-                        reader_descriptor.as_ref(),
-                    )
-                    .then(|| self.catalog_snapshot(&inner));
-                drop(inner);
-                snapshot.map_or(Ok(()), |snapshot| {
-                    snapshot.and_then(|snapshot| self.write_catalog(snapshot))
-                })
+            // miss). The catalog is written before the terminal record, and
+            // the terminal is published only after both, so at every point a
+            // crash leaves the catalog at least as new as the terminal record:
+            // startup never finds a finished job whose workspace looks unused
+            // since before it ran. A catalog ahead of an unfinished job only
+            // keeps its workspace longer. Either save failing retries both,
+            // with the job still being finalized; repeating the update only
+            // moves the last-use time forward. Both saves run without the
+            // state lock.
+            let catalog = if job.base {
+                Ok(None)
             } else {
-                Ok(())
+                self.note_finished_workspace(
+                    &mut inner,
+                    job.request.as_ref().unwrap(),
+                    reader_descriptor.as_ref(),
+                )
+                .then(|| self.catalog_snapshot(&inner))
+                .transpose()
             };
+            drop(inner);
+            let saved = catalog
+                .and_then(|catalog| catalog.map_or(Ok(()), |catalog| self.write_catalog(catalog)))
+                .and_then(|()| self.save(&finished));
+            self.finish_step(id, &job.kill, "terminal record written", finish_started);
             inner = self.core.inner.lock().unwrap();
             if saved.is_ok()
                 && inner
@@ -6064,7 +6347,7 @@ impl Runner {
                     inner.finalizing.remove(&id);
                     inner.exit_statuses.remove(&id);
                     inner.cpu_times.remove(&id);
-                    break (inner, success, catalog);
+                    break (inner, success);
                 }
                 Err(error) => {
                     tracing::warn!(%id, %error, "terminal persistence failed; retrying");
@@ -6099,8 +6382,6 @@ impl Runner {
                 success,
                 (!fill_failure.is_empty()).then(|| fill_failure.join("; ")),
             )?;
-        } else {
-            catalog?;
         }
         drop(inner);
         // Replay waits for the state lock, so the terminal reaches clients
@@ -6321,12 +6602,7 @@ impl DispatchIndex {
             if !job.claimed_cpus().is_empty() {
                 index.claims.insert(job.id, job.claimed_cpus().to_vec());
             }
-            // A job whose withdrawal is being saved is about to become a
-            // tombstone; it is not queued for dispatch.
-            if job.state == JobState::Queued
-                && !inner.starting.contains(&job.id)
-                && !inner.terminal_saves.contains(&job.id)
-            {
+            if job.state == JobState::Queued && !inner.starting.contains(&job.id) {
                 index
                     .queued
                     .entry(job.key().to_owned())

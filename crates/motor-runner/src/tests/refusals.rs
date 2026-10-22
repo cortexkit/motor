@@ -131,7 +131,7 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
         .state = JobState::Queued;
     let log = logs(|| {
         runner
-            .launch(
+            .launch_without_dispatch(
                 Setup {
                     id: setup.job_id,
                     cpus: vec![1, 17],
