@@ -297,7 +297,7 @@ pub struct Handler {
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
 }
-fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
+pub(crate) fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
     module_data_dir_for(
         module_id,
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),

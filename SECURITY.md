@@ -113,13 +113,21 @@ the host as a third account, `motor-prep`, before the VM boots.
   and unknown job IDs receive identical refusals without runner I/O. The
   plaintext is sent only on the live submitting direct route, never in replay,
   status, runner frames or module logs. AFT and Basal are unchanged. The CLI
-  prints the secret once on stderr unless `run --secret-file PATH` creates a
-  new `0600` file instead; keep both secrets and captured stderr private.
-  `attach` reads stdin or `--secret-file`, never argv or environment variables.
+  saves the secret in a per-user `0700` directory under ck-motor's data root
+  and prints only the job ID and secret-file path on stderr. The secret file is
+  created exclusively with mode `0600`; `attach JOB_ID` discovers it by ID.
+  `run --secret-file PATH` still creates a caller-selected new `0600` file.
+  Default files are removed after a terminal is received, with a sweep for files
+  older than the 24-hour job retention. `attach` can still read stdin or an
+  explicit `--secret-file`, never argv or environment variables.
   File permissions do not protect against a hostile same-uid process that can
   read the file or process memory; this is a bearer capability, not a new user
   isolation boundary. See [direct runs](docs/module.md#direct-runs). Tests:
   `direct_secret_reattaches_replays_and_never_leaks`,
+  `default_secret_file_is_private_and_attachable_by_job_id`,
+  `default_secret_sweep_removes_only_expired_job_files`,
+  `default_run_secret_never_reaches_output_and_attach_finds_it_by_id`,
+  `default_secret_save_collision_refuses_without_printing_the_secret`,
   `secret_file_is_private_new_and_never_overwrites`,
   `attach_never_accepts_an_argv_secret_or_echoes_it`.
 - **The operator and the runner account.** They are trusted. A compromise of

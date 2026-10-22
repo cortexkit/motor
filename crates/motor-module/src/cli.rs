@@ -18,9 +18,9 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufRead, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use subc_client_rs::{
     async_trait, CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer,
@@ -87,7 +87,7 @@ and stderr here as they arrive.
   --cwd PATH          directory to run in; its git checkout is the workspace
   --return-path PATH  return this absolute workspace file (repeatable, at most 64)
   --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
-  --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
+  --secret-file PATH  save the reattach secret in this new 0600 file (optional)
   --allow-spill       allow this gate job to spill to hosted capacity when configured
   --hosted            operator test of the hosted path: run this one job on a
                       hosted runner, never on the build server; a lease that
@@ -108,11 +108,13 @@ Exit status: the command's own exit code; 128+N when a signal N killed it;
 Ctrl-C or SIGTERM cancels the job and waits for its outcome; a second one stops
 waiting. If the route closes, run tries to reattach for up to 60 seconds without
 resubmitting the job. The job keeps running until it ends or its timeout stops it.
-Save the one-time job ID and secret printed on stderr, or use
---secret-file. Reconnect with `ck motor attach JOB_ID`, reading the secret from
-stdin, or `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job, and run
-parallel jobs from separate checkouts: the runner runs one job per workspace at
-a time.";
+Save the one-time job ID printed on stderr and the secret file path, or use
+--secret-file. By default, the secret is saved in ck-motor's private data
+directory and only its path is printed; `ck motor attach JOB_ID` finds it there.
+An explicit --secret-file overrides that location. Reconnect with `ck motor attach JOB_ID`,
+or use `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job,
+and run parallel jobs from separate checkouts: the runner runs one job per
+workspace at a time.";
 
 /// What `ck motor run` was asked to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -239,7 +241,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
 pub const ATTACH_HELP: &str = "\
 usage: ck motor attach JOB_ID [--secret-file PATH] [--status]
 
-Reads the job's secret from one line of stdin, or from --secret-file PATH.
+Uses the saved default secret for JOB_ID when available, otherwise reads one
+line of stdin; --secret-file PATH selects an explicit secret file.
 Secrets are never accepted as arguments or from environment variables.
 Replays output from the start, then streams until the job ends. --status prints
 the current state and outcome as JSON without streaming (exit 0 while running).
@@ -285,6 +288,7 @@ pub fn parse_attach_args(args: &[String]) -> Result<Option<AttachArgs>, String> 
 pub struct SecretFile {
     file: fs::File,
     path: PathBuf,
+    remove_on_terminal: bool,
 }
 
 impl SecretFile {
@@ -293,10 +297,27 @@ impl SecretFile {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         Ok(Self {
             file,
             path: path.into(),
+            remove_on_terminal: false,
+        })
+    }
+
+    fn create_default(directory: &Path, job_id: Uuid) -> std::io::Result<Self> {
+        let path = default_secret_path(directory, job_id);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok(Self {
+            file,
+            path,
+            remove_on_terminal: true,
         })
     }
 
@@ -304,6 +325,96 @@ impl SecretFile {
         writeln!(self.file, "{secret}")?;
         self.file.sync_all()
     }
+
+    fn remove_after_terminal(&self) -> std::io::Result<()> {
+        fs::remove_file(&self.path)
+    }
+}
+
+const JOB_SECRET_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_SECRET_DIRECTORY: &str = "direct-secrets";
+
+fn default_secret_path(directory: &Path, job_id: Uuid) -> PathBuf {
+    directory.join(job_id.to_string())
+}
+
+fn prepare_default_secret_directory() -> std::io::Result<PathBuf> {
+    let data_root = crate::module::module_data_dir("ck-motor")?;
+    prepare_default_secret_directory_under(&data_root)
+}
+
+fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(data_root)?;
+    let directory = data_root.join(DEFAULT_SECRET_DIRECTORY);
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    // Open without following a link, then set the mode through the directory
+    // handle so an existing link cannot redirect the permission change.
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&directory)?;
+    handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+    sweep_default_secrets(&directory)?;
+    Ok(directory)
+}
+
+fn existing_default_secret_directory() -> std::io::Result<Option<PathBuf>> {
+    let directory = crate::module::module_data_dir("ck-motor")?.join(DEFAULT_SECRET_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&directory)?;
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            sweep_default_secrets(&directory)?;
+            Ok(Some(directory))
+        }
+        Ok(_) => Err(std::io::Error::other(
+            "default secret path is not a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn sweep_default_secrets(directory: &Path) -> std::io::Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(job_id) = name.parse::<Uuid>() else {
+            continue;
+        };
+        if job_id.to_string() != name {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file()
+            && now
+                .duration_since(metadata.modified()?)
+                .is_ok_and(|age| age > JOB_SECRET_RETENTION)
+        {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_default_secret(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 fn read_secret(reader: impl Read) -> String {
@@ -531,6 +642,38 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
+    let default_secret_directory = if secret_file.is_none() {
+        match prepare_default_secret_directory() {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let _ = writeln!(err, "ck motor run: cannot create secret file: {error}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+    drive_run_with_secret_directory(
+        client,
+        request,
+        secret_file,
+        default_secret_directory,
+        out,
+        err,
+        interrupts,
+    )
+    .await
+}
+
+async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
+    client: &C,
+    request: &RunRequest,
+    secret_file: Option<SecretFile>,
+    default_secret_directory: Option<PathBuf>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
     let stream = match client.run(request).await {
         Ok(stream) => stream,
         Err(SubmitError::NotSent(message) | SubmitError::CapabilityUnavailable(message)) => {
@@ -552,6 +695,8 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
             job_id: None,
             secret: None,
             secret_file,
+            default_secret_directory,
+            default_secret_file: None,
         },
         out,
         err,
@@ -564,12 +709,26 @@ struct Session {
     job_id: Option<Uuid>,
     secret: Option<String>,
     secret_file: Option<SecretFile>,
+    default_secret_directory: Option<PathBuf>,
+    default_secret_file: Option<PathBuf>,
 }
 
 pub async fn drive_attach<C: ExecClient + ?Sized>(
     client: &C,
     args: &AttachArgs,
     secret: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    drive_attach_inner(client, args, secret, None, out, err, interrupts).await
+}
+
+async fn drive_attach_inner<C: ExecClient + ?Sized>(
+    client: &C,
+    args: &AttachArgs,
+    secret: &str,
+    default_secret_file: Option<PathBuf>,
     out: &mut dyn Write,
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
@@ -582,6 +741,11 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
                     "{}",
                     serde_json::to_string(&status).expect("serializable status")
                 );
+                if status.terminal.is_some() {
+                    if let Some(path) = &default_secret_file {
+                        let _ = fs::remove_file(path);
+                    }
+                }
                 status.terminal.as_ref().map_or(0, exit_code)
             }
             Err(failure) => attach_failure(failure, err),
@@ -598,6 +762,8 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
             job_id: Some(args.job_id),
             secret: Some(secret.into()),
             secret_file: None,
+            default_secret_directory: None,
+            default_secret_file,
         },
         out,
         err,
@@ -771,6 +937,12 @@ async fn consume<C: ExecClient + ?Sized>(
                 ) {
                     job_id = Some(id);
                     session.secret = Some(secret.into());
+                    if session.secret_file.is_none() {
+                        session.secret_file = session
+                            .default_secret_directory
+                            .as_deref()
+                            .and_then(|directory| SecretFile::create_default(directory, id).ok());
+                    }
                     if let Some(file) = session.secret_file.as_mut() {
                         if file.save(secret).is_err() {
                             let _ = writeln!(
@@ -785,7 +957,11 @@ async fn consume<C: ExecClient + ?Sized>(
                             file.path.display()
                         );
                     } else {
-                        let _ = writeln!(err, "ck motor run: job_id={id} secret={secret}");
+                        let _ = writeln!(
+                            err,
+                            "ck motor run: could not save the reattach secret for job_id={id}"
+                        );
+                        return EXIT_UNKNOWN;
                     }
                 }
             }
@@ -868,6 +1044,16 @@ async fn consume<C: ExecClient + ?Sized>(
                         state.billed_line()
                     );
                 }
+                if let Some(file) = session
+                    .secret_file
+                    .as_ref()
+                    .filter(|file| file.remove_on_terminal)
+                {
+                    let _ = file.remove_after_terminal();
+                }
+                if let Some(path) = &session.default_secret_file {
+                    let _ = fs::remove_file(path);
+                }
                 return settle_named(&terminal, name, err);
             }
             _ => {}
@@ -878,6 +1064,7 @@ async fn consume<C: ExecClient + ?Sized>(
 fn reattach_hint(job_id: Option<Uuid>, secret_file: Option<&SecretFile>, err: &mut dyn Write) {
     if let Some(id) = job_id {
         let file = secret_file
+            .filter(|file| !file.remove_on_terminal)
             .map(|file| {
                 format!(
                     " {}",
@@ -1326,6 +1513,34 @@ pub async fn hosted_check_main(args: &[String]) -> u8 {
     }
 }
 
+fn attach_secret(args: &AttachArgs, stdin: impl Read) -> (String, Option<PathBuf>) {
+    let default_directory = existing_default_secret_directory().ok().flatten();
+    attach_secret_from_directory(args, stdin, default_directory)
+}
+
+fn attach_secret_from_directory(
+    args: &AttachArgs,
+    stdin: impl Read,
+    default_directory: Option<PathBuf>,
+) -> (String, Option<PathBuf>) {
+    if let Some(path) = &args.secret_file {
+        return (
+            fs::File::open(path).map(read_secret).unwrap_or_default(),
+            None,
+        );
+    }
+    let default_file =
+        default_directory.map(|directory| default_secret_path(&directory, args.job_id));
+    if let Some(path) = default_file {
+        match open_default_secret(&path) {
+            Ok(file) => return (read_secret(file), Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return (String::new(), None),
+        }
+    }
+    (read_secret(stdin), None)
+}
+
 pub async fn attach_main(args: &[String]) -> u8 {
     let args = match parse_attach_args(args) {
         Ok(Some(args)) => args,
@@ -1338,10 +1553,7 @@ pub async fn attach_main(args: &[String]) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let secret = match &args.secret_file {
-        Some(path) => fs::File::open(path).map(read_secret).unwrap_or_default(),
-        None => read_secret(std::io::stdin().lock()),
-    };
+    let (secret, default_secret_file) = attach_secret(&args, std::io::stdin().lock());
     let workspace = match std::env::current_dir() {
         Ok(path) => path,
         Err(_) => {
@@ -1360,10 +1572,11 @@ pub async fn attach_main(args: &[String]) -> u8 {
         Ok(client) => client,
         Err(failure) => return attach_failure(failure, &mut std::io::stderr()),
     };
-    drive_attach(
+    drive_attach_inner(
         &client,
         &args,
         &secret,
+        default_secret_file,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         &mut interrupts,
@@ -1469,6 +1682,69 @@ mod tests {
         let link = scratch.join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(super::SecretFile::create(&link).is_err());
+    }
+
+    #[test]
+    fn default_secret_file_is_private_and_attachable_by_job_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-default-secret");
+        let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let job_id = motor_protocol::Uuid::now_v7();
+        let secret = "d".repeat(64);
+        let mut file = super::SecretFile::create_default(&directory, job_id).unwrap();
+        file.save(&secret).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let args = super::AttachArgs {
+            job_id,
+            secret_file: None,
+            status: false,
+        };
+        let (loaded, path) =
+            super::attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
+        assert_eq!(loaded, secret);
+        assert_eq!(path, Some(file.path.clone()));
+
+        let linked_id = motor_protocol::Uuid::now_v7();
+        let link = super::default_secret_path(&directory, linked_id);
+        std::os::unix::fs::symlink(&file.path, &link).unwrap();
+        assert!(super::SecretFile::create_default(&directory, linked_id).is_err());
+    }
+
+    #[test]
+    fn default_secret_sweep_removes_only_expired_job_files() {
+        use std::fs::FileTimes;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-secret-sweep");
+        let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let expired = motor_protocol::Uuid::now_v7();
+        let current = motor_protocol::Uuid::now_v7();
+        let expired_path = super::default_secret_path(&directory, expired);
+        let current_path = super::default_secret_path(&directory, current);
+        std::fs::write(&expired_path, "old\n").unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&expired_path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(
+                std::time::SystemTime::now()
+                    - super::JOB_SECRET_RETENTION
+                    - std::time::Duration::from_secs(1),
+            ))
+            .unwrap();
+
+        super::sweep_default_secrets(&directory).unwrap();
+        assert!(!expired_path.exists());
+        assert!(current_path.exists());
     }
 
     #[test]
@@ -1875,6 +2151,51 @@ mod hosted_cli_tests {
         }
     }
 
+    struct DirectRunClient(Vec<Vec<u8>>);
+    #[async_trait]
+    impl ExecClient for DirectRunClient {
+        async fn run(&self, _: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+            Ok(Box::new(Records(VecDeque::from(self.0.clone()))))
+        }
+        async fn attach(&self, _: Uuid, _: &str) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn status(&self, _: Uuid, _: &str) -> Result<JobStatusReply, SubmitError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    struct SecretCheckingClient {
+        expected_secret: String,
+    }
+    #[async_trait]
+    impl ExecClient for SecretCheckingClient {
+        async fn run(&self, _: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            job_id: Uuid,
+            secret: &str,
+        ) -> Result<Box<dyn RecordStream>, SubmitError> {
+            assert_eq!(secret, self.expected_secret);
+            let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+            Ok(Box::new(Records(VecDeque::from([serde_json::to_vec(
+                &StreamRecord::Terminal(terminal),
+            )
+            .unwrap()]))))
+        }
+        async fn status(&self, _: Uuid, _: &str) -> Result<JobStatusReply, SubmitError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
     #[tokio::test]
     async fn hosted_cli_completion_prints_billing_and_keeps_real_exit_code() {
         for (billed, billing, expected) in [
@@ -1910,6 +2231,8 @@ mod hosted_cli_tests {
                     job_id: Some(id),
                     secret: None,
                     secret_file: None,
+                    default_secret_directory: None,
+                    default_secret_file: None,
                 },
                 &mut out,
                 &mut err,
@@ -1919,6 +2242,117 @@ mod hosted_cli_tests {
             assert_eq!(code, 23);
             assert!(String::from_utf8(err).unwrap().contains(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn default_run_secret_never_reaches_output_and_attach_finds_it_by_id() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-default-secret");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let job_id = Uuid::now_v7();
+        let secret = "c".repeat(64);
+        let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+        let mut record = serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap();
+        record["direct_job"] = json!({ "job_id": job_id, "secret": secret });
+        let client = DirectRunClient(vec![serde_json::to_vec(&record).unwrap()]);
+        let request = RunRequest::new("workspace", "repository", "workspace", "true");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            None,
+            Some(directory.clone()),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(!out
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(!err
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains(&format!("job_id={job_id} secret-file=")));
+        assert!(!default_secret_path(&directory, job_id).exists());
+
+        let attach_id = Uuid::now_v7();
+        let attach_secret = "e".repeat(64);
+        let mut secret_file = SecretFile::create_default(&directory, attach_id).unwrap();
+        secret_file.save(&attach_secret).unwrap();
+        let args = AttachArgs {
+            job_id: attach_id,
+            secret_file: None,
+            status: false,
+        };
+        let (loaded_secret, default_file) =
+            attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
+        assert_eq!(loaded_secret, attach_secret);
+        let client = SecretCheckingClient {
+            expected_secret: attach_secret,
+        };
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drive_attach_inner(
+            &client,
+            &args,
+            &loaded_secret,
+            default_file,
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(!default_secret_path(&directory, attach_id).exists());
+    }
+
+    #[tokio::test]
+    async fn default_secret_save_collision_refuses_without_printing_the_secret() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-secret-collision");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let job_id = Uuid::now_v7();
+        let secret = "f".repeat(64);
+        let target = scratch.join("target");
+        std::fs::write(&target, "do not replace").unwrap();
+        std::os::unix::fs::symlink(&target, default_secret_path(&directory, job_id)).unwrap();
+        let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+        let mut record = serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap();
+        record["direct_job"] = json!({ "job_id": job_id, "secret": secret });
+        let client = DirectRunClient(vec![serde_json::to_vec(&record).unwrap()]);
+        let request = RunRequest::new("workspace", "repository", "workspace", "true");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            None,
+            Some(directory),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, EXIT_UNKNOWN);
+        assert!(!out
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(!err
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("ck motor run: could not save the reattach secret for job_id={job_id}\n")
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "do not replace");
     }
 }
 
