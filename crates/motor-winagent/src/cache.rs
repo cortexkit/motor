@@ -13,6 +13,10 @@ pub struct HypervDisk {
     pub system: bool,
 }
 
+pub fn parse_hyperv_disk_inventory(json: &str) -> Result<Vec<HypervDisk>, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
 /// This runner expects the OS at SCSI LUN 0 and the cache at LUN 1. Require the
 /// complete two-disk topology, not merely the absence of a virtio serial.
 pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
@@ -297,6 +301,28 @@ mod tests {
         let mut duplicate = cache();
         duplicate.number = 0;
         assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
+    }
+
+    #[test]
+    fn hyperv_inventory_parser_requires_a_json_array() {
+        let os = r#"{"number":0,"lun":0,"boot":true,"system":true}"#;
+        let cache = r#"{"number":1,"lun":1,"boot":false,"system":false}"#;
+        let many = format!("[{os},{cache}]");
+        let disks = super::parse_hyperv_disk_inventory(&many).unwrap();
+        assert_eq!(super::select_hyperv_cache_disk(&disks).unwrap(), 1);
+        assert_eq!(super::parse_hyperv_disk_inventory("[]").unwrap().len(), 0);
+        assert_eq!(
+            super::parse_hyperv_disk_inventory(&format!("[{os}]"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            super::parse_hyperv_disk_inventory(&format!(
+                "{{\"value\":[{os},{cache}],\"Count\":2}}"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

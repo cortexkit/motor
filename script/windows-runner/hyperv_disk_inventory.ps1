@@ -18,4 +18,5 @@ $items = @(Get-CimInstance -ClassName Win32_DiskDrive | ForEach-Object {
         system = [bool]$disk.IsSystem
     }
 })
-ConvertTo-Json -InputObject $items -Compress
+$elements = @($items | ForEach-Object { $_ | ConvertTo-Json -Compress })
+'[' + ($elements -join ',') + ']'

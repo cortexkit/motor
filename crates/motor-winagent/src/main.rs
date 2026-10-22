@@ -739,8 +739,8 @@ mod guest {
                 ))
             })?;
             diagnostic!("Hyper-V disk topology {}", inventory);
-            let disks: Vec<motor_winagent::cache::HypervDisk> =
-                serde_json::from_str(&inventory).map_err(|e| invalid(e.to_string()))?;
+            let disks = motor_winagent::cache::parse_hyperv_disk_inventory(&inventory)
+                .map_err(|error| invalid(error.to_string()))?;
             motor_winagent::cache::select_hyperv_cache_disk(&disks)
         }
         #[cfg(not(feature = "hyperv-runner"))]
