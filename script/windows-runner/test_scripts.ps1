@@ -66,6 +66,29 @@ try {
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     . "$PSScriptRoot\parent-identity.ps1"
+    $hypervPath = Join-Path $PSScriptRoot 'hyperv.ps1'
+    $hypervTokens = $null
+    $hypervErrors = $null
+    $hypervAst = [Management.Automation.Language.Parser]::ParseFile($hypervPath, [ref]$hypervTokens, [ref]$hypervErrors)
+    if ($hypervErrors.Count) { throw "FAIL parent-identity-guard-fixture-source-parse: $($hypervErrors | Out-String)" }
+    $guards = @($hypervAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -ieq 'parentGuard' -and
+        $node.Right.Extent.Text -match 'Open-RunnerVerifiedParent'
+    }, $true) | Sort-Object { $_.Extent.StartOffset })
+    if ($guards.Count -ne 2) {
+        throw "FAIL parent-identity-guard-fixture-expected-two-assignments-found-$($guards.Count)"
+    }
+    if ($guards[0].Right.Extent.Text -notmatch '\$Parent\s+\$ParentSha256\s+\$parentRecord') {
+        throw 'FAIL parent-identity-guard-fixture-Prepare-assignment-not-found'
+    }
+    if ($guards[1].Right.Extent.Text -notmatch '\$metadata\.parent\s+\$metadata\.sha256\s+\$parentRecord') {
+        throw 'FAIL parent-identity-guard-fixture-Run-assignment-not-found'
+    }
+    Write-Host 'PASS parent-identity-guard-fixture-found-Prepare-and-Run-assignments'
+    $count++
     $fixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-parent-tests-' + [Guid]::NewGuid())
     New-Item $fixture -ItemType Directory | Out-Null
     $Parent = Join-Path $fixture 'parent.vhdx'
