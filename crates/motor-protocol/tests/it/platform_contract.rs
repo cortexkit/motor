@@ -141,6 +141,63 @@ fn platform_unsupported_uses_published_refusal_reason() {
 }
 
 #[test]
+fn macos_platform_round_trips_as_macos_tag_in_run_accepted_and_request() {
+    let mut run = run();
+    run.platform = Some(Platform::Macos);
+    let frame = Frame::Run(run);
+    let encoded = serde_json::to_value(&frame).unwrap();
+    assert_eq!(encoded["platform"], "macos");
+    let decoded: Frame = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, frame);
+    let Frame::Run(decoded) = decoded else {
+        panic!("expected Run");
+    };
+    assert_eq!(decoded.platform, Some(Platform::Macos));
+
+    let legacy = br#"{"type":"accepted","job_id":"00000000-0000-0000-0000-000000000000","queue_position":0}"#;
+    let Frame::Accepted(accepted) = serde_json::from_slice(legacy).unwrap() else {
+        panic!("expected Accepted");
+    };
+    let accepted = accepted.with_platform(Platform::Macos);
+    assert_eq!(accepted.platform, Some(Platform::Macos));
+    let frame = Frame::Accepted(accepted);
+    let encoded = serde_json::to_value(&frame).unwrap();
+    assert_eq!(encoded["platform"], "macos");
+    assert_eq!(serde_json::from_value::<Frame>(encoded).unwrap(), frame);
+
+    let request =
+        RunRequest::new("/work", "/source", "/work", "true").with_platform(Platform::Macos);
+    let encoded = serde_json::to_value(&request).unwrap();
+    assert_eq!(encoded["platform"], "macos");
+    assert_eq!(
+        serde_json::from_value::<RunRequest>(encoded).unwrap(),
+        request
+    );
+}
+
+#[test]
+fn unknown_platform_tags_still_round_trip_unchanged_beside_macos() {
+    // Tags close to "macos" must stay Unknown and keep their exact spelling,
+    // so a newer caller's platform string survives a relay through this crate.
+    for tag in ["future-os", "darwin", "MacOS", "macos-arm64"] {
+        let decoded: Platform = serde_json::from_value(json!(tag)).unwrap();
+        assert_eq!(decoded, Platform::Unknown(tag.into()));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), json!(tag));
+
+        let mut run = run();
+        run.platform = Some(decoded.clone());
+        let frame = Frame::Run(run);
+        let encoded = serde_json::to_value(&frame).unwrap();
+        assert_eq!(encoded["platform"], tag);
+        assert_eq!(serde_json::from_value::<Frame>(encoded).unwrap(), frame);
+
+        let request =
+            RunRequest::new("/work", "/source", "/work", "true").with_platform(decoded.clone());
+        assert_eq!(serde_json::to_value(&request).unwrap()["platform"], tag);
+    }
+}
+
+#[test]
 fn started_mapping_is_optional_and_absence_keeps_legacy_wire_bytes() {
     let frame: Frame = serde_json::from_slice(LEGACY_STARTED).unwrap();
     assert_eq!(
