@@ -384,6 +384,23 @@ seen the job survives a `ck-motor` restart. Tests:
 `cancel_before_seen_survives_module_restart_and_attach_cancel`,
 `cancel_while_second_bundle_is_held_preserves_cancelled_tombstone`.
 
+9.2. The runner's cancel takes the job's output log ahead of output commits
+that have not started, so a job printing faster than the runner can commit
+its output does not hold back the unit stop. Test:
+`cancel_takes_the_job_log_ahead_of_the_next_output_commit`.
+
+9.3. While `exec.cancel` delivers a build-server cancel on its own
+connection, the job's stream keeps its connection: it sends no second cancel
+and does not reattach, so the terminal arrives without a reconnect. Test:
+`job_stream_keeps_its_connection_while_cancel_is_delivered`.
+
+9.4. Both sides log each cancel step at INFO with the job ID. `ck-motor` logs
+the elapsed milliseconds from the caller's request to the runner's
+acknowledgement. The runner logs the elapsed milliseconds from the cancel
+frame to the unit stop; for a killed job it then logs each step from the
+unit's exit to the terminal, with the time since finishing began and since
+the kill was recorded, and when the terminal frame is written to the client.
+
 ## 10. Compatibility
 
 10.1. Every addition in this version is optional and omitted at its default,
