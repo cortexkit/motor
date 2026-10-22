@@ -23,7 +23,9 @@ fn firecracker_create_timeout_names_the_endpoint_and_uncertain_writer() {
         assert_eq!(request, "PUT /snapshot/create HTTP/1.1\r\n");
         wait.recv().unwrap();
     });
-    let error = create_snapshot(scratch.path(), Duration::from_millis(20)).unwrap_err();
+    let mut uncertain = false;
+    let error =
+        create_snapshot(scratch.path(), Duration::from_millis(20), &mut uncertain).unwrap_err();
     let text = error.to_string();
     assert!(
         text.starts_with(crate::tenant::SNAPSHOT_CREATE_UNCERTAIN),
@@ -39,8 +41,15 @@ fn firecracker_create_timeout_names_the_endpoint_and_uncertain_writer() {
     );
     done.send(()).unwrap();
     thread.join().unwrap();
+    assert!(uncertain, "a sent create must quarantine the VM on timeout");
 
-    let error = create_snapshot(&scratch.join("missing"), Duration::from_millis(20)).unwrap_err();
+    let error = create_snapshot(
+        &scratch.join("missing"),
+        Duration::from_millis(20),
+        &mut uncertain,
+    )
+    .unwrap_err();
+    assert!(!uncertain, "a connection failure did not start a writer");
     assert!(error.0.starts_with("suspend_create_not_sent"));
     assert!(error
         .0

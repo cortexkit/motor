@@ -31,6 +31,7 @@ struct Running {
     paused: bool,
     attached: bool,
     restored: bool,
+    snapshot_uncertain: bool,
 }
 pub struct LinuxTenants {
     config: Config,
@@ -291,6 +292,11 @@ impl Backend for LinuxTenants {
             .get_mut(tenant)
             .is_some_and(|v| matches!(v.child.try_wait(), Ok(None)))
     }
+    fn snapshot_uncertain(&self, tenant: &str) -> bool {
+        self.running
+            .get(tenant)
+            .is_some_and(|vm| vm.snapshot_uncertain)
+    }
     fn was_restored(&self, tenant: &str) -> bool {
         self.running.get(tenant).is_some_and(|vm| vm.restored)
     }
@@ -474,6 +480,7 @@ impl Backend for LinuxTenants {
                 paused: true,
                 attached: false,
                 restored: saved,
+                snapshot_uncertain: false,
             },
         );
         // A successful connection is required, not merely a leftover socket inode.
@@ -556,7 +563,7 @@ impl Backend for LinuxTenants {
                 r.guest_ram_mib,
                 timeout.as_millis()
             );
-            create_snapshot(&vm.root, timeout)?;
+            create_snapshot(&vm.root, timeout, &mut vm.snapshot_uncertain)?;
             for (src, dst) in [
                 ("new.vmstate", "suspend.vmstate"),
                 ("new.memory", "suspend.memory"),
@@ -719,15 +726,25 @@ fn snapshot_create_timeout(ram_mib: u64) -> Duration {
     Duration::from_secs(ram_mib.div_ceil(64).saturating_add(30).clamp(60, 480))
 }
 
-pub(crate) fn create_snapshot(root: &Path, timeout: Duration) -> Result<()> {
-    api_with_timeout(root, "PUT", "/snapshot/create", &snapshot_body(), timeout).map_err(|error| {
-        let prefix = if error.request_started {
-            crate::tenant::SNAPSHOT_CREATE_UNCERTAIN
-        } else {
-            "suspend_create_not_sent"
-        };
-        Error(format!("{prefix}: {error}"))
-    })
+pub(crate) fn create_snapshot(root: &Path, timeout: Duration, uncertain: &mut bool) -> Result<()> {
+    *uncertain = true;
+    let result = api_with_timeout(root, "PUT", "/snapshot/create", &snapshot_body(), timeout)
+        .map_err(|error| {
+            let prefix = if error.request_started {
+                crate::tenant::SNAPSHOT_CREATE_UNCERTAIN
+            } else {
+                "suspend_create_not_sent"
+            };
+            Error(format!("{prefix}: {error}"))
+        });
+    if !result.as_ref().is_err_and(|error| {
+        error
+            .0
+            .starts_with(crate::tenant::SNAPSHOT_CREATE_UNCERTAIN)
+    }) {
+        *uncertain = false;
+    }
+    result
 }
 
 struct ApiFailure {

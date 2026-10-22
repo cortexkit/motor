@@ -1324,7 +1324,10 @@ async fn unauthenticated_slot_is_held_until_challenge_verifies_not_until_job_end
     ));
     let challenge = hello(&mut client, &broker, &requester, &c).await;
     assert_eq!(slots.available_permits(), 0);
-    respond(&mut client, &requester, &c, challenge).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
     assert_eq!(slots.available_permits(), 1);
     drop(client);
     let _ = task.await.unwrap();

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::sync::Mutex;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Progress {
     client_read: u64,
     guest_written: u64,
@@ -136,7 +136,7 @@ mod tests {
         )
         .await
         .is_err());
-        let p = trace.progress.lock().unwrap();
+        let p = trace.progress.lock().unwrap().clone();
         assert_eq!(
             (p.frame_type, p.frame_seq, p.frame_written, p.client_written),
             ("output", Some(7), 9, 9)
@@ -157,7 +157,7 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::BrokenPipe
         );
-        let p = trace.progress.lock().unwrap();
+        let p = trace.progress.lock().unwrap().clone();
         assert_eq!((p.client_read, p.guest_written, p.input_pending), (9, 0, 9));
     }
 }
