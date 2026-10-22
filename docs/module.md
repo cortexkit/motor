@@ -159,16 +159,19 @@ Tests: `missing_key_fails_health_and_run_before_snapshot_or_ssh`,
 
 ### Retry hints on credential refusals
 
-A refusal for one of these codes carries the terminal record's optional
-`retry_after_ms` only when it clears without an operator, so a caller can wait
-and retry remotely instead of running the job somewhere else. Prepare replies
+Only a transient signing failure (`runner_sign_unavailable`,
+`runner_sign_invalid_response`) puts the terminal record's optional
+`retry_after_ms` on its refusal. The hint is the time left in the agent's
+backoff for that failure: once it passes, the next job's sign request asks the
+vault again, so a caller can wait and retry remotely instead of running the job
+somewhere else. It does not promise the vault has recovered. Prepare replies
 carry the same hint.
 
 | Code | `retry_after_ms` |
 | --- | --- |
 | `runner_sign_unavailable`, `runner_sign_invalid_response` | The milliseconds left in the agent's 2-second backoff for that failure, rounded up: at least 1, at most 2000. |
 | `runner_sign_missing`, `runner_sign_grant_refused` | Absent. An operator must re-create the credential or re-approve the grant; a wait-and-retry hint would make a caller retry in a loop. |
-| `runner_credential_*`, `runner_agent_start_failed`, `runner_agent_stopped`, `runner_ssh_config_invalid` | Absent, for the same reason. |
+| `runner_credential_*`, `runner_agent_start_failed`, `runner_agent_stopped`, `runner_ssh_config_invalid` | Absent. Most need an operator to fix the vault, the agent or the SSH alias; the background retries above have no fixed time a caller could wait for. |
 
 The hint is set wherever a connector refusal becomes a refusal: the check
 before the snapshot, and a refusal found while opening the runner channel. Both
