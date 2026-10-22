@@ -610,7 +610,10 @@ fn concurrent_touches_of_one_snapshot_keep_the_newer_invalidation() {
     let (release, released) = mpsc::channel::<()>();
     let gate = Mutex::new(Some((inspected, released)));
     f.store.touch_inspected = Some(Arc::new(move |_: &Path| {
-        if let Some((inspected, released)) = gate.lock().unwrap().take() {
+        // Taken in its own statement, so the gate's lock is released before
+        // pausing and cannot itself serialize the two touches.
+        let first = gate.lock().unwrap().take();
+        if let Some((inspected, released)) = first {
             inspected.send(()).unwrap();
             released.recv().unwrap();
         }
@@ -620,11 +623,14 @@ fn concurrent_touches_of_one_snapshot_keep_the_newer_invalidation() {
         paused.recv().unwrap();
         let second = scope.spawn(|| f.touch(&newer, &b2, newer_closed));
         std::thread::sleep(Duration::from_millis(300));
+        let waited = !second.is_finished();
+        // Released before asserting: a failed assertion must not leave the
+        // paused thread waiting, or the scope would never finish.
+        release.send(()).unwrap();
         assert!(
-            !second.is_finished(),
+            waited,
             "a touch of the snapshot must wait while another one is between inspection and writing"
         );
-        release.send(()).unwrap();
         (
             first.join().unwrap().unwrap(),
             second.join().unwrap().unwrap(),
