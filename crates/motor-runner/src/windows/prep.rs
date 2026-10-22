@@ -656,7 +656,7 @@ fn append(
     Ok(())
 }
 
-pub(super) fn store_collection(
+pub(crate) fn store_collection(
     config: &Config,
     id: Uuid,
     bytes: &[u8],

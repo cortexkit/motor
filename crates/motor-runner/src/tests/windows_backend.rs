@@ -604,11 +604,10 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             stored.started.as_ref().unwrap().path_mapping,
             Some(PathMapping::new("/", r"C:\m"))
         );
-        assert!(terminal
-            .workspace_changes
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("changed.rs")));
+        assert_eq!(
+            terminal.workspace_changes.unwrap(),
+            ["changed.rs", "deleted.rs"]
+        );
         let replay = runner.replay(r.job_id, 0).unwrap();
         assert!(
             matches!(&replay[0], Frame::Started { path_mapping: Some(mapping), .. } if mapping == &PathMapping::new("/", r"C:\m"))
@@ -663,6 +662,75 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             .disk(&r.workspace_key)
             .exists());
         assert!(!Path::new(&r.workspace_key).exists());
+    }
+}
+
+#[test]
+fn windows_backend_reports_workspace_changes_relative_to_checkout_root() {
+    let f = Fixture::new();
+    let (c, _) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    // Each key is paired with the collection prefix the guest uses for it. The
+    // trailing-slash key must not change the result, and the deeper key must
+    // not match its shallower neighbour.
+    for (key, member) in [
+        ("/Users/u/repo", "m/Users/u/repo"),
+        ("/Users/u/repo/", "m/Users/u/repo"),
+        ("/srv/work/a/b/c/repo", "m/srv/work/a/b/c/repo"),
+    ] {
+        let id = Uuid::now_v7();
+        let mut builder = tar::Builder::new(Vec::new());
+        for name in [
+            format!("{member}/a.txt"),
+            format!("{member}/sub/b.txt"),
+            // A sibling checkout beside the workspace, and one whose name
+            // only shares the workspace's text prefix.
+            format!("{member}-sibling/c.txt"),
+            "m/Users/u/sibling/d.txt".into(),
+            "m/srv/work/a/b/c/other/e.txt".into(),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(1);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &b"x"[..]).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        prep::store_collection(
+            runner.config(),
+            id,
+            &bytes,
+            &[
+                format!("{member}/gone.txt"),
+                "m/Users/u/sibling/gone.txt".into(),
+            ],
+        )
+        .unwrap();
+        let (mut r, _) = request(&f);
+        r.workspace_key = key.into();
+        let job = Job::new(id, Some(r), 0, 0, 4);
+        assert_eq!(
+            WindowsBackend
+                .collect_changes(&runner.core.trees, &job)
+                .unwrap()
+                .unwrap(),
+            ["a.txt", "gone.txt", "sub/b.txt"],
+            "{key}"
+        );
+        // The stored collection keeps its guest form for its other readers.
+        let stored: Vec<String> = read_json(
+            &runner
+                .config()
+                .state_dir()
+                .join("jobs")
+                .join(id.to_string())
+                .join("windows-changes.json"),
+        )
+        .unwrap();
+        assert!(
+            stored.contains(&format!("{member}/sub/b.txt")),
+            "{stored:?}"
+        );
     }
 }
 

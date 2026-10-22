@@ -164,6 +164,29 @@ pub(crate) fn command(config: &Config, program: &str, args: &[String]) -> io::Re
     Command::new(program).args(args).output()
 }
 
+/// Converts one member of the stored Windows collection to the form the Linux
+/// backend reports in `workspace_changes`: a '/'-separated path relative to the
+/// job's checkout root (the workspace key).
+///
+/// The guest sees host path P at `C:\m` + P, so a collection member is
+/// `m/` followed by the host path without its leading '/'. The guest collects
+/// everything under `C:\m`, which also holds sibling checkouts. The Linux
+/// backend runs `git status` in the checkout root, and sibling checkouts sit
+/// beside the checkout rather than inside it, so Linux never reports them.
+/// Members outside the checkout root are therefore left out here too.
+/// The stored collection keeps the `m/` form because other readers of the
+/// job directory depend on it; only the reported list is converted.
+fn checkout_relative(key: &str, member: &str) -> Option<String> {
+    let host = member.strip_prefix("m/")?;
+    let root = key.trim_matches('/');
+    let relative = if root.is_empty() {
+        host
+    } else {
+        host.strip_prefix(root)?.strip_prefix('/')?
+    };
+    (!relative.is_empty()).then(|| relative.to_owned())
+}
+
 pub(crate) struct WindowsBackend;
 impl Backend for WindowsBackend {
     fn validate(&self, config: &Config) -> io::Result<()> {
@@ -238,11 +261,16 @@ impl Backend for WindowsBackend {
             .join("jobs")
             .join(job.id.to_string())
             .join("windows-changes.json");
-        if path.exists() {
-            read_json(&path).map(Some)
-        } else {
-            Ok(None)
+        if !path.exists() {
+            return Ok(None);
         }
+        let collected: Vec<String> = read_json(&path)?;
+        Ok(Some(
+            collected
+                .iter()
+                .filter_map(|member| checkout_relative(job.key(), member))
+                .collect(),
+        ))
     }
     fn reconcile(&self, config: &Config, _interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
         #[cfg(any(target_os = "linux", test))]
