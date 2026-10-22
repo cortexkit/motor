@@ -796,3 +796,55 @@ async fn prepare_enforces_the_cap_after_resolving_its_snapshots() {
     assert!(!published(&unreferenced));
     assert!(published(&created));
 }
+
+/// The sequence a runner goes through when it is deployed with sibling
+/// snapshots on top of a state left by in-place siblings: a job checked the
+/// sibling out at its path and recorded it, then the runner restarts in
+/// snapshot mode. Startup maintenance retires that checkout when nothing
+/// claims it, and keeps the directory, dropping only the record, when the
+/// path is also a catalogued workspace.
+#[tokio::test]
+async fn in_place_sibling_checkout_is_retired_when_the_runner_reopens_in_snapshot_mode() {
+    for catalogued in [false, true] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.disable_warm_builds = true;
+        let runner = Runner::open(config).unwrap();
+        assert!(runner.core.config.in_place_siblings());
+        let (run, bytes) = f.run("cat ../commons/source");
+        f.submit(&runner, &run, &bytes);
+        let t = terminal(&runner, run.job_id).await;
+        assert_eq!(
+            t.outcome,
+            Outcome::Exit { code: 0 },
+            "{:?}",
+            t.refusal_detail
+        );
+        let checkout = Path::new(&f.canonical);
+        assert!(checkout.join("source").exists());
+        assert!(recorded(&runner, &f.canonical));
+        if catalogued {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let now = runner.now();
+            inner.catalog.workspaces.insert(
+                f.canonical.clone(),
+                Workspace {
+                    used_ms: now,
+                    ..Workspace::default()
+                },
+            );
+            runner.catalog(&inner).unwrap();
+        }
+        drop(runner);
+
+        let (mut config, _) = snapshot_config(&f);
+        config.disable_warm_builds = true;
+        let runner = reopen(config);
+        assert!(!recorded(&runner, &f.canonical), "{catalogued}");
+        assert_eq!(
+            checkout.join("source").exists(),
+            catalogued,
+            "catalogued: {catalogued}"
+        );
+    }
+}
