@@ -43,6 +43,8 @@ mod repository_retirement;
 mod return_paths;
 #[path = "tests/started.rs"]
 mod started;
+#[path = "tests/state_lock.rs"]
+mod state_lock;
 #[path = "tests/status_transitions.rs"]
 mod status_transitions;
 #[path = "tests/tip_capability.rs"]
