@@ -837,7 +837,10 @@ fn metadata_left_without_its_directory_is_removed() {
     )))
     .unwrap();
 
-    assert_eq!(orphaned_metadata(&f.snapshots()).unwrap(), [orphan.clone()]);
+    assert_eq!(
+        orphaned_metadata(&f.snapshots()).unwrap(),
+        std::slice::from_ref(&orphan)
+    );
     assert!(store.remove_orphaned_metadata(&orphan).unwrap());
     assert!(!store.remove_orphaned_metadata(&kept).unwrap());
     assert!(!metadata_path(&orphan).exists());
@@ -852,7 +855,7 @@ fn metadata_left_without_its_directory_is_removed() {
         .into_iter()
         .map(|snapshot| snapshot.directory)
         .collect();
-    assert_eq!(listed, [kept.clone()]);
+    assert_eq!(listed, std::slice::from_ref(&kept));
     assert_eq!(temporaries(&f.snapshots()).unwrap().len(), 1);
 }
 
