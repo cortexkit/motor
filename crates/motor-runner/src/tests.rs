@@ -1742,7 +1742,7 @@ async fn connect(socket: &Path) -> UnixStream {
         read_next(&mut stream).await,
         Frame::Hello {
             return_paths: true,
-            return_chunked: false,
+            return_chunked: true,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,

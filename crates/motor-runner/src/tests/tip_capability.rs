@@ -17,8 +17,14 @@ async fn connect_tip(socket: &Path, capable: bool) -> UnixStream {
     };
     write_frame_async(&mut stream, &hello).await.unwrap();
     let mut expected = hello;
-    if let Frame::Hello { return_paths, .. } = &mut expected {
+    if let Frame::Hello {
+        return_paths,
+        return_chunked,
+        ..
+    } = &mut expected
+    {
         *return_paths = true;
+        *return_chunked = true;
     }
     assert_eq!(read_next(&mut stream).await, expected);
     stream

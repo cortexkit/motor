@@ -188,10 +188,10 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
     .unwrap();
     let expected = match (kind, started) {
         (BackendKind::Host, false) => {
-            br#"{"type":"hello","protocol_version":1,"return_paths":true}"#.as_slice()
+            br#"{"type":"hello","protocol_version":1,"return_paths":true,"return_chunked":true}"#.as_slice()
         }
         (BackendKind::Host, true) => {
-            br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true}"#
+            br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true,"return_chunked":true}"#
                 .as_slice()
         }
         (BackendKind::WindowsVm, true) => {
