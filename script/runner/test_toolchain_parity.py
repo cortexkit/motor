@@ -423,7 +423,8 @@ class InstallerTests(unittest.TestCase):
             bins = root / 'cargo-home/bin'
             self.assertIn('--locked --version =0.9.138 cargo-nextest', (bins / 'cargo-nextest').read_text())
             default = bins / 'ckdev-mutate'
-            self.assertEqual(default.read_bytes(), (bins / 'ckdev-mutate-9d6b663d').read_bytes())
+            default_rev = next(t['rev'] for t in manifest['cargo_installs'] if t.get('default'))
+            self.assertEqual(default.read_bytes(), (bins / ('ckdev-mutate-' + default_rev[:8])).read_bytes())
             self.assertTrue((bins / 'worker-codegen').is_file())
             sysroot = root / 'sysroot'
             self.assertEqual(str(sysroot / 'usr/local/lib/bun/1.3.14/bin/bun'),

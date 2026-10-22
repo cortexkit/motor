@@ -77,7 +77,7 @@
       "g++-mingw-w64-x86-64"
     ]
   },
-  "capture_sha256": "cd01ba4dede6681441ed7b9884f105476c53657e5d48a4dad6e7b3adee6a9c26",
+  "capture_sha256": "240dff24c0df9f29f5c529153fad0e5b6ea347f2b1ba17a09fa0c2d2315cc60d",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
@@ -95,8 +95,8 @@
       "version": "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)"
     },
     "ckdev-mutate": {
-      "matches": "ckdev-mutate-9d6b663d",
-      "version": "ckdev-mutate 0.12.1"
+      "matches": "ckdev-mutate-5d005f45",
+      "version": "ckdev-mutate 0.12.7"
     },
     "ckdev-mutate-0097d269": {
       "version": "ckdev-mutate 0.9.1"
@@ -109,6 +109,9 @@
     },
     "ckdev-mutate-46cc166b": {
       "version": "ckdev-mutate 0.8.0"
+    },
+    "ckdev-mutate-5d005f45": {
+      "version": "ckdev-mutate 0.12.7"
     },
     "ckdev-mutate-73c7e661": {
       "version": "ckdev-mutate 0.9.5"
@@ -261,7 +264,6 @@
         "ckdev-mutate"
       ],
       "crate": "cortexkit-mutate",
-      "default": true,
       "git": "https://github.com/cortexkit/commons",
       "rev": "9d6b663dac487bb982c7bfd18a96eee2292164ad"
     },
@@ -280,6 +282,15 @@
       "crate": "cortexkit-mutate",
       "git": "https://github.com/cortexkit/commons",
       "rev": "0b3bc096880e22ab43bec18eb6719a50fc59c270"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "default": true,
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "5d005f453c892a09147ffb5e991c06966ff9b4a2"
     }
   ],
   "compile_wrapper": {
