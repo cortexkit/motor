@@ -143,44 +143,14 @@ fn a_full_return_chunk_frame_fits_the_frame_cap() {
     assert_eq!(read_frame(&mut encoded.as_slice()).unwrap(), Some(frame));
 }
 
-/// The crate's own `return-chunked` vectors, located through Cargo so the
-/// test reads exactly the pinned release.
+/// The `return-chunked` vectors shipped in cortexkit-exec-remote-types 0.2.10
+/// (`test-vectors/exec-remote-v1/return-chunked`), copied byte for byte into
+/// this crate. Reading them from the registry instead needs `cargo metadata`,
+/// which fails offline on CI when any package in the resolve (bumpalo, for
+/// one) was never downloaded. When the pinned version changes, copy the new
+/// release's directory over this one.
 fn shared_vectors() -> std::path::PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--offline",
-            "--manifest-path",
-        ])
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-        // Clear inherited compiler-wrapper settings: a wrapper such as sccache
-        // may be unusable where the tests run, and metadata needs none.
-        .env("RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let manifest = metadata["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|package| package["name"] == "cortexkit-exec-remote-types")
-        .expect("cortexkit-exec-remote-types is a dependency")["manifest_path"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    std::path::Path::new(&manifest)
-        .parent()
-        .unwrap()
-        .join("test-vectors/exec-remote-v1/return-chunked")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/return-chunked")
 }
 
 /// What the shared checker makes of a vector's records, in the vector's
