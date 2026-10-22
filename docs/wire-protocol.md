@@ -151,6 +151,15 @@ The record also carries:
   (an array only when `ran` is `"remote"`; an empty array means no changes).
   Both are always present, explicitly null when unavailable. Test:
   `outcome_vectors_pin_before_start_proofs_and_nullability`.
+  On both Linux and Windows, each `workspace_changes` entry is a path relative
+  to the job's checkout root (the workspace key), with `/` separators and no
+  leading `/`, for example `sub/b.txt`. Paths outside the checkout root, such
+  as files in sibling checkouts, are not listed. Linux reports `git status`
+  entries (a rename lists only its destination; untracked files are
+  included). Windows reports files the job added, changed or deleted in the
+  guest; the runner converts the guest's `C:\m` paths to this form. Test:
+  `windows_backend_reports_workspace_changes_relative_to_checkout_root`
+  (`crates/motor-runner/src/tests/windows_backend.rs`).
 - Optional `pipestatus`, `refusal_detail` (at most 1024 bytes, for display,
   never for parsing), and `retry_after_ms`.
 
