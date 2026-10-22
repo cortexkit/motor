@@ -34,8 +34,6 @@ fn transcript(last: Frame) -> Vec<(Peer, Frame)> {
     vec![
         (Peer::Agent, hello()),
         (Peer::Host, Frame::TreeEnd { command: command() }),
-        (Peer::Agent, Frame::TreeReceived {}),
-        (Peer::Host, Frame::Start {}),
         (Peer::Agent, Frame::Started {}),
         (Peer::Agent, output(Stream::Stdout)),
         (Peer::Agent, output(Stream::Stderr)),
@@ -57,7 +55,7 @@ fn advanced(count: usize) -> Protocol {
     protocol
 }
 
-const TRANSCRIPT_LEN: usize = 9;
+const TRANSCRIPT_LEN: usize = 7;
 
 fn other(peer: Peer) -> Peer {
     match peer {
@@ -125,7 +123,7 @@ fn signal_conversation_completes_and_then_eof_is_clean() {
 
 #[test]
 fn command_may_end_without_output() {
-    let mut protocol = advanced(5);
+    let mut protocol = advanced(3);
     assert_eq!(protocol.state(), State::Running);
     protocol
         .accept(Peer::Agent, &Frame::Signal { signal: 9 })
@@ -195,12 +193,11 @@ fn order_and_direction_are_enforced_at_every_phase() {
         (1, Peer::Host, Frame::Start {}),
         (1, Peer::Agent, hello()),
         (2, Peer::Host, Frame::TreeEnd { command: command() }),
+        (2, Peer::Agent, Frame::Exit { code: 0 }),
+        (2, Peer::Agent, Frame::Signal { signal: 9 }),
+        (2, Peer::Agent, output(Stream::Stdout)),
+        (3, Peer::Host, Frame::Start {}),
         (3, Peer::Agent, Frame::Started {}),
-        (3, Peer::Agent, output(Stream::Stdout)),
-        (4, Peer::Agent, Frame::Exit { code: 0 }),
-        (4, Peer::Agent, Frame::Signal { signal: 9 }),
-        (4, Peer::Agent, output(Stream::Stdout)),
-        (5, Peer::Host, Frame::Start {}),
         (TRANSCRIPT_LEN, Peer::Agent, output(Stream::Stdout)),
         (TRANSCRIPT_LEN, Peer::Agent, Frame::Exit { code: 0 }),
         (TRANSCRIPT_LEN, Peer::Agent, Frame::Signal { signal: 9 }),
@@ -230,7 +227,7 @@ fn cancel_is_accepted_only_while_starting_or_running() {
         let mut protocol = advanced(step);
         assert!(protocol.accept(Peer::Agent, &Frame::Cancel {}).is_err());
     }
-    let mut protocol = advanced(4);
+    let mut protocol = advanced(2);
     protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
     protocol.accept(Peer::Agent, &Frame::Started {}).unwrap();
     protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
@@ -243,7 +240,7 @@ fn cancel_is_accepted_only_while_starting_or_running() {
 #[test]
 fn non_positive_signal_is_rejected() {
     for signal in [0, -1, i32::MIN] {
-        let mut protocol = advanced(5);
+        let mut protocol = advanced(3);
         assert!(
             protocol
                 .accept(Peer::Agent, &Frame::Signal { signal })
@@ -347,6 +344,12 @@ fn macos_rejects_receive_tree() {
     assert_rejected_everywhere(Frame::ReceiveTree {
         bytes: vec![0, 255],
     });
+}
+
+#[test]
+fn macos_rejects_tree_received_and_start() {
+    assert_rejected_everywhere(Frame::TreeReceived {});
+    assert_rejected_everywhere(Frame::Start {});
 }
 
 #[test]
