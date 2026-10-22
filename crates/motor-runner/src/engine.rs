@@ -6014,11 +6014,13 @@ impl Runner {
             drop(inner);
             let saved = self.save(&finished);
             self.finish_step(id, &job.kill, "terminal record written", finish_started);
-            // A job that is not a warm build updates its workspace's catalog
-            // record, which is written here without the state lock and
-            // before the terminal is published, so a client that sees the
-            // terminal also sees a catalog that includes this job. Repeating
-            // this on a later attempt changes nothing more.
+            // A job that is not a warm build, and whose workspace is in the
+            // catalog, updates that workspace's last use (and any warm-cache
+            // miss). The catalog is written here, without the state lock and
+            // before the terminal is published, so whoever sees the terminal
+            // finds a durable catalog that includes this job. A failed write
+            // is returned after the terminal is published, as before. A later
+            // attempt only moves the last-use time forward.
             let catalog = if saved.is_ok() && !job.base {
                 let mut inner = self.core.inner.lock().unwrap();
                 let snapshot = self
