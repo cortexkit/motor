@@ -55,8 +55,8 @@ pub(crate) enum CatalogWrite {
     Starting,
     /// The new file has replaced the old one; the directory is not synced.
     Renamed,
-    /// A snapshot covered by a newer rename whose directory sync failed is
-    /// about to retry that sync.
+    /// A snapshot already covered by a rename whose directory sync failed
+    /// is about to retry that sync.
     SyncRetry,
 }
 #[cfg(test)]
@@ -749,8 +749,8 @@ impl PendingStart {
     /// the queue with its CPUs, setup time, queue clock and workspace
     /// rotation as they were, giving back the writer slot of a warm build.
     /// `reason` is why the start failed. The job is not dispatched again
-    /// before a delay that doubles with each consecutive failure (see
-    /// `StartRetry`), so a failure that persists (a full disk, say) does not
+    /// before a delay that doubles with each consecutive failure, up to
+    /// `START_RETRY_MAX_MS` (see `StartRetry`), so a failure that persists (a full disk, say) does not
     /// redo the whole setup on every scheduler pass.
     fn requeue(&mut self, inner: &mut Inner, reason: &str) {
         let Some((job, clock, rotation)) = self.undo.take() else {
@@ -967,11 +967,12 @@ fn delete_retired_chunks(paths: Vec<PathBuf>) {
 
 impl JobLog {
     /// Take `write`. Neither `write` nor `signalling` guards data of its
-    /// own: a job's state lives in its record and under the state lock. So
-    /// a panic while one was held (for instance during a record save)
-    /// leaves nothing behind it inconsistent, and a poisoned lock is taken
-    /// like a healthy one. Without that, every later step for the job
-    /// (cancel, withdraw, setup, finish) would panic too.
+    /// own: a job's state lives in its record and under the state lock, and
+    /// the markers set around a save are cleared by guards when it unwinds.
+    /// So a lock poisoned by a panic while it was held (for instance during
+    /// a record save) is taken like a healthy one. That does not undo work
+    /// the panic interrupted; it keeps every later step for the job (cancel,
+    /// withdraw, setup, finish) from panicking too.
     fn lock_write(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write
             .lock()

@@ -1405,7 +1405,8 @@ fn a_start_unwinding_after_its_job_was_cancelled_releases_the_reservation() {
 }
 
 /// A job whose start keeps failing is not set up again on every scheduler
-/// pass: each failure doubles the delay before it is dispatched again.
+/// pass: each failure doubles the delay before it is dispatched again, up
+/// to `START_RETRY_MAX_MS`.
 #[test]
 fn a_failing_start_is_retried_after_a_growing_delay() {
     let f = SaveFixture::new("catalog_save");
