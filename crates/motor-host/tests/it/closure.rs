@@ -244,7 +244,7 @@ fn cloud_closure_reply_closes_the_closed_accounts_tenant_and_not_the_open_one() 
         assert!(closed_subjects(&quiet).is_empty(), "{quiet}");
     }
     let subjects = closed_subjects(reply);
-    assert_eq!(subjects, [closed_sub.clone()]);
+    assert_eq!(subjects, std::slice::from_ref(&closed_sub));
     assert!(!subjects.contains(&format!(
         "acct:{}",
         v["unreported_closed_account"].as_str().unwrap()
