@@ -1,0 +1,18 @@
+[package]
+name = "motor-macagent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Motor's single-job macOS VM guest agent"
+
+[dependencies]
+motor-winagent = { path = "../motor-winagent" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+motor-protocol = { path = "../motor-protocol" }
+tempfile = "3"
+tokio = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+cortexkit-test-support = "=0.1.10"

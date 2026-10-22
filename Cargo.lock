@@ -950,6 +950,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "motor-macagent"
+version = "0.1.0"
+dependencies = [
+ "cortexkit-test-support",
+ "libc",
+ "motor-protocol",
+ "motor-winagent",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "motor-module"
 version = "0.1.0"
 dependencies = [

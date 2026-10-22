@@ -301,7 +301,7 @@ impl Protocol {
         Ok(())
     }
 
-    /// The macOS sequence: Hello, TreeEnd, TreeReceived, Start, Started, any
+    /// The macOS sequence: Hello, TreeEnd, Started, any
     /// number of Output, then Exit or Signal. Cancel is allowed while the
     /// command is starting or running. Every other frame, including the Windows
     /// cache, tree-chunk, collect and dismount frames, poisons the conversation.
@@ -317,10 +317,8 @@ impl Protocol {
             }
             (AwaitCommand, Host, TreeEnd { command }) => {
                 command.validate_posix()?;
-                AwaitTreeReceived
+                AwaitStarted
             }
-            (AwaitTreeReceived, Agent, TreeReceived {}) => Ready,
-            (Ready, Host, Start {}) => AwaitStarted,
             (AwaitStarted, Agent, Started {}) => Running,
             (AwaitStarted | Running, Host, Cancel {}) => self.state,
             (Running, Agent, Output { .. }) => Running,
