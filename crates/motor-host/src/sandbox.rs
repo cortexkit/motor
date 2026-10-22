@@ -115,6 +115,8 @@ struct StorageHealthState {
     status: String,
     identity: Option<[u64; 3]>,
     expires_monotonic_ns: u64,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn monotonic_ns() -> std::io::Result<u64> {
@@ -168,7 +170,7 @@ impl StorageHealthGate {
         Ok(file)
     }
 
-    fn healthy(&self) -> std::io::Result<bool> {
+    fn withholding(&self) -> std::io::Result<Option<String>> {
         let file = self.private_file(&self.config.state_file, false)?;
         let mut bytes = Vec::new();
         file.take(4097).read_to_end(&mut bytes)?;
@@ -178,9 +180,21 @@ impl StorageHealthGate {
         let state: StorageHealthState = serde_json::from_slice(&bytes)?;
         // A lease also fails closed if systemd cannot run crash cleanup (for
         // example, the interpreter itself is unavailable during restoration).
-        Ok(state.status == "healthy"
-            && state.identity == Some(self.identity)
-            && monotonic_ns()? < state.expires_monotonic_ns)
+        Ok(if state.status != "healthy" {
+            Some(format!(
+                "storage_unhealthy: {}",
+                state
+                    .reason
+                    .as_deref()
+                    .unwrap_or("watcher reported unhealthy")
+            ))
+        } else if state.identity != Some(self.identity) {
+            Some("storage_identity_mismatch".into())
+        } else if monotonic_ns()? >= state.expires_monotonic_ns {
+            Some("storage_health_expired".into())
+        } else {
+            None
+        })
     }
 }
 
@@ -290,7 +304,7 @@ impl AdmissionGate {
     }
 
     /// [`Self::withholding`], logging when the reason changes.
-    fn admissible(&self, runtime: &Runtime) -> bool {
+    fn admission_withholding(&self, runtime: &Runtime) -> Option<String> {
         let reason = self.withholding(runtime);
         let mut withheld = self.withheld.lock().expect("withheld lock");
         if *withheld != reason {
@@ -300,7 +314,7 @@ impl AdmissionGate {
             }
             *withheld = reason.clone();
         }
-        reason.is_none()
+        reason
     }
 }
 
@@ -431,33 +445,49 @@ pub(crate) fn publish_readiness(
             .as_ref()
             .and_then(|identity| identity.read().ok())
     };
-    let _lock = if let Some(gate) = storage {
-        match gate.lock() {
+    let mut reason = "broker_keys_or_sandbox_identity_unavailable".to_string();
+    let _lock = if let Some(storage_gate) = storage {
+        match storage_gate.lock() {
             Ok(lock) => Some(lock),
             Err(error) => {
-                withdraw_readiness(marker)?;
+                withdraw_readiness(
+                    marker,
+                    &format!("storage_health_unavailable: {error}"),
+                    gate,
+                )?;
                 return Err(error);
             }
         }
     } else {
         None
     };
-    if let Some(gate) = storage {
-        match gate.healthy() {
-            Ok(true) => {}
-            Ok(false) => wanted = None,
+    if let Some(storage_gate) = storage {
+        match storage_gate.withholding() {
+            Ok(None) => {}
+            Ok(Some(cause)) => {
+                wanted = None;
+                reason = cause;
+            }
             Err(error) => {
-                withdraw_readiness(marker)?;
+                withdraw_readiness(
+                    marker,
+                    &format!("storage_health_unavailable: {error}"),
+                    gate,
+                )?;
                 return Err(error);
             }
         }
     }
-    if wanted.is_some() && !gate.admissible(runtime) {
-        wanted = None;
+    if wanted.is_some() {
+        if let Some(cause) = gate.admission_withholding(runtime) {
+            wanted = None;
+            reason = cause;
+        }
     }
     if wanted.is_none() {
-        return withdraw_readiness(marker);
+        return withdraw_readiness(marker, &reason, gate);
     }
+    let _ = std::fs::remove_file(marker.with_file_name("endpoint-withdrawal.json"));
     let current = std::fs::read_to_string(marker).ok();
     if wanted == current {
         return Ok(());
@@ -487,11 +517,43 @@ pub(crate) fn publish_readiness(
     Ok(())
 }
 
-fn withdraw_readiness(marker: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(marker) {
-        Ok(()) => tracing::info!("endpoint_ready_marker_removed"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+fn withdraw_readiness(marker: &Path, rule: &str, gate: &AdmissionGate) -> std::io::Result<()> {
+    let removed = match std::fs::remove_file(marker) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
+    };
+    let volume = gate.disk.as_ref().map(|(disk, _)| disk.path.as_path());
+    let free_bytes = volume.and_then(|path| available_bytes(path).ok());
+    let free_inodes = volume.and_then(|path| {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        #[allow(clippy::useless_conversion)]
+        (unsafe { libc::statvfs(path.as_ptr(), &mut stats) } == 0)
+            .then(|| u64::from(stats.f_favail))
+    });
+    // Runtime metadata lives outside the job's work volume, so the runner can
+    // retain this reason even when the job filled that volume completely.
+    let record = serde_json::json!({"at_ms": unix_ms(), "rule": rule, "volume": volume,
+        "free_bytes": free_bytes, "free_inodes": free_inodes});
+    let path = marker.with_file_name("endpoint-withdrawal.json");
+    let temporary = path.with_extension("tmp");
+    let saved = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, record.to_string().as_bytes())?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = saved {
+        tracing::warn!(%error, "endpoint_withdrawal_reason_unavailable");
+    }
+    if removed {
+        tracing::warn!(rule, volume = ?volume, ?free_bytes, ?free_inodes, "endpoint_ready_marker_removed");
     }
     Ok(())
 }
@@ -536,8 +598,8 @@ pub async fn run(config: Config) -> Result<()> {
                     ready.refresh_keys(KEY_RETRY_S);
                 }
                 retry_recovery(&ready, &mut recovery_failure);
-                if publish_readiness(&ready, &marker, storage.as_ref(), &gate).is_err() {
-                    tracing::warn!("endpoint_ready_marker_failed");
+                if let Err(error) = publish_readiness(&ready, &marker, storage.as_ref(), &gate) {
+                    tracing::warn!(%error, "endpoint_ready_marker_failed");
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }

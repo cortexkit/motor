@@ -788,7 +788,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
 }
 
 #[test]
-fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
+fn oom_without_any_exit_status_reports_proven_kill_not_unknown() {
     for contents in [None, Some("")] {
         let f = Fixture::new();
         let mut config = f.config();
@@ -841,15 +841,12 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
         }
         runner.follow_unit(request.job_id).unwrap();
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
-        assert_eq!(job.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
+        let terminal = job.terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+        assert!(terminal.refusal_detail().unwrap().contains("out of memory"));
         let detail = job.memory_limit_detail.unwrap();
         assert!(detail.contains("memory limit of 16 GiB"), "{detail}");
-        assert!(detail.contains("exit status could not be read"), "{detail}");
-        assert!(
-            detail.contains("systemd exit status unavailable"),
-            "{detail}"
-        );
-        assert!(job_output(&runner, request.job_id).contains("systemd exit status unavailable"));
+        assert!(job.monitoring_error.is_none());
         assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
     }
 }
@@ -901,6 +898,9 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
                     }
                 }
                 ["show", "--property=Result", _] => "Result=exit-code\n",
+                ["show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", _] => {
+                    "Result=exit-code\n"
+                }
                 ["reset-failed", _] | ["list-units", ..] => "",
                 _ => panic!("unexpected systemd command: {args:?}"),
             };
@@ -987,6 +987,25 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
             );
         } else {
             assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
+            let detail = terminal
+                .refusal_detail()
+                .expect("unknown must explain itself");
+            for expected in [
+                "pid_bootstrap_unproven",
+                "memory.peak=",
+                "memory.events[",
+                "ExecMainCode=",
+                "ExecMainStatus=",
+                "workspace[free_bytes=",
+                "runner_state[free_bytes=",
+                "free_inodes=",
+            ] {
+                assert!(
+                    detail.contains(expected),
+                    "{case}: missing {expected}: {detail}"
+                );
+            }
+            assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
             assert!(
                 job.started.is_some(),
                 "no proof that job never started: {case}"

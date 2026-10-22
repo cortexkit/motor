@@ -46,6 +46,8 @@ pub(crate) const SUPERVISOR_FAILED: i32 = 227;
 /// runner creates it root-owned 0600 before the unit starts; only the init,
 /// still root, can open it, and it is closed before the wrapper runs.
 pub(crate) const SETUP_ERROR_FILE: &str = "setup-error";
+/// Allocated before launch so reporting does not need another block on a full disk.
+pub(crate) const REPORT_BYTES: usize = 4096;
 /// Start of the line the init writes to [`SETUP_ERROR_FILE`] on failure.
 pub(crate) const SETUP_FAILURE_PREFIX: &str = "motor: job PID namespace setup failed: ";
 /// The capabilities the unit keeps for the init. The init empties the bounding
@@ -268,7 +270,7 @@ impl Report {
         let fd = unsafe {
             libc::open(
                 path.as_ptr(),
-                libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         Self {
@@ -286,17 +288,26 @@ impl Report {
     fn write(&self, line: &str) {
         // SAFETY: the buffer is valid for its length. Retry interrupted and
         // partial writes so the engine can recognize the setup failure line.
+        let mut block = [b' '; REPORT_BYTES];
+        let bytes = if self.owned {
+            // Preserve the allocated block and erase any earlier telemetry.
+            // A newline is copied only with a complete report, never a torn prefix.
+            let n = line.len().min(REPORT_BYTES);
+            block[..n].copy_from_slice(&line.as_bytes()[..n]);
+            &block[..]
+        } else {
+            line.as_bytes()
+        };
         unsafe {
             if self.owned {
-                libc::ftruncate(self.fd, 0);
                 libc::lseek(self.fd, 0, libc::SEEK_SET);
             }
             let mut written = 0;
-            while written < line.len() {
+            while written < bytes.len() {
                 let n = libc::write(
                     self.fd,
-                    line.as_ptr().add(written).cast(),
-                    line.len() - written,
+                    bytes.as_ptr().add(written).cast(),
+                    bytes.len() - written,
                 );
                 if n > 0 {
                     written += n as usize;

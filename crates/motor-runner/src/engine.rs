@@ -40,6 +40,8 @@ mod migration;
 mod retirement;
 #[path = "sibling_eviction.rs"]
 mod sibling_eviction;
+#[path = "terminal_evidence.rs"]
+pub(crate) mod terminal_evidence;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -1830,6 +1832,17 @@ impl Runner {
         runner.check_mirrors();
         runner.maintenance()?;
         for (id, process) in lost {
+            let mut job = runner.core.inner.lock().unwrap().jobs[&id].clone();
+            let evidence = runner.execution_evidence(&job);
+            let detail = runner.explained_terminal(
+                &job,
+                "restart_execution_not_reattachable",
+                "runner restarted; execution and durable exit evidence cannot be reattached",
+                &evidence,
+            );
+            job.terminal = job.terminal.take().map(|t| t.with_refusal_detail(detail));
+            runner.save(&job)?;
+            runner.core.inner.lock().unwrap().jobs.insert(id, job);
             runner.recovery_diagnostic(id, process, false)?;
         }
         for id in recovered {
@@ -3949,10 +3962,7 @@ impl Runner {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
                     drop(signalling);
                     drop(write);
-                    return self.finish(
-                        id,
-                        Err(io::Error::other("cancel recorded after unit exited")),
-                    );
+                    return self.finish_unobserved_unit(id, "cancel recorded after unit exited");
                 } else {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
                     self.core.backend.cancel(&self.core.config, &job, false)?;
@@ -5141,8 +5151,8 @@ impl Runner {
                 Ok(alive) if job.process.is_none() || alive == Some(false) => {
                     let runner = self.clone();
                     std::thread::spawn(move || {
-                        if let Err(error) = runner
-                            .finish(id, Err(io::Error::other("cancelled unit already exited")))
+                        if let Err(error) =
+                            runner.finish_unobserved_unit(id, "cancelled unit already exited")
                         {
                             tracing::error!(%id, %error, "terminal bookkeeping failed");
                         }
@@ -5435,6 +5445,17 @@ impl Runner {
                         let mut failed = job.clone();
                         failed.terminal(Outcome::OutcomeUnknown, self.now());
                         failed.monitoring_error = Some(error.to_string());
+                        let evidence = self.execution_evidence(&failed);
+                        let detail = self.explained_terminal(
+                            &failed,
+                            "cache_fill_setup_failed",
+                            &error.to_string(),
+                            &evidence,
+                        );
+                        failed.terminal = failed
+                            .terminal
+                            .take()
+                            .map(|t| t.with_refusal_detail(detail));
                         self.save(&failed)?;
                         inner.jobs.insert(id, failed);
                         return self.finish_base(inner, &r, false, None);
@@ -6079,6 +6100,19 @@ impl Runner {
             finished.terminal(Outcome::OutcomeUnknown, self.now());
         }
         finished.monitoring_error = Some(error.to_string());
+        if !no_start {
+            let evidence = self.execution_evidence(&finished);
+            let detail = self.explained_terminal(
+                &finished,
+                "launch_gate_release_failed",
+                &format!("{reason}: {error}"),
+                &evidence,
+            );
+            finished.terminal = finished
+                .terminal
+                .take()
+                .map(|t| t.with_refusal_detail(detail));
+        }
         let mut delay = Duration::from_millis(50);
         loop {
             let saved = self.save(&finished);
@@ -6117,7 +6151,36 @@ impl Runner {
                     _ => break,
                 }
             }
-            if let Err(error) = self.finish(id, Err(error)) {
+            if disk::storage_full(&error) {
+                let mut inner = self.core.inner.lock().unwrap();
+                inner
+                    .jobs
+                    .get_mut(&id)
+                    .unwrap()
+                    .execution_evidence
+                    .get_or_insert_with(Default::default)
+                    .output_storage_full = true;
+                drop(inner);
+                self.release_disk_reserve();
+            }
+            let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+            // Replay failures do not invalidate independent exit evidence.
+            let result = if job.durable_output {
+                let directory = self
+                    .core
+                    .trees
+                    .state
+                    .join("sandboxes")
+                    .join(id.to_string())
+                    .join("output");
+                self.finish_ended_unit(id, job.process, &directory, Some(&error))
+            } else {
+                self.finish(
+                    id,
+                    Err(io::Error::other(format!("monitor_output: {error}"))),
+                )
+            };
+            if let Err(error) = result {
                 tracing::error!(%id, %error, "terminal bookkeeping failed");
             }
         }
@@ -6162,6 +6225,16 @@ impl Runner {
             // Output is tailed frequently, but spawning systemctl for
             // every tail read would turn quiet jobs into a busy polling load.
             if std::time::Instant::now() >= inspect_at {
+                let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+                let evidence = self.execution_evidence(&job);
+                self.core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .jobs
+                    .get_mut(&id)
+                    .unwrap()
+                    .execution_evidence = Some(evidence);
                 let was_alive = alive;
                 alive = match self.unit_alive(process) {
                     Ok(alive) => alive == Some(true),
@@ -6184,6 +6257,7 @@ impl Runner {
                     }
                 }
             }
+            let mut output_unavailable = false;
             if durable {
                 for (name, stream) in [
                     ("stdout", OutputStream::Stdout),
@@ -6216,13 +6290,16 @@ impl Runner {
                             // workspace. Keep monitoring it until it really ends.
                             tracing::warn!(%id, %error, "reattached output unavailable");
                         }
-                        Err(error) => return self.finish(id, Err(error)),
+                        Err(error) => {
+                            output_unavailable = true;
+                            tracing::warn!(%id, %error, "ended unit output unavailable; recovering exit status");
+                        }
                         _ => {}
                     }
                 }
             }
             if !alive {
-                if durable {
+                if durable && !output_unavailable {
                     // Repeat while either durable log still has unread bytes.
                     let inner = self.core.inner.lock().unwrap();
                     let job = &inner.jobs[&id];
@@ -6234,42 +6311,70 @@ impl Runner {
                         continue;
                     }
                 }
-                let (status, exit_file) = if durable {
-                    self.durable_exit_status(process, &directory.join("exit"))
-                } else {
-                    (
-                        Err(io::Error::other(
-                            "legacy unit ended without retained exit status",
-                        )),
-                        Ok(None),
-                    )
-                };
-                #[cfg(target_os = "linux")]
-                let status = if durable && self.unproven_pid_bootstrap_status(&status, &exit_file) {
-                    if let Some(detail) = self.pid_namespace_setup_failure(
-                        id,
-                        &directory,
-                        &status,
-                        matches!(exit_file, Ok(None)),
-                    ) {
-                        return self.refuse_unstarted_unit(id, detail);
-                    }
-                    // Status 226 alone cannot prove whether job code ran. A
-                    // missing report must not turn into a retry-safe refusal
-                    // or masquerade as a trustworthy command exit code.
-                    Err(io::Error::other(format!(
-                        "Boat PID namespace bootstrap status {}: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown",
-                        status.as_ref().ok().and_then(|status| status.code()).unwrap()
-                    )))
-                } else {
-                    status
-                };
-                #[cfg(not(target_os = "linux"))]
-                let _ = exit_file;
-                return self.finish(id, status);
+                if durable {
+                    return self.finish_ended_unit(id, process, &directory, None);
+                }
+                return self.finish(
+                    id,
+                    Err(io::Error::other(
+                        "legacy_unit_ended: no retained exit status",
+                    )),
+                );
             }
             std::thread::park_timeout(Duration::from_millis(25));
         }
+    }
+    fn finish_unobserved_unit(&self, id: Uuid, reason: &str) -> io::Result<()> {
+        let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+        if job.durable_output {
+            let directory = self
+                .core
+                .trees
+                .state
+                .join("sandboxes")
+                .join(id.to_string())
+                .join("output");
+            self.finish_ended_unit(
+                id,
+                job.process,
+                &directory,
+                Some(&io::Error::other(reason.to_owned())),
+            )
+        } else {
+            self.finish(id, Err(io::Error::other(reason.to_owned())))
+        }
+    }
+    fn finish_ended_unit(
+        &self,
+        id: Uuid,
+        process: Option<platform::ProcessIdentity>,
+        directory: &Path,
+        monitor_error: Option<&io::Error>,
+    ) -> io::Result<()> {
+        let (status, exit_file) = self.durable_exit_status(process, &directory.join("exit"));
+        #[cfg(target_os = "linux")]
+        let status = if self.unproven_pid_bootstrap_status(&status, &exit_file) {
+            if let Some(detail) = self.pid_namespace_setup_failure(
+                id,
+                directory,
+                &status,
+                matches!(exit_file, Ok(None)),
+            ) {
+                return self.refuse_unstarted_unit(id, detail);
+            }
+            // An init status without its root-only report does not prove that
+            // the wrapper never ran, so it must not authorize an automatic retry.
+            Err(io::Error::other(format!("pid_bootstrap_unproven: Boat PID namespace bootstrap status {}: wrapper exit status and complete root-only setup evidence unavailable; execution status unknown", status.as_ref().ok().and_then(|s| s.code()).unwrap())))
+        } else {
+            status
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = exit_file;
+        let status = status.map_err(|error| match monitor_error {
+            Some(monitor) => io::Error::other(format!("monitor_output: {monitor}; {error}")),
+            None => error,
+        });
+        self.finish(id, status)
     }
     #[cfg(target_os = "linux")]
     fn unproven_pid_bootstrap_status(
@@ -6428,7 +6533,7 @@ impl Runner {
             if code.len() > 32 {
                 return Err(io::Error::other("oversized durable exit file"));
             }
-            if code.is_empty() {
+            if code.trim().is_empty() {
                 return Ok(None);
             }
             code.trim()
@@ -6621,11 +6726,13 @@ impl Runner {
         };
         self.finish_step(id, &job.kill, "finalization claimed", finish_started);
         let ended_ms = self.now();
-        let oom_stopped = self
-            .core
-            .backend
-            .oom_stopped(&self.core.config, job.process)
-            .unwrap_or(false);
+        let evidence = self.execution_evidence(&job);
+        let oom_stopped = evidence.oom_killed()
+            || self
+                .core
+                .backend
+                .oom_stopped(&self.core.config, job.process)
+                .unwrap_or(false);
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
             oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.capacity())
@@ -6664,7 +6771,17 @@ impl Runner {
             }
         };
         self.finish_step(id, &job.kill, "workspace changes collected", finish_started);
+        let lost_status = status.as_ref().err().map(ToString::to_string);
         let mut status = status;
+        // A cgroup OOM kill is a definite resource termination even when the
+        // wrapper and init died before retaining their own wait status.
+        #[cfg(unix)]
+        if status.is_err() && oom_stopped {
+            use std::os::unix::process::ExitStatusExt;
+            status = Ok(backend::ExecutionOutcome::Unix(
+                std::process::ExitStatus::from_raw(libc::SIGKILL),
+            ));
+        }
         let lock_check = if job.base {
             let r = job.request.as_ref().unwrap();
             (|| -> io::Result<()> {
@@ -6825,6 +6942,41 @@ impl Runner {
             }
             finished.terminal(outcome, self.now());
             finished.monitoring_error = monitoring_error.clone();
+            let explanation = if let Some(error) = &monitoring_error {
+                Some(self.explained_terminal(&job, "exit_evidence_unavailable", error, &evidence))
+            } else if oom_stopped {
+                Some(self.explained_terminal(
+                    &job,
+                    "out_of_memory",
+                    &format!(
+                        "out of memory: the job ran; a cgroup process was OOM-killed; {}",
+                        lost_status.as_deref().unwrap_or("retained exit status")
+                    ),
+                    &evidence,
+                ))
+            } else if evidence.disk_full() {
+                Some(self.explained_terminal(
+                    &job,
+                    "disk_full",
+                    "disk full: the job ran; retained exit status is authoritative",
+                    &evidence,
+                ))
+            } else if self.core.config.boat_profile {
+                Some(self.explained_terminal(
+                    &job,
+                    "retained_exit",
+                    "retained job exit status",
+                    &evidence,
+                ))
+            } else {
+                None
+            };
+            if let Some(detail) = explanation {
+                finished.terminal = finished
+                    .terminal
+                    .take()
+                    .map(|t| t.with_refusal_detail(detail));
+            }
             finished.memory_limit_detail = memory_limit_detail.as_ref().map(|detail| {
                 if let Some(error) = &monitoring_error {
                     format!("{detail} The job's exit status could not be read: {error}.")

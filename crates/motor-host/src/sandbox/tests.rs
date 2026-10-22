@@ -882,9 +882,21 @@ async fn sandbox_disk_under_the_floor_withdraws_readiness_until_space_is_freed()
         publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
         assert!(!marker.exists(), "under the floor the runner refuses jobs");
     }
+    let reason_file = marker.with_file_name("endpoint-withdrawal.json");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&reason_file).unwrap()).unwrap();
+    assert!(record["rule"]
+        .as_str()
+        .unwrap()
+        .starts_with("disk_below_floor free_bytes=99"));
+    assert_eq!(record["volume"], f.dir.path().to_str().unwrap());
+    assert!(record["free_bytes"].is_u64());
+    assert!(record["free_inodes"].is_u64());
+    assert!(record["at_ms"].as_u64().unwrap() > 0);
     free.store(100, Ordering::SeqCst);
     publish_readiness(&f.runtime, &marker, None, &admission).unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), ID);
+    assert!(!reason_file.exists());
 }
 
 #[test]

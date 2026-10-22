@@ -204,10 +204,11 @@ pub(crate) struct Job {
     /// Retained in the record even when replay storage cannot accept a diagnostic.
     #[serde(default)]
     pub monitoring_error: Option<String>,
-    /// Why the job was stopped by its memory limit, when it was. The terminal
-    /// record sent to callers (`TerminalRecord` in cortexkit-exec-remote-types)
-    /// has no free-form detail field outside refusals, so the text is kept here
-    /// and also written to the job's stderr.
+    /// Last live cgroup sample; systemd can remove the cgroup before finalization.
+    #[serde(skip)]
+    pub(crate) execution_evidence: Option<crate::engine::terminal_evidence::ExecutionEvidence>,
+    /// Memory-limit advice retained for inspection and stderr. The terminal's
+    /// existing detail field separately carries bounded resource evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +312,7 @@ impl Job {
             stderr_offset: 0,
             durable_output: false,
             monitoring_error: None,
+            execution_evidence: None,
             memory_limit_detail: None,
             reservation_use: None,
             execution_ended_ms: None,

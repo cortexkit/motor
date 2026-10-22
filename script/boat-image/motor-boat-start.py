@@ -296,16 +296,16 @@ def storage_lock():
         yield
 
 
-def write_storage_health(status, identity=None):
+def write_storage_health(status, identity=None, reason=None):
     temporary = STORAGE_HEALTH.with_suffix('.tmp')
     with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), 'w') as output:
         os.fchmod(output.fileno(), 0o600)
         expires = time.monotonic_ns() + STORAGE_HEALTH_TTL_NS if status == 'healthy' else 0
-        json.dump({'status': status, 'identity': identity, 'expires_monotonic_ns': expires}, output)
+        json.dump({'status': status, 'identity': identity, 'expires_monotonic_ns': expires, 'reason': reason}, output)
     temporary.replace(STORAGE_HEALTH)
 
 
-def withdraw_storage():
+def withdraw_storage(reason='storage_watch_starting'):
     with storage_lock():
         # Withdraw before disk writes or logging; the lock prevents the endpoint
         # from publishing against the old health state during this transition.
@@ -315,7 +315,22 @@ def withdraw_storage():
             # Removing the old lease needs no new file allocation. A failed
             # unhealthy-state write must not leave a valid healthy lease behind.
             STORAGE_HEALTH.unlink(missing_ok=True)
-            write_storage_health('unhealthy')
+            write_storage_health('unhealthy', reason=reason)
+        volumes = {}
+        for name, path in [('runner_state', STATE), ('workspace', USERS)]:
+            try:
+                stats = os.statvfs(path)
+                volumes[name] = {'volume': str(path), 'free_bytes': stats.f_bavail * stats.f_frsize,
+                                 'free_inodes': stats.f_favail}
+            except OSError as error:
+                volumes[name] = {'volume': str(path), 'probe_error': str(error)}
+        record = {'at_ms': time.time_ns() // 1_000_000, 'rule': reason, 'volumes': volumes}
+        path = ENDPOINT_READY.with_name('endpoint-withdrawal.json')
+        temporary = path.with_suffix('.tmp')
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), 'w') as output:
+            output.write(json.dumps(record) + '\n')
+        temporary.replace(path)
+    print('endpoint_readiness_withdrawn ' + json.dumps(record), file=sys.stderr, flush=True)
 
 
 def notify_systemd(message):
@@ -351,7 +366,7 @@ def watch_storage(pause=time.sleep, notify=None):
         # notification, or an interrupted sleep. ExecStopPost repeats cleanup for
         # uncatchable exits; the health lease expires if cleanup cannot complete.
         try:
-            withdraw_storage()
+            withdraw_storage(f'storage_watch_failed: {error}')
         except BaseException:
             try:
                 ENDPOINT_READY.unlink(missing_ok=True)
