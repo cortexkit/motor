@@ -37,7 +37,7 @@ sudo -n apt-get update
 # Bun's installer; xz and CA certificates are required by toolchain downloads.
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   build-essential clang lld pkg-config libssl-dev sqlite3 git rsync curl jq \
-  ca-certificates unzip xz-utils unattended-upgrades ufw nodejs npm
+  ca-certificates unzip xz-utils binaryen unattended-upgrades ufw nodejs npm
 sudo -n install -d -o ubuntu -g ubuntu /srv/build /srv/build/src /srv/build/target /srv/build/cargo-home /srv/build/tools-target /srv/build/mirrors /srv/build/bundles
 
 # Mac paths must share the generations' XFS device: FICLONE cannot cross from

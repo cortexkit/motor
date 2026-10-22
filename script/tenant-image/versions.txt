@@ -13,18 +13,19 @@
     "build-essential", "clang", "lld", "pkg-config", "libssl-dev",
     "sqlite3", "libsqlite3-dev", "git", "rsync", "curl", "jq",
     "ca-certificates", "unzip", "xz-utils", "unattended-upgrades", "ufw",
-    "binaryen", "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
+    "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
     "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch",
     "gettext", "libcurl4-gnutls-dev", "libexpat1-dev", "libpcre2-dev", "zlib1g-dev"
   ],
   "runner_inputs_sha256": {
-    "script/runner/tools.txt": "971d6fc20abb8d76c5397803e90e7f58f0edb916c254a5b3ba4427dbc29213a1",
+    "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
     "script/runner/install-tools.sh": "381d6d1e0b56690a34a2c6df40f86f90eb6574663e2f91e9d7b27120d752a9ea",
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/motor-net.nft": "b0e1dddc368a7fca09b1c6df87b4c917319eebf75bd14be9ce9dc8193a1eb2bb",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
-    "script/runner/toolchain.json": "065d5ccf26fd91946ca09dfd73748ba6267f8c781840295e97f2cbada0dda749",
-    "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940"
+    "script/runner/toolchain.json": "1b978ae738ac3c12d306ced3852f9c3dbeddfb8d4a18d866fe32db4b9682b664",
+    "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940",
+    "script/runner/install-binaryen.py": "dfd4a8741fe70f2334cfaf63681710f6271f15067a9f3b1012fd82d22416ab6d"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",
   "rust_default": "1.99.0",

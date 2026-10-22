@@ -106,6 +106,20 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('run("bash", str(ROOT / "script/runner/build-git.sh"))', source)
         self.assertIn('manifest["tools"]["git"]["source"]["build_packages"]', source)
 
+    def test_binaryen_120_replaces_the_distro_tool_and_is_pinned(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        spec = manifest['tools']['wasm-opt']
+        self.assertEqual('wasm-opt version 120', spec['version'])
+        self.assertEqual('/usr/local/bin/wasm-opt', spec['path_by_role']['boat'])
+        self.assertEqual('ddb097af51d1bdb17300d986b0de7d97422f1933dedb4c9eda3510e0bf4076cc',
+                         spec['source']['sha256'])
+        self.assertNotIn('binaryen', manifest['apt_packages']['required'])
+        self.assertIn('binaryen', install.BOAT_BASE_PURGE)
+        self.assertIn('script/runner/install-binaryen.py', install.RUNNER_INPUTS)
+        self.assertIn("run('/usr/bin/python3', str(ROOT / 'script/runner/install-binaryen.py')",
+                      (HERE / 'install.py').read_text())
+        self.assertIn('"wasm-opt": ["wasm-opt", "--version"]', (HERE / 'install.py').read_text())
+
     def test_recipe_passes_exact_rustup_component_and_target_argv(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
         with patch.object(install, 'run', return_value='') as run:

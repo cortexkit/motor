@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -35,6 +36,7 @@ PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
 GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
+WASM_OPT_PROBE = ROOT / 'script/runner/wasm-opt-probe.py'
 ROOT_PATHS_SCRIPT = ROOT / 'script/tenant-image/guest/root_paths.py'
 
 
@@ -544,6 +546,23 @@ def git_pushurl_check(parsed):
     return parsed['code'] == 0 and report.get('passed') is True, report
 
 
+def wasm_opt_check(parsed):
+    try:
+        report = json.loads(parsed['stdout'])
+    except ValueError:
+        return False, parsed
+    def valid_digest(value):
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in '0123456789abcdef' for character in value)
+    version = re.match(r'wasm-opt version (\d+)(?:\s|$)', report.get('version', ''))
+    passed = (parsed.get('code') == 0 and report.get('passed') is True
+              and version is not None and version.group(1) == '120'
+              and report.get('round_trip_bytes', 0) > 0
+              and valid_digest(report.get('module_sha256'))
+              and valid_digest(report.get('round_trip_sha256')))
+    return passed, report
+
+
 def marker_matches(read, sid):
     return read.get('exit_code') == 0 and read.get('stdout') in (sid, sid + '\n')
 
@@ -1020,8 +1039,9 @@ class RunnerHost:
                                          ("job_toolchain_parity", "cargo --version >/dev/null && python3 -c " + shlex.quote(parity_source(
                                             job=True, gnu_test_sha256=gnu_test_hash, cargo_seed_sha256=self.probe.cargo_seed_sha256))),
                                          ('offline_cargo_seed', 'python3 -c ' + shlex.quote(CARGO_OFFLINE_PROBE.read_text())),
-                                         ('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text())),
-                                        ("isolation", "python3 -c " + shlex.quote(job_script)),
+                                          ('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text())),
+                                          ('wasm_opt_120_round_trip', 'python3 -c ' + shlex.quote(WASM_OPT_PROBE.read_text())),
+                                         ("isolation", "python3 -c " + shlex.quote(job_script)),
                                         ('sigkill_job', 'kill -KILL $$'),
                                         ('job_stdin_eof', "python3 -c 'import os; print(\"boat-stdin-eof\" if os.read(0, 1) == b\"\" else \"unexpected-input\")'"),
                                         ('pid1_ignores_job_sigkill', 'kill -KILL 1; printf boat-pid1-alive')]
@@ -1049,6 +1069,8 @@ class RunnerHost:
                         self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
                     elif name == 'git_worktree_pushurl_reset':
                         self.check(label + '.' + name, *git_pushurl_check(parsed))
+                    elif name == 'wasm_opt_120_round_trip':
+                        self.check(label + '.' + name, *wasm_opt_check(parsed))
                     elif name == "isolation":
                         checks = isolation_result_checks(parsed, host)
                         isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}

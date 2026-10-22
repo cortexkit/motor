@@ -105,6 +105,9 @@ def install_tools(pins):
         run("rustup", "target", "add", "--toolchain", toolchain, *targets)
     run("rustup", "default", pins["rust_default"])
 
+    run("apt-get", "purge", "-y", "binaryen")
+    run("python3", str(BUILD / "script/runner/install-binaryen.py"),
+        str(BUILD / "script/runner/toolchain.json"))
     node_file = f"node-v{pins['node']}-linux-x64.tar.xz"
     node_url = f"https://nodejs.org/dist/v{pins['node']}/"
     download(node_url + node_file, BUILD / node_file,
@@ -308,6 +311,21 @@ def verify_git(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=
     return actual
 
 
+def verify_wasm_opt(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=shutil.which):
+    spec = manifest["tools"]["wasm-opt"]
+    search = next(line.removeprefix("Environment=PATH=") for line in Path(unit).read_text().splitlines()
+                  if line.startswith("Environment=PATH="))
+    path = which("wasm-opt", path=search)
+    if path != spec["path_by_role"]["tenant"]:
+        raise ValueError(f"wasm-opt resolves to {path}, not the pinned Binaryen release")
+    actual = run(path, "--version", capture=True)
+    expected_major = re.fullmatch(r"wasm-opt version (\d+)", spec["version"])
+    actual_major = re.match(r"wasm-opt version (\d+)(?:\s|$)", actual)
+    if not expected_major or not actual_major or expected_major.group(1) != actual_major.group(1):
+        raise ValueError(f"wasm-opt major version differs: {actual}")
+    return actual
+
+
 def verify(pins):
     systemd = run("/usr/lib/systemd/systemd", "--version", capture=True)
     if int(systemd.split()[1]) < 257:
@@ -326,7 +344,9 @@ def verify(pins):
             raise ValueError(f"Rust targets differ: {toolchain}")
         inventory["rust_toolchains"][toolchain] = actual
     inventory["runner"] = run("motor-runner", "--version", capture=True)
-    inventory["git"] = verify_git(json.loads((BUILD / "script/runner/toolchain.json").read_text()))
+    manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
+    inventory["git"] = verify_git(manifest)
+    inventory["wasm_opt"] = verify_wasm_opt(manifest)
     # Both errors occur during parsing, before a listener or runner can be opened.
     refuse_probe(["tenant-agent", "image-capability-probe"], "tenant-agent takes no arguments")
     refuse_probe(["image-capability-probe", "--tenant-vm", "--backend", "vm"],

@@ -33,10 +33,10 @@ The other inputs are:
   interval-set expressions are part of `NF_TABLES` itself in Linux 6.1; there is
   no separate `NFT_COUNTER` option at this pin.
 - Debian trixie from the dated Debian snapshot in `versions.txt`. Packages,
-  including Python 3, C/clang/lld, SQLite, mingw win32, binaryen and hivex, are
-  resolved from that signed snapshot. Systemd must be at least 257 for
-  `PrivatePIDs`. Node/npm come from the pinned upstream distribution rather
-  than the distribution's Node package.
+  including Python 3, C/clang/lld, SQLite, mingw win32 and hivex, are resolved
+  from that signed snapshot. Systemd must be at least 257 for `PrivatePIDs`.
+  Node/npm come from the pinned upstream distribution rather than the
+  distribution's Node package.
 - SHA-256-pinned copies of the runner's `tools.txt`, `install-tools.sh`,
   `build-sccache.sh`, read-only-hit patch and `motor-net.nft`. A changed source
   file fails the build until its pin is deliberately updated. Every Cargo tool
@@ -50,6 +50,11 @@ The other inputs are:
   installed; the build dependencies (libcurl GnuTLS, expat, PCRE2, zlib,
   gettext) are in the package list. Image verification runs the git the agent's
   PATH finds and requires the server's exact `git --version`.
+- Binaryen 120 comes from the official upstream x86_64 Linux release archive,
+  pinned by SHA-256 in `toolchain.json` and installed under
+  `/usr/local/lib/binaryen/120`; the distro `binaryen` package is purged. The
+  agent PATH resolves `/usr/local/bin/wasm-opt` to that release and image
+  verification requires major version 120, matching the build server.
 - An explicitly supplied Linux `motor-runner` binary. Its SHA-256 is recorded
   in the manifest. Use a binary built from the intended reviewed Motor commit
   and record that commit in the operator's release record. The build executes

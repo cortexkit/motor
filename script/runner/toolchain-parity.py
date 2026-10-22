@@ -234,6 +234,25 @@ def validate(manifest):
             raise ValueError("invalid Bun archive binary: " + name)
         if name == "node22" and archive.get("strip_components") != 1:
             raise ValueError("invalid Node archive root: " + name)
+    wasm_opt = manifest["tools"].get("wasm-opt")
+    if wasm_opt is not None:
+        match = re.fullmatch(r"wasm-opt version (\d+)", wasm_opt.get("version", ""))
+        if not match:
+            raise ValueError("unpinned version: wasm-opt")
+        release = match.group(1)
+        source = wasm_opt.get("source", {})
+        url = (f"https://github.com/WebAssembly/binaryen/releases/download/version_{release}/"
+               f"binaryen-version_{release}-x86_64-linux.tar.gz")
+        expected_paths = {"boat": "/usr/local/bin/wasm-opt", "tenant": "/usr/local/bin/wasm-opt"}
+        expected_realpaths = {role: f"/usr/local/lib/binaryen/{release}/bin/wasm-opt"
+                              for role in ("boat", "tenant")}
+        if (source.get("url") != url or not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", ""))
+                or source.get("archive_root") != f"binaryen-version_{release}"
+                or source.get("install_dir") != f"/usr/local/lib/binaryen/{release}"
+                or wasm_opt.get("path") != "/usr/bin/wasm-opt"
+                or wasm_opt.get("path_by_role") != expected_paths
+                or wasm_opt.get("realpath_suffix_by_role") != expected_realpaths):
+            raise ValueError("invalid pinned Binaryen archive or install layout")
     git = manifest["tools"].get("git")
     if git is not None:
         validate_git(git)
@@ -336,7 +355,15 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         equal(name + " path", expected.get("path_by_role", {}).get(role, expected["path"]), observed.get("path"))
         equal(name + " --version exit", 0, observed.get("exit_code"))
         version = first_line(observed.get("version"))
-        if "version" in expected:
+        if name == "wasm-opt":
+            expected_major = re.fullmatch(r"wasm-opt version (\d+)", expected.get("version", ""))
+            actual_major = re.match(r"wasm-opt version (\d+)(?:\s|$)", version)
+            if (not expected_major or not actual_major
+                    or expected_major.group(1) != actual_major.group(1)):
+                expected_value = expected_major.group(1) if expected_major else None
+                observed_value = actual_major.group(1) if actual_major else version
+                errors.append(f"wasm-opt major version: expected {expected_value!r}, observed {observed_value!r}")
+        elif "version" in expected:
             equal(name + " version", expected["version"], version)
         elif not re.fullmatch(expected["version_pattern"], version):
             errors.append(name + ": unexpected distro tool version " + repr(version))
