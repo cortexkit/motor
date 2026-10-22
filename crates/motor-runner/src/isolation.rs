@@ -7,7 +7,7 @@ use sha2::Digest;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Write},
     os::{
         fd::{FromRawFd, IntoRawFd},
         unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
@@ -2396,7 +2396,14 @@ impl Sandbox {
         let mut writer_grants = Vec::new();
         for name in ["stdout", "stderr", "exit", "cache-stats"] {
             let file = output.join(name);
-            fs::write(&file, "")?;
+            if name == "exit" {
+                // Allocate and flush the exit block before job code can fill the
+                // volume. The wrapper overwrites it without truncation.
+                fs::write(&file, [b' '; 32])?;
+                File::open(&file)?.sync_all()?;
+            } else {
+                fs::write(&file, "")?;
+            }
             grant_paths.push(file);
         }
         // Supply only the default names and validated repository loopback
@@ -2746,14 +2753,14 @@ impl Sandbox {
         let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR");
         // Output is a read-only directory with fixed writable file bind mounts,
         // so an exit file cannot be created or replaced by rename here. A normal
-        // exit completes this write; if the shell is killed mid-write, the failed
+        // exit overwrites a preallocated block without truncation; if the shell is killed mid-write, the failed
         // unit retains its status for the engine's systemd fallback to read.
         let shell = if durable && self.writer {
-            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; if test \"$code\" = 0; then /bin/bash -c \"$1\" </dev/null >>/motor-output/stdout 2>>/motor-output/stderr; code=$?; fi; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>>/motor-output/stderr || true; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; if test \"$code\" = 0; then /bin/bash -c \"$1\" </dev/null >>/motor-output/stdout 2>>/motor-output/stderr; code=$?; fi; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>>/motor-output/stderr || true; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if durable && cached {
-            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if durable {
-            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; printf '%s\\n' \"$code\" >/motor-output/exit; exit \"$code\""
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if self.writer {
             "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py || exit $?; exec /bin/bash -c \"$1\" </dev/null"
         } else {
@@ -2985,13 +2992,15 @@ impl Sandbox {
             use std::os::unix::fs::OpenOptionsExt;
             // The init reports a setup failure here, while still root. The file
             // is root-owned 0600, so the job cannot open it afterwards.
-            OpenOptions::new()
+            let mut report = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(self.setup_error_path())?;
+            report.write_all(&[b' '; pid_init::REPORT_BYTES])?;
+            report.sync_all()?;
         }
         let gate = if durable {
             use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};

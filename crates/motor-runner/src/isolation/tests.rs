@@ -2597,3 +2597,58 @@ fn make_writable(path: &Path) {
         .unwrap();
     assert!(status.success());
 }
+
+#[test]
+#[ignore = "requires a trusted operator host with root mount namespaces"]
+fn isolated_boat_full_disk_wrapper_preserves_preallocated_exit() {
+    let f = Fixture::new();
+    let mut sandbox = f.command_sandbox();
+    sandbox.boat_profile = true;
+    sandbox.private_pids = false;
+    sandbox.pid_init = Some(test_identity());
+    let command = sandbox
+        .command("exit 23", &f.workspace, &[], true, &[], 4)
+        .unwrap();
+    let shell = command
+        .get_args()
+        .find_map(|arg| arg.to_str().filter(|s| s.starts_with("IFS= read")))
+        .unwrap()
+        .replace("/motor-output", "\"$MOTOR_OUTPUT\"");
+    let mount = f.scratch.join("full-disk");
+    fs::create_dir(&mount).unwrap();
+    let output = crate::privilege::command("/usr/bin/unshare")
+        .args([
+            "--mount",
+            "/bin/bash",
+            "-c",
+            r#"
+set -eu
+mount --make-rprivate /
+mount -t tmpfs -o size=1M tmpfs "$1"
+export MOTOR_OUTPUT="$1"
+printf '%32s' '' >"$1/exit"
+touch "$1/stdout" "$1/stderr"
+dd if=/dev/zero of="$1/fill" bs=4096 status=none 2>/dev/null && exit 91
+# A failed fresh write proves the fixture really exhausted the mounted volume.
+if printf x >"$1/control" 2>/dev/null; then exit 92; fi
+set +e
+/bin/bash -c "$2" motor-job 'exit 23' <<<g
+code=$?
+set -e
+test "$code" = 23
+test "$(stat -c %s "$1/exit")" = 32
+test "$(tr -d ' \n' <"$1/exit")" = 23
+"#,
+            "full-disk-probe",
+        ])
+        .arg(&mount)
+        .arg(&shell)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status={:?}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

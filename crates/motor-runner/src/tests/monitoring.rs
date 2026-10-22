@@ -82,15 +82,8 @@ async fn monitor_output_enospc_retries_terminal_and_drain_completes() {
     wait_for(|| runner.drain_result() == Some(false)).await;
     monitor.join().unwrap();
     let disk: Job = read_json(&runner.record_path(id)).unwrap();
-    assert_eq!(disk.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
-    assert_eq!(
-        disk.monitoring_error.as_deref(),
-        Some(
-            io::Error::from_raw_os_error(libc::ENOSPC)
-                .to_string()
-                .as_str()
-        )
-    );
+    assert_eq!(disk.terminal.unwrap().outcome, Outcome::Exit { code: 101 });
+    assert_eq!(disk.monitoring_error, None);
 }
 
 #[tokio::test]
@@ -1736,4 +1729,146 @@ fn ref_pruning_batches_stale_deletions_without_dropping_held_refs() {
         .lines()
         .any(|reference| reference == format!("refs/tips/{}", request.integration_tip)));
     runner.cancel(request.job_id).unwrap();
+}
+
+#[test]
+fn boat_oom_killed_init_without_exit_is_definite_and_explained() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.boat_memory_max_bytes = Some(12_500_000_000);
+    config.systemd_command = Some(Arc::new(|args| {
+        use std::os::unix::process::ExitStatusExt;
+        let text = match args {
+            ["show", "--property=LoadState", "--property=ActiveState", _] => "LoadState=loaded\nActiveState=failed\n",
+            ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => "ExecMainCode=0\nExecMainStatus=0\n",
+            ["show", "--property=Result", _] => "Result=oom-kill\n",
+            ["show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", _] => "Result=oom-kill\nMemoryPeak=12500000000\nMemoryMax=12500000000\nExecMainCode=0\nExecMainStatus=0\n",
+            ["reset-failed", _] | ["list-units", ..] => "",
+            _ => panic!("unexpected systemd command: {args:?}"),
+        };
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.as_bytes().to_vec(),
+            stderr: vec![],
+        })
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .process = Some(platform::ProcessIdentity {
+        pid: 0,
+        start: 0,
+        unit: Some(Uuid::now_v7()),
+    });
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    for name in ["stdout", "stderr", "exit"] {
+        fs::write(directory.join(name), "").unwrap();
+    }
+    runner.follow_unit(id).unwrap();
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    let detail = terminal.refusal_detail().unwrap();
+    for expected in [
+        "rule=out_of_memory",
+        "out of memory",
+        "memory.peak=12500000000",
+        "memory.max=12500000000",
+        "memory.max_hit=true",
+        "ExecMainCode=0",
+        "ExecMainStatus=0",
+        "workspace[free_bytes=",
+        "free_inodes=",
+        "runner_state[free_bytes=",
+    ] {
+        assert!(detail.contains(expected), "missing {expected}: {detail}");
+    }
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+    let decoded: TerminalRecord =
+        serde_json::from_value(serde_json::to_value(&terminal).unwrap()).unwrap();
+    assert_eq!(decoded, terminal);
+}
+
+#[test]
+fn boat_disk_full_replay_keeps_real_exit_and_explanation() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.boat_memory_max_bytes = Some(12_500_000_000);
+    config.free_space_floor_bytes = u64::MAX;
+    // Admission has headroom; the end-of-job statvfs snapshot is below this floor.
+    config.free_space_probe = Arc::new(|_| Ok(u64::MAX));
+    config.before_job_write = Some(Arc::new(|path| {
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chunk-")
+        {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            Ok(())
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("stdout"), "all suites passed\n").unwrap();
+    fs::write(directory.join("stderr"), "").unwrap();
+    fs::write(directory.join("exit"), "101\n                            ").unwrap();
+    runner.monitor_unit(id);
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 101 });
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    let detail = terminal.refusal_detail().unwrap();
+    assert!(detail.contains("rule=disk_full"), "{detail}");
+    assert!(detail.contains("disk full: the job ran"), "{detail}");
+    assert!(
+        detail.contains("withdrawal=disk_below_floor volume=runner_state"),
+        "{detail}"
+    );
+    assert!(detail.contains("free_inodes="), "{detail}");
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+}
+
+#[test]
+fn cancel_after_durable_unit_exit_recovers_command_status() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = running_record(&f, &runner);
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("exit"), "23\n").unwrap();
+    runner.cancel(id).unwrap();
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(terminal.killed, Some(Killed::Cancel));
 }

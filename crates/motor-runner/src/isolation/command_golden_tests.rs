@@ -32,7 +32,7 @@ fn render(name: &str, sandbox: &Sandbox, f: &Fixture, durable: bool) -> String {
 }
 
 /// SHA-256 of the rendered argv of every case below.
-const PINNED_SHA256: &str = "79671b8fbf784d06b7ef04f1e749bf8d7cde70349a358b13017bb67ace08a184";
+const PINNED_SHA256: &str = "8040faddec111adcd41aa3b27406970c21ef34bbebdf812078505c4b1963d6d4";
 
 #[test]
 fn job_unit_commands_match_the_pinned_argv() {

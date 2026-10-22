@@ -545,10 +545,10 @@ class RecipeTests(unittest.TestCase):
                     stack.enter_context(patch.object(start, 'notify_systemd', side_effect=OSError('notify failed')))
                 elif source == 'health_write':
                     original = start.write_storage_health
-                    def write(status, identity=None):
+                    def write(status, identity=None, reason=None):
                         if status == 'healthy':
                             raise OSError('health write failed')
-                        original(status, identity)
+                        original(status, identity, reason)
                     stack.enter_context(patch.object(start, 'write_storage_health', side_effect=write))
                 def pause(_):
                     marker.touch()
@@ -576,12 +576,12 @@ class RecipeTests(unittest.TestCase):
     def test_storage_watch_failed_revocation_write_cannot_leave_healthy_lease(self):
         with self.storage_watch_paths() as (_, marker, health):
             original, revocations = start.write_storage_health, []
-            def write(status, identity=None):
+            def write(status, identity=None, reason=None):
                 if status == 'unhealthy':
                     revocations.append(status)
                     if len(revocations) > 1:
                         raise OSError('cannot write unhealthy state')
-                original(status, identity)
+                original(status, identity, reason)
             def pause(_):
                 self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
                 marker.touch()
@@ -643,10 +643,14 @@ class RecipeTests(unittest.TestCase):
             self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
 
     def test_storage_watch_health_lease_expires_without_further_polls(self):
-        with self.storage_watch_paths() as (_, _, health), patch.object(start.time, 'monotonic_ns', return_value=100):
+        with self.storage_watch_paths() as (_, marker, health), patch.object(start.time, 'monotonic_ns', return_value=100):
             start.write_storage_health('healthy', (1792, 128, 131))
             self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 5_000_000_100)
-            start.withdraw_storage()
+            start.withdraw_storage('storage_identity_changed')
+            withdrawal = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())
+            self.assertEqual(withdrawal['rule'], 'storage_identity_changed')
+            self.assertIn('runner_state', withdrawal['volumes'])
+            self.assertIn('workspace', withdrawal['volumes'])
             self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 0)
 
     def test_storage_watch_unit_has_watchdog_cleanup_and_explicit_crash_limit(self):

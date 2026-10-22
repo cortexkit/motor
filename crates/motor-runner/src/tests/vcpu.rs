@@ -478,6 +478,44 @@ async fn isolated_oom_stop_records_detail_and_health_counter() {
     assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
 }
 
+fn systemd_show_requests_result(args: &[&str]) -> bool {
+    args.first() == Some(&"show")
+        && args.iter().any(|arg| {
+            arg.strip_prefix("--property=")
+                .is_some_and(|names| names.split(',').any(|name| name == "Result"))
+        })
+}
+
+#[test]
+fn oom_observation_matches_single_and_combined_result_queries() {
+    for args in [
+        vec!["show", "--property=Result", "motor-job.service"],
+        vec![
+            "show",
+            "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus",
+            "motor-job.service",
+        ],
+        vec![
+            "show",
+            "motor-job.service",
+            "--property=Result,ExecMainStatus",
+        ],
+    ] {
+        assert!(systemd_show_requests_result(&args), "{args:?}");
+    }
+    for args in [
+        vec!["show", "--property=ExecMainStatus", "motor-job.service"],
+        vec![
+            "show",
+            "--property=OtherResult,ResultSuffix",
+            "motor-job.service",
+        ],
+        vec!["reset-failed", "--property=Result", "motor-job.service"],
+    ] {
+        assert!(!systemd_show_requests_result(&args), "{args:?}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd cgroup OOM support"]
@@ -578,14 +616,16 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                 .args(["-n", "/usr/bin/systemctl"])
                 .args(args)
                 .output()?;
-            if args.contains(&"--property=Result") {
+            // Finalization can read Result with memory/exit properties in one
+            // query, then skip the older single-property OOM fallback query.
+            if systemd_show_requests_result(args) {
                 let job: Job = read_json(&record)?;
                 let launch = job
                     .process
                     .and_then(|process| process.unit)
                     .ok_or_else(|| io::Error::other("started job has no unit identity"))?;
                 let unit = crate::backend::host_unit_name(launch);
-                if args.last() != Some(&unit.as_str()) {
+                if !args.contains(&unit.as_str()) {
                     return Ok(output);
                 }
                 let status = Command::new("/usr/bin/sudo")
@@ -593,6 +633,7 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                         "-n",
                         "/usr/bin/systemctl",
                         "show",
+                        "--property=LoadState",
                         "--property=Result",
                         "--property=ExecMainCode",
                         "--property=ExecMainStatus",
@@ -603,10 +644,11 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                 let exit = fs::read_to_string(&exit_file).map_err(|error| error.to_string());
                 let modified = fs::metadata(&exit_file).and_then(|meta| meta.modified());
                 let status = String::from_utf8_lossy(&status.stdout).into_owned();
+                let result_read = String::from_utf8_lossy(&output.stdout).into_owned();
                 println!(
-                    "OOM_FINISH_OBSERVATION: unit={unit}\n{status}exit={exit:?} mtime={modified:?}"
+                    "OOM_FINISH_OBSERVATION: unit={unit}\nconsumed query:\n{result_read}retained unit:\n{status}exit={exit:?} mtime={modified:?}"
                 );
-                *observed.lock().unwrap() = Some((status, exit));
+                *observed.lock().unwrap() = Some((result_read, status, exit));
             }
             Ok(output)
         })
@@ -622,13 +664,22 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
 
     let terminal = terminal(&runner, request.job_id).await;
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
-    let (status, exit) = observed.lock().unwrap().clone().unwrap();
+    let (result_read, status, exit) = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("finalization must query the job unit's Result before collecting it");
     println!(
         "OOM_TERMINAL_OBSERVATION: outcome={:?} monitoring_error={:?} memory_limit_detail={:?}",
         terminal.outcome, job.monitoring_error, job.memory_limit_detail
     );
     assert!(
-        status.contains("Result=oom-kill"),
+        result_read.lines().any(|line| line == "Result=oom-kill"),
+        "the last Result read by the runner must prove the OOM kill: {result_read}"
+    );
+    assert!(
+        status.lines().any(|line| line == "LoadState=loaded")
+            && status.lines().any(|line| line == "Result=oom-kill"),
         "the failed unit must still be loaded when finish inspects it: {status}"
     );
     assert_eq!(
@@ -788,7 +839,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
 }
 
 #[test]
-fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
+fn oom_without_any_exit_status_reports_proven_kill_not_unknown() {
     for contents in [None, Some("")] {
         let f = Fixture::new();
         let mut config = f.config();
@@ -841,15 +892,12 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
         }
         runner.follow_unit(request.job_id).unwrap();
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
-        assert_eq!(job.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
+        let terminal = job.terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+        assert!(terminal.refusal_detail().unwrap().contains("out of memory"));
         let detail = job.memory_limit_detail.unwrap();
         assert!(detail.contains("memory limit of 16 GiB"), "{detail}");
-        assert!(detail.contains("exit status could not be read"), "{detail}");
-        assert!(
-            detail.contains("systemd exit status unavailable"),
-            "{detail}"
-        );
-        assert!(job_output(&runner, request.job_id).contains("systemd exit status unavailable"));
+        assert!(job.monitoring_error.is_none());
         assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
     }
 }
@@ -901,6 +949,9 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
                     }
                 }
                 ["show", "--property=Result", _] => "Result=exit-code\n",
+                ["show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", _] => {
+                    "Result=exit-code\n"
+                }
                 ["reset-failed", _] | ["list-units", ..] => "",
                 _ => panic!("unexpected systemd command: {args:?}"),
             };
@@ -987,6 +1038,25 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
             );
         } else {
             assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
+            let detail = terminal
+                .refusal_detail()
+                .expect("unknown must explain itself");
+            for expected in [
+                "pid_bootstrap_unproven",
+                "memory.peak=",
+                "memory.events[",
+                "ExecMainCode=",
+                "ExecMainStatus=",
+                "workspace[free_bytes=",
+                "runner_state[free_bytes=",
+                "free_inodes=",
+            ] {
+                assert!(
+                    detail.contains(expected),
+                    "{case}: missing {expected}: {detail}"
+                );
+            }
+            assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
             assert!(
                 job.started.is_some(),
                 "no proof that job never started: {case}"

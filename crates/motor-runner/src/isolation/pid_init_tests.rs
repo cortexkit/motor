@@ -698,3 +698,21 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
         }
     }
 }
+
+#[test]
+fn setup_report_overwrites_allocated_block_without_truncation() {
+    use std::os::fd::IntoRawFd;
+    let scratch = cortexkit_test_support::ScratchDir::new("pid-init-report");
+    let path = scratch.path().join("setup-error");
+    fs::write(&path, [b' '; REPORT_BYTES]).unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let report = Report {
+        fd: file.into_raw_fd(),
+        owned: true,
+    };
+    report.write("{\"longer_old_telemetry\":true}\n");
+    report.write("failure: test\n");
+    let contents = fs::read_to_string(path).unwrap();
+    assert_eq!(contents.len(), REPORT_BYTES);
+    assert_eq!(contents.trim_end(), "failure: test");
+}
