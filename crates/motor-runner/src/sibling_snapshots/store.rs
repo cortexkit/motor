@@ -8,7 +8,8 @@
 //! A snapshot is built under a temporary name, from a copy of the most
 //! recently used ready snapshot of the same repository (its predecessor) or
 //! from a fresh clone of the mirror. Its tree is verified against the
-//! requested `tree_hash`, group and other write access is removed, and the
+//! requested `tree_hash`, its JavaScript dependencies are installed from its
+//! lockfiles, group and other write access is removed, and the
 //! job account gets read-only access. Then its metadata, which records the
 //! verified tree, is written and fsynced beside the directory, and a rename
 //! publishes the directory under its final name. A final directory therefore
@@ -343,6 +344,7 @@ impl SnapshotStore {
             let mismatch = Trees::tree_hash_mismatch(temporary, tree_hash, &computed);
             return Err(invalid(format!("sibling {}: {mismatch}", key.repository)));
         }
+        install_javascript(config, key, tree_hash, temporary)?;
         remove_group_and_other_write(temporary)?;
         restrict_job_access(config, temporary)?;
         Ok(cloned)
@@ -504,6 +506,39 @@ pub(crate) fn remove_group_and_other_write(_root: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "sibling snapshots need a Unix runner",
     ))
+}
+
+/// Installs the snapshot's JavaScript dependencies from its lockfiles, once,
+/// as jobs would otherwise do for an in-place sibling on every setup. The
+/// package managers run in helper units that show the snapshot at the
+/// sibling's path, so the install sees exactly the tree jobs will see there.
+fn install_javascript(
+    config: &Config,
+    key: &SnapshotKey,
+    tree_hash: &str,
+    temporary: &Path,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::setup_log::phase("prepare sibling snapshot javascript dependencies", || {
+            crate::isolation::prepare_snapshot_javascript(
+                config,
+                Path::new(&key.repository),
+                temporary,
+                tree_hash,
+            )
+        })
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("sibling {}: {error}", key.repository))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Snapshot mode is never on outside isolated Linux runners, and
+        // portable fixtures on other systems use no JavaScript.
+        let _ = (config, key, tree_hash, temporary);
+        Ok(())
+    }
 }
 
 /// Gives the job account read-only access through ACLs and removes any ACL

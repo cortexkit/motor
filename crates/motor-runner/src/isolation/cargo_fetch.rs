@@ -5,23 +5,47 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) fn prepare(command: impl FnMut() -> io::Result<Command>) -> io::Result<()> {
-    prepare_with_limits(command, Duration::from_secs(120), Duration::from_secs(30))
+/// Runs a tenant runner's root fetch: online first, then an offline fallback
+/// that can still use the cache during an outage. `run` runs each attempt
+/// under its limit, as a plain bounded child or in a sibling snapshot helper
+/// unit.
+pub(super) fn prepare_via(
+    command: impl FnMut() -> io::Result<Command>,
+    run: impl FnMut(&mut Command, Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    prepare_with_limits_via(
+        command,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+        run,
+    )
 }
 
+#[cfg(test)]
 fn prepare_with_limits(
-    mut command: impl FnMut() -> io::Result<Command>,
+    command: impl FnMut() -> io::Result<Command>,
     online: Duration,
     offline: Duration,
 ) -> io::Result<()> {
+    prepare_with_limits_via(command, online, offline, |command, limit| {
+        bounded(command, limit)
+    })
+}
+
+fn prepare_with_limits_via(
+    mut command: impl FnMut() -> io::Result<Command>,
+    online: Duration,
+    offline: Duration,
+    mut run: impl FnMut(&mut Command, Duration) -> io::Result<()>,
+) -> io::Result<()> {
     let online_result = crate::setup_log::phase("fetch cargo dependencies online", || {
-        bounded(command()?.env("CARGO_NET_OFFLINE", "false"), online)
+        run(command()?.env("CARGO_NET_OFFLINE", "false"), online)
     });
     let Err(online_error) = online_result else {
         return Ok(());
     };
     crate::setup_log::phase("fetch cargo dependencies offline fallback", || {
-        bounded(command()?.arg("--offline").env("CARGO_NET_OFFLINE", "true"), offline)
+        run(command()?.arg("--offline").env("CARGO_NET_OFFLINE", "true"), offline)
     }).map_err(|offline_error| io::Error::new(offline_error.kind(), format!(
         "tenant dependency preparation failed: online fetch: {online_error}; offline fallback could not supply locked sources: {offline_error}; provision the tenant Cargo registry index, crate cache and Git sources before running this locked workspace"
     )))

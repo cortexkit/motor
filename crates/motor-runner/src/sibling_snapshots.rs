@@ -10,6 +10,8 @@
 //! creates, mounts or removes snapshots while `Config::sibling_snapshot_mode`
 //! is false, and production builds keep it false; only tests override it.
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod helper;
 pub(crate) mod store;
 
 #[cfg(test)]

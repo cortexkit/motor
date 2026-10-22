@@ -617,6 +617,10 @@ impl Backend for HostBackend {
                             &r.repository_root,
                             config.tenant_vm,
                             config.shared_compile_cache(),
+                            // Siblings are not mounted from snapshots yet:
+                            // jobs see each sibling's in-place checkout at its
+                            // path, and the prefetch reads the same checkout.
+                            None,
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
