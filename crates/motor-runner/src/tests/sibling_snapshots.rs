@@ -125,9 +125,13 @@ fn snapshot_worktree_with_a_dangling_legacy_sibling_alias_is_admitted() {
 fn snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
-    let (config, _) = snapshot_config(&f);
-    let roots = format!("{:?}", config.owned_workspace_roots);
+    let (mut config, _) = snapshot_config(&f);
+    // Exercise internal-path redaction regardless of the host's TMPDIR layout.
+    config.build_slot_root = f.scratch.join("remote");
+    let roots = format!("allowed_roots={:?}", config.owned_workspace_roots);
     let runner = manual_runner(config);
+    let roots = runner.safe_refusal_detail(roots, std::iter::empty());
+    assert!(roots.starts_with("allowed_roots=[") && roots.ends_with(']'));
     fs::create_dir_all(&f.key).unwrap();
     let alias = Path::new(&f.key).parent().unwrap().join("commons");
     symlink(f.scratch.join("outside/commons"), &alias).unwrap();
@@ -167,8 +171,10 @@ fn snapshot_sibling_path_authorization_refuses_roots_nesting_and_symlink_escape(
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
     let (config, _) = snapshot_config(&f);
-    let roots = format!("{:?}", config.owned_workspace_roots);
+    let roots = format!("allowed_roots={:?}", config.owned_workspace_roots);
     let runner = manual_runner(config);
+    let roots = runner.safe_refusal_detail(roots, std::iter::empty());
+    assert!(roots.starts_with("allowed_roots=[") && roots.ends_with(']'));
     let (original, _) = f.run("true");
     let outside = f.scratch.join("outside/commons");
     let escape = f.scratch.join("remote/escape");
