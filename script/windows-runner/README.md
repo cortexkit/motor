@@ -154,24 +154,37 @@ or production launches. An interrupted step/unwound call aborts collection with
 an explicit instrumentation error instead of assigning a later return to it.
 Production launches do not enable loader snaps or debugger creation flags.
 
-For the AppContainer launch failure, collect the separate lowbox-only diagnostic
-with `run-system.ps1 -PrepLaunchMatrix -LowboxLaunch`. It first records (without
-asserting) the SYSTEM session's AppContainer object directory and package child,
-the `motor-prep` profile hive and mapping key, and the batch token's session ID.
-Then it runs four probe variants: the existing LPAC process-attribute path, a
-self-created named-object directory plus `NtCreateLowBoxToken` with no process
-security-capabilities attribute, and LPAC/plain-AppContainer process-attribute
-launches after creating the AppContainer profile while impersonating `motor-prep`.
-The self-created-token cell uses native object-manager calls and an explicit
-SYSTEM/package-SID DACL; those calls are diagnostic evidence, not a production
-implementation recommendation. Every probe screens fetch-temp, runner and user
-profile paths, the AppContainer data folder and its registry key. After the first
-probe child actually resumes, the same policy variant also runs an online,
-locked `cargo fetch` for the pinned fixture, exercising TLS. Each cell records
-its failing API/Win32 error, profile/object-directory cleanup and exact leftovers.
-Persistent package grants are reverted and compared; staging is removed unless
-cleanup is deferred for an unreaped child. The complete report remains diagnostic
-evidence, not qualification.
+For the AppContainer network failure, collect the lowbox-only diagnostic with
+`run-system.ps1 -PrepLaunchMatrix -LowboxLaunch`. It records no-launch prechecks
+for the session's `AppContainerNamedObjects` directory, the `motor-prep` profile
+hive/mapping and batch-token session. The SYSTEM process resolves an index.crates.io
+address once so each token can be tested separately for name resolution and raw
+TCP access through the Windows Filtering Platform (WFP). Three variants use the same self-created object directory and
+`NtCreateLowBoxToken` path: Less Privileged AppContainer (LPAC) with the current
+capabilities, plain AppContainer with `internetClient`, and LPAC plus
+`privateNetworkClientServer`. The last
+capability is the documented private-network grant; Chromium's Windows network
+service also uses it alongside `internetClient` for its AppContainer path. See
+[Microsoft networking capabilities](https://learn.microsoft.com/en-us/windows/apps/develop/networking/networking-basics),
+[Microsoft WinHTTP SSL](https://learn.microsoft.com/en-us/windows/win32/winhttp/ssl-in-winhttp),
+[Chromium's network broker](https://chromium.googlesource.com/chromium/src/+/673a5aee77ad12e118c8edac73359acdeb7f491c/services/network/broker_helper_win.cc),
+and [DNS client RPC behavior](https://projectzero.google/2021/08/understanding-network-access-windows-app.html).
+
+Each token runs the same filesystem-write checks and calls in-token `getaddrinfo`
+to record whether name resolution succeeds; this does not test direct reachability
+of a DNS server. Raw TCP is separately attempted against the SYSTEM-resolved
+index.crates.io address, and WinHTTP tests HTTPS using Schannel TLS.
+`LsaConnectUntrusted` is reported separately; it does not gate the transport
+result or Cargo fetch. If a probe child starts, Cargo fetch uses the first token
+passing DNS/TCP/Schannel; if none passes all three, it uses the started token with
+the most transport progress. If no probe child starts, Cargo fetch is skipped.
+Each report records all token capabilities, Local Security Authority (LSA) status,
+network stages, failing API/Win32 error, write attempts and cleanup paths. The
+diagnostic attempts to revert persistent grants and records whether their
+before/after discretionary access control lists (DACLs) match. It also attempts
+to remove staging; an unreaped child defers that cleanup, and the report records
+any leftover path. This remains diagnostic evidence, not qualification or a
+production policy change.
 
 Run the operator-only lowbox lane from an elevated PowerShell 5.1 prompt after
 installing a bundle built from the reviewed source commit:

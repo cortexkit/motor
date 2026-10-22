@@ -180,7 +180,7 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('lpac_policy: lpac.then(|| Box::new(ALL_APPLICATION_PACKAGES_OPT_OUT))', self.appcontainer)
         self.code('let attributes = Attributes::new(&mut handles, &extra)?;', self.process)
         self.code('appcontainer::Launch::with_profile(lpac, profile.token.0)', self.session)
-        self.code('appcontainer::Launch::new(lpac)', self.session)
+        self.code('appcontainer::Launch::new(lpac, plan.diagnostic_policy.lowbox_private_network())', self.session)
         self.code('launch.attributes()', self.session)
         self.code('CreateRestrictedToken(profile.token.0, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut result)', self.session)
         self.code('CreateAppContainerProfile(', self.appcontainer)
@@ -205,9 +205,9 @@ class LowboxLaunchCellTests(unittest.TestCase):
 
     def test_probe_reports_live_items_without_asserting(self):
         for fragment in ('CreateEventW(null(), 1, 0, name.as_ptr())', 'LsaConnectUntrusted(&mut handle)',
-                         '("index.crates.io", "static.crates.io")', 'TcpStream::connect_timeout(address',
-                         'launch::rng_probe(mode, &file)', 'println!("{text}")', 'launch::appcontainer_context()'):
-            self.code(fragment.replace('("index.crates.io", "static.crates.io")', '["index.crates.io", "static.crates.io"]'), self.cells)
+                         '("index.crates.io", 443).to_socket_addrs()', 'TcpStream::connect_timeout(&address',
+                         'WinHttpOpenRequest(', 'launch::rng_probe(mode, &file)', 'println!("{text}")', 'launch::appcontainer_context()'):
+            self.code(fragment, self.cells)
         self.code('checksum = \\"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\\"', self.cells)
 
     def test_qualify_lane_routes_to_the_lowbox_entry(self):
@@ -217,26 +217,39 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('"qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config)', (SRC.parent / 'main.rs').read_text())
 
 
-    def test_lowbox_matrix_has_prechecks_four_launch_variants_and_first_success_fetch(self):
+    def test_lowbox_network_matrix_reuses_self_token_and_gates_fetch_on_transport(self):
         source = flat(self.cells)
         for cell in (
-            '(1, "baseline-attribute-lpac", LowboxLpac)',
-            '(2, "self-made-token-no-profile", LowboxSelfToken)',
-            '(3, "profile-attribute-lpac", LowboxProfileLpac)',
-            '(4, "profile-attribute-appcontainer", LowboxProfileAppContainer)',
+            '(1, "self-token-lpac", LowboxSelfToken)',
+            '(2, "self-token-plain-appcontainer", LowboxSelfTokenPlain)',
+            '(3, "self-token-lpac-private-network", LowboxSelfTokenPrivateNetwork)',
         ):
             self.code(cell, source)
         self.code('let prechecks = launch::lowbox_prechecks(config)?;', source)
-        self.code('if child_started && !fetch_attempted', source)
+        self.code('resolve_host_tcp_target()', source)
+        self.code('transport_steps_pass(&cell["probe_proof"])', source)
+        self.code('fn transport_steps_pass(proof: &Value)', source)
+        self.code('if transport_passed && first_transport_success.is_none()', source)
+        self.code('furthest_candidate', source)
+        self.code('run_real_cargo_fetch(', source)
+        self.code('"network_fetch_gate"', source)
+        self.code('"lsa_is_observational"', source)
         self.code('"fetch", "--locked", "--target", "x86_64-pc-windows-msvc", "--manifest-path"', source)
         self.code('"real_cargo_fetch_skipped"', source)
-        self.code('"cell_5"', source)
-        self.code('"prechecks_cell"', source)
+        self.code('"cell_4"', source)
+        self.code('"MOTOR_LOWBOX_TCP_TARGET"', source)
         self.code('"persistent_grants_reverted_exactly"', source)
         self.code('"staging_removed"', source)
         for call in ('InitializeProcThreadAttributeList', 'UpdateProcThreadAttribute', 'CreateProcessAsUserW'):
             self.code(call, self.process)
         self.code('"failure_details"', source)
+
+    def test_private_network_variant_only_adds_the_documented_capability(self):
+        self.code('privateNetworkClientServer', self.appcontainer)
+        self.code('policy.lowbox_private_network()', self.session)
+        self.code('Self::LowboxSelfTokenPrivateNetwork', self.launch)
+        self.code('lowbox_private_network(self)', self.launch)
+
 
     def test_lowbox_cells_create_and_report_the_required_token_profile_and_cleanup_paths(self):
         source = flat(self.cells + self.launch + self.appcontainer + self.process + self.session)

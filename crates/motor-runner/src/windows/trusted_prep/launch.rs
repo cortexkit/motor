@@ -38,6 +38,10 @@ pub(super) enum DiagnosticPolicy {
     LowboxAppContainer,
     /// LPAC token built with NtCreateLowBoxToken and a caller-created object directory.
     LowboxSelfToken,
+    /// Plain AppContainer token built through the same self-created directory.
+    LowboxSelfTokenPlain,
+    /// LPAC with privateNetworkClientServer to compare getaddrinfo and private-network behavior.
+    LowboxSelfTokenPrivateNetwork,
     /// LPAC profile created under the prep user's loaded hive before attribute launch.
     LowboxProfileLpac,
     /// Plain AppContainer profile created under the prep user's loaded hive.
@@ -47,13 +51,26 @@ impl DiagnosticPolicy {
     /// Some(true) for LPAC, Some(false) for plain AppContainer, None otherwise.
     pub(super) fn lowbox(self) -> Option<bool> {
         match self {
-            Self::LowboxAppContainer | Self::LowboxProfileAppContainer => Some(false),
-            Self::LowboxLpac | Self::LowboxSelfToken | Self::LowboxProfileLpac => Some(true),
+            Self::LowboxLpac
+            | Self::LowboxSelfToken
+            | Self::LowboxSelfTokenPrivateNetwork
+            | Self::LowboxProfileLpac => Some(true),
+            Self::LowboxAppContainer
+            | Self::LowboxSelfTokenPlain
+            | Self::LowboxProfileAppContainer => Some(false),
             _ => None,
         }
     }
     pub(super) fn lowbox_self_token(self) -> bool {
-        self == Self::LowboxSelfToken
+        matches!(
+            self,
+            Self::LowboxSelfToken
+                | Self::LowboxSelfTokenPlain
+                | Self::LowboxSelfTokenPrivateNetwork
+        )
+    }
+    pub(super) fn lowbox_private_network(self) -> bool {
+        self == Self::LowboxSelfTokenPrivateNetwork
     }
     pub(super) fn lowbox_profile(self) -> bool {
         matches!(

@@ -713,7 +713,7 @@ impl Session {
                 if plan.diagnostic_policy.lowbox_profile() {
                     appcontainer::Launch::with_profile(lpac, profile.token.0)
                 } else {
-                    appcontainer::Launch::new(lpac)
+                    appcontainer::Launch::new(lpac, plan.diagnostic_policy.lowbox_private_network())
                 }
             })
             .transpose()?;

@@ -144,13 +144,13 @@ pub(crate) struct Launch {
     pub(super) info: Value,
 }
 impl Launch {
-    pub(super) fn new(lpac: bool) -> io::Result<Self> {
-        Self::build(lpac, None)
+    pub(super) fn new(lpac: bool, private_network: bool) -> io::Result<Self> {
+        Self::build(lpac, private_network, None)
     }
     pub(super) fn with_profile(lpac: bool, token: HANDLE) -> io::Result<Self> {
-        Self::build(lpac, Some(token))
+        Self::build(lpac, false, Some(token))
     }
-    fn build(lpac: bool, profile_token: Option<HANDLE>) -> io::Result<Self> {
+    fn build(lpac: bool, private_network: bool, profile_token: Option<HANDLE>) -> io::Result<Self> {
         let mut names = vec![(
             "internetClient".to_owned(),
             vec![INTERNET_CLIENT.to_owned()],
@@ -159,6 +159,11 @@ impl Launch {
             for name in ["registryRead", "lpacCryptoServices"] {
                 names.push((name.to_owned(), capability_sids(name)?));
             }
+        }
+        if private_network {
+            // Test whether this documented grant changes getaddrinfo or private-network access.
+            let name = "privateNetworkClientServer";
+            names.push((name.to_owned(), capability_sids(name)?));
         }
         let capability_sids = names
             .iter()
@@ -210,6 +215,7 @@ impl Launch {
             Reserved: 0,
         });
         let info = json!({"package_name": PACKAGE_NAME, "package_sid": package_text, "lpac": lpac,
+            "private_network_client_server":private_network,
             "capabilities": names.iter().map(|(name, sids)| json!({"name": name, "sids": sids})).collect::<Vec<_>>(),
             "profile_name": profile_name, "profile_created": profile_created,
             "profile_folder": profile_folder, "profile_folder_error": profile_folder_error});
