@@ -1732,6 +1732,10 @@ async fn hash_mismatch_and_materialization_failure_never_start() {
 }
 
 async fn connect(socket: &Path) -> UnixStream {
+    connect_with_sibling_paths(socket, false).await
+}
+
+async fn connect_with_sibling_paths(socket: &Path, sibling_paths: bool) -> UnixStream {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     write_frame_async(
         &mut stream,
@@ -1753,7 +1757,7 @@ async fn connect(socket: &Path) -> UnixStream {
         Frame::Hello {
             return_paths: true,
             return_chunked: true,
-            sibling_paths: false,
+            sibling_paths,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -2922,7 +2926,7 @@ cat "$TMPDIR/serve-write-probe"
     for key in ["TMPDIR", "TMP", "TEMP", "HOME"] {
         request.env.insert(key.into(), "/tmp/caller-shared".into());
     }
-    let mut stream = connect(&socket).await;
+    let mut stream = connect_with_sibling_paths(&socket, true).await;
     write_frame_async(&mut stream, &Frame::Run(request.clone()))
         .await
         .unwrap();

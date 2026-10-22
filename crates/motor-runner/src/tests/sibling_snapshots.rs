@@ -23,6 +23,9 @@ async fn sibling_paths_capability_tracks_snapshot_mode() {
         assert_eq!(config.windows_instance(), mode == "windows");
         let runner = Runner::open_with_backend(config, Box::new(NoWindowsSetup)).unwrap();
         let (socket, server) = listener(&f, &runner);
+        if mode != "windows" {
+            drop(connect_with_sibling_paths(&socket, mode == "snapshot").await);
+        }
         let mut stream = UnixStream::connect(&*socket).await.unwrap();
         write_frame_async(
             &mut stream,
@@ -66,6 +69,96 @@ async fn snapshot_sibling_in_another_allowed_root_is_prepared() {
         fs::read_to_string(Path::new(&source[0]).join("source")).unwrap(),
         "first\n"
     );
+}
+
+#[test]
+fn snapshot_worktree_with_siblings_is_admitted_after_a_cache_fill() {
+    let f = Fixture::new();
+    let (config, _) = snapshot_config(&f);
+    let runner = manual_runner(config);
+    let (mut fill, _) = f.run("true");
+    fill.workspace_key = format!("base:{}", f.root);
+    fill.cwd = text(&f.scratch.join("remote/source/.motor-base-checkout")).into();
+    fill.siblings.clear();
+    let mut job = Job::new(fill.job_id, Some(fill), runner.now(), 1, 2);
+    job.base = true;
+    job.terminal(Outcome::Exit { code: 0 }, runner.now());
+    runner.core.inner.lock().unwrap().jobs.insert(job.id, job);
+
+    let (mut reader, _) = f.run("true");
+    reader.workspace_key = text(&f.scratch.join("remote/worktrees/first-reader")).into();
+    reader.cwd = reader.workspace_key.clone();
+    reader.workspace_kind = Some(WorkspaceKind::Task);
+    assert_ne!(reader.workspace_key, reader.repository_root);
+    assert!(!reader.siblings.is_empty());
+    assert_run_accepted(&runner, &reader);
+    runner
+        .admit_prepare(&prepare_for(&reader))
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_worktree_with_a_dangling_legacy_sibling_alias_is_admitted() {
+    let f = Fixture::new();
+    let (config, _) = snapshot_config(&f);
+    let runner = manual_runner(config);
+    fs::create_dir_all(&f.key).unwrap();
+    let alias = Path::new(&f.key).parent().unwrap().join("commons");
+    std::os::unix::fs::symlink(&f.canonical, &alias).unwrap();
+    assert!(!Path::new(&f.canonical).exists());
+    assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+    assert!(workspace::destination(&alias).is_err());
+    assert!(crate::writer::canonical_future(&alias).is_err());
+    let (reader, _) = f.run("true");
+    assert_run_accepted(&runner, &reader);
+    runner
+        .admit_prepare(&prepare_for(&reader))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read_link(&alias).unwrap(), Path::new(&f.canonical));
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let (config, _) = snapshot_config(&f);
+    let roots = format!("{:?}", config.owned_workspace_roots);
+    let runner = manual_runner(config);
+    fs::create_dir_all(&f.key).unwrap();
+    let alias = Path::new(&f.key).parent().unwrap().join("commons");
+    symlink(f.scratch.join("outside/commons"), &alias).unwrap();
+    let (reader, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(reader).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+    ));
+
+    let real_workspace = f.scratch.join("remote/real-reader");
+    fs::create_dir_all(&real_workspace).unwrap();
+    let outside = f.scratch.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&real_workspace, outside.join("first-reader")).unwrap();
+    symlink(&f.canonical, outside.join("commons")).unwrap();
+    let (mut reader, _) = f.run("true");
+    reader.workspace_key = text(&outside.join("first-reader")).into();
+    reader.cwd = reader.workspace_key.clone();
+    assert!(matches!(
+        runner.accept(reader.clone()).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+    ));
+    let detail = runner.core.inner.lock().unwrap().jobs[&reader.job_id]
+        .terminal
+        .as_ref()
+        .unwrap()
+        .refusal_detail
+        .clone()
+        .unwrap();
+    assert!(detail.contains(&roots), "{detail}");
+    assert!(detail.contains("outside runner-owned roots"), "{detail}");
 }
 
 #[cfg(unix)]
@@ -229,7 +322,7 @@ async fn isolated_snapshot_sibling_in_another_allowed_root_is_read_only_at_its_p
     assert_eq!(terminal.outcome, Outcome::Exit { code: 0 }, "{terminal:?}");
     let output = job_output(&runner, run.job_id);
     assert!(output.starts_with("first\nfirst\n"), "{output}");
-    assert!(output.ends_with("first\n"), "{output}");
+    assert_eq!(output.lines().last(), Some("first"), "{output}");
     assert!(!Path::new(&f.canonical).exists());
     drop(runner);
     crate::isolation::restore_runner_access(&f.scratch).unwrap();
