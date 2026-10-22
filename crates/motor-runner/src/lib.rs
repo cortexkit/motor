@@ -22,6 +22,10 @@ mod privilege;
 mod return_paths;
 mod server;
 mod setup_log;
+// Nothing in a production build uses sibling snapshots yet: the mode predicate
+// is false, and the store is wired in together with the mount and fence changes.
+#[cfg_attr(not(test), allow(dead_code))]
+mod sibling_snapshots;
 mod spool;
 mod state_lock;
 mod storage;
