@@ -45,6 +45,10 @@ pub(crate) type AccessHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 #[cfg(test)]
 pub(crate) type CloneHook = Arc<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
 
+/// Called in tests with a snapshot directory; see `touch_inspected`.
+#[cfg(test)]
+pub(crate) type TouchHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 const METADATA_VERSION: u32 = 1;
 
 /// Marks a directory under construction or being removed:
@@ -123,6 +127,10 @@ pub(crate) struct SnapshotStore {
     registry: Mutex<Registry>,
     #[cfg(test)]
     pub(crate) clone_override: Option<CloneHook>,
+    /// Called by the switch touch once it has decided which paths of a
+    /// snapshot to touch and before it writes any, with the key mutex held.
+    #[cfg(test)]
+    pub(crate) touch_inspected: Option<TouchHook>,
 }
 
 /// A predecessor registered by a creation, released when the creation ends.

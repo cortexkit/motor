@@ -10,6 +10,7 @@
 //! creates, mounts or removes snapshots while `Config::sibling_snapshot_mode`
 //! is false, and production builds keep it false; only tests override it.
 
+pub(crate) mod freshness;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod helper;
 pub(crate) mod store;
@@ -118,6 +119,29 @@ impl JavascriptEnvironment {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The digest for this runner as it is now: the installed package
+    /// managers' and Node's versions and the daemon's dependency-selection
+    /// environment. Only isolated Linux runners create snapshots.
+    pub(crate) fn current(config: &Config) -> io::Result<Self> {
+        #[cfg(test)]
+        if let Some(environment) = &config.javascript_environment_override {
+            return Ok(environment.clone());
+        }
+        let _ = config;
+        #[cfg(target_os = "linux")]
+        {
+            let (managers, node_version) = crate::isolation::javascript_runner_versions();
+            Ok(Self::of_runner(&managers, &node_version))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "sibling snapshots need an isolated Linux runner",
+            ))
+        }
     }
 }
 

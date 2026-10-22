@@ -62,6 +62,16 @@ pub(crate) fn git(path: &Path, args: &[&str]) -> io::Result<String> {
         .to_string())
 }
 
+/// `git` with its standard output returned byte for byte, for output that
+/// carries paths: a path need not be valid UTF-8.
+pub(crate) fn git_bytes(path: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    let output = git_command(path).args(args).output()?;
+    if !output.status.success() {
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output.stdout)
+}
+
 pub(crate) fn delete_refs(path: &Path, references: &[String]) -> io::Result<()> {
     if references.is_empty() {
         return Ok(());
@@ -438,6 +448,26 @@ pub(crate) fn record_workspace(
     now: u64,
 ) {
     record_siblings(catalog, siblings);
+    record_workspace_entry(catalog, key, root, commit, siblings, now);
+}
+
+/// Record a populated workspace without recording sibling checkouts, for a
+/// setup that mounted its siblings from snapshots and so checked none out at
+/// its host path. The entry's sibling freshness record is kept: it describes
+/// the workspace's `target/`, which a new setup keeps.
+pub(crate) fn record_workspace_entry(
+    catalog: &mut Catalog,
+    key: &str,
+    root: &str,
+    commit: &str,
+    siblings: &[SiblingSnapshot],
+    now: u64,
+) {
+    let sibling_freshness = catalog
+        .workspaces
+        .remove(key)
+        .map(|previous| previous.sibling_freshness)
+        .unwrap_or_default();
     catalog.workspaces.insert(
         key.to_string(),
         Workspace {
@@ -446,6 +476,7 @@ pub(crate) fn record_workspace(
             snapshot: commit.to_string(),
             siblings: siblings.to_vec(),
             used_ms: now,
+            sibling_freshness,
         },
     );
 }
@@ -953,8 +984,22 @@ impl Trees {
         tree_hash: &str,
         caller_commit: &str,
     ) -> io::Result<()> {
+        self.siblings(Path::new(key), siblings, recorded)?;
+        self.populate_main(key, root, commit, tree_hash, caller_commit)
+    }
+    /// The main-workspace part of `populate`: check out the source,
+    /// preserving an existing target directory. A setup that mounts its
+    /// siblings from snapshots calls this alone, so it never touches a
+    /// sibling's host path.
+    pub(crate) fn populate_main(
+        &self,
+        key: &str,
+        root: &str,
+        commit: &str,
+        tree_hash: &str,
+        caller_commit: &str,
+    ) -> io::Result<()> {
         let path = Path::new(key);
-        self.siblings(path, siblings, recorded)?;
         self.sync_workspace(root, path, commit, tree_hash, caller_commit)?;
         let target = path.join("target");
         if !target.exists() {

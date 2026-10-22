@@ -147,6 +147,10 @@ pub struct Config {
     /// Time limit of one sibling snapshot helper unit running a JavaScript
     /// install while a snapshot is created.
     pub snapshot_javascript_timeout: Duration,
+    /// Most entries one workspace's freshness record keeps per sibling; older
+    /// closed entries are folded into one `unknown` entry beyond it (see
+    /// `sibling_snapshots::freshness`). At least 2.
+    pub sibling_freshness_entries: usize,
     /// Probe available bytes on the filesystem containing the supplied path.
     pub free_space_probe: FreeSpaceProbe,
     /// Linux production uses systemd services under motor-job. The portable
@@ -212,6 +216,11 @@ pub struct Config {
     /// unit, which needs sudo and systemd.
     #[cfg(test)]
     pub(crate) snapshot_helper_launcher: Option<crate::sibling_snapshots::helper::Launcher>,
+    /// Replaces the runner's JavaScript environment digest in sibling
+    /// snapshot keys, which otherwise runs each package manager.
+    #[cfg(test)]
+    pub(crate) javascript_environment_override:
+        Option<crate::sibling_snapshots::JavascriptEnvironment>,
     #[cfg(test)]
     pub(crate) accounting_report: Option<AccountingReportHook>,
     #[cfg(test)]
@@ -359,6 +368,7 @@ impl Config {
             drop_timeout: Duration::from_secs(60),
             snapshot_prefetch_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
             snapshot_javascript_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
+            sibling_freshness_entries: crate::sibling_snapshots::freshness::DEFAULT_RECORD_ENTRIES,
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
             job_network: None,
@@ -405,6 +415,8 @@ impl Config {
             sibling_snapshot_access: None,
             #[cfg(test)]
             snapshot_helper_launcher: None,
+            #[cfg(test)]
+            javascript_environment_override: None,
             #[cfg(test)]
             accounting_report: None,
             #[cfg(test)]
@@ -962,6 +974,9 @@ struct Core {
     config: Config,
     backend: Box<dyn Backend>,
     trees: Trees,
+    /// Creates sibling snapshots and serializes work on each one; used only
+    /// in sibling snapshot mode.
+    snapshots: crate::sibling_snapshots::store::SnapshotStore,
     inner: crate::state_lock::StateLock<Inner>,
     job_logs: Mutex<BTreeMap<Uuid, Arc<JobLog>>>,
     /// Ref mutations acquire this before the state lock, which is released
@@ -1250,6 +1265,7 @@ impl Runner {
             || config.sccache_size_gib == 0
             || config.snapshot_prefetch_timeout.is_zero()
             || config.snapshot_javascript_timeout.is_zero()
+            || config.sibling_freshness_entries < 2
             || config
                 .sccache_size_gib
                 .checked_mul(1024 * 1024 * 1024)
@@ -1707,6 +1723,7 @@ impl Runner {
                 config,
                 backend,
                 trees,
+                snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
                     writer: None,
                     #[cfg(target_os = "linux")]
@@ -2394,7 +2411,9 @@ impl Runner {
         })
     }
     /// Record a workspace a setup created, so drop and retention can delete
-    /// it. Its siblings are recorded only when the setup succeeded.
+    /// it. Its siblings are recorded only when the setup succeeded, and their
+    /// commits as checked out at their host paths only when
+    /// `sibling_checkouts` says the setup checked them out there.
     #[allow(clippy::too_many_arguments)]
     fn note_workspace(
         &self,
@@ -2404,13 +2423,23 @@ impl Runner {
         commit: &str,
         siblings: &[SiblingSnapshot],
         populated: bool,
+        sibling_checkouts: bool,
         kind: Option<WorkspaceKind>,
     ) {
         if self.core.config.windows_instance() {
             return;
         }
-        if populated {
+        if populated && sibling_checkouts {
             workspace::record_workspace(
+                &mut inner.catalog,
+                key,
+                root,
+                commit,
+                siblings,
+                self.now(),
+            );
+        } else if populated {
+            workspace::record_workspace_entry(
                 &mut inner.catalog,
                 key,
                 root,
@@ -3031,7 +3060,8 @@ impl Runner {
         self.allow_prepare()?;
         workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings)?;
         self.validate_writer_paths(&r.workspace_key, None, &r.siblings)?;
-        let recorded = {
+        let snapshot_mode = self.core.config.sibling_snapshot_mode();
+        let (recorded, prior) = {
             let mut inner = self.core.inner.lock().unwrap();
             if Self::deleting(&inner, &r.workspace_key, &r.siblings)
                 || Self::occupied(&inner, &r.workspace_key)
@@ -3048,8 +3078,16 @@ impl Runner {
                     since_ms: self.now(),
                 },
             );
-            inner.catalog.sibling_commits.clone()
+            (
+                inner.catalog.sibling_commits.clone(),
+                snapshot_mode.then(|| {
+                    crate::sibling_snapshots::freshness::Prior::of(&inner.catalog, &r.workspace_key)
+                }),
+            )
         };
+        // Wall clock, not the runner clock: the switch touch compares it with
+        // file mtimes.
+        let started_at = std::time::SystemTime::now();
         // Released on every exit, including the early errors below.
         let reservation = Marker::new(self, {
             let key = r.workspace_key.clone();
@@ -3080,21 +3118,54 @@ impl Runner {
             &self.core.trees.mirror(&r.repository_root),
             &["rev-parse", &format!("{}^{{tree}}", r.base_commit)],
         )?;
-        let populated = setup_step(
-            "materialize prepared workspace",
-            self.core.trees.populate(
-                &r.workspace_key,
-                &r.repository_root,
-                &r.base_commit,
-                &r.siblings,
-                &recorded,
-                &tree_hash,
-                &r.base_commit,
+        let populated = match &prior {
+            // Snapshot mode never reads or writes a sibling's host path: each
+            // sibling comes from its snapshot, touched for this workspace
+            // before its freshness record is updated below.
+            Some(prior) => setup_step(
+                "materialize prepared workspace",
+                self.core
+                    .trees
+                    .populate_main(
+                        &r.workspace_key,
+                        &r.repository_root,
+                        &r.base_commit,
+                        &tree_hash,
+                        &r.base_commit,
+                    )
+                    .and_then(|()| {
+                        crate::sibling_snapshots::freshness::prepare_siblings(
+                            &self.core.config,
+                            &self.core.snapshots,
+                            &self.core.trees,
+                            prior,
+                            started_at,
+                            &r.siblings,
+                            &crate::sibling_snapshots::JavascriptEnvironment::current(
+                                &self.core.config,
+                            )?,
+                        )
+                    }),
             ),
-        );
+            None => setup_step(
+                "materialize prepared workspace",
+                self.core
+                    .trees
+                    .populate(
+                        &r.workspace_key,
+                        &r.repository_root,
+                        &r.base_commit,
+                        &r.siblings,
+                        &recorded,
+                        &tree_hash,
+                        &r.base_commit,
+                    )
+                    .map(|()| Vec::new()),
+            ),
+        };
         #[cfg(target_os = "linux")]
         let populated = if self.core.config.isolate_jobs {
-            populated.and_then(|()| {
+            populated.and_then(|freshness| {
                 setup_step(
                     "prepare workspace target",
                     crate::isolation::prepare_job_writable_target(
@@ -3105,7 +3176,8 @@ impl Runner {
                 setup_step(
                     "prepare workspace checkout root",
                     crate::isolation::prepare_job_checkout_root(Path::new(&r.workspace_key)),
-                )
+                )?;
+                Ok(freshness)
             })
         } else {
             populated
@@ -3124,8 +3196,20 @@ impl Runner {
             &r.base_commit,
             &r.siblings,
             populated.is_ok(),
+            prior.is_none(),
             r.workspace_kind,
         );
+        // Only a Prepare whose checkout and touch completed updates the
+        // freshness record; a failure before this point leaves it as it was.
+        // A record applied here stays correct even if the catalog write below
+        // fails: the touch it describes has already happened.
+        let populated = populated.map(|freshness| {
+            for pending in freshness {
+                if !pending.apply(&mut inner.catalog, &r.workspace_key) {
+                    tracing::warn!(workspace = %r.workspace_key, "prepared workspace has no catalog entry for its sibling freshness record");
+                }
+            }
+        });
         // The catalog is saved without the state lock. The reservation stays
         // until it is, so no job uses the workspace before the record that
         // drop and retention delete it by is durable.
@@ -5518,6 +5602,7 @@ impl Runner {
                 &r.snapshot_commit,
                 &r.siblings,
                 prepared.is_ok(),
+                true,
                 r.workspace_kind,
             );
         }
