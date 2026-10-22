@@ -755,3 +755,107 @@ fn workspace_job_being_withdrawn_still_holds_later_sibling_users() {
     assert_eq!(phase.as_deref(), Some("queued workspace job"));
     assert_eq!(after, BTreeSet::from([user_id]));
 }
+
+/// An 8-permit runner whose gate job `gate` (with `gate_weight` permits)
+/// failed to start and is waiting out its retry delay, while a 2-permit job
+/// runs in workspace `owned` and another waits behind it, and a 2-permit
+/// worker waits in a workspace of its own. Returns the runner and the ids
+/// of the gate, the job behind the owner and the worker.
+fn retry_delayed_gate(f: &Fixture, gate_weight: u32) -> (Runner, Uuid, Uuid, Uuid) {
+    let mut config = f.config();
+    config.max_weight = 8;
+    config.cpu_topology = Some(CpuTopology::new((0..9).map(|cpu| vec![cpu]).collect()).unwrap());
+    config.disable_warm_builds = true;
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (mut request, _) = f.run("true");
+    request.siblings.clear();
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut owner = job(&request, &format!("{}-owned", f.key), 2, 1, false, now);
+    owner.state = JobState::Running;
+    owner.started_ms = Some(now);
+    let gate = job(
+        &request,
+        &format!("{}-gate", f.key),
+        gate_weight,
+        2,
+        true,
+        now,
+    );
+    let behind = job(&request, &format!("{}-owned", f.key), 2, 3, false, now);
+    let worker = job(&request, &format!("{}-worker", f.key), 2, 4, false, now);
+    let ids = (gate.id, behind.id, worker.id);
+    inner.start_retries.insert(
+        gate.id,
+        StartRetry {
+            not_before_ms: now + START_RETRY_MS,
+            delay_ms: START_RETRY_MS,
+            reason: "injected".into(),
+        },
+    );
+    for job in [owner, gate, behind, worker] {
+        inner.jobs.insert(job.id, job);
+    }
+    drop(inner);
+    (runner, ids.0, ids.1, ids.2)
+}
+
+/// A gate job waiting out its start retry delay keeps its claim on
+/// capacity, as if it were waiting for permits: a smaller worker does not
+/// take its place. The clock and `waiting_on` helpers agree: the job queued
+/// behind a workspace owner is held back by the gate's capacity fence too,
+/// so its clock runs, and the gate itself is waiting on permits. This holds
+/// whether or not the gate would fit the free permits.
+#[test]
+fn a_gate_in_its_start_retry_delay_still_fences_capacity() {
+    for gate_weight in [8, 4] {
+        let f = Fixture::new();
+        let (runner, gate, behind, worker) = retry_delayed_gate(&f, gate_weight);
+        let now = runner.now();
+        let mut inner = runner.core.inner.lock().unwrap();
+        runner.dispatch(&mut inner, now).unwrap();
+        let started = inner.starting.clone();
+        let index = DispatchIndex::build(&inner);
+        let gate_phase = runner.queue_wait_phase(&inner, &index, gate);
+        let behind_entry = inner.jobs[&behind].queue_entry.load(Ordering::Acquire);
+        drop(inner);
+        assert!(
+            started.is_empty(),
+            "gate of {gate_weight} permits: a job started in its place: {started:?} (worker {worker})"
+        );
+        assert_eq!(gate_phase, Some("permits"), "gate of {gate_weight} permits");
+        assert_ne!(
+            behind_entry, PAUSED_QUEUE,
+            "gate of {gate_weight} permits: the job behind the owner was paused \
+             although the gate's capacity fence holds it back too"
+        );
+    }
+}
+
+/// A gate whose earlier start attempt is still being cleaned up is skipped
+/// like a checkout conflict, which can last until its VM is confirmed
+/// stopped: it fences nothing, and the job behind a workspace owner pauses
+/// as it would with no gate at all.
+#[test]
+fn a_gate_with_cleanup_pending_fences_nothing() {
+    let f = Fixture::new();
+    let (runner, gate, behind, worker) = retry_delayed_gate(&f, 8);
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner.start_retries.clear();
+    runner
+        .config()
+        .windows_runtime
+        .set_cleanup_pending(gate, true);
+    runner.dispatch(&mut inner, now).unwrap();
+    let started = inner.starting.clone();
+    let behind_entry = inner.jobs[&behind].queue_entry.load(Ordering::Acquire);
+    drop(inner);
+    runner
+        .config()
+        .windows_runtime
+        .set_cleanup_pending(gate, false);
+    assert_eq!(started, BTreeSet::from([worker]));
+    assert_eq!(behind_entry, PAUSED_QUEUE);
+}
