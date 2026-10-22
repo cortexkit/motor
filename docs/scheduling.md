@@ -84,7 +84,8 @@ others. A head whose last start attempt failed (its setup record or the
 catalog could not be saved, say) is queued again and not started before a
 retry delay, 1 second doubling to at most 60 seconds per consecutive failure.
 During that delay it keeps its place and its claim on capacity, exactly as a
-head waiting for permits: a gate or aged head still stops backfill, and its
+head waiting for permits: a gate or aged head still stops backfill, and when
+nothing else (a workspace owner, a sibling checkout) holds it, its
 `waiting_on` is `permits`. A head whose earlier start attempt is still being
 cleaned up (a Windows VM not yet confirmed stopped) waits like a head blocked
 by its own workspace, with `waiting_on` = `workspace setup`, and stops no one:
