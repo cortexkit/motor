@@ -66,6 +66,12 @@ def process(argv, timeout=20, input_text=None):
         result.update(exit_code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except (OSError, subprocess.TimeoutExpired) as error:
         result["error"] = str(error)
+        # Keep what a timed-out command printed before it was killed: a client
+        # that never finishes still shows how far it got.
+        for name in ("stdout", "stderr"):
+            partial = getattr(error, name, None)
+            if partial is not None:
+                result["partial_" + name] = partial.decode(errors="replace") if isinstance(partial, bytes) else partial
     result["seconds"] = time.monotonic() - start
     return result
 

@@ -10,6 +10,7 @@ import tempfile
 import tarfile
 import base64
 import hashlib
+import shlex
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -543,6 +544,132 @@ class RunnerHostTests(unittest.TestCase):
             self.assertEqual(record['status']['exit_code'], 3)
             self.assertEqual(record['status']['argv'], ['/usr/bin/systemctl','status','--no-pager','-l',unit])
             self.assertEqual(record['journal']['argv'], ['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])
+
+    def hang_fixture(self, tmp):
+        """A /proc, cgroup and runner state tree: runner 100 with two threads,
+        a job process 200 in a motor-job cgroup, and one recent job record."""
+        proc, cgroup, state = (Path(tmp, name) for name in ('proc', 'cgroup', 'state'))
+        for pid, comm, threads in ((100, 'motor-runner', (100, 101)), (200, 'npm ci', (200,)), (300, 'sshd', (300,)),
+                                   (150, 'git', (150,))):
+            Path(proc, str(pid)).mkdir(parents=True)
+            Path(proc, str(pid), 'comm').write_text(comm + '\n')
+            Path(proc, str(pid), 'cmdline').write_text(comm.replace(' ', '\0') + '\0')
+            Path(proc, str(pid), 'status').write_text(f'Name:\t{comm}\nThreads:\t{len(threads)}\n')
+            for tid in threads:
+                task = Path(proc, str(pid), 'task', str(tid))
+                task.mkdir(parents=True)
+                task.joinpath('comm').write_text(f'{comm}-{tid}\n')
+                task.joinpath('wchan').write_text('futex_wait_queue')
+                task.joinpath('stat').write_text(f'{tid} ({comm} x) S 1 2 3')
+                task.joinpath('syscall').write_text('202 0x1 0x2')
+                task.joinpath('stack').write_text('[<0>] futex_wait_queue+0x5c/0x90\n')
+        for name in ('loadavg', 'meminfo'):
+            Path(proc, name).write_text(name + ' fixture\n')
+        unit = Path(cgroup, 'system.slice', 'motor-job-0190.service', 'job')
+        unit.mkdir(parents=True)
+        unit.parent.joinpath('cgroup.procs').write_text('')
+        unit.joinpath('cgroup.procs').write_text('200\n')
+        Path(cgroup, 'system.slice', 'sshd.service').mkdir()
+        Path(cgroup, 'system.slice', 'sshd.service', 'cgroup.procs').write_text('300\n')
+        Path(cgroup, 'system.slice', 'motor-boat.service').mkdir()
+        Path(cgroup, 'system.slice', 'motor-boat.service', 'cgroup.procs').write_text('100\n150\n')
+        job = '0190aaaa-0000-7000-8000-000000000001'
+        Path(state, 'jobs', job).mkdir(parents=True)
+        Path(state, 'jobs', job, 'record.json').write_text(json.dumps(
+            {'id': job, 'state': 'queued', 'accepted_ms': 5, 'started_ms': None, 'terminal': None,
+             'request': {'command': 'node -e 1', 'env': {'SECRET_NAME': 'value'}}}))
+        Path(state, 'sandboxes', job, 'output').mkdir(parents=True)
+        Path(state, 'sandboxes', job, 'output', 'stderr').write_text('x' * 9000 + 'npm warn tail')
+        Path(state, 'tenant-events.json').write_text('{"setup": "prepare javascript dependencies"}')
+        return proc, cgroup, state, job
+
+    def run_hang_diagnostics(self, tmp, which=lambda name: None):
+        proc, cgroup, state, job = self.hang_fixture(tmp)
+        commands = []
+        def command(argv, **kwargs):
+            commands.append(argv)
+            if argv[:2] == ['systemctl', 'show']:
+                return Mock(returncode=0, stdout='MainPID=100\nActiveState=active\n' if argv[2] == 'motor-boat.service'
+                            else 'MainPID=0\n', stderr='')
+            if argv[0] == 'ps':
+                return Mock(returncode=0, stderr='', stdout='  PID   TID\n  100   101 motor-runner\n  150   150 git\n  200   200 npm ci\n'
+                            '  300   300 sshd\n  400   400 python3 /usr/local/libexec/motor-boat-bridge.py\n')
+            return Mock(returncode=0, stdout='captured ' + argv[0], stderr='')
+        script = (host.JOB_HANG_DIAGNOSTICS.replace("PROC = '/proc'", f'PROC = {str(proc)!r}')
+                  .replace("CGROUP = '/sys/fs/cgroup'", f'CGROUP = {str(cgroup)!r}')
+                  .replace("STATE = '/var/lib/motor-boat/state/boat'", f'STATE = {str(state)!r}'))
+        self.assertNotEqual(script, host.JOB_HANG_DIAGNOSTICS)
+        output = io.StringIO()
+        with patch('subprocess.run', side_effect=command), patch('shutil.which', side_effect=which), \
+             contextlib.redirect_stdout(output):
+            exec(script, {})
+        return json.loads(output.getvalue()), commands, job
+
+    def test_hang_diagnostics_capture_runner_threads_job_processes_and_recent_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, commands, job = self.run_hang_diagnostics(tmp)
+        journal = data['journal']['argv']
+        self.assertEqual(journal[:6], ['journalctl', '--no-pager', '-o', 'short-iso-precise', '--since', '-5min'])
+        for unit in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-bridge.service', 'motor-job-*'):
+            self.assertIn(unit, journal)
+        # The runner by its unit's MainPID; its setup child and the job
+        # process by their cgroups; an unrelated service process is left out.
+        self.assertEqual(set(data['processes']), {'100', '150', '200'})
+        self.assertEqual(data['cgroup_pids'], [100, 150, 200])
+        self.assertEqual(data['tenant_events']['tail'], '{"setup": "prepare javascript dependencies"}')
+        runner = data['processes']['100']
+        self.assertEqual(set(runner['tasks']), {'100', '101'})
+        self.assertEqual(runner['tasks']['101']['wchan'], 'futex_wait_queue')
+        self.assertEqual(runner['tasks']['101']['state'], 'S')
+        self.assertIn('futex_wait_queue', runner['tasks']['101']['stack'])
+        self.assertEqual(runner['user_stacks'], {'error': 'neither eu-stack nor gdb is installed'})
+        self.assertNotIn('user_stacks', data['processes']['200'])
+        self.assertEqual(data['processes']['200']['cmdline'], 'npm ci ')
+        self.assertEqual(data['ps']['stdout'].splitlines(), ['  PID   TID', '  100   101 motor-runner', '  150   150 git', '  200   200 npm ci',
+                                                             '  400   400 python3 /usr/local/libexec/motor-boat-bridge.py'])
+        recent = data['recent_jobs'][job]
+        self.assertEqual((recent['state'], recent['started_ms'], recent['command']), ('queued', None, 'node -e 1'))
+        self.assertNotIn('request', recent)
+        self.assertEqual(recent['output']['stderr']['size'], 9013)
+        self.assertTrue(recent['output']['stderr']['tail'].endswith('npm warn tail'))
+        self.assertIn('error', recent['output']['stdout'])
+        self.assertIn(['df', '-B1', '/var/lib/motor-boat', '/'], commands)
+
+    def test_hang_diagnostics_take_user_space_stacks_with_the_installed_dumper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, commands, _ = self.run_hang_diagnostics(tmp, which=lambda name: '/usr/bin/gdb' if name == 'gdb' else None)
+        gdb = ['gdb', '-p', '100', '-batch', '-nx', '-ex', 'set pagination off', '-ex', 'thread apply all bt']
+        self.assertEqual(data['processes']['100']['user_stacks']['argv'], gdb)
+        self.assertEqual([argv for argv in commands if argv[0] in ('gdb', 'eu-stack')], [gdb])
+        with tempfile.TemporaryDirectory() as tmp:
+            data, _, _ = self.run_hang_diagnostics(tmp, which=lambda name: '/usr/bin/' + name)
+        self.assertEqual(data['processes']['100']['user_stacks']['argv'], ['eu-stack', '-p', '100'])
+
+    def test_client_failure_records_sandbox_diagnostics_without_masking_the_failure(self):
+        probe = Mock(data={})
+        probe.execute.return_value = {'exitCode': 0, 'stdout': '{"journal": {"stdout": "runner log"}}', 'stderr': ''}
+        lane = host.RunnerHost(probe)
+        result = {'argv': ['client'], 'error': 'timed out after 150 seconds'}
+        lane.client_failure_diagnostics('bx_1', result)
+        self.assertEqual(result['sandbox_diagnostics'], {'journal': {'stdout': 'runner log'}})
+        self.assertIn(shlex.quote(host.JOB_HANG_DIAGNOSTICS), probe.execute.call_args.args[1])
+        self.assertTrue(probe.execute.call_args.args[1].startswith('sudo -n /usr/bin/python3 -c '))
+        probe.execute.side_effect = ValueError('timed out polling command 7')
+        failed = {'argv': ['client']}
+        lane.client_failure_diagnostics('bx_1', failed)
+        self.assertEqual(failed['sandbox_diagnostics_error'], 'timed out polling command 7')
+        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        failure = phase.index('failure = "motor client failed: " + json.dumps(result)')
+        collect = phase.index('self.client_failure_diagnostics(sid, record[name])')
+        self.assertLess(failure, collect)
+        self.assertLess(collect, phase.index('raise ValueError(failure', collect))
+
+    def test_timed_out_client_keeps_what_it_printed(self):
+        script = 'import sys, time; print("accepted", file=sys.stderr, flush=True); time.sleep(30)'
+        result = host.process([sys.executable, '-c', script], timeout=2)
+        self.assertIn('timed out after 2 seconds', result['error'])
+        self.assertIn('accepted', result['partial_stderr'])
+        self.assertNotIn('exit_code', result)
 
     def test_admission_parser_requires_real_auth_refusal_and_all_private_sockets(self):
         sample = {'endpoint_refusal': {'connected': True, 'frame': {'type':'lease_refused','reason':'auth'}},

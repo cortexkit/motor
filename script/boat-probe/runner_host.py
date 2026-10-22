@@ -371,6 +371,138 @@ print(json.dumps({'seconds':elapsed, 'started':started, 'before':before, 'seeded
     'after':after, 'unit':unit, 'reclaimed_during_idle':reclaimed}))
 '''
 
+# Collected when the probe client gets no terminal for a real job, before the
+# tunnel closes and the sandbox is cleaned up. The client cannot tell which
+# stage stopped (submission, setup, the command, or finishing), so this records
+# what each side was doing: the runner, endpoint and bridge journals, every
+# thread's kernel stack and wait channel for the runner and endpoint, user-space
+# stacks when a stack dumper is installed, the job units and their processes,
+# the runner's records of recent jobs with the tails of their output files, and
+# the setup phases the runner reported (a job's setup, including its JavaScript
+# install, runs before the command's timeout starts, so a stuck setup never
+# times out on its own). Paths are constants so tests can point them at a
+# fixture tree; STATE is the runner's state directory (state root + instance).
+JOB_HANG_DIAGNOSTICS = r'''
+import json, os, shutil, subprocess, time
+PROC = '/proc'
+CGROUP = '/sys/fs/cgroup'
+STATE = '/var/lib/motor-boat/state/boat'
+UNITS = ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-bridge.service')
+NAMES = ('motor-runner', 'motor-host')
+RECENT_S = 900
+out = {'monotonic': time.monotonic(), 'wall': time.time()}
+def command(argv, timeout=30, limit=262144):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, errors='replace', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {'argv': argv, 'error': str(error)}
+    return {'argv': argv, 'exit_code': result.returncode, 'stdout': result.stdout[-limit:],
+            'stdout_truncated': len(result.stdout) > limit, 'stderr': result.stderr[-8192:]}
+def read(path, limit=65536):
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(limit)
+    except OSError as error:
+        return {'error': str(error)}
+    return data.decode(errors='replace')
+def tail(path, limit=8192):
+    try:
+        with open(path, 'rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            stream.seek(max(0, size - limit))
+            return {'size': size, 'tail': stream.read(limit).decode(errors='replace')}
+    except OSError as error:
+        return {'error': str(error)}
+def tasks(pid):
+    rows = {}
+    try:
+        names = sorted(os.listdir(f'{PROC}/{pid}/task'), key=int)
+    except OSError as error:
+        return {'error': str(error)}
+    for task in names:
+        base = f'{PROC}/{pid}/task/{task}'
+        stat = read(base + '/stat')
+        rows[task] = {'comm': read(base + '/comm'), 'wchan': read(base + '/wchan'),
+                      'state': stat.rsplit(')', 1)[-1].split()[0] if isinstance(stat, str) and ')' in stat else stat,
+                      'syscall': read(base + '/syscall'), 'stack': read(base + '/stack')}
+    return rows
+def user_stacks(pid):
+    # Kernel stacks of a blocked Rust thread end in futex_wait; only a
+    # user-space stack names the lock it waits for.
+    if shutil.which('eu-stack'):
+        return command(['eu-stack', '-p', str(pid)], timeout=60)
+    if shutil.which('gdb'):
+        return command(['gdb', '-p', str(pid), '-batch', '-nx', '-ex', 'set pagination off',
+                        '-ex', 'thread apply all bt'], timeout=90)
+    return {'error': 'neither eu-stack nor gdb is installed'}
+out['journal'] = command(['journalctl', '--no-pager', '-o', 'short-iso-precise', '--since', '-5min',
+                          *[flag for unit in UNITS for flag in ('-u', unit)], '-u', 'motor-job-*'])
+out['units'] = {unit: command(['systemctl', 'show', unit, '-p', 'MainPID', '-p', 'ActiveState',
+                               '-p', 'SubState', '-p', 'NRestarts']) for unit in UNITS}
+out['job_units'] = command(['systemctl', 'status', '--no-pager', '-l', '--lines=20', 'motor-job-*'])
+service_pids = set()
+for unit in UNITS:
+    text = out['units'][unit].get('stdout', '')
+    for line in text.splitlines():
+        if line.startswith('MainPID=') and line[8:].isdigit() and int(line[8:]) > 0:
+            service_pids.add(int(line[8:]))
+for entry in os.listdir(PROC):
+    if entry.isdigit() and read(f'{PROC}/{entry}/comm', 64) in [name + '\n' for name in NAMES]:
+        service_pids.add(int(entry))
+job_pids = set()
+for root, directories, _ in os.walk(CGROUP):
+    # Each job unit's cgroup, and the runner's own: a job's setup, including
+    # its JavaScript install, runs as children of the runner before the job
+    # unit exists. Nested cgroups count as their ancestor's.
+    parts = os.path.relpath(root, CGROUP).split(os.sep)
+    if any(part.startswith('motor-job-') or part == 'motor-boat.service' for part in parts):
+        procs = read(root + '/cgroup.procs')
+        if isinstance(procs, str):
+            job_pids.update(int(pid) for pid in procs.split())
+out['cgroup_pids'] = sorted(job_pids)
+out['processes'] = {}
+for pid in sorted(service_pids) + sorted(job_pids - service_pids)[:50]:
+    cmdline = read(f'{PROC}/{pid}/cmdline', 4096)
+    out['processes'][str(pid)] = {'comm': read(f'{PROC}/{pid}/comm'),
+        'cmdline': cmdline.replace('\0', ' ') if isinstance(cmdline, str) else cmdline,
+        'status': read(f'{PROC}/{pid}/status'), 'tasks': tasks(pid)}
+for pid in sorted(service_pids):
+    if read(f'{PROC}/{pid}/comm', 64) == 'motor-runner\n':
+        out['processes'][str(pid)]['user_stacks'] = user_stacks(pid)
+ps = command(['ps', '-eLo', 'pid,tid,ppid,user:12,stat,wchan:32,etimes,pcpu,comm,args', '--sort=pid'])
+kept = set(service_pids) | job_pids
+rows = ps.get('stdout', '').splitlines()
+ps['stdout'] = '\n'.join(rows[:1] + [row for row in rows[1:] if 'motor' in row
+                         or (row.split() and row.split()[0].isdigit() and int(row.split()[0]) in kept)])
+out['ps'] = ps
+out['loadavg'] = read(f'{PROC}/loadavg')
+out['meminfo'] = read(f'{PROC}/meminfo')
+out['pressure'] = {name: read(f'{PROC}/pressure/{name}') for name in ('cpu', 'memory', 'io')}
+out['df'] = command(['df', '-B1', '/var/lib/motor-boat', '/'])
+now = time.time()
+out['recent_jobs'] = {}
+jobs = os.path.join(STATE, 'jobs')
+for name in sorted(os.listdir(jobs)) if os.path.isdir(jobs) else []:
+    record = os.path.join(jobs, name, 'record.json')
+    try:
+        if now - os.stat(record).st_mtime > RECENT_S:
+            continue
+        with open(record) as stream:
+            job = json.load(stream)
+    except (OSError, ValueError) as error:
+        out['recent_jobs'][name] = {'error': str(error)}
+        continue
+    summary = {key: job.get(key) for key in ('state', 'accepted_ms', 'queued_ms', 'setup_ms', 'started_ms',
+               'finished_ms', 'execution_ended_ms', 'process', 'kill', 'terminal', 'next_seq', 'output_bytes',
+               'weight', 'base', 'durable_output', 'stdout_offset', 'stderr_offset', 'monitoring_error')}
+    summary['command'] = (job.get('request') or {}).get('command')
+    output = os.path.join(STATE, 'sandboxes', name, 'output')
+    summary['output'] = {stream: tail(os.path.join(output, stream)) for stream in ('stdout', 'stderr', 'exit')}
+    out['recent_jobs'][name] = summary
+out['tenant_events'] = tail(os.path.join(STATE, 'tenant-events.json'), 65536)
+print(json.dumps(out))
+'''
+
 # Run only in a disposable probe clone, after its real-job and resume phases.
 # Reproduce Boat removing /Users after readiness, then directly start Users.mount
 # as a job dependency could, over a newly created root-disk workspace directory.
@@ -907,6 +1039,24 @@ class RunnerHost:
     def endpoint_state(self, sid):
         return json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(ENDPOINT_STATE))['stdout'])
 
+    def client_failure_diagnostics(self, sid, result):
+        """Record what the sandbox was doing when a real job's client failed
+        or timed out without a terminal. Stored on the client result, so it
+        lands in results.json beside the failure; never raises, so the
+        client's own failure stays the reported error."""
+        try:
+            collected = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(JOB_HANG_DIAGNOSTICS),
+                                           poll_seconds=300)
+            result['sandbox_diagnostics_command'] = {key: collected.get(key) for key in
+                                                     ('exitCode', 'stderr', 'stdoutTruncated', 'stderrTruncated')}
+            result['sandbox_diagnostics'] = json.loads(collected['stdout'])
+        except Exception as error:
+            result['sandbox_diagnostics_error'] = str(error)
+        try:
+            self.probe.checkpoint()
+        except Exception as error:
+            result['sandbox_diagnostics_checkpoint_error'] = str(error)
+
     def read_marker(self, sid):
         result = self.probe.execute(sid, MARKER_READ)
         return {'exit_code': result.get('exitCode'), 'stdout': result.get('stdout'), 'stderr': result.get('stderr')}
@@ -1056,7 +1206,9 @@ class RunnerHost:
                     result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
-                        raise ValueError("motor client failed: " + json.dumps(result))
+                        failure = "motor client failed: " + json.dumps(result)
+                        self.client_failure_diagnostics(sid, record[name])
+                        raise ValueError(failure + "; sandbox state at failure: runner_host.phases[]." + name + ".sandbox_diagnostics")
                     parsed = job_result(result["stdout"])
                     record[name]["result"] = parsed
                     if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
