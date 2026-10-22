@@ -10,6 +10,7 @@ $files = @(Get-ChildItem $PSScriptRoot -Filter '*.ps1') + @(
     Get-Item "$PSScriptRoot\..\hyperv-spike\provision.ps1"
     Get-Item "$PSScriptRoot\..\windows-vm\bootstrap.ps1"
     Get-Item "$PSScriptRoot\..\windows-vm\setup-job-baseline.ps1"
+    Get-Item "$PSScriptRoot\..\..\crates\motor-winagent\src\hyperv_disk_inventory.ps1"
 )
 $count = 0
 foreach ($file in $files) {
@@ -65,6 +66,39 @@ try {
 }
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $script:diskInventoryGetDiskCalls = 0
+    $script:diskInventoryPerDiskQuery = $false
+    function global:Get-Disk {
+        param([uint32]$Number)
+        $script:diskInventoryGetDiskCalls++
+        if ($PSBoundParameters.ContainsKey('Number')) { $script:diskInventoryPerDiskQuery = $true }
+        @(
+            [pscustomobject]@{Number=[uint32]0; BusType='SCSI'; IsBoot=$true; IsSystem=$true}
+            [pscustomobject]@{Number=[uint32]1; BusType='SCSI'; IsBoot=$false; IsSystem=$false}
+        )
+    }
+    function global:Get-CimInstance {
+        param([string]$ClassName)
+        if ($ClassName -ne 'Win32_DiskDrive') { throw "Unexpected CIM inventory class $ClassName" }
+        @(
+            [pscustomobject]@{Index=[uint32]0; SCSILogicalUnit=[uint32]0}
+            [pscustomobject]@{Index=[uint32]1; SCSILogicalUnit=[uint32]1}
+        )
+    }
+    try {
+        $inventoryPath = Join-Path $PSScriptRoot '..\..\crates\motor-winagent\src\hyperv_disk_inventory.ps1'
+        $inventory = @((& $inventoryPath) | ConvertFrom-Json)
+        if ($script:diskInventoryGetDiskCalls -ne 1 -or $script:diskInventoryPerDiskQuery) {
+            throw 'FAIL hyperv-cache-inventory-uses-one-storage-query'
+        }
+        if ($inventory.Count -ne 2 -or $inventory[0].number -ne 0 -or $inventory[0].lun -ne 0 -or -not $inventory[0].boot -or -not $inventory[0].system -or $inventory[1].number -ne 1 -or $inventory[1].lun -ne 1 -or $inventory[1].boot -or $inventory[1].system) {
+            throw 'FAIL hyperv-cache-inventory-preserves-disk-topology'
+        }
+        Write-Host 'PASS hyperv-cache-inventory-uses-one-storage-query-and-preserves-topology'
+        $count++
+    } finally {
+        Remove-Item Function:\Get-Disk,Function:\Get-CimInstance
+    }
     . "$PSScriptRoot\parent-identity.ps1"
     $hypervPath = Join-Path $PSScriptRoot 'hyperv.ps1'
     $hypervTokens = $null

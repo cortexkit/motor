@@ -731,15 +731,11 @@ mod guest {
     fn cache_disk(reporter: &CacheReporter) -> io::Result<u32> {
         #[cfg(feature = "hyperv-runner")]
         {
-            let inventory = reporter.step(CacheStep::DiskSerial, || powershell(r#"
-$ErrorActionPreference='Stop'
-$items = @(Get-CimInstance Win32_DiskDrive | ForEach-Object {
-    $disk = Get-Disk -Number $_.Index
-    if ([string]$disk.BusType -ne 'SCSI') { throw 'Unexpected non-SCSI disk in Hyper-V job' }
-    @{number=[uint32]$_.Index; lun=[uint32]$_.SCSILogicalUnit; boot=[bool]$disk.IsBoot; system=[bool]$disk.IsSystem}
-})
-ConvertTo-Json -InputObject $items -Compress
-"#))?;
+            // Query Get-Disk once for the inventory; a per-drive provider call
+            // delays cache mounting on a cold guest boot.
+            let inventory = reporter.step(CacheStep::DiskSerial, || {
+                powershell(include_str!("hyperv_disk_inventory.ps1"))
+            })?;
             diagnostic!("Hyper-V disk topology {}", inventory);
             let disks: Vec<motor_winagent::cache::HypervDisk> =
                 serde_json::from_str(&inventory).map_err(|e| invalid(e.to_string()))?;
