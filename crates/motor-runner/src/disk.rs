@@ -64,7 +64,9 @@ impl Drop for TransferGuard {
         inner.preparing.remove(&self.id);
         if let Some(transfer) = inner.catalog.transferred.get_mut(&self.id) {
             transfer.finished_ms = self.runner.now();
-            if let Err(error) = self.runner.catalog(&inner) {
+            let catalog = self.runner.catalog_snapshot(&inner);
+            drop(inner);
+            if let Err(error) = catalog.and_then(|catalog| self.runner.write_catalog(catalog)) {
                 tracing::error!(%error, "cannot persist completed transfer retention");
             }
         }
@@ -802,6 +804,7 @@ impl Runner {
                     Err(error) if error.kind() == io::ErrorKind::NotFound
                 );
             let mut inner = self.core.inner.lock().unwrap();
+            let mut catalog = None;
             inner.evicting_dependencies.remove(&candidate.path);
             inner.evicting_caches.remove(&candidate.path);
             if let Some(key) = &candidate.workspace {
@@ -836,11 +839,8 @@ impl Runner {
                             c.eviction_bytes += bytes;
                         });
                     inner.last_eviction = Some(eviction);
-                    if let Err(error) = self.catalog(&inner) {
-                        // Metadata writes can still fail when deleting reflinks
-                        // freed no blocks. Preserve the typed admission refusal.
-                        tracing::error!(%error, "cannot persist pressure cleanup catalog");
-                    }
+                    // Saved after the state lock is released, below.
+                    catalog = Some(self.catalog_snapshot(&inner));
                 }
                 Err(_) if disappeared => {}
                 Err(error) => {
@@ -859,6 +859,13 @@ impl Runner {
                 }
             }
             drop(inner);
+            if let Some(catalog) = catalog {
+                if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
+                    // Metadata writes can still fail when deleting reflinks
+                    // freed no blocks. Preserve the typed admission refusal.
+                    tracing::error!(%error, "cannot persist pressure cleanup catalog");
+                }
+            }
             free = probe()?;
             if free >= soft {
                 self.core.health.lock().unwrap().record(self.now(), |c| {

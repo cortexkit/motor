@@ -529,6 +529,15 @@ pub(crate) fn atomic_json_private(path: &Path, value: &impl Serialize) -> io::Re
 }
 
 fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    write_json(&mut bytes, value)?;
+    atomic_bytes(path, &bytes, private)
+}
+
+/// `atomic_json` for a value already serialized, so a caller can serialize
+/// under a lock and write after releasing it. `private` creates the file
+/// readable by its owner only, as `atomic_json_private` does.
+pub(crate) fn atomic_bytes(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("record has no parent"))?;
@@ -555,7 +564,7 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
         // This directory inherits the installer's SYSTEM/Administrators DACL.
         File::create(&tmp)?
     };
-    write_json(&mut file, value)?;
+    file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
     drop(file);

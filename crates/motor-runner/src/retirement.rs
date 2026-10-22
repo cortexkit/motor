@@ -96,7 +96,11 @@ impl Runner {
             .mirror_used_ms
             .retain(|name, _| present.contains(name));
         if changed || before != inner.catalog.mirror_used_ms.len() {
-            self.catalog(&inner)?;
+            // Written after the state lock is released, like every catalog
+            // save that need not hold it.
+            let catalog = self.catalog_snapshot(&inner)?;
+            drop(inner);
+            self.write_catalog(catalog)?;
         }
         Ok(())
     }
