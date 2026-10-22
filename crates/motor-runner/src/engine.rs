@@ -157,6 +157,13 @@ pub struct Config {
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
+    /// Replaces `sibling_snapshot_mode()`, so portable fixtures can run either
+    /// sibling mode without the isolated host backend.
+    #[cfg(test)]
+    pub(crate) sibling_snapshot_mode_override: Option<bool>,
+    /// Replaces `in_place_siblings()`, independently of the snapshot mode.
+    #[cfg(test)]
+    pub(crate) in_place_siblings_override: Option<bool>,
     #[cfg(test)]
     pub(crate) accounting_report: Option<AccountingReportHook>,
     #[cfg(test)]
@@ -330,6 +337,10 @@ impl Config {
             before_replay_read: None,
             #[cfg(test)]
             systemd_command: None,
+            #[cfg(test)]
+            sibling_snapshot_mode_override: None,
+            #[cfg(test)]
+            in_place_siblings_override: None,
             #[cfg(test)]
             accounting_report: None,
             #[cfg(test)]

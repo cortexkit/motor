@@ -22,6 +22,10 @@ mod privilege;
 mod return_paths;
 mod server;
 mod setup_log;
+// Nothing in a production build uses sibling snapshots yet: production builds
+// keep sibling snapshot mode off, so only tests reach this module.
+#[cfg_attr(not(test), allow(dead_code))]
+mod sibling_snapshots;
 mod spool;
 mod state_lock;
 mod storage;

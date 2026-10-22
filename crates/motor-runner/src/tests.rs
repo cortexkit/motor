@@ -41,6 +41,8 @@ mod refusals;
 mod repository_retirement;
 #[path = "tests/return_paths.rs"]
 mod return_paths;
+#[path = "tests/sibling_snapshots.rs"]
+mod sibling_snapshots;
 #[path = "tests/started.rs"]
 mod started;
 #[path = "tests/state_lock.rs"]

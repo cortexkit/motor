@@ -773,9 +773,20 @@ fn javascript_cache_key(
         field(&mut hash, object.kind.as_bytes());
         field(&mut hash, object.id.as_bytes());
     }
-    // Daemon configuration can affect dependency selection even with an identical
-    // lockfile (for example NODE_ENV or npm_config_omit). Cache locations are
-    // controlled by the runner and are not dependency-selection inputs.
+    for (name, value) in javascript_selection_environment() {
+        field(&mut hash, name.as_bytes());
+        field(&mut hash, value.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// The daemon's environment variables that can change which JavaScript
+/// dependencies an install selects, sorted by name. Daemon configuration can
+/// affect dependency selection even with an identical lockfile (for example
+/// NODE_ENV or npm_config_omit). Cache locations are controlled by the runner
+/// and are not dependency-selection inputs. Both the install cache key and the
+/// sibling snapshot key hash this list, so the two change together.
+pub(crate) fn javascript_selection_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut environment: Vec<_> = std::env::vars_os()
         .filter(|(name, _)| {
             let name = name.to_string_lossy().to_ascii_uppercase();
@@ -786,11 +797,7 @@ fn javascript_cache_key(
         })
         .collect();
     environment.sort();
-    for (name, value) in environment {
-        field(&mut hash, name.as_bytes());
-        field(&mut hash, value.as_bytes());
-    }
-    Ok(format!("{:x}", hash.finalize()))
+    environment
 }
 
 fn javascript_cache_inputs(
