@@ -871,6 +871,100 @@ fn finish_catalog_save_holds_no_lock_and_precedes_the_terminal() {
     );
 }
 
+/// Let a warm build run until the file `warm_build_release` names exists,
+/// and finish it while the long step `label` of its finish is held. The
+/// status reply and another job's admission complete meanwhile. Returns
+/// the warm build's terminal and the warm-build writer slot as seen during
+/// the hold, then checks that the build settles once the hold is released.
+fn hold_warm_build_finish(label: &'static str) -> (Option<TerminalRecord>, Option<Uuid>) {
+    let f = SaveFixture::with(label, |config| {
+        config.disable_warm_builds = false;
+        config.base_commands = vec![format!(
+            "while [ ! -e '{}' ]; do sleep 0.01; done",
+            warm_build_release(config).display()
+        )];
+    });
+    // The default-branch fetch queues a warm build, which starts once the
+    // job itself has finished.
+    let id = f.queued("foreground", "true").job_id;
+    let warm = |f: &SaveFixture| {
+        let inner = f.runner.core.inner.lock().unwrap();
+        inner.jobs.values().find(|job| job.base).cloned()
+    };
+    f.tick_until("the warm build runs", |f| {
+        f.terminal(id).is_some() && warm(f).is_some_and(|job| job.state == JobState::Running)
+    });
+    let warm_id = warm(&f).unwrap().id;
+    let root = warm(&f).unwrap().request.unwrap().repository_root;
+    f.hold.arm();
+    let release = warm_build_release(f.runner.config());
+    let held = f.hold_in(move |_| fs::write(release, b"").unwrap());
+    f.assert_unrelated_requests_complete();
+    let during = {
+        let inner = f.runner.core.inner.lock().unwrap();
+        (inner.jobs[&warm_id].terminal.clone(), inner.writer)
+    };
+    drop(held);
+    let catalog = f.runner.core.trees.state.join("catalog.json");
+    assert!(
+        poll(Duration::from_secs(30), || {
+            read_json::<Catalog>(&catalog).is_ok_and(|saved| {
+                saved
+                    .repositories
+                    .get(&root)
+                    .and_then(|repository| repository.result.clone())
+                    == Some(RebuildResult::Ok)
+            })
+        }),
+        "the warm build's result never reached the saved catalog"
+    );
+    let (terminal, writer) = {
+        let inner = f.runner.core.inner.lock().unwrap();
+        (inner.jobs[&warm_id].terminal.clone(), inner.writer)
+    };
+    assert_eq!(terminal.unwrap().outcome, Outcome::Exit { code: 0 });
+    assert_eq!(writer, None, "the settled warm build kept the writer slot");
+    during
+}
+
+fn warm_build_release(config: &Config) -> PathBuf {
+    config.state_dir().join("release-warm-build")
+}
+
+/// Finishing a warm build's cache fill and releasing its scratch directory
+/// run without the state lock, before its terminal is published. The build
+/// keeps the writer slot meanwhile, so no other warm build can start.
+#[test]
+fn warm_build_cleanup_holds_no_lock_and_keeps_the_writer_slot() {
+    let (terminal, writer) = hold_warm_build_finish("base_cleanup");
+    assert!(
+        terminal.is_none(),
+        "the terminal was published before cleanup"
+    );
+    assert!(
+        writer.is_some(),
+        "the writer slot was given back before cleanup"
+    );
+}
+
+/// The catalog recording a finished warm build's result is written without
+/// the state lock.
+#[test]
+fn warm_build_catalog_save_holds_no_lock() {
+    let (terminal, writer) = hold_warm_build_finish("catalog_save");
+    assert!(terminal.is_some());
+    assert_eq!(writer, None);
+}
+
+/// Planning the next warm build from the repository's mirror runs without
+/// the state lock.
+#[test]
+fn next_warm_build_plan_holds_no_lock() {
+    let (terminal, writer) = hold_warm_build_finish("base_plan");
+    assert!(terminal.is_some());
+    assert_eq!(writer, None);
+}
+
 /// Maintenance writes the catalog without the state lock.
 #[test]
 fn maintenance_catalog_save_holds_no_lock() {

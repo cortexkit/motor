@@ -711,6 +711,25 @@ struct FillInputs {
     tree: Option<io::Result<String>>,
 }
 
+/// The change tracking of a warm build's compiler cache fill, begun when the
+/// build is dispatched. Only Linux tracks fills; elsewhere this type has no
+/// values, so there is never a fill to finish.
+#[cfg(target_os = "linux")]
+type CacheFill = crate::writer::CacheFill;
+#[cfg(not(target_os = "linux"))]
+enum CacheFill {}
+
+/// The results of the parts of finishing a warm build that wait on child
+/// processes and the disk (see `Runner::clean_base`), for
+/// `Runner::record_base`.
+struct BaseCleanup {
+    /// The cache fill's ACL repair, when the build had a fill.
+    fill: Option<io::Result<()>>,
+    /// Discarding the build's scratch directory, after restoring the
+    /// runner's access to it when Linux job isolation is on.
+    scratch: io::Result<()>,
+}
+
 /// Clears an in-memory marker that was set under the state lock. Its owner
 /// normally clears it with `clear`, under a state lock it already holds; if
 /// the owner returns early or unwinds first, dropping this takes the state
@@ -6471,6 +6490,17 @@ impl Runner {
         } else {
             Ok(())
         };
+        // Settling a warm build waits on child processes and the disk (see
+        // `clean_base`), seconds on a loaded host, so that part runs here,
+        // without the state lock. Until `record_base` runs below, the build
+        // still holds the writer slot, so no other warm build starts and the
+        // compiler cache is not evicted meanwhile; and it has no terminal
+        // yet, so no second warm build is queued for its repository.
+        let base_cleanup = job.base.then(|| {
+            let fill = Self::take_cache_fill(&mut self.core.inner.lock().unwrap(), id);
+            self.long_work("base_cleanup");
+            self.clean_base(id, fill)
+        });
         let mut fill_failure = Vec::new();
         if let Err(error) = &lock_check {
             fill_failure.push(format!("lockfile integrity: {error}"));
@@ -6693,17 +6723,36 @@ impl Runner {
                     }
                 ));
             }
-            self.finish_base(
+            // The warm build's result reaches the catalog with its terminal,
+            // under this lock hold; the catalog is saved, and the next warm
+            // build is planned from the mirror, after it is released.
+            let cleanup = base_cleanup.expect("a warm build is cleaned up before its terminal");
+            self.record_base(
                 &mut inner,
                 &request,
                 success,
                 (!fill_failure.is_empty()).then(|| fill_failure.join("; ")),
+                cleanup,
             )?;
+            let catalog = self.catalog_snapshot(&inner)?;
+            let next = inner.catalog.repositories[&request.repository_root]
+                .desired
+                .clone()
+                .filter(|desired| {
+                    self.warm_builds_enabled(&desired.tip) && inner.drain_deadline.is_none()
+                });
+            drop(inner);
+            self.finish_step(id, &kill, "state lock released", finish_started);
+            self.write_catalog(catalog)?;
+            if let Some(desired) = next {
+                self.queue_next_base(&request.repository_root, &desired)?;
+            }
+        } else {
+            drop(inner);
+            // Replay waits for the state lock, so the terminal reaches clients
+            // only after this point.
+            self.finish_step(id, &kill, "state lock released", finish_started);
         }
-        drop(inner);
-        // Replay waits for the state lock, so the terminal reaches clients
-        // only after this point.
-        self.finish_step(id, &kill, "state lock released", finish_started);
         self.prune_refs()?;
         Ok(())
     }
@@ -6765,6 +6814,12 @@ impl Runner {
         }
     }
 
+    /// Settle a warm build that has its terminal: finish its cache fill,
+    /// release its scratch directory and writer slot, record the result in
+    /// the catalog, save the catalog and queue the next warm build the
+    /// repository wants, all with the state lock held. `finish_execution`,
+    /// which finishes most warm builds, runs these steps itself and does the
+    /// slow ones without the lock.
     fn finish_base(
         &self,
         inner: &mut Inner,
@@ -6772,32 +6827,85 @@ impl Runner {
         success: bool,
         failure: Option<String>,
     ) -> io::Result<()> {
+        let fill = Self::take_cache_fill(inner, r.job_id);
+        let cleanup = self.clean_base(r.job_id, fill);
+        self.record_base(inner, r, success, failure, cleanup)?;
+        self.catalog(inner)?;
+        if let Some(desired) = inner.catalog.repositories[&r.repository_root]
+            .desired
+            .clone()
+        {
+            self.queue_base(
+                inner,
+                &r.repository_root,
+                &desired.tip,
+                &desired.workspace,
+                &[],
+                &[],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Take the cache fill begun when warm build `id` was dispatched, if any,
+    /// to finish it with `clean_base`.
+    fn take_cache_fill(inner: &mut Inner, id: Uuid) -> Option<CacheFill> {
         #[cfg(target_os = "linux")]
-        let mut failure = failure;
+        return inner.cache_fills.remove(&id);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (inner, id);
+            None
+        }
+    }
+
+    /// The parts of settling warm build `id` that wait on child processes and
+    /// the disk. They read and change no runner state, so they can run with
+    /// or without the state lock: finishing the cache fill repairs the ACL of
+    /// each cache entry the build changed, one setfacl each, and the build's
+    /// scratch directory is moved to the trash, after (when Linux job
+    /// isolation is on) a recursive setfacl restores the runner's access.
+    fn clean_base(&self, id: Uuid, fill: Option<CacheFill>) -> BaseCleanup {
         #[cfg(target_os = "linux")]
-        let success = if let Some(fill) = inner.cache_fills.remove(&r.job_id) {
-            if let Err(error) = fill.finish() {
-                let detail = format!("cache ACL repair/tracking: {error}");
-                failure = Some(failure.map(|f| format!("{f}; {detail}")).unwrap_or(detail));
-                false
-            } else {
-                success
+        let fill = fill.map(CacheFill::finish);
+        #[cfg(not(target_os = "linux"))]
+        let fill = fill.map(|fill| match fill {});
+        let scratch = self.core.config.writer_scratch_dir().join(id.to_string());
+        let scratch = (|| {
+            if scratch.exists() {
+                #[cfg(target_os = "linux")]
+                if self.core.config.isolate_jobs {
+                    crate::isolation::restore_runner_access(&scratch)?;
+                }
+                self.discard(&scratch)?;
             }
+            Ok(())
+        })();
+        BaseCleanup { fill, scratch }
+    }
+
+    /// Record a settled warm build in memory, from `clean_base`'s results:
+    /// give back the writer slot and record the fill's result in the
+    /// catalog. The caller saves the catalog. If the scratch directory could
+    /// not be released, this returns that error before anything changes, and
+    /// the build keeps the writer slot.
+    fn record_base(
+        &self,
+        inner: &mut Inner,
+        r: &Run,
+        success: bool,
+        failure: Option<String>,
+        cleanup: BaseCleanup,
+    ) -> io::Result<()> {
+        let mut failure = failure;
+        let success = if let Some(Err(error)) = cleanup.fill {
+            let detail = format!("cache ACL repair/tracking: {error}");
+            failure = Some(failure.map(|f| format!("{f}; {detail}")).unwrap_or(detail));
+            false
         } else {
             success
         };
-        let scratch = self
-            .core
-            .config
-            .writer_scratch_dir()
-            .join(r.job_id.to_string());
-        if scratch.exists() {
-            #[cfg(target_os = "linux")]
-            if self.core.config.isolate_jobs {
-                crate::isolation::restore_runner_access(&scratch)?;
-            }
-            self.discard(&scratch)?;
-        }
+        cleanup.scratch?;
         if inner.writer == Some(r.job_id) {
             inner.writer = None;
         }
@@ -6843,21 +6951,35 @@ impl Runner {
                 g.result = Some(RebuildResult::Failed);
             }
         }
-        self.catalog(inner)?;
-        if let Some(desired) = inner.catalog.repositories[&r.repository_root]
-            .desired
-            .clone()
-        {
-            self.queue_base(
-                inner,
-                &r.repository_root,
-                &desired.tip,
-                &desired.workspace,
-                &[],
-                &[],
-            )?;
-        }
         Ok(())
+    }
+
+    /// Queue the warm build that repository `root` wants after one of its
+    /// warm builds finished, as `queue_base` does, but plan it from the
+    /// mirror before taking the state lock. `desired` is the build the repository wanted
+    /// when the finished one was settled; if it wants another by the time
+    /// the lock is taken, nothing is queued here (the request that changed
+    /// it queues that one, or the scheduler's next pass does).
+    fn queue_next_base(&self, root: &str, desired: &BaseRequest) -> io::Result<()> {
+        self.long_work("base_plan");
+        let plan = self.base_plan(root, &desired.tip, true);
+        let mut inner = self.core.inner.lock().unwrap();
+        let current = inner
+            .catalog
+            .repositories
+            .get(root)
+            .and_then(|repository| repository.desired.as_ref());
+        if !current.is_some_and(|current| {
+            current.tip == desired.tip && current.workspace == desired.workspace
+        }) {
+            return Ok(());
+        }
+        if !self.queue_base_planned(&mut inner, root, &desired.workspace, plan)? {
+            return Ok(());
+        }
+        let catalog = self.catalog_snapshot(&inner)?;
+        drop(inner);
+        self.write_catalog(catalog)
     }
 }
 
