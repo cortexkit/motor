@@ -2642,6 +2642,12 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+        #[cfg(unix)]
+        if request.platform == Some(Platform::Macos) {
+            if let Err(error) = crate::macos::validate_paths(request) {
+                return Some((RefusalReason::RequestRejected, error.to_string()));
+            }
+        }
         if let Err(code) = validate_return_request(
             &request.workspace_key,
             &request.return_paths,

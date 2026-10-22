@@ -304,3 +304,40 @@ async fn platform_wire_refusal_names_requested_and_served_platforms() {
         server.abort();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn macos_path_refusal_is_durable_before_platform_or_workspace_setup() {
+    let f = Fixture::new();
+    let runner = platform_runner(&f, BackendKind::Host);
+    for invalid in [
+        "relative",
+        "/Users/a/../r",
+        "/Users/./r",
+        "/Users//r",
+        "/Users/a/r/",
+        "/outside/r",
+        "/Users/a/r b",
+    ] {
+        let (mut request, _) = f.run("touch must-not-run");
+        request.platform = Some(Platform::Macos);
+        request.workspace_key = "/Users/motor/r".into();
+        request.repository_root = "/Users/motor/r".into();
+        request.siblings.clear();
+        request.cwd = invalid.into();
+        let id = request.job_id;
+        assert!(matches!(
+            runner.accept(request).unwrap(),
+            Admission::Refused(RefusalReason::RequestRejected)
+        ));
+        let job: Job = read_json(&runner.record_path(id)).unwrap();
+        assert!(job.started_ms.is_none());
+        assert!(job.process.is_none());
+        let terminal = job.terminal.unwrap();
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert!(terminal
+            .refusal_detail()
+            .unwrap()
+            .contains("macos_path_invalid"));
+    }
+}

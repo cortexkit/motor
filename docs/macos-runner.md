@@ -1,10 +1,35 @@
-# macOS VM guest boot contract
+# macOS runner
+
+The macOS host-preparation API stages snapshots and resolves dependencies before
+a job can be admitted to a VM. A preparation refusal is a refusal before start:
+the job command has not run.
+
+## Host preparation
+
+### Bun lockfiles
+
+Host preparation supports the text `bun.lock` format. Binary `bun.lockb` files
+are refused before dependency fetching or publication because host preflight
+does not decode the binary format. The refusal names the `bun.lockb` path.
+
+In the caller checkout, convert the lockfile with:
+
+```sh
+bun install --save-text-lockfile
+```
+
+Commit `bun.lock` and remove the superseded `bun.lockb` from the submitted
+snapshot before retrying. The runner does not convert lockfiles or execute
+caller lifecycle scripts on the host; dependency installation uses
+`bun install --frozen-lockfile --ignore-scripts`.
+
+## Guest boot contract
 
 `motor-macagent` runs as root in a single-job macOS VM. Its executable is built
 for `aarch64-apple-darwin`. It uses `motor-winagent`'s shared framing and macOS
 profile, version 1. The Windows profile remains version 4.
 
-## Nonce disk and connection
+### Nonce disk and connection
 
 The host attaches exactly two disks: the boot disk and a read-only raw nonce
 disk. At byte zero the nonce disk contains these bytes, with no length prefix:
@@ -29,7 +54,7 @@ sequence is `Hello` → host `TreeEnd { command }` → agent `Started` → zero 
 `Output` → `Exit { code }` or `Signal { signal }`. There is no `TreeReceived` or
 host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
 
-## Shares and command execution
+### Shares and command execution
 
 The workspace is mounted read-write at its caller's absolute path. Each sibling
 is mounted read-only at its own caller path, preserving their relative layout.
@@ -52,7 +77,7 @@ forwarding every byte before terminal status has no deadline. A pipe that stays
 open closes the session without a terminal frame (`output_incomplete`). Cancel
 also kills the entire job uid, even while output forwarding is blocked.
 
-## Agent launch options and portable checks
+### Agent launch options and portable checks
 
 The root launch daemon normally needs no arguments. Trusted image configuration
 may override:
