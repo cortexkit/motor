@@ -172,6 +172,10 @@ pub struct Config {
     /// that step.
     #[cfg(test)]
     pub(crate) catalog_write: Option<CatalogWriteHook>,
+    /// When set, the next setup thread fails to be created, as
+    /// `thread::Builder::spawn` can.
+    #[cfg(test)]
+    pub(crate) fail_setup_spawn: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
@@ -354,6 +358,8 @@ impl Config {
             before_job_write: None,
             #[cfg(test)]
             catalog_write: None,
+            #[cfg(test)]
+            fail_setup_spawn: Arc::default(),
             #[cfg(test)]
             before_replay_read: None,
             #[cfg(test)]
@@ -750,21 +756,22 @@ struct PendingStart {
     id: Uuid,
     workspace: String,
     base: bool,
-    /// The job as dispatch found it, its queue clock then, and the
-    /// workspace's rotation before `start`. `None` once settled.
-    undo: Option<(Job, QueueClock, Option<u64>)>,
+    /// The job as dispatch found it and the workspace's rotation before
+    /// `start`. `None` once settled.
+    undo: Option<(Job, Option<u64>)>,
 }
 
 impl PendingStart {
     /// Undo the dispatch: release the reservation and put the job back in
-    /// the queue with its CPUs, setup time, queue clock and workspace
-    /// rotation as they were, giving back the writer slot of a warm build.
+    /// the queue with its CPUs, setup time and workspace rotation as they
+    /// were and its queue clock running again, giving back the writer slot
+    /// of a warm build.
     /// `reason` is why the start failed. The job is not dispatched again
     /// before a delay that doubles with each consecutive failure, up to
     /// `START_RETRY_MAX_MS` (see `StartRetry`), so a failure that persists (a full disk, say) does not
     /// redo the whole setup on every scheduler pass.
     fn requeue(&mut self, inner: &mut Inner, reason: &str) {
-        let Some((job, clock, rotation)) = self.undo.take() else {
+        let Some((job, rotation)) = self.undo.take() else {
             return;
         };
         inner.starting.remove(&self.id);
@@ -780,9 +787,12 @@ impl PendingStart {
             #[cfg(target_os = "linux")]
             inner.cache_fills.remove(&self.id);
         }
-        clock.restore(&job);
-        inner.jobs.insert(self.id, job);
+        // `start` stopped the queue-wait clock, which this job shares with
+        // its copies, keeping the wait accrued until then. It runs again
+        // from now: the failed attempt's setup time is not queue wait.
         let now = self.runner.now();
+        job.resume_queue_wait(now);
+        inner.jobs.insert(self.id, job);
         let retry = inner.start_retries.entry(self.id).or_default();
         let first = retry.delay_ms == 0;
         retry.delay_ms = if first {
@@ -840,7 +850,7 @@ impl Drop for PendingStart {
         tracing::error!(job_id = %self.id, "job start unwound after the job ended; its reservation is released");
         inner.starting.remove(&self.id);
         inner.reserved.remove(&self.workspace);
-        let request = self.undo.take().and_then(|(job, ..)| job.request);
+        let request = self.undo.take().and_then(|(job, _)| job.request);
         if let (true, Some(request)) = (self.base, request) {
             if let Err(error) = runner.finish_base(&mut inner, &request, false, None) {
                 tracing::error!(job_id = %self.id, %error, "warm build bookkeeping failed");
@@ -2090,7 +2100,14 @@ impl Runner {
     /// and writing the older one would undo them on disk. If that newer
     /// write's directory sync failed, this one retries the sync instead.
     fn write_catalog(&self, snapshot: CatalogSnapshot) -> io::Result<()> {
-        let mut written = self.core.catalog_written.lock().unwrap();
+        // The watermarks are only ever raised once a write step succeeded,
+        // so a panic during a write leaves them low: at worst a later
+        // write repeats work. A poisoned lock is taken as a healthy one.
+        let mut written = self
+            .core
+            .catalog_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if written.synced >= snapshot.generation {
             return Ok(());
         }
@@ -2820,12 +2837,25 @@ impl Runner {
         drop(inner);
         self.save(&job)?;
         let mut inner = self.core.inner.lock().unwrap();
-        job.start_queue_wait(queued_ms);
         inner.jobs.insert(id, job);
         let index = DispatchIndex::build(&inner);
         // The clocks change at the current time, not at `queued_ms`, which
-        // was taken before the save.
+        // was taken before the save. This also starts the new job's clock,
+        // paused if it waits only for a workspace owner: it is not charged
+        // for that owner's time during its own save. Otherwise its queue
+        // wait counts from `queued_ms`, when its bundles were pinned.
         self.update_queue_wait_clocks(&inner, self.now(), &index);
+        let queued = &inner.jobs[&id];
+        if queued
+            .queue_wait_clock_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+            && queued
+                .queue_entry
+                .load(std::sync::atomic::Ordering::Acquire)
+                != PAUSED_QUEUE
+        {
+            queued.start_queue_wait(queued_ms);
+        }
         tracing::info!(job_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "bundles fetched; job queued");
         let Some(plan) = plan else {
             return Ok(());
@@ -3862,9 +3892,8 @@ impl Runner {
     }
 
     /// The first queue head ahead of `id` that stops later heads from being
-    /// started for capacity, with whether it is a gate job. It mirrors the
-    /// scheduler's stop rule: a gate job, or a non-base job queued past
-    /// BACKFILL_GRACE_MS, that doesn't fit in the free permits.
+    /// started for capacity, with whether it is a gate job (see
+    /// `holds_back_later_heads`).
     fn blocking_head(
         &self,
         inner: &Inner,
@@ -3877,14 +3906,38 @@ impl Runner {
             .iter()
             .take_while(|head| **head != id)
             .map(|head| &inner.jobs[head])
-            .find(|head| {
-                let aged = !head.base
-                    && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms))
-                        >= BACKFILL_GRACE_MS;
-                (head.gate_job() || aged)
-                    && held.saturating_add(head.weight) > self.core.config.max_weight
-            })
+            .find(|head| self.holds_back_later_heads(inner, head, held, now))
             .map(|head| (head.id, head.gate_job()))
+    }
+
+    /// Whether queue head `head` stops later heads from being started for
+    /// capacity, mirroring dispatch's stop rule: a head whose withdrawal is
+    /// being saved; or a gate job, or a non-base job queued past
+    /// BACKFILL_GRACE_MS, that doesn't fit in `held` permits or is waiting
+    /// out its start retry delay (such a head keeps its claim on capacity,
+    /// as if it were waiting for permits). A head whose earlier attempt is
+    /// still being cleaned up is skipped like a checkout conflict and stops
+    /// nothing.
+    fn holds_back_later_heads(&self, inner: &Inner, head: &Job, held: u32, now: u64) -> bool {
+        if inner.terminal_saves.contains(&head.id) {
+            return true;
+        }
+        if self.core.config.windows_runtime.cleanup_pending(head.id) {
+            return false;
+        }
+        let aged = !head.base
+            && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms)) >= BACKFILL_GRACE_MS;
+        (head.gate_job() || aged)
+            && (held.saturating_add(head.weight) > self.core.config.max_weight
+                || Self::start_deferred(inner, head.id, now))
+    }
+
+    /// Whether `id`'s last start failed and its retry delay has not passed.
+    fn start_deferred(inner: &Inner, id: Uuid, now: u64) -> bool {
+        inner
+            .start_retries
+            .get(&id)
+            .is_some_and(|retry| now < retry.not_before_ms)
     }
 
     fn queue_wait_phase(
@@ -3900,7 +3953,8 @@ impl Runner {
         if job.state != JobState::Queued {
             return None;
         }
-        if inner.starting.contains(&id) {
+        // An earlier attempt to start the job is still being cleaned up.
+        if inner.starting.contains(&id) || self.core.config.windows_runtime.cleanup_pending(id) {
             return Some("workspace setup");
         }
         Some(if inner.dropping.contains(job.key()) {
@@ -3919,7 +3973,11 @@ impl Runner {
             "queued workspace job"
         } else if job.weight > self.core.config.max_weight {
             "demand exceeds capacity"
-        } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight {
+        } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight
+            || Self::start_deferred(inner, id, self.now())
+        {
+            // A job waiting out its start retry delay keeps its claim on
+            // capacity, as if it were waiting for permits.
             "permits"
         } else {
             "queue order"
@@ -3936,12 +3994,7 @@ impl Runner {
                 continue;
             }
             let job = &inner.jobs[id];
-            let aged = !job.base
-                && now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
-                    >= BACKFILL_GRACE_MS;
-            if (job.gate_job() || aged)
-                && index.weight.saturating_add(job.weight) > self.core.config.max_weight
-            {
+            if self.holds_back_later_heads(inner, job, index.weight, now) {
                 blocking_head = Some((job.id, job.gate_job()));
             }
         }
@@ -5069,23 +5122,23 @@ impl Runner {
                     // A checkout conflict cannot be resolved by idling unrelated CPUs.
                     continue;
                 }
-                // Not yet: the job's last start failed and its retry delay
-                // has not passed, or that attempt is still being cleaned up
-                // (a Windows VM whose stop maintenance retries) and owns
+                // An earlier attempt to start the job is still being cleaned
+                // up (a Windows VM whose stop maintenance retries) and owns
                 // paths named by the job's ID, which a new attempt would
-                // reuse.
-                if inner
-                    .start_retries
-                    .get(&id)
-                    .is_some_and(|retry| now < retry.not_before_ms)
-                    || self.core.config.windows_runtime.cleanup_pending(id)
-                {
+                // reuse. Like a checkout conflict, this holds back no one
+                // else: it can last until the VM is confirmed stopped.
+                if self.core.config.windows_runtime.cleanup_pending(id) {
                     continue;
                 }
                 if job.weight > self.core.config.max_weight {
                     continue;
                 }
-                if index.weight.saturating_add(job.weight) > self.core.config.max_weight {
+                // A job whose last start failed waits out its retry delay
+                // (at most START_RETRY_MAX_MS) as if it were waiting for
+                // permits: a gate or aged head still fences capacity.
+                if index.weight.saturating_add(job.weight) > self.core.config.max_weight
+                    || Self::start_deferred(inner, id, now)
+                {
                     // Gates and aged heads stop backfill only for capacity,
                     // after their checkout conflicts have already been excluded.
                     if job.gate_job()
@@ -5168,8 +5221,6 @@ impl Runner {
         queued_job.cpus = placement.cpus;
         let setup_ms = self.now();
         queued_job.setup_ms = Some(setup_ms);
-        // Kept to restore exactly if the start is undone.
-        let clock = QueueClock::of(&job);
         queued_job.stop_queue_wait(setup_ms);
         queued_job
             .queue_entry
@@ -5202,15 +5253,26 @@ impl Runner {
             base: job.base,
             recorded: inner.catalog.sibling_commits.clone(),
         };
-        let mut pending = PendingStart {
-            runner: self.clone(),
-            id,
-            workspace: setup.request.workspace_key.clone(),
-            base: job.base,
-            undo: Some((job, clock, rotation)),
-        };
-        std::thread::spawn(move || {
-            let runner = pending.runner.clone();
+        // The undo reaches the setup thread as plain data and becomes a
+        // `PendingStart` only there. If the thread cannot be created, the
+        // closure is dropped on this thread, which holds the state lock, and
+        // a `PendingStart` dropped here would take that lock again: it is a
+        // plain, non-reentrant mutex, so the scheduler would hang holding it.
+        // The copy kept here undoes the dispatch under the lock already held.
+        let workspace = setup.request.workspace_key.clone();
+        let base = job.base;
+        let undo = (job, rotation);
+        let kept = undo.clone();
+        let runner = self.clone();
+        let thread_workspace = workspace.clone();
+        let spawned = self.spawn_setup(move || {
+            let mut pending = PendingStart {
+                runner: runner.clone(),
+                id,
+                workspace: thread_workspace,
+                base,
+                undo: Some(undo),
+            };
             if !runner.persist_setup(&setup, &mut pending) {
                 return;
             }
@@ -5220,7 +5282,34 @@ impl Runner {
             }
             pending.settled();
         });
+        if let Err(error) = spawned {
+            let mut pending = PendingStart {
+                runner: self.clone(),
+                id,
+                workspace,
+                base,
+                undo: Some(kept),
+            };
+            pending.requeue(inner, &format!("setup thread not started: {error}"));
+        }
         Ok(())
+    }
+    /// Run a job's setup on a new thread. Thread creation can fail (too many
+    /// threads, no memory); the caller then undoes the dispatch.
+    fn spawn_setup(&self, work: impl FnOnce() + Send + 'static) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .core
+            .config
+            .fail_setup_spawn
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // As `Builder::spawn` does when it fails: the closure is dropped
+            // on the calling thread.
+            drop(work);
+            return Err(io::Error::other("injected thread creation failure"));
+        }
+        std::thread::Builder::new().spawn(work).map(drop)
     }
     /// Save the setup record of a job `start` reserved, before any of its
     /// setup work, and return whether setup may go ahead. The save runs
@@ -5432,20 +5521,21 @@ impl Runner {
         };
         let catalog = self.catalog_snapshot(&inner);
         let mut job = inner.jobs[&id].clone();
-        // From here until the job's process is recorded, a live unit of this
-        // job can exist that the job does not name yet.
-        inner.launching.insert(id);
         drop(inner);
         if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
             // Nothing ran: put the job back in the queue as dispatch found
             // it. The prepared workspace (and Windows VM) goes first, so it
             // never outlives the reservation that covered it.
             self.release_prepared(prepared);
-            let mut inner = self.core.inner.lock().unwrap();
-            inner.launching.remove(&id);
-            pending.requeue(&mut inner, &format!("catalog not saved: {error}"));
+            pending.requeue(
+                &mut self.core.inner.lock().unwrap(),
+                &format!("catalog not saved: {error}"),
+            );
             return Err(error);
         }
+        // From here until the job's process is recorded, a live unit of this
+        // job can exist that the job does not name yet.
+        self.core.inner.lock().unwrap().launching.insert(id);
         tracing::info!(job_id = %id, cache_fill = s.base, "handing materialized job to execution");
         let launch = match self.core.backend.launch(
             &self.core.config,

@@ -391,6 +391,8 @@ struct SaveFaults {
     catalog: Option<CatalogWrite>,
     /// Panic in the long step with this label, after any hold on it.
     panic_work: Option<&'static str>,
+    /// Panic in the next catalog write at this step.
+    catalog_panic: Option<CatalogWrite>,
     /// Catalog writes failed so far.
     catalog_failures: usize,
 }
@@ -474,6 +476,11 @@ impl SaveFixture {
             let faults = faults.clone();
             Arc::new(move |step| {
                 let mut faults = faults.lock().unwrap();
+                if faults.catalog_panic == Some(step) {
+                    faults.catalog_panic = None;
+                    drop(faults);
+                    panic!("injected panic in a catalog write");
+                }
                 if faults.catalog != Some(step) {
                     return Ok(());
                 }
@@ -1547,6 +1554,120 @@ fn queue_clocks_change_at_the_time_after_a_pass_s_mirror_reads() {
         0,
         "the job was credited with wait from before the mirror reads"
     );
+}
+
+/// If the setup thread for a dispatched job cannot be created, the dispatch
+/// is undone under the state lock the scheduler already holds: it neither
+/// hangs on that lock nor leaves the job reserved.
+#[test]
+fn a_setup_thread_that_cannot_start_requeues_the_job() {
+    let f = SaveFixture::new("record_save");
+    let id = f.queued("unspawned", "true").job_id;
+    f.runner
+        .config()
+        .fail_setup_spawn
+        .store(true, Ordering::SeqCst);
+    let runner = f.runner.clone();
+    completes(
+        "a dispatch pass whose setup thread cannot start",
+        move || runner.tick().unwrap(),
+    );
+    {
+        let inner = f.runner.core.inner.lock().unwrap();
+        let (state, starting, reserved, retrying) = (
+            inner.jobs[&id].state,
+            inner.starting.contains(&id),
+            !inner.reserved.is_empty(),
+            inner.start_retries.contains_key(&id),
+        );
+        drop(inner);
+        assert_eq!(state, JobState::Queued);
+        assert!(!starting && !reserved, "the job kept its reservation");
+        assert!(retrying, "the failed start was not recorded for a retry");
+    }
+    f.pass_start_retry_delay(START_RETRY_MS);
+    f.tick_until("the job runs once a setup thread starts", |f| {
+        f.terminal(id).is_some()
+    });
+}
+
+/// A job newly fetched behind a running owner of its workspace starts its
+/// queue clock paused: the owner's time during the job's own Queued save is
+/// not charged to it.
+#[test]
+fn a_fetched_job_behind_its_workspace_owner_starts_paused() {
+    let f = SaveFixture::new("record_save");
+    let (owner_request, _) = job_at(&f.fixture, "owned", "true");
+    let owner = owner_request.job_id;
+    {
+        let now = f.runner.now();
+        let mut job = Job::new(owner, Some(owner_request), now, 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(now);
+        f.runner.core.inner.lock().unwrap().jobs.insert(owner, job);
+    }
+    let (request, bytes) = job_at(&f.fixture, "owned", "true");
+    let id = request.job_id;
+    assert_run_accepted(&f.runner, &request);
+    let upload = f.fixture.spool(&f.runner, &request, &bytes);
+    let directory = upload.directory.clone();
+    f.hold_save(id, Saved::Admitted);
+    let held = f.hold_in(move |runner| runner.fetch_run(&request, &directory, false).unwrap());
+    f.fixture.clock.fetch_add(10_000, Ordering::SeqCst);
+    drop(held);
+    drop(upload);
+    let job = f.job(id).unwrap();
+    assert_eq!(job.queue_entry.load(Ordering::Acquire), PAUSED_QUEUE);
+    assert_eq!(
+        job.queue_wait_ms(f.runner.now()),
+        0,
+        "the job was charged for its owner's time during its own save"
+    );
+    f.runner.cancel(owner).ok();
+}
+
+/// A job put back in the queue after a failed start is not charged for that
+/// attempt's setup time: its queue clock runs again from the requeue.
+#[test]
+fn a_requeued_job_is_not_charged_for_its_failed_setup() {
+    let f = SaveFixture::new("materialize");
+    let id = f.queued("requeued", "true").job_id;
+    let waited = f.job(id).unwrap().queue_wait_ms(f.runner.now());
+    f.hold.arm();
+    f.fail_catalog(Some(CatalogWrite::Starting));
+    let held = f.hold_in(|runner| runner.tick().unwrap());
+    f.fixture.clock.fetch_add(5000, Ordering::SeqCst);
+    drop(held);
+    assert!(poll(Duration::from_secs(60), || {
+        f.catalog_failures() == 1 && !f.runner.core.inner.lock().unwrap().starting.contains(&id)
+    }));
+    f.fail_catalog(None);
+    assert_eq!(
+        f.job(id).unwrap().queue_wait_ms(f.runner.now()),
+        waited,
+        "the failed setup was charged as queue wait"
+    );
+}
+
+/// A panic in the catalog write before a launch, when no unit can exist,
+/// puts the job back in the queue (its reservation is not kept as for a
+/// possibly spawned unit), and later catalog writes still work.
+#[test]
+fn a_panic_in_the_launch_catalog_write_requeues_the_job() {
+    let f = SaveFixture::new("catalog_save");
+    let id = f.queued("panicking", "true").job_id;
+    f.faults.lock().unwrap().catalog_panic = Some(CatalogWrite::Starting);
+    f.runner.tick().unwrap();
+    assert!(
+        poll(Duration::from_secs(60), || {
+            let inner = f.runner.core.inner.lock().unwrap();
+            inner.starting.is_empty() && inner.reserved.is_empty()
+        }),
+        "the unwound launch kept its reservation"
+    );
+    assert!(f.runner.core.inner.lock().unwrap().launching.is_empty());
+    f.pass_start_retry_delay(START_RETRY_MS);
+    f.tick_until("the job runs after the panic", |f| f.terminal(id).is_some());
 }
 
 /// Ranks the call sites that hold the runner's state lock while real jobs
