@@ -171,6 +171,11 @@ pub trait Backend {
     fn key(&mut self, registry: &Registry) -> Result<SnapshotKey>;
     fn saved_key(&mut self, registry: &Registry) -> Result<Option<SnapshotKey>>;
     fn running(&mut self, tenant: &str) -> bool;
+    /// A failed create request may still be writing. Only a completed stop may
+    /// clear its quarantine; child liveness alone cannot authorize adoption.
+    fn snapshot_uncertain(&self, _tenant: &str) -> bool {
+        false
+    }
     fn was_restored(&self, _tenant: &str) -> bool {
         false
     }
@@ -208,6 +213,9 @@ pub trait Backend {
 }
 
 pub struct Controller<B: Backend>(pub B);
+
+// Backend errors use this prefix only when snapshot/create may still be writing.
+pub(crate) const SNAPSHOT_CREATE_UNCERTAIN: &str = "suspend_create_uncertain";
 impl<B: Backend> Controller<B> {
     pub fn handle(&mut self, tenant: &str, op: Operation) -> Result<Response> {
         validate_name(tenant)?;
@@ -219,6 +227,11 @@ impl<B: Backend> Controller<B> {
         }
         let r = self.0.registry(tenant)?;
         r.validate(tenant)?;
+        // Stop before recording recovery or consuming files: recording can
+        // itself stall on the disk that made snapshot/create time out.
+        if self.0.snapshot_uncertain(tenant) {
+            self.0.stop(tenant)?;
+        }
         self.record_lost_vm(tenant, &r)?;
         let mut restored = self.0.was_restored(tenant);
         match op {
@@ -284,9 +297,26 @@ impl<B: Backend> Controller<B> {
                 // A refused or timed-out prepare must never reach snapshot/create.
                 if let Err(error) = self.0.prepare(tenant) {
                     let _ = self.0.thaw(tenant);
-                    return Err(error);
+                    return Err(Error(format!("suspend_prepare_refused: {error}")));
                 }
                 if let Err(error) = self.0.snapshot(tenant, &r, &key) {
+                    if error.0.starts_with(SNAPSHOT_CREATE_UNCERTAIN) {
+                        // Closing the API socket does not cancel Firecracker's
+                        // writer. Kill and reap it before deleting any output.
+                        // Prepare already drained jobs and froze the filesystem,
+                        // but the next boot must still perform unclean recovery.
+                        self.0.stop(tenant).map_err(|stop| Error(format!(
+                            "suspend_create_stop_failed: {error}; stop: {stop}"
+                        )))?;
+                        // The running marker already forces recovery if this
+                        // reason cannot be recorded after the writer is stopped.
+                        let record = self.0.mark_unclean(&r, &error.to_string());
+                        let cleanup = self.0.consume(&r);
+                        eprintln!("tenant {tenant}: suspend_create_failed_vm_stopped action=cold_boot_recovery cause={error}");
+                        record?;
+                        cleanup?;
+                        return Err(Error(format!("suspend_create_failed_vm_stopped: {error}")));
+                    }
                     let cleanup = self.0.consume(&r);
                     self.0.thaw(tenant)?;
                     cleanup?;

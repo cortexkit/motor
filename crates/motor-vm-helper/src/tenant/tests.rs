@@ -49,6 +49,11 @@ struct Fake {
     unclean: bool,
     marker: bool,
     present: bool,
+    frozen: bool,
+    partial_snapshot: bool,
+    snapshot_uncertain: bool,
+    stop_failures: u32,
+    record_failures: u32,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -62,6 +67,11 @@ impl Default for Fake {
             unclean: false,
             marker: false,
             present: false,
+            frozen: false,
+            partial_snapshot: false,
+            snapshot_uncertain: false,
+            stop_failures: 0,
+            record_failures: 0,
         }
     }
 }
@@ -89,6 +99,10 @@ impl Backend for Fake {
     }
     fn mark_unclean(&mut self, _: &Registry, _: &str) -> Result<()> {
         self.call("unclean-fsync")?;
+        if self.record_failures > 0 {
+            self.record_failures -= 1;
+            return Err(Error("unclean record I/O failure".into()));
+        }
         self.unclean = true;
         Ok(())
     }
@@ -137,6 +151,9 @@ impl Backend for Fake {
     }
     fn running(&mut self, _: &str) -> bool {
         self.running
+    }
+    fn snapshot_uncertain(&self, _: &str) -> bool {
+        self.snapshot_uncertain
     }
     fn load(&mut self, _: &str, _: &Registry, saved: bool) -> Result<()> {
         self.running = true;
@@ -208,19 +225,38 @@ impl Backend for Fake {
         if matches!(self.fail, "agent-refused" | "agent-timeout") {
             return Err(Error(self.fail.into()));
         }
+        self.frozen = true;
         Ok(())
     }
     fn thaw(&mut self, _: &str) -> Result<()> {
-        self.call("thaw")
+        self.call("thaw")?;
+        self.frozen = false;
+        Ok(())
     }
     fn snapshot(&mut self, _: &str, _: &Registry, k: &SnapshotKey) -> Result<()> {
         self.call("snapshot-create")?;
+        if self.fail == "create-timeout" {
+            assert!(
+                self.frozen,
+                "only a drained and frozen VM may be snapshotted"
+            );
+            self.partial_snapshot = true;
+            self.snapshot_uncertain = true;
+            return Err(Error(format!("{SNAPSHOT_CREATE_UNCERTAIN}: Firecracker PUT /snapshot/create step=read_status api_timeout elapsed_ms=480000")));
+        }
         self.saved = Some(k.clone());
         Ok(())
     }
     fn stop(&mut self, _: &str) -> Result<()> {
         self.call("stop")?;
+        if self.stop_failures > 0 {
+            self.stop_failures -= 1;
+            return Err(Error("cgroup.kill I/O failure".into()));
+        }
         self.running = false;
+        self.snapshot_uncertain = false;
+        self.partial_snapshot = false;
+        self.frozen = false;
         Ok(())
     }
     fn available(&mut self, _: &Registry) -> Result<u64> {
@@ -386,9 +422,11 @@ fn hosted_prepare_refusal_or_timeout_never_creates_snapshot() {
             fail: reason,
             ..Fake::default()
         });
-        assert!(c.handle("a", Operation::Suspend).is_err(), "{reason}");
+        let error = c.handle("a", Operation::Suspend).err().unwrap();
+        assert!(error.0.starts_with("suspend_prepare_refused:"), "{error}");
         assert_eq!(c.0.calls, ["registry", "prepare", "thaw"]);
         assert!(c.0.running);
+        assert!(!c.0.frozen && !c.0.partial_snapshot && c.0.saved.is_none());
     }
 }
 #[test]
@@ -411,6 +449,98 @@ fn hosted_failed_snapshot_thaws_and_keeps_vm_running() {
     );
     assert!(c.0.running);
 }
+
+#[test]
+fn hosted_create_timeout_reaps_writer_cleans_partial_snapshot_and_cold_boots_with_recovery() {
+    let mut c = Controller(Fake {
+        running: true,
+        marker: true,
+        fail: "create-timeout",
+        ..Fake::default()
+    });
+    let error = c.handle("a", Operation::Suspend).err().unwrap();
+    assert!(
+        error.0.starts_with("suspend_create_failed_vm_stopped"),
+        "{error}"
+    );
+    assert_eq!(
+        c.0.calls,
+        [
+            "registry",
+            "prepare",
+            "snapshot-create",
+            "stop",
+            "unclean-fsync",
+            "unlink-fsync"
+        ]
+    );
+    assert!(!c.0.running && !c.0.partial_snapshot && !c.0.frozen);
+    assert!(c.0.saved.is_none() && c.0.marker && c.0.unclean);
+    c.0.fail = "";
+    c.0.calls.clear();
+    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.calls.contains(&"load-base-size-tap".into()));
+    assert!(!c.0.calls.contains(&"load-saved-tap".into()));
+    assert!(!c.0.frozen);
+    c.handle("a", Operation::RecoveryComplete).unwrap();
+    assert!(!c.0.unclean);
+    c.handle("a", Operation::Relay(52)).unwrap();
+}
+#[test]
+fn hosted_uncertain_create_retries_stop_before_record_or_adoption() {
+    let mut c = Controller(Fake {
+        running: true,
+        marker: true,
+        fail: "create-timeout",
+        stop_failures: 2,
+        record_failures: 1,
+        ..Fake::default()
+    });
+    let error = c.handle("a", Operation::Suspend).err().unwrap();
+    assert!(error.0.starts_with("suspend_create_stop_failed"), "{error}");
+    assert_eq!(
+        c.0.calls,
+        ["registry", "prepare", "snapshot-create", "stop"]
+    );
+    assert!(c.0.running && c.0.snapshot_uncertain && c.0.partial_snapshot);
+    assert!(!c.0.unclean);
+
+    c.0.calls.clear();
+    assert!(c.handle("a", Operation::Ensure).is_err());
+    assert_eq!(c.0.calls, ["registry", "stop"]);
+    assert!(c.0.running && c.0.snapshot_uncertain && c.0.partial_snapshot);
+
+    c.0.calls.clear();
+    assert!(c.handle("a", Operation::Ensure).is_err());
+    assert_eq!(c.0.calls, ["registry", "stop", "unclean-fsync"]);
+    assert!(!c.0.running && !c.0.snapshot_uncertain && !c.0.partial_snapshot);
+    assert!(c.0.marker && !c.0.unclean);
+
+    c.0.calls.clear();
+    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.unclean && c.0.marker);
+    assert!(c.0.calls.contains(&"load-base-size-tap".into()));
+    assert!(!c.0.calls.contains(&"load-saved-tap".into()));
+}
+
 #[test]
 fn hosted_suspend_space_check_is_bytes_and_precedes_prepare() {
     let mut c = Controller(Fake {

@@ -53,6 +53,9 @@ impl Control for Fake {
     }
     fn suspend(&self, _: &str) -> Result<()> {
         self.calls.lock().unwrap().push("suspend".into());
+        if *self.fail.lock().unwrap() == Some("suspend-stopped") {
+            bail!("suspend_create_failed_vm_stopped: PUT /snapshot/create step=read_status api_timeout");
+        }
         Ok(())
     }
     fn available_bytes(&self) -> Result<u64> {
@@ -79,6 +82,51 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
         .thumbprint()
         .unwrap();
     (runtime, fake, broker, requester, c)
+}
+
+#[tokio::test]
+async fn failed_suspend_reconciles_readiness_and_the_next_lease_can_start_a_job() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let now = unix_ms();
+    {
+        let mut h = runtime.host.lock().unwrap();
+        h.guest_ready("tenant", 1).unwrap();
+        h.event("tenant", &event(1, TenantEventKind::Idle, None, None), now)
+            .unwrap();
+    }
+    runtime.tick(now).unwrap();
+    *fake.fail.lock().unwrap() = Some("suspend-stopped");
+    assert!(runtime.tick(now + 60_000).is_err());
+    assert!(!runtime.host.lock().unwrap().is_ready("tenant"));
+    *fake.fail.lock().unwrap() = None;
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    respond(&mut client, &requester, &c, challenge).await;
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "verified_lease"
+    );
+    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+    write_frame(
+        &mut guest,
+        &json!({"type":"started", "seq":0, "job_id":JOB}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "started");
+    assert!(fake.calls.lock().unwrap().contains(&"wake".into()));
+    drop(guest);
+    let _ = read_frame(&mut client).await;
+    drop(client);
+    let _ = task.await.unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
 }
 
 #[tokio::test]
@@ -1239,6 +1287,50 @@ async fn a_guest_that_closes_after_accepted_is_reported_as_a_guest_eof_in_the_re
         ("client", "lease_hello", None)
     );
     runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_lease_hello_times_out_and_releases_the_unauthenticated_slot() {
+    let (runtime, _, _, _, _) = fixture();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let slot = slots.clone().try_acquire_owned().unwrap();
+    let (_client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(motor_host::server::serve_with_slot(
+        runtime,
+        server,
+        Some(slot),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(slots.available_permits(), 0);
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    let report = motor_host::server::describe_close(&task.await.unwrap().unwrap_err());
+    assert_eq!(
+        (report.step, report.cause.as_str()),
+        ("lease_hello", "timed out")
+    );
+    assert_eq!(slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn unauthenticated_slot_is_held_until_challenge_verifies_not_until_job_ends() {
+    let (runtime, _, broker, requester, c) = fixture();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let slot = slots.clone().try_acquire_owned().unwrap();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(motor_host::server::serve_with_slot(
+        runtime,
+        server,
+        Some(slot),
+    ));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    assert_eq!(slots.available_permits(), 1);
+    drop(client);
+    let _ = task.await.unwrap();
 }
 
 /// A loopback TCP connection whose socket buffers are kept small, so a slow
