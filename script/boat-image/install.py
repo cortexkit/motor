@@ -47,7 +47,7 @@ RUNNER_INPUTS = (
     'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
     'script/runner/cargo-seed.py',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
-    'script/runner/build-git.sh',
+    'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
 )
 # motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
 TOOL_HOME = Path("/home/ubuntu")
@@ -70,9 +70,10 @@ TOOL_HOME = Path("/home/ubuntu")
 # or as a PATH symlink into one, so a remaining root-owned entry that is
 # unsafe fails the root-owned path check by name.
 BOAT_BASE_UID = 1000
-# Packages Boat's base installs that the build server doesn't have and that
-# leave non-root-owned files on root's executable paths.
-BOAT_BASE_PURGE = ("at",)
+# Packages that Boat's base image supplies but the runner does not use. `at`
+# leaves a daemon-owned setuid executable; Binaryen is replaced by the pinned
+# release because Ubuntu 24.04's version cannot read current wasm-bindgen output.
+BOAT_BASE_PURGE = ("at", "binaryen")
 BOAT_BASE_USR_LOCAL = {
     # The tree walked: every entry beneath it, at any depth, without following
     # symlinks, so a link never leads the walk (or a removal) outside it.
@@ -528,6 +529,7 @@ def tools(manifest):
         run("update-alternatives", "--set", "x86_64-w64-mingw32-" + name,
             "/usr/bin/x86_64-w64-mingw32-" + name + "-win32")
     gnu_aliases(manifest)
+    run('/usr/bin/python3', str(ROOT / 'script/runner/install-binaryen.py'), str(PARITY_PATH))
     # Ubuntu 24.04's git is older than the build server's and behaves
     # differently; build the server's release ahead of it on PATH. The
     # anonymous ls-remote below then also exercises the build's https support.
@@ -734,7 +736,7 @@ def main():
         "runner": ["motor-runner", "--version"], "rust": ["rustc", "--version"],
         "node": ["node", "--version"], "bun": ["bun", "--version"],
         "pnpm": ["pnpm", "--version"], "git": ["git", "--version"],
-        "nats": ["nats-server", "--version"], "python": ["python3", "--version"],
+        "wasm-opt": ["wasm-opt", "--version"], "nats": ["nats-server", "--version"], "python": ["python3", "--version"],
         "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),

@@ -88,6 +88,19 @@ class RunnerHostTests(unittest.TestCase):
         phase = __import__('inspect').getsource(host.RunnerHost.phase)
         self.assertIn("('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text()))", phase)
 
+    def test_wasm_opt_job_requires_version_120_and_a_completed_round_trip(self):
+        report = {'passed': True, 'version': 'wasm-opt version 120 (version_120)', 'module_sha256': 'a' * 64,
+                  'round_trip_sha256': 'b' * 64, 'round_trip_bytes': 8}
+        self.assertEqual((True, report), host.wasm_opt_check({'code': 0, 'stdout': json.dumps(report)}))
+        older = dict(report, passed=False, version='wasm-opt version 116')
+        self.assertFalse(host.wasm_opt_check({'code': 1, 'stdout': json.dumps(older)})[0])
+        self.assertFalse(host.wasm_opt_check({'code': 0, 'stdout': json.dumps(dict(report, version='wasm-opt version 116'))})[0])
+        invalid = dict(report, round_trip_sha256='not-a-digest')
+        self.assertFalse(host.wasm_opt_check({'code': 0, 'stdout': json.dumps(invalid)})[0])
+        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        self.assertIn("('wasm_opt_120_round_trip', 'python3 -c ' + shlex.quote(WASM_OPT_PROBE.read_text()))", phase)
+        self.assertIn("label + '.' + name, *wasm_opt_check(parsed)", phase)
+
     def test_parity_checker_remeasures_live_files_and_uses_operator_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp, 'wasm32-unknown-unknown')

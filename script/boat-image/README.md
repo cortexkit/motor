@@ -226,14 +226,21 @@ the missing-target regression and fresh-measurement boundary.
 The manifest explicitly lists accepted OS-level differences rather than claiming
 identical Linux distributions. Required distro packages and GNU aliases must
 exist, but their versions are recorded rather than equal across Ubuntu releases.
-In particular, `/usr/bin/wasm-opt` comes from apt `binaryen`; its observed version
-is in each qualification report and optimizer output may differ. ENGRAM provides
-esbuild through its own nested JS lockfile install, not a global esbuild. The
-runner supplies neither `ESBUILD_BIN` nor the `WASM_*_BIN` overrides; repositories
-set those themselves. Native Cargo executable hashes can vary across builds;
-Cargo versions/default aliases are exact, while Boat's patched sccache is checked
-using its build-input marker, recorded output hashes and a distinct stock binary. The server's sccache
-hashes are checked directly. Inventory never starts either sccache executable.
+Binaryen is not an accepted difference: Boat and tenant remove the distro package
+and install the official Binaryen 120 x86_64 Linux release from GitHub. Its archive
+URL and SHA-256 (`ddb097af51d1bdb17300d986b0de7d97422f1933dedb4c9eda3510e0bf4076cc`)
+are pinned in `toolchain.json`; `/usr/local/bin/wasm-opt` resolves into
+`/usr/local/lib/binaryen/120`, ahead of `/usr/bin`. Parity requires major
+version 120, matching the build server. Each real Boat job also runs
+that binary on a tiny valid WebAssembly module and optimizes the output again;
+the probe uses a round trip rather than a hand-encoded newer proposal module.
+ENGRAM provides esbuild through its own nested JS lockfile install, not a global
+esbuild. The runner supplies neither `ESBUILD_BIN` nor the `WASM_*_BIN` overrides;
+repositories set those themselves. Native Cargo executable hashes can vary across
+builds; Cargo versions/default aliases are exact, while Boat's patched sccache is
+checked using its build-input marker, recorded output hashes and a distinct stock
+binary. The server's sccache hashes are checked directly. Inventory never starts
+either sccache executable.
 
 Git is not an accepted difference. Ubuntu 24.04's git is 2.43, and git's
 behaviour changes between that and the server's 2.53: from 2.46 an empty

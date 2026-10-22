@@ -357,6 +357,26 @@ class ParityTests(unittest.TestCase):
         self.assertIn("git path: expected '/usr/local/bin/git', observed '/usr/bin/git'", errors)
         self.assertIn('git: wrong resolved executable path', errors)
 
+    def test_boat_wasm_opt_must_match_the_build_server_major_version(self):
+        actual = self.observed('boat')
+        self.assertEqual([], self.report(actual, job=True, role='boat')['errors'])
+        actual['tools']['wasm-opt']['version'] = 'wasm-opt version 120 (version_120)'
+        self.assertEqual([], self.report(actual, job=True, role='boat')['errors'])
+        actual['tools']['wasm-opt']['version'] = 'wasm-opt version 116'
+        self.assertEqual(["wasm-opt major version: expected '120', observed '116'"],
+                         self.report(actual, job=True, role='boat')['errors'])
+
+    def test_binaryen_source_pin_and_install_layout_are_versioned_together(self):
+        parity.validate(self.manifest)
+        for change in ({'version': 'wasm-opt version 121'},
+                       {'source': dict(self.manifest['tools']['wasm-opt']['source'], sha256='latest')},
+                       {'source': dict(self.manifest['tools']['wasm-opt']['source'], install_dir='/usr/local/lib')}):
+            with self.subTest(change=change):
+                manifest = copy.deepcopy(self.manifest)
+                manifest['tools']['wasm-opt'].update(change)
+                with self.assertRaisesRegex(ValueError, 'Binaryen'):
+                    parity.validate(manifest)
+
     def test_git_source_pin_follows_the_measured_version(self):
         parity.validate(self.manifest)
         for change in ({'version': 'git version 2.54.0'}, {'version': 'git version 2.53'},

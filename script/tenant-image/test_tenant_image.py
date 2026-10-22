@@ -108,6 +108,29 @@ class ImageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not the pinned build"):
                 guest.verify_git(manifest, unit, lambda name, path: "/usr/bin/git")
 
+    def test_binaryen_120_is_installed_from_the_pinned_archive_and_verified(self):
+        pins = image.load_versions(self.versions)
+        manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
+        spec = manifest['tools']['wasm-opt']
+        self.assertNotIn('binaryen', pins['packages'])
+        self.assertIn('script/runner/install-binaryen.py', image.RUNNER_INPUTS)
+        installer = (HERE / 'install-guest.py').read_text()
+        self.assertIn('run("apt-get", "purge", "-y", "binaryen")', installer)
+        self.assertIn('script/runner/install-binaryen.py', installer)
+        self.assertEqual('/usr/local/bin/wasm-opt', spec['path_by_role']['tenant'])
+        self.assertEqual('wasm-opt version 120', spec['version'])
+        observed = 'wasm-opt version 120 (version_120)'
+        unit = HERE / 'guest/motor-tenant-agent.service'
+        which = lambda name, path: '/usr/local/bin/wasm-opt'
+        with mock.patch.object(guest, 'run', return_value=observed) as run:
+            self.assertEqual(observed, guest.verify_wasm_opt(manifest, unit, which))
+        run.assert_called_once_with('/usr/local/bin/wasm-opt', '--version', capture=True)
+        with mock.patch.object(guest, 'run', return_value='wasm-opt version 108'):
+            with self.assertRaisesRegex(ValueError, 'wasm-opt major version differs'):
+                guest.verify_wasm_opt(manifest, unit, which)
+        with self.assertRaisesRegex(ValueError, 'not the pinned Binaryen release'):
+            guest.verify_wasm_opt(manifest, unit, which=lambda name, path: '/usr/bin/wasm-opt')
+
     def test_unpinned_inputs_are_rejected(self):
         for key, value in (("node", "latest"), ("pnpm", "11.2.0"), ("rust_default", "stable"),
                            ("debian_snapshot", "latest"), ("rootfs_gib", 0), ("packages", ["bad; package"]),
