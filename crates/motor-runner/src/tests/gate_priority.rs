@@ -492,3 +492,220 @@ fn dispatch_indexes_add_each_starting_weight_and_cpu_claim_before_selecting_next
         "new setup reservations must consume capacity immediately"
     );
 }
+
+/// A runner whose scheduler runs only when a test calls `dispatch`, so a test
+/// can step admission and read queue clocks under one lock without a
+/// background tick starting jobs in between.
+fn manual_runner(f: &Fixture) -> Runner {
+    let mut config = f.config();
+    config.max_weight = 64;
+    config.cpu_topology = Some(CpuTopology::new((0..65).map(|cpu| vec![cpu]).collect()).unwrap());
+    config.disable_warm_builds = true;
+    config.manual_tick = true;
+    Runner::open(config).unwrap()
+}
+
+/// A job in another repository that declares the fixture's sibling, whose
+/// canonical path is also `workspace_job`'s main workspace.
+fn sibling_user(f: &Fixture, request: &Run, name: &str, order: u64, now: u64) -> Job {
+    let user = job(request, &format!("{}-{name}", f.key), 2, order, false, now);
+    assert_eq!(
+        user.request.as_ref().unwrap().siblings[0].canonical_path,
+        f.canonical
+    );
+    user
+}
+
+/// A job whose main workspace is the fixture sibling's canonical path, as a
+/// direct run in that repository is: the sibling checkout and this workspace
+/// are the same host directory.
+fn workspace_job(f: &Fixture, request: &Run, order: u64, gate: bool, now: u64) -> Job {
+    let mut main = job(request, &f.canonical, 2, order, gate, now);
+    main.request.as_mut().unwrap().siblings.clear();
+    main
+}
+
+fn run_now(inner: &mut Inner, id: Uuid, now: u64) {
+    let key = inner.jobs[&id].key().to_owned();
+    inner.starting.remove(&id);
+    inner.reserved.remove(&key);
+    let job = inner.jobs.get_mut(&id).unwrap();
+    job.state = JobState::Running;
+    job.started_ms = Some(now);
+}
+
+#[test]
+fn overlapping_sibling_users_cannot_starve_a_queued_job_on_their_checkout() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut first = sibling_user(&f, &request, "user-0", 1, now);
+    first.state = JobState::Running;
+    first.started_ms = Some(now);
+    let mut running = std::collections::VecDeque::from([first.id]);
+    inner.jobs.insert(first.id, first);
+    let main = workspace_job(&f, &request, 2, true, now);
+    let main_id = main.id;
+    inner.jobs.insert(main_id, main);
+
+    // Each round a new sibling user arrives while the older ones still run,
+    // and then the oldest running one finishes. Without a hold, a newer
+    // sibling user has always started before the older one finishes, so the
+    // checkout is never free and the workspace job never starts.
+    let mut later_users = Vec::new();
+    let mut later_started = Vec::new();
+    let mut main_started_in_round = None;
+    for round in 1..=6u64 {
+        let user = sibling_user(&f, &request, &format!("user-{round}"), 2 + round, now);
+        later_users.push(user.id);
+        inner.jobs.insert(user.id, user);
+        runner.dispatch(&mut inner, now).unwrap();
+        if inner.starting.contains(&main_id) {
+            main_started_in_round = Some(round);
+            break;
+        }
+        let started: Vec<_> = later_users
+            .iter()
+            .copied()
+            .filter(|id| inner.starting.contains(id))
+            .collect();
+        for id in started {
+            run_now(&mut inner, id, now);
+            running.push_back(id);
+            later_started.push(id);
+        }
+        if let Some(oldest) = running.pop_front() {
+            inner.jobs.remove(&oldest);
+        }
+    }
+    for id in running {
+        inner.jobs.remove(&id);
+    }
+    later_started.extend(
+        later_users
+            .iter()
+            .copied()
+            .filter(|id| inner.starting.contains(id)),
+    );
+    let phase = runner
+        .queue_wait_phase(&inner, &DispatchIndex::build(&inner), later_users[0])
+        .map(str::to_owned);
+    drop(inner);
+    assert_eq!(
+        main_started_in_round,
+        Some(2),
+        "the workspace job must start once the sibling user that arrived before it finishes"
+    );
+    assert!(
+        later_started.is_empty(),
+        "sibling users that arrived after the workspace job must wait for it: {later_started:?}"
+    );
+    assert_eq!(phase.as_deref(), Some("sibling checkout owner"));
+}
+
+#[test]
+fn held_sibling_user_queue_wait_pauses_only_while_held() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut earlier = sibling_user(&f, &request, "earlier", 1, now);
+    earlier.state = JobState::Running;
+    earlier.started_ms = Some(now);
+    let earlier_id = earlier.id;
+    inner.jobs.insert(earlier_id, earlier);
+    let main = workspace_job(&f, &request, 2, false, now);
+    let main_id = main.id;
+    inner.jobs.insert(main_id, main);
+    let held = sibling_user(&f, &request, "held", 3, now);
+    let held_id = held.id;
+    inner.jobs.insert(held_id, held);
+
+    runner.dispatch(&mut inner, now).unwrap();
+    let held_phase = runner
+        .queue_wait_phase(&inner, &DispatchIndex::build(&inner), held_id)
+        .map(str::to_owned);
+    let held_entry = inner.jobs[&held_id].queue_entry.load(Ordering::Acquire);
+    let held_wait = inner.jobs[&held_id].queue_wait_ms(now + 100_000);
+
+    // The workspace job goes away and the earlier user now fills the runner,
+    // so only capacity blocks the formerly held job: its clock must resume.
+    inner.jobs.remove(&main_id);
+    inner.jobs.get_mut(&earlier_id).unwrap().weight = 63;
+    runner.dispatch(&mut inner, now + 100_000).unwrap();
+    let capacity_phase = runner
+        .queue_wait_phase(&inner, &DispatchIndex::build(&inner), held_id)
+        .map(str::to_owned);
+    let resumed_wait = inner.jobs[&held_id].queue_wait_ms(now + 100_400);
+    let started = inner.jobs[&held_id].setup_ms.is_some();
+    inner.jobs.remove(&earlier_id);
+    drop(inner);
+
+    assert_eq!(held_phase.as_deref(), Some("queued workspace job"));
+    assert_eq!(held_entry, PAUSED_QUEUE);
+    assert_eq!(
+        held_wait, 0,
+        "time held for the workspace job is not queue wait"
+    );
+    assert!(!started);
+    assert_eq!(capacity_phase.as_deref(), Some("permits"));
+    assert_eq!(resumed_wait, 400, "the clock resumes once the hold ends");
+}
+
+#[test]
+fn repositories_naming_each_other_as_siblings_never_hold_each_other() {
+    for first_is_x in [true, false] {
+        let f = Fixture::new();
+        let runner = manual_runner(&f);
+        let (request, _) = f.run("true");
+        let now = runner.now();
+        let x_key = format!("{}-x", f.key);
+        let y_key = format!("{}-y", f.key);
+        let mut inner = runner.core.inner.lock().unwrap();
+        let mut ids = Vec::new();
+        for (key, other, order) in [
+            (&x_key, &y_key, if first_is_x { 1 } else { 2 }),
+            (&y_key, &x_key, if first_is_x { 2 } else { 1 }),
+        ] {
+            let mut queued = job(&request, key, 2, order, false, now);
+            queued.request.as_mut().unwrap().siblings[0].canonical_path = other.clone();
+            ids.push(queued.id);
+            inner.jobs.insert(queued.id, queued);
+        }
+        runner.dispatch(&mut inner, now).unwrap();
+        let started = inner.starting.clone();
+        drop(inner);
+        let earlier = if first_is_x { ids[0] } else { ids[1] };
+        assert_eq!(
+            started,
+            BTreeSet::from([earlier]),
+            "the earlier of two mutually dependent jobs must start"
+        );
+    }
+}
+
+#[test]
+fn sibling_user_accepted_before_the_workspace_job_starts_first() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let user = sibling_user(&f, &request, "earlier", 1, now);
+    let user_id = user.id;
+    inner.jobs.insert(user_id, user);
+    let main = workspace_job(&f, &request, 2, false, now);
+    let main_id = main.id;
+    inner.jobs.insert(main_id, main);
+    runner.dispatch(&mut inner, now).unwrap();
+    let started = inner.starting.clone();
+    let main_phase = runner
+        .queue_wait_phase(&inner, &DispatchIndex::build(&inner), main_id)
+        .map(str::to_owned);
+    drop(inner);
+    assert_eq!(started, BTreeSet::from([user_id]));
+    assert_eq!(main_phase.as_deref(), Some("workspace owner"));
+}

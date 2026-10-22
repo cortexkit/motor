@@ -552,7 +552,9 @@ pub struct JobStatusReply {
     pub unit: Option<String>,
     pub unit_alive: Option<bool>,
     /// Present while the job remains queued; it counts time spent waiting for
-    /// shared scheduler capacity, excluding time paused behind a workspace owner.
+    /// shared scheduler capacity, excluding time paused behind a workspace owner
+    /// or held for an earlier queued job whose main workspace overlaps one of this
+    /// job's sibling checkout paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_ms: Option<u64>,
 }

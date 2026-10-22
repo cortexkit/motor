@@ -356,13 +356,16 @@ changes it. Tests:
 8.1. `heartbeat.queue_wait_ms` is present only while the job is queued,
 measured from when its bundles were verified and pinned. It counts time waiting
 for capacity or another shared scheduler blocker, but excludes time when an
-earlier job owning the same workspace is the only blocker. The runner resumes
+earlier job owning the same workspace is the only blocker, and time when the
+job is held back only for an earlier queued job whose main workspace overlaps
+one of this job's sibling checkout paths (both use the same host directory). The runner resumes
 the clock if another blocker appears. Upload, fetch, setup and execution are
 excluded. Cancellation still removes a queued job, and the request's execution
 timeout starts when its command starts. The `queue_wait_ms` in `started` and in
 the terminal record is this same counted wait, so a job that waited only behind
 its own workspace reports 0. `job_status_reply.waiting_on` reports the
-current blocker, such as `workspace owner` or `permits`. A plain heartbeat never
+current blocker, such as `workspace owner`, `queued workspace job` or `permits`;
+it is free text, so clients show an unknown value as is. A plain heartbeat never
 authorizes withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
 `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`
 (`crates/motor-module/src/queue_tests.rs`).

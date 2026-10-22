@@ -3326,6 +3326,8 @@ impl Runner {
             .is_some_and(|r| index.siblings_blocked(&r.siblings, &inner.catalog.sibling_commits))
         {
             "sibling checkout owner"
+        } else if index.held_by_queued_workspace(inner, job, self.core.config.max_weight) {
+            "queued workspace job"
         } else if job.weight > self.core.config.max_weight {
             "demand exceeds capacity"
         } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight {
@@ -3368,23 +3370,36 @@ impl Runner {
                 .then(|| index.workspace_owners.get(job.key()).copied())
                 .flatten()
                 .filter(|(owner_id, _)| *owner_id != id);
+            // A job held back only so that an earlier queued workspace job can
+            // use their shared checkout first is waiting on a workspace
+            // conflict, not on capacity, so its clock pauses as it would
+            // behind a running owner of its own workspace. Unlike that owner,
+            // the queued job holds no permits, so none are counted as about
+            // to be freed when checking that this job would otherwise fit.
+            let held = owner.is_none()
+                && is_workspace_head
+                && !index.occupied(job.key())
+                && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
             let pause = job.queued_ms.is_some()
-                && owner.is_some_and(|(_, owner_weight)| {
-                    let Some(request) = job.request.as_ref() else {
-                        return false;
-                    };
-                    let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
-                    !blocked_by_head
-                        && !Self::deleting(inner, job.key(), &request.siblings)
-                        && !index
-                            .siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
-                        && job.weight <= self.core.config.max_weight
-                        && index
-                            .weight
-                            .saturating_sub(owner_weight)
-                            .saturating_add(job.weight)
-                            <= self.core.config.max_weight
-                });
+                && owner
+                    .map(|(_, owner_weight)| owner_weight)
+                    .or(held.then_some(0))
+                    .is_some_and(|owner_weight| {
+                        let Some(request) = job.request.as_ref() else {
+                            return false;
+                        };
+                        let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
+                        !blocked_by_head
+                            && !Self::deleting(inner, job.key(), &request.siblings)
+                            && !index
+                                .siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
+                            && job.weight <= self.core.config.max_weight
+                            && index
+                                .weight
+                                .saturating_sub(owner_weight)
+                                .saturating_add(job.weight)
+                                <= self.core.config.max_weight
+                    });
             let initialized = job
                 .queue_wait_clock_initialized
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -4330,6 +4345,7 @@ impl Runner {
                     && Self::deleting(inner, job.key(), &request.siblings))
                     || index.occupied(job.key())
                     || index.siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
+                    || index.held_by_queued_workspace(inner, job, self.core.config.max_weight)
                 {
                     // A checkout conflict cannot be resolved by idling unrelated CPUs.
                     continue;
@@ -5884,6 +5900,39 @@ impl DispatchIndex {
                         catalog.get(&sibling.canonical_path) != Some(&sibling.commit)
                             || commits.iter().any(|commit| commit != &sibling.commit)
                     })
+        })
+    }
+    /// Whether a queued workspace job holds `job` back from starting.
+    ///
+    /// A sibling is checked out in place at its canonical path, the same host
+    /// directory a job whose main workspace is that path uses, so the two
+    /// cannot run together. Jobs that use the path as a sibling at one commit
+    /// may overlap one another, so under steady load they would keep the
+    /// directory busy and the main workspace job would never start. The next
+    /// job to start on a workspace therefore holds back every job that
+    /// declares an overlapping sibling and was accepted after it. Holding
+    /// only later arrivals keeps the waits acyclic: two repositories that
+    /// name each other as siblings cannot hold each other back. Cache-fill
+    /// jobs and jobs that can never fit the runner do not hold anyone.
+    fn held_by_queued_workspace(&self, inner: &Inner, job: &Job, max_weight: u32) -> bool {
+        let Some(request) = job.request.as_ref() else {
+            return false;
+        };
+        if request.siblings.is_empty() {
+            return false;
+        }
+        self.queued.iter().any(|(key, queue)| {
+            let Some(head) = queue.first().map(|id| &inner.jobs[id]) else {
+                return false;
+            };
+            head.id != job.id
+                && !head.base
+                && head.weight <= max_weight
+                && head.order < job.order
+                && request
+                    .siblings
+                    .iter()
+                    .any(|sibling| Self::overlap(key, &sibling.canonical_path))
         })
     }
     fn heads(&self, inner: &Inner, now: u64) -> Vec<Uuid> {
