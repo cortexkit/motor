@@ -208,18 +208,9 @@ pub(crate) fn validate(
             destination(Path::new(workspace))?,
             destination(Path::new(repository))?,
         ];
-        for sibling in siblings {
+        for (sibling, alias) in siblings.iter().zip(sibling_aliases(workspace, siblings)?) {
             let path = destination(Path::new(&sibling.canonical_path))?;
-            let alias = destination(
-                &Path::new(workspace)
-                    .parent()
-                    .ok_or_else(|| invalid("workspace has no parent"))?
-                    .join(
-                        Path::new(&sibling.canonical_path)
-                            .file_name()
-                            .ok_or_else(|| invalid("sibling path has no name"))?,
-                    ),
-            )?;
+            let alias = alias.canonical;
             for mount in [&path, &alias] {
                 if paths
                     .iter()
@@ -264,39 +255,9 @@ pub(crate) fn validate_destinations(
     cwd: Option<&str>,
     siblings: &[SiblingSnapshot],
 ) -> io::Result<()> {
-    let allowed: Vec<_> = roots
-        .iter()
-        .map(|root| {
-            destination(root).map_err(|error| {
-                invalid(format!(
-                    "cannot resolve owned root: path={} allowed_roots={roots:?}: {error}",
-                    root.display()
-                ))
-            })
-        })
-        .collect::<io::Result<_>>()?;
-    let resolve = |path: &str| -> io::Result<PathBuf> {
-        if absolute(path) {
-            let canonical = destination(Path::new(path)).map_err(|error| {
-                invalid(format!(
-                    "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
-                ))
-            })?;
-            // Compare resolved paths only: a root or a request path may reach the
-            // same directory through a symlinked prefix (macOS /var is
-            // /private/var), and what matters is where the files actually land.
-            if allowed
-                .iter()
-                .any(|resolved| canonical.starts_with(resolved) && canonical != *resolved)
-            {
-                return Ok(canonical);
-            }
-        }
-        Err(invalid(format!(
-            "destination outside runner-owned roots: path={path} allowed_roots={roots:?}; \
-             move the checkout under one of the allowed roots"
-        )))
-    };
+    let allowed = allowed_roots(roots)?;
+    let resolve =
+        |path: &str| authorize_destination(roots, &allowed, path, destination(Path::new(path)));
     let workspace = resolve(key)?;
     if let Some(cwd) = cwd {
         if !resolve(cwd)?.starts_with(&workspace) {
@@ -309,10 +270,79 @@ pub(crate) fn validate_destinations(
     Ok(())
 }
 
+fn allowed_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    roots
+        .iter()
+        .map(|root| {
+            destination(root).map_err(|error| {
+                invalid(format!(
+                    "cannot resolve owned root: path={} allowed_roots={roots:?}: {error}",
+                    root.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn authorize_destination(
+    roots: &[PathBuf],
+    allowed: &[PathBuf],
+    path: &str,
+    canonical: io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    if absolute(path) {
+        let canonical = canonical.map_err(|error| {
+            invalid(format!(
+                "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
+            ))
+        })?;
+        // Compare resolved paths only: a root or a request path may reach the
+        // same directory through a symlinked prefix (macOS /var is
+        // /private/var), and what matters is where the files actually land.
+        if allowed
+            .iter()
+            .any(|resolved| canonical.starts_with(resolved) && canonical != *resolved)
+        {
+            return Ok(canonical);
+        }
+    }
+    Err(invalid(format!(
+        "destination outside runner-owned roots: path={path} allowed_roots={roots:?}; \
+             move the checkout under one of the allowed roots"
+    )))
+}
+
+/// A snapshot sibling's worktree alias and its resolved mount destination.
+/// A dangling host alias is accepted only if its target resolves to the sibling's
+/// authorized path. The sandbox hides that link with a snapshot mount.
+pub(crate) struct SiblingAlias {
+    pub path: PathBuf,
+    pub canonical: PathBuf,
+}
+
+pub(crate) fn validate_alias_destinations(
+    roots: &[PathBuf],
+    aliases: &[SiblingAlias],
+) -> io::Result<()> {
+    let allowed = allowed_roots(roots)?;
+    for alias in aliases {
+        authorize_destination(
+            roots,
+            &allowed,
+            alias
+                .path
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF8 sibling alias"))?,
+            Ok(alias.canonical.clone()),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn sibling_aliases(
     key: &str,
     siblings: &[SiblingSnapshot],
-) -> io::Result<Vec<SiblingSnapshot>> {
+) -> io::Result<Vec<SiblingAlias>> {
     siblings
         .iter()
         .map(|sibling| {
@@ -324,12 +354,30 @@ pub(crate) fn sibling_aliases(
                         .file_name()
                         .ok_or_else(|| invalid("sibling path has no name"))?,
                 );
-            let mut alias = sibling.clone();
-            alias.canonical_path = path
-                .to_str()
-                .ok_or_else(|| invalid("non-UTF8 sibling alias"))?
-                .into();
-            Ok(alias)
+            let canonical = match destination(&path) {
+                Ok(canonical) => canonical,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) =>
+                {
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| invalid("alias has no parent"))?;
+                    let target = parent.join(fs::read_link(&path)?);
+                    if destination(&target)? != destination(Path::new(&sibling.canonical_path))? {
+                        return Err(error);
+                    }
+                    // Retiring an in-place sibling leaves its worktree alias dangling.
+                    // Snapshot mounts hide that host link: validate the virtual mount
+                    // node, but only for a link to this sibling's authorized path.
+                    destination(parent)?.join(
+                        path.file_name()
+                            .ok_or_else(|| invalid("alias has no name"))?,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(SiblingAlias { path, canonical })
         })
         .collect()
 }

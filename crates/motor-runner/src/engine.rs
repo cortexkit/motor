@@ -726,6 +726,9 @@ fn nested_workspace_detail(
         for request in inner
             .jobs
             .values()
+            // Cache-fill jobs use base:<root> as a scheduling key, not a filesystem
+            // path. Writer-path validation checks each fill job's actual checkout cwd.
+            .filter(|job| !job.base)
             .filter_map(|j| j.request.as_ref())
             .chain(inner.admitting.values())
         {
@@ -2826,10 +2829,8 @@ impl Runner {
             return Ok(());
         }
         if self.core.config.sibling_snapshot_mode() {
-            workspace::validate_destinations(
+            workspace::validate_alias_destinations(
                 &self.core.config.owned_workspace_roots,
-                key,
-                cwd,
                 &workspace::sibling_aliases(key, siblings)?,
             )?;
         }
@@ -2889,10 +2890,8 @@ impl Runner {
         }
         crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
         if self.core.config.sibling_snapshot_mode() {
-            crate::writer::validate_paths(
+            crate::writer::validate_alias_paths(
                 &self.core.config,
-                workspace,
-                cwd,
                 &workspace::sibling_aliases(workspace, siblings)?,
                 &known,
             )?;

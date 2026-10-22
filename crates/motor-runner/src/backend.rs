@@ -397,10 +397,8 @@ impl Backend for HostBackend {
         )?;
         if config.sibling_snapshot_mode() && !s.base {
             workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings, true)?;
-            workspace::validate_destinations(
+            workspace::validate_alias_destinations(
                 &config.owned_workspace_roots,
-                &r.workspace_key,
-                Some(&r.cwd),
                 &workspace::sibling_aliases(&r.workspace_key, &r.siblings)?,
             )?;
         }

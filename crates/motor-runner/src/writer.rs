@@ -91,6 +91,35 @@ pub(crate) fn validate_paths(
     siblings: &[SiblingSnapshot],
     known_checkouts: &[PathBuf],
 ) -> io::Result<()> {
+    validate_resolved_paths(
+        config,
+        known_checkouts,
+        std::iter::once(workspace)
+            .chain(cwd)
+            .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
+            .map(|path| Ok((PathBuf::from(path), canonical_future(Path::new(path))?))),
+    )
+}
+
+pub(crate) fn validate_alias_paths(
+    config: &Config,
+    aliases: &[workspace::SiblingAlias],
+    known_checkouts: &[PathBuf],
+) -> io::Result<()> {
+    validate_resolved_paths(
+        config,
+        known_checkouts,
+        aliases
+            .iter()
+            .map(|alias| Ok((alias.path.clone(), alias.canonical.clone()))),
+    )
+}
+
+fn validate_resolved_paths(
+    config: &Config,
+    known_checkouts: &[PathBuf],
+    paths: impl IntoIterator<Item = io::Result<(PathBuf, PathBuf)>>,
+) -> io::Result<()> {
     let mut protected = vec![
         canonical_runner_path(&config.state_dir().join("sccache"))?,
         canonical_runner_path(&config.writer_scratch_dir())?,
@@ -99,14 +128,10 @@ pub(crate) fn validate_paths(
         protected.push(canonical_future(checkout)?);
     }
     let prefix = format!(".motor-base-{}-", config.instance);
-    for path in std::iter::once(workspace)
-        .chain(cwd)
-        .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
-    {
-        let supplied = Path::new(path);
-        let canonical = canonical_future(supplied)?;
+    for path in paths {
+        let (supplied, canonical) = path?;
         if protected.iter().any(|owned| overlaps(&canonical, owned))
-            || has_base_component(supplied, &prefix)
+            || has_base_component(&supplied, &prefix)
             || has_base_component(&canonical, &prefix)
             || contains_base_checkout(&canonical, &prefix)?
         {

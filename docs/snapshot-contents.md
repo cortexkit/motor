@@ -39,6 +39,14 @@ must not overlap, including siblings with colliding directory names. Tests:
 `snapshot_sibling_path_authorization_refuses_roots_nesting_and_symlink_escape`,
 `snapshot_sibling_refuses_nesting_in_known_workspace_or_sibling_by_canonical_path`.
 
+After an in-place sibling checkout is retired, its worktree alias can remain a
+dangling host symlink. Snapshot mounts do not need that host checkout. A dangling
+alias is accepted only when its target resolves to the declared sibling path;
+the virtual alias mount node still receives root, overlap and writer-storage
+checks. Other dangling host paths remain refused. Tests:
+`snapshot_worktree_with_a_dangling_legacy_sibling_alias_is_admitted`,
+`snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes`.
+
 1.4. Older runners, in-place runners and Windows runners still require siblings
 to share the repository root's parent directory. For a linked worktree this
 means beside its main checkout, not beside the worktree. In-place runners
