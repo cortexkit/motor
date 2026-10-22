@@ -22,7 +22,10 @@
 # recorded measurement says when, where and at which revision it was taken.
 # It reads only; it never changes a checkout.
 #
-# Requires GNU du (for --exclude); the build server's Linux has it.
+# Requires GNU du (for --exclude). It prefers `gnudu` over `du` because
+# Ubuntu 26.04 makes uutils coreutils the default `du` and installs GNU's as
+# `gnudu`. The other tools it calls (find -print0, sort -z, cut, date) work
+# the same in GNU and uutils.
 
 set -euo pipefail
 
@@ -31,17 +34,30 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-if ! du --version 2>/dev/null | grep -q 'GNU coreutils'; then
-  echo "GNU du is required (for --exclude); run this on the Linux build server" >&2
+gnu_du=
+for candidate in gnudu du; do
+  # Read the version into a variable rather than piping it to grep -q: grep
+  # exiting early could kill the writer, and pipefail would then reject GNU du.
+  version="$("$candidate" --version 2>/dev/null)" || continue
+  case "$version" in
+    *"GNU coreutils"*)
+      gnu_du="$candidate"
+      break
+      ;;
+  esac
+done
+if [ -z "$gnu_du" ]; then
+  echo "GNU du is required (for --exclude); neither gnudu nor du is GNU coreutils du" >&2
   exit 2
 fi
 
 kib() {
-  du -sk "$@" | cut -f1
+  "$gnu_du" -sk "$@" | cut -f1
 }
 
 echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "host: $(hostname)"
+echo "du: $(command -v "$gnu_du")"
 
 status=0
 for checkout in "$@"; do
