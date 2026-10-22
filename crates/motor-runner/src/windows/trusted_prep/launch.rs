@@ -40,8 +40,10 @@ pub(super) enum DiagnosticPolicy {
     LowboxSelfToken,
     /// Plain AppContainer token built through the same self-created directory.
     LowboxSelfTokenPlain,
-    /// LPAC with privateNetworkClientServer to compare getaddrinfo and private-network behavior.
-    LowboxSelfTokenPrivateNetwork,
+    /// LPAC profile created under motor-prep impersonation with the self-created token path.
+    LowboxSelfTokenProfileLpac,
+    /// Plain AppContainer profile created under motor-prep impersonation with the self-token path.
+    LowboxSelfTokenProfileAppContainer,
     /// LPAC profile created under the prep user's loaded hive before attribute launch.
     LowboxProfileLpac,
     /// Plain AppContainer profile created under the prep user's loaded hive.
@@ -53,10 +55,11 @@ impl DiagnosticPolicy {
         match self {
             Self::LowboxLpac
             | Self::LowboxSelfToken
-            | Self::LowboxSelfTokenPrivateNetwork
+            | Self::LowboxSelfTokenProfileLpac
             | Self::LowboxProfileLpac => Some(true),
             Self::LowboxAppContainer
             | Self::LowboxSelfTokenPlain
+            | Self::LowboxSelfTokenProfileAppContainer
             | Self::LowboxProfileAppContainer => Some(false),
             _ => None,
         }
@@ -66,16 +69,17 @@ impl DiagnosticPolicy {
             self,
             Self::LowboxSelfToken
                 | Self::LowboxSelfTokenPlain
-                | Self::LowboxSelfTokenPrivateNetwork
+                | Self::LowboxSelfTokenProfileLpac
+                | Self::LowboxSelfTokenProfileAppContainer
         )
-    }
-    pub(super) fn lowbox_private_network(self) -> bool {
-        self == Self::LowboxSelfTokenPrivateNetwork
     }
     pub(super) fn lowbox_profile(self) -> bool {
         matches!(
             self,
-            Self::LowboxProfileLpac | Self::LowboxProfileAppContainer
+            Self::LowboxProfileLpac
+                | Self::LowboxProfileAppContainer
+                | Self::LowboxSelfTokenProfileLpac
+                | Self::LowboxSelfTokenProfileAppContainer
         )
     }
     pub(super) fn changes_default_dacl(self) -> bool {

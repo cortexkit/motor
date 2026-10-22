@@ -1,8 +1,11 @@
 //! Diagnostic-only AppContainer network matrix for trusted preparation. It uses
-//! the self-created NtCreateLowBoxToken/object-directory launch path with Less
-//! Privileged AppContainer (LPAC), plain AppContainer, and LPAC plus
-//! privateNetworkClientServer tokens. It records name resolution, raw TCP,
-//! Schannel TLS, a separate Local Security Authority (LSA) probe, and filesystem-write-check evidence.
+//! the self-created NtCreateLowBoxToken/object-directory launch path with an
+//! AppContainer profile created under motor-prep impersonation. It compares LPAC
+//! and plain AppContainer tokens. It records name resolution, raw TCP, Schannel
+//! TLS, a separate Local Security Authority (LSA) probe, and filesystem-write-check evidence.
+//! If a probe child starts, Cargo uses the first token passing DNS/TCP/TLS, or
+//! the started token with the most transport progress if none passes; if no child
+//! starts, Cargo is skipped.
 //! If a probe child starts, Cargo uses the first token passing DNS/TCP/TLS, or
 //! the started token with the most transport progress if none passes; if no child
 //! starts, Cargo is skipped.
@@ -178,11 +181,18 @@ fn schannel_tls_probe() -> Value {
 
     fn failed(call: &str) -> Value {
         let error = std::io::Error::last_os_error();
+        let code = error.raw_os_error();
+        let code_name = match code {
+            Some(14) => Some("ERROR_OUTOFMEMORY"),
+            Some(8) => Some("ERROR_NOT_ENOUGH_MEMORY"),
+            _ => None,
+        };
         json!({
             "api":"WinHTTP/Schannel",
             "handshake_completed":false,
             "failed_call":call,
-            "win32_error":error.raw_os_error(),
+            "win32_error":code,
+            "win32_error_name":code_name,
             "error":error.to_string()
         })
     }
@@ -439,10 +449,17 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
         };
         let mut handle = null_mut();
         let status = unsafe { LsaConnectUntrusted(&mut handle) };
-        if status >= 0 {
-            unsafe { LsaDeregisterLogonProcess(handle) };
-        }
-        json!({"lsa_connect_untrusted_ntstatus": format!("0x{:08X}", status as u32), "connected": status >= 0})
+        let deregister = if handle.is_null() {
+            None
+        } else {
+            Some(unsafe { LsaDeregisterLogonProcess(handle) })
+        };
+        json!({
+            "lsa_connect_untrusted_ntstatus": format!("0x{:08X}", status as u32),
+            "connected": status >= 0 && !handle.is_null(),
+            "handle_returned": !handle.is_null(),
+            "deregister_ntstatus": deregister.map(|status| format!("0x{:08X}", status as u32))
+        })
     };
     let mut rng = serde_json::Map::new();
     for mode in ["rng-process-prng", "rng-bcrypt-gen-random"] {
@@ -506,9 +523,10 @@ pub(super) fn probe(credential: &Path, outside: &Path, output: &Path) -> io::Res
     Ok(())
 }
 
-/// SYSTEM side: record no-launch prechecks, compare three self-created-token
-/// network variants, and, if any probe child starts, run Cargo on the first
-/// DNS/TCP/TLS-ready token or the furthest-reaching launched token. LSA is separate.
+/// SYSTEM side: record no-launch prechecks and compare LPAC/plain AppContainer
+/// profiles launched through self-created tokens. If a probe child starts, run
+/// Cargo on the first token passing DNS/TCP/TLS or the furthest-reaching token if
+/// none passes. LSA is reported separately.
 pub(super) fn entry(config: Config) -> io::Result<()> {
     use fs2::FileExt;
     use windows_service::{
@@ -607,7 +625,7 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
             report_path: &report_path,
         };
         use launch::DiagnosticPolicy::{
-            LowboxSelfToken, LowboxSelfTokenPlain, LowboxSelfTokenPrivateNetwork,
+            LowboxSelfTokenProfileAppContainer, LowboxSelfTokenProfileLpac,
         };
         let mut cells = Vec::new();
         let cargo_home = stage.join("fetch-temp/cargo-network");
@@ -626,12 +644,11 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
             u8,
         )> = None;
         for (index, name, policy) in [
-            (1, "self-token-lpac", LowboxSelfToken),
-            (2, "self-token-plain-appcontainer", LowboxSelfTokenPlain),
+            (1, "self-token-profile-lpac", LowboxSelfTokenProfileLpac),
             (
-                3,
-                "self-token-lpac-private-network",
-                LowboxSelfTokenPrivateNetwork,
+                2,
+                "self-token-profile-appcontainer",
+                LowboxSelfTokenProfileAppContainer,
             ),
         ] {
             let output = stage.join(format!("fetch-temp/lowbox-network-probe-{index}.json"));
@@ -742,8 +759,8 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
             let fetch_report = run_real_cargo_fetch(&cargo_fetch_context, &cargo_home, policy);
             let deferred = fetch_report.get("cleanup_deferred").is_some();
             report["real_cargo_fetch_attempted"] = json!(true);
-            report["cell_4"] = json!({
-                "cell":4,
+            report["cell_3"] = json!({
+                "cell":3,
                 "name":"real-cargo-fetch",
                 "trigger_cell":index,
                 "trigger_variant":name,
@@ -762,7 +779,7 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
         } else {
             let reason = "no token variant resumed a probe child; Cargo could not be launched";
             report["real_cargo_fetch_skipped"] = json!(reason);
-            report["cell_4"] = json!({"cell":4,"name":"real-cargo-fetch","launched":false,"skipped_reason":reason});
+            report["cell_3"] = json!({"cell":3,"name":"real-cargo-fetch","launched":false,"skipped_reason":reason});
             report["real_cargo_fetch_attempted"] = json!(false);
         }
         Ok(())
@@ -785,6 +802,10 @@ pub(super) fn entry(config: Config) -> io::Result<()> {
     report["persistent_grants_reverted_exactly"] =
         json!(before.iter().all(Result::is_ok) && before == after);
     report["revoke_error"] = json!(revoke.as_ref().err().map(ToString::to_string));
+    report["post_diagnostic_prechecks"] = match launch::lowbox_prechecks(config) {
+        Ok(checks) => checks,
+        Err(error) => json!({"error":error.to_string()}),
+    };
     let mut outside_leftovers = Vec::new();
     for outside in &outside_files {
         if outside.exists() {

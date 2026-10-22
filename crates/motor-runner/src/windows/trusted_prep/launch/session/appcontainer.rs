@@ -144,13 +144,13 @@ pub(crate) struct Launch {
     pub(super) info: Value,
 }
 impl Launch {
-    pub(super) fn new(lpac: bool, private_network: bool) -> io::Result<Self> {
-        Self::build(lpac, private_network, None)
+    pub(super) fn new(lpac: bool) -> io::Result<Self> {
+        Self::build(lpac, None)
     }
     pub(super) fn with_profile(lpac: bool, token: HANDLE) -> io::Result<Self> {
-        Self::build(lpac, false, Some(token))
+        Self::build(lpac, Some(token))
     }
-    fn build(lpac: bool, private_network: bool, profile_token: Option<HANDLE>) -> io::Result<Self> {
+    fn build(lpac: bool, profile_token: Option<HANDLE>) -> io::Result<Self> {
         let mut names = vec![(
             "internetClient".to_owned(),
             vec![INTERNET_CLIENT.to_owned()],
@@ -159,11 +159,6 @@ impl Launch {
             for name in ["registryRead", "lpacCryptoServices"] {
                 names.push((name.to_owned(), capability_sids(name)?));
             }
-        }
-        if private_network {
-            // Test whether this documented grant changes getaddrinfo or private-network access.
-            let name = "privateNetworkClientServer";
-            names.push((name.to_owned(), capability_sids(name)?));
         }
         let capability_sids = names
             .iter()
@@ -215,7 +210,6 @@ impl Launch {
             Reserved: 0,
         });
         let info = json!({"package_name": PACKAGE_NAME, "package_sid": package_text, "lpac": lpac,
-            "private_network_client_server":private_network,
             "capabilities": names.iter().map(|(name, sids)| json!({"name": name, "sids": sids})).collect::<Vec<_>>(),
             "profile_name": profile_name, "profile_created": profile_created,
             "profile_folder": profile_folder, "profile_folder_error": profile_folder_error});
@@ -604,7 +598,13 @@ impl ObjectDirectory {
         })?;
         let status = unsafe { create(&mut directory, 0x000F_000F, &mut attributes, null_mut(), 0) };
         if status < 0 {
-            return Err(native_error("NtCreateDirectoryObjectEx", status));
+            return Err(step(
+                "NtCreateDirectoryObjectEx",
+                format!(
+                    "path={path}; {}",
+                    native_error("NtCreateDirectoryObjectEx", status)
+                ),
+            ));
         }
         Ok(Self {
             parent,
@@ -628,17 +628,38 @@ impl ObjectDirectory {
                 format!("path={}; {}", self.path, errors.join("; ")),
             ));
         }
-        let after = directory_probe(&self.path);
+        // The token is given this directory handle; allow process/token teardown to
+        // release its reference before treating a still-named object as a leftover.
+        let started = std::time::Instant::now();
+        let first = directory_probe(&self.path);
+        let mut after = first.clone();
+        let mut polls = 0;
+        while after["exists"] == json!(true)
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            after = directory_probe(&self.path);
+            polls += 1;
+        }
         let removed = after["exists"] == json!(false);
         if !removed {
             return Err(step(
                 "object-directory-cleanup",
-                format!("path={}; post-close-probe={after}", self.path),
+                format!(
+                    "path={}; first-post-close-probe={first}; final-probe={after}; polls={polls}",
+                    self.path
+                ),
             ));
         }
-        Ok(
-            json!({"path":self.path,"handles_closed":self.directory.0.is_null() && self.parent.0.is_null(),"directory_removed":true,"post_close_probe":after}),
-        )
+        Ok(json!({
+            "path":self.path,
+            "handles_closed":self.directory.0.is_null() && self.parent.0.is_null(),
+            "directory_removed":true,
+            "first_post_close_probe":first,
+            "post_close_probe":after,
+            "post_close_poll_count":polls,
+            "settle_ms":started.elapsed().as_millis()
+        }))
     }
 }
 impl Drop for ObjectDirectory {
@@ -751,13 +772,33 @@ pub(super) fn precheck_profile_registry(user_sid: &str, package_sid: &str) -> Va
     if mapping_exists {
         unsafe { RegCloseKey(mapping) };
     }
+    let storage_path = format!(
+        r"{user_sid}\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\{package_sid}"
+    );
+    let mut storage = null_mut();
+    let storage_status = unsafe {
+        RegOpenKeyExW(
+            hkey_users,
+            wide(&storage_path).as_ptr(),
+            0,
+            KEY_READ,
+            &mut storage,
+        )
+    };
+    let storage_exists = storage_status == 0;
+    if storage_exists {
+        unsafe { RegCloseKey(storage) };
+    }
     json!({
         "hive_path":format!(r"HKEY_USERS\{user_sid}"),
         "profile_hive_loaded":hive_open,
         "profile_hive_open_status":hive_status,
         "mapping_path":format!(r"HKEY_USERS\{mapping_path}"),
         "mapping_exists":mapping_exists,
-        "mapping_open_status":mapping_status
+        "mapping_open_status":mapping_status,
+        "storage_path":format!(r"HKEY_USERS\{storage_path}"),
+        "storage_exists":storage_exists,
+        "storage_open_status":storage_status
     })
 }
 

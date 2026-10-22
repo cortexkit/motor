@@ -157,30 +157,39 @@ Production launches do not enable loader snaps or debugger creation flags.
 For the AppContainer network failure, collect the lowbox-only diagnostic with
 `run-system.ps1 -PrepLaunchMatrix -LowboxLaunch`. It records no-launch prechecks
 for the session's `AppContainerNamedObjects` directory, the `motor-prep` profile
-hive/mapping and batch-token session. The SYSTEM process resolves an index.crates.io
-address once so each token can be tested separately for name resolution and raw
-TCP access through the Windows Filtering Platform (WFP). Three variants use the same self-created object directory and
-`NtCreateLowBoxToken` path: Less Privileged AppContainer (LPAC) with the current
-capabilities, plain AppContainer with `internetClient`, and LPAC plus
-`privateNetworkClientServer`. The last
-capability is the documented private-network grant; Chromium's Windows network
-service also uses it alongside `internetClient` for its AppContainer path. See
-[Microsoft networking capabilities](https://learn.microsoft.com/en-us/windows/apps/develop/networking/networking-basics),
-[Microsoft WinHTTP SSL](https://learn.microsoft.com/en-us/windows/win32/winhttp/ssl-in-winhttp),
-[Chromium's network broker](https://chromium.googlesource.com/chromium/src/+/673a5aee77ad12e118c8edac73359acdeb7f491c/services/network/broker_helper_win.cc),
+hive/mapping, and the batch-token session. SYSTEM resolves an index.crates.io
+address once so token name resolution can be distinguished from raw TCP/Windows
+Filtering Platform (WFP) access.
+It then compares two variants that create the AppContainer profile under
+`motor-prep` impersonation with its hive loaded, but launch through the same
+self-created object directory and `NtCreateLowBoxToken` path. The variants are
+Less Privileged AppContainer (LPAC) with `internetClient`, `registryRead` and
+`lpacCryptoServices`, and plain AppContainer with `internetClient`. This combines profile registration/storage with
+the self-created-token launch method. The filesystem-write checks also attempt
+writes to the AppContainer profile folder and registry storage. See [Microsoft's AppContainer profile
+guidance](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer),
+[`NtCreateLowBoxToken`](https://learn.microsoft.com/en-us/windows/win32/secauthz/ntcreatelowboxtoken),
+[WinHTTP SSL](https://learn.microsoft.com/en-us/windows/win32/winhttp/ssl-in-winhttp),
 and [DNS client RPC behavior](https://projectzero.google/2021/08/understanding-network-access-windows-app.html).
 
 Each token runs the same filesystem-write checks and calls in-token `getaddrinfo`
 to record whether name resolution succeeds; this does not test direct reachability
 of a DNS server. Raw TCP is separately attempted against the SYSTEM-resolved
-index.crates.io address, and WinHTTP tests HTTPS using Schannel TLS.
+index.crates.io address, and WinHTTP tests HTTPS using Schannel TLS. Microsoft's
+[WinHttpOpen documentation](https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpopen)
+lists `ERROR_NOT_ENOUGH_MEMORY` as a generic allocation failure; Win32 14 is
+`ERROR_OUTOFMEMORY` (not enough storage), with no documented AppContainer-specific
+meaning. It fails before a request or Schannel handshake, so the probe records the
+startup error without treating it as a network result. See [system error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
 `LsaConnectUntrusted` is reported separately; it does not gate the transport
 result or Cargo fetch. If a probe child starts, Cargo fetch uses the first token
 passing DNS/TCP/Schannel; if none passes all three, it uses the started token with
 the most transport progress. If no probe child starts, Cargo fetch is skipped.
 Each report records all token capabilities, Local Security Authority (LSA) status,
-network stages, failing API/Win32 error, write attempts and cleanup paths. The
-diagnostic attempts to revert persistent grants and records whether their
+network stages, failing API/Win32 error, write attempts and cleanup paths. Per-cell
+cleanup records profile deletion, profile-folder/registry state, user-hive unload,
+token closure and object-directory disappearance; a final precheck reports leftovers.
+The diagnostic attempts to revert persistent grants and records whether their
 before/after discretionary access control lists (DACLs) match. It also attempts
 to remove staging; an unreaped child defers that cleanup, and the report records
 any leftover path. This remains diagnostic evidence, not qualification or a

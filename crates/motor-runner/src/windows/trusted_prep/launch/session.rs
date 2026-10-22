@@ -713,7 +713,7 @@ impl Session {
                 if plan.diagnostic_policy.lowbox_profile() {
                     appcontainer::Launch::with_profile(lpac, profile.token.0)
                 } else {
-                    appcontainer::Launch::new(lpac, plan.diagnostic_policy.lowbox_private_network())
+                    appcontainer::Launch::new(lpac)
                 }
             })
             .transpose()?;
@@ -903,8 +903,40 @@ impl Session {
                     }
                     Err(error) => errors.push(error.to_string()),
                 }
-                self.cleanup_report["profile_registry_after_delete"] =
+                let registry_check =
                     appcontainer::precheck_profile_registry(&self.user_sid, &launch.package_text);
+                self.cleanup_report["profile_registry_after_delete"] = registry_check.clone();
+                for key in ["mapping", "storage"] {
+                    let path = registry_check[format!("{key}_path").as_str()]
+                        .as_str()
+                        .unwrap_or("<unknown registry path>");
+                    let status = registry_check[format!("{key}_open_status").as_str()]
+                        .as_i64()
+                        .unwrap_or(-1);
+                    if registry_check[format!("{key}_exists").as_str()] == json!(true)
+                        || !matches!(status, 2 | 3)
+                    {
+                        errors.push(format!(
+                            "AppContainer {key} remains or cannot be verified at {path} (open status {status})"
+                        ));
+                    }
+                }
+                if let Some(folder) = launch.info["profile_folder"].as_str() {
+                    let folder_path = Path::new(folder);
+                    let folder_state = match fs::symlink_metadata(folder_path) {
+                        Ok(_) => json!({"path":folder,"exists":true}),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            json!({"path":folder,"exists":false})
+                        }
+                        Err(error) => {
+                            json!({"path":folder,"exists":null,"error":error.to_string()})
+                        }
+                    };
+                    if folder_state["exists"] != json!(false) {
+                        errors.push(format!("AppContainer profile folder remains or cannot be verified: {folder_state}"));
+                    }
+                    self.cleanup_report["appcontainer_profile_folder_after_delete"] = folder_state;
+                }
             }
         }
         if let Some(directory) = &mut self.object_directory {

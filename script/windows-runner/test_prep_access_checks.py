@@ -180,7 +180,7 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('lpac_policy: lpac.then(|| Box::new(ALL_APPLICATION_PACKAGES_OPT_OUT))', self.appcontainer)
         self.code('let attributes = Attributes::new(&mut handles, &extra)?;', self.process)
         self.code('appcontainer::Launch::with_profile(lpac, profile.token.0)', self.session)
-        self.code('appcontainer::Launch::new(lpac, plan.diagnostic_policy.lowbox_private_network())', self.session)
+        self.code('appcontainer::Launch::new(lpac)', self.session)
         self.code('launch.attributes()', self.session)
         self.code('CreateRestrictedToken(profile.token.0, DISABLE_MAX_PRIVILEGE, 0, null(), 0, null(), 0, null(), &mut result)', self.session)
         self.code('CreateAppContainerProfile(', self.appcontainer)
@@ -217,12 +217,11 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('"qualify-prep-lowbox" => motor_runner::hyperv_qualify_prep_lowbox(config)', (SRC.parent / 'main.rs').read_text())
 
 
-    def test_lowbox_network_matrix_reuses_self_token_and_gates_fetch_on_transport(self):
+    def test_profile_network_matrix_combines_hive_profile_and_self_token(self):
         source = flat(self.cells)
         for cell in (
-            '(1, "self-token-lpac", LowboxSelfToken)',
-            '(2, "self-token-plain-appcontainer", LowboxSelfTokenPlain)',
-            '(3, "self-token-lpac-private-network", LowboxSelfTokenPrivateNetwork)',
+            '(1, "self-token-profile-lpac", LowboxSelfTokenProfileLpac)',
+            '(2, "self-token-profile-appcontainer", LowboxSelfTokenProfileAppContainer)',
         ):
             self.code(cell, source)
         self.code('let prechecks = launch::lowbox_prechecks(config)?;', source)
@@ -231,24 +230,26 @@ class LowboxLaunchCellTests(unittest.TestCase):
         self.code('fn transport_steps_pass(proof: &Value)', source)
         self.code('if transport_passed && first_transport_success.is_none()', source)
         self.code('furthest_candidate', source)
+        self.code('appcontainer::Launch::with_profile(lpac, profile.token.0)', self.session)
+        self.code('launch.create_token(base.0, directory.handle())', self.session)
         self.code('run_real_cargo_fetch(', source)
         self.code('"network_fetch_gate"', source)
         self.code('"lsa_is_observational"', source)
-        self.code('"fetch", "--locked", "--target", "x86_64-pc-windows-msvc", "--manifest-path"', source)
-        self.code('"real_cargo_fetch_skipped"', source)
-        self.code('"cell_4"', source)
+        self.code('"cell_3"', source)
         self.code('"MOTOR_LOWBOX_TCP_TARGET"', source)
         self.code('"persistent_grants_reverted_exactly"', source)
+        self.code('"post_diagnostic_prechecks"', source)
         self.code('"staging_removed"', source)
         for call in ('InitializeProcThreadAttributeList', 'UpdateProcThreadAttribute', 'CreateProcessAsUserW'):
             self.code(call, self.process)
         self.code('"failure_details"', source)
 
-    def test_private_network_variant_only_adds_the_documented_capability(self):
-        self.code('privateNetworkClientServer', self.appcontainer)
-        self.code('policy.lowbox_private_network()', self.session)
-        self.code('Self::LowboxSelfTokenPrivateNetwork', self.launch)
-        self.code('lowbox_private_network(self)', self.launch)
+    def test_self_token_profile_policies_keep_the_lpac_plain_capability_split(self):
+        for policy in ('LowboxSelfTokenProfileLpac', 'LowboxSelfTokenProfileAppContainer'):
+            self.code(policy, self.launch)
+        self.code('lowbox_profile(self)', self.launch)
+        self.code('registryRead', self.appcontainer)
+        self.code('lpacCryptoServices', self.appcontainer)
 
 
     def test_lowbox_cells_create_and_report_the_required_token_profile_and_cleanup_paths(self):
@@ -261,17 +262,22 @@ class LowboxLaunchCellTests(unittest.TestCase):
             'NtCreateLowBoxToken',
             '"profile_hive_loaded"',
             '"mapping_path"',
+            '"storage_path"',
+            '"storage_exists"',
             'GetAppContainerFolderPath',
             'GetAppContainerRegistryLocation',
             '"appcontainer_profile_folder"',
             '"appcontainer_registry"',
             '"session_cleanup"',
             '"process_created"',
+            '"appcontainer_profile_folder_after_delete"',
         ):
             self.code(fragment, source)
         self.code('"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;{package_sid})"', self.appcontainer)
         self.code('"handles_closed"', self.appcontainer)
         self.code('"directory_removed"', self.appcontainer)
+        self.code('"post_close_poll_count"', self.appcontainer)
+        self.code('"first_post_close_probe"', self.appcontainer)
     def test_self_created_lowbox_uses_lpac_policy_without_security_capabilities_attribute(self):
         method = self.appcontainer.split('fn policy_attribute(', 1)[1].split('\n    }', 1)[0]
         self.code('ALL_APPLICATION_PACKAGES_POLICY_ATTRIBUTE', method)
