@@ -223,7 +223,10 @@ class RecipeTests(unittest.TestCase):
     def test_host_unit_has_explicit_boat_profile_and_no_enabled_bridge(self):
         unit = (HERE / "motor-boat.service").read_text()
         self.assertIn("--boat-profile", unit)
-        self.assertIn("--max-weight @VCPUS@", unit)
+        # The CPU count is measured at start (sized_runner_args), never baked into the image.
+        self.assertNotIn("--max-weight", unit)
+        self.assertNotIn("--rustc-slots", unit)
+        self.assertNotIn("@VCPUS@", unit)
         self.assertIn("--job-network veth", unit)
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
@@ -784,16 +787,51 @@ class RecipeTests(unittest.TestCase):
     def test_bootstrap_and_host_exec_clear_every_provider_prefix(self):
         class ExecObserved(Exception):
             pass
-        def execv(program, args):
-            self.assertEqual(program, '/usr/local/bin/motor-host')
-            self.assertEqual(args, [program, '--sandbox', '/etc/motor/sandbox.json'])
-            self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
-            raise ExecObserved()
-        with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
-             patch.object(start, 'check_storage'), \
-             patch.object(sys, 'argv', ['start','--host-exec','--sandbox','/etc/motor/sandbox.json']), patch.object(start.os, 'execv', execv):
-            with self.assertRaises(ExecObserved):
-                start.main()
+        with tempfile.TemporaryDirectory() as tmp:
+            source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'run-sandbox.json')
+            source.write_text(json.dumps({'vcpu_ceiling': 8, 'job_socket': '/run/motor-tenant/jobs.sock'}))
+            def execv(program, args):
+                self.assertEqual(program, '/usr/local/bin/motor-host')
+                self.assertEqual(args, [program, '--sandbox', str(sized)])
+                self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
+                raise ExecObserved()
+            with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
+                 patch.object(start, 'check_storage'), patch.object(start, 'SIZED_SANDBOX', sized), \
+                 patch.object(start, 'sandbox_cpus', return_value=4), \
+                 patch.object(sys, 'argv', ['start','--host-exec','--sandbox',str(source)]), patch.object(start.os, 'execv', execv):
+                with self.assertRaises(ExecObserved):
+                    start.main()
+            self.assertEqual(json.loads(sized.read_text()), {'vcpu_ceiling': 4, 'job_socket': '/run/motor-tenant/jobs.sock'})
+
+    def test_runner_and_endpoint_cpu_counts_follow_the_running_sandbox(self):
+        # An image built on an 8-vCPU large and cloned onto a 4-vCPU default must
+        # admit 4, whatever count an older unit file still carries.
+        self.assertEqual(start.sized_runner_args(['serve', '--max-weight', '8', '--rustc-slots', '8', '--job-network', 'veth'], 4),
+                         ['serve', '--job-network', 'veth', '--max-weight', '4', '--rustc-slots', '4'])
+        self.assertEqual(start.sized_runner_args(['serve'], 2), ['serve', '--max-weight', '2', '--rustc-slots', '2'])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'sized.json')
+            source.write_text(json.dumps({'vcpu_ceiling': 8, 'ready_marker': '/run/motor/endpoint-ready'}))
+            self.assertEqual(start.sized_host_args(['--sandbox', str(source)], 4, sized), ['--sandbox', str(sized)])
+            self.assertEqual(json.loads(sized.read_text()), {'vcpu_ceiling': 4, 'ready_marker': '/run/motor/endpoint-ready'})
+            self.assertEqual(sized.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(source.read_text())['vcpu_ceiling'], 8)
+
+    def test_runner_is_started_with_the_measured_cpu_count(self):
+        launched = []
+        class Stop(Exception):
+            pass
+        def popen(argv):
+            launched.append(argv)
+            raise Stop()
+        with patch.object(sys, 'argv', ['start', 'serve', '--boat-profile']), patch.object(start, 'check_storage'), \
+             patch.object(start.Path, 'read_text', return_value=json.dumps({'mem_available_bytes': 8 << 30})), \
+             patch.object(start, 'sandbox_cpus', return_value=4), patch.object(start.subprocess, 'Popen', popen), \
+             self.assertRaises(Stop):
+            start.main()
+        self.assertEqual(launched[0][:6], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile',
+                                           '--max-weight', '4', '--rustc-slots'])
+        self.assertEqual(launched[0][6], '4')
 
     def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
         calls = []

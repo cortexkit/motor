@@ -8,7 +8,9 @@ Recover an interrupted run: same credentials, --cleanup DIR/results.json.
 Render evidence without credentials: --render DIR/results.json --findings FILE.
 Exit status: 0 when the verdict passed (cleanup complete, or Boat accepted every deletion and
 only its final purge is pending), 1 when the verdict failed, 3 when resources may still exist
-and need --cleanup. JSON `verdict` and `cleanup_state` report the two separately.
+and need --cleanup, 4 when Boat refused to create the requested --size from a snapshot taken on
+a larger size (verdict outcome snapshot_size_bound). JSON `verdict` and `cleanup_state` report
+the two separately.
 """
 from __future__ import annotations
 
@@ -33,10 +35,55 @@ from reach import tcp_probe
 
 API = "https://boat.dev/api/v1"
 READY = {"ready", "idle", "running"}
+# Boat's published sandbox sizes (https://docs.boat.dev/machines), as Boat reports them in
+# sandbox.vcpu and sandbox.memoryGB. These only check that Boat created the size that was asked
+# for; job CPU and memory limits always come from what is measured inside the sandbox.
+SIZES = {"small": {"vcpu": 2, "memoryGB": 4},
+         "default": {"vcpu": 4, "memoryGB": 8},
+         "large": {"vcpu": 8, "memoryGB": 16}}
+# Every prepared image and snapshot the operator holds so far was saved from a large sandbox.
+SNAPSHOT_SOURCE_SIZE = "large"
 
 
 class ProbeError(Exception):
     pass
+
+
+class SnapshotSizeBound(ProbeError):
+    """Boat refused to create a smaller sandbox from a snapshot saved on a larger one."""
+
+    def __init__(self, evidence):
+        self.evidence = evidence
+        super().__init__(f"Boat refused to create a {evidence['requested_size']} sandbox from snapshot "
+                         f"{evidence['snapshot']}: {evidence['boat_error']}")
+
+
+def provider_sizing_matches(item, size):
+    """Whether Boat reports the vCPU and memory of the size that was requested."""
+    expected = SIZES[size]
+    return item.get("vcpu") == expected["vcpu"] and item.get("memoryGB") == expected["memoryGB"]
+
+
+def sizing_error(size):
+    expected = SIZES[size]
+    return f"provider did not report requested {size} sizing ({expected['vcpu']} vCPU, {expected['memoryGB']} GB)"
+
+
+# HTTP statuses that say nothing about the requested size: a bad key, a missing snapshot, a
+# timeout or rate limiting. Any other 4xx refusal of a create whose only difference from a
+# working large create is the smaller type is attributed to that type.
+NOT_SIZE_STATUSES = {401, 404, 408, 429}
+SIZE_REFUSAL_TEXT = re.compile(r"too[_ ]small", re.IGNORECASE)
+
+
+def size_refusal(error):
+    """Whether a create-from-snapshot error is Boat refusing the requested (smaller) size."""
+    if isinstance(error, ApiError):
+        if error.status == 403:
+            return bool(SIZE_REFUSAL_TEXT.search(str(error.body)))
+        return 400 <= error.status < 500 and error.status not in NOT_SIZE_STATUSES
+    # A sandbox that Boat accepted and then failed while restoring the snapshot.
+    return bool(SIZE_REFUSAL_TEXT.search(str(error)))
 
 
 class ApiError(ProbeError):
@@ -156,8 +203,11 @@ class Probe:
     cargo_seed_sha256: 'str | None'
     cargo_seed_archive: 'Path | None'
 
-    def __init__(self, client, data, checkpoint, port=9443, minutes=30):
+    def __init__(self, client, data, checkpoint, port=9443, minutes=30, size="large"):
+        if size not in SIZES:
+            raise ProbeError("unknown Boat sandbox size: " + str(size))
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
+        self.size = size
         self.deadline = time.monotonic() + minutes * 60
         self.minutes = minutes
         self.base = ".boat-probe-" + data["run_id"]
@@ -239,8 +289,9 @@ class Probe:
             out["after_reapply"] = tcp_probe(item.get("ip"), self.port, listening["certificate_pem"])
         return out
 
-    def create(self, snapshot_name=None):
-        body = {"type": "large", "ttlSeconds": 1800, "noEnv": True}
+    def create(self, snapshot_name=None, source_size=SNAPSHOT_SOURCE_SIZE):
+        """`source_size` is the size of the sandbox `snapshot_name` was saved from."""
+        body = {"type": self.size, "ttlSeconds": 1800, "noEnv": True}
         if snapshot_name:
             body["from"] = snapshot_name
         token = "boat-probe-" + uuid.uuid4().hex
@@ -248,13 +299,38 @@ class Probe:
         self.data["pending_creates"].append(pending)
         self.checkpoint()
         start = time.monotonic()
-        response = self.request("POST", "/sandboxes", body, idempotency=token)
+        try:
+            response = self.request("POST", "/sandboxes", body, idempotency=token)
+        except ApiError as error:
+            if self.smaller_than_snapshot(snapshot_name, source_size) and size_refusal(error):
+                # Boat refused the create, so nothing exists to replay or delete.
+                self.data["pending_creates"].remove(pending)
+                self.checkpoint()
+                raise self.size_bound(snapshot_name, source_size, error.status, error.body) from None
+            raise
         item = sandbox(response)
         self.data["resources"].append({"kind": "sandbox", "id": item["id"]})
         self.data["pending_creates"].remove(pending)
         self.checkpoint()
-        ready = self.wait_sandbox(item["id"], READY)
-        return ready, {"seconds_to_ready": time.monotonic() - start, "sandbox": ready}
+        try:
+            ready = self.wait_sandbox(item["id"], READY)
+        except ProbeError as error:
+            if self.smaller_than_snapshot(snapshot_name, source_size) and size_refusal(error):
+                raise self.size_bound(snapshot_name, source_size, None, str(error)) from None
+            raise
+        self.data.setdefault("sizing", {}).setdefault(self.size, {})["provider_reported"] = {
+            "vcpu": ready.get("vcpu"), "memoryGB": ready.get("memoryGB"), "published": SIZES[self.size]}
+        return ready, {"seconds_to_ready": time.monotonic() - start, "sandbox": ready, "requested_size": self.size}
+
+    def smaller_than_snapshot(self, snapshot_name, source_size):
+        return bool(snapshot_name) and SIZES[self.size]["vcpu"] < SIZES[source_size]["vcpu"]
+
+    def size_bound(self, snapshot_name, source_size, status, body):
+        evidence = {"requested_size": self.size, "snapshot": snapshot_name,
+                    "snapshot_source_size": source_size, "http_status": status, "boat_error": body}
+        self.data["snapshot_size_bound"] = evidence
+        self.checkpoint()
+        return SnapshotSizeBound(evidence)
 
     def cycle(self, item, records=None, toolchain=False):
         sid = item["id"]
@@ -300,7 +376,7 @@ class Probe:
         self.request("POST", f"/sandboxes/{sid}/stop", {})
         self.wait_sandbox(sid, {"archived"})
         start = time.monotonic()
-        clone, self.data["create_from_snapshot"] = self.create(name)
+        clone, self.data["create_from_snapshot"] = self.create(name, source_size=self.size)
         self.data["create_from_snapshot"]["hydrated"] = self.wait_hydrated(clone["id"])
         self.data["create_from_snapshot"]["seconds_to_hydrated"] = time.monotonic() - start
         self.data["create_from_snapshot"]["persistence"] = self.guest(clone["id"], "persistence")
@@ -313,8 +389,8 @@ class Probe:
 
     def run(self):
         item, self.data["create"] = self.create()
-        if item.get("vcpu") != 8 or item.get("memoryGB") != 16:
-            raise ProbeError("provider did not report requested large sizing (8 vCPU, 16 GB)")
+        if not provider_sizing_matches(item, self.size):
+            raise ProbeError(sizing_error(self.size))
         self.data["guest"] = self.guest(item["id"], "inspect", timeout=180)
         self.data["network_initial"] = self.network(item, apply=True)
         for _ in range(3):
@@ -483,7 +559,18 @@ def required_checks_passed(checks):
 
 
 def verdict(data):
-    """Require all required checks to pass, listing unproven idle-reclaim checks separately."""
+    """Require all required checks to pass, listing unproven idle-reclaim checks separately.
+
+    `outcome` is "passed", "failed" or "snapshot_size_bound": Boat refused to create the
+    requested size from a snapshot saved on a larger one, which answers the measurement
+    (that image cannot serve this size) rather than failing it.
+    """
+    bound = data.get("snapshot_size_bound")
+    if bound:
+        return {"passed": False, "outcome": "snapshot_size_bound",
+                "reasons": [f"snapshot_size_bound: Boat refused to create a {bound.get('requested_size')} sandbox "
+                            f"from snapshot {bound.get('snapshot')} (saved on {bound.get('snapshot_source_size')}): "
+                            f"HTTP {bound.get('http_status')} {bound.get('boat_error')}"]}
     reasons = []
     inconclusive = []
     if not data.get("measurements_complete"):
@@ -497,14 +584,14 @@ def verdict(data):
             if data[mode].get("all_passed") is not True:
                 if mode != 'runner_host' or not required_checks_passed(checks):
                     reasons.append(mode + " checks did not all pass")
-    result = {"passed": not reasons, "reasons": reasons}
+    result = {"passed": not reasons, "outcome": "failed" if reasons else "passed", "reasons": reasons}
     if inconclusive:
         result['inconclusive'] = inconclusive
     return result
 
 
 # Exit statuses. Cleanup that Boat accepted but has not purged yet does not fail a run.
-EXIT_PASSED, EXIT_FAILED, EXIT_CLEANUP_INCOMPLETE = 0, 1, 3
+EXIT_PASSED, EXIT_FAILED, EXIT_CLEANUP_INCOMPLETE, EXIT_SNAPSHOT_SIZE_BOUND = 0, 1, 3, 4
 
 
 def exit_status(data, cleanup_only=False):
@@ -513,7 +600,10 @@ def exit_status(data, cleanup_only=False):
         return EXIT_CLEANUP_INCOMPLETE
     if cleanup_only:
         return EXIT_PASSED
-    return EXIT_PASSED if verdict(data)["passed"] else EXIT_FAILED
+    outcome = verdict(data)
+    if outcome["outcome"] == "snapshot_size_bound":
+        return EXIT_SNAPSHOT_SIZE_BOUND
+    return EXIT_PASSED if outcome["passed"] else EXIT_FAILED
 
 
 TEMPLATE = """# Boat runner measurement findings
@@ -666,12 +756,47 @@ def mib(value):
     return f"{value / (1 << 20):.0f}" if isinstance(value, (int, float)) else "unmeasured"
 
 
+SIZING_COLUMNS = (("usable_vcpus", "Usable vCPUs (nproc)"), ("runner_max_weight", "Runner --max-weight"),
+                  ("runner_rustc_slots", "Runner --rustc-slots"), ("endpoint_vcpu_ceiling", "Endpoint vcpu_ceiling"),
+                  ("job_vcpus", "Job vCPUs asked"), ("mem_total_bytes", "MemTotal bytes"),
+                  ("mem_available_before_runner_bytes", "MemAvailable before runner bytes"),
+                  ("runner_memory_max_bytes", "Runner job memory.max bytes"))
+
+
+def sizing_section(data):
+    """Per Boat size: what Boat reported and what each phase measured inside the sandbox."""
+    lines = ["## Sandbox sizing", "",
+             "Measured inside each sandbox; the runner's job memory.max and CPU counts must come from "
+             "these values, not from the size the image was built on.", "",
+             "| Size | Boat-reported vCPU / GB | Phase | " + " | ".join(title for _, title in SIZING_COLUMNS) + " |",
+             "| --- | --- | --- | " + " | ".join("---" for _ in SIZING_COLUMNS) + " |"]
+    sizing = data.get("sizing") or {}
+    for size, record in sizing.items():
+        provider = record.get("provider_reported") or {}
+        reported = display([provider.get("vcpu"), provider.get("memoryGB")])
+        phases = record.get("phases") or {"unmeasured": {}}
+        for phase, values in phases.items():
+            lines.append(f"| {size} | {reported} | {phase} | " +
+                         " | ".join(display(values.get(key, "unmeasured")) for key, _ in SIZING_COLUMNS) + " |")
+    if not sizing:
+        lines.append("| " + display(data.get("size", "large")) + " | unmeasured | unmeasured | " +
+                     " | ".join("unmeasured" for _ in SIZING_COLUMNS) + " |")
+    skipped = [(phase.get("name"), job) for phase in (data.get("runner_host") or {}).get("phases", [])
+               for job in phase.get("skipped_jobs", [])]
+    lines += ["", "Skipped jobs: " + ("; ".join(f"{name} {job['name']}: {job['reason']}" for name, job in skipped)
+                                       if skipped else "none") + "."]
+    return lines
+
+
 def render_runner_host(data):
     """Findings for --runner-host: the verdict, per-phase jobs, timings and job memory budget."""
     runner = data["runner_host"]
     checks = runner.get("checks", [])
     failing = [c["name"] for c in checks if c.get("status") not in ('PASS', 'INCONCLUSIVE')]
     outcome = data.get("verdict") or verdict(data)
+    bound = data.get("snapshot_size_bound")
+    label = ("SNAPSHOT_SIZE_BOUND" if outcome.get("outcome") == "snapshot_size_bound" else
+             "PASSED" if outcome["passed"] else "FAILED")
     error = display(data["error"]) if data.get("error") is not None else "none recorded"
     status = data.get("exit_status")
     status_text = (f"Exit status: {status}" if status is not None else
@@ -682,14 +807,19 @@ def render_runner_host(data):
              f"Source revision: {display(runner.get('source_revision', 'unmeasured'))}.",
              "Evidence: the accompanying `results.json` (API responses, guest output, raw job terminals).", "",
              "## Verdict", "",
-             f"Runner-host verdict: **{'PASSED' if outcome['passed'] else 'FAILED'}**. "
+             f"Runner-host verdict: **{label}**. "
               f"Checks: {sum(c.get('status') == 'PASS' for c in checks)} of {len(checks)} passed.",
+              *([f"Boat refused to create a {display(bound.get('requested_size'))} sandbox from snapshot "
+                 f"{display(bound.get('snapshot'))} (saved on {display(bound.get('snapshot_source_size'))}): "
+                 f"HTTP {display(bound.get('http_status'))}, Boat's error: {display(bound.get('boat_error'))}. "
+                 "This image cannot serve that size; no job ran."] if bound else []),
+              f"Sandbox size: {display(data.get('size', 'large'))}.",
               f"Failing checks: {display(failing) if failing else 'none'}.",
               f"Inconclusive preconditions: {display(outcome.get('inconclusive')) if outcome.get('inconclusive') else 'none'}.",
              f"Reasons: {display(outcome['reasons']) if outcome['reasons'] else 'none'}.",
              f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
              f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "
-             f"{status_text} (0 passed, 1 failed, 3 resources need --cleanup).", "",
+             f"{status_text} (0 passed, 1 failed, 3 resources need --cleanup, 4 snapshot_size_bound).", "",
              "## Phases", "",
              "Every phase runs real jobs through the motor client over the pinned SSH forward.", "",
              "| Phase | Checks passed | Exit job code | Rust job code | Job seconds (exit / rust / isolation) | "
@@ -761,6 +891,7 @@ def render_runner_host(data):
                      ("mem_available_bytes", "runner_idle_bytes", "margin_bytes", "memory_max_bytes")) +
                      f" | {mib(budget.get('memory_max_bytes'))} | {display(job.get('limits', {}).get('memory.max', 'unmeasured'))} |")
     lines += ["", f"Smallest job memory budget across phases: {mib(min(budgets)) if budgets else 'unmeasured'} MiB.", "",
+              *sizing_section(data), "",
               "## Snapshots", "",
               "| Role | Name | Snapshot id | Size bytes | Retained | Real jobs qualified |", "| --- | --- | --- | --- | --- | --- |"]
     for role, item in (("prepared source (borrowed, not deleted)", runner.get("prepared_source")),
@@ -796,9 +927,12 @@ def main(report_stream=None):
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
+    parser.add_argument("--size", choices=tuple(SIZES), default="large",
+                        help="Boat sandbox size for every sandbox this run creates, including "
+                             "--verify-prepared-image clones (default: large)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--ssh-reach", action="store_true", help="one fresh large; pinned SSH, loopback TLS forwarding and key restrictions")
-    mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh large; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
+    mode.add_argument("--ssh-reach", action="store_true", help="one fresh sandbox of --size; pinned SSH, loopback TLS forwarding and key restrictions")
+    mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh sandbox of --size; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
     mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
     parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
@@ -847,13 +981,13 @@ def main(report_stream=None):
         args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
         path = args.output / "results.json"
         data = {"schema": 1, "run_id": uuid.uuid4().hex, "started_at": datetime.now(timezone.utc).isoformat(),
-                "api": [], "resources": [], "pending_creates": [], "cycles": [], "cleanup": []}
+                "size": args.size, "api": [], "resources": [], "pending_creates": [], "cycles": [], "cleanup": []}
     checkpoint = lambda: save(path, data, key)
     client = Client(key, data, checkpoint)
     signal.signal(signal.SIGTERM, interrupt)
     try:
         if not args.cleanup:
-            runner = Probe(client, data, checkpoint, minutes=args.max_minutes)
+            runner = Probe(client, data, checkpoint, minutes=args.max_minutes, size=args.size)
             runner.results_path = path.resolve()
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image
@@ -873,6 +1007,10 @@ def main(report_stream=None):
             else:
                 runner.run()
             data["measurements_complete"] = True
+    except SnapshotSizeBound:
+        # A definite answer, not an error: this snapshot cannot serve the requested size.
+        # Probe.size_bound already recorded Boat's refusal in data["snapshot_size_bound"].
+        data["measurements_complete"] = True
     except (Exception, KeyboardInterrupt) as error:
         data["error"] = scrub(str(error), key)
     finally:

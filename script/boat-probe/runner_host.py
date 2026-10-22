@@ -22,6 +22,7 @@ import time
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
+from probe import provider_sizing_matches, sizing_error
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -254,6 +255,26 @@ tenant_sockets = {}
 for path in [pathlib.Path('/run/motor-tenant'), *[pathlib.Path('/run/motor-tenant')/name for name in ('jobs.sock','events.sock','admin.sock')]]:
     meta = path.lstat()
     tenant_sockets[str(path)] = {'uid':meta.st_uid, 'mode':oct(stat.S_IMODE(meta.st_mode)), 'socket':stat.S_ISSOCK(meta.st_mode)}
+def endpoint_config():
+    # The configuration the running endpoint was started with (its --sandbox argument).
+    try:
+        argv = [part.decode() for part in pathlib.Path('/proc/'+str(idle['motor-boat-host']['main_pid'])+'/cmdline').read_bytes().split(b'\0') if part]
+        path = argv[argv.index('--sandbox') + 1]
+        return path, json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError, IndexError) as error:
+        return None, {'error': str(error)}
+def state_disk():
+    try:
+        disk = os.statvfs('/var/lib/motor-boat/state')
+        return {'total_bytes': disk.f_blocks * disk.f_frsize, 'free_bytes': disk.f_bavail * disk.f_frsize}
+    except OSError as error:
+        return {'error': str(error)}
+# The sandbox's real CPU count and the counts the runner and endpoint were started with.
+endpoint_path, endpoint = endpoint_config()
+sizing = {'nproc': int(subprocess.check_output(['nproc'], text=True).strip()),
+          'affinity_cpus': len(os.sched_getaffinity(0)),
+          'runner_argv': [part.decode() for part in pathlib.Path('/proc/'+pid+'/cmdline').read_bytes().split(b'\0') if part],
+          'endpoint_config_path': endpoint_path, 'endpoint_config': endpoint, 'state_disk': state_disk()}
 print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('net','pid','mnt')},
     'systemd_version':int(subprocess.check_output(['systemctl', '--version'], text=True).split()[1]),
     'credential_audit': credential_audit(), 'ssh_config': configs,
@@ -265,6 +286,7 @@ print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('n
     'idle_services_memory': idle, 'meminfo_at_idle': pathlib.Path('/proc/meminfo').read_text(),
     'endpoint_refusal': endpoint_refusal(), 'tenant_sockets': tenant_sockets,
     'runner_pid':int(pid),
+    'sizing':sizing,
     'sshd_pids':sshd_pids,
     'provider_sanitization': json.loads(pathlib.Path('/run/motor-boat-credentials.json').read_text()),
     'listeners': capture(['ss','-ltnp']),
@@ -726,27 +748,34 @@ def job_result(text):
     return result
 
 
-def isolation_result_checks(result, host):
+def isolation_result_checks(result, host, weight=None):
     if result['code'] != 0:
         return {'isolation_job_completed': False}
     try:
         payload = json.loads(result['stdout'])
     except ValueError as error:
         raise ValueError('isolation job exited zero but did not emit JSON evidence') from error
-    return isolation_checks(payload, host)
+    return isolation_checks(payload, host, weight)
 
 
-def isolation_checks(job, host):
+def isolation_checks(job, host, weight=None):
+    """`weight` is the vCPUs the job asked for; by default the sandbox's measured CPUs."""
     cpu = job["limits"]["cpu.max"].split()
     budget = host['memory_budget']
+    usable = usable_vcpus(host)
+    weight = usable if weight is None else weight
+    cpu_expected = [str(weight * 100000), "100000"] if weight else None
     expected = (budget['mem_available_bytes'] - budget['runner_idle_bytes'] - budget['margin_bytes']) // (1 << 20) * (1 << 20)
     return {
         "job_account": job["user"] == "motor-job" and job["uid"] != 0,
         "loopback_only": job["interfaces"] == ["lo"],
         "private_network": job["namespaces"]["net"] != host["namespaces"]["net"],
         "private_shm": job["private_shm"] is True and job["shm_writable"] is True,
+        # The 1 GiB floor is the start wrapper's and the runner's own refusal floor, the same on
+        # every size; the budget itself is what this sandbox measured.
         "memory_limit": job["limits"]["memory.max"] == str(budget['memory_max_bytes']) and budget['memory_max_bytes'] == expected and expected > (1 << 30),
-        "cpu_limit": len(cpu) == 2 and cpu == ["800000", "100000"] and job['nproc'] == '8',
+        # The runner sets CPUQuota to the job's requested vCPUs; nproc is the sandbox's CPUs.
+        "cpu_limit": usable is not None and len(cpu) == 2 and cpu == cpu_expected and job['nproc'] == str(usable),
         "pid_limit": job["limits"]["pids.max"] == "4096",
         "no_provider_job_environment": not any(job["provider_environment"].values()),
         "no_provider_job_access": provider_access_denied(job['provider_access']),
@@ -837,6 +866,90 @@ def root_paths_source():
 
 def root_paths_passed(report):
     return report.get('offender_count') == 0 and report.get('offenders') == [] and report.get('entries', 0) > 0
+
+
+# vCPUs a probe job asks for, by job name, when it needs a fixed count. A job not listed
+# asks for every vCPU the sandbox measured, the way one spilled job uses a whole sandbox.
+JOB_VCPUS = {}
+
+
+def usable_vcpus(host):
+    """The sandbox's CPUs as nproc measured them in the sandbox, or None when unmeasured."""
+    value = (host.get('sizing') or {}).get('nproc')
+    return value if type(value) is int and value > 0 else None
+
+
+def job_vcpus(requested, usable, size):
+    """(vCPUs to ask for, None), or (None, reason) when the job cannot fit this size and
+    must be skipped: asking the runner for more CPUs than exist measures nothing."""
+    if requested is None:
+        return usable, None
+    if requested > usable:
+        return None, (f'skipped: the job asks for {requested} vCPUs and this {size} sandbox '
+                      f'has {usable} usable vCPUs')
+    return requested, None
+
+
+def argv_int(argv, flag):
+    """The integer after the last `flag` in `argv`, or None."""
+    values = [argv[index + 1] for index in range(len(argv) - 1) if argv[index] == flag]
+    try:
+        return int(values[-1]) if values else None
+    except ValueError:
+        return None
+
+
+def meminfo_bytes(text, key):
+    for line in (text or '').splitlines():
+        name, _, value = line.partition(':')
+        if name == key:
+            amount, _, unit = value.strip().partition(' ')
+            return int(amount) * 1024 if unit == 'kB' and amount.isdigit() else None
+    return None
+
+
+def sizing_record(host, job_weight):
+    """What this sandbox measured about its own size, and what the runner and endpoint were
+    configured with, so CLOUD can size its broker from real values for each Boat size."""
+    sizing = host.get('sizing') or {}
+    budget = host.get('memory_budget') or {}
+    runner = sizing.get('runner_argv') or []
+    return {'usable_vcpus': usable_vcpus(host), 'affinity_cpus': sizing.get('affinity_cpus'),
+            'runner_max_weight': argv_int(runner, '--max-weight'),
+            'runner_rustc_slots': argv_int(runner, '--rustc-slots'),
+            'endpoint_vcpu_ceiling': (sizing.get('endpoint_config') or {}).get('vcpu_ceiling'),
+            'endpoint_config_path': sizing.get('endpoint_config_path'),
+            'job_vcpus': job_weight,
+            'runner_memory_max_bytes': budget.get('memory_max_bytes'),
+            'runner_memory_flag_bytes': argv_int(runner, '--boat-memory-max-bytes'),
+            'mem_total_bytes': meminfo_bytes(host.get('meminfo_at_idle'), 'MemTotal'),
+            'mem_available_before_runner_bytes': budget.get('mem_available_bytes'),
+            'mem_available_at_idle_bytes': meminfo_bytes(host.get('meminfo_at_idle'), 'MemAvailable'),
+            'runner_idle_bytes': budget.get('runner_idle_bytes'), 'margin_bytes': budget.get('margin_bytes'),
+            'state_disk': sizing.get('state_disk')}
+
+
+def sizing_checks(record):
+    """The runner and endpoint must use this sandbox's measured size, not the size the
+    image was built on: an image built on large and cloned onto default would otherwise
+    admit 8 vCPUs of work onto 4."""
+    usable = record['usable_vcpus']
+    memory = record['runner_memory_max_bytes']
+    return {
+        'runner_vcpus_follow_sandbox': usable is not None and record['runner_max_weight'] == usable
+            and record['runner_rustc_slots'] == usable and record['endpoint_vcpu_ceiling'] == usable,
+        'runner_memory_from_measurement': type(memory) is int and record['runner_memory_flag_bytes'] == memory
+            and type(record['mem_total_bytes']) is int and memory < record['mem_total_bytes'],
+    }
+
+
+def sizing_reason(key, record):
+    if key == 'runner_vcpus_follow_sandbox':
+        return (f"sandbox has {record['usable_vcpus']} usable vCPUs; runner --max-weight "
+                f"{record['runner_max_weight']}, --rustc-slots {record['runner_rustc_slots']}, endpoint "
+                f"vcpu_ceiling {record['endpoint_vcpu_ceiling']} ({record['endpoint_config_path']})")
+    return (f"runner --boat-memory-max-bytes {record['runner_memory_flag_bytes']}, measured budget "
+            f"{record['runner_memory_max_bytes']}, MemTotal {record['mem_total_bytes']}")
 
 
 def snapshot_metadata(snapshot):
@@ -1148,6 +1261,14 @@ class RunnerHost:
         self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
         host = record["host"]
+        size = getattr(self.probe, 'size', 'large')
+        usable = usable_vcpus(host)
+        if usable is None:
+            raise ValueError('the sandbox CPU count was not measured; refusing to size probe jobs')
+        record['sizing'] = sizing_record(host, usable)
+        self.probe.data.setdefault('sizing', {}).setdefault(size, {}).setdefault('phases', {})[label] = record['sizing']
+        for key, passed in sizing_checks(record['sizing']).items():
+            self.check(label + '.' + key, passed, record['sizing'], reason=None if passed else sizing_reason(key, record['sizing']))
         host['job_security_reference'] = json.loads(self.execute(
             sid, 'sudo -n ' + reference_command())['stdout'])
         record['toolchain_parity'] = json.loads(self.execute(
@@ -1198,12 +1319,18 @@ class RunnerHost:
                 if label in ('prepared_clone', 'snapshot_clone'):
                     jobs.append(('after_idle', NODE_CHECK))
                 for name, command in jobs:
+                    weight, skipped = job_vcpus(JOB_VCPUS.get(name), usable, size)
+                    if skipped:
+                        record.setdefault('skipped_jobs', []).append(
+                            {'name': name, 'requested_vcpus': JOB_VCPUS.get(name), 'usable_vcpus': usable, 'reason': skipped})
+                        self.probe.checkpoint()
+                        continue
                     if name == 'after_idle':
                         idle = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
                         record['idle_reclaim'] = idle
                         status = idle_reclaim_status(idle)
                         self.check(label + '.idle_reclaim_observed', status == 'PASS', idle, status=status)
-                    result = process([str(client), address, str(repository), storage, command], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
+                    result = process([str(client), address, str(repository), storage, command, str(weight)], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
                     record[name] = result
                     if result.get("exit_code") != 0:
                         failure = "motor client failed: " + json.dumps(result)
@@ -1224,7 +1351,7 @@ class RunnerHost:
                     elif name == 'wasm_opt_120_round_trip':
                         self.check(label + '.' + name, *wasm_opt_check(parsed))
                     elif name == "isolation":
-                        checks = isolation_result_checks(parsed, host)
+                        checks = isolation_result_checks(parsed, host, weight)
                         isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}
                         for key, passed in checks.items():
                             reason = None if passed else (pid_failure_reason(key, isolation, host) if parsed['code'] == 0
@@ -1251,7 +1378,7 @@ class RunnerHost:
                     marker = 'boat-pid-teardown-' + label + '-' + action
                     command = teardown_job(marker)
                     with ThreadPoolExecutor(max_workers=1) as executor:
-                        pending = executor.submit(process, [str(client), address, str(repository), storage, command], timeout=90)
+                        pending = executor.submit(process, [str(client), address, str(repository), storage, command, str(usable)], timeout=90)
                         observed = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
                                                           + ' ' + shlex.quote(marker) + ' ' + action, timeout=60)['stdout'])
                         completed = pending.result()
@@ -1282,6 +1409,9 @@ class RunnerHost:
         started = time.monotonic()
         item, self.data['create_from_snapshot'] = self.probe.create(name)
         sid = item['id']
+        size = getattr(self.probe, 'size', 'large')
+        if not provider_sizing_matches(item, size):
+            raise ValueError(sizing_error(size))
         self.probe.wait_hydrated(sid)
         self.data['create_from_snapshot']['seconds_to_hydrated'] = time.monotonic() - started
         with tempfile.TemporaryDirectory(prefix='boat-job-', dir=ROOT / '.cortexkit') as repo:
@@ -1340,8 +1470,8 @@ class RunnerHost:
                 self.data['prepared_source']['borrowed_not_deleted'] = True
             item, self.data["create"] = self.probe.create(source_image)
             sid = item["id"]
-            if item.get("vcpu") != 8 or item.get("memoryGB") != 16:
-                raise ValueError("unexpected large sandbox sizing")
+            if not provider_sizing_matches(item, getattr(self.probe, 'size', 'large')):
+                raise ValueError(sizing_error(getattr(self.probe, 'size', 'large')))
             if source_image:
                 self.probe.wait_hydrated(sid)
                 # A prepared image from an older recipe still has the path unit.
@@ -1390,7 +1520,7 @@ class RunnerHost:
                 if not original.get("deleted") and state.get("stage") != "waiting_for_uploads":
                     raise ValueError("original is not confirmed stopped/deletion-accepted; refusing a concurrent clone")
                 start = time.monotonic()
-                clone, self.data["create_from_snapshot"] = self.probe.create(name)
+                clone, self.data["create_from_snapshot"] = self.probe.create(name, source_size=getattr(self.probe, 'size', 'large'))
                 sid = clone["id"]
                 # Install while Boat may still be restoring files, as a broker
                 # racing the restore would; broker_order re-installs if lost.

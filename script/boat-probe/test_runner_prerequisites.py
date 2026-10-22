@@ -101,6 +101,7 @@ class PrerequisitesTests(unittest.TestCase):
 
     def test_run_records_one_sandbox_without_installs(self):
         class Probe:
+            size = "large"
             def __init__(self, status):
                 self.data, self.status, self.commands = {}, status, []
             def create(self):

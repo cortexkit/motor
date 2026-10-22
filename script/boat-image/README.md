@@ -489,7 +489,7 @@ Rust job builds in the same fixed folder as on the build server:
 `./target` and `/run/motor/target` are one directory. The live Rust job runs its
 binary from `$CARGO_TARGET_DIR`, and the isolation job checks both facts.
 
-The daemon's weight and rustc slots use `nproc`. Its `--job-network veth` allows
+The daemon's weight and rustc slots use `nproc`, measured by the start wrapper on every start. Its `--job-network veth` allows
 network **only for explicit outbound requests**, through the existing private
 network/veth machinery. A root pre-start reapplies only motor's nftables table
 using the current IPv4 route's interface, enables forwarding and adds the narrow
@@ -509,9 +509,14 @@ separately built authenticated endpoint, not a measured claim that their future 
 `motor-boat-host.service` and `motor-boat-bridge.service` cgroups independently. ExecStartPost requires
 the **final daemon PID** to own the listening socket before dependents start.
 
-One job may use all measured usable vCPUs; this recipe targets `large` only and
-uses its measured `nproc=8` for weight/slots. The unit explicitly sets
-`--reserve-daemon-core false`, so the sandbox's single job may use all eight
+One job may use all measured usable vCPUs. The image is built on `large`, but
+sandboxes of other sizes are created from it, so no CPU count is baked into the
+image: on every start `motor-boat-start.py` passes the runner `--max-weight` and
+`--rustc-slots` equal to the sandbox's `nproc`, and `--host-exec` writes
+`/run/motor/sandbox.json`, a copy of `/etc/motor/sandbox.json` whose `vcpu_ceiling`
+is that count, for the endpoint (the `/etc` value is the build sandbox's count).
+The unit explicitly sets
+`--reserve-daemon-core false`, so the sandbox's single job may use all its
 vCPUs; this is not inferred from machine size and the fleet default still reserves
 a daemon core where its existing topology policy applies. The fresh-resource operator pass
 measured MemAvailable **15,492,481,024 B** on large (labels are not a capacity
