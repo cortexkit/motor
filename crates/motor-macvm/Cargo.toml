@@ -1,0 +1,23 @@
+[package]
+name = "motor-macvm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+motor-winagent = { path = "../motor-winagent" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-virtualization = "0.3"
+block2 = "0.6"
+objc2-app-kit = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+cortexkit-test-support = "=0.1.10"
