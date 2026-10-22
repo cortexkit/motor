@@ -201,8 +201,25 @@ impl Runner {
         }
         // A sibling checkout lives at its repository's own path and borrows
         // that repository's mirror objects; it retires with the repository.
+        // Retiring it deletes the path, so it waits while the path overlaps,
+        // under any spelling, a workspace of another repository or work in
+        // flight. The repository's own Head workspaces retire with it.
+        let claims = (!inner.catalog.sibling_commits.is_empty())
+            .then(|| sibling_eviction::PathClaims::of(inner));
         for path in inner.catalog.sibling_commits.keys() {
-            touch(path, 0, None);
+            let checkout = sibling_eviction::Spelled::new(path);
+            let held = claims.as_ref().is_some_and(|claims| {
+                checkout.unresolved()
+                    || claims.live_overlaps(&checkout)
+                    || claims.workspace_overlaps(&checkout, |(repository, kind)| {
+                        !(kind == WorkspaceKind::Head && repository == path)
+                    })
+            });
+            touch(
+                path,
+                0,
+                held.then_some("sibling checkout overlaps a workspace"),
+            );
         }
         let mut block = |mirror: &Path, at: u64, reason: &'static str| {
             let Some(name) = mirror.file_name() else {

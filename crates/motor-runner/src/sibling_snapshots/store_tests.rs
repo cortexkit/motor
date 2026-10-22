@@ -592,7 +592,10 @@ fn snapshot_without_readable_metadata_is_recreated() {
         assert!(!directory.join("stale").exists(), "{damage}");
         assert_eq!(
             read_metadata(&directory).unwrap(),
-            Metadata::new(&key, &tree)
+            Metadata {
+                boot_id: current_boot(&f.config),
+                ..Metadata::new(&key, &tree)
+            }
         );
         assert_eq!(entries(&f.snapshots()), published(&directory), "{damage}");
     }
@@ -984,4 +987,99 @@ fn creation_during_a_deletion_neither_waits_for_nor_reads_the_victim() {
         "the claimed victim was the only ready snapshot, so nothing is copied"
     );
     assert_eq!(fs::read_to_string(aside.join("source")).unwrap(), "one\n");
+}
+
+/// Makes every file under the snapshot's `.git/objects` empty, as a host
+/// crash can leave files whose data never reached the disk.
+fn empty_git_objects(directory: &Path) {
+    let mut pending = vec![directory.join(".git/objects")];
+    while let Some(path) = pending.pop() {
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            for entry in fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+        } else {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::write(&path, b"").unwrap();
+        }
+    }
+}
+
+fn git_is_whole(directory: &Path) -> bool {
+    crate::workspace::git(directory, &["fsck", "--no-progress", "--no-dangling"]).is_ok()
+}
+
+/// A snapshot whose metadata is valid but whose files were damaged by a host
+/// crash: a daemon restart in the same boot uses it as it is, without
+/// checking it, while the first use after a host restart checks it, rebuilds
+/// it when its Git directory or its checkout is damaged, and otherwise
+/// records that it is whole in the new boot. Snapshots from the earlier boot
+/// are not copied as predecessors before they are checked.
+#[test]
+fn snapshot_from_an_earlier_boot_is_checked_once_and_rebuilt_when_damaged() {
+    let mut f = Fixture::new("motor-snapshot-store-reboot");
+    f.config.boot_id_override = Some("boot-one".into());
+    let (first, first_tree) = f.commit(&[("source", "one\n")]);
+    let (second, second_tree) = f.commit(&[("source", "two\n")]);
+    let (third, third_tree) = f.commit(&[("source", "three\n")]);
+    let keys = [
+        (f.key(&first, &first), first_tree, "one\n"),
+        (f.key(&second, &second), second_tree, "two\n"),
+        (f.key(&third, &third), third_tree, "three\n"),
+    ];
+    let (store, _) = copying_store();
+    let directories: Vec<_> = keys
+        .iter()
+        .map(|(key, tree, _)| f.resolve(&store, key, tree).unwrap())
+        .collect();
+    for directory in &directories {
+        assert_eq!(
+            read_metadata(directory).unwrap().boot_id.as_deref(),
+            Some("boot-one")
+        );
+    }
+    let broken_git = &directories[0];
+    let changed_file = &directories[1];
+    empty_git_objects(broken_git);
+    fs::write(changed_file.join("source"), "lost\n").unwrap();
+    assert!(!git_is_whole(broken_git));
+    let work = CheckoutWorkCapture::begin(&f.config.sibling_snapshots_dir());
+
+    // A daemon restart: same boot, so nothing is checked or rebuilt.
+    let (restarted, _) = copying_store();
+    for (key, tree, _) in &keys {
+        f.resolve(&restarted, key, tree).unwrap();
+    }
+    assert!(work.events().is_empty(), "{:?}", work.events());
+    assert!(!git_is_whole(broken_git));
+
+    // A host restart: the damaged snapshots are rebuilt, the whole one kept.
+    f.config.boot_id_override = Some("boot-two".into());
+    let (rebooted, rebooted_calls) = copying_store();
+    for ((key, tree, content), directory) in keys.iter().zip(&directories) {
+        assert_eq!(&f.resolve(&rebooted, key, tree).unwrap(), directory);
+        assert_eq!(
+            fs::read_to_string(directory.join("source")).unwrap(),
+            *content
+        );
+        assert!(git_is_whole(directory));
+        assert_eq!(
+            read_metadata(directory).unwrap().boot_id.as_deref(),
+            Some("boot-two")
+        );
+    }
+    assert_eq!(
+        work.events(),
+        ["sync_workspace", "sync_workspace"],
+        "only the two damaged snapshots are rebuilt"
+    );
+    // The first rebuild found no snapshot checked in this boot and cloned
+    // the mirror; the second copied the first, rebuilt in this boot.
+    let sources: Vec<_> = rebooted_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(source, _)| source.clone())
+        .collect();
+    assert_eq!(sources, std::slice::from_ref(broken_git));
 }

@@ -273,25 +273,40 @@ impl Runner {
         {
             return;
         }
+        let claims = PathClaims::of(&inner);
+        let legacy_siblings: Vec<_> = inner
+            .jobs
+            .values()
+            .filter(|job| Self::legacy_sibling_user(&inner, job))
+            .filter_map(|job| job.request.as_ref())
+            .flat_map(|request| &request.siblings)
+            .map(|sibling| Spelled::new(&sibling.canonical_path))
+            .collect();
         let paths: Vec<String> = inner.catalog.sibling_commits.keys().cloned().collect();
         let mut changed = false;
         for path in paths {
-            if Self::legacy_checkout_in_use(&inner, &path) {
+            let checkout = Spelled::new(&path);
+            if checkout.unresolved() {
+                // The path cannot be resolved, so a workspace might be
+                // there under another spelling: keep it.
                 continue;
             }
-            if inner.catalog.workspaces.contains_key(&path) {
-                // The repository's own main workspace: only the record that
-                // it also held a sibling checkout goes.
+            if claims.live_overlaps(&checkout)
+                || legacy_siblings
+                    .iter()
+                    .any(|sibling| sibling.overlaps(&checkout))
+            {
+                continue;
+            }
+            if claims.workspace_is(&checkout) {
+                // A catalogued workspace, possibly reached through another
+                // spelling of the path: only the record that it also held a
+                // sibling checkout goes.
                 inner.catalog.sibling_commits.remove(&path);
                 changed = true;
                 continue;
             }
-            if inner
-                .catalog
-                .workspaces
-                .keys()
-                .any(|key| overlaps(Path::new(key), Path::new(&path)))
-            {
+            if claims.workspace_overlaps(&checkout, |_| true) {
                 // Discarding it would take a nested workspace with it.
                 continue;
             }
@@ -320,26 +335,113 @@ impl Runner {
             }
         }
     }
+}
 
-    /// Whether anything may still use the legacy sibling checkout at `path`:
-    /// a reservation, a Prepare, an admission or a drop of an overlapping
-    /// workspace, a job that has not ended whose workspace overlaps it, or a
-    /// running job started with its siblings bound from their host paths
-    /// that declares an overlapping sibling.
-    fn legacy_checkout_in_use(inner: &Inner, path: &str) -> bool {
-        let near = |key: &str| !key.is_empty() && overlaps(Path::new(key), Path::new(path));
-        inner.reserved.keys().any(|key| near(key))
-            || inner.preparing.values().any(|r| near(&r.workspace_key))
-            || inner.admitting.values().any(|r| near(&r.workspace_key))
-            || inner.dropping.iter().any(|key| near(key))
-            || inner.jobs.values().any(|job| {
-                let Some(request) = &job.request else {
-                    return false;
-                };
-                (SnapshotReferences::live(inner, job)
-                    && (near(&request.workspace_key) || near(&request.cwd)))
-                    || (Self::legacy_sibling_user(inner, job)
-                        && Self::workspace_uses_sibling(path, &request.siblings))
+/// A host path as spelled, and as resolved through symbolic links in its
+/// existing ancestors. Destinations reached through a symlinked prefix are
+/// accepted (`workspace::validate_destinations`), so two different spellings
+/// can name one directory; comparing both forms catches that.
+pub(super) struct Spelled {
+    lexical: PathBuf,
+    /// `None` when the path cannot be resolved, for example through a
+    /// dangling symbolic link.
+    resolved: Option<PathBuf>,
+}
+
+impl Spelled {
+    pub(super) fn new(path: &str) -> Self {
+        Self {
+            lexical: PathBuf::from(path),
+            resolved: workspace::destination(Path::new(path)).ok(),
+        }
+    }
+
+    /// Whether the path could not be resolved, so where it lands is unknown.
+    pub(super) fn unresolved(&self) -> bool {
+        self.resolved.is_none()
+    }
+
+    /// Whether either path contains the other, as spelled or as resolved.
+    fn overlaps(&self, other: &Spelled) -> bool {
+        overlaps(&self.lexical, &other.lexical)
+            || matches!((&self.resolved, &other.resolved), (Some(a), Some(b)) if overlaps(a, b))
+    }
+
+    fn same(&self, other: &Spelled) -> bool {
+        self.lexical == other.lexical
+            || matches!((&self.resolved, &other.resolved), (Some(a), Some(b)) if a == b)
+    }
+}
+
+/// The host paths that workspaces and work in flight own, for deciding
+/// whether a legacy sibling checkout can be deleted without deleting one of
+/// them: catalogued workspaces, and the workspaces and working directories of
+/// jobs that have not ended, reservations, admissions, Prepares and drops.
+/// Built under the state lock; it resolves paths but runs no process.
+pub(super) struct PathClaims {
+    /// Catalogued workspaces, with the repository and kind of each.
+    workspaces: Vec<(Spelled, String, WorkspaceKind)>,
+    live: Vec<Spelled>,
+}
+
+impl PathClaims {
+    pub(super) fn of(inner: &Inner) -> Self {
+        let workspaces = inner
+            .catalog
+            .workspaces
+            .iter()
+            .map(|(key, workspace)| {
+                (
+                    Spelled::new(key),
+                    workspace.repository.clone(),
+                    workspace.kind,
+                )
             })
+            .collect();
+        let mut live: Vec<&str> = Vec::new();
+        for job in inner.jobs.values() {
+            if let (true, Some(request)) = (SnapshotReferences::live(inner, job), &job.request) {
+                live.push(&request.workspace_key);
+                live.push(&request.cwd);
+            }
+        }
+        live.extend(inner.reserved.keys().map(String::as_str));
+        for request in inner.admitting.values() {
+            live.push(&request.workspace_key);
+            live.push(&request.cwd);
+        }
+        live.extend(inner.preparing.values().map(|r| r.workspace_key.as_str()));
+        live.extend(inner.dropping.iter().map(String::as_str));
+        let live = live
+            .into_iter()
+            // Warm-build keys (`base:<root>`) and requests without a
+            // workspace name no host path.
+            .filter(|path| workspace::absolute(path))
+            .map(Spelled::new)
+            .collect();
+        Self { workspaces, live }
+    }
+
+    /// Whether a job, reservation, admission, Prepare or drop holds a path
+    /// overlapping `path`.
+    pub(super) fn live_overlaps(&self, path: &Spelled) -> bool {
+        self.live.iter().any(|claim| claim.overlaps(path))
+    }
+
+    /// Whether `path` is itself a catalogued workspace.
+    fn workspace_is(&self, path: &Spelled) -> bool {
+        self.workspaces.iter().any(|(claim, _, _)| claim.same(path))
+    }
+
+    /// Whether a catalogued workspace that `counts` (given its repository
+    /// and kind) overlaps `path`.
+    pub(super) fn workspace_overlaps(
+        &self,
+        path: &Spelled,
+        counts: impl Fn((&str, WorkspaceKind)) -> bool,
+    ) -> bool {
+        self.workspaces
+            .iter()
+            .any(|(claim, repository, kind)| counts((repository, *kind)) && claim.overlaps(path))
     }
 }

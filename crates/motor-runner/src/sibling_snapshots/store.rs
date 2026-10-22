@@ -70,6 +70,14 @@ pub(crate) struct Metadata {
     javascript_environment: String,
     /// The tree the snapshot was verified to hold when it was created.
     pub(crate) tree_hash: String,
+    /// The boot of the host in which the snapshot's files were last known
+    /// to be whole: the boot that published it, or a later one that checked
+    /// it again. Publication does not flush the snapshot's files to disk, so
+    /// after a host crash a snapshot from an earlier boot may have lost file
+    /// contents and is checked before it is used. `None` in metadata written
+    /// before this field existed, which counts as an earlier boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
 }
 
 impl Metadata {
@@ -81,7 +89,16 @@ impl Metadata {
             caller: key.caller.clone(),
             javascript_environment: key.javascript_environment.as_str().to_string(),
             tree_hash: tree_hash.to_string(),
+            boot_id: None,
         }
+    }
+
+    /// Whether the snapshot's files may have been lost in a host crash since
+    /// they were last known whole: the metadata names a boot other than
+    /// `boot`, the current one. When the current boot is unknown nothing can
+    /// be told, and the snapshot is trusted as before.
+    fn predates_boot(&self, boot: Option<&str>) -> bool {
+        boot.is_some_and(|boot| self.boot_id.as_deref() != Some(boot))
     }
 
     /// Metadata of an unknown version, or one naming another key, cannot
@@ -235,9 +252,35 @@ impl SnapshotStore {
             ));
         }
         let directory = key.directory(config);
+        let boot = current_boot(config);
         self.with_key_lock(&directory, || {
             match existing(key, &directory)? {
                 Existing::Ready(metadata) if metadata.tree_hash == tree_hash => {
+                    if metadata.predates_boot(boot.as_deref()) {
+                        // The first use since the host restarted: the files
+                        // may not have reached the disk before it went down.
+                        match verify_after_reboot(trees, key, &metadata, &directory) {
+                            Ok(()) => atomic_json(
+                                &metadata_path(&directory),
+                                &Metadata {
+                                    boot_id: boot.clone(),
+                                    ..metadata
+                                },
+                            )?,
+                            Err(error) => {
+                                tracing::warn!(snapshot = %directory.display(), %error, "sibling snapshot from before the host restarted is damaged; recreating it");
+                                discard(&directory)?;
+                                return self.create(
+                                    config,
+                                    trees,
+                                    key,
+                                    tree_hash,
+                                    &directory,
+                                    boot.as_deref(),
+                                );
+                            }
+                        }
+                    }
                     // The directory's mtime is its last-use time.
                     if let Err(error) = stamp(&directory) {
                         tracing::warn!(snapshot = %directory.display(), %error, "cannot stamp sibling snapshot use");
@@ -259,7 +302,7 @@ impl SnapshotStore {
                 }
                 Existing::Absent => {}
             }
-            self.create(config, trees, key, tree_hash, &directory)
+            self.create(config, trees, key, tree_hash, &directory, boot.as_deref())
         })?;
         Ok(directory)
     }
@@ -373,6 +416,7 @@ impl SnapshotStore {
         key: &SnapshotKey,
         tree_hash: &str,
         directory: &Path,
+        boot: Option<&str>,
     ) -> io::Result<()> {
         let started = Instant::now();
         let parent = directory
@@ -382,11 +426,13 @@ impl SnapshotStore {
         let temporary = temporary_path(directory);
         // The predecessor stays registered until publication, so a deletion
         // cannot remove it while its files are being copied.
-        let predecessor = self.register_predecessor(key, parent);
+        let predecessor = self.register_predecessor(key, parent, boot);
         let source = predecessor.as_ref().map(|p| p.directory.clone());
         let result = self
             .build(config, trees, key, tree_hash, source.as_deref(), &temporary)
-            .and_then(|cloned| publish(key, tree_hash, &temporary, directory).map(|()| cloned));
+            .and_then(|cloned| {
+                publish(key, tree_hash, boot, &temporary, directory).map(|()| cloned)
+            });
         drop(predecessor);
         match result {
             Ok(cloned) => {
@@ -452,9 +498,16 @@ impl SnapshotStore {
     }
 
     /// Picks the most recently used ready snapshot of the repository that no
-    /// deletion has claimed and registers it as a predecessor.
-    fn register_predecessor(&self, key: &SnapshotKey, parent: &Path) -> Option<Predecessor<'_>> {
-        let candidates = ready_snapshots(key, parent);
+    /// deletion has claimed and registers it as a predecessor. A snapshot
+    /// from an earlier boot that no setup has checked since is not copied:
+    /// its files may be damaged.
+    fn register_predecessor(
+        &self,
+        key: &SnapshotKey,
+        parent: &Path,
+        boot: Option<&str>,
+    ) -> Option<Predecessor<'_>> {
+        let candidates = ready_snapshots(key, parent, boot);
         let mut registry = lock(&self.registry);
         let directory = candidates
             .into_iter()
@@ -498,10 +551,10 @@ fn existing(key: &SnapshotKey, directory: &Path) -> io::Result<Existing> {
     }
 }
 
-/// Ready snapshots of the repository in `parent`, most recently used first.
-/// Temporary directories and metadata files have a `.` in their names; final
-/// snapshot names never do.
-fn ready_snapshots(key: &SnapshotKey, parent: &Path) -> Vec<PathBuf> {
+/// Ready snapshots of the repository in `parent` known whole in the current
+/// `boot`, most recently used first. Temporary directories and metadata files
+/// have a `.` in their names; final snapshot names never do.
+fn ready_snapshots(key: &SnapshotKey, parent: &Path, boot: Option<&str>) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -514,8 +567,9 @@ fn ready_snapshots(key: &SnapshotKey, parent: &Path) -> Vec<PathBuf> {
             let metadata = read_metadata(&path).ok()?;
             (found.is_dir()
                 && metadata.version == METADATA_VERSION
-                && metadata.repository == key.repository)
-                .then_some((found.modified().ok()?, path))
+                && metadata.repository == key.repository
+                && !metadata.predates_boot(boot))
+            .then_some((found.modified().ok()?, path))
         })
         .collect();
     ready.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -535,17 +589,65 @@ fn temporary_path(directory: &Path) -> PathBuf {
 fn publish(
     key: &SnapshotKey,
     tree_hash: &str,
+    boot: Option<&str>,
     temporary: &Path,
     directory: &Path,
 ) -> io::Result<()> {
     let parent = directory
         .parent()
         .ok_or_else(|| invalid("sibling snapshot has no parent directory"))?;
-    atomic_json(&metadata_path(directory), &Metadata::new(key, tree_hash))?;
+    let metadata = Metadata {
+        boot_id: boot.map(str::to_string),
+        ..Metadata::new(key, tree_hash)
+    };
+    atomic_json(&metadata_path(directory), &metadata)?;
     crate::filesystem::rename(temporary, directory)?;
     crate::filesystem::sync_directory(parent)?;
     if let Err(error) = stamp(directory) {
         tracing::warn!(snapshot = %directory.display(), %error, "cannot stamp sibling snapshot use");
+    }
+    Ok(())
+}
+
+/// The current boot of the host, or `None` where it cannot be read. The
+/// kernel picks a new boot ID at every boot, so a daemon restart keeps it and
+/// a host restart, including after a crash, changes it.
+fn current_boot(config: &Config) -> Option<String> {
+    #[cfg(test)]
+    if let Some(boot) = &config.boot_id_override {
+        return Some(boot.clone());
+    }
+    let _ = config;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(boot.trim().to_string()).filter(|boot| !boot.is_empty())
+}
+
+/// Checks, before its first use since the host restarted, a snapshot whose
+/// files may not have reached the disk before the restart: its HEAD is still
+/// the caller commit, `git fsck` finds its Git directory whole (every object
+/// and the index), and the checkout still hashes to the tree it was verified
+/// to hold. Untracked contents such as `node_modules` are not checked.
+fn verify_after_reboot(
+    trees: &Trees,
+    key: &SnapshotKey,
+    metadata: &Metadata,
+    directory: &Path,
+) -> io::Result<()> {
+    let head = crate::workspace::git(directory, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if head != key.caller {
+        return Err(invalid(format!(
+            "HEAD is {head}, not the caller commit {}",
+            key.caller
+        )));
+    }
+    crate::workspace::git(directory, &["fsck", "--no-progress", "--no-dangling"])?;
+    let computed = trees.tree_hash(directory)?;
+    if computed != metadata.tree_hash {
+        return Err(Trees::tree_hash_mismatch(
+            directory,
+            &metadata.tree_hash,
+            &computed,
+        ));
     }
     Ok(())
 }

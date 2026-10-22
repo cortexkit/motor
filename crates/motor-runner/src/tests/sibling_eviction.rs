@@ -796,3 +796,130 @@ async fn prepare_enforces_the_cap_after_resolving_its_snapshots() {
     assert!(!published(&unreferenced));
     assert!(published(&created));
 }
+
+/// The sequence a runner goes through when it is deployed with sibling
+/// snapshots on top of a state left by in-place siblings: a job checked the
+/// sibling out at its path and recorded it, then the runner restarts in
+/// snapshot mode. Startup maintenance retires that checkout when nothing
+/// claims it, and keeps the directory, dropping only the record, when the
+/// path is also a catalogued workspace.
+#[tokio::test]
+async fn in_place_sibling_checkout_is_retired_when_the_runner_reopens_in_snapshot_mode() {
+    for catalogued in [false, true] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.disable_warm_builds = true;
+        let runner = Runner::open(config).unwrap();
+        assert!(runner.core.config.in_place_siblings());
+        let (run, bytes) = f.run("cat ../commons/source");
+        f.submit(&runner, &run, &bytes);
+        let t = terminal(&runner, run.job_id).await;
+        assert_eq!(
+            t.outcome,
+            Outcome::Exit { code: 0 },
+            "{:?}",
+            t.refusal_detail
+        );
+        let checkout = Path::new(&f.canonical);
+        assert!(checkout.join("source").exists());
+        assert!(recorded(&runner, &f.canonical));
+        if catalogued {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let now = runner.now();
+            inner.catalog.workspaces.insert(
+                f.canonical.clone(),
+                Workspace {
+                    used_ms: now,
+                    ..Workspace::default()
+                },
+            );
+            runner.catalog(&inner).unwrap();
+        }
+        drop(runner);
+
+        let (mut config, _) = snapshot_config(&f);
+        config.disable_warm_builds = true;
+        let runner = reopen(config);
+        assert!(!recorded(&runner, &f.canonical), "{catalogued}");
+        assert_eq!(
+            checkout.join("source").exists(),
+            catalogued,
+            "catalogued: {catalogued}"
+        );
+    }
+}
+
+/// Workspaces are accepted through a symlinked prefix, so a legacy sibling
+/// record can name a directory by another spelling than the workspace or
+/// work that owns it. Legacy cleanup compares resolved paths too: a checkout
+/// that is a catalogued workspace under the other spelling loses only its
+/// record, and one that a running job, a reservation, a Prepare or a nested
+/// catalogued workspace holds under the other spelling stays.
+#[test]
+fn legacy_cleanup_sees_owners_through_a_symlinked_prefix() {
+    let f = Fixture::new();
+    let runner = manual_runner(snapshot_config(&f).0);
+    let now = runner.now();
+    let real = f.scratch.join("remote/real");
+    let alias = f.scratch.join("remote/alias");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let names = [
+        "unused",
+        "catalogued",
+        "nested",
+        "running",
+        "reserved",
+        "preparing",
+    ];
+    for name in names {
+        fs::create_dir_all(real.join(name)).unwrap();
+        fs::write(real.join(name).join("source"), "legacy\n").unwrap();
+    }
+    let spelled = |base: &Path, name: &str| text(&base.join(name)).to_string();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        for name in names {
+            inner
+                .catalog
+                .sibling_commits
+                .insert(spelled(&alias, name), commit_id(7));
+        }
+        for key in [spelled(&real, "catalogued"), spelled(&real, "nested/inner")] {
+            inner.catalog.workspaces.insert(
+                key,
+                Workspace {
+                    used_ms: now,
+                    ..Workspace::default()
+                },
+            );
+        }
+        let mut job = running_job(&f, 0, now);
+        let request = job.request.as_mut().unwrap();
+        request.workspace_key = spelled(&real, "running");
+        request.cwd = request.workspace_key.clone();
+        inner.jobs.insert(job.id, job);
+        inner
+            .reserved
+            .insert(spelled(&real, "reserved"), reservation(&f, 0, now));
+        let mut prepare = prepare_for(&f.run("true").0);
+        prepare.workspace_key = spelled(&real, "preparing");
+        inner.preparing.insert(prepare.transfer_id, prepare);
+    }
+    runner.maintenance().unwrap();
+    let outcome = |name: &str| {
+        (
+            real.join(name).join("source").exists(),
+            recorded(&runner, &spelled(&alias, name)),
+        )
+    };
+    assert_eq!(outcome("unused"), (false, false), "nothing owns it");
+    assert_eq!(
+        outcome("catalogued"),
+        (true, false),
+        "a workspace: only the record goes"
+    );
+    for held in ["nested", "running", "reserved", "preparing"] {
+        assert_eq!(outcome(held), (true, true), "{held}");
+    }
+}
