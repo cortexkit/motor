@@ -65,12 +65,12 @@ try {
 }
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-    $script:diskInventoryGetDiskCalls = 0
-    $script:diskInventoryPerDiskQuery = $false
+    $global:diskInventoryGetDiskCalls = 0
+    $global:diskInventoryPerDiskQuery = $false
     function global:Get-Disk {
         param([uint32]$Number)
-        $script:diskInventoryGetDiskCalls++
-        if ($PSBoundParameters.ContainsKey('Number')) { $script:diskInventoryPerDiskQuery = $true }
+        $global:diskInventoryGetDiskCalls++
+        if ($PSBoundParameters.ContainsKey('Number')) { $global:diskInventoryPerDiskQuery = $true }
         @(
             [pscustomobject]@{Number=[uint32]0; BusType='SCSI'; IsBoot=$true; IsSystem=$true}
             [pscustomobject]@{Number=[uint32]1; BusType='SCSI'; IsBoot=$false; IsSystem=$false}
@@ -87,7 +87,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     try {
         $inventoryPath = Join-Path $PSScriptRoot 'hyperv_disk_inventory.ps1'
         $inventory = @((& $inventoryPath) | ConvertFrom-Json)
-        if ($script:diskInventoryGetDiskCalls -ne 1 -or $script:diskInventoryPerDiskQuery) {
+        if ($global:diskInventoryGetDiskCalls -ne 1 -or $global:diskInventoryPerDiskQuery) {
             throw 'FAIL hyperv-cache-inventory-uses-one-storage-query'
         }
         if ($inventory.Count -ne 2 -or $inventory[0].number -ne 0 -or $inventory[0].lun -ne 0 -or -not $inventory[0].boot -or -not $inventory[0].system -or $inventory[1].number -ne 1 -or $inventory[1].lun -ne 1 -or $inventory[1].boot -or $inventory[1].system) {
@@ -97,6 +97,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $count++
     } finally {
         Remove-Item Function:\Get-Disk,Function:\Get-CimInstance
+        Remove-Variable -Name diskInventoryGetDiskCalls,diskInventoryPerDiskQuery -Scope Global -ErrorAction SilentlyContinue
     }
     . "$PSScriptRoot\parent-identity.ps1"
     $hypervPath = Join-Path $PSScriptRoot 'hyperv.ps1'

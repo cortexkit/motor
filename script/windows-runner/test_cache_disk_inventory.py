@@ -22,6 +22,13 @@ class CacheDiskInventoryTests(unittest.TestCase):
             r'(?s)powershell\(include_str!\(\s*"../../../script/windows-runner/hyperv_disk_inventory\.ps1"\s*\)\)',
         )
 
+        fixture = (ROOT / "script/windows-runner/test_scripts.ps1").read_text()
+        self.assertIn("$global:diskInventoryGetDiskCalls = 0", fixture)
+        self.assertIn("$global:diskInventoryGetDiskCalls++", fixture)
+        self.assertIn("$global:diskInventoryPerDiskQuery", fixture)
+        self.assertIn("$inventory = @((& $inventoryPath) | ConvertFrom-Json)", fixture)
+        self.assertIn("Remove-Variable -Name diskInventoryGetDiskCalls,diskInventoryPerDiskQuery -Scope Global", fixture)
+
 
 if __name__ == "__main__":
     unittest.main()
