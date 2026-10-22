@@ -369,6 +369,10 @@ impl Handler {
         self.storage_ready_deadline = deadline;
         self
     }
+    #[cfg(test)]
+    pub(crate) fn ssh_connector(&self) -> Option<Arc<SshConnector>> {
+        self.ssh.get().cloned()
+    }
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
         self.resolver = resolver;
         self
@@ -943,7 +947,7 @@ impl ModuleHandler for Handler {
         } else {
             self.ssh
                 .get()
-                .and_then(|ssh| crate::Connector::refusal(ssh.as_ref()))
+                .and_then(|ssh| ssh.health_refusal())
                 .map(str::to_owned)
         };
         let mut report = self

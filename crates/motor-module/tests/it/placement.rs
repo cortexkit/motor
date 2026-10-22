@@ -156,6 +156,12 @@ pub(crate) struct FakeVault {
     pub key: ed25519_dalek::SigningKey,
     pub signs: AtomicUsize,
     pub refused: AtomicBool,
+    /// Fails each sign as if the vault were briefly unavailable.
+    pub unavailable: AtomicBool,
+    /// While set, each sign waits for a permit on `sign_gate` before replying,
+    /// so a test can hold a vault call in flight.
+    pub gated: AtomicBool,
+    pub sign_gate: tokio::sync::Semaphore,
     pub invalid_public: AtomicBool,
 }
 impl FakeVault {
@@ -167,6 +173,9 @@ impl FakeVault {
             key: ed25519_dalek::SigningKey::from_bytes(&seed),
             signs: AtomicUsize::new(0),
             refused: AtomicBool::new(false),
+            unavailable: AtomicBool::new(false),
+            gated: AtomicBool::new(false),
+            sign_gate: tokio::sync::Semaphore::new(0),
             invalid_public: AtomicBool::new(false),
         })
     }
@@ -215,6 +224,15 @@ impl CredentialGetTarget for FakeVault {
         assert_eq!(id, "signing:ck-motor-ssh:1");
         Box::pin(async move {
             self.signs.fetch_add(1, Ordering::SeqCst);
+            if self.gated.load(Ordering::SeqCst) {
+                self.sign_gate.acquire().await.unwrap().forget();
+            }
+            if self.unavailable.load(Ordering::SeqCst) {
+                return Err(CredentialResolverError::new(
+                    CredentialErrorClass::Unavailable,
+                    "private vault detail",
+                ));
+            }
             if self.refused.load(Ordering::SeqCst) {
                 return Ok(
                     json!({"result":{"error":{"code":"auth_required", "message":"private vault detail"}}}),
@@ -1246,10 +1264,177 @@ async fn refused_sign_returns_agent_failure_typed_run_refusal_and_failing_health
     assert_eq!(
         vault.signs.load(Ordering::SeqCst),
         1,
-        "terminal auth refusal must not retry"
+        "a refused grant is not retried before its backoff passes"
     );
     rig.stop().await;
     assert!(!runtime.exists());
+}
+
+/// Signs once through the agent socket and returns whether the reply was a
+/// signature (true) or SSH_AGENT_FAILURE (false).
+async fn signs_through(socket: &std::path::Path, key: &[u8]) -> bool {
+    match agent_packet(socket, &sign_packet(key, b"challenge")).await[..] {
+        [5] => false,
+        [14, ..] => true,
+        ref other => panic!("unexpected agent reply type {}", other[0]),
+    }
+}
+fn assert_refused_run(terminal: Value, code: &str) {
+    let StreamRecord::Terminal(terminal) = serde_json::from_value(terminal).unwrap() else {
+        panic!("expected refusal")
+    };
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::RunnerAuthenticationFailed
+        }
+    );
+    assert_eq!(terminal.refusal_detail(), Some(code));
+}
+
+// A vault that is briefly unavailable must not take the build server offline
+// until ck-motor restarts: once the short backoff has passed, the next job's
+// sign request asks the vault again, and health recovers when it signs.
+#[tokio::test]
+async fn transient_sign_failure_is_retried_after_backoff_and_health_recovers() {
+    let vault = FakeVault::new();
+    vault.unavailable.store(true, Ordering::SeqCst);
+    let mut rig = Rig::with_resolver(vault.resolver()).await;
+    assert_eq!(
+        rig.bind(aft(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    let ssh = rig.handler.ssh_connector().unwrap();
+    let agent = ssh.agent().unwrap();
+    agent.signing().pause();
+    let key = identity(&agent.socket).await;
+    assert!(!signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+    let health = rig.handler.health().await;
+    assert_eq!(health.status, HealthStatus::Failing);
+    assert_failing_detail_and_counters(&health, "runner_sign_unavailable");
+    // While the failure holds, jobs are refused before start with the typed code.
+    assert_eq!(ssh.refusal(), Some("runner_sign_unavailable"));
+    assert_refused_run(rig.run("any").await, "runner_sign_unavailable");
+    assert!(!rig.root.join("spools").exists());
+
+    // The vault comes back, but is not asked again inside the backoff.
+    vault.unavailable.store(false, Ordering::SeqCst);
+    assert!(!signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+    assert_eq!(ssh.refusal(), Some("runner_sign_unavailable"));
+
+    // After the backoff a job is let through to SSH, while health keeps showing
+    // the failure until a sign actually succeeds.
+    agent
+        .signing()
+        .advance(crate::agent::TRANSIENT_SIGN_BACKOFF);
+    assert_eq!(ssh.refusal(), None);
+    let health = rig.handler.health().await;
+    assert_eq!(health.status, HealthStatus::Failing);
+    assert_failing_detail_and_counters(&health, "runner_sign_unavailable");
+    assert!(signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(ssh.refusal(), None);
+    assert_eq!(ssh.health_refusal(), None);
+    assert_eq!(rig.handler.health().await.status, HealthStatus::Ok);
+    // Healthy again: later signs go straight to the vault.
+    assert!(signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 3);
+    rig.stop().await;
+}
+
+// A refused grant is repaired by re-approving it, without a restart, so it is
+// retried too, on the longer backoff.
+#[tokio::test]
+async fn refused_sign_grant_is_retried_after_longer_backoff_once_reapproved() {
+    let vault = FakeVault::new();
+    vault.refused.store(true, Ordering::SeqCst);
+    let mut rig = Rig::with_resolver(vault.resolver()).await;
+    assert_eq!(
+        rig.bind(aft(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    let ssh = rig.handler.ssh_connector().unwrap();
+    let agent = ssh.agent().unwrap();
+    agent.signing().pause();
+    let key = identity(&agent.socket).await;
+    assert!(!signs_through(&agent.socket, &key).await);
+    assert_eq!(ssh.refusal(), Some("runner_sign_grant_refused"));
+
+    vault.refused.store(false, Ordering::SeqCst);
+    // The short backoff of a transient failure does not apply here.
+    agent
+        .signing()
+        .advance(crate::agent::TRANSIENT_SIGN_BACKOFF);
+    assert_eq!(ssh.refusal(), Some("runner_sign_grant_refused"));
+    assert!(!signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+    assert_refused_run(rig.run("any").await, "runner_sign_grant_refused");
+
+    agent
+        .signing()
+        .advance(crate::agent::REPAIRABLE_SIGN_BACKOFF - crate::agent::TRANSIENT_SIGN_BACKOFF);
+    assert_eq!(ssh.refusal(), None);
+    assert_eq!(
+        rig.handler.health().await.status,
+        HealthStatus::Failing,
+        "health shows the refusal until a sign succeeds"
+    );
+    assert!(signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.handler.health().await.status, HealthStatus::Ok);
+    rig.stop().await;
+}
+
+// A burst of jobs against a failing vault makes at most one vault call per
+// backoff window: none inside it, and exactly one once it has passed. Admitting
+// that one call starts a new window, so requests that arrive while it is still
+// waiting for the vault are refused without calling it.
+#[tokio::test]
+async fn concurrent_sign_requests_make_one_vault_call_per_backoff_window() {
+    const BURST: usize = 8;
+    fn burst(socket: &std::path::Path, key: &[u8]) -> tokio::task::JoinSet<bool> {
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..BURST {
+            let (socket, key) = (socket.to_path_buf(), key.to_vec());
+            requests.spawn(async move { signs_through(&socket, &key).await });
+        }
+        requests
+    }
+    let scratch = SocketScratch::new("ac");
+    let vault = FakeVault::new();
+    vault.unavailable.store(true, Ordering::SeqCst);
+    let agent = start_agent(&scratch, &vault).await;
+    agent.signing().pause();
+    let key = identity(&agent.socket).await;
+    assert!(!signs_through(&agent.socket, &key).await);
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+
+    // Inside the backoff no request reaches the vault.
+    let mut requests = burst(&agent.socket, &key);
+    while let Some(signed) = requests.join_next().await {
+        assert!(!signed.unwrap());
+    }
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 1);
+
+    // After it, the vault call that one request makes is held open; every
+    // other request is answered with a failure without calling the vault.
+    vault.gated.store(true, Ordering::SeqCst);
+    agent
+        .signing()
+        .advance(crate::agent::TRANSIENT_SIGN_BACKOFF);
+    let mut requests = burst(&agent.socket, &key);
+    for _ in 1..BURST {
+        assert!(!requests.join_next().await.unwrap().unwrap());
+    }
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 2);
+    vault.sign_gate.add_permits(1);
+    assert!(!requests.join_next().await.unwrap().unwrap());
+    assert_eq!(vault.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(agent.refusal(), Some("runner_sign_unavailable"));
+    agent.shutdown().await;
 }
 #[tokio::test]
 async fn agent_rejects_foreign_key_flags_and_malformed_requests_without_signing() {
