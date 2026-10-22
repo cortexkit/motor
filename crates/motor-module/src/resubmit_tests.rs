@@ -164,6 +164,53 @@ async fn spill_refused_by_hosted_runner_before_run_resubmits() {
     assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
 }
 
+/// The hosted runner answered the have exchange, but ck-motor could not build
+/// the bundle for it, so no Run frame was sent: the spill goes back to the
+/// build server under a new ID rather than ending refused_before_start /
+/// snapshot_failed. The fixture holds a ref named `refs/ck-motor`, which
+/// makes every `refs/ck-motor/<id>/...` bundle ref impossible to create; the
+/// build server reports holding every commit, so it needs no bundle.
+#[tokio::test]
+async fn spill_whose_bundle_fails_before_run_resubmits() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = ScratchDir::new("motor-spill-bundle-failed");
+    let repo = fixture_repo(&scratch);
+    assert!(std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["update-ref", "refs/ck-motor", "HEAD"])
+        .status()
+        .unwrap()
+        .success());
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&h.route.broker_url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
+    assert_one_build_server_job(id, &records);
+    let resubmitted = assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    let job = motor.storage.job(id).unwrap();
+    assert_eq!(job.build_server_job_id, Some(resubmitted));
+    // The hosted runner answered the have exchange and never got a Run frame.
+    assert!(h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, Frame::Have { .. })));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    let requests = h.requests.lock().unwrap();
+    assert!(
+        requests.last().unwrap().ends_with("/release"),
+        "{requests:?}"
+    );
+    assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
+}
+
 /// Once the Run frame may have reached a hosted runner, a lost acknowledgement
 /// is followed by reattaching to that runner, never by a second submission.
 #[tokio::test]

@@ -949,6 +949,12 @@ impl Motor {
                 if explicit_windows && self.next_windows_runner(id)? {
                     return Ok(true);
                 }
+                if self
+                    .return_spill(id, "hosted_platform_unsupported", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 return self
                     .refused(
                         id,
@@ -1027,15 +1033,38 @@ impl Motor {
         })
         .await
         .map_err(io::Error::other)
-        .inspect_err(|error| self.log_hosted_failure(id, "transfer_bundles", error))?;
+        .and_then(|bundles| bundles);
         let (bundles, git_dependencies, upload) = match bundles {
             Ok(b) => b,
             Err(error) => {
                 self.log_hosted_failure(id, "transfer_bundles", &error);
+                // No Run frame was sent, so a spilled job goes back to the
+                // build server instead of failing for the caller.
+                drop(channel);
+                if self
+                    .return_spill(id, "hosted_transfer_bundles_failed", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 return self
                     .refused(id, RefusalReason::SnapshotFailed, Some(hash), None, tx)
                     .await
                     .map(|_| false);
+            }
+        };
+        let workspace_kind = match snapshot::workspace_kind(&self.config, &request.workspace_key) {
+            Ok(kind) => kind,
+            Err(error) => {
+                self.log_hosted_failure(id, "workspace_kind", &error);
+                drop(channel);
+                if self
+                    .return_spill(id, "hosted_workspace_kind_failed", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                return Err(error);
             }
         };
         let run = Run {
@@ -1051,10 +1080,7 @@ impl Motor {
             },
             job_id: build_server_id,
             workspace_key: request.workspace_key.clone(),
-            workspace_kind: Some(
-                snapshot::workspace_kind(&self.config, &request.workspace_key)
-                    .inspect_err(|error| self.log_hosted_failure(id, "workspace_kind", error))?,
-            ),
+            workspace_kind: Some(workspace_kind),
             repository_root: request.repository_root,
             cwd: request.cwd,
             command: request.command,
@@ -1484,6 +1510,16 @@ impl Motor {
         {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
+        if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
+            // Every route to an unknown outcome names its cause here, whether
+            // the runner reported it or ck-motor gave up on the job itself.
+            let cause = terminal
+                .refusal_detail
+                .as_deref()
+                .unwrap_or("no terminal received from the hosted runner");
+            tracing::warn!(job_id = %id, step = "finish", hosted_code = ?state.hosted_code,
+                cause, wall_ms = terminal.wall_ms, "hosted job outcome unknown");
+        }
         if unavailable {
             self.storage.hosted_update(id, |s| {
                 if s.billing != crate::BillingStatus::Available {
@@ -1821,6 +1857,9 @@ impl Motor {
                         self.shadows.terminal(id, &terminal);
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+                    if hosted {
+                        log_hosted_terminal(id, &terminal);
+                    }
                     if !self.pending(id)
                         && spill_watch
                             .as_ref()
@@ -2497,6 +2536,9 @@ mod queue_tests;
 mod repository_routing_tests;
 
 #[cfg(test)]
+mod outcome_unknown_tests;
+
+#[cfg(test)]
 #[path = "started_tests.rs"]
 mod started_tests;
 
@@ -2530,6 +2572,23 @@ fn log_refusal(id: Uuid, refusal: &Refusal) {
     let detail = refusal.detail.as_deref().map(crate::shadow::detail_tail);
     tracing::warn!(job_id = %id, reason = ?refusal.reason, refusal_detail = ?detail,
         retry_after_ms = refusal.retry_after_ms, "runner admission refused");
+}
+
+/// Log the terminal a hosted runner sent, before ck-motor settles the lease
+/// with it. A runner can end a running job as outcome_unknown on a live
+/// connection; without this line the log would show only the settlement.
+fn log_hosted_terminal(id: Uuid, terminal: &TerminalRecord) {
+    let cause = terminal
+        .refusal_detail
+        .as_deref()
+        .unwrap_or("no detail from the runner");
+    if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
+        tracing::warn!(job_id = %id, step = "terminal", cause, wall_ms = terminal.wall_ms,
+            killed = ?terminal.killed, "hosted runner reported outcome unknown");
+    } else {
+        tracing::info!(job_id = %id, step = "terminal", outcome = ?terminal.outcome, cause,
+            wall_ms = terminal.wall_ms, killed = ?terminal.killed, "hosted runner terminal");
+    }
 }
 
 #[cfg(test)]
