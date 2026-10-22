@@ -287,8 +287,8 @@ impl Runner {
         for path in paths {
             let checkout = Spelled::new(&path);
             if checkout.unresolved() {
-                // Where the files are cannot be told, so nothing can be ruled
-                // out as living there.
+                // The path cannot be resolved, so a workspace might be
+                // there under another spelling: keep it.
                 continue;
             }
             if claims.live_overlaps(&checkout)
