@@ -215,14 +215,31 @@ impl Trees {
         &self,
         dependencies: &[GitDependency],
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
+        self.dependency_routes_checked(dependencies, &|| Ok(()))
+    }
+    fn dependency_routes_checked(
+        &self,
+        dependencies: &[GitDependency],
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
         validate_dependencies(dependencies)?;
         let grouped = dependency_commits(dependencies);
         let mut routes = BTreeMap::new();
         let mut missing = Vec::new();
         for (url, commits) in &grouped {
+            check()?;
             let mirror = self.dependency_mirror(url);
             let lock = self.dependency_lock(&mirror);
-            let _guard = crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap());
+            let _guard = loop {
+                check()?;
+                match lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10))
+                    }
+                    Err(e) => return Err(invalid(e)),
+                }
+            };
             let absent: Vec<_> = commits
                 .iter()
                 .filter(|c| {
@@ -375,6 +392,14 @@ impl Trees {
         dependencies: &[GitDependency],
         lockfile: &str,
     ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
+        self.dependency_fetch_routes_checked(dependencies, lockfile, &|| Ok(()))
+    }
+    pub(crate) fn dependency_fetch_routes_checked(
+        &self,
+        dependencies: &[GitDependency],
+        lockfile: &str,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
         let mut declarations = dependencies.to_vec();
         for (url, commit, _) in locked_sources(lockfile)? {
             if dependencies.iter().any(|d| d.url == url) {
@@ -385,7 +410,7 @@ impl Trees {
                 });
             }
         }
-        self.dependency_routes(&declarations)
+        self.dependency_routes_checked(&declarations, check)
     }
 
     /// The caller holds each mapped mirror's lock until Cargo fetch finishes.

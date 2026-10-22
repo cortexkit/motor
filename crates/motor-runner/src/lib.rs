@@ -10,6 +10,8 @@ mod filesystem;
 #[cfg(target_os = "linux")]
 mod isolation;
 pub mod local_transport;
+#[cfg(unix)]
+pub mod macos;
 #[cfg(windows)]
 mod native_process;
 pub mod network;
