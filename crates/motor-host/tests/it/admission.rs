@@ -505,7 +505,12 @@ fn refused_suspend_backs_off_across_activity_and_success_resets_the_cooldown() {
         h.suspend_failed("tenant", now);
         h.prelude("tenant", true);
         h.prelude("tenant", false);
-        assert!(!h.suspend_candidate("tenant", now + delay - 1));
+        // Probe twice across a full idle interval inside the cooldown. A single
+        // probe could be refused by the idle timer even with no failure backoff.
+        assert!(!h.begin_suspend("tenant", now + 1, u64::MAX));
+        assert!(!h.begin_suspend("tenant", now + 60_001, u64::MAX));
+        assert!(!h.begin_suspend("tenant", now + delay - 60_002, u64::MAX));
+        assert!(!h.begin_suspend("tenant", now + delay - 1, u64::MAX));
         now += delay;
         // A fresh idle period is still required after the backoff.
         assert!(!h.suspend_candidate("tenant", now));
