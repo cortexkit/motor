@@ -3,7 +3,7 @@
 //! host saves the Started job record on disk before asking the guest to run the
 //! command, so a failed record write or a crash before that request starts nothing.
 use crate::{backend::*, engine::Config, platform, storage::*, workspace::Trees};
-use motor_protocol::Uuid;
+use motor_protocol::{RefusalReason, Uuid, WindowsGuestAgentReadiness};
 use serde::Deserialize;
 #[cfg(any(unix, test))]
 use std::process::Output;
@@ -68,6 +68,11 @@ pub(crate) fn qualify_prep_local_registry(config: Config) -> io::Result<()> {
 }
 #[cfg(windows)]
 pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
+    if let Some((_, detail)) =
+        guest_agent_refusal(config.windows_runtime.guest_agent_readiness().as_ref())
+    {
+        return Err(io::Error::other(detail));
+    }
     vm::qualify_disconnect(config)
 }
 #[cfg(windows)]
@@ -94,9 +99,44 @@ pub(crate) struct VmConfig {
     #[cfg(windows)]
     pub prep_cargo_sha256: String,
     #[cfg(windows)]
+    #[serde(default)]
+    pub guest_agent_sha256: Option<String>,
+    #[cfg(windows)]
     #[serde(default = "one_slot")]
     pub concurrent_jobs: u32,
 }
+pub(crate) fn guest_agent_readiness(
+    parent_agent_sha256: Option<&str>,
+    release_agent_sha256: &str,
+) -> WindowsGuestAgentReadiness {
+    let valid_hash =
+        |hash: &str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let release = release_agent_sha256.to_ascii_uppercase();
+    let parent = parent_agent_sha256
+        .filter(|hash| valid_hash(hash))
+        .map(str::to_ascii_uppercase);
+    let detail = if !valid_hash(&release) {
+        Some(format!(
+            "windows_guest_agent_release_hash_invalid release_agent_sha256={release}"
+        ))
+    } else if parent.is_none() {
+        Some(format!("windows_guest_agent_identity_missing parent_agent_sha256=missing release_agent_sha256={release}"))
+    } else if parent.as_deref() != Some(release.as_str()) {
+        Some(format!(
+            "windows_guest_agent_mismatch parent_agent_sha256={} release_agent_sha256={release}",
+            parent.as_deref().unwrap()
+        ))
+    } else {
+        None
+    };
+    WindowsGuestAgentReadiness {
+        ready: detail.is_none(),
+        parent_agent_sha256: parent,
+        release_agent_sha256: release,
+        detail,
+    }
+}
+
 #[cfg(windows)]
 fn one_slot() -> u32 {
     1
@@ -314,5 +354,70 @@ impl Backend for WindowsBackend {
         #[cfg(unix)]
         vm::cleanup_orphans(config)?;
         Ok(Vec::new())
+    }
+}
+
+pub(crate) fn guest_agent_refusal(
+    readiness: Option<&WindowsGuestAgentReadiness>,
+) -> Option<(RefusalReason, String)> {
+    match readiness {
+        Some(readiness) if !readiness.ready => Some((
+            RefusalReason::RequestRejected,
+            readiness
+                .detail
+                .clone()
+                .unwrap_or_else(|| "windows guest agent is not ready".into()),
+        )),
+        None => Some((
+            RefusalReason::RequestRejected,
+            "windows_guest_agent_not_ready identity_check_missing".into(),
+        )),
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod guest_agent_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn guest_agent_readiness_covers_match_mismatch_and_missing_record() {
+        let release = "A".repeat(64);
+        let matched = guest_agent_readiness(Some(&release), &release);
+        assert!(matched.ready);
+        assert_eq!(
+            matched.parent_agent_sha256.as_deref(),
+            Some(release.as_str())
+        );
+        assert_eq!(matched.release_agent_sha256, release);
+        assert!(matched.detail.is_none());
+
+        let parent = "B".repeat(64);
+        let mismatch = guest_agent_readiness(Some(&parent), &"A".repeat(64));
+        assert!(!mismatch.ready);
+        let detail = mismatch.detail.unwrap();
+        assert!(detail.contains(&format!("parent_agent_sha256={parent}")));
+        assert!(detail.contains(&format!("release_agent_sha256={}", "A".repeat(64))));
+
+        let missing = guest_agent_readiness(None, &"A".repeat(64));
+        assert!(!missing.ready);
+        let detail = missing.detail.unwrap();
+        assert!(detail.contains("parent_agent_sha256=missing"));
+        assert!(detail.contains(&format!("release_agent_sha256={}", "A".repeat(64))));
+    }
+
+    #[test]
+    fn guest_agent_mismatch_refuses_before_job_start_with_both_hashes() {
+        let parent = "B".repeat(64);
+        let release = "A".repeat(64);
+        let readiness = guest_agent_readiness(Some(&parent), &release);
+        let refusal = guest_agent_refusal(Some(&readiness)).unwrap();
+        assert_eq!(refusal.0, RefusalReason::RequestRejected);
+        assert!(refusal.1.contains(&parent));
+        assert!(refusal.1.contains(&release));
+        assert!(
+            guest_agent_refusal(Some(&guest_agent_readiness(Some(&release), &release))).is_none()
+        );
+        assert!(guest_agent_refusal(None).is_some());
     }
 }

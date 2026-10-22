@@ -1900,6 +1900,18 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+        #[cfg(windows)]
+        if self.core.config.windows_instance() {
+            if let Some(refusal) = crate::windows::guest_agent_refusal(
+                self.core
+                    .config
+                    .windows_runtime
+                    .guest_agent_readiness()
+                    .as_ref(),
+            ) {
+                return Some(refusal);
+            }
+        }
         if let Err(code) = validate_return_paths(
             &request.workspace_key,
             &request.return_paths,

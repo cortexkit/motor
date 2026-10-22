@@ -20,9 +20,19 @@ JOBS: Any = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(JOBS)
 
 
-def hello(version=1, platform="windows"):
-    payload = json.dumps(dict(type="hello", protocol_version=version, platforms=[platform])).encode()
+def _wire(value):
+    payload = json.dumps(value).encode()
     return struct.pack(">I", len(payload)) + payload
+
+
+def status_reply(ready=True, detail=None):
+    agent = dict(ready=ready, parent_agent_sha256="A" * 64, release_agent_sha256="A" * 64, detail=detail)
+    return _wire(dict(type="status_reply", health=dict(windows_guest_agent=agent)))
+
+
+def hello(version=1, platform="windows", agent_ready=True, agent_detail=None):
+    return _wire(dict(type="hello", protocol_version=version, platforms=[platform])) + status_reply(agent_ready, agent_detail)
+
 
 
 class Bridge:
@@ -88,6 +98,15 @@ class QualificationReadinessTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("Get-Service -Name MotorRunner", command[-1])
         self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+    def test_ready_status_requires_a_matching_guest_agent_identity(self):
+        ready = dict(health=dict(windows_guest_agent=dict(ready=True, parent_agent_sha256="A" * 64, release_agent_sha256="A" * 64)))
+        self.assertTrue(JOBS.require_windows_guest_agent_ready(ready)["ready"])
+        mismatch = "windows_guest_agent_mismatch parent_agent_sha256=" + "B" * 64 + " release_agent_sha256=" + "A" * 64
+        with self.assertRaisesRegex(JOBS.RunnerBridgeRefused, mismatch):
+            JOBS.require_windows_guest_agent_ready(dict(health=dict(windows_guest_agent=dict(ready=False, detail=mismatch))))
+        with self.assertRaisesRegex(JOBS.RunnerBridgeRefused, "identity status missing"):
+            JOBS.require_windows_guest_agent_ready(dict(health={}))
 
     def test_service_status_query_failure_is_explicit(self):
         response = subprocess.CompletedProcess([], 1, "", "service not installed")
@@ -182,6 +201,21 @@ class QualificationReadinessTests(unittest.TestCase):
         evidence = json.loads((self.root / "service-readiness.json").read_text())
         self.assertNotIn("hello_validated", evidence["observations"][0])
         self.assertTrue(evidence["ready"])
+
+    def test_guest_agent_mismatch_fails_readiness_before_jobs(self):
+        detail = "windows_guest_agent_mismatch parent_agent_sha256=" + "B" * 64 + " release_agent_sha256=" + "A" * 64
+        mismatch = Bridge(hello(agent_ready=False, agent_detail=detail), running=True)
+        self.bridges = [mismatch]
+        with self.readiness_environment() as (_, launch, output):
+            with self.assertRaisesRegex(JOBS.RunnerBridgeRefused, "Windows guest agent not ready.*windows_guest_agent_mismatch"):
+                JOBS.wait_for_service_ready(self.root, self.runner, self.root, timeout=10)
+        self.assertEqual(launch.call_count, 1)
+        evidence = json.loads((self.root / "service-readiness.json").read_text())
+        self.assertFalse(evidence["ready"])
+        self.assertIn("parent_agent_sha256=" + "B" * 64, evidence["failure"])
+        self.assertIn("release_agent_sha256=" + "A" * 64, evidence["failure"])
+        self.assertNotIn("PASS", output.getvalue())
+        self.assertTrue(mismatch.reaped)
 
     def test_stop_during_startup_is_clear_and_retained(self):
         with self.readiness_environment(["StartPending", "Stopped"]) as (_, launch, _):

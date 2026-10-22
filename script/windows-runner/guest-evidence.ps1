@@ -84,7 +84,7 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         if ($partitions.Count -ne 1) { throw 'Expected one Windows basic-data partition' }
         $partition = $partitions[0]
         if (-not $partition.DriveLetter) {
-            $partition | Add-PartitionAccessPath -AssignDriveLetter
+            $partition | Add-PartitionAccessPath -AssignDriveLetter | Out-Null
             $assigned = $true
             $partition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber
         }

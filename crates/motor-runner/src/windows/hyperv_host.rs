@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 pub(super) fn load(path: &Path) -> io::Result<VmConfig> {
@@ -103,6 +104,30 @@ pub(super) fn validate(config: &Config) -> io::Result<()> {
             "parent image SHA-256 validation result"
         );
     }
+    let release_agent_path = vm.layout_root.join("bin/motor-winagent.exe");
+    let release_agent_sha256 = format!(
+        "{:X}",
+        Sha256::digest(fs::read(&release_agent_path).map_err(|error| {
+            invalid(format!(
+                "Cannot read bundled guest agent {}: {error}",
+                release_agent_path.display()
+            ))
+        })?)
+    );
+    let guest_agent_readiness =
+        super::guest_agent_readiness(vm.guest_agent_sha256.as_deref(), &release_agent_sha256);
+    if let Some(detail) = &guest_agent_readiness.detail {
+        tracing::warn!(%detail, "Windows guest agent release is not ready for the sealed parent");
+    } else {
+        tracing::info!(
+            parent_agent_sha256 = ?guest_agent_readiness.parent_agent_sha256,
+            release_agent_sha256 = %guest_agent_readiness.release_agent_sha256,
+            "Windows guest agent matches the sealed parent"
+        );
+    }
+    config
+        .windows_runtime
+        .set_guest_agent_readiness(guest_agent_readiness);
     if let Some(file) = guard {
         *lifetime = Some((parent, file));
     }

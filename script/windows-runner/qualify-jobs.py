@@ -47,8 +47,17 @@ def require_runner_service():
     return state
 
 
+def require_windows_guest_agent_ready(status):
+    health = status.get("health") if isinstance(status, dict) else None
+    agent = health.get("windows_guest_agent") if isinstance(health, dict) else None
+    if not isinstance(agent, dict) or agent.get("ready") is not True:
+        detail = agent.get("detail") if isinstance(agent, dict) else None
+        raise RunnerBridgeRefused(f"Windows guest agent not ready: {detail or 'identity status missing'}")
+    return agent
+
+
 class Channel:
-    def __init__(self, runner, root, log, hello_timeout: float = 30):
+    def __init__(self, runner, root, log, hello_timeout: float = 30, check_agent_readiness: bool = False):
         require_runner_service()
         self.log_path = log
         self.log = log.open("wb")
@@ -66,6 +75,10 @@ class Channel:
             hello = self.until("hello", timeout=hello_timeout)
             if hello.get("protocol_version") != 1 or hello.get("platforms") != ["windows"]:
                 raise RuntimeError(f"wrong runner Hello version/platform: {hello}")
+            if check_agent_readiness:
+                self.guest_agent_readiness = require_windows_guest_agent_ready(
+                    self.request_status(hello_timeout)
+                )
         except Exception as error:
             classified = error
             if isinstance(error, (OSError, TimeoutError)):
@@ -81,6 +94,10 @@ class Channel:
                 raise classified from error
             raise
         threading.Thread(target=self.heartbeat, daemon=True).start()
+
+    def request_status(self, timeout):
+        self.send({"type": "status"})
+        return self.until("status_reply", timeout=timeout)
 
     def bridge_failure(self, reason):
         try:
@@ -186,17 +203,18 @@ def wait_for_service_ready(root, runner, evidence, timeout=180):
                 raise RunnerBridgeUnavailable(f"runner service not running (MotorRunner status={state}); startup/parent verification did not complete")
             if state == "Running":
                 try:
-                    channel = Channel(runner, root, evidence / f"bridge-ready-{len(observations)}.log", hello_timeout=min(5, max(0.01, timeout - (time.monotonic() - started))))
+                    channel = Channel(runner, root, evidence / f"bridge-ready-{len(observations)}.log", hello_timeout=min(5, max(0.01, timeout - (time.monotonic() - started))), check_agent_readiness=True)
+                except RunnerBridgeRefused as error:
+                    observation["guest_agent_not_ready"] = str(error)
+                    raise
                 except RunnerBridgeUnavailable as error:
                     observation["bridge_error"] = str(error)
                 else:
                     channel.close()
                     ready = True
                     observation["hello_validated"] = True
-                    # The runner binds this pipe only after Runner::open has
-                    # finished parent validation and reconciliation. A Running
-                    # service status alone is earlier, not a readiness signal.
-                    print("PASS runner-service-ready parent-verification-complete windows-protocol-hello", flush=True)
+                    # Runner readiness includes the sealed guest-agent identity check.
+                    print("PASS runner-service-ready parent-verification-complete windows-protocol-hello guest-agent-ready", flush=True)
                     return
             save()
             time.sleep(min(0.5, max(0, timeout - (time.monotonic() - started))))

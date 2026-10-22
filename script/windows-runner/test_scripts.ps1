@@ -65,6 +65,14 @@ try {
 }
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    . "$PSScriptRoot\guest-agent-identity.ps1"
+    $parentAgentHash = 'A' * 64
+    $otherAgentHash = 'B' * 64
+    if ((Get-RunnerProvisionedAgentHash "$parentAgentHash  motor-winagent.exe") -cne $parentAgentHash) { throw 'FAIL parent-agent-record-match' }
+    if ((Get-RunnerProvisionedAgentHash "$otherAgentHash  motor-winagent.exe") -cne $otherAgentHash) { throw 'FAIL parent-agent-record-mismatch' }
+    if (Get-RunnerProvisionedAgentHash $null) { throw 'FAIL parent-agent-record-missing' }
+    Write-Host 'PASS parent-agent-record-match-mismatch-missing'
+    $count++
     $global:diskInventoryGetDiskCalls = 0
     $global:diskInventoryPerDiskQuery = $false
     $global:diskInventoryFixtureMode = ''

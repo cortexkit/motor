@@ -10,6 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . "$PSScriptRoot\accounts.ps1"
+. "$PSScriptRoot\guest-evidence.ps1"
+. "$PSScriptRoot\guest-agent-identity.ps1"
 $Root = 'C:\ProgramData\MotorRunner'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -173,11 +175,23 @@ foreach ($setting in $settings) {
 if ($LASTEXITCODE -ne 0) { throw 'Cannot apply power policy' }
 Save-Installation
 $cargoHash = (Get-FileHash "$Root\prep-toolchain\bin\cargo.exe" -Algorithm SHA256).Hash
+$parentAgentHash = ''
+try {
+    $sealedAgentHash = Get-RunnerSealedAgentHash $parent
+    if ($sealedAgentHash) {
+        $parentAgentHash = $sealedAgentHash
+    } else {
+        Write-Warning 'Sealed parent has no valid provisioning agent identity; Windows jobs will remain not-ready'
+    }
+} catch {
+    Write-Warning "Cannot read sealed guest-agent provisioning record; Windows jobs will remain not-ready: $_"
+}
 @"
 layout_root = 'C:\ProgramData\MotorRunner'
 baseline = 'ally-hvsock.vhdx'
 parent_sha256 = '$parentHash'
 prep_cargo_sha256 = '$cargoHash'
+guest_agent_sha256 = '$parentAgentHash'
 memory_mib = 8192
 cpu_set = [0, 1, 2, 3]
 concurrent_jobs = 1

@@ -30,6 +30,41 @@ class InstallScriptTests(unittest.TestCase):
                                      f"{script.name}: {match.group(1)!r}")
         self.assertGreater(found, 0, "no New-LocalUser -Description literal found to check")
 
+    def test_installer_pins_guest_agent_hash_from_sealed_provisioning_record(self):
+        install = (HERE / "install.ps1").read_text()
+        identity = (HERE / "guest-agent-identity.ps1").read_text()
+        provision = (HERE / ".." / "windows-vm" / "setup-job-baseline.ps1").read_text()
+        self.assertIn('. "$PSScriptRoot\\guest-agent-identity.ps1"', install)
+        self.assertIn("Get-RunnerSealedAgentHash $parent", install)
+        self.assertIn("guest_agent_sha256 = '$parentAgentHash'", install)
+        self.assertIn("build\\provision\\winagent.sha256", identity)
+        self.assertIn("Use-DiagnosticWindowsDisk -Path $Parent", identity)
+        self.assertIn(r"\A([0-9A-Fa-f]{64})\s+motor-winagent\.exe\z", identity)
+        self.assertIn("if (-not $match.Success) { return $null }", identity)
+        self.assertIn("return $match.Groups[1].Value.ToUpperInvariant()", identity)
+        self.assertIn("Get-RunnerProvisionedAgentHash ([IO.File]::ReadAllText($record.FullName))", identity)
+        self.assertNotIn("ProgramData\\Motor\\motor-winagent.exe", identity)
+        self.assertIn("$agentHash  motor-winagent.exe", provision)
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("parent-agent-record-match-mismatch-missing", fixture)
+        self.assertIn("Get-RunnerProvisionedAgentHash $null", fixture)
+
+    def test_service_refuses_mismatch_and_reports_readiness(self):
+        root = HERE.parents[1] / "crates/motor-runner/src"
+        host = (root / "windows/hyperv_host.rs").read_text()
+        runner = (root / "engine.rs").read_text()
+        status = (root / "disk.rs").read_text()
+        protocol = (HERE.parents[1] / "crates/motor-protocol/src/types.rs").read_text()
+        self.assertIn("vm.guest_agent_sha256.as_deref()", host)
+        self.assertIn('join("bin/motor-winagent.exe")', host)
+        self.assertIn("set_guest_agent_readiness(guest_agent_readiness)", host)
+        self.assertIn("guest_agent_refusal(", runner)
+        self.assertIn("windows_guest_agent: self.core.config.windows_runtime.guest_agent_readiness()", status)
+        self.assertIn("pub windows_guest_agent: Option<WindowsGuestAgentReadiness>", protocol)
+        qualification = (HERE / "qualify-jobs.py").read_text()
+        self.assertIn("self.request_status(hello_timeout)", qualification)
+        self.assertIn("require_windows_guest_agent_ready", qualification)
+
     def test_cmd_never_echoes_a_variable_straight_into_a_redirect(self):
         # In cmd, `echo %errorlevel%>file` with a one-digit value reads as a
         # handle redirect (`0>`), so the file gets "ECHO is off." instead of

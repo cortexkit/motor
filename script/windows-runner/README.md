@@ -57,10 +57,18 @@ the host.
   security descriptors at VM creation/removal. File ID, size, LastWrite, read-only
   and owner/ACL must still match. The exact Hyper-V VM Bus Provider capability SID
   receives read-only parent access alongside the VM group; no other grant is added.
-  Restart to re-verify a changed parent. Startup and jobs trust the record equally.
-  SYSTEM and Administrators are trusted; while no runner process holds a guard,
-  they can rewrite equal-length content and restore LastWrite without detection.
-  That service-stopped maintenance window is accepted, not prevented by metadata.
+   Restart the MotorRunner service to re-verify a changed parent. Startup verification and Windows jobs both rely on the sealed parent's identity record.
+   At install, the guest-agent SHA-256 is copied from the sealed image's
+   `build\provision\winagent.sha256` provisioning record into `vm.toml`. Startup
+   compares it with the release's `bin\motor-winagent.exe`; if missing or different,
+   health reports `windows_guest_agent.ready=false`, new Windows runs are refused
+   before start with both hashes, and operator readiness fails. The host bundle
+   does not replace the agent inside an already sealed parent. Provision a fresh
+   image from the bundle before upgrading; the Linux `agent-swap.sh` only handles
+   qcow2 images and does not upgrade the Hyper-V runner's sealed VHDX.
+   SYSTEM and Administrators are trusted; while no runner process holds a guard,
+   they can rewrite equal-length content and restore LastWrite without detection.
+   That service-stopped maintenance window is accepted, not prevented by metadata.
 - No job NIC, COM mapping, optional integration service or Enhanced Session.
   Host isolation is checked before boot, every 250 ms while running, and at
   shutdown. The creation-time VM configuration checks and later samples are

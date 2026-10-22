@@ -27,10 +27,17 @@ pub(crate) struct Runtime {
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
+    guest_agent_readiness: Mutex<Option<WindowsGuestAgentReadiness>>,
     #[cfg(test)]
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    pub(crate) fn set_guest_agent_readiness(&self, readiness: WindowsGuestAgentReadiness) {
+        *self.guest_agent_readiness.lock().unwrap() = Some(readiness);
+    }
+    pub(crate) fn guest_agent_readiness(&self) -> Option<WindowsGuestAgentReadiness> {
+        self.guest_agent_readiness.lock().unwrap().clone()
+    }
     #[cfg(windows)]
     pub(crate) fn reuse_parent_verification_for_qualification(&self) {
         self.reuse_parent_verification
