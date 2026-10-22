@@ -62,7 +62,7 @@ an SSH connection or executes a local command.
 | No timeout or runtime cap below minimum | `RequestRejected` | `hosted_no_timeout`, `hosted_max_s_too_short` |
 | Path outside supported roots | `RequestRejected` | `hosted_path_outside_roots` |
 | Hosted workspace prepare/drop | `RequestRejected` | `hosted_prepare_unsupported` |
-| Return path limits/capability missing | `RequestRejected` | `return_paths_exceeded`, `return_paths_unsupported` |
+| Return path limits/capability missing | `RequestRejected` | `return_paths_exceeded`, `return_paths_unsupported`, `return_chunked_unsupported` |
 | Runner lease mismatch | `RequestRejected` | `lease_mismatch` |
 | Generic pre-start request rejection | Existing validation reason | `hosted_request_rejected` |
 

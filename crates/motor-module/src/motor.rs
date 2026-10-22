@@ -471,6 +471,7 @@ impl Motor {
                 .filter(|d| {
                     d.starts_with("hosted_")
                         || d.starts_with("return_paths_")
+                        || d.starts_with("return_chunked_")
                         || d.starts_with("lease_mismatch")
                 })
                 .and_then(|d| d.split(':').next())
@@ -515,10 +516,11 @@ impl Motor {
     ) -> io::Result<()> {
         let (request, returns) = submission;
         let hosted = self.hosted_state(id).is_some();
-        if let Err(code) = validate_return_paths(
+        if let Err(code) = validate_return_request(
             &request.workspace_key,
             &returns.return_paths,
             returns.return_max_bytes,
+            returns.return_chunked,
         ) {
             return self
                 .refused(
@@ -882,6 +884,28 @@ impl Motor {
                     .await
                     .map(|_| false);
             }
+            // A runner from before chunked returned files would ignore
+            // Run.return_chunked and refuse its larger cap, or send one
+            // return_result the caller did not ask for. Refuse first instead.
+            if returns.return_chunked && !returns.return_paths.is_empty() && !channel.return_chunked
+            {
+                if self
+                    .return_spill(id, "return_chunked_unsupported", spill_started)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                return self
+                    .refused(
+                        id,
+                        RefusalReason::RequestRejected,
+                        Some(snapshots.main.tree_hash.clone()),
+                        Some("return_chunked_unsupported".into()),
+                        tx,
+                    )
+                    .await
+                    .map(|_| false);
+            }
             if windows
                 && !channel
                     .platforms
@@ -981,6 +1005,7 @@ impl Motor {
             }
         };
         let run = Run {
+            return_chunked: returns.return_chunked && !returns.return_paths.is_empty(),
             return_paths: returns.return_paths,
             return_max_bytes: returns.return_max_bytes,
             gate_job: self.storage.job(id).is_some_and(|job| job.gate_job) && channel.gate_jobs,
@@ -1682,6 +1707,32 @@ impl Motor {
                     cursor = result.seq.saturating_add(1);
                     result.job_id = id;
                     self.storage.return_result(result)?;
+                    backoff = 1;
+                }
+                // Chunked returned files go to the job stream as they arrive;
+                // only the agent route ever asks for them. A replay after the
+                // runner's retention window sends the manifest without its
+                // chunks, leaving a gap in seq that the caller accepts.
+                Ok(Incoming::Frame(Frame::ReturnChunk(mut chunk)))
+                    if chunk.job_id == build_server_id =>
+                {
+                    if chunk.seq < cursor {
+                        continue;
+                    }
+                    cursor = chunk.seq.saturating_add(1);
+                    chunk.job_id = id;
+                    emit(tx, StreamRecord::ReturnChunk(chunk)).await?;
+                    backoff = 1;
+                }
+                Ok(Incoming::Frame(Frame::ReturnManifest(mut manifest)))
+                    if manifest.job_id == build_server_id =>
+                {
+                    if manifest.seq < cursor {
+                        continue;
+                    }
+                    cursor = manifest.seq.saturating_add(1);
+                    manifest.job_id = id;
+                    emit(tx, StreamRecord::ReturnManifest(manifest)).await?;
                     backoff = 1;
                 }
                 Ok(Incoming::Unknown(seq)) => {
@@ -2422,6 +2473,7 @@ mod delivery_tests {
                         &mut peer,
                         &Frame::Hello {
                             return_paths: false,
+                            return_chunked: false,
                             protocol_version: PROTOCOL_VERSION,
                             started: false,
                             default_branch_tip: false,

@@ -117,6 +117,13 @@ pub(crate) const NETWORK_CAPABILITY: &str = "exec-remote-net/v1";
 /// job's stream then has a `return_result` record before its terminal record.
 /// Callers send non-empty `return_paths` only to a module that lists it.
 pub(crate) const RETURN_CAPABILITY: &str = "exec-remote-return/v1";
+/// Always advertised next to `RETURN_CAPABILITY`: an `exec.run` request may set
+/// `return_chunked`, and the job's stream then has `return_chunk` records and
+/// one `return_manifest` before its terminal record instead of `return_result`.
+/// A runner too old to send them refuses the job with
+/// `return_chunked_unsupported` before it runs.
+pub(crate) const RETURN_CHUNKED_CAPABILITY: &str =
+    cortexkit_exec_remote_types::RETURN_CHUNKED_CAPABILITY;
 
 pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_config(module_id, &Config::default())
@@ -127,6 +134,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         CAPABILITY.into(),
         FLOW_SCOPES_CAPABILITY.into(),
         RETURN_CAPABILITY.into(),
+        RETURN_CHUNKED_CAPABILITY.into(),
     ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())

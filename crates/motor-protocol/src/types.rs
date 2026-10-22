@@ -1,6 +1,11 @@
 // Share the exact caller types with routing clients; only runner transfer and
 // framing types are defined locally.
 pub use cortexkit_exec_remote_types::types::*;
+// The shared checker for chunked returned files, so runner tests and ck-motor
+// verify a stream exactly as callers do.
+pub use cortexkit_exec_remote_types::assembler::{
+    ReturnAssembler, ReturnStreamError, VerifiedReturn,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -69,6 +74,13 @@ pub struct Run {
         skip_serializing_if = "is_default_return_max_bytes"
     )]
     pub return_max_bytes: u64,
+    /// Return the files as `ReturnChunk` frames followed by one
+    /// `ReturnManifest`, instead of one `ReturnResult`, and allow
+    /// `return_max_bytes` up to `RETURN_CHUNKED_MAX_BYTES_CAP`. ck-motor sets it
+    /// only for a runner whose Hello advertises `return_chunked`; an older
+    /// runner ignores the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub return_chunked: bool,
     pub queue_wait_limit_s: u64,
     pub snapshot_commit: String,
     pub tree_hash: String,
@@ -330,6 +342,10 @@ define_frames! {
         gate_jobs: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         return_paths: bool,
+        /// The runner accepts `Run.return_chunked` and answers it with
+        /// `ReturnChunk` and `ReturnManifest` frames.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        return_chunked: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         platforms: Vec<String>,
     },
@@ -362,6 +378,11 @@ define_frames! {
     },
     Output(Output),
     ReturnResult(ReturnResult),
+    // The answer to a Run with `return_chunked`: chunks of the returned
+    // files, then one manifest. Manifest paths are the Run's absolute
+    // `return_paths`; ck-motor maps them back to the caller's paths.
+    ReturnChunk(ReturnChunk),
+    ReturnManifest(ReturnManifest),
     Heartbeat {
         /// Elapsed time waiting for scheduler capacity on a job stream. When
         /// absent, the client clears its local queue deadline rather than
@@ -435,9 +456,25 @@ pub fn validate_return_paths(
     paths: &[String],
     cap: u64,
 ) -> Result<(), &'static str> {
+    validate_return_request(workspace, paths, cap, false)
+}
+
+/// `validate_return_paths` for a request that may set `return_chunked`, which
+/// raises the byte cap from `RETURN_MAX_BYTES` to `RETURN_CHUNKED_MAX_BYTES_CAP`.
+pub fn validate_return_request(
+    workspace: &str,
+    paths: &[String],
+    cap: u64,
+    chunked: bool,
+) -> Result<(), &'static str> {
     use std::path::{Component, Path};
     let root = Path::new(workspace);
-    if cap > RETURN_MAX_BYTES || paths.len() > 64 {
+    let limit = if chunked {
+        RETURN_CHUNKED_MAX_BYTES_CAP
+    } else {
+        RETURN_MAX_BYTES
+    };
+    if cap > limit || paths.len() > 64 {
         return Err("return_paths_exceeded");
     }
     for path in paths {

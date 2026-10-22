@@ -273,6 +273,7 @@ impl Fixture {
             Run {
                 return_paths: Vec::new(),
                 return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+                return_chunked: false,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -393,6 +394,7 @@ impl Fixture {
             Run {
                 return_paths: Vec::new(),
                 return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+                return_chunked: false,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -1726,6 +1728,7 @@ async fn connect(socket: &Path) -> UnixStream {
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1739,6 +1742,7 @@ async fn connect(socket: &Path) -> UnixStream {
         read_next(&mut stream).await,
         Frame::Hello {
             return_paths: true,
+            return_chunked: true,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1926,6 +1930,7 @@ fn blocking_hello(socket: &Path) -> io::Result<std::os::unix::net::UnixStream> {
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,

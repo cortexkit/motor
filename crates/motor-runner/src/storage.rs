@@ -13,6 +13,13 @@ use std::{
 
 pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 pub const REPLAY_BYTES: u64 = 64 * 1024 * 1024;
+/// How long chunked returned files stay available for replay after the job
+/// ends. They can be 10 MiB per job, so they are not kept for the whole job
+/// history; a later replay sends the manifest with `expired` entries instead.
+pub const RETURN_RETENTION_MS: u64 = 60 * 60 * 1000;
+/// Prefix of the job-directory subdirectory that holds one collection's
+/// returned-file chunks.
+pub(crate) const RETURNED_DIRECTORY_PREFIX: &str = "returned-";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JobState {
@@ -56,6 +63,62 @@ impl Serialize for Chunks {
 impl<'de> Deserialize<'de> for Chunks {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         VecDeque::<Chunk>::deserialize(deserializer).map(|chunks| Self(Arc::new(chunks)))
+    }
+}
+
+/// One chunk of a returned file. Its bytes are the file
+/// `<job directory>/<ReturnedFiles::directory>/chunk-<position>`, where
+/// position is the chunk's index in `ReturnedFiles::chunks`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReturnedChunk {
+    pub seq: u64,
+    pub path_index: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// The chunked returned files of a job that set `Run.return_chunked`.
+///
+/// The chunk bytes live in their own directory rather than in this record,
+/// and are written and synced before the record that names them is saved,
+/// as output chunks are. They are deleted `RETURN_RETENTION_MS` after the job
+/// ends, while the record, with this index and the manifest, stays for the
+/// job's whole history.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReturnedFiles {
+    /// Name of the job-directory subdirectory holding the chunk bytes.
+    pub directory: String,
+    pub chunks: Vec<ReturnedChunk>,
+    /// Lists the Run's absolute paths; ck-motor maps them to the caller's.
+    pub manifest: ReturnManifest,
+    /// Set, and the directory deleted, once the retention window has passed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
+}
+
+impl ReturnedFiles {
+    pub fn chunk_path(&self, job_directory: &Path, position: usize) -> std::path::PathBuf {
+        job_directory
+            .join(&self.directory)
+            .join(format!("chunk-{position}"))
+    }
+
+    /// The manifest a replay sends once the bytes are gone: at its original
+    /// seq, each returned entry failed as `expired` with its size, other
+    /// failures unchanged, and no returned bytes.
+    pub fn expired_manifest(&self) -> ReturnManifest {
+        let mut manifest = self.manifest.clone();
+        for entry in &mut manifest.files {
+            if let ReturnManifestOutcome::Returned { size, .. } = entry.outcome {
+                *entry = ReturnManifestEntry::failed(
+                    entry.path.clone(),
+                    ReturnPathsFailureCause::Expired,
+                )
+                .with_size(size);
+            }
+        }
+        manifest.total_bytes = 0;
+        manifest
     }
 }
 
@@ -117,6 +180,8 @@ pub(crate) struct Job {
     pub terminal: Option<TerminalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_result: Option<ReturnResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned: Option<ReturnedFiles>,
     pub chunks: Chunks,
     pub next_seq: u64,
     pub output_bytes: u64,
@@ -224,6 +289,7 @@ impl Job {
             process: None,
             terminal: None,
             return_result: None,
+            returned: None,
             chunks: Chunks::default(),
             next_seq: 0,
             output_bytes: 0,
@@ -521,6 +587,32 @@ pub(crate) fn recover_output_tail(directory: &Path, job: &Job) {
         if sequence.is_some_and(|sequence| !committed.contains(&sequence)) {
             if let Err(error) = fs::remove_file(entry.path()) {
                 tracing::warn!(job_id = %job.id, %error, "cannot remove uncommitted output tail");
+            }
+        }
+    }
+    remove_unreferenced_returned(directory, job);
+}
+
+/// Remove returned-file directories the record does not reference: a
+/// collection interrupted before its record was saved, or bytes whose expiry
+/// was saved before their deletion finished.
+pub(crate) fn remove_unreferenced_returned(directory: &Path, job: &Job) {
+    let kept = job
+        .returned
+        .as_ref()
+        .filter(|returned| !returned.expired)
+        .map(|returned| returned.directory.as_str());
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(RETURNED_DIRECTORY_PREFIX) && Some(name) != kept {
+            if let Err(error) = fs::remove_dir_all(entry.path()) {
+                tracing::warn!(job_id = %job.id, %error, "cannot remove unreferenced returned files");
             }
         }
     }

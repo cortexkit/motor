@@ -13,13 +13,21 @@ impl Motor {
         &self,
         request: RunRequest,
         attribution: Option<JobAttribution>,
-        returns: Option<(crate::ReturnOptions, String)>,
+        returns: Option<crate::agent_route::ReturnRequest>,
     ) -> io::Result<JobStream> {
-        let Some((returns, cwd)) = returns else {
+        let Some(crate::agent_route::ReturnRequest {
+            options,
+            cwd,
+            requested,
+        }) = returns
+        else {
             return self.run_attributed(request, attribution);
         };
         let stream =
-            self.run_classified(request, (attribution, None), false, false, false, returns)?;
+            self.run_classified(request, (attribution, None), false, false, false, options)?;
+        if let Some(requested) = requested {
+            self.storage.return_requested(stream.job_id, requested)?;
+        }
         // The job ID is minted inside run_classified, so the cwd is stored
         // just after the job task starts. A return result exists only once
         // that task has snapshotted, uploaded and run the command remotely,

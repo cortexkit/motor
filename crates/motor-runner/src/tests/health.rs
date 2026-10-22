@@ -197,6 +197,7 @@ fn recorded_job(
     let request = Run {
         return_paths: Vec::new(),
         return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+        return_chunked: false,
         job_id: id,
         gate_job: false,
         network: None,

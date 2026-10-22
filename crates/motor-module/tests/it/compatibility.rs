@@ -215,6 +215,93 @@ async fn new_direct_client_negotiates_gate_mark_with_pinned_runner() {
 }
 
 #[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production runner"]
+async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let helper = std::env::var_os("MOTOR_COMPAT_RUNNER")
+        .expect("run python3 scripts/mixed-version.py to build the unchanged pinned runner");
+    let mut f = Fixture::new(Cut::None, 28).await;
+    let state = f.scratch.join("old-runner-state");
+    let socket = cortexkit_test_support::scratch_root()
+        .parent()
+        .unwrap()
+        .join(format!(
+            "old-motor-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+    let mut helper = Command::new(helper)
+        .args([&state, &socket, f.remote_key.parent().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        BufReader::new(helper.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n", "pinned runner failed before serving");
+    f.use_external_runner_socket(socket);
+    let hello = Arc::new(Mutex::new(None));
+    let motor = crate::Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(RunnerHello {
+            proxy: f.proxy.clone(),
+            frame: hello.clone(),
+            legacy_reply: false,
+        }),
+    )
+    .unwrap();
+    // An agent asking for chunked returned files from a runner that predates
+    // them is refused with a clear reason, before any Run frame is sent.
+    let mut request = f
+        .request("touch should-not-run")
+        .with_return_paths(vec!["out".into()])
+        .with_return_chunked(true);
+    let returns = crate::agent_route::take_return_request(&mut request).unwrap();
+    let records = super::recovery::collect(motor.run_agent(request, None, returns).unwrap()).await;
+    let terminal = super::recovery::terminal(&records);
+    assert!(matches!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    ));
+    let Some(Frame::Hello {
+        return_paths,
+        return_chunked,
+        ..
+    }) = hello.lock().unwrap().clone()
+    else {
+        panic!("runner Hello must be observed")
+    };
+    assert!(!return_chunked, "the pinned runner predates chunked return");
+    // A runner that predates returned files altogether is refused for that
+    // first; one that has them but not chunking, for chunking.
+    let expected = if return_paths {
+        "return_chunked_unsupported"
+    } else {
+        "return_paths_unsupported"
+    };
+    assert_eq!(terminal.refusal_detail.as_deref(), Some(expected));
+    assert!(!f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Run(_))));
+    assert!(!f.remote_key.join("should-not-run").exists());
+    helper.kill().await.unwrap();
+    helper.wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn legacy_runner_hello_omits_direct_gate_mark() {
     let f = Fixture::new(Cut::None, 28).await;
     let hello = Arc::new(Mutex::new(None));

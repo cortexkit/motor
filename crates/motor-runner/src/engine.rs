@@ -1994,10 +1994,11 @@ impl Runner {
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
-        if let Err(code) = validate_return_paths(
+        if let Err(code) = validate_return_request(
             &request.workspace_key,
             &request.return_paths,
             request.return_max_bytes,
+            request.return_chunked,
         ) {
             return Some((RefusalReason::RequestRejected, code.into()));
         }
@@ -2668,6 +2669,7 @@ impl Runner {
         let request = Run {
             return_paths: Vec::new(),
             return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+            return_chunked: false,
             gate_job: false,
             network: None,
             platform: None,
@@ -2718,7 +2720,18 @@ impl Runner {
     ) -> io::Result<Vec<Frame>> {
         self.ensure_job_readable(id)?;
         let log = self.job_log(id);
-        let (started, terminal, return_result, chunks, earliest, output_from, shift, _lease) = loop {
+        let job_directory = self.record_path(id).parent().unwrap().to_owned();
+        let (
+            started,
+            terminal,
+            return_result,
+            chunks,
+            (returned_chunks, manifest),
+            earliest,
+            output_from,
+            shift,
+            _lease,
+        ) = loop {
             let mut inner = self.core.inner.lock().unwrap();
             if let Some(job) = inner.jobs.get(&id) {
                 let shift = if let (false, Some(started)) = (supports_started, &job.started) {
@@ -2759,6 +2772,47 @@ impl Runner {
                     bytes += chunk.length;
                     chunks.push(chunk.clone());
                 }
+                // Chunked returned files follow all output, on the same page
+                // budget. Once their retention window has passed, a replay
+                // sends only the manifest, with returned entries `expired`,
+                // which leaves a seq gap where the chunks were.
+                let mut returned_chunks = Vec::new();
+                let mut manifest = None;
+                if let (false, Some(returned)) = (more, &job.returned) {
+                    let expired = returned.expired
+                        || job.finished_ms.is_some_and(|finished| {
+                            self.now().saturating_sub(finished) >= RETURN_RETENTION_MS
+                        });
+                    if !expired {
+                        let beginning = returned.chunks.partition_point(|chunk| chunk.seq < from);
+                        for (position, chunk) in returned.chunks.iter().enumerate().skip(beginning)
+                        {
+                            if chunks.len() + returned_chunks.len() == REPLAY_PAGE_CHUNKS
+                                || bytes.saturating_add(chunk.length) > REPLAY_PAGE_BYTES
+                            {
+                                if chunks.is_empty() && returned_chunks.is_empty() {
+                                    return Err(invalid(
+                                        "returned file chunk exceeds replay page limit",
+                                    ));
+                                }
+                                more = true;
+                                break;
+                            }
+                            bytes += chunk.length;
+                            returned_chunks.push((
+                                returned.chunk_path(&job_directory, position),
+                                chunk.clone(),
+                            ));
+                        }
+                    }
+                    if !more && returned.manifest.seq >= from {
+                        manifest = Some(if expired {
+                            returned.expired_manifest()
+                        } else {
+                            returned.manifest.clone()
+                        });
+                    }
+                }
                 let terminal = if more { None } else { job.terminal.clone() };
                 let return_result = job
                     .return_result
@@ -2776,6 +2830,7 @@ impl Runner {
                                 .unwrap()
                                 .join(format!("chunk-{}", chunk.seq))
                         })
+                        .chain(returned_chunks.iter().map(|(path, _)| path.clone()))
                         .collect(),
                 );
                 break (
@@ -2783,6 +2838,7 @@ impl Runner {
                     terminal,
                     return_result,
                     chunks,
+                    (returned_chunks, manifest),
                     earliest,
                     output_from,
                     shift,
@@ -2863,6 +2919,28 @@ impl Runner {
         if let Some(mut result) = return_result {
             result.seq -= shift;
             frames.push(Frame::ReturnResult(result));
+        }
+        for (path, chunk) in returned_chunks {
+            let mut bytes = Vec::with_capacity(chunk.length as usize);
+            File::open(&path)?
+                .take(chunk.length + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != chunk.length {
+                return Err(invalid(
+                    "retained returned file chunk length differs from its committed index",
+                ));
+            }
+            frames.push(Frame::ReturnChunk(ReturnChunk::new(
+                id,
+                chunk.seq - shift,
+                chunk.path_index,
+                chunk.offset,
+                BytePayload(bytes),
+            )));
+        }
+        if let Some(mut manifest) = manifest {
+            manifest.seq -= shift;
+            frames.push(Frame::ReturnManifest(manifest));
         }
         if let Some(terminal) = terminal {
             frames.push(Frame::Terminal(terminal));
@@ -3434,6 +3512,54 @@ impl Runner {
             .await
             .map_err(io::Error::other)?
     }
+    /// Delete chunked returned files `RETURN_RETENTION_MS` after their job
+    /// ended. The record keeps the manifest and says the bytes expired; it is
+    /// saved first, so a crash before the deletion leaves only bytes that
+    /// startup recovery removes, never a record naming missing files. A job
+    /// being replayed keeps its bytes until a later pass.
+    fn expire_returned_files(&self, inner: &mut Inner) {
+        let now = self.now();
+        let due: Vec<_> = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.returned.as_ref().is_some_and(|r| !r.expired)
+                    && job
+                        .finished_ms
+                        .is_some_and(|finished| now.saturating_sub(finished) >= RETURN_RETENTION_MS)
+            })
+            .map(|job| job.id)
+            .collect();
+        for id in due {
+            let log = self.job_log(id);
+            let Ok(_write) = log.write.try_lock() else {
+                continue;
+            };
+            if log.retention.lock().unwrap().readers != 0 {
+                continue;
+            }
+            let mut job = inner.jobs[&id].clone();
+            let returned = job.returned.as_mut().unwrap();
+            returned.expired = true;
+            let directory = self
+                .record_path(id)
+                .parent()
+                .unwrap()
+                .join(&returned.directory);
+            if let Err(error) = self.save(&job) {
+                tracing::warn!(%id, %error, "returned file expiry could not be saved; retrying later");
+                continue;
+            }
+            inner.jobs.insert(id, job);
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%id, %error, "expired returned files could not be deleted")
+                }
+            }
+        }
+    }
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
@@ -3470,6 +3596,7 @@ impl Runner {
                 }
             }
         }
+        self.expire_returned_files(&mut inner);
         self.core.job_logs.lock().unwrap().retain(|id, log| {
             inner.jobs.contains_key(id)
                 || inner.pending_replays.contains(id)
@@ -5171,16 +5298,27 @@ impl Runner {
         let return_result = job
             .request
             .as_ref()
-            .filter(|r| !r.return_paths.is_empty())
+            .filter(|r| !r.return_paths.is_empty() && !r.return_chunked)
             .map(|request| {
                 let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
                 crate::return_paths::collect(request, seq)
             });
+        let job_directory = self.record_path(id).parent().unwrap().to_owned();
+        let returned = job
+            .request
+            .as_ref()
+            .filter(|r| !r.return_paths.is_empty() && r.return_chunked)
+            .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
         let log = self.job_log(id);
         let (mut inner, success) = loop {
             let write = log.write.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
+                if let Some(returned) = &returned {
+                    // Another finisher committed the terminal; these bytes
+                    // were never referenced by the record.
+                    let _ = fs::remove_dir_all(job_directory.join(&returned.directory));
+                }
                 return Ok(());
             }
             // A monitor that lost the claim can still supply the real status.
@@ -5208,6 +5346,11 @@ impl Runner {
                 );
                 finished.next_seq += 1;
                 finished.return_result = Some(result);
+            }
+            if let Some(returned) = &returned {
+                // Chunk bytes are already synced; this save commits their
+                // seqs, the manifest and the terminal together.
+                finished.returned = Some(returned.commit(id, &mut finished.next_seq));
             }
             finished.execution_ended_ms = Some(ended_ms);
             if let Some(cpu_time_ns) = inner.cpu_times.get(&id) {

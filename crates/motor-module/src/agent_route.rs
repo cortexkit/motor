@@ -40,17 +40,28 @@ pub(crate) enum ReturnRequestError {
 /// contract requires an over-cap value to be refused whether or not paths
 /// accompany it.
 ///
-/// Returns the runner-side options and the `cwd` to store with the job, or
-/// `None` when the caller asked for no files.
+/// With `return_chunked`, the cap may be up to `RETURN_CHUNKED_MAX_BYTES_CAP`
+/// and defaults to it, and the runner answers with `return_chunk` records and
+/// one `return_manifest` instead of a `return_result`.
+///
+/// Returns the runner-side options and what to store with the job, or `None`
+/// when the caller asked for no files.
 pub(crate) fn take_return_request(
     request: &mut RunRequest,
-) -> Result<Option<(ReturnOptions, String)>, ReturnRequestError> {
+) -> Result<Option<ReturnRequest>, ReturnRequestError> {
     let paths = std::mem::take(&mut request.return_paths);
     let cap = request.return_max_bytes.take();
-    if let Some(cap) = cap.filter(|cap| *cap > shared::RETURN_MAX_BYTES_CAP) {
+    let chunked = std::mem::take(&mut request.return_chunked);
+    // Chunked return raises the cap to 10 MiB; without it the 256 KiB cap of
+    // a single return_result record stays.
+    let limit = if chunked {
+        shared::RETURN_CHUNKED_MAX_BYTES_CAP
+    } else {
+        shared::RETURN_MAX_BYTES_CAP
+    };
+    if let Some(cap) = cap.filter(|cap| *cap > limit) {
         return Err(ReturnRequestError::InvalidParams(format!(
-            "return_max_bytes {cap} exceeds the {} byte cap",
-            shared::RETURN_MAX_BYTES_CAP
+            "return_max_bytes {cap} exceeds the {limit} byte cap"
         )));
     }
     if paths.is_empty() {
@@ -65,13 +76,33 @@ pub(crate) fn take_return_request(
         }
         absolute.push(cwd.join(path).to_string_lossy().into_owned());
     }
-    Ok(Some((
-        ReturnOptions {
+    Ok(Some(ReturnRequest {
+        options: ReturnOptions {
             return_paths: absolute,
-            return_max_bytes: cap.unwrap_or(RETURN_MAX_BYTES),
+            return_max_bytes: cap.unwrap_or(if chunked {
+                shared::RETURN_CHUNKED_MAX_BYTES_CAP
+            } else {
+                RETURN_MAX_BYTES
+            }),
+            return_chunked: chunked,
         },
-        request.cwd.clone(),
-    )))
+        cwd: request.cwd.clone(),
+        requested: chunked.then_some(paths),
+    }))
+}
+
+/// The runner-side form of an agent's returned-file request, and what the
+/// agent route needs to turn the runner's answer back into the caller's terms.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReturnRequest {
+    pub options: ReturnOptions,
+    /// The request's `cwd`, which turns runner paths back into caller paths.
+    pub cwd: String,
+    /// The paths exactly as the caller sent them, kept only for a chunked
+    /// request: its `return_manifest` must echo each one unchanged, and
+    /// joining to `cwd` and stripping it again can normalise a path (for
+    /// example `./out` becomes `out`).
+    pub requested: Option<Vec<String>>,
 }
 
 /// The hosted placement and billing to report on a job's terminal record.
@@ -165,6 +196,23 @@ pub(crate) fn return_record(
     ))
 }
 
+/// The caller-facing form of the runner's manifest: each entry carries the
+/// path exactly as the caller requested it. The runner lists the absolute
+/// paths it was sent, in request order, so entries map by position. When the
+/// job has no stored list of requested paths, or one of a different length,
+/// entries keep the runner's paths.
+pub(crate) fn caller_manifest(
+    mut manifest: shared::ReturnManifest,
+    requested: Option<&[String]>,
+) -> shared::ReturnManifest {
+    if let Some(requested) = requested.filter(|paths| paths.len() == manifest.files.len()) {
+        for (entry, path) in manifest.files.iter_mut().zip(requested) {
+            entry.path = path.clone();
+        }
+    }
+    manifest
+}
+
 /// The records an agent caller receives for one record from the job stream.
 /// Only the terminal record changes: it gains the hosted usage, and when the
 /// caller asked for returned files the return result goes immediately before
@@ -176,8 +224,16 @@ pub(crate) fn agent_records(
     from_seq: u64,
     record: StreamRecord,
 ) -> Vec<StreamRecord> {
-    let StreamRecord::Terminal(terminal) = record else {
-        return vec![record];
+    let terminal = match record {
+        StreamRecord::Terminal(terminal) => terminal,
+        StreamRecord::ReturnManifest(manifest) => {
+            let requested = storage.job(id).and_then(|job| job.return_requested);
+            return vec![StreamRecord::ReturnManifest(caller_manifest(
+                manifest,
+                requested.as_deref(),
+            ))];
+        }
+        record => return vec![record],
     };
     let job = storage.job(id);
     let mut records = Vec::with_capacity(2);
