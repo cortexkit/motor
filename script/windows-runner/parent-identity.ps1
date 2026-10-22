@@ -135,22 +135,16 @@ function Assert-RunnerPrivateDirectory([string]$Path) {
     if (-not $item.PSIsContainer) { throw "Runner path is not a directory: $current" }
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse runner directory refused: $current" }
     $acl = Get-Acl -LiteralPath $current
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $raw.DiscretionaryAcl) { throw "Null runner directory DACL refused: $current" }
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) {
         throw "Runner directory owner must be SYSTEM or Administrators: $current"
     }
-    $writeMask = [int]([Security.AccessControl.FileSystemRights]::Write -bor
-        [Security.AccessControl.FileSystemRights]::Modify -bor
-        [Security.AccessControl.FileSystemRights]::FullControl -bor
-        [Security.AccessControl.FileSystemRights]::Delete -bor
-        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-        [Security.AccessControl.FileSystemRights]::TakeOwnership -bor
-        [Security.AccessControl.FileSystemRights]::CreateFiles -bor
-        [Security.AccessControl.FileSystemRights]::CreateDirectories)
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow') { continue }
         $sid = $rule.IdentityReference.Value
-        if ($sid -notin @('S-1-5-18','S-1-5-32-544') -and ([int]$rule.FileSystemRights -band $writeMask)) {
-            throw "Runner directory grants write access outside SYSTEM/Administrators: $current ($sid)"
+        if ($sid -notin @('S-1-5-18','S-1-5-32-544')) {
+            throw "Runner directory grants access outside SYSTEM/Administrators: $current ($sid)"
         }
     }
     for ($parent = [IO.Directory]::GetParent($current); $null -ne $parent; $parent = $parent.Parent) {

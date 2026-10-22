@@ -41,7 +41,9 @@ $installation = @{ schema=1; root=$Root; accounts=@{}; enhanced_session_before=(
 function Save-Installation { $installation | ConvertTo-Json -Depth 6 | Set-Content "$Root\installation.json" -Encoding UTF8 }
 Save-Installation
 foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks','staging','state\ally','state\ally\local-registry-cache','evidence','service-home')) { New-Item "$Root\$directory" -ItemType Directory -Force | Out-Null }
+Protect-RunnerPath "$Root\state\ally"
 Protect-RunnerPath "$Root\state\ally\local-registry-cache"
+Protect-RunnerPath "$Root\staging"
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
 foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }

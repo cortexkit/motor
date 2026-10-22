@@ -25,6 +25,9 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.main = (ROOT / "crates/motor-runner/src/main.rs").read_text()
         self.library = (ROOT / "crates/motor-runner/src/lib.rs").read_text()
         self.prepare = (WINDOWS / "prep.rs").read_text()
+        self.hyperv = (HERE / "hyperv.ps1").read_text()
+        self.install = (HERE / "install.ps1").read_text()
+        self.parent_helper = (HERE / "parent-identity.ps1").read_text()
         self.wrapper = (HERE / "run-system.ps1").read_text()
         self.qualify = (HERE / "qualify.ps1").read_text()
 
@@ -61,6 +64,55 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn('download_allowlisted("static.crates.io"', prepare_body)
         self.assertNotIn("run_cargo(", prepare_body)
         self.assertNotIn("Command::new(cargo)", prepare_body)
+        execute_body = self.prepare.split("pub(crate) fn execute_with_registry(", 1)[1].split("\n}", 1)[0]
+        self.assertLess(
+            execute_body.index("validate_repository_cargo_sources"),
+            execute_body.index("prepare_registry("),
+        )
+        self.assertCodeIn('"unsupported Git bundle source URL: {url}"', self.prepare)
+        lock_validation = self.prepare.split("fn validate_lock(", 1)[1].split("fn git(", 1)[0]
+        self.assertLess(
+            lock_validation.index("validate_git_source_url(url)?"),
+            lock_validation.index("return Err(invalid(format!("),
+        )
+
+    def test_runtime_registry_cache_matches_the_installed_private_directory(self):
+        self.assertCodeIn(
+            'const LOCAL_REGISTRY_CACHE_DIRECTORY: &str = "local-registry-cache"',
+            self.prep,
+        )
+        self.assertCodeIn(
+            "config.state_dir().join(LOCAL_REGISTRY_CACHE_DIRECTORY)",
+            self.prep,
+        )
+        self.assertIn(r"state\ally\local-registry-cache", self.install)
+        self.assertIn(r'Protect-RunnerPath "$Root\state\ally\local-registry-cache"', self.install)
+        self.assertIn(r'Protect-RunnerPath "$Root\staging"', self.install)
+        self.assertIn(r"$Root\state\ally\local-registry-cache", self.hyperv)
+        private_checks = self.hyperv.split("foreach ($path in @($Root, \"$Root\\state\",", 1)[1].split(") {", 1)[0]
+        self.assertIn(r"$Root\state\ally\local-registry-cache", private_checks)
+        self.assertIn(r"$Root\staging", private_checks)
+        self.assertIn("Required private runner directory is missing", self.hyperv)
+        self.assertIn("Assert-RunnerPrivateDirectory $path", self.hyperv)
+        self.assertIn("Reparse runner directory refused", self.parent_helper)
+        self.assertIn("Runner directory grants access outside SYSTEM/Administrators", self.parent_helper)
+        self.assertIn("Runner directory owner must be SYSTEM or Administrators", self.parent_helper)
+        self.assertIn("Null runner directory DACL refused", self.parent_helper)
+
+    def test_unsupported_repository_sources_are_refused_before_registry_fetch(self):
+        self.assertCodeIn("validate_repository_cargo_sources(&plan.staging)", self.prepare)
+        self.assertCodeIn('for key in ["source", "registry", "registries"]', self.prepare)
+        self.assertCodeIn("unsupported repository Cargo {key} configuration", self.prepare)
+        self.assertCodeIn("repository_source_override_is_named_and_rejected_before_registry_fetch", self.prepare)
+
+    def test_restricted_token_and_access_check_diagnostics_are_removed(self):
+        self.assertFalse((WINDOWS / "trusted_prep/launch").exists())
+        self.assertFalse((WINDOWS / "trusted_prep/lowbox.rs").exists())
+        self.assertFalse((HERE / "test_prep_access_checks.py").exists())
+        for source in (self.prepare, self.prep, self.hyperv, self.qualify):
+            self.assertNotIn("PrepLaunchMatrix", source)
+            self.assertNotIn("AccessChecksOnly", source)
+            self.assertNotIn("CreateRestrictedToken", source)
 
     def test_local_registry_proof_checks_pinned_cargo_offline(self):
         self.assertCodeIn("[switch]$LocalRegistryOnly", self.wrapper)
@@ -84,9 +136,14 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
             "lock_unchanged_after_build",
             "cargo_rejected_changed_archive_checksum",
             "repository_source_override_test",
+            '"diagnostic_error_mentions_cfg_if": override_error_mentions_cfg_if',
         ):
             self.assertCodeIn(fragment, self.registry)
         archive_gate = self.registry.split("fn write_verified_archive(", 1)[1].split("\n}", 1)[0]
+        self.assertCodeIn(
+            'report["repository_source_override_test"]["diagnostic_error_mentions_cfg_if"] == true',
+            self.registry,
+        )
         self.assertLess(
             archive_gate.index("verify_archive_checksum(bytes, expected_checksum)?"),
             archive_gate.index("OpenOptions::new"),

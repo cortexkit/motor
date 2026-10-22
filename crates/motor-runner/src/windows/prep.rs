@@ -291,7 +291,22 @@ fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Out
     }
 }
 
+pub(super) fn validate_git_source_url(url: &str) -> io::Result<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| invalid(format!("unsupported Git bundle source URL: {url}")))?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(invalid(format!("unsupported Git bundle source URL: {url}")));
+    }
+    Ok(())
+}
+
 fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<()> {
+    for url in routes.keys() {
+        validate_git_source_url(url)?;
+    }
     let value: toml::Value = toml::from_str(lock).map_err(invalid)?;
     for package in value
         .get("package")
@@ -306,8 +321,9 @@ fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<(
                 continue;
             }
             if let Some(git) = source.strip_prefix("git+") {
-                let url = git.split(['?', '#']).next().unwrap();
-                if routes.contains_key(url) && !url.starts_with("ssh:") {
+                let url = git.split(['?', '#']).next().unwrap_or(git);
+                if routes.contains_key(url) {
+                    validate_git_source_url(url)?;
                     continue;
                 }
             }
@@ -529,10 +545,10 @@ pub(crate) fn execute_with_registry(
 ) -> io::Result<()> {
     let plan: Plan = read_json(plan_path)?;
     let workspace = stage_snapshots(&plan)?;
+    validate_repository_cargo_sources(&plan.staging)?;
     prepare_registry(&plan.staging, &workspace, &plan.routes)?;
     build_tar(&plan.staging)
 }
-
 
 fn check_case(path: &str, cases: &mut BTreeMap<String, String>) -> io::Result<()> {
     let mut prefix = String::new();
@@ -545,6 +561,66 @@ fn check_case(path: &str, cases: &mut BTreeMap<String, String>) -> io::Result<()
             if original != prefix {
                 return Err(invalid(format!("case collision: {prefix} and {original}")));
             }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_repository_cargo_sources(staging: &Path) -> io::Result<()> {
+    let mut directories = vec![staging.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        crate::filesystem::identity(&directory)?;
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            crate::filesystem::identity(&path)?;
+            if path.file_name().is_some_and(|name| name == ".cargo") {
+                for name in ["config", "config.toml"] {
+                    let config_path = path.join(name);
+                    let metadata = match fs::symlink_metadata(&config_path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if !metadata.is_file() {
+                        return Err(invalid(format!(
+                            "Cargo config is not a regular file: {}",
+                            config_path.display()
+                        )));
+                    }
+                    crate::filesystem::identity(&config_path)?;
+                    let bytes = fs::read_to_string(&config_path).map_err(|error| {
+                        invalid(format!(
+                            "cannot read Cargo config {}: {error}",
+                            config_path.display()
+                        ))
+                    })?;
+                    let config: toml::Value = toml::from_str(&bytes).map_err(|error| {
+                        invalid(format!(
+                            "invalid Cargo config {}: {error}",
+                            config_path.display()
+                        ))
+                    })?;
+                    for key in ["source", "registry", "registries"] {
+                        if let Some(value) = config.get(key) {
+                            let names = value
+                                .as_table()
+                                .map(|table| table.keys().cloned().collect::<Vec<_>>().join(", "))
+                                .filter(|names| !names.is_empty())
+                                .unwrap_or_else(|| "invalid table".into());
+                            return Err(invalid(format!(
+                                "unsupported repository Cargo {key} configuration in {}: {names}",
+                                config_path.display()
+                            )));
+                        }
+                    }
+                }
+            }
+            directories.push(path);
         }
     }
     Ok(())
@@ -842,5 +918,121 @@ mod trusted_cargo_config_tests {
             "trusted Cargo must use the repository's default target directory"
         );
         assert_ne!(metadata["target_directory"].as_str(), sentinel.to_str());
+    }
+}
+
+#[cfg(test)]
+mod git_source_validation_tests {
+    use super::*;
+
+    fn lock_with_source(source: &str) -> String {
+        format!(
+            "[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\nsource = \"git+{source}?rev=main#0123456789012345678901234567890123456789\"\n"
+        )
+    }
+
+    #[test]
+    fn valid_http_git_bundle_source_is_accepted() {
+        let url = "https://example.invalid/fixture.git";
+        let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
+        assert!(validate_lock(&lock_with_source(url), &routes).is_ok());
+    }
+
+    #[test]
+    fn unsupported_git_schemes_and_credentials_fail_before_fetch() {
+        for url in [
+            "ssh://example.invalid/fixture.git",
+            "file:///tmp/fixture.git",
+            "https://user:secret@example.invalid/fixture.git",
+        ] {
+            let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
+            let error = validate_lock(&lock_with_source(url), &routes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(url),
+                "Git source error did not name {url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_invalid_git_route_is_refused_before_fetch() {
+        let url = "https://user:secret@example.invalid/unused.git";
+        let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/unused"))]);
+        let error = validate_lock("version = 3\n", &routes)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(url),
+            "route error did not name {url}: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repository_cargo_source_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    use std::cell::Cell;
+
+    #[test]
+    fn repository_source_override_is_named_and_rejected_before_registry_fetch() {
+        let scratch = ScratchDir::new("windows-prep-source-override");
+        let staging = scratch.path().join("staging");
+        let repository = staging.join("m/repository");
+        fs::create_dir_all(repository.join(".cargo")).unwrap();
+        fs::write(repository.join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(
+            repository.join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = 'private-mirror'\n[source.private-mirror]\nregistry = 'sparse+https://mirror.invalid/index/'\n",
+        )
+        .unwrap();
+
+        let plan = Plan {
+            staging: staging.clone(),
+            snapshots: Vec::new(),
+            routes: BTreeMap::new(),
+            workspace: "/repository".into(),
+            tree_hash: String::new(),
+            cargo: PathBuf::new(),
+            rustup: PathBuf::new(),
+            toolchain_bin: PathBuf::new(),
+            toolchain_source: PathBuf::new(),
+        };
+        let plan_path = staging.join("prepare.json");
+        atomic_json(&plan_path, &plan).unwrap();
+        let registry_called = Cell::new(false);
+        let error = execute_with_registry(&plan_path, |_, _, _| {
+            registry_called.set(true);
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("unsupported repository Cargo source configuration"),
+            "unexpected registry preparation error: {error}"
+        );
+        assert!(error.contains("crates-io"));
+        assert!(error.contains("private-mirror"));
+        assert!(
+            !registry_called.get(),
+            "network fetch ran before config refusal"
+        );
+    }
+
+    #[test]
+    fn harmless_repository_cargo_build_config_is_allowed() {
+        let scratch = ScratchDir::new("windows-prep-harmless-cargo-config");
+        let staging = scratch.path().join("staging");
+        let cargo = staging.join("m/repository/.cargo");
+        fs::create_dir_all(&cargo).unwrap();
+        fs::write(
+            cargo.join("config.toml"),
+            "[build]\ntarget-dir = 'target'\n",
+        )
+        .unwrap();
+        validate_repository_cargo_sources(&staging).unwrap();
     }
 }

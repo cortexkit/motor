@@ -3,6 +3,8 @@ use super::*;
 use std::collections::BTreeMap;
 mod local_registry;
 mod system;
+
+const LOCAL_REGISTRY_CACHE_DIRECTORY: &str = "local-registry-cache";
 fn checked(ok: i32) -> io::Result<()> {
     if ok == 0 {
         Err(io::Error::last_os_error())
@@ -339,7 +341,7 @@ pub(super) fn prepare_local_registry(
         .write(true)
         .open(vm.layout_root.join("prep.lock"))?;
     lock.lock_exclusive()?;
-    let cache = config.state_dir().join("ally/local-registry-cache");
+    let cache = config.state_dir().join(LOCAL_REGISTRY_CACHE_DIRECTORY);
     let cargo_home = staging.join("cargo-home");
     let stats = local_registry::prepare_for_job(&cache, staging, &cargo_home, lockfile, routes)?;
     tracing::info!(

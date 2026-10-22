@@ -587,13 +587,7 @@ fn write_job_cargo_config(cargo_home: &Path, has_crates_io: bool) -> io::Result<
 fn write_git_rewrites(cargo_home: &Path, routes: &BTreeMap<String, PathBuf>) -> io::Result<()> {
     let mut mappings = Vec::new();
     for (url, mirror) in routes {
-        let parsed = url::Url::parse(url).map_err(invalid)?;
-        if !matches!(parsed.scheme(), "https" | "http")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return Err(invalid(format!("unsupported Git bundle source URL: {url}")));
-        }
+        super::super::prep::validate_git_source_url(url)?;
         let relative = mirror.strip_prefix(cargo_home).map_err(|_| {
             invalid(format!(
                 "Git bundle path is outside Cargo home: {}",
@@ -671,9 +665,11 @@ fn publish_cached_file(
     bytes: &[u8],
     replace: bool,
 ) -> io::Result<()> {
-    // The stage and persistent cache are SYSTEM/Administrators-only, and the
-    // caller holds the cache lock. Fetched bytes are validated before a
-    // create-new staging write, then published into the cache by same-volume rename.
+    // Path-based publication is safe because SYSTEM/Administrators alone can
+    // modify staging and cache directories, the caller holds the single-writer
+    // cache lock, and the complete response was verified in memory before any
+    // staging write. Reparse points are checked before opens and publication;
+    // create-new plus same-volume rename keeps partial files unseen.
     let target = cache_root.join(relative);
     reject_reparse_under(cache_root, &target)?;
     let parent = target
@@ -1075,8 +1071,17 @@ pub(super) fn prove(
         &temp,
         "fetch",
     );
+    let override_output = format!(
+        "{}\n{}",
+        override_result["stdout"].as_str().unwrap_or(""),
+        override_result["stderr"].as_str().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let override_error_mentions_cfg_if = override_result["success"] == false
+        && override_output.contains("no matching package")
+        && override_output.contains("cfg-if");
     let repository_config_check_started = override_result["process_started"] == true;
-    let repository_override_selected = override_result["success"] == false;
+    let repository_override_selected = override_error_mentions_cfg_if;
     fs::remove_dir_all(&repository_config_dir)?;
     let lock_unchanged_after_override = lockfile_matches(&lock_path, &lock_before);
     report["repository_source_override_test"] = json!({
@@ -1087,6 +1092,7 @@ pub(super) fn prove(
         "cargo_result": override_result,
         "check_started": repository_config_check_started,
         "repository_config_was_selected": repository_override_selected,
+        "diagnostic_error_mentions_cfg_if": override_error_mentions_cfg_if,
         "lockfile_unchanged": lock_unchanged_after_override
     });
     report["proof_passed"] = json!(
@@ -1103,6 +1109,9 @@ pub(super) fn prove(
                 == true
             && report["network_policy_negative_controls"]["redirect_status_refused"] == true
             && report["repository_source_override_test"]["check_started"] == true
+            && report["repository_source_override_test"]["repository_config_was_selected"] == true
+            && report["repository_source_override_test"]["diagnostic_error_mentions_cfg_if"]
+                == true
             && report["repository_source_override_test"]["lockfile_unchanged"] == true
     );
     write_report(report_path, &report)?;

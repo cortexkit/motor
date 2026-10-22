@@ -16,11 +16,10 @@ if ($Root -cne 'C:\ProgramData\MotorRunner' -or -not (Test-Path -LiteralPath "$R
 foreach ($path in @('C:\ProgramData', $Root, "$Root\baselines", "$Root\state", "$Root\staging")) {
     if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse root refused: $path" }
 }
-foreach ($path in @($Root, "$Root\state", "$Root\state\ally", "$Root\staging")) {
-    if (Test-Path -LiteralPath $path) { Assert-RunnerPrivateDirectory $path }
+foreach ($path in @($Root, "$Root\state", "$Root\state\ally", "$Root\state\ally\local-registry-cache", "$Root\staging")) {
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "Required private runner directory is missing: $path" }
+    Assert-RunnerPrivateDirectory $path
 }
-$crateCache = "$Root\state\ally\local-registry-cache"
-if (Test-Path -LiteralPath $crateCache) { Assert-RunnerPrivateDirectory $crateCache }
 Import-Module Hyper-V
 $prefix = 'motor-ally-'
 $owner = "MotorRunner:$Root"
@@ -163,8 +162,9 @@ switch ($Operation) {
         if ($foreign.Count) { throw 'Additional host hvsock registrations require an isolation review; no foreign registration was changed' }
         $registration = Get-ItemProperty -LiteralPath $key
         if ($registration.MotorOwner -ne 'motor-runner-hyperv' -or $registration.MotorRoot -cne $Root) { throw 'hvsock registration not owned by runner' }
-        # Every service-owned path has a protected SYSTEM/Administrators DACL.
-        foreach ($path in @($Root, "$Root\bin", "$Root\state")) {
+        # Crate downloads are published by path only after checksum verification,
+        # so the staging and persistent-cache directories must stay private.
+        foreach ($path in @($Root, "$Root\bin", "$Root\state", "$Root\state\ally", "$Root\state\ally\local-registry-cache", "$Root\staging")) {
             $acl = Get-Acl -LiteralPath $path
             foreach ($rule in $acl.Access) {
                 $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
