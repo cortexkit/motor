@@ -653,6 +653,12 @@ struct JobLog {
     /// Output commits take it through `write_for_output` and cancellation
     /// through `write_ahead_of_output`; other callers lock it directly.
     write: Mutex<()>,
+    /// Held by a cancel or kill retry from its last check that finalization
+    /// is not claimed until its unit query and stop have been issued, which
+    /// run without the state lock. Claiming finalization takes it first, so
+    /// a job being finalized is never signalled. Acquire after `write`, if
+    /// held, and never while holding the state lock.
+    signalling: Mutex<()>,
     /// How many cancels are waiting for `write`. An output commit waits for
     /// this to reach zero before it takes `write`. Without that, a job whose
     /// output arrives faster than it can be committed keeps a cancel waiting
@@ -3115,6 +3121,7 @@ impl Runner {
                 drop(inner);
                 self.save(&updated)?;
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded");
+                let signalling = log.signalling.lock().unwrap();
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
                 if inner.finalizing.contains(&id) {
@@ -3124,13 +3131,14 @@ impl Runner {
                 let job = inner.jobs[&id].clone();
                 // Query and stop the unit without the state lock: each is a
                 // systemctl process, slow on a loaded host, and every other
-                // job's admission and status reply waits for that lock. The
-                // job log lock this cancel still holds keeps finalization
-                // from being claimed meanwhile (`finish_execution` takes it
-                // first), so an exited job being finalized is never signalled.
+                // job's admission and status reply waits for that lock.
+                // `signalling` keeps finalization from being claimed
+                // meanwhile, so an exited job being finalized is never
+                // signalled.
                 drop(inner);
                 if job.process.is_none() || self.unit_alive(job.process)? == Some(false) {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
+                    drop(signalling);
                     drop(write);
                     return self.finish(
                         id,
@@ -3673,8 +3681,12 @@ impl Runner {
         self.retire_unused_repositories()
     }
     /// Move an expired job's directory into the trash directory, so the
-    /// caller can delete it after releasing the state lock.
+    /// caller can delete it after releasing the state lock. Anything but a
+    /// directory is refused, as deleting it in place would be.
     fn set_aside_job_directory(&self, id: Uuid, directory: &Path) -> io::Result<PathBuf> {
+        if !directory.symlink_metadata()?.is_dir() {
+            return Err(io::Error::other("expired job path is not a directory"));
+        }
         fs::create_dir_all(self.trash())?;
         let aside = self.trash().join(format!("job-{id}-{}", Uuid::now_v7()));
         fs::rename(directory, &aside)?;
@@ -4108,6 +4120,7 @@ impl Runner {
             let Ok(_write) = log.write.try_lock() else {
                 continue;
             };
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             let Some(job) = inner
                 .jobs
@@ -4156,11 +4169,10 @@ impl Runner {
             }
             // Query and signal the unit without the state lock: each is a
             // systemctl process, slow on a loaded host, and every admission,
-            // status reply and cancel waits for that lock. The job log lock
-            // held for this job keeps finalization from being claimed
-            // meanwhile (`finish_execution` takes it first) and keeps any
-            // other pass from retrying this job, so the retry state read above
-            // is still this job's when it is written back below.
+            // status reply and cancel waits for that lock. `_signalling`
+            // keeps finalization from being claimed meanwhile, and `_write`
+            // keeps any other pass from retrying this job, so the retry state
+            // read above is still this job's when it is written back below.
             drop(inner);
             let next = match self.unit_alive(job.process) {
                 Err(error) => {
@@ -5069,7 +5081,7 @@ impl Runner {
         let mut finished = {
             // As in `finish_execution`: wait out a stop signalling this unit.
             let log = self.job_log(id);
-            let _write = log.write.lock().unwrap();
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
                 return Ok(());
@@ -5325,11 +5337,11 @@ impl Runner {
         // workspace until the terminal is committed.
         let finish_started = std::time::Instant::now();
         let job = {
-            // Take the job log lock before claiming: a cancel or deadline
-            // stop holds it while it queries and signals the unit without the
-            // state lock, and must finish that before finalization is claimed.
+            // Wait out a cancel or deadline stop that is querying or
+            // signalling the unit without the state lock (see
+            // `JobLog::signalling`) before claiming finalization.
             let log = self.job_log(id);
-            let _write = log.write.lock().unwrap();
+            let _signalling = log.signalling.lock().unwrap();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs[&id].terminal.is_some() {
                 return Ok(());
