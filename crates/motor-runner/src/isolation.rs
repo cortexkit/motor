@@ -2080,6 +2080,39 @@ fn fetch_failure(stage: &str, error: &str) -> String {
     }
 }
 
+/// The directories a job's Git may treat as repositories although another
+/// account owns them: the workspace, and each place a sibling is mounted, its
+/// canonical path and, when there is one, its `../<name>` alias. The sibling
+/// files belong to the runner account (a snapshot, or an in-place checkout),
+/// so without an entry Git inside the job refuses them as "dubious
+/// ownership". Only these exact paths are listed, never a `*` wildcard.
+fn safe_directories(workspace: &Path, sibling_mounts: &[(String, PathBuf)]) -> Vec<PathBuf> {
+    std::iter::once(workspace.to_path_buf())
+        .chain(
+            sibling_mounts
+                .iter()
+                .map(|(_, destination)| destination.clone()),
+        )
+        .collect()
+}
+
+/// Adds one `safe.directory` entry per directory to the Git config file
+/// `config`, the job's global config (`$HOME/.gitconfig`). Git reads this
+/// setting only from global, system or command-line config, never from a
+/// repository's own.
+fn write_safe_directories(config: &Path, directories: &[PathBuf]) -> io::Result<()> {
+    for directory in directories {
+        checked(
+            Command::new("git")
+                .args(["config", "--file"])
+                .arg(config)
+                .args(["--add", "safe.directory"])
+                .arg(directory),
+        )?;
+    }
+    Ok(())
+}
+
 /// The read-only mounts that show each sibling to a job, as (systemd mount
 /// spec, destination): one at the sibling's canonical path P and, when the
 /// workspace's parent is not P's parent, one at the alias
@@ -2382,19 +2415,11 @@ impl Sandbox {
         fs::create_dir_all(host_home.join("tmp"))?;
         fs::create_dir_all(host_home.join("cargo/registry"))?;
         fs::create_dir_all(host_home.join("cargo/git"))?;
-        for path in std::iter::once(workspace.to_path_buf())
-            .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
-        {
-            // Git's ownership check is still enabled; grant only the declared
-            // immutable repositories, not a wildcard exception for the host.
-            checked(
-                Command::new("git")
-                    .args(["config", "--file"])
-                    .arg(host_home.join(".gitconfig"))
-                    .args(["--add", "safe.directory"])
-                    .arg(path),
-            )?;
-        }
+        let sibling_mounts = sibling_mounts(workspace, siblings, snapshots)?;
+        write_safe_directories(
+            &host_home.join(".gitconfig"),
+            &safe_directories(workspace, &sibling_mounts),
+        )?;
         prepare_job_home(&host_home)?;
         let shared_cargo = PathBuf::from(
             std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
@@ -2485,7 +2510,7 @@ impl Sandbox {
             read_only.push(word(&git)?);
             mount_destinations.push(git);
         }
-        for (mount, destination) in sibling_mounts(workspace, siblings, snapshots)? {
+        for (mount, destination) in sibling_mounts {
             read_only.push(mount);
             mount_destinations.push(destination);
         }

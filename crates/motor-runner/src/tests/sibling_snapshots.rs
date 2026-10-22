@@ -639,6 +639,22 @@ fn sibling_repository_job(f: &Fixture, command: &str) -> (Run, Vec<Vec<u8>>) {
     (run, vec![bytes])
 }
 
+/// Shell that runs Git read-only in the job's sibling at both places it is
+/// mounted, the `../commons` alias and the canonical path: it prints the
+/// sibling's HEAD at each and its last commit, and `git status`, which prints
+/// nothing for the clean snapshot. The sibling belongs to the runner account,
+/// so each command fails with "dubious ownership" unless the job's Git
+/// config lists that path as safe.
+#[cfg(target_os = "linux")]
+fn sibling_git(f: &Fixture) -> String {
+    format!(
+        "git -C ../commons rev-parse HEAD; git -C '{0}' rev-parse HEAD; \
+         git -C ../commons log -1 --format=%H; git -C ../commons status --porcelain; \
+         git -C '{0}' status --porcelain",
+        f.canonical
+    )
+}
+
 /// Shell that prints what the job sees, marks itself started, waits for the
 /// test's release file in its workspace, then prints `after` again.
 #[cfg(target_os = "linux")]
@@ -700,7 +716,8 @@ async fn isolated_main_workspace_and_sibling_user_run_concurrently() {
         let (b2, _) = commit(&f.sibling, "second\n");
         let (user, user_bytes) = f.run(&held(
             &format!(
-                "git -C ../commons rev-parse HEAD; cat ../commons/source; cat '{}/source'",
+                "{}; cat ../commons/source; cat '{}/source'",
+                sibling_git(&f),
                 f.canonical
             ),
             "cat ../commons/source",
@@ -756,7 +773,7 @@ async fn isolated_main_workspace_and_sibling_user_run_concurrently() {
         );
         assert_eq!(
             job_output(&runner, user.job_id),
-            format!("{b2}\nsecond\nsecond\nsecond\n")
+            format!("{b2}\n{b2}\n{b2}\nsecond\nsecond\nsecond\n")
         );
         assert_eq!(host_head(), b1);
         drop(runner);
@@ -776,11 +793,11 @@ async fn isolated_sibling_users_at_two_commits_run_concurrently() {
     config.isolate_jobs = true;
     config.disable_warm_builds = true;
     let runner = Runner::open(config).unwrap();
-    let read = "git -C ../commons rev-parse HEAD; cat ../commons/source";
+    let read = format!("{}; cat ../commons/source", sibling_git(&f));
     let b1 = git(&f.sibling, &["rev-parse", "HEAD"]);
-    let (first, first_bytes) = job_at(&f, "first", &held(read, "cat ../commons/source"));
+    let (first, first_bytes) = job_at(&f, "first", &held(&read, "cat ../commons/source"));
     let (b2, _) = commit(&f.sibling, "second\n");
-    let (second, second_bytes) = job_at(&f, "second", &held(read, "cat ../commons/source"));
+    let (second, second_bytes) = job_at(&f, "second", &held(&read, "cat ../commons/source"));
     f.submit(&runner, &first, &first_bytes);
     reached_marker(&runner, first.job_id, &first.workspace_key).await;
     f.submit(&runner, &second, &second_bytes);
@@ -800,11 +817,11 @@ async fn isolated_sibling_users_at_two_commits_run_concurrently() {
     }
     assert_eq!(
         job_output(&runner, first.job_id),
-        format!("{b1}\nfirst\nfirst\n")
+        format!("{b1}\n{b1}\n{b1}\nfirst\nfirst\n")
     );
     assert_eq!(
         job_output(&runner, second.job_id),
-        format!("{b2}\nsecond\nsecond\n")
+        format!("{b2}\n{b2}\n{b2}\nsecond\nsecond\n")
     );
     assert!(
         !Path::new(&f.canonical).exists(),

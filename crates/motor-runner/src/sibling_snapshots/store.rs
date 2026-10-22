@@ -523,7 +523,7 @@ pub(crate) fn remove_group_and_other_write(_root: &Path) -> io::Result<()> {
 /// mirror, so Git inside a job needs the snapshot to stand alone. Both a
 /// fresh clone (`clone --shared`) and a copied predecessor (re-linked by the
 /// sync) borrow from the mirror at this point.
-fn dissociate(temporary: &Path) -> io::Result<()> {
+pub(crate) fn dissociate(temporary: &Path) -> io::Result<()> {
     let alternates = temporary.join(".git/objects/info/alternates");
     if !alternates.is_file() {
         return Ok(());
