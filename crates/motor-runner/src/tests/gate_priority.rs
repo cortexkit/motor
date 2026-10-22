@@ -707,5 +707,5 @@ fn sibling_user_accepted_before_the_workspace_job_starts_first() {
         .map(str::to_owned);
     drop(inner);
     assert_eq!(started, BTreeSet::from([user_id]));
-    assert_eq!(main_phase.as_deref(), Some("workspace owner"));
+    assert_eq!(main_phase.as_deref(), Some("sibling user of this checkout"));
 }

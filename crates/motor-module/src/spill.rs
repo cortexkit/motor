@@ -1,4 +1,6 @@
-use motor_protocol::{Outcome, Ran, RefusalReason, RunRequest, TerminalRecord};
+use motor_protocol::{
+    Outcome, Ran, RefusalReason, RunRequest, TerminalRecord, SPILL_WITHDRAWAL_DETAIL_PREFIX,
+};
 use tokio::time::Instant;
 
 pub(crate) fn eligible(
@@ -22,6 +24,8 @@ pub(crate) struct Watch {
     after: u64,
     permits: Option<(Instant, u64)>,
     may_have_started: bool,
+    /// The capacity wait when a spill withdrawal was sent, if one was.
+    spill_requested: Option<u64>,
 }
 impl Watch {
     pub(crate) fn new(after: u64) -> Self {
@@ -29,6 +33,7 @@ impl Watch {
             after,
             permits: None,
             may_have_started: false,
+            spill_requested: None,
         }
     }
     pub(crate) fn observe(&mut self, elapsed: Option<u64>) {
@@ -46,8 +51,31 @@ impl Watch {
             elapsed.saturating_add(at.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
         })
     }
+    /// Record a withdrawal being sent, with whether it asked to spill.
+    pub(crate) fn withdraw_sent(&mut self, spill: bool) {
+        if spill {
+            self.spill_requested = Some(self.wait_ms());
+        }
+    }
+    /// The capacity wait to report for a spill: at least the wait observed
+    /// when the spill withdrawal was sent, since later heartbeats may no
+    /// longer carry one.
+    pub(crate) fn spill_wait_ms(&self) -> u64 {
+        self.spill_requested.unwrap_or(0).max(self.wait_ms())
+    }
     pub(crate) fn withdrawn(&self, terminal: &TerminalRecord) -> bool {
-        self.ready()
+        // Once the runner withdraws the job, its heartbeats stop carrying a
+        // queue wait, and one can arrive before the terminal record. That
+        // clears the observed permit wait, so `ready` alone would let the
+        // terminal through as a refusal. A spill request sent while `ready`
+        // held still counts when the runner marks the terminal as a spill
+        // withdrawal, which it does only for a job that never started.
+        let spill_acknowledged = self.spill_requested.is_some()
+            && !self.may_have_started
+            && terminal
+                .refusal_detail()
+                .is_some_and(|detail| detail.starts_with(SPILL_WITHDRAWAL_DETAIL_PREFIX));
+        (self.ready() || spill_acknowledged)
             && terminal.ran == Some(Ran::None)
             && terminal.outcome
                 == Outcome::RefusedBeforeStart {
@@ -117,6 +145,52 @@ mod tests {
         assert!(watch.withdrawn(&terminal));
         watch.observe(None);
         assert!(!watch.withdrawn(&terminal), "busy workspace must not spill");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn spill_request_survives_a_heartbeat_without_queue_wait_before_the_terminal() {
+        let terminal = |detail: &str| {
+            TerminalRecord::new(
+                motor_protocol::Uuid::now_v7(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::QueueWaitExceeded,
+                },
+                0,
+                0,
+                0,
+            )
+            .with_ran(Ran::None)
+            .with_refusal_detail(detail)
+        };
+        let spilled = terminal(&format!(
+            "{SPILL_WITHDRAWAL_DETAIL_PREFIX}waiting_on=permits; requested_permits=4"
+        ));
+        let refused = terminal("waiting_on=permits; requested_permits=4");
+        let mut watch = Watch::new(45);
+        watch.observe(Some(45_000));
+        assert!(watch.ready());
+        watch.withdraw_sent(true);
+        // The runner has withdrawn the job, so its next heartbeat carries no
+        // queue wait, and it can arrive before the terminal record.
+        watch.observe(None);
+        assert!(
+            watch.withdrawn(&spilled),
+            "the requested spill must not become a refusal"
+        );
+        assert_eq!(watch.spill_wait_ms(), 45_000);
+        assert!(
+            !watch.withdrawn(&refused),
+            "only a terminal the runner marks as a spill withdrawal counts"
+        );
+        let mut unrequested = Watch::new(45);
+        unrequested.observe(Some(45_000));
+        unrequested.withdraw_sent(false);
+        unrequested.observe(None);
+        assert!(!unrequested.withdrawn(&spilled));
+        let mut started = Watch::new(45);
+        started.observe(Some(45_000));
+        started.withdraw_sent(true);
+        started.started();
+        assert!(!started.withdrawn(&spilled));
     }
     #[tokio::test(start_paused = true)]
     async fn started_or_disconnected_job_cannot_spill() {

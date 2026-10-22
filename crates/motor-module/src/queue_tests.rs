@@ -316,6 +316,18 @@ impl Connector for SpillPeer {
                             )
                             .await
                             .unwrap();
+                            // As the real runner can: once the job is
+                            // withdrawn its heartbeats carry no queue wait,
+                            // and one may go out before the terminal record,
+                            // which marks the withdrawal as a spill.
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::Heartbeat {
+                                    queue_wait_ms: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
                             write_frame_async(
                                 &mut peer,
                                 &Frame::Terminal(
@@ -328,7 +340,13 @@ impl Connector for SpillPeer {
                                         0,
                                         0,
                                     )
-                                    .with_ran(Ran::None),
+                                    .with_ran(Ran::None)
+                                    .with_refusal_detail(
+                                        format!(
+                                            "{}waiting_on=permits",
+                                            motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
+                                        ),
+                                    ),
                                 ),
                             )
                             .await

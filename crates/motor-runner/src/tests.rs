@@ -4377,6 +4377,155 @@ fn queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes() {
         .starts_with("waiting_on=permits"));
 }
 
+/// Jobs for `sibling_user_wait_*` tests: a running job in another workspace
+/// that declares the fixture sibling, and a queued job whose main workspace is
+/// that sibling's canonical path, the same host directory. The queued job gets
+/// a one second queue budget.
+fn sibling_user_and_waiter(
+    f: &Fixture,
+    runner: &Runner,
+    waiter_weight: u32,
+    waiter_siblings: Vec<SiblingSnapshot>,
+) -> (Run, Run) {
+    let now = runner.now();
+    let (user, _) = job_at(f, "sibling-user", "true");
+    let (mut waiting, _) = f.run("true");
+    waiting.workspace_key = f.canonical.clone();
+    waiting.cwd = f.canonical.clone();
+    waiting.siblings = waiter_siblings;
+    waiting.queue_wait_limit_s = 1;
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut user_job = Job::new(user.job_id, Some(user.clone()), now, 1, 2);
+    user_job.state = JobState::Running;
+    user_job.started_ms = Some(now);
+    inner.jobs.insert(user.job_id, user_job);
+    let mut waiting_job = Job::new(waiting.job_id, Some(waiting.clone()), now, 2, waiter_weight);
+    waiting_job.state = JobState::Queued;
+    waiting_job.queued_ms = Some(now);
+    waiting_job.start_queue_wait(now);
+    inner.jobs.insert(waiting.job_id, waiting_job);
+    (user, waiting)
+}
+
+fn manual_tick_runner(f: &Fixture, max_weight: u32) -> Runner {
+    let mut config = f.config();
+    config.max_weight = max_weight;
+    config.manual_tick = true;
+    Runner::open(config).unwrap()
+}
+
+#[test]
+fn sibling_user_wait_is_named_with_its_holder_and_does_not_spend_queue_wait_budget() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 8);
+    let (user, waiting) = sibling_user_and_waiter(&f, &runner, 2, Vec::new());
+
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(
+        status.waiting_on.as_deref(),
+        Some("sibling user of this checkout"),
+        "another workspace's sibling checkout is not this workspace's owner"
+    );
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0),
+        "time behind a sibling user of this checkout is not queue wait"
+    );
+    let detail = {
+        let inner = runner.core.inner.lock().unwrap();
+        runner.queue_wait_detail(&inner, waiting.job_id)
+    };
+    assert!(
+        detail.starts_with(&format!(
+            "waiting_on=sibling user of this checkout; sibling_users=[job={} workspace={} permits=2]; requested_permits=2;",
+            user.job_id, user.workspace_key
+        )),
+        "{detail}"
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Started,
+        "a checkout conflict must not spend the budget a spill withdrawal checks"
+    );
+}
+
+#[test]
+fn sibling_user_wait_also_blocking_the_waiters_sibling_does_not_spend_queue_wait_budget() {
+    // The two repositories name each other as siblings: the running job's own
+    // workspace is also the waiting job's sibling checkout. That one job is
+    // still the only blocker.
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 8);
+    let sibling = SiblingSnapshot {
+        canonical_path: f
+            .scratch
+            .join("remote/worktrees/sibling-user")
+            .to_string_lossy()
+            .to_string(),
+        commit: "other".into(),
+        tree_hash: String::new(),
+        base_commit: None,
+    };
+    let (_, waiting) = sibling_user_and_waiter(&f, &runner, 2, vec![sibling]);
+
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(
+        status.waiting_on.as_deref(),
+        Some("sibling user of this checkout")
+    );
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Started
+    );
+}
+
+#[test]
+fn sibling_user_wait_still_spends_budget_when_capacity_would_also_block() {
+    // As behind a workspace owner, the clock keeps running when the job would
+    // not fit even after the sibling user frees its permits.
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    let (mut capacity, _) = job_at(&f, "capacity", "true");
+    capacity.siblings.clear();
+    let (_, waiting) = sibling_user_and_waiter(&f, &runner, 4, Vec::new());
+    {
+        let now = runner.now();
+        let mut inner = runner.core.inner.lock().unwrap();
+        let mut capacity_job = Job::new(capacity.job_id, Some(capacity.clone()), now, 0, 2);
+        capacity_job.state = JobState::Running;
+        capacity_job.started_ms = Some(now);
+        inner.jobs.insert(capacity.job_id, capacity_job);
+    }
+
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+    f.clock.fetch_add(1_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(1_000)
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let terminal = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    assert!(terminal
+        .refusal_detail()
+        .unwrap()
+        .starts_with("waiting_on=sibling user of this checkout; sibling_users=[job="));
+}
+
 #[test]
 fn cancelled_workspace_waiter_is_removed_from_the_queue() {
     let f = Fixture::new();
