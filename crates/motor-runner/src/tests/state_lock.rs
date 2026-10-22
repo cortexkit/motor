@@ -1033,13 +1033,14 @@ fn restart_counts_a_finished_job_as_its_workspace_last_use() {
     assert!(Path::new(&request.workspace_key).exists());
 }
 
+/// A job's CPUs, setup time, workspace rotation and queue clock (entry,
+/// elapsed, initialized).
+type DispatchState = (Vec<u32>, Option<u64>, Option<u64>, (u64, u64, bool));
+
 /// The state a dispatch attempt changes, to compare before and after one
 /// that is undone: the job's CPUs, setup time and queue clock, and its
 /// workspace's rotation.
-fn dispatch_state(
-    f: &SaveFixture,
-    id: Uuid,
-) -> (Vec<u32>, Option<u64>, Option<u64>, (u64, u64, bool)) {
+fn dispatch_state(f: &SaveFixture, id: Uuid) -> DispatchState {
     let inner = f.runner.core.inner.lock().unwrap();
     let job = &inner.jobs[&id];
     let clock = QueueClock::of(job);
