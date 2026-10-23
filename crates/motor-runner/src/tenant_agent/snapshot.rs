@@ -127,7 +127,9 @@ pub(super) async fn thaw() -> io::Result<()> {
             let file = fs::File::open("/tenant")?;
             // FITHAW is the ioctl used by fsfreeze -u. EINVAL means that a
             // previous thaw already completed, which makes retries idempotent.
-            if unsafe { libc::ioctl(file.as_raw_fd(), 0xc0045878 as libc::c_ulong, 0) } != 0 {
+            // Typed u32 first: musl's request type is a signed int, and the
+            // cast must keep the bit pattern rather than overflow a literal.
+            if unsafe { libc::ioctl(file.as_raw_fd(), 0xc0045878_u32 as libc::Ioctl, 0) } != 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::EINVAL) {
                     return Err(error);

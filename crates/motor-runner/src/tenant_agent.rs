@@ -376,10 +376,12 @@ fn clock_and_rng(unix_ms: u64, seed: &str) -> io::Result<()> {
         bytes: seed,
     };
     let random = OpenOptions::new().write(true).open("/dev/urandom")?;
-    if unsafe { libc::ioctl(random.as_raw_fd(), 0x40085203 as libc::c_ulong, &entropy) } < 0 {
+    // `libc::Ioctl` is the request type of the target's libc: unsigned long on
+    // glibc, int on musl (the tenant runner is a static musl build).
+    if unsafe { libc::ioctl(random.as_raw_fd(), 0x40085203 as libc::Ioctl, &entropy) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    if unsafe { libc::ioctl(random.as_raw_fd(), 0x5207 as libc::c_ulong) } < 0 {
+    if unsafe { libc::ioctl(random.as_raw_fd(), 0x5207 as libc::Ioctl) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -672,7 +674,7 @@ fn reflink_probe(source: &Path, destination: &Path) -> io::Result<()> {
         if unsafe {
             libc::ioctl(
                 target.as_raw_fd(),
-                0x40049409 as libc::c_ulong,
+                0x40049409 as libc::Ioctl,
                 source.as_raw_fd(),
             )
         } < 0

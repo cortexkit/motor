@@ -181,15 +181,19 @@ impl Dir {
                     libc::RENAME_SWAP,
                 )
             })?;
+            // The raw syscall: musl's libc bindings have no renameat2 wrapper,
+            // and the tenant runner is a static musl build. The return value is
+            // 0 or -1, so narrowing it to c_int is exact.
             #[cfg(target_os = "linux")]
             cv(unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     self.0.as_raw_fd(),
                     from.as_ptr(),
                     self.0.as_raw_fd(),
                     to.as_ptr(),
                     libc::RENAME_EXCHANGE,
-                )
+                ) as libc::c_int
             })?;
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             return Err(invalid("atomic target exchange is unsupported"));
@@ -528,7 +532,7 @@ impl Dir {
                     cv(unsafe {
                         libc::ioctl(
                             output.as_raw_fd(),
-                            0x40049409 as libc::c_ulong,
+                            0x40049409 as libc::Ioctl,
                             source.as_raw_fd(),
                         )
                     })?;
