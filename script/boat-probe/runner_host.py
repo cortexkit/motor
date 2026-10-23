@@ -1266,6 +1266,7 @@ class RunnerHost:
             self.existing_then_reinstall(sid, label, record, hydrated_at)
         else:
             self.arm_then_install(sid, label, record)
+        record['kernel_release'] = self.execute(sid, 'uname -r')['stdout'].strip()
         record['storage'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
         for key, passed in storage_checks(record['storage']).items():
             self.check(label + '.' + key, passed, record['storage'])

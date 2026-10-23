@@ -508,6 +508,12 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
         ("x86 clone3", x86, CLONE3, [pid, 88], false),
         ("x32 clone3", x86, CLONE3 | x32, [pid, 88], false),
         ("i386 clone3", i386, CLONE3, [pid, 88], false),
+        ("native file_setattr", x86, 469, [3, 0], false),
+        ("x32 file_setattr", x86, 469 | x32, [3, 0], false),
+        ("i386 file_setattr", i386, 469, [3, 0], false),
+        ("native file_getattr", x86, 468, [3, 0], false),
+        ("x32 file_getattr", x86, 468 | x32, [3, 0], false),
+        ("i386 file_getattr", i386, 468, [3, 0], false),
         // Any unrecognized architecture fails closed in this filter itself.
         (
             "aarch64 unshare pid",
@@ -520,7 +526,7 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
         let result = evaluate(&program, arch, nr, args, &mut seen, &mut branches);
         let expected = if arch != x86 && arch != i386 {
             SECCOMP_RET_KILL_PROCESS
-        } else if nr & !x32 == CLONE3 {
+        } else if matches!(nr & !x32, CLONE3 | 469) {
             SECCOMP_RET_ERRNO | libc::ENOSYS as u32
         } else if refused {
             deny
@@ -671,6 +677,14 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
             {
                 libc::_exit(8);
             }
+            if libc::syscall(FILE_SETATTR as libc::c_long, -1, 0, 0, 0, 0) != -1
+                || *libc::__errno_location() != libc::ENOSYS
+            {
+                libc::_exit(40);
+            }
+            if refused_here(libc::syscall(468, -1, 0, 0, 0, 0)) {
+                libc::_exit(41);
+            }
             // Runs `check` in a grandchild: Some(passed), or None when the
             // grandchild was killed before it could answer.
             let isolated = |check: &dyn Fn() -> bool| -> Option<bool> {
@@ -685,6 +699,16 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
             let x32 = isolated(&|| {
                 let x32_unshare = libc::c_long::from(X86_64_UNSHARE | X32_SYSCALL_BIT);
                 refused_here(libc::syscall(x32_unshare, pid))
+                    && libc::syscall((469 | X32_SYSCALL_BIT) as libc::c_long, -1, 0, 0, 0, 0) == -1
+                    && *libc::__errno_location() == libc::ENOSYS
+                    && !refused_here(libc::syscall(
+                        (468 | X32_SYSCALL_BIT) as libc::c_long,
+                        -1,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ))
             });
             let i386 = isolated(&|| {
                 let call = |nr: u32, arg: u32| -> i32 {
@@ -702,6 +726,8 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
                 };
                 call(I386_UNSHARE, CLONE_NEWPID) == -ours
                     && call(I386_UNSHARE, libc::CLONE_NEWUTS as u32) != -ours
+                    && call(469, u32::MAX) == -libc::ENOSYS
+                    && call(468, u32::MAX) != -ours
             });
             if x32 == Some(false) {
                 libc::_exit(20);
