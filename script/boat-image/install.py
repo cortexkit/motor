@@ -54,6 +54,7 @@ RUNNER_INPUTS = (
     'script/runner/tools.txt', 'script/runner/install-tools.sh',
     'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
     'script/runner/cargo-seed.py',
+    'script/runner/syscall-surface.py',
     'script/runner/job-account.py',
     'script/runner/sysctl/60-motor-inotify.conf',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',

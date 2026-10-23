@@ -1,6 +1,8 @@
 import importlib.util
 import contextlib
 import copy
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -19,6 +21,37 @@ if spec is None or spec.loader is None:
     raise ImportError("cannot load toolchain parity checker")
 parity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parity)
+
+
+class SyscallSurfaceTests(unittest.TestCase):
+    def test_raw_probe_calls_fchmodat2_on_a_retained_directory_without_fallback(self):
+        chmod_calls = []
+
+        def syscall(number, *args):
+            if number.value == 452:
+                fd, path, mode, flags = args
+                self.assertTrue(os.path.isdir(f'/proc/self/fd/{fd}'))
+                self.assertEqual((b'', 0o700, 0x1000), (path, mode, flags))
+                chmod_calls.append(fd)
+            ctypes.set_errno(errno.ENOSYS)
+            return -1
+
+        with patch.object(parity.syscall_surface.ctypes, 'CDLL') as library:
+            library.return_value.syscall.side_effect = syscall
+            actual = parity.syscall_surface.capture()
+        self.assertEqual(1, len(chmod_calls))
+        self.assertEqual({'errno': errno.ENOSYS, 'result': 'ENOSYS'}, actual['fchmodat2.EMPTY_PATH'])
+        self.assertEqual(30, len(actual))
+        self.assertEqual(set(parity.syscall_surface.expectations(True)), set(actual))
+
+    def test_job_clone3_denial_is_required_but_not_expected_on_the_host(self):
+        self.assertEqual({errno.ENOSYS}, parity.syscall_surface.expectations(True)['clone3.invalid'])
+        self.assertEqual({errno.EINVAL}, parity.syscall_surface.expectations(False)['clone3.invalid'])
+
+    def test_missing_probe_results_fail_closed(self):
+        errors = parity.syscall_surface.differences({})
+        self.assertIn('syscall fchmodat2.EMPTY_PATH', '\n'.join(errors))
+        self.assertEqual(31, len(errors))
 
 
 class JobAccountTests(unittest.TestCase):
@@ -195,6 +228,12 @@ class ParityTests(unittest.TestCase):
                             'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
                             'tmpdir_exec': True, 'sshd_executable': True},
                 'job_identity': dict(manifest['job_identity']),
+                'syscalls': {**{name: {'errno': 0} for name in parity.syscall_surface.SUCCESS},
+                             'openat2.reject_symlink': {'errno': errno.ELOOP},
+                             'mount_setattr.invalid': {'errno': errno.EINVAL},
+                             'open_tree.invalid': {'errno': errno.EBADF},
+                             'move_mount.invalid': {'errno': errno.EPERM},
+                             'clone3.invalid': {'errno': errno.EINVAL}},
                 'compile_wrapper': {
                     **manifest['compile_wrapper'],
                     'resolved': '/motor-tools/sccache' if role == 'boat' else '/motor-tools/prefrontal-build-slot',
@@ -206,8 +245,23 @@ class ParityTests(unittest.TestCase):
                 'mountinfo': '1 0 0:0 / ' + manifest['rustup_home'] + ' ro - ext4 /dev/example rw',
                 'cargo_registry': self.registry()}
 
+    def test_fchmodat2_enosys_fails_every_role_and_mode(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                with self.subTest(role=role, job=job):
+                    actual = self.observed(role)
+                    actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                    self.assertFalse(any('syscall ' in error for error in
+                                         parity.differences(self.manifest, actual, role, job)))
+                    actual['syscalls']['fchmodat2.EMPTY_PATH']['errno'] = errno.ENOSYS
+                    errors = parity.differences(self.manifest, actual, role, job)
+                    self.assertEqual(["syscall fchmodat2.EMPTY_PATH: expected ['OK'], observed errno 38"],
+                                     [error for error in errors if error.startswith('syscall ')])
+
     def report(self, actual, job=False, role='build-server'):
-        with patch.object(parity, 'capture', return_value=copy.deepcopy(actual)):
+        captured = copy.deepcopy(actual)
+        captured['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+        with patch.object(parity, 'capture', return_value=captured):
             return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test',
                                 cargo_registry=self.registry())
 

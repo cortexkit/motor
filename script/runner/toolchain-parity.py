@@ -23,6 +23,12 @@ if 'seed' not in globals():
         raise ImportError('cannot load Cargo seed inventory')
     seed = importlib.util.module_from_spec(seed_spec)
     seed_spec.loader.exec_module(seed)
+if 'syscall_surface' not in globals():
+    syscall_spec = importlib.util.spec_from_file_location('syscall_surface', HERE / 'syscall-surface.py')
+    if syscall_spec is None or syscall_spec.loader is None:
+        raise ImportError('cannot load syscall surface probe')
+    syscall_surface = importlib.util.module_from_spec(syscall_spec)
+    syscall_spec.loader.exec_module(syscall_surface)
 
 
 def output(*args, env=None):
@@ -240,6 +246,7 @@ def capture(manifest=None, job=False, role="build-server"):
         "compile_wrapper": wrapper,
         "mountinfo": mountinfo,
         "runtime": runtime_capture() if job else {},
+        "syscalls": syscall_surface.capture(),
         "job_identity": job_identity(job),
         "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
     }
@@ -392,6 +399,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
             errors.append(f"{name}: expected {expected!r}, observed {observed!r}")
 
     equal('motor-job identity', manifest['job_identity'], actual.get('job_identity'))
+    errors.extend(syscall_surface.differences(actual.get('syscalls', {}), job=job))
 
     for key in ("rust_default", "rust_profile", "cargo_home", "rustup_home"):
         equal(key, manifest[key], actual.get(key))

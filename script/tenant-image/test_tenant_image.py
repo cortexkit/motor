@@ -149,6 +149,15 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             image.load_versions(self.versions)
 
+    def test_kernel_must_implement_descriptor_relative_chmod(self):
+        for version in ('6.1.128', '6.6.0', '6.12.114'):
+            with self.subTest(version=version):
+                self.change_pin('kernel', version)
+                with self.assertRaisesRegex(ValueError, 'Firecracker-supported.*fchmodat2'):
+                    image.load_versions(self.versions)
+        self.change_pin('kernel', '6.18.0')
+        self.assertEqual('6.18.0', image.load_versions(self.versions)['kernel'])
+
     def test_source_digest_is_checked_before_copying(self):
         source, dest = self.root / "source", self.root / "destination"
         source.write_text("drifted installer")
@@ -303,13 +312,17 @@ class ImageTests(unittest.TestCase):
     def test_kernel_options_include_boot_and_isolation_drivers(self):
         config = set(resolved_config().splitlines())
         for name in ("XFS_FS", "OVERLAY_FS", "VSOCKETS", "VIRTIO_VSOCKETS", "VIRTIO_BLK",
+                     "VIRTIO_VSOCKETS_COMMON", "VIRTIO", "VIRTIO_MMIO", "VIRTIO_MMIO_CMDLINE_DEVICES",
+                     "VIRTIO_NET", "VIRTIO_CONSOLE", "SERIAL_8250", "SERIAL_8250_CONSOLE", "PRINTK",
+                     "HW_RANDOM", "HW_RANDOM_VIRTIO",
                      "EXT4_FS", "TMPFS", "MEMCG", "CGROUP_PIDS", "BPF_SYSCALL", "CGROUP_BPF",
                      "SECCOMP_FILTER", "NET_NS", "NF_TABLES", "VETH"):
             self.assertIn(f"CONFIG_{name}=y", config)
 
     def test_resolved_kernel_rejects_missing_driver_module_or_fallback_tunnel(self):
         path = self.root / "kernel.config"
-        for name in ("XFS_FS", "OVERLAY_FS", "VIRTIO_VSOCKETS", "VIRTIO_BLK"):
+        for name in ("XFS_FS", "OVERLAY_FS", "VIRTIO_VSOCKETS", "VIRTIO_BLK",
+                     "VIRTIO_VSOCKETS_COMMON", "HW_RANDOM", "HW_RANDOM_VIRTIO", "PRINTK"):
             for replacement in ("m", "n"):
                 with self.subTest(name=name, replacement=replacement):
                     path.write_text(resolved_config().replace(f"CONFIG_{name}=y", f"CONFIG_{name}={replacement}"))
