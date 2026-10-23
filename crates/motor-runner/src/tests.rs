@@ -1032,13 +1032,19 @@ async fn drain_completes_promptly_with_a_started_unit_backed_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_waits_for_a_job_still_preparing() {
     let f = Fixture::new();
-    let (runner, hold, _release) = held_runner(&f);
+    let hold = Hold::new("materialize");
+    let mut config = f.config();
+    // A cache fill can start before the foreground job and consume this
+    // one-shot hold. Only the job whose drain behavior we assert may reach it.
+    config.disable_warm_builds = true;
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let _release = Release(hold.clone());
     hold.arm();
     let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
     reached(&hold).await;
     runner.begin_drain(Duration::from_secs(30), false);
-    settle().await;
     assert_eq!(
         runner.drain_result(),
         None,
