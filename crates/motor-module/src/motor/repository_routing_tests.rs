@@ -296,6 +296,51 @@ async fn stage1_validation_and_lease_refusals_name_the_route_and_never_fall_back
     }
 }
 
+/// A routed job has no build server to go back to, so a lease body the
+/// broker cannot take is a typed refusal: one ck-motor finds invalid is never
+/// sent and names the member, and one the broker refuses with 400
+/// `bad_request` says so. Neither calls it a lease mismatch.
+#[tokio::test]
+async fn stage1_invalid_lease_bodies_are_typed_refusals_not_lease_mismatch() {
+    for (timeout, broker_refusal, detail) in [
+        (10_800, false, "hosted_request_invalid: timeout_s"),
+        (5, false, "hosted_request_invalid: timeout_s"),
+        (30, true, "hosted_request_invalid"),
+    ] {
+        let h = Harness::new(Behavior::CompleteRun).await;
+        if broker_refusal {
+            h.broker.lock().unwrap().knobs.refusal = Some((400, "bad_request".into()));
+        }
+        let (scratch, repo) = committed_repo();
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
+            .unwrap();
+        let request = request(&repo).with_timeout(timeout);
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        let (_, terminal) = records(stream).await;
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        );
+        let refusal = terminal.refusal_detail.unwrap();
+        assert!(
+            refusal.contains("hosted stage-1 routing (hosted_repositories)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(detail), "{refusal}");
+        assert!(!refusal.contains("lease_mismatch"), "{refusal}");
+        let state = motor.hosted_state(id).unwrap();
+        assert_eq!(state.hosted_code.as_deref(), Some("hosted_request_invalid"));
+        assert!(state.hosted_no_fallback && !state.run_sent);
+        assert_eq!(lease_bodies(&h).len(), usize::from(broker_refusal));
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[tokio::test]
 async fn stage1_lost_run_ack_reattaches_without_direct_fallback() {
     let h = Harness::new(Behavior::DropRunAck).await;
