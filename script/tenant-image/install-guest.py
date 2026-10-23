@@ -98,12 +98,18 @@ def install_tools(pins):
     (PREFIX / "cargo").mkdir()
     shutil.copytree(BUILD / "cargo-home/bin", PREFIX / "cargo/bin", symlinks=True)
     shutil.move("/home/ubuntu/.rustup", PREFIX / "rustup")
+    # Root runs these files, so they get a fixed root-only-writable mode rather
+    # than whatever mode the build checkout's umask left on the source copy.
+    def install_file(source, destination):
+        shutil.copyfile(source, destination)
+        os.chmod(destination, 0o644)
+
     for name in ("sccache-inputs.sha256", "sccache-artifacts.json"):
-        shutil.copy2(BUILD / name, PREFIX / name)
+        install_file(BUILD / name, PREFIX / name)
     parity_dir = PREFIX / "parity"
-    parity_dir.mkdir()
+    parity_dir.mkdir(mode=0o755)
     for name in ("toolchain.json", "toolchain-parity.py", "cargo-seed.py", "syscall-surface.py"):
-        shutil.copy2(BUILD / "script/runner" / name, parity_dir / name)
+        install_file(BUILD / "script/runner" / name, parity_dir / name)
     # Only immutable binaries and toolchains enter the image, not install caches.
     os.environ.update(CARGO_HOME=str(PREFIX / "cargo"), RUSTUP_HOME=str(PREFIX / "rustup"),
                       PATH=f"/home/ubuntu/.bun/bin:{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
