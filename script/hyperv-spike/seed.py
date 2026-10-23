@@ -63,7 +63,10 @@ def stage(destination, archive, guest_agent=None, peer_runner=None):
     verify_archive(archive)
     destination.mkdir(parents=True)
     (destination / "autounattend.xml").write_text(answer(
-        (SETUP / "autounattend.xml").read_text(), "Aa1!" + secrets.token_urlsafe(36)), encoding="utf-8")
+        # No "-": the template also names the placeholder in an XML comment, where
+        # "--" is illegal, so a password with two in a row broke the answer file.
+        (SETUP / "autounattend.xml").read_text(), "Aa1!" + secrets.token_urlsafe(36).replace("-", "_")),
+        encoding="utf-8")
     for marker in ("job-baseline", "hyperv-spike"):
         (destination / marker).touch()
     scripts = ("bootstrap.ps1", "setup-guest.ps1", "setup-job-baseline.ps1", "install-powershell.ps1",

@@ -16,6 +16,17 @@ NAMESPACE = "urn:schemas-microsoft-com:unattend"
 WCM = "http://schemas.microsoft.com/WMIConfig/2002/State"
 
 
+def bootstrap_password():
+    """A one-time setup password that is safe inside the template's XML comment.
+
+    The unattended template also names the password placeholder in a comment,
+    and XML forbids "--" inside a comment. token_urlsafe can emit "-", so a
+    password with two in a row made the rendered answer unparseable about one
+    time in eight. Its alphabet without "-" keeps 62 of 64 symbols.
+    """
+    return "Aa1!" + secrets.token_urlsafe(36).replace("-", "_")
+
+
 def job_answer(answer):
     """Register elevated bootstrap during Setup, not from the interactive account."""
     tag = lambda name: f"{{{NAMESPACE}}}{name}"
@@ -84,7 +95,7 @@ def main():
     if template.count("__BOOTSTRAP_PASSWORD__") != 4:
         # One occurrence is in the template's explanatory comment.
         raise SystemExit("Unexpected unattended template")
-    password = "Aa1!" + secrets.token_urlsafe(36)
+    password = bootstrap_password()
     answer = template.replace("__BOOTSTRAP_PASSWORD__", password)
     if args.job_baseline:
         answer = job_answer(answer)

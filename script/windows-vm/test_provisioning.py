@@ -91,6 +91,16 @@ class SeedTests(unittest.TestCase):
         self.assertFalse((seed / "motor-winagent/target").exists())
         self.assertFalse((seed / "motor-winagent/.cargo").exists())
 
+    def test_password_with_hyphens_still_renders_a_well_formed_answer(self):
+        # token_urlsafe can emit "--", which XML forbids inside the template's
+        # comment that names the placeholder.
+        with patch.object(prepare.secrets, "token_urlsafe", return_value="ab--cd-" * 7), \
+                patch.object(Path, "home", side_effect=AssertionError("job mode read SSH keys")):
+            self.render("--job-baseline", "--agent-source", str(self.agent))
+        answer = (self.root / "seed/autounattend.xml").read_text()
+        ET.fromstring(answer)
+        self.assertNotIn("-", prepare.bootstrap_password())
+
     def test_job_seed_rejects_missing_or_wrong_powershell_before_writing(self):
         archive = self.root / media.ARCHIVE_NAME
         for missing in (False, True):
