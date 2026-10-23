@@ -774,12 +774,13 @@ class SizeOptionTests(unittest.TestCase):
 
     def test_size_choices_are_boat_sizes_the_probe_knows(self):
         errors = io.StringIO()
-        with patch("sys.argv", ["probe.py", "--output", "unused", "--size", "xlarge"]), \
+        with patch("sys.argv", ["probe.py", "--output", "unused", "--size", "xxlarge"]), \
              contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
             probe.main()
         self.assertIn("invalid choice", errors.getvalue())
         with self.assertRaises(probe.ProbeError):
-            probe.Probe(FakeClient({}), evidence(), lambda: None, size="xlarge")
+            probe.Probe(FakeClient({}), evidence(), lambda: None, size="xxlarge")
+        self.assertTrue(probe.provider_sizing_matches({"vcpu": 16, "memoryGB": 32}, "xlarge"))
 
     def test_provider_sizing_follows_the_requested_size(self):
         self.assertTrue(probe.provider_sizing_matches({"vcpu": 4, "memoryGB": 8}, "default"))

@@ -40,7 +40,9 @@ READY = {"ready", "idle", "running"}
 # for; job CPU and memory limits always come from what is measured inside the sandbox.
 SIZES = {"small": {"vcpu": 2, "memoryGB": 4},
          "default": {"vcpu": 4, "memoryGB": 8},
-         "large": {"vcpu": 8, "memoryGB": 16}}
+         "large": {"vcpu": 8, "memoryGB": 16},
+         # Needs Boat's $100 plan or higher (docs.boat.dev/pricing).
+         "xlarge": {"vcpu": 16, "memoryGB": 32}}
 # The size an operator's prepared image is assumed to have been saved from; every prepared
 # image built so far came from a large sandbox.
 SNAPSHOT_SOURCE_SIZE = "large"
