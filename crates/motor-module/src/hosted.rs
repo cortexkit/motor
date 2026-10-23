@@ -989,6 +989,10 @@ impl Client {
                     };
                     let retry_at =
                         tokio::time::Instant::now() + Duration::from_millis(retry_after_ms);
+                    // Held-clock tests must observe a parsed reply and a fixed
+                    // wake time before advancing time; a server-side send is too early.
+                    #[cfg(test)]
+                    tracing::info!(path, "hosted broker retry wait");
                     if retry_at >= deadline {
                         tokio::time::sleep_until(deadline).await;
                         return Err(pending);

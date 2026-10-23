@@ -357,9 +357,12 @@ async fn stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host() {
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() {
+    let _clock = HeldClock::new();
     for provisioning in [false, true] {
+        let waits = crate::logging::Captured::default();
+        let _logs = crate::logging::scoped(waits.clone());
         let h = Harness::new(Behavior::CompleteRun).await;
         h.lease_replies.lock().unwrap().push_back((
             503,
@@ -389,15 +392,20 @@ async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() 
         let started = tokio::time::Instant::now();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
-        let (_, terminal) = records(stream).await;
-        assert!(started.elapsed() >= Duration::from_secs(2));
-        // Both second replies ask for a 30 s wait (after clamping), so a retry
-        // that restarted or ignored the 2 s budget would take at least 30 s.
-        // The bound leaves room for a loaded test machine.
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "Neither retry can restart the queue-wait budget"
-        );
+        let job = tokio::spawn(records(stream));
+        for replies in 1..=2 {
+            // A recorded lease request does not mean its reply has been parsed.
+            // Hold time still until the client has fixed the next retry's wake time.
+            until("the broker retry wait", || {
+                waits.text().matches("hosted broker retry wait").count() == replies
+            })
+            .await;
+            assert_eq!(h.lease_bodies.lock().unwrap().len(), replies);
+            assert!(!job.is_finished(), "the job must wait out its queue budget");
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let terminal = terminal_without_more_time(job).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
         let reason = if provisioning {
             RefusalReason::Unreachable
         } else {
