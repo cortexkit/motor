@@ -21,6 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from typing import Any
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
@@ -1459,8 +1460,9 @@ class RunnerHost:
         import disk_quota
         import quota_adversarial
         import uuid
-        record = self.data['disk_quota'] = {'reserve_assurance': {
+        record: dict[str, Any] = {'reserve_assurance': {
             'floor_bytes': disk_quota.RESERVE_BYTES, 'scope': 'floor_enforcement_only', 'sufficiency_proven': False}}
+        self.data['disk_quota'] = record
         control = record['setter_positive_control'] = json.loads(self.execute(
             sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
         self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)
@@ -1490,7 +1492,8 @@ class RunnerHost:
                             self.check('disk_quota.reflink_baseline_headroom', False, capacity, status='INCONCLUSIVE')
                             continue
                         simple_job('reflink_seed', disk_quota.reflink_seed(capacity['baseline_bytes']))
-                    row = record.setdefault('lanes', {})[lane] = {}
+                    row: dict[str, Any] = {}
+                    record.setdefault('lanes', {})[lane] = row
                     token = uuid.uuid4().hex
                     command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token))
                     invocation = [str(client), address, str(repository), storage, command, '1', '900']
