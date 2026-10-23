@@ -325,7 +325,7 @@ fn sockets_bind_under_a_directory_longer_than_a_socket_address() {
         .unwrap();
     let path = directory.join("sccache.sock");
     assert!(path.as_os_str().len() > 108);
-    assert_eq!(sockets.paths(), [path.clone()]);
+    assert_eq!(sockets.paths(), std::slice::from_ref(&path));
     let binary = forwarder_binary(scratch.path());
     let (status, _group) = start_forwarder(&binary, &directory, port, "sccache.sock");
     assert!(status.success());
