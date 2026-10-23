@@ -98,6 +98,51 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_direct_reason: Option<String>,
 }
+// Journal equality follows the serialized record. The migration marker is only
+// in-memory bookkeeping and must not turn an unchanged record into an upsert.
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            legacy_shape: _,
+            hosted,
+            return_result,
+            return_cwd,
+            return_requested,
+            direct_secret_hash,
+            gate_job,
+            runner_instance,
+            windows_runner,
+            attribution,
+            queue_wait_limit_s,
+            pending_cancel,
+            local_terminal,
+            terminal_observed_at_ms,
+            terminal_delivered_at_ms,
+            retain_until_ms,
+            workspace_key,
+            build_server_job_id,
+            routed_direct_reason,
+        } = self;
+        hosted == &other.hosted
+            && return_result == &other.return_result
+            && return_cwd == &other.return_cwd
+            && return_requested == &other.return_requested
+            && direct_secret_hash == &other.direct_secret_hash
+            && gate_job == &other.gate_job
+            && runner_instance == &other.runner_instance
+            && windows_runner == &other.windows_runner
+            && attribution == &other.attribution
+            && queue_wait_limit_s == &other.queue_wait_limit_s
+            && pending_cancel == &other.pending_cancel
+            && local_terminal == &other.local_terminal
+            && terminal_observed_at_ms == &other.terminal_observed_at_ms
+            && terminal_delivered_at_ms == &other.terminal_delivered_at_ms
+            && retain_until_ms == &other.retain_until_ms
+            && workspace_key == &other.workspace_key
+            && build_server_job_id == &other.build_server_job_id
+            && routed_direct_reason == &other.routed_direct_reason
+    }
+}
 impl Job {
     fn lacks_newer_fields(&self) -> bool {
         self.hosted.is_none()
@@ -205,7 +250,7 @@ fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
         .map(|jobs| jobs.into_iter().map(|(id, job)| (id, job.0)).collect())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VerifiedTip {
     pub remote_url: String,
     pub branch: String,
