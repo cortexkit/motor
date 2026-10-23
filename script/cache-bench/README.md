@@ -1,6 +1,6 @@
 # Operator-only compile-cache placement benchmark
 
-These scripts measure a pinned motor workspace against several S3-compatible
+These scripts measure pinned Rust workspaces against several S3-compatible
 backends. They do not configure production caches. Run A **directly over SSH** on
 the Linux build server, not as a runner job. Run B in a disposable Boat clone of
 the current prepared image through `probe.py --cache-bench`. No live speed result
@@ -64,8 +64,8 @@ cargo test --no-run --locked --workspace
 The second command reuses the first command's target *within* a sample, not
 across samples. `CARGO_NET_OFFLINE=true`, incremental compilation is off, and
 parallelism is fixed in the bundle. “Cold” means cold Cargo target, **not**
-dropped OS page caches. No tests execute. Only motor is fetched; adding a larger
-private fleet repository would need a separately pinned source/seed and access.
+dropped OS page caches. No tests execute. The legacy commands fetch motor only;
+the hourly protocol below prepares separately pinned private fleet bundles.
 Use otherwise-idle hosts with comparable CPU/memory limits. Linking, uncacheable
 work, disk/page caches and sandbox overhead remain placement differences.
 
@@ -174,7 +174,268 @@ per object. Unexpected methods/paths/framing fail instead of bypassing metrics.
   The server's [0.18.0 local read-only-hit patch](../runner/patches/sccache-0.18.0-read-only-hits.patch)
   does not change S3 behavior; binary SHA is recorded separately from version.
 
-## Exact operator sequence: A (direct Linux SSH shell)
+## 72-hour interleaved OVH comparison
+
+No live calibration or repository choice is checked in. **The first measurement
+step is calibration on Boat large**, after preparing the three inputs. It measures
+motor, prefrontal and broca in separate disposable sandboxes, using an uncached
+build plus test compilation for each. `calibration.json` records cold Cargo wall
+seconds and the raw dependency timing units from each command, plus lifecycle and
+bundle evidence. Dependency unit-seconds are summed **non-workspace** Cargo unit
+durations (including dependency build scripts); overlapping units are not CPU or
+build wall seconds. The parser matches package name/version to full Cargo metadata
+and rejects ambiguous matches. It parses the pinned Cargo version's HTML
+`UNIT_DATA` (not a stable machine API); absent/changed timing data fails admission.
+
+Selection admits only a candidate with more measured dependency unit-seconds than
+motor. It picks the smallest estimated hourly budget that fits 1,800 seconds:
+`7 × (motor cold seconds + candidate cold seconds) + 360s non-build allowance + 180s margin`.
+Seven is six RO samples (three per class) plus the sixth-hour baseline. The 360s
+allowance covers uploads/hydration, probes and cleanup; it is an estimate, **not a
+guarantee**. A bad network/hour or large upload can exceed it. Runtime SSH steps
+use the remaining TTL with a 30s cleanup reserve and fail rather than extending
+the sandbox. If neither candidate fits, calibration fails and scheduling refuses
+to start: inspect the evidence, do not hand-edit admission or invent a choice.
+
+Each iteration uses **one new Boat large sandbox for both classes and both
+repositories**, swapping bundles sequentially at the same absolute paths used
+during fill. `/srv/cache-bench/motor` is deliberately the fixed checkout path even
+for prefrontal/broca; `manifest.repository` identifies the real source. Three
+cold-target RO rebuilds per class/repository, 200 full GETs per direct/gateway
+route, and the existing TCP/tiny-GET probes run there. A single uncached baseline
+per repository runs only at hours 6, 12, …, 72, before that hour's first class.
+The server leg performs **only** direct TCP, tiny GET and 200 full GET probes per
+class/repository, via pinned operator SSH. It does not extract sources or invoke
+Cargo. Class order alternates for both legs; motor runs before the selected repo.
+Within an iteration Boat precedes server, so the two placements are not simultaneous.
+
+The scheduler fixes 72 slots, at start + 0h through start + 71h, not 72 hours of
+continuous load. `state.json` is atomically checkpointed before/after each leg.
+An exclusive output-folder lock prevents two schedulers sharing state. Restart
+with **the identical command, script revision and inputs**: finished slots are
+never rerun; an interrupted slot becomes failed; slots whose whole hour elapsed
+offline become `missed` instead of being backfilled in a burst. The remaining
+slots keep their original timestamps and class/baseline ordering. Failed Boat
+legs do not suppress server legs or the next hour. Unresolved sandbox cleanup is
+retried before another Boat clone; it can fail that Boat leg, not silently leak
+additional clones. Keep the probe checkpoints for operator cleanup, even after
+an interruption. Exit 1 at the end means at least one failed/missed slot, not that
+the later hours were abandoned.
+
+### 1. Prepare private inputs (direct Linux SSH host, never a runner job)
+
+Use the **delivered script revision** throughout preparation, calibration, fill
+and scheduling. Do not upgrade it midway. Start with empty reserved
+`/srv/cache-bench`; this protocol replaces that directory between repositories.
+Run the following in a direct operator SSH shell on the build server. Set the
+three checkout paths and the exact toolchain installed in the prepared image.
+Ensure native dependencies for all three workspaces exist in that image first.
+
+```sh
+set -eu
+set +x
+DRIVER="$HOME/motor/script/cache-bench/bench.py"
+TOOLCHAIN=1.99.0
+EXPERIMENT="$(date -u +%Y%m%dT%H%M%SZ)-ovh72"
+ASSETS="$HOME/cache-bench-evidence/$EXPERIMENT/assets"
+MOTOR_SOURCE="$HOME/motor"
+PREFRONTAL_SOURCE="$HOME/prefrontal"
+BROCA_SOURCE="$HOME/broca"
+mkdir -p "$ASSETS"
+chmod 700 "$ASSETS"
+sudo install -d -m700 -o "$(id -u)" -g "$(id -g)" /srv/cache-bench
+test -z "$(ls -A /srv/cache-bench)"
+export PATH="/srv/build/cargo-home/bin:$PATH" RUSTUP_HOME=/home/ubuntu/.rustup
+for NAME in motor prefrontal broca; do
+  case "$NAME" in
+    motor) SOURCE="$MOTOR_SOURCE";;
+    prefrontal) SOURCE="$PREFRONTAL_SOURCE";;
+    broca) SOURCE="$BROCA_SOURCE";;
+  esac
+  PIN=$(git -C "$SOURCE" rev-parse HEAD)
+  SEED="$ASSETS/seed-$NAME"
+  mkdir -m700 "$SEED"
+  git -C "$SOURCE" worktree add --detach "$ASSETS/fetch-$NAME" "$PIN"
+  env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+    CARGO_HOME="$SEED" RUSTUP_TOOLCHAIN="$TOOLCHAIN" RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
+    cargo fetch --locked --manifest-path "$ASSETS/fetch-$NAME/Cargo.toml"
+  git -C "$SOURCE" worktree remove "$ASSETS/fetch-$NAME"
+  python3 "$DRIVER" --prepare --repository "$NAME" --source "$SOURCE" \
+    --commit "$PIN" --cargo-home "$SEED" --toolchain "$TOOLCHAIN" --jobs 8 \
+    --bundle "$ASSETS/$NAME.tar.gz" > "$ASSETS/$NAME-preparation.json"
+  sha256sum "$ASSETS/$NAME.tar.gz" > "$ASSETS/$NAME.sha256"
+  rm -rf -- /srv/cache-bench
+  mkdir -m700 /srv/cache-bench
+done
+printf '%s\n' "$EXPERIMENT" > "$ASSETS/experiment.txt"
+printf '%s\n' "$ASSETS" > "$ASSETS/server-assets.txt"
+```
+
+Use the actual `cargo_home` and `rustup_home` from `script/runner/toolchain.json`
+if different from the example exports. Bundles include private tracked sources
+and dependency seeds; inspect metadata for embedded secrets before use. Transfer
+only with private SSH/scp, never public upload services or CI artifacts.
+
+### 2. Calibrate first (operator machine)
+
+Create a two-entry operator manifest containing **only** `ovh-standard` and
+`ovh-high-performance` from `backends.example.json`. Both credential paths refer
+to the operator's existing owner-only credential file. The scheduler refuses
+missing keys, a third backend, different endpoints/regions, or missing classes.
+The SSH alias below must have a pre-verified host key in `known_hosts` (no
+`StrictHostKeyChecking=no`). Replace the key-reader example with your trusted
+executable/arguments; use a wrapper executable if the reader needs a pipeline.
+The command is parsed with `shlex`, not a shell. No keys belong in its arguments.
+
+```sh
+set -eu
+set +x
+REPO="$HOME/motor"
+SERVER=cache-bench-server                  # your pinned operator SSH alias
+REMOTE_ASSETS='/absolute/private/server/evidence/assets'  # ASSETS from step 1
+INPUT="$HOME/cache-bench-input/ovh72"
+OUT="$HOME/cache-bench-evidence/ovh72"
+BACKENDS="$HOME/.config/cache-bench/ovh-pair.json"
+IMAGE='<current-prepared-named-snapshot>'
+KEY_READER='/absolute/path/to/boat-key-reader'
+mkdir -p "$INPUT" "$OUT"
+chmod 700 "$INPUT" "$OUT"
+scp "$SERVER:$REMOTE_ASSETS/"'*.tar.gz' "$SERVER:$REMOTE_ASSETS/"'*.sha256' \
+  "$SERVER:$REMOTE_ASSETS/experiment.txt" "$INPUT/"
+python3 - "$INPUT" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+experiment = (root / 'experiment.txt').read_text().strip()
+repos = []
+for name in ('motor', 'prefrontal', 'broca'):
+    path = root / (name + '.tar.gz')
+    expected = (root / (name + '.sha256')).read_text().split()[0]
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    assert digest.hexdigest() == expected
+    repos.append(dict(name=name, bundle=str(path), bundle_sha256=expected,
+                      prefix='cache-bench/' + experiment + '-' + name + '/'))
+(root / 'repositories.json').write_text(json.dumps(repos, indent=2) + '\n')
+PY
+python3 "$REPO/script/cache-bench/schedule.py" --calibrate \
+  --repositories "$INPUT/repositories.json" --backends "$BACKENDS" \
+  --image "$IMAGE" --key-reader "$KEY_READER" --output "$OUT/calibration"
+python3 - "$OUT/calibration/calibration.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+print('Selected:', data['selected'], '\nReason:', data['reason'])
+for name, result in data['records'].items():
+    print(name, result['cold_seconds'], 'cold s;', result['dependency_unit_seconds'], 'dependency unit-s')
+PY
+```
+
+Retain the complete calibration folder, not just its final JSON. A successful
+calibration and matching raw results are mandatory before fill or scheduling.
+No cache objects are read or written during calibration. Each calibration clone
+is cleaned up by the normal probe path; the key reader runs afresh for each one.
+
+### 3. Fill both classes once, from the server (operator machine drives SSH)
+
+```sh
+python3 "$REPO/script/cache-bench/schedule.py" --fill \
+  --repositories "$INPUT/repositories.json" --backends "$BACKENDS" \
+  --image "$IMAGE" --key-reader "$KEY_READER" --server "$SERVER" \
+  --server-assets "$REMOTE_ASSETS" --calibration "$OUT/calibration/calibration.json" \
+  --output "$OUT/fills"
+```
+
+This preflights **all four** selected repository/class prefixes before any fill.
+A nonempty prefix refuses the whole operation. It verifies the independently
+recorded bundle digests on the server, extracts each at the fixed paths, then
+fills Standard and EXPRESS_ONEZONE independently and audits actual returned
+classes. It never runs no-cache/local-cache/RO samples during fill. Fill Cargo
+logs and results stay in the private server `$REMOTE_ASSETS/fills`; successful
+matrix results are copied into `$OUT/fills` and checked against the pinned
+bundles before scheduling. Failed fills must be explicitly purged, not resumed
+or silently topped up. Preserve server evidence before using a new experiment.
+The reserved root must already exist and be owned by your SSH user (step 1).
+
+Object-store credentials stay in operator files and memory. Fill and network
+legs stream parsed credentials **only via SSH stdin**, constructing S3 clients
+in remote memory; no remote credential files, jobs, argv or evidence contain
+them. Boat uses the existing owner-only `/dev/shm` credential files and removes
+them in `finally`. The API key is supplied via `probe.py --key-stdin`, never an
+environment variable or command argument. Do not enable shell tracing.
+
+### 4. Start/resume, check progress, summarize (operator machine)
+
+```sh
+mkdir -p "$OUT/schedule"
+chmod 700 "$OUT/schedule"
+nohup python3 -u "$REPO/script/cache-bench/schedule.py" \
+  --repositories "$INPUT/repositories.json" --backends "$BACKENDS" \
+  --image "$IMAGE" --key-reader "$KEY_READER" --server "$SERVER" \
+  --calibration "$OUT/calibration/calibration.json" --fills "$OUT/fills" \
+  --output "$OUT/schedule" > "$OUT/schedule.log" 2>&1 < /dev/null &
+echo $! > "$OUT/scheduler.pid"
+
+python3 - "$OUT/schedule/state.json" <<'PY'
+import collections, json, sys
+data = json.load(open(sys.argv[1]))
+print(collections.Counter(h['status'] for h in data['iterations']))
+for h in data['iterations']:
+    if h['status'] != 'pending':
+        print(h['hour'], h['status'], h.get('order'), 'baseline:', h['baseline'])
+PY
+tail -n 20 "$OUT/schedule.log"
+# Safe during the run: the state snapshot points only at completed report files.
+python3 "$REPO/script/cache-bench/bench.py" --summarize "$OUT/schedule"
+```
+
+Rerun the identical `nohup` command after a restart (check no scheduler still
+owns the folder). The operator machine must stay awake/online; the key reader
+must work noninteractively for three days. Do not delete input bundles,
+calibration, fill evidence, or change credential paths while resuming. Keys can
+be rotated in their existing files. The scheduler fingerprints scripts/options,
+not credential values.
+
+`summary.{json,md}` pools raw successful full-fetch/TCP/tiny-GET latency samples
+per class × placement × repository × route, reporting nearest-rank p50/p95/p99,
+error/timeout denominators, rebuild/baseline distributions and hit/miss/cache
+error counts. It includes all schedule slots (including failed/missed ones),
+hourly measurements and HP-minus-Standard paired differences for each measured
+hour/metric. Missing observations are never imputed. Errors/timeouts are logical
+probe outcomes; a stale-connection retry that succeeds is included in the
+end-to-end latency, not counted as a failed logical fetch. A deterministic
+descriptive comparison states whether the absolute median paired difference
+exceeds the paired-hour IQR (at least six pairs required); it makes no statistical
+significance, causal, or production recommendation. Network-only server rows have
+no rebuild distribution, not artificial zero-second builds.
+
+### 5. Cleanup/purge (after schedule stops and evidence is retained)
+
+```sh
+# For any checkpoint reporting incomplete cleanup (also after an interrupted hour):
+# YOUR_BOAT_KEY_READER | python3 "$REPO/script/boat-probe/probe.py" --key-stdin \
+#   --cleanup "$OUT/schedule/hour-NNN/boat/probe/results.json"
+python3 - "$OUT/calibration/calibration.json" > "$OUT/purge-prefixes.txt" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+for repo in data['repositories']:
+    if repo['name'] in ('motor', data['selected']):
+        print(repo['prefix'])
+PY
+while IFS= read -r PREFIX; do
+  python3 "$REPO/script/cache-bench/bench.py" --purge --backends "$BACKENDS" --prefix "$PREFIX"
+done < "$OUT/purge-prefixes.txt"
+# On the direct SSH server, after saving its fill logs:
+ssh "$SERVER" 'rm -rf -- /srv/cache-bench'
+```
+
+Purge runs on the operator machine using its local credential files and verified
+HTTPS; it verifies each class prefix is empty. Calibration never populated the
+unselected repository. After a partial failed fill, purge the same selected
+prefixes before preparing a **new** experiment. Do not purge during reads. The
+legacy unversioned-bucket warning below still applies.
+
+## Legacy exact operator sequence: A (direct Linux SSH shell)
 
 Requirements: Python 3.10+, Git/tar, sccache 0.18.0, installed matching toolchain
 and native compiler/linker prerequisites, enough disk for the seed/archive,
@@ -220,7 +481,7 @@ standalone credential files, `bin/`, target or a checkout `.git`. Source/seed
 metadata can still contain embedded credentials/private URLs: inspect and treat
 the bundle as private. No private larger repository is included automatically.
 
-## Exact operator sequence: B (operator machine drives Boat)
+## Legacy exact operator sequence: B (operator machine drives Boat)
 
 Copy A's bundle, independently recorded digest, prefix and A results to the
 operator machine via SSH/scp. Use the **same driver revision** and backend names.
@@ -301,12 +562,13 @@ or runner credential filtering are changed.
 
 ```sh
 python3 --version
-python3 -m py_compile script/cache-bench/bench.py script/boat-probe/cache_bench.py script/boat-probe/probe.py
+python3 -m py_compile script/cache-bench/bench.py script/cache-bench/schedule.py script/boat-probe/cache_bench.py script/boat-probe/probe.py
 python3 -m unittest discover -s script/cache-bench -p 'test_*.py' -v
 python3 -m unittest discover -s script/boat-probe -p 'test_*.py' -v
 python3 scripts/run-script-tests.py
 ```
 
-Workers run these with `runon: linux,8c`, never locally on the operator machine. Fixtures do not compile
+Editing workers run these on the remote Linux test runner with four allocated
+vCPUs (`runon: linux,4c` in the worker shell tool), not on the shared Mac. Fixtures do not compile
 the workspace, contact providers, or assert live performance. Operator gates
 above require direct host access, not the remote job runner.
