@@ -136,7 +136,10 @@ fn managers_search_the_configured_directories_then_fixed_system_ones() {
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("motor-javascript-tools-{}", uuid::Uuid::now_v7())))
+        Self(
+            cortexkit_test_support::scratch_root()
+                .join(format!("motor-javascript-tools-{}", uuid::Uuid::now_v7())),
+        )
     }
 }
 impl Drop for Scratch {
