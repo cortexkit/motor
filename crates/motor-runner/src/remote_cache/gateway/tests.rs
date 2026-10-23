@@ -8,8 +8,8 @@ use crate::remote_cache::provisioning::{derived_prefix, Generation, HostRole, Ke
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-const TENANT: &str = "acct:01KXJJHK4V6DB42W1YAN2XD9QN";
-const BUCKET: &str = "fleet-cache";
+pub(crate) const TENANT: &str = "acct:01KXJJHK4V6DB42W1YAN2XD9QN";
+pub(crate) const BUCKET: &str = "fleet-cache";
 const CLASS: &str = "EXPRESS_ONEZONE";
 /// What the fake store puts in error bodies; it must never reach a tool.
 const LEAK: &str = "LEAKED-ACCESS-ID";
@@ -49,11 +49,11 @@ struct Knobs {
 
 /// One request the fake store received.
 #[derive(Clone, Debug)]
-struct Seen {
-    method: String,
-    path: String,
+pub(crate) struct Seen {
+    pub(crate) method: String,
+    pub(crate) path: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Seen {
@@ -73,7 +73,7 @@ impl Seen {
 }
 
 #[derive(Default)]
-struct FakeStore {
+pub(crate) struct FakeStore {
     knobs: Mutex<Knobs>,
     objects: Mutex<HashMap<String, Vec<u8>>>,
     /// Objects of zeros, generated as they are sent, so large ones cost no
@@ -90,7 +90,7 @@ impl FakeStore {
     fn knobs(&self) -> Knobs {
         self.knobs.lock().unwrap().clone()
     }
-    fn seen(&self) -> Vec<Seen> {
+    pub(crate) fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
     fn seen_count(&self) -> usize {
@@ -99,7 +99,7 @@ impl FakeStore {
     fn connects(&self) -> usize {
         self.connects.load(Ordering::SeqCst)
     }
-    fn put_object(&self, path: &str, body: &[u8]) {
+    pub(crate) fn put_object(&self, path: &str, body: &[u8]) {
         self.objects
             .lock()
             .unwrap()
@@ -268,7 +268,7 @@ impl FakeStore {
     }
 }
 
-struct FakeConnector(Arc<FakeStore>);
+pub(crate) struct FakeConnector(pub(crate) Arc<FakeStore>);
 
 impl Connector for FakeConnector {
     fn connect<'a>(&'a self, target: &'a Target) -> ConnectFuture<'a> {
@@ -296,10 +296,10 @@ impl Connector for FakeConnector {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct Switchable(Mutex<Option<Arc<ActiveGeneration>>>);
+pub(crate) struct Switchable(Mutex<Option<Arc<ActiveGeneration>>>);
 
 impl Switchable {
-    fn set(&self, generation: Option<ActiveGeneration>) {
+    pub(crate) fn set(&self, generation: Option<ActiveGeneration>) {
         *self.0.lock().unwrap() = generation.map(Arc::new);
     }
 }
@@ -312,7 +312,7 @@ impl Generations for Switchable {
 
 /// A build-server generation; its key ids name the generation so tests can
 /// tell which one signed a request.
-fn generation(name: &str, tenant: &str) -> ActiveGeneration {
+pub(crate) fn generation(name: &str, tenant: &str) -> ActiveGeneration {
     ActiveGeneration {
         generation: Generation(name.to_string()),
         tenant: tenant.to_string(),
@@ -333,7 +333,7 @@ fn generation(name: &str, tenant: &str) -> ActiveGeneration {
 }
 
 /// The store path of a bare key under the fleet prefix.
-fn stored(tool: Tool, key: &str) -> String {
+pub(crate) fn stored(tool: Tool, key: &str) -> String {
     format!("/{BUCKET}/{}{}/{key}", derived_prefix(TENANT), tool.id())
 }
 

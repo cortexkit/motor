@@ -564,6 +564,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
         )),
         retain_failed: false,
         network: false,
@@ -573,6 +574,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         boat_memory_max: None,
         pid_init: None,
         provider_unset_env: Vec::new(),
+        cache_forwarders: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: WRITER_USER,
