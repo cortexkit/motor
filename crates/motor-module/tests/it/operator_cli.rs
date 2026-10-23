@@ -1454,6 +1454,62 @@ async fn direct_runs_need_a_timeout_within_the_cap_and_aft_runs_do_not() {
 }
 
 #[tokio::test]
+async fn cli_net_run_is_admitted_on_direct_route_and_relays_outbound() {
+    let mut f = Fixture::new(Cut::None, 28).await;
+    f.config.network_routing = true;
+    // Simulate the grant at the proxy so the portable runner remains offline.
+    f.proxy.strip_run_network.store(true, Ordering::SeqCst);
+    *f.proxy.accepted_network.lock().unwrap() = Some(Some(motor_protocol::Network::Outbound));
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    assert_eq!(
+        daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+        FrameType::Response
+    );
+    let cli::Invocation::Run(args) = cli::parse_args(&[
+        "--net".into(),
+        "--cwd".into(),
+        f.main.display().to_string(),
+        "--".into(),
+        "true".into(),
+    ])
+    .unwrap() else {
+        panic!("expected a run")
+    };
+    let request = cli::build_request(&args).unwrap();
+    let records = run_records(&daemon, DIRECT_CHANNEL, request).await;
+    let StreamRecord::Accepted(accepted) = &records[0] else {
+        panic!("accepted must be the first stream record: {records:?}")
+    };
+    assert_eq!(accepted.network, Some(motor_protocol::Network::Outbound));
+    assert_eq!(
+        f.recorded_run().network,
+        Some(motor_protocol::Network::Outbound)
+    );
+    assert_eq!(last_terminal(&records).outcome, Outcome::Exit { code: 0 });
+}
+
+#[tokio::test]
+async fn direct_net_runs_still_require_network_routing() {
+    let f = Fixture::new(Cut::None, 28).await;
+    assert!(!f.config.network_routing);
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    assert_eq!(
+        daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+        FrameType::Response
+    );
+    let request = timed(&f, "true", 60).with_network(motor_protocol::Network::Outbound);
+    let records = run_records(&daemon, DIRECT_CHANNEL, request).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        last_terminal(&records).outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::NetworkUnsupported,
+        }
+    );
+    assert!(f.proxy.frames.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn only_direct_routes_mark_gates_and_extend_the_queue_wait() {
     let f = Fixture::new(Cut::None, 28).await;
     let daemon = Daemon::start(&f, direct_config(&f)).await;
