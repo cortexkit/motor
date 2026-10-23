@@ -70,6 +70,22 @@ pub(crate) fn reader_environment(env: &mut BTreeMap<String, String>, size_gib: u
     }
 }
 
+/// Whether the shared compiler cache at `fleet` may hold compiled entries:
+/// whether any one-hex-digit path exists at its top level. sccache 0.18.0
+/// stores each entry under such a directory (see `writer::cache`), and the
+/// only other directory the runner creates there, `preprocessor/`, holds no
+/// Rust entries, so a cache without one is empty. A missing cache is empty.
+pub(crate) fn holds_entries(fleet: &Path) -> io::Result<bool> {
+    for shard in "0123456789abcdef".chars() {
+        match fs::symlink_metadata(fleet.join(shard.to_string())) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 /// Follow Cargo's ancestor search and its preference for config over config.toml.
 /// Read data only: never invoke Cargo or a workspace wrapper as the runner.
 pub(crate) fn configured_wrapper(workspace: &Path, cwd: &Path) -> io::Result<bool> {

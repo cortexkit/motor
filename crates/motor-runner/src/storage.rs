@@ -517,6 +517,12 @@ pub(crate) struct Catalog {
     /// the runner's `retire_unused_repositories`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mirror_used_ms: BTreeMap<String, u64>,
+    /// When a job last finished, for the shared compiler cache's last use.
+    /// Jobs mount that cache read-only, so its own timestamps never show
+    /// reads; disk eviction ages the cache by this instead. A job still in
+    /// flight counts as use at the current time without being recorded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cache_used_ms: Option<u64>,
 }
 
 impl Default for Catalog {
@@ -530,6 +536,22 @@ impl Default for Catalog {
             sibling_commits: BTreeMap::new(),
             transferred: BTreeMap::new(),
             mirror_used_ms: BTreeMap::new(),
+            compile_cache_used_ms: None,
+        }
+    }
+}
+
+impl Catalog {
+    /// Forget every repository's record of what the shared compiler cache
+    /// holds. Call whenever the cache's contents go, however that happens:
+    /// a repository whose fill is still recorded is never filled again until
+    /// its dependencies change, and every job compiles uncached meanwhile.
+    pub(crate) fn forget_compiler_cache_fills(&mut self) {
+        for repository in self.repositories.values_mut() {
+            repository.filled_descriptor = None;
+            repository.filled_descriptors.clear();
+            repository.recorded_without_writer.clear();
+            repository.miss_refills.clear();
         }
     }
 }

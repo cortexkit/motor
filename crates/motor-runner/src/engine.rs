@@ -1824,6 +1824,32 @@ impl Runner {
                 });
             }
         }
+        // The fill records describe the shared compiler cache's contents. A
+        // cache found empty here was emptied while the runner was down: by
+        // hand, or by an eviction that moved it aside but did not live to
+        // save the catalog. Its fills are gone, so each repository's next
+        // pass must fill it again rather than reuse its record. With a writer
+        // account the directory always exists by now (prepared just above);
+        // without one no job mounts it, so an absent directory is left alone.
+        let fleet = config.sccache_dir();
+        if !config.windows_instance() && fleet.is_dir() {
+            match crate::compile_cache::holds_entries(&fleet) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if catalog
+                        .repositories
+                        .values()
+                        .any(|repository| !repository.filled_descriptors.is_empty())
+                    {
+                        tracing::info!("compiler cache is empty; forgetting recorded fills");
+                    }
+                    catalog.forget_compiler_cache_fills();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot inspect the compiler cache; keeping recorded fills")
+                }
+            }
+        }
         for repository in catalog.repositories.values_mut() {
             // Descriptors are recorded only for clients advertising a trusted
             // default-branch tip; older clients' arbitrary HEAD tips cannot be
@@ -4351,12 +4377,15 @@ impl Runner {
 
     /// Whether queue head `head` stops later heads from being started for
     /// capacity, mirroring dispatch's stop rule: a head whose withdrawal is
-    /// being saved; or a gate job, or a non-base job queued past
-    /// BACKFILL_GRACE_MS, that doesn't fit in `held` permits or is waiting
-    /// out its start retry delay (such a head keeps its claim on capacity,
-    /// as if it were waiting for permits). A head whose earlier attempt is
-    /// still being cleaned up is skipped like a checkout conflict and stops
-    /// nothing.
+    /// being saved; or a gate job, a cache fill that may start (the writer
+    /// slot is free, the cache is not being evicted, and the fill may pass
+    /// queued foreground jobs; see `fill_passes_queue`), or a non-base job
+    /// queued past BACKFILL_GRACE_MS, whose weight added to the `held`
+    /// (already occupied) permits exceeds the runner's permit limit, or that
+    /// is waiting out its start retry delay (such a head keeps its claim on
+    /// capacity, as if it were waiting for permits). A head whose earlier
+    /// attempt is still being cleaned up is skipped like a checkout conflict
+    /// and stops nothing.
     fn holds_back_later_heads(&self, inner: &Inner, head: &Job, held: u32, now: u64) -> bool {
         if inner.terminal_saves.contains(&head.id) {
             return true;
@@ -4364,11 +4393,26 @@ impl Runner {
         if self.core.config.cleanup_pending(head.id) {
             return false;
         }
+        let fill = head.base
+            && inner.writer.is_none()
+            && !inner
+                .evicting_caches
+                .contains(&self.core.config.sccache_dir())
+            && (self.fill_passes_queue(head.weight)
+                || !Self::scheduler_jobs(inner).any(|job| !job.base && job.pending()));
         let aged = !head.base
             && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms)) >= BACKFILL_GRACE_MS;
-        (head.gate_job() || aged)
+        (head.gate_job() || fill || aged)
             && (held.saturating_add(head.weight) > self.core.config.max_weight
                 || Self::start_deferred(inner, head.id, now))
+    }
+
+    /// Whether a cache fill of `weight` permits may start while foreground
+    /// jobs are queued: only when it leaves at least as many permits as it
+    /// takes. A fill's weight is fixed (`WARM_BUILD_VCPUS`, or the whole
+    /// host when that is smaller), so on all but the smallest hosts it does.
+    fn fill_passes_queue(&self, weight: u32) -> bool {
+        weight.saturating_mul(2) <= self.core.config.max_weight
     }
 
     /// Whether `id`'s last start failed and its retry delay has not passed.
@@ -4577,12 +4621,15 @@ impl Runner {
             .unwrap_or("queue order");
         let phase = if phase == "queue order" {
             // This job would fit, so a job ahead of it holds the queue: a gate
-            // job, or an older job past its backfill grace that is waiting for
-            // enough free permits (the scheduler stops smaller jobs overtaking
-            // it so it cannot starve). Name that job.
+            // job, a cache fill, or an older job past its backfill grace,
+            // waiting for enough free permits (the scheduler stops smaller
+            // jobs overtaking it so it cannot starve). Name that job.
             blocking_head = self.blocking_head(inner, &heads, id, index.weight, now);
             match blocking_head {
                 Some((_, true)) => "gate job ahead",
+                Some((head, false)) if inner.jobs[&head].base => {
+                    "cache fill ahead needs more free permits"
+                }
                 Some((_, false)) => "older job ahead needs more free permits",
                 None => "queue order",
             }
@@ -5562,12 +5609,18 @@ impl Runner {
                 }
                 let job = &inner.jobs[&id];
                 let request = job.request.as_ref().unwrap();
+                // One cache fill at a time (the writer slot), and none while
+                // the cache is being evicted. A fill does not wait for queued
+                // foreground jobs: under steady load the queue never empties,
+                // and an emptied cache would then never be filled again. On a
+                // host so small that the fill would take over half of it, it
+                // still waits for the foreground queue to empty.
                 if job.base
                     && (inner.writer.is_some()
                         || inner
                             .evicting_caches
                             .contains(&self.core.config.sccache_dir())
-                        || index.foreground_pending != 0)
+                        || (index.foreground_pending != 0 && !self.fill_passes_queue(job.weight)))
                 {
                     continue;
                 }
@@ -5603,12 +5656,14 @@ impl Runner {
                 if index.weight.saturating_add(job.weight) > self.core.config.max_weight
                     || Self::start_deferred(inner, id, now)
                 {
-                    // Gates and aged heads stop backfill only for capacity,
-                    // after their checkout conflicts have already been excluded.
+                    // Gates, the fill that may start and aged heads stop
+                    // backfill only for capacity, after their checkout
+                    // conflicts have already been excluded. Running jobs keep
+                    // their permits; the fill waits for permits to come free.
                     if job.gate_job()
-                        || (!job.base
-                            && now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
-                                >= BACKFILL_GRACE_MS)
+                        || job.base
+                        || now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
+                            >= BACKFILL_GRACE_MS
                     {
                         return Ok(());
                     }
@@ -7232,6 +7287,12 @@ impl Runner {
             // with the job still being finalized; repeating the update only
             // moves the last-use time forward. Both saves run without the
             // state lock.
+            //
+            // Every job also counts as a use of the shared compiler cache,
+            // which jobs mount read-only so nothing on disk shows their reads;
+            // disk eviction ages the cache by this time. A warm build's catalog
+            // is saved with its result, below.
+            inner.catalog.compile_cache_used_ms = Some(self.now());
             let catalog = if job.base {
                 Ok(None)
             } else {
@@ -7239,9 +7300,8 @@ impl Runner {
                     &mut inner,
                     job.request.as_ref().unwrap(),
                     reader_descriptor.as_ref(),
-                )
-                .then(|| self.catalog_snapshot(&inner))
-                .transpose()
+                );
+                self.catalog_snapshot(&inner).map(Some)
             };
             drop(inner);
             let saved = catalog
@@ -7352,16 +7412,16 @@ impl Runner {
     }
 
     /// Note in the catalog that a finished job (not a warm build) last used
-    /// its workspace now, and handle a warm-cache miss it reported. Returns
-    /// whether the catalog knows the workspace, and so whether it changed.
+    /// its workspace now, and handle a warm-cache miss it reported. A
+    /// workspace the catalog does not know is left alone.
     fn note_finished_workspace(
         &self,
         inner: &mut Inner,
         request: &Run,
         reader_descriptor: Option<&String>,
-    ) -> bool {
+    ) {
         let Some(w) = inner.catalog.workspaces.get_mut(&request.workspace_key) else {
-            return false;
+            return;
         };
         w.used_ms = self.now();
         if let Some(descriptor) = reader_descriptor {
@@ -7380,7 +7440,6 @@ impl Runner {
                 }
             }
         }
-        true
     }
 
     /// Log one step of finishing a job, with the time since finishing began.
@@ -7590,6 +7649,10 @@ const SIBLING_USER_WAIT: &str = "sibling user of this checkout";
 struct DispatchIndex {
     weight: u32,
     foreground_pending: usize,
+    /// For each repository root, the `order` of its most recently accepted
+    /// foreground job, retained records included. The next cache fill is the
+    /// one for the repository whose jobs arrived most recently.
+    newest_arrivals: BTreeMap<String, u64>,
     workspaces: BTreeSet<String>,
     sibling_paths: BTreeSet<String>,
     running_paths: BTreeSet<String>,
@@ -7678,6 +7741,15 @@ impl DispatchIndex {
         for (key, reservation) in &inner.reserved {
             if !excluded_reservations.contains(key) {
                 index.reserve(key, &reservation.siblings);
+            }
+        }
+        for job in inner.jobs.values().filter(|job| !job.base) {
+            if let Some(request) = &job.request {
+                let newest = index
+                    .newest_arrivals
+                    .entry(request.repository_root.clone())
+                    .or_default();
+                *newest = (*newest).max(job.order);
             }
         }
         for queue in index.queued.values_mut() {
@@ -7794,6 +7866,11 @@ impl DispatchIndex {
                     .any(|sibling| Self::overlap(key, &sibling.canonical_path))
         })
     }
+    /// The head of each workspace queue, in the order dispatch tries them:
+    /// gates; then a cache fill, for the repository whose foreground jobs
+    /// arrived most recently (there is one writer slot, so at most one of
+    /// them starts); then heads that have waited past the backfill grace;
+    /// then the rest, rotating between workspaces.
     fn heads(&self, inner: &Inner, now: u64) -> Vec<Uuid> {
         let mut heads: Vec<_> = self
             .queued
@@ -7804,14 +7881,20 @@ impl DispatchIndex {
                 if job.gate_job() {
                     (0, job.order, 0, *id)
                 } else if job.base {
-                    (3, job.order, 0, *id)
+                    let newest = job
+                        .request
+                        .as_ref()
+                        .and_then(|request| self.newest_arrivals.get(&request.repository_root))
+                        .copied()
+                        .unwrap_or(0);
+                    (1, u64::MAX - newest, job.order, *id)
                 } else if now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
                     >= BACKFILL_GRACE_MS
                 {
-                    (1, job.order, 0, *id)
+                    (2, job.order, 0, *id)
                 } else {
                     (
-                        2,
+                        3,
                         inner.rotation.get(job.key()).copied().unwrap_or(0),
                         job.order,
                         *id,

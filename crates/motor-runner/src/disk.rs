@@ -511,16 +511,29 @@ impl Runner {
         if inner.writer.is_none() && !inner.evicting_caches.contains(&fleet) {
             if let Ok(metadata) = fs::symlink_metadata(&fleet) {
                 if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    // Jobs read the cache through a read-only mount, so the
+                    // directory's own time shows only when the writer last
+                    // added a top-level entry. Its last use is the latest of
+                    // that, the last job to finish, and now while any job is
+                    // admitted, queued or running: each of those reads it.
+                    let modified_ms = metadata
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let in_flight = !inner.admitting.is_empty()
+                        || inner.jobs.values().any(|job| job.terminal.is_none());
+                    let last_used_ms = if in_flight {
+                        self.now()
+                    } else {
+                        modified_ms.max(inner.catalog.compile_cache_used_ms.unwrap_or(0))
+                    };
                     candidates.push(Candidate {
                         path: fleet,
                         workspace: None,
                         cache_disk: false,
                         snapshot: false,
-                        last_used_ms: metadata
-                            .modified()?
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
+                        last_used_ms,
                     });
                 }
             }
@@ -592,8 +605,15 @@ impl Runner {
     /// Records the outcome of one pressure deletion: the eviction and its
     /// catalog changes, or a failure, which holds the path back from
     /// eviction for a while. A failed deletion of a path that no longer
-    /// exists is not a failure.
-    fn record_disk_removal(&self, candidate: &Candidate, deleted: io::Result<u64>) {
+    /// exists is not a failure. `cache_cleared` says the shared compiler
+    /// cache was moved away from its path, which empties it even when a
+    /// later step of its deletion failed.
+    fn record_disk_removal(
+        &self,
+        candidate: &Candidate,
+        deleted: io::Result<u64>,
+        cache_cleared: bool,
+    ) {
         let disappeared = deleted.is_err()
             && matches!(
                 fs::symlink_metadata(&candidate.path),
@@ -606,16 +626,16 @@ impl Runner {
         if let Some(key) = &candidate.workspace {
             inner.dropping.remove(key);
         }
+        // The fill records describe the cache's contents, so they go with
+        // them, also when the deletion failed after the cache had left.
+        if cache_cleared || (deleted.is_ok() && candidate.path == self.core.config.sccache_dir()) {
+            inner.catalog.forget_compiler_cache_fills();
+            if deleted.is_err() {
+                catalog = Some(self.catalog_snapshot(&inner));
+            }
+        }
         match deleted {
             Ok(bytes) => {
-                if candidate.path == self.core.config.sccache_dir() {
-                    for repository in inner.catalog.repositories.values_mut() {
-                        repository.filled_descriptor = None;
-                        repository.filled_descriptors.clear();
-                        repository.recorded_without_writer.clear();
-                        repository.miss_refills.clear();
-                    }
-                }
                 if let Some(key) = &candidate.workspace {
                     inner.catalog.workspaces.remove(key);
                 }
@@ -943,7 +963,7 @@ impl Runner {
                     Ok(Some(bytes)) => Ok(bytes),
                     Err(error) => Err(error),
                 };
-                self.record_disk_removal(&candidate, deleted);
+                self.record_disk_removal(&candidate, deleted, false);
                 free = probe()?;
                 if free >= soft && !sweep_idle_workspaces {
                     self.core.health.lock().unwrap().record(self.now(), |c| {
@@ -1046,6 +1066,7 @@ impl Runner {
             });
             #[cfg(not(target_os = "linux"))]
             let access: io::Result<()> = authorization;
+            let mut cache_cleared = false;
             let deleted = access.and_then(|()| {
                 let bytes = allocated_bytes(&candidate.path, device)?;
                 if candidate.cache_disk {
@@ -1061,6 +1082,8 @@ impl Runner {
                     }
                     #[cfg(not(target_os = "linux"))]
                     fs::rename(&candidate.path, &trash)?;
+                    // From here on jobs see an empty cache, whatever fails next.
+                    cache_cleared = true;
                     #[cfg(target_os = "linux")]
                     if let Some(account) = self.core.config.writer_account {
                         crate::isolation::prepare_writer_cache(&candidate.path, account)?;
@@ -1075,7 +1098,7 @@ impl Runner {
                 }
                 Ok(bytes)
             });
-            self.record_disk_removal(&candidate, deleted);
+            self.record_disk_removal(&candidate, deleted, cache_cleared);
             free = probe()?;
             if free >= soft && !sweep_idle_workspaces {
                 self.core.health.lock().unwrap().record(self.now(), |c| {
