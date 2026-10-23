@@ -9,12 +9,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shlex
 import shutil
 import socket
 import subprocess
+from subprocess import Popen as _quota_popen
 import sys
 import tarfile
 import tempfile
@@ -1435,8 +1437,8 @@ class RunnerHost:
             # would repair the startup order this mode is meant to observe.
             self.phase(sid, 'prepared_clone', directory, public, repository, client, first_started=started)
             self.disk_quota(sid, directory, public, repository, client)
-            self.data['disk_quota']['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
-            self.probe.wait_sandbox(sid, {'archived'})
+            if not self.data['disk_quota'].get('stopped_with_retained_target'):
+                raise ValueError('quota probe did not archive the retained target')
             self.data['disk_quota']['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
             from probe import READY, required_checks_passed
             self.probe.wait_sandbox(sid, READY)
@@ -1454,9 +1456,11 @@ class RunnerHost:
         self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
 
     def disk_quota(self, sid, directory, public, repository, client):
-        from concurrent.futures import ThreadPoolExecutor
         import disk_quota
-        record = self.data['disk_quota'] = {}
+        import quota_adversarial
+        import uuid
+        record = self.data['disk_quota'] = {'reserve_assurance': {
+            'floor_bytes': disk_quota.RESERVE_BYTES, 'scope': 'floor_enforcement_only', 'sufficiency_proven': False}}
         control = record['setter_positive_control'] = json.loads(self.execute(
             sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
         self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)
@@ -1465,32 +1469,96 @@ class RunnerHost:
         argv = self.route(sid, directory, public)
         with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
             with tempfile.TemporaryDirectory(prefix='boat-quota-client-') as storage:
-                for lane in disk_quota.LANES:
+                def simple_job(name, source, marker=None):
+                    result = process([str(client), address, str(repository), storage, 'python3 -c ' + shlex.quote(source), '1', '900'], timeout=1000)
+                    parsed = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
+                    record[name] = {'client': result, 'result': parsed}
+                    self.check_job('disk_quota.' + name, parsed, 0, marker=marker)
+                    if parsed.get('code') != 0:
+                        raise ValueError('adversarial setup job failed: ' + name)
+                    return parsed
+                simple_job('deep_tree', disk_quota.DEEP_JOB)
+                record['deep_cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                self.check('disk_quota.deep_tree_capacity_recovered', record['deep_cleanup'].get('ready') is True and record['deep_cleanup'].get('leases') == [], record['deep_cleanup'])
+                for lane in disk_quota.LANES + (disk_quota.RETAINED_LANE,):
+                    if lane == 'reused_target':
+                        simple_job('baseline_seed', disk_quota.BASELINE_JOB, marker='baseline-seeded')
+                    if lane == 'reflink_target':
+                        capacity = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CAPACITY))['stdout'])
+                        record['reflink_seed_capacity'] = capacity
+                        if capacity['baseline_bytes'] < 64 * 1024**2:
+                            self.check('disk_quota.reflink_baseline_headroom', False, capacity, status='INCONCLUSIVE')
+                            continue
+                        simple_job('reflink_seed', disk_quota.reflink_seed(capacity['baseline_bytes']))
                     row = record.setdefault('lanes', {})[lane] = {}
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        command = 'python3 -c ' + shlex.quote(disk_quota.job(lane))
-                        pending = executor.submit(process, [str(client), address, str(repository), storage, command, '1', '900'], timeout=1000)
-                        row['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.OBSERVER), timeout=950)['stdout'])
-                        result = pending.result()
-                    row['client'] = result
-                    row['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
-                    row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
-                    for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup']).items():
-                        self.check('disk_quota.' + lane + '.' + name, passed, row)
-                    status = disk_quota.file_setattr_status(row['result'], control)
-                    reason = ('unfiltered root file_setattr returned ENOSYS; kernel/inherited policy cannot distinguish the job filter; uname -r: '
-                              + control.get('kernel_release', 'unknown')) if status == 'INCONCLUSIVE' else None
-                    self.check('disk_quota.' + lane + '.file_setattr_refusal', status == 'PASS',
-                               {'control': control, 'job': row['result'], 'observation_gap': reason}, status=status, reason=reason)
-                    if lane == 'tmp':
-                        record['at_limit'] = row['at_limit']
-                    if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
-                        raise ValueError('disk quota lane failed: ' + lane)
-                normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
-                record['next_job'] = normal
-                self.check_job('disk_quota.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')
+                    token = uuid.uuid4().hex
+                    command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token))
+                    invocation = [str(client), address, str(repository), storage, command, '1', '900']
+                    started = time.monotonic()
+                    child = _quota_popen(invocation, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             text=True, env={key: value for key, value in os.environ.items() if key != 'BOAT_API_KEY'})
+                    complete = False
+                    try:
+                        row['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.observer(token, lane == disk_quota.RETAINED_LANE)), timeout=950)['stdout'])
+                        if lane == disk_quota.RETAINED_LANE:
+                            self.check('disk_quota.retained_target_at_limit', disk_quota.retained_checks(row['at_limit']), row['at_limit'])
+                            if not disk_quota.retained_checks(row['at_limit']):
+                                raise ValueError('retained target did not reach an enforced quota boundary')
+                            row['pre_stop'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])))['stdout'])
+                            if row['pre_stop'].get('job_running') is not True:
+                                raise ValueError('retained target job is no longer live before snapshot')
+                            # Keep the job at its barrier so idle eviction cannot
+                            # remove the full target before the provider snapshots it.
+                            record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+                            self.probe.wait_sandbox(sid, {'archived'})
+                            record['stopped_with_retained_target'] = True
+                            row['client_interrupted_for_snapshot'] = True
+                            complete = True
+                            self.check('disk_quota.stop_with_quota_sized_target', True, row['at_limit'])
+                            break
+                        if 'errno' not in row['at_limit']:
+                            raise ValueError('quota job ended before reaching its write limit')
+                        stdout, stderr = child.communicate(timeout=1000)
+                        result = dict(argv=invocation, exit_code=child.returncode, stdout=stdout, stderr=stderr, seconds=time.monotonic()-started)
+                        row['client'] = result
+                        row['result'] = job_result(stdout) if child.returncode == 0 else {}
+                        row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                        for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup']).items():
+                            self.check('disk_quota.' + lane + '.' + name, passed, row)
+                        status = disk_quota.file_setattr_status(row['result'], control)
+                        reason = ('unfiltered root file_setattr returned ENOSYS; this cannot distinguish the job filter; uname -r: '
+                                  + control.get('kernel_release', 'unknown')) if status == 'INCONCLUSIVE' else None
+                        self.check('disk_quota.' + lane + '.file_setattr_refusal', status == 'PASS',
+                                   {'control': control, 'job': row['result'], 'observation_gap': reason}, status=status, reason=reason)
+                        if lane == 'tmp': record['at_limit'] = row['at_limit']
+                        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
+                            raise ValueError('disk quota lane failed: ' + lane)
+                        normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
+                        row['next_job'] = normal
+                        self.check_job('disk_quota.' + lane + '.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')
+                        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
+                            raise ValueError('normal job after quota cleanup failed: ' + lane)
+                        complete = True
+                    finally:
+                        captured = None
+                        if child.poll() is None:
+                            child.terminate()
+                            try: captured = child.communicate(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                child.kill(); captured = child.communicate()
+                        if row.get('client_interrupted_for_snapshot'):
+                            stdout, stderr = captured if captured is not None else child.communicate()
+                            row['client'] = dict(exit_code=child.returncode, stdout=stdout, stderr=stderr,
+                                                 seconds=time.monotonic()-started, intentionally_interrupted=True)
+                        if not complete:
+                            try:
+                                row['abort_cleanup'] = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.abort_source(token)), poll_seconds=30)
+                            except Exception as error:
+                                row['abort_cleanup_error'] = str(error)
+                if not record.get('stopped_with_retained_target'):
+                    raise ValueError('no retained-target snapshot qualification was performed')
         if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.')):
-            raise ValueError('disk quota qualification failed; refusing stop/resume qualification')
+            raise ValueError('disk quota qualification failed')
 
     def _run(self):
         from probe import READY, cleanup, required_checks_passed
@@ -1586,8 +1654,8 @@ class RunnerHost:
                 self.phase(sid, "snapshot_clone", directory, public, repository, client, first_started=start,
                            pre_swap_install=pre_swap, hydrated_at=hydrated_at)
                 self.disk_quota(sid, directory, public, repository, client)
-                self.data['disk_quota']['stop'] = self.probe.request("POST", f"/sandboxes/{sid}/stop", {})
-                self.probe.wait_sandbox(sid, {"archived"})
+                if not self.data['disk_quota'].get('stopped_with_retained_target'):
+                    raise ValueError('quota probe did not archive the retained target')
                 self.data['disk_quota']['resume'] = self.probe.request("POST", f"/sandboxes/{sid}/resume", {})
                 self.probe.wait_sandbox(sid, READY)
                 self.probe.wait_hydrated(sid)

@@ -13,6 +13,7 @@ class DiskQuotaChecks(unittest.TestCase):
                       setters_refused=[0x401c5820, 0x40086602, 0x40046602], file_setattr_errno=errno.ENOSYS))))
         at_limit = dict(errno=errno.EDQUOT, bytes_written=2**30, lease=dict(blocks=2**21, project=1, growth_bytes=2**30),
                         kernel_hard_limit_warning=True,
+                        kernel_usage=dict(hard_bytes=2**30, used_bytes=2**30), before=dict(physical_allowance_bytes=2**30),
                         root_free_bytes=disk_quota.RESERVE_BYTES, xfs_free_bytes=disk_quota.RESERVE_BYTES)
         cleanup = dict(ready=True, leases=[], root_free_bytes=2**36, xfs_free_bytes=2**36)
         return result, at_limit, cleanup
@@ -62,12 +63,46 @@ class DiskQuotaChecks(unittest.TestCase):
             self.assertFalse(disk_quota.checks(result, at_limit, cleanup)['output_inode_was_charged'])
 
     def test_every_required_lane_builds_a_complete_job_program(self):
-        self.assertEqual(disk_quota.LANES, ('tmp', 'home', 'var_tmp', 'output_stdout'))
-        for lane in disk_quota.LANES:
+        self.assertEqual(disk_quota.LANES, ('tmp', 'home', 'var_tmp', 'output_stdout', 'workspace', 'target', 'reused_target', 'reflink_target'))
+        for lane in disk_quota.LANES + (disk_quota.RETAINED_LANE,):
             compile(disk_quota.job(lane), '<quota-job>', 'exec')
         with self.assertRaises(ValueError):
             disk_quota.job('outside-quota')
         compile(disk_quota.POSITIVE_CONTROL, '<root-attribute-control>', 'exec')
+        compile(disk_quota.observer('probe-token', True), '<quota-observer>', 'exec')
+        compile(disk_quota.DEEP_JOB, '<deep-job>', 'exec')
+        compile(disk_quota.BASELINE_JOB, '<baseline-job>', 'exec')
+        compile(disk_quota.reflink_seed(64 * 1024**2), '<reflink-seed>', 'exec')
+        import quota_adversarial
+        compile(quota_adversarial.abort_source('probe-token'), '<abort-probe>', 'exec')
+        compile(quota_adversarial.retained_guard({}), '<retained-guard>', 'exec')
+
+    def test_warning_loss_is_not_a_proxy_for_enforcement(self):
+        result, at_limit, cleanup = self.evidence()
+        at_limit['kernel_hard_limit_warning'] = False
+        self.assertTrue(disk_quota.checks(result, at_limit, cleanup)['filled_real_quota'])
+        at_limit['kernel_usage']['used_bytes'] = 0
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup)['filled_real_quota'])
+
+    def test_retained_snapshot_needs_real_charged_data_and_both_reserves(self):
+        _, observation, _ = self.evidence()
+        observation['retained_allocated_bytes'] = 2**30
+        self.assertTrue(disk_quota.retained_checks(observation))
+        observation['retained_allocated_bytes'] = 0
+        self.assertFalse(disk_quota.retained_checks(observation))
+        observation['retained_allocated_bytes'] = 2**30
+        observation['root_free_bytes'] = disk_quota.RESERVE_BYTES - 1
+        self.assertFalse(disk_quota.retained_checks(observation))
+
+    def test_reflink_bound_uses_independent_physical_allowance(self):
+        mib = 1024**2
+        observation = dict(released_logical_bytes=256*mib, bytes_written=960*mib, retained_allocated_bytes=960*mib,
+                           lease=dict(initial_blocks=320*mib//512, blocks=1024*mib//512),
+                           before=dict(root_free_bytes=64*1024*mib, xfs_free_bytes=64*1024*mib, physical_allowance_bytes=1024*mib),
+                           root_free_bytes=64*1024*mib-960*mib, xfs_free_bytes=64*1024*mib-960*mib)
+        self.assertTrue(disk_quota.reflink_bound(observation))
+        observation['retained_allocated_bytes'] = 2*1024*mib
+        self.assertFalse(disk_quota.reflink_bound(observation))
 
     def control(self, supported=True):
         return dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,

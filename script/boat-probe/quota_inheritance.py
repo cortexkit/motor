@@ -2,8 +2,8 @@
 
 SOURCE = r'''
 def verify_quota_inheritance(directory):
-    import ctypes, errno, fcntl, os, struct
-    child = directory / 'quota-inheritance-child'
+    import ctypes, errno, fcntl, os, struct, uuid
+    child = directory / ('quota-inheritance-child-' + uuid.uuid4().hex)
     child.mkdir()
     fd = os.open(child, os.O_RDONLY | os.O_DIRECTORY)
     def attributes(descriptor):

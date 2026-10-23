@@ -871,7 +871,7 @@ class RunnerHostTests(unittest.TestCase):
         runner.phase = Mock(side_effect=phase)
         def disk_quota(*args):
             order.append('disk_quota')
-            runner.data['disk_quota'] = {}
+            runner.data['disk_quota'] = {'stopped_with_retained_target': True}
         runner.disk_quota = Mock(side_effect=disk_quota)
         runner.replay_cleanup = Mock(side_effect=lambda sid: order.append('cleanup_replay'))
         runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
@@ -882,6 +882,49 @@ class RunnerHostTests(unittest.TestCase):
         self.assertEqual(order, ['hydrated', 'prepared_clone', 'disk_quota', 'hydrated', 'resumed', 'cleanup_replay'])
         runner.execute.assert_not_called()
         probe.create.assert_called_once_with('prepared')
+        self.assertFalse(any(call.args[0] == 'POST' and call.args[1].endswith('/stop') for call in probe.request.call_args_list))
+
+
+class RetainedQuotaSnapshotTests(unittest.TestCase):
+    def test_snapshot_stops_with_data_held_and_never_on_missing_charge(self):
+        import disk_quota
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                probe = Mock()
+                probe.data = {}
+                runner = host.RunnerHost(probe)
+                runner.route = Mock(return_value=['ssh'])
+                runner.check_job = Mock()
+                control = dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,
+                               before_project=0, after_project=0, file_setattr_supported=True, file_setattr_errno=0)
+                observation = dict(errno=errno.EDQUOT, lease=dict(blocks=2**21, growth_bytes=2**30),
+                                   kernel_usage=dict(hard_bytes=2**30, used_bytes=2**30),
+                                   before=dict(physical_allowance_bytes=2**30), retained_allocated_bytes=2**30 if valid else 0,
+                                   root_free_bytes=disk_quota.RESERVE_BYTES, xfs_free_bytes=disk_quota.RESERVE_BYTES)
+                runner.execute = Mock(side_effect=[{'stdout': json.dumps(control)},
+                                                   {'stdout': json.dumps(dict(ready=True, leases=[]))},
+                                                   {'stdout': json.dumps(observation)},
+                                                   {'stdout': json.dumps(dict(job_running=True, allocated_bytes=2**30))}])
+                order = []
+                probe.request.side_effect = lambda *args: order.append('stop') or {}
+                probe.wait_sandbox.side_effect = lambda *args: order.append('archived')
+                child = Mock(returncode=-15)
+                child.poll.return_value = None
+                child.communicate.return_value = ('', 'client interrupted')
+                child.terminate.side_effect = lambda: order.append('terminate')
+                with patch.object(disk_quota, 'LANES', ()), patch.object(host, 'tunnel', return_value=contextlib.nullcontext('address')), \
+                     patch.object(host, 'process', return_value={'exit_code': 0, 'stdout': json.dumps(dict(code=0, terminal={}, stdout='deep'))}), \
+                     patch.object(host, '_quota_popen', return_value=child):
+                    if valid:
+                        runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
+                        self.assertEqual(order, ['stop', 'archived', 'terminate'])
+                        self.assertTrue(runner.data['disk_quota']['stopped_with_retained_target'])
+                        self.assertFalse(runner.data['disk_quota']['reserve_assurance']['sufficiency_proven'])
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'retained target'):
+                            runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
+                        probe.request.assert_not_called()
+                self.assertTrue(any('HOLD_AT_LIMIT=True' in call.args[1] for call in runner.execute.call_args_list))
 
 
 if __name__ == "__main__":

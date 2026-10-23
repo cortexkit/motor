@@ -650,14 +650,14 @@ code digest and both exact command forms are valid. Boat runs the trusted unit
 as root and installs that same fixed helper, without granting jobs sudo. No
 setuid helper or shell command is delegated.
 
-The Boat unit explicitly sets a **24 GiB admission floor** and **32 GiB soft
-eviction goal**; neither is inferred from the provider label or filesystem size.
-An operator-reported cold Cargo build used about 20 GiB, so 24 GiB reserves that
-footprint plus 4 GiB of working headroom rather than admitting a cold build with
-only 4 GiB free. The 32 GiB goal starts reclaiming inactive caches earlier. Both
-fit the roughly 63 GiB free measured inside this 64 GiB XFS volume. These are
-admission/reclamation thresholds, not a disk quota or a guarantee for arbitrary
-artifact sizes; active workspaces and cache-ownership protections are unchanged.
+The Boat unit sets a **32 GiB + 64 MiB admission/readiness floor** and a **40 GiB
+soft eviction goal**. The floor leaves the provisional 24-GiB snapshot/cleanup
+reserve, the existing 64-MiB replay bound, and an 8-GiB minimum cold cap. Boat
+probes the lesser of XFS and outer-root available space; the endpoint remains
+withdrawn while either filesystem cannot leave that cold cap. Active streams
+continue while readiness is withdrawn. Idle pressure cleanup restores capacity
+without waiting for a new booking. These thresholds are not a measured upper
+bound on snapshot scratch or a promise that arbitrary builds fit.
 The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
 `--free-space-floor-bytes` flag sets the floor; new
 `--free-space-eviction-bytes` optionally overrides the soft goal and must exceed
@@ -683,16 +683,37 @@ systemd version's private-temporary backing. The live probe verifies project IDs
 on both spellings. Binds of an unexpected
 filesystem fail setup, rather than silently escaping the quota.
 
-Additional growth is capped at 32 GiB and calculated from
+The **total** hard block cap is at most 32 GiB, calculated from
 `min(XFS available bytes, / available bytes) - provisional reserve - replay tail
-allowance - outstanding job reservations`, rounded down to 512 bytes. The **24
-GiB snapshot/cleanup reserve is provisional**, reusing the existing admission
-floor; it is **not** a measured upper bound on Boat's snapshot staging. The
-runner also withholds the existing 64-MiB replay-tail maximum from growth.
-Already-present workspace blocks are charged as initial usage, not mistakenly
-treated as free growth. Inodes have a hard additional cap of 65,536, leaving
-8,192 available for runner bookkeeping. A flock serializes allocation and
-cleanup, and durable leases retain outstanding reservations across restart.
+allowance`, rounded down to 512 bytes. The **24-GiB reserve is provisional**,
+not an empirically established snapshot requirement. Initial logical usage
+consumes the cap; it never increases it. Reflinked baseline extents can become
+physical CoW allocations or release logical charge without freeing physical
+space, so initial-plus-growth accounting is unsafe even for sequential jobs.
+
+A reused baseline leaving under 8 GiB of growth is evicted through the same
+owned cache-removal/catalog path as idle eviction, then materialized cold once.
+The setup reservation stays held. A cold physical cap below 8 GiB produces the
+existing safe refused-before-start `RunnerDiskFull`, withdraws the ready marker,
+and cannot run the command. Automatic placement elsewhere is not implemented.
+A cold checkout that itself exceeds the total cap is a no-start
+setup failure. Inodes retain an additional cap of 65,536 and an 8,192-inode
+bookkeeping reserve. Boat dispatch enforces one job, including setup, regardless
+of weight or workspace. Older leases retain their inode ownership until cleanup
+but cannot spend unused allowance after the singleton successor starts.
+
+A flock serializes lease changes. Cleanup clears only inodes still carrying
+that lease's project, so delayed A cleanup cannot unquota successor B. Durable
+pending/active/releasing phases and missing-record recovery make interrupted
+setup and double release idempotent. Launch independently requires the active
+lease, matching kernel limits, and owned writable roots.
+
+Quota walking is iterative and descriptor-relative, validates all physical
+roots first, deduplicates `(dev, ino)`, and is limited to 262,144 entries, depth
+128 and five seconds. Cached-tree preflight precedes permission repair. A hostile
+retired runtime is quarantined without retaining a quota reservation; IDs are
+not recycled into quarantined usage. Private GC is bounded and can lift deep
+subtrees within private storage so later passes make progress without recursion.
 
 Block/inode hard-limit failures stay inside the job as EDQUOT (or ENOSPC).
 Start logs include both filesystems' available bytes and the job allowance.
