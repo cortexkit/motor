@@ -1848,6 +1848,11 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
 pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
     let _access = crate::tree_access::lock(path);
     crate::boat_quota::release_runtime(path)?;
+    // Quota cleanup may atomically quarantine an over-budget hostile tree.
+    // It no longer has a reservation or a path exposed to a future job.
+    if !path.exists() {
+        return Ok(());
+    }
     // ACLs alone cannot override sticky-directory unlink rules. Once the job's
     // cgroup is gone, reclaim the entire private tree (including nested sticky
     // directories and root-owned mount ancestors), without following symlinks.
@@ -1990,6 +1995,9 @@ impl Drop for RuntimeDir {
             return;
         }
         if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return;
+            }
             tracing::warn!(%error, path = %self.0.display(), "could not remove private job home");
         }
     }

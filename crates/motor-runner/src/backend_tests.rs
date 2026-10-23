@@ -54,6 +54,61 @@ fn boat_backend_refuses_storage_before_dispatch() {
         .contains("Boat storage verification failed before job launch"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_launch_without_a_quota_lease_never_starts_even_without_isolation() {
+    let scratch = ScratchDir::new("boat-launch-no-quota");
+    let mut config = Config::new(scratch.join("runner"), "boat");
+    config.boat_profile = true;
+    let mut setup = setup(scratch.path());
+    setup.request.base_commit = Some("source".into());
+    let prepared = Prepared {
+        cwd: scratch.path().to_owned(),
+        target: scratch.join("target"),
+        sandbox: None,
+        wrapper: None,
+        windows: None,
+    };
+    match HostBackend.launch(&config, &trees(&config), &setup, &prepared, 1) {
+        Ok(mut launch) => {
+            // The native fixture holds its harmless `exit 0` behind a gate.
+            // Release and reap it before reporting the missing quota backstop.
+            launch.execution.release().unwrap();
+            let _ = launch.execution.wait();
+            launch.execution.reap();
+            panic!("Boat launched without a quota lease");
+        }
+        Err(error) => assert!(error.to_string().contains("Boat quota lease"), "{error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_cached_depth_is_bounded_before_permission_repair() {
+    let scratch = ScratchDir::new("boat-preflight-before-repair");
+    let workspace = scratch.join("remote/worktrees/deep");
+    fs::create_dir_all(&workspace).unwrap();
+    let _tree = crate::boat_quota::DeepTree::unlabelled(&workspace, 2200, 1);
+    let mut config = Config::new(scratch.join("runner"), "boat");
+    config.boat_profile = true;
+    config.isolate_jobs = true;
+    config.workspace_roots = vec![scratch.join("remote/worktrees")];
+    config.owned_workspace_roots = vec![scratch.join("remote")];
+    crate::systemd::with_process_hook(
+        Box::new(|_| panic!("privileged permission repair ran before the quota preflight")),
+        || {
+            let error = HostBackend
+                .materialize(&config, &trees(&config), &setup(&workspace))
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("traversal depth budget"),
+                "{error}"
+            );
+        },
+    );
+}
+
 fn trees(config: &Config) -> Trees {
     Trees {
         dependency_locks: Mutex::new(BTreeMap::new()),

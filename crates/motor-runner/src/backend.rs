@@ -444,6 +444,15 @@ impl Backend for HostBackend {
         }
         let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
         #[cfg(target_os = "linux")]
+        if config.boat_profile && path.exists() {
+            // Bound hostile cached trees before permission repair or checkout
+            // starts a separate, potentially much larger traversal.
+            setup_step(
+                "preflight Boat cached tree",
+                crate::boat_quota::preflight_cached_tree(&path),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
         if config.isolate_jobs && path.exists() {
             crate::setup_log::phase("restore workspace access", || {
                 crate::isolation::restore_runner_access(&path)
@@ -770,6 +779,23 @@ impl Backend for HostBackend {
             setup_step(
                 "verify Boat storage",
                 verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.cwd),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        if config.boat_profile {
+            let workspace = Path::new(if s.base { &r.cwd } else { &r.workspace_key });
+            setup_step(
+                "verify Boat quota lease",
+                crate::boat_quota::validate_for_launch(
+                    &trees.state,
+                    s.id,
+                    &crate::boat_quota::job_roots(
+                        workspace,
+                        &prepared.target,
+                        &trees.state.join("sandboxes").join(s.id.to_string()),
+                        &trees.state.join("spools").join(s.id.to_string()),
+                    ),
+                ),
             )?;
         }
         let mut env = BTreeMap::new();

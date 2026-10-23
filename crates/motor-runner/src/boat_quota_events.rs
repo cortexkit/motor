@@ -167,47 +167,45 @@ pub(crate) fn start(manifest: &Path, project: u32, device: u64) -> io::Result<()
     let stopping = Arc::new(AtomicBool::new(false));
     let stop = stopping.clone();
     let path = manifest.to_path_buf();
-    let handle = std::thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        loop {
-            // SAFETY: recv writes at most buffer.len() initialized bytes.
-            let count = unsafe {
-                libc::recv(
-                    fd.as_raw_fd(),
-                    buffer.as_mut_ptr() as *mut _,
-                    buffer.len(),
-                    0,
-                )
-            };
-            if count > 0 {
-                let mut bytes = &buffer[..count as usize];
-                while bytes.len() >= 20 {
-                    let length = u32_value(bytes).unwrap() as usize;
-                    if length < 20 || length > bytes.len() {
-                        break;
-                    }
-                    if hard_hit(&bytes[16..length], project, device) {
-                        let saved = fs::write(path.with_extension("hit"), b"hard limit\n");
-                        tracing::warn!(project, manifest = %path.display(), persisted = saved.is_ok(), "Boat job hit disk quota hard limit (kernel warning)");
-                        return;
-                    }
-                    let next = (length + 3) & !3;
-                    if next > bytes.len() {
-                        break;
-                    }
-                    bytes = &bytes[next..];
-                }
-            } else if stop.load(Ordering::Acquire) || !path.exists() {
-                return;
-            }
-        }
-    });
+    let handle = std::thread::spawn(move || receive(fd.as_raw_fd(), &stop, &path, project, device));
     MONITORS
         .get_or_init(Default::default)
         .lock()
         .unwrap()
         .insert(manifest.to_path_buf(), (stopping, handle));
     Ok(())
+}
+
+fn receive(fd: std::os::fd::RawFd, stop: &AtomicBool, path: &Path, project: u32, device: u64) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        // A different live project can keep the multicast socket busy. Check
+        // shutdown before every receive, not only when the socket becomes idle.
+        if stop.load(Ordering::Acquire) || !path.exists() {
+            return;
+        }
+        // SAFETY: recv writes at most buffer.len() initialized bytes.
+        let count = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+        if count > 0 {
+            let mut bytes = &buffer[..count as usize];
+            while bytes.len() >= 20 {
+                let length = u32_value(bytes).unwrap() as usize;
+                if length < 20 || length > bytes.len() {
+                    break;
+                }
+                if hard_hit(&bytes[16..length], project, device) {
+                    let saved = fs::write(path.with_extension("hit"), b"hard limit\n");
+                    tracing::warn!(project, manifest = %path.display(), persisted = saved.is_ok(), "Boat job hit disk quota hard limit (kernel warning)");
+                    return;
+                }
+                let next = (length + 3) & !3;
+                if next > bytes.len() {
+                    break;
+                }
+                bytes = &bytes[next..];
+            }
+        }
+    }
 }
 
 pub(crate) fn finish(manifest: &Path) -> bool {
@@ -226,6 +224,55 @@ pub(crate) fn finish(manifest: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_shutdown_does_not_wait_for_a_busy_socket_to_become_idle() {
+        let scratch = cortexkit_test_support::ScratchDir::new("quota-monitor-stop");
+        let manifest = scratch.path().join("lease.json");
+        fs::write(&manifest, b"lease").unwrap();
+        let mut packet = vec![0u8; 16];
+        packet.extend_from_slice(&[1, 1, 0, 0]);
+        for (kind, value) in [
+            (1u16, 2u32.to_ne_bytes().to_vec()),
+            (2, 42u64.to_ne_bytes().to_vec()),
+            (3, 4u32.to_ne_bytes().to_vec()),
+            (4, 7u32.to_ne_bytes().to_vec()),
+            (5, 3u32.to_ne_bytes().to_vec()),
+        ] {
+            packet.extend_from_slice(&((value.len() + 4) as u16).to_ne_bytes());
+            packet.extend_from_slice(&kind.to_ne_bytes());
+            packet.extend(value);
+        }
+        let length = packet.len() as u32;
+        packet[..4].copy_from_slice(&length.to_ne_bytes());
+        for stopping in [true, false] {
+            let (sender, receiver) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+                .unwrap();
+            sender.send(&packet).unwrap();
+            let stop = Arc::new(AtomicBool::new(stopping));
+            let (signal, done) = std::sync::mpsc::channel();
+            let handle = {
+                let (stop, manifest) = (stop.clone(), manifest.clone());
+                std::thread::spawn(move || {
+                    receive(
+                        receiver.as_raw_fd(),
+                        &stop,
+                        &manifest,
+                        42,
+                        libc::makedev(7, 3),
+                    );
+                    signal.send(()).unwrap();
+                })
+            };
+            let finished = done.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            stop.store(true, Ordering::Release);
+            handle.join().unwrap();
+            assert!(finished, "monitor did not stop within its socket timeout");
+            assert_eq!(manifest.with_extension("hit").exists(), !stopping);
+        }
+    }
     #[test]
     fn recognizes_only_this_project_and_device_hard_limit_events() {
         let device = libc::makedev(7, 3);

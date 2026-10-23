@@ -4,6 +4,44 @@ use super::*;
 
 const GIB: u64 = 1 << 30;
 
+// Exercise scheduling with native fixture processes, without requiring a root
+// XFS quota mount. The production host backend has no such quota bypass.
+struct SchedulerFixtureBackend;
+impl backend::Backend for SchedulerFixtureBackend {
+    fn materialize(&self, config: &Config, trees: &Trees, setup: &Setup) -> io::Result<Prepared> {
+        backend::HostBackend.materialize(config, trees, setup)
+    }
+    fn launch(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        setup: &Setup,
+        prepared: &Prepared,
+        weight: u32,
+    ) -> io::Result<backend::Launch> {
+        let mut native = Config::new(config.state_root.clone(), config.instance.clone());
+        native.fixture_cargo_home = config.fixture_cargo_home.clone();
+        native.test_processes = config.test_processes.clone();
+        backend::HostBackend.launch(&native, trees, setup, prepared, weight)
+    }
+    fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {
+        backend::HostBackend.cancel(config, job, hard)
+    }
+    fn unit_alive(
+        &self,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>> {
+        backend::HostBackend.unit_alive(config, process)
+    }
+    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+        backend::HostBackend.collect_changes(trees, job)
+    }
+    fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
+        backend::HostBackend.reconcile(config, interrupted)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boat_queues_a_second_small_job_through_setup_and_execution() {
     let f = Fixture::new();
@@ -12,7 +50,7 @@ async fn boat_queues_a_second_small_job_through_setup_and_execution() {
     let mut config = boat_config(&f, |_| Ok(63 * GIB));
     config.manual_tick = false;
     config.long_work = Some(hold.hook());
-    let runner = Runner::open(config).unwrap();
+    let runner = Runner::open_with_backend(config, Box::new(SchedulerFixtureBackend)).unwrap();
     let marker = f.scratch.join("release-first");
     hold.arm();
     let (mut first, mut first_bytes) = job_at(

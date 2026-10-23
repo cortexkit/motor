@@ -10,6 +10,11 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "boat_quota_walk.rs"]
+mod walk;
+#[cfg(test)]
+pub(crate) use regression_tests::DeepTree;
+
 const MOUNT: &str = "/var/lib/motor-boat";
 // Provisional: the existing admission floor, not a measured Boat snapshot bound.
 // The write-to-quota + stop/resume probe records the headroom needed to tune it.
@@ -164,85 +169,45 @@ fn assignment(mut attr: FsXattr, project: u32, directory: bool) -> FsXattr {
     attr
 }
 
-fn assign(system: &impl QuotaSystem, path: &Path, project: u32, device: u64) -> io::Result<()> {
-    visit(path, project, device, &mut |path, project, directory| {
-        set_project(system, path, project, directory)
-    })
-}
-
-fn visit(
-    path: &Path,
+fn assign_roots(
+    system: &impl QuotaSystem,
+    paths: &[PathBuf],
     project: u32,
+    expected: Option<u32>,
     device: u64,
-    update: &mut impl FnMut(&Path, u32, bool) -> io::Result<()>,
 ) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.dev() != device {
-        return Err(io::Error::other("Boat quota tree crosses a filesystem"));
-    }
-    // Never follow links into shared trees; special inodes have no writable data.
-    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
-        return Ok(());
-    }
-    update(path, project, metadata.is_dir())?;
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            visit(&entry?.path(), project, device, update)?;
+    let mut budget = walk::Budget::default();
+    let roots = walk::pin_roots(paths, expected.is_some(), &budget)?;
+    for root in &roots {
+        if root.metadata()?.dev() != device {
+            return Err(io::Error::other("Boat quota root crosses a filesystem"));
         }
+    }
+    for root in roots {
+        walk::visit(root, device, &mut budget, &mut |file, metadata| {
+            let attr = system.attributes(file)?;
+            if expected.is_some_and(|owner| !owns_project(attr.project, owner)) {
+                return Ok(false);
+            }
+            system.set_attributes(file, &assignment(attr, project, metadata.is_dir()))?;
+            Ok(true)
+        })?;
     }
     Ok(())
 }
 
-fn set_project(
-    system: &impl QuotaSystem,
-    path: &Path,
-    project: u32,
-    directory: bool,
-) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let mut attr = system.attributes(&file)?;
-    attr = assignment(attr, project, directory);
-    system.set_attributes(&file, &attr)
-}
-
-fn assign_owned(
-    system: &impl QuotaSystem,
+#[cfg(test)]
+fn visit(
     path: &Path,
     project: u32,
     device: u64,
+    update: &mut impl FnMut(&File, u32, bool) -> io::Result<()>,
 ) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    // A replaced root may no longer belong to this lease. Never follow a
-    // symlink or special file during cleanup.
-    if !metadata.is_dir() && !metadata.is_file() {
-        return Ok(());
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !owns_project(system.attributes(&file)?.project, project) {
-        return Ok(());
-    }
-    visit(path, 0, device, &mut |path, _, directory| {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        let attr = system.attributes(&file)?;
-        if owns_project(attr.project, project) {
-            system.set_attributes(&file, &assignment(attr, 0, directory))?;
-        }
-        Ok(())
+    let mut budget = walk::Budget::default();
+    let root = walk::physical_root(path, &budget)?;
+    walk::visit(root, device, &mut budget, &mut |file, metadata| {
+        update(file, project, metadata.is_dir())?;
+        Ok(true)
     })
 }
 
@@ -328,8 +293,120 @@ fn lock(state: &Path) -> io::Result<(File, PathBuf)> {
     Ok((file, directory))
 }
 
+fn next_project(
+    system: &impl QuotaSystem,
+    directory: &Path,
+    used: &std::collections::BTreeSet<u32>,
+) -> io::Result<u32> {
+    let counter = directory.join("next-project");
+    let saved: u32 = match fs::read(&counter) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 1,
+        Err(error) => return Err(error),
+    };
+    let mut project = saved.max(used.last().copied().unwrap_or(0).saturating_add(1));
+    loop {
+        if project == u32::MAX {
+            return Err(io::Error::other("Boat project IDs exhausted"));
+        }
+        let occupied = usage(system, project)?.is_some_and(|quota| {
+            quota.blocks != 0 || quota.inodes != 0 || quota.block_hard != 0 || quota.inode_hard != 0
+        });
+        if !used.contains(&project) && !occupied {
+            break;
+        }
+        project += 1;
+    }
+    // Never recycle an ID while quarantined or unlinked-but-open inodes may
+    // still carry it. The counter is durable before any inode is assigned.
+    crate::storage::atomic_json_private(&counter, &(project + 1))?;
+    Ok(project)
+}
+
+fn quarantine_runtime(runtime: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if !runtime.exists() {
+        return Ok(());
+    }
+    let Some(sandboxes) = runtime
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "sandboxes"))
+    else {
+        return Err(io::Error::other(
+            "refusing to quarantine a non-runtime path",
+        ));
+    };
+    let directory = sandboxes.parent().unwrap().join("boat-quarantine");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    let target = directory.join(format!(
+        "{}-{}",
+        runtime.file_name().unwrap().to_string_lossy(),
+        Uuid::now_v7()
+    ));
+    fs::rename(runtime, &target)?;
+    tracing::warn!(path = %runtime.display(), quarantine = %target.display(), "quarantined hostile Boat runtime without retaining its quota reservation");
+    Ok(())
+}
+
 pub(crate) fn prepare(state: &Path, id: Uuid, roots: Vec<PathBuf>) -> io::Result<()> {
     prepare_with(&System, state, id, roots)
+}
+
+pub(crate) fn preflight_cached_tree(path: &Path) -> io::Result<()> {
+    let mut budget = walk::Budget::default();
+    let root = walk::physical_root(path, &budget)?;
+    let device = root.metadata()?.dev();
+    walk::visit(root, device, &mut budget, &mut |_, _| Ok(true))
+}
+
+pub(crate) fn validate_for_launch(state: &Path, id: Uuid, roots: &[PathBuf]) -> io::Result<()> {
+    validate_for_launch_with(&System, state, id, roots)
+}
+
+fn validate_for_launch_with(
+    system: &impl QuotaSystem,
+    state: &Path,
+    id: Uuid,
+    roots: &[PathBuf],
+) -> io::Result<()> {
+    let refused = || {
+        io::Error::other(
+            "Boat quota lease is missing, incomplete, or no longer owns its writable roots",
+        )
+    };
+    if !state.join("boat-quotas").is_dir() {
+        return Err(refused());
+    }
+    let (_lock, directory) = lock(state)?;
+    let lease: Lease = serde_json::from_slice(&fs::read(directory.join(format!("{id}.json")))?)?;
+    if !lease.active() || lease.blocks == 0 || lease.inodes == 0 || lease.roots != roots {
+        return Err(refused());
+    }
+    let quota = usage(system, lease.project)?.ok_or_else(refused)?;
+    if quota.block_hard != lease.blocks || quota.inode_hard != lease.inodes {
+        return Err(refused());
+    }
+    let budget = walk::Budget::default();
+    for (index, path) in roots.iter().enumerate() {
+        // The runner-managed upload spool can already have been consumed. It is
+        // not a job mount; workspace, target and runtime must still be present.
+        if index == 3 && !path.exists() {
+            continue;
+        }
+        let root = walk::physical_root(path, &budget)?;
+        let metadata = root.metadata()?;
+        let file = File::open(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
+        let attr = system.attributes(&file)?;
+        if !owns_project(attr.project, lease.project)
+            || (metadata.is_dir() && attr.flags & 0x200 == 0)
+        {
+            return Err(refused());
+        }
+    }
+    Ok(())
 }
 
 fn prepare_with(
@@ -364,9 +441,7 @@ fn prepare_with(
                 reserved_inodes.saturating_add(lease.inodes.saturating_sub(usage.inodes));
         }
     }
-    let project = (1..u32::MAX)
-        .find(|id| !used_ids.contains(id))
-        .ok_or_else(|| io::Error::other("Boat project IDs exhausted"))?;
+    let project = next_project(system, &directory, &used_ids)?;
     let (xfs, inodes) = system.available(system.mount())?;
     let (root, _) = system.available(Path::new("/"))?;
     // The replay tail is written by the runner, outside the job project. Keep
@@ -395,9 +470,7 @@ fn prepare_with(
     };
     crate::storage::atomic_json_private(&manifest, &lease)?;
     system.monitor(&manifest, project, device)?;
-    for path in &lease.roots {
-        assign(system, path, project, device)?;
-    }
+    assign_roots(system, &lease.roots, project, None, device)?;
     let initial = system.quota(project, None)?;
     lease.blocks = initial.blocks + bytes / 512;
     lease.inodes = initial.inodes + inode_budget;
@@ -437,23 +510,32 @@ fn release_runtime_with(system: &impl QuotaSystem, runtime: &Path) -> io::Result
     };
     lease.phase = Phase::Releasing;
     crate::storage::atomic_json_private(&manifest, &lease)?;
-    let usage = usage(system, lease.project)?.unwrap_or_default();
+    let usage = match usage(system, lease.project) {
+        Ok(usage) => usage.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(project = lease.project, %error, "could not read retired Boat quota usage");
+            DiskQuota::default()
+        }
+    };
     let hit_observed = system.finish_monitor(&manifest);
     tracing::info!(job_id = ?id, project = lease.project, blocks = usage.blocks, block_limit = lease.blocks, inodes = usage.inodes, inode_limit = lease.inodes,
         hit_observed, "Boat job disk quota cleanup");
     let device = fs::metadata(system.mount())?.dev();
-    for path in &lease.roots {
-        assign_owned(system, path, lease.project, device)?;
-    }
+    let relabel = assign_roots(system, &lease.roots, 0, Some(lease.project), device);
     if let Err(error) = system.quota(lease.project, Some((0, 0))) {
         if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error);
+            tracing::warn!(project = lease.project, %error, "could not clear retired Boat quota limits; project ID will not be reused");
         }
     }
     if hit_observed {
-        fs::remove_file(manifest.with_extension("hit"))?;
+        let _ = fs::remove_file(manifest.with_extension("hit"));
     }
-    fs::remove_file(manifest)
+    fs::remove_file(manifest)?;
+    if let Err(error) = relabel {
+        tracing::warn!(project = lease.project, bounded_walk = walk::is_limit(&error), %error, "retired Boat tree could not be relabelled");
+        quarantine_runtime(runtime)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -517,21 +599,21 @@ mod tests {
         std::os::unix::fs::symlink("/", root.join("outside")).unwrap();
         let device = fs::metadata(root).unwrap().dev();
         let mut assigned = Vec::new();
-        visit(root, 42, device, &mut |path, id, directory| {
-            assigned.push((
-                path.strip_prefix(root).unwrap().to_path_buf(),
-                id,
-                directory,
-            ));
+        visit(root, 42, device, &mut |file, id, directory| {
+            assigned.push((file.metadata()?.ino(), id, directory));
             Ok(())
         })
         .unwrap();
         assert_eq!(
             assigned,
             [
-                (PathBuf::new(), 42, true),
-                (PathBuf::from("child"), 42, true),
-                (PathBuf::from("child/file"), 42, false)
+                (fs::metadata(root).unwrap().ino(), 42, true),
+                (fs::metadata(root.join("child")).unwrap().ino(), 42, true),
+                (
+                    fs::metadata(root.join("child/file")).unwrap().ino(),
+                    42,
+                    false
+                )
             ]
         );
         assert!(visit(root, 42, device + 1, &mut |_, _, _| panic!(
