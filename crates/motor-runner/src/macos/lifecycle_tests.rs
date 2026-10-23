@@ -613,7 +613,7 @@ fn nonroot_cleanup_repairs_guest_modes_without_following_links_across_restart() 
     std::fs::create_dir_all(locked.join("nonempty")).unwrap();
     std::fs::write(locked.join("nonempty/file"), "owned").unwrap();
     symlink(&sentinel, paths.tree.join("outside-link")).unwrap();
-    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o000)).unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
     assert_eq!(
         std::fs::read_dir(&empty).unwrap_err().kind(),
