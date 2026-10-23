@@ -29,6 +29,11 @@ if parity_spec is None or parity_spec.loader is None:
     raise ImportError("cannot load toolchain parity checker")
 parity = importlib.util.module_from_spec(parity_spec)
 parity_spec.loader.exec_module(parity)
+account_spec = importlib.util.spec_from_file_location("job_account", ROOT / "script/runner/job-account.py")
+if account_spec is None or account_spec.loader is None:
+    raise ImportError("cannot load the shared job identity installer")
+job_account = importlib.util.module_from_spec(account_spec)
+account_spec.loader.exec_module(job_account)
 # The tenant image recipe owns the shared root-owned path check; Boat loads the
 # same file from the source checkout so both images enforce one invariant.
 root_paths_spec = importlib.util.spec_from_file_location("root_paths", ROOT / "script/tenant-image/guest/root_paths.py")
@@ -49,6 +54,8 @@ RUNNER_INPUTS = (
     'script/runner/tools.txt', 'script/runner/install-tools.sh',
     'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
     'script/runner/cargo-seed.py',
+    'script/runner/job-account.py',
+    'script/runner/sysctl/60-motor-inotify.conf',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
     'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
 )
@@ -488,7 +495,7 @@ def gnu_aliases(manifest):
             alias.symlink_to(target)
 
 
-def tools(manifest):
+def tools(manifest, role="boat"):
     pins = {name: spec["version"].removeprefix("v").removeprefix("nats-server: v")
             for name, spec in manifest["tools"].items() if "version" in spec}
     pins["rustup"] = manifest["rustup"]
@@ -498,7 +505,7 @@ def tools(manifest):
     os.environ.update(CARGO_HOME="/srv/build/cargo-home", RUSTUP_HOME="/home/ubuntu/.rustup",
                       TMPDIR="/srv/build/tmp", CARGO_TARGET_DIR="/srv/build/target",
                       RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="", GIT_TERMINAL_PROMPT="0",
-                      CARGO_BUILD_JOBS="4",
+                      CARGO_BUILD_JOBS=os.environ.get("CARGO_BUILD_JOBS", "4"),
                       PATH="/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     rustup = (f"https://static.rust-lang.org/rustup/archive/{pins['rustup']}/"
               "x86_64-unknown-linux-gnu/rustup-init")
@@ -539,7 +546,7 @@ def tools(manifest):
     run("bash", str(ROOT / "script/runner/build-git.sh"))
     # Fail anonymously instead of forwarding an operator's repository credentials.
     run("git", "-c", "credential.helper=", "ls-remote", "https://github.com/cortexkit/commons", "HEAD")
-    run("bash", str(ROOT / "script/runner/install-tools.sh"), "boat")
+    run("bash", str(ROOT / "script/runner/install-tools.sh"), role)
     marker = BUILD / "sccache-inputs.sha256"
     artifacts_path = BUILD / 'sccache-artifacts.json'
     inputs = digest(ROOT / "script/runner/build-sccache.sh") + digest(
@@ -611,7 +618,8 @@ def install_units(systemd=Path("/etc/systemd/system")):
 
 
 def accounts():
-    for account in ("motor-job", "motor-cache"):
+    job_account.ensure(json.loads(PARITY_PATH.read_text())['job_identity'], run)
+    for account in ("motor-cache",):
         if subprocess.run(["id", "-u", account], capture_output=True).returncode:
             run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
                 "--shell", "/usr/sbin/nologin", account)
@@ -624,6 +632,9 @@ def configure(pins, revision):
     # The runner-disk mount written by state() requires motor-boat-restored.service.
     install_units()
     state(pins)
+    inotify = '/etc/sysctl.d/60-motor-inotify.conf'
+    shutil.copy2(ROOT / 'script/runner/sysctl/60-motor-inotify.conf', inotify)
+    run('sysctl', '-p', inotify)
     config = Path("/etc/ssh/sshd_config").read_text()
     if not re.search(r"(?im)^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf\s*$", config):
         raise ValueError("sshd does not include drop-ins; refusing an unverified policy")

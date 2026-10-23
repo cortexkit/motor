@@ -25,6 +25,10 @@ RUNNER_INPUTS = (
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
     "script/runner/build-git.sh", "script/runner/install-binaryen.py",
+    "script/runner/toolchain-parity.py", "script/runner/cargo-seed.py",
+    "script/runner/job-account.py",
+    "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
+    "script/tenant-image/guest/root_paths.py",
 )
 
 

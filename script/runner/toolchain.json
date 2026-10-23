@@ -1,6 +1,6 @@
 {
   "accepted_os_differences": [
-    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: Boat builds the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of Ubuntu's git on PATH, and git --version is checked exactly.",
+    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
     "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
     "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
@@ -8,7 +8,7 @@
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
     "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
     "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
-    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. So Boat jobs have no RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. All other job environment values remain exact."
+    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat and tenant jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. Neither image's jobs have RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. Tenant's immutable Rustup home is /usr/local/lib/motor/rustup and its mounted Cargo bin is /tenant/cargo-home/bin. Bun precedes Cargo on every role's job PATH. Inotify instance capacity must be at least 8192; watch/event limits are recorded because kernel RAM-based defaults differ."
   ],
   "apt_packages": {
     "by_role": {
@@ -18,6 +18,9 @@
       "build-server": [
         "binaryen",
         "gnu-coreutils"
+      ],
+      "tenant": [
+        "coreutils"
       ]
     },
     "observed_build_server_versions": {
@@ -36,6 +39,7 @@
       "libssl-dev": "3.5.5-1ubuntu3.7",
       "lld": "1:21.1.6-71",
       "nftables": "1.1.6-1",
+      "openssh-server": "1:10.2p1-2ubuntu3.8",
       "patch": "2.8-2build1",
       "pkg-config": "2.5.1-4",
       "procps": "2:4.0.4-9ubuntu1",
@@ -72,6 +76,7 @@
       "unzip",
       "xz-utils",
       "patch",
+      "openssh-server",
       "ufw",
       "gcc-mingw-w64-x86-64",
       "g++-mingw-w64-x86-64"
@@ -406,10 +411,17 @@
     "gnuwhoami": "/usr/bin/gnuwhoami",
     "gnuyes": "/usr/bin/gnuyes"
   },
+  "job_identity": {
+    "uid": 999,
+    "gid": 986
+  },
   "job_environment": {
     "CARGO_HOME": "/motor-home/cargo",
     "ESBUILD_BIN": null,
     "RUSTUP_HOME": "/home/ubuntu/.rustup",
+    "TMPDIR": "/motor-home/tmp",
+    "TMP": "/motor-home/tmp",
+    "TEMP": "/motor-home/tmp",
     "WASM_BINDGEN_BIN": null,
     "WASM_OPT_BIN": null
   },
@@ -423,7 +435,28 @@
       "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
       "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot",
       "SCCACHE_DIR": "/motor-cache"
+    },
+    "tenant": {
+      "PATH": "/home/ubuntu/.bun/bin:/tenant/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
+      "RUSTUP_HOME": "/usr/local/lib/motor/rustup",
+      "RUSTC_WRAPPER": null,
+      "SCCACHE_DIR": null
     }
+  },
+  "layout_by_role": {
+    "tenant": {
+      "host": {
+        "cargo_home": "/usr/local/lib/motor/cargo",
+        "rustup_home": "/usr/local/lib/motor/rustup"
+      },
+      "job": {
+        "cargo_home": "/tenant/cargo-home",
+        "rustup_home": "/usr/local/lib/motor/rustup"
+      }
+    }
+  },
+  "inotify_minimum": {
+    "max_user_instances": 8192
   },
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
   "rust_profile": "minimal",
@@ -541,10 +574,12 @@
     "git": {
       "path": "/usr/bin/git",
       "path_by_role": {
-        "boat": "/usr/local/bin/git"
+        "boat": "/usr/local/bin/git",
+        "tenant": "/usr/local/bin/git"
       },
       "realpath_suffix_by_role": {
         "boat": "/usr/local/lib/git/2.53.0/bin/git",
+        "tenant": "/usr/local/lib/git/2.53.0/bin/git",
         "build-server": "/usr/bin/git"
       },
       "source": {

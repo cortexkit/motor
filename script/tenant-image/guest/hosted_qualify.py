@@ -26,6 +26,7 @@ ATTACH_WAIT_S = 90.0
 TOOL_ROOTS = (Path("/usr/local/lib/motor/rustup"), Path("/usr/local/lib/motor/cargo"))
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
 ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
+PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
 SAMPLE_BYTES = 32 * 1024 * 1024
 
 
@@ -283,6 +284,16 @@ def run(*args, **kwargs):
     return result.stdout
 
 
+def toolchain_probe(root):
+    report = json.loads(run("python3", str(root / "toolchain-parity.py"),
+                            "--check", "--role", "tenant"))
+    (root / "parity-host.json").write_text(json.dumps(report, indent=2) + "\n")
+    expected = (root / "gnutest.sha256").read_text().strip()
+    if not report['passed'] or report["observed"]["tools"]["gnutest"]["sha256"] != expected:
+        raise RuntimeError("booted package-qualified gnutest differs from the image inventory or parity failed")
+    print(PARITY, flush=True)
+
+
 def main():
     deadline = time.monotonic() + 120
     while subprocess.run(["systemctl", "is-active", "--quiet", "motor-tenant-runner.service"]).returncode:
@@ -294,6 +305,7 @@ def main():
     tool_tree_probe()
     root_path_probe()
     root = Path("/tenant/qualification")
+    toolchain_probe(root)
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)
     env = dict(os.environ, TMPDIR=str(scratch), RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="")

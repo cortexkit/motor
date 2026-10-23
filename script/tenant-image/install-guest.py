@@ -82,60 +82,31 @@ def published_hash(url, filename):
 
 
 def install_tools(pins):
-    os.environ.update(
-        CARGO_HOME="/srv/build/cargo-home", RUSTUP_HOME="/home/ubuntu/.rustup",
-        CARGO_TARGET_DIR="/srv/build/target", TMPDIR="/srv/build/tmp",
-        RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="", GIT_TERMINAL_PROMPT="0",
-        HOME="/root", PATH="/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-    )
-    (BUILD / "tmp").mkdir()
-    rustup_url = (f"https://static.rust-lang.org/rustup/archive/{pins['rustup']}/"
-                  "x86_64-unknown-linux-gnu/rustup-init")
-    rustup_sha = urllib.request.urlopen(rustup_url + ".sha256").read().decode().split()[0]
-    download(rustup_url, BUILD / "rustup-init", rustup_sha)
-    (BUILD / "rustup-init").chmod(0o755)
-    run(str(BUILD / "rustup-init"), "-y", "--no-modify-path", "--profile", "minimal",
-        "--default-toolchain", pins["rust_default"])
-    # rustup replaces itself with the newest release during `toolchain install`
-    # unless told not to, which would drift from the pinned version.
-    run("rustup", "set", "auto-self-update", "disable")
-    for toolchain, targets in pins["rust_toolchains"].items():
-        run("rustup", "toolchain", "install", toolchain, "--profile", "minimal",
-            "--component", "clippy", "--component", "rustfmt")
-        run("rustup", "target", "add", "--toolchain", toolchain, *targets)
-    run("rustup", "default", pins["rust_default"])
-
+    # Use the same measured releases, target/component sets and installers as
+    # Boat; tenant-only pins describe the OS and kernel, never a second toolchain.
+    spec = importlib.util.spec_from_file_location("boat_tools", BUILD / "script/boat-image/install.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the shared image tool installer")
+    shared = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shared)
+    manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
+    shared.parity.validate(manifest)
     run("apt-get", "purge", "-y", "binaryen")
-    run("python3", str(BUILD / "script/runner/install-binaryen.py"),
-        str(BUILD / "script/runner/toolchain.json"))
-    node_file = f"node-v{pins['node']}-linux-x64.tar.xz"
-    node_url = f"https://nodejs.org/dist/v{pins['node']}/"
-    download(node_url + node_file, BUILD / node_file,
-             published_hash(node_url + "SHASUMS256.txt", node_file))
-    extract(BUILD / node_file, "/usr/local", "-J", "--strip-components=1")
-    bun_file = "bun-linux-x64.zip"
-    bun_url = f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/"
-    download(bun_url + bun_file, BUILD / bun_file,
-             published_hash(bun_url + "SHASUMS256.txt", bun_file))
-    run("unzip", "-q", str(BUILD / bun_file), "-d", str(BUILD / "bun"))
-    shutil.copy2(BUILD / "bun/bun-linux-x64/bun", "/usr/local/bin/bun")
-    Path("/usr/local/bin/bun").chmod(0o755)
-    run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts",
-        f"npm@{pins['npm']}", f"pnpm@{pins['pnpm']}")
-    run("bash", str(BUILD / "script/runner/install-tools.sh"), "tenant")
-    run("sh", str(BUILD / "script/runner/build-sccache.sh"))
-    # Debian trixie's git (2.47) is older than the build server's; build the
-    # server's release into /usr/local, ahead of Debian's git on job PATH.
-    run("bash", str(BUILD / "script/runner/build-git.sh"))
+    shared.tools(manifest, role="tenant")
 
     PREFIX.mkdir(parents=True)
     (PREFIX / "cargo").mkdir()
     shutil.copytree(BUILD / "cargo-home/bin", PREFIX / "cargo/bin", symlinks=True)
     shutil.move("/home/ubuntu/.rustup", PREFIX / "rustup")
-    Path("/home/ubuntu").rmdir()
+    for name in ("sccache-inputs.sha256", "sccache-artifacts.json"):
+        shutil.copy2(BUILD / name, PREFIX / name)
+    parity_dir = PREFIX / "parity"
+    parity_dir.mkdir()
+    for name in ("toolchain.json", "toolchain-parity.py", "cargo-seed.py"):
+        shutil.copy2(BUILD / "script/runner" / name, parity_dir / name)
     # Only immutable binaries and toolchains enter the image, not install caches.
     os.environ.update(CARGO_HOME=str(PREFIX / "cargo"), RUSTUP_HOME=str(PREFIX / "rustup"),
-                      PATH=f"{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+                      PATH=f"/home/ubuntu/.bun/bin:{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 
 
 def install_services(source, destination):
@@ -254,7 +225,13 @@ def verify_tool_trees(roots=TOOL_TREES, acl=has_access_acl, owner=0, group=0):
 
 
 def configure(pins):
-    for account in ("motor-job", "motor-cache"):
+    spec = importlib.util.spec_from_file_location("job_account", BUILD / "script/runner/job-account.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the shared job identity installer")
+    account = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(account)
+    account.ensure(json.loads((BUILD / "script/runner/toolchain.json").read_text())['job_identity'], run)
+    for account in ("motor-cache",):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
             "--shell", "/usr/sbin/nologin", account)
     for directory in ("tenant", "Users", "home", "overlay", ".lower", "usr/local/libexec", "etc/nftables.d"):
@@ -274,6 +251,7 @@ def configure(pins):
         raise ValueError("unexpected runner network interface template")
     Path("/etc/nftables.d/motor-net.nft").write_text(rules.replace("enp6s0", "eth0"))
     Path("/etc/sysctl.d/90-motor.conf").write_text("net.ipv4.ip_forward=1\nkernel.modules_disabled=1\n")
+    shutil.copy2(BUILD / "script/runner/sysctl/60-motor-inotify.conf", "/etc/sysctl.d/60-motor-inotify.conf")
     Path("/etc/hostname").write_text("motor-tenant\n")
     Path("/etc/hosts").write_text("127.0.0.1 localhost\n127.0.1.1 motor-tenant\n")
     Path("/etc/resolv.conf").unlink(missing_ok=True)
@@ -292,7 +270,10 @@ def configure(pins):
     run("systemctl", "mask", "systemd-networkd.service", "systemd-resolved.service",
         "systemd-remount-fs.service",
         "apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service",
-        "ufw.service", "nftables.service", "nats-server.service", "serial-getty@ttyS0.service")
+        "ufw.service", "nftables.service", "nats-server.service", "ssh.service", "ssh.socket",
+        "serial-getty@ttyS0.service")
+    for key in Path("/etc/ssh").glob("ssh_host_*"):
+        key.unlink()
     run("systemctl", "set-default", "multi-user.target")
 
 
@@ -303,7 +284,7 @@ def verify_git(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=
     search = next(line.removeprefix("Environment=PATH=") for line in Path(unit).read_text().splitlines()
                   if line.startswith("Environment=PATH="))
     path = which("git", path=search)
-    if path != spec["path_by_role"]["boat"]:
+    if path != spec["path_by_role"]["tenant"]:
         raise ValueError(f"git resolves to {path}, not the pinned build")
     actual = run(path, "--version", capture=True)
     if actual != spec["version"]:
@@ -333,16 +314,10 @@ def verify(pins):
     inventory = {"systemd": systemd, "rust_toolchains": {}}
     inventory["agent_validated_paths"] = verify_agent_paths(Path("/"))
     inventory["static_module_load_requests"] = verify_no_module_load_requests(Path("/"))
-    for name, command in (("node", "node"), ("npm", "npm"), ("bun", "bun"), ("pnpm", "pnpm")):
-        actual = run(command, "--version", capture=True).removeprefix("v")
-        if actual != pins[name]:
-            raise ValueError(f"{name} version differs: {actual}")
-        inventory[name] = actual
-    for toolchain, expected in pins["rust_toolchains"].items():
-        actual = run("rustup", "target", "list", "--installed", "--toolchain", toolchain, capture=True).splitlines()
-        if sorted(actual) != sorted(expected):
-            raise ValueError(f"Rust targets differ: {toolchain}")
-        inventory["rust_toolchains"][toolchain] = actual
+    parity = json.loads(run("python3", str(PREFIX / "parity/toolchain-parity.py"),
+                            "--check", "--role", "tenant", capture=True))
+    inventory["parity"] = parity
+    inventory["rust_toolchains"] = parity["observed"]["rust_toolchains"]
     inventory["runner"] = run("motor-runner", "--version", capture=True)
     manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
     inventory["git"] = verify_git(manifest)
@@ -366,7 +341,7 @@ def verify(pins):
     inventory["root_owned_paths"] = root_paths.require(root_paths.TENANT_ROOTS)
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
-    print(f"guest inventory: {len(pins['packages'])} packages; {len(pins['rust_toolchains'])} Rust toolchains; "
+    print(f"guest inventory: {len(pins['packages'])} base packages; {len(inventory['rust_toolchains'])} Rust toolchains; "
           "4 JS tools; runner tenant-agent, git, sccache, nextest and Python executed")
 
 

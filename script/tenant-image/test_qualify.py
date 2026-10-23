@@ -2,6 +2,7 @@
 """Portable qualification plumbing tests, never VM qualification evidence."""
 import base64
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -29,6 +30,54 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_qualification_cannot_check_an_image_with_different_parity_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / 'repo'
+            (repo / 'script/runner').mkdir(parents=True)
+            hashes = {}
+            for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py'):
+                relative = 'script/runner/' + name
+                (repo / relative).write_text(name)
+                hashes[relative] = hashlib.sha256(name.encode()).hexdigest()
+            (root / 'manifest.json').write_text(json.dumps({'versions': {'runner_inputs_sha256': hashes}}))
+            (root / 'tools.json').write_text(json.dumps({'parity': {'observed': {'tools': {'gnutest': {'sha256': 'a' * 64}}}}}))
+            self.assertEqual('a' * 64, q.parity_inputs(root, repo))
+            (repo / 'script/runner/toolchain.json').write_text('changed contract')
+            with self.assertRaisesRegex(RuntimeError, 'parity input differs.*toolchain.json'):
+                q.parity_inputs(root, repo)
+
+    def test_real_job_parity_command_checks_and_propagates_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checker = root / 'toolchain-parity.py'
+            checker.write_text('import sys\nassert sys.argv[1:6] == ["--check", "--role", "tenant", "--job", "--gnu-test-sha256"]\nprint("parity measured")\nsys.exit(7)\n')
+            command = f'd="{root}"; ' + q.parity_job_command('a' * 64, 1) + 'echo false-success'
+            result = subprocess.run(['sh', '-c', command], cwd=root, capture_output=True, text=True)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual('parity measured\n', result.stderr)
+            self.assertEqual('', result.stdout)
+            checker.write_text(checker.read_text().replace('sys.exit(7)', 'sys.exit(0)'))
+            result = subprocess.run(['sh', '-c', command], cwd=root, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode)
+            self.assertEqual('false-success\n', result.stdout)
+        with self.assertRaisesRegex(ValueError, 'package-qualified'):
+            q.parity_job_command('', 1)
+
+    def test_guest_host_parity_must_match_image_gnutest_inventory(self):
+        guest = q.module('parity_guest', q.HERE / 'guest/hosted_qualify.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'gnutest.sha256').write_text('a' * 64)
+            report = {'passed': True, 'observed': {'tools': {'gnutest': {'sha256': 'a' * 64}}}}
+            with mock.patch.object(guest, 'run', return_value=json.dumps(report)) as run, mock.patch('builtins.print'):
+                guest.toolchain_probe(root)
+            self.assertEqual(('python3', str(root / 'toolchain-parity.py'), '--check', '--role', 'tenant'), run.call_args.args)
+            self.assertEqual(report, json.loads((root / 'parity-host.json').read_text()))
+            report['observed']['tools']['gnutest']['sha256'] = 'b' * 64
+            with mock.patch.object(guest, 'run', return_value=json.dumps(report)), self.assertRaisesRegex(RuntimeError, 'gnutest differs'):
+                guest.toolchain_probe(root)
+
     def test_program_staging_copies_bytes_not_symlink_or_writable_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

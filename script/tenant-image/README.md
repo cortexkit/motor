@@ -7,19 +7,26 @@ supported; byte-identical filesystem images are not promised.
 
 ## Inputs
 
-The release toolchain inventory was captured on the Linux build server on
-2026-10-17. `stable` resolved to Rust 1.99.0 and is recorded as that release, not
-as a floating channel. Each release has its own installed target list. Node
-24.21.0, npm 11.19.0, Bun 1.4.2 and pnpm 11.1.2 came from the same inventory.
-To deliberately refresh those pins, run on the tool-supplying Linux server:
+`script/runner/toolchain.json` is the job-visible toolchain contract for the
+build server, Boat and tenant images. The tenant recipe calls Boat's tool
+installer with the tenant role, including the separate frozen `stable` copy,
+exact Rust components/targets, upstream NATS, GNU aliases and pinned runtime
+archives. The legacy release fields in `versions.txt` are still validated
+(including its pnpm 11.1.2 constraint), but do not select installed tools.
+`capture-versions.py` only refreshes that legacy summary. To propose a
+toolchain refresh, capture on the
+tool-supplying Linux server and review the shared manifest:
 
 ```sh
-python3 script/tenant-image/capture-versions.py
+python3 script/runner/toolchain-parity.py --capture > toolchain-state.json
+python3 script/runner/toolchain-parity.py --from-capture toolchain-state.json \
+  > toolchain-proposed.json
 ```
 
-Review and commit the refreshed `versions.txt` before building. Capturing refuses a pnpm version
-other than 11.1.2. It preserves the separately reviewed kernel, OS, package and
-installer pins. There is no automatic capture in the build path.
+Review the proposed shared manifest, source archives and per-role differences,
+then refresh both images' `runner_inputs_sha256` maps. Tenant pins also cover
+the shared Boat installer, parity checker, account installer and inotify sysctl.
+There is no automatic capture in the build path.
 
 The other inputs are:
 
@@ -142,7 +149,13 @@ The build creates the following artifacts under the operator-host output root,
 The image contains systemd, `motor-job`/`motor-cache` nologin accounts, sudo/ACL
 and namespace prerequisites, Python 3 and `motor-runner`. The existing tools
 installer's build-only directories live inside the disposable chroot; only
-`/usr/local/lib/motor/cargo/bin` and `/usr/local/lib/motor/rustup` enter the image.
+`/usr/local/lib/motor/cargo/bin`, `/usr/local/lib/motor/rustup`, the parity
+checker/manifest and sccache build receipts enter the image. Bun lives at
+`/home/ubuntu/.bun/bin` as on the build server. Required packages and Git build
+dependencies come from the shared manifest in addition to the tenant OS packages.
+Both images create `motor-job` with the manifest's exact UID and primary GID;
+numeric collisions refuse the build and name the existing owner. `motor-cache`
+remains an image-local, non-job account with a system-assigned identity.
 Registry, Git, build and compile caches are not baked into the shared image.
 Firecracker/jailer and the kernel compiler are host-only prerequisites from
 `tools.txt`, not guest VM-launching tools.
@@ -162,7 +175,10 @@ snapshots retain that upper. This setup must precede a per-size base snapshot.
 then listens on vsock. The rules use `eth0` (`net.ifnames=0`) instead of the
 host installer's physical-interface name. IPv4 forwarding is enabled, kernel
 module loading is disabled, and generic firewall/update/network services are
-masked; only the agent configures tenant networking. No SSH login is installed.
+masked; only the agent configures tenant networking. `openssh-server` supplies
+`/usr/sbin/sshd` for callers' transport tests, but SSH services/socket activation
+are masked and generated host keys removed. No SSH login is enabled. The shared
+inotify sysctl raises `fs.inotify.max_user_instances` to 8192 at guest boot.
 The nft and tenant-agent units forward their own stdout/stderr to the serial
 console, so an nft startup failure remains visible even when it prevents the
 agent and opt-in qualification unit from starting. Static module-load directories
@@ -181,7 +197,9 @@ are not accepted as immutable tool inputs, even when a version probe runs fine.
 The checked path list is recorded in tools.json before the image can complete.
 
 The agent receives `CARGO_HOME=/usr/local/lib/motor/cargo` as the **immutable
-bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/tenant`. It
+bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/home/ubuntu`.
+The latter makes the runner mount the immutable Bun directory into jobs; each
+job still gets its own `/motor-home` as HOME. The agent
 mounts the provisioned XFS `/dev/vdb`, binds its tool `bin` read-only onto
 `/tenant/cargo-home/bin`, binds `/tenant/roots/{Users,home}`, and runs the
 FICLONE probes. It starts the transient `motor-tenant-runner` unit using
@@ -247,6 +265,42 @@ companions set to `m`: those modules cannot be loaded in a guest that has no
 module store and locks module loading.
 
 ## Operator qualification
+
+Image creation runs `toolchain-parity.py --check --role tenant`, including
+required packages and sccache build receipts. Qualification reruns that host
+check after attachment and runs `--check --role tenant --job` in each leased
+job (cold, warm and post-restore). It fails if the checkout's parity inputs
+differ from those pinned into the image. The job check covers exact UID/GID,
+PATH order, tool versions, Rust components/targets and real libstd payloads,
+read-only Rustup, readable proc, writable shared memory, executable TMPDIR,
+sshd availability and the inotify instance floor. The versionless `gnutest`
+is bound to its package-qualified image hash, rechecked in the booted guest.
+Tenant dependency caches live on its private data disk; unlike Boat's fleet
+seed, their contents are not part of this immutable toolchain contract.
+
+On a host with a registered tenant, `qualify.py` deliberately refuses. Do not
+remove a registration or stop a live helper to bypass this fence. After the
+operator deploys the new image through the normal tenant replacement workflow,
+verify it with a real job on that tenant, not an operator shell. Obtain the
+trusted hash on the operator host:
+
+```sh
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parity"]["observed"]["tools"]["gnutest"]["sha256"])' \
+  /var/lib/motor-vm/tenant-images/IMAGE_VERSION/tools.json
+```
+
+Pass that hash literally to the job (do not compute it from the same job's
+`gnutest`, which would compare the file to itself):
+
+```sh
+python3 script/runner/toolchain-parity.py --capture --role tenant --job
+python3 script/runner/toolchain-parity.py --check --role tenant --job \
+  --gnu-test-sha256 OPERATOR_RECORDED_HASH
+```
+
+Require exit 0 and `passed: true`. Archive both outputs; a changed recipe does
+not prove a rebuilt/deployed image passes. Keep the normal disposable-host
+qualification lane for suspend/restore, kernel and isolation evidence.
 
 `qualify.py` is an operator-only lane for an already built image. Run it as root
 on the dedicated Linux KVM server, **not** through the remote-job runner. It
