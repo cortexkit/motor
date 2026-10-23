@@ -255,7 +255,9 @@ these unsigned binaries; scripts do not change Smart App Control or WDAC.
 Run `install.ps1` from an elevated administrator shell, not a SYSTEM scheduled
 task. Changing the parent file's owner requires that install context; the
 installer rejects SYSTEM before creating or changing installation state.
-`run-system.ps1` is for qualification only, not installation.
+`run-system.ps1` is for qualification only, not installation. Native commands are
+judged by their process exit code; captured stderr and exit status are logged in
+`C:\ProgramData\MotorRunner\installation-native.jsonl`.
 
 First compare the ZIP's SHA-256 with the checksum supplied with the release,
 then extract it to a fresh source directory, and run the parser/policy and native parent-identity fixtures **before any
@@ -349,10 +351,12 @@ guest EOF. No guest passwords, DPAPI files, registry hives or disk images are co
 
 ## One removal
 
-Copy evidence out first. Upgrades use this uninstall/reinstall path; install.ps1 refuses
-an existing root, so a fresh sealed parent must be provisioned before reinstalling.
-Copy removal scripts outside the root because the root, sealed parent, caches and
-every retained job record will be deleted:
+Before uninstalling, copy any evidence you need to retain from the runner root to a location
+outside it. Upgrades use this uninstall/reinstall path; install.ps1 refuses an existing
+root, so a fresh sealed parent must be provisioned before reinstalling. The uninstaller
+removes the marked SSH block even if an earlier install stopped before recording
+`ssh_block`. Copy removal scripts outside the root because the root, sealed parent,
+caches and every retained job record will be deleted:
 
 ```powershell
 New-Item C:\motor-runner-remove -ItemType Directory -Force | Out-Null

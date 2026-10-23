@@ -24,7 +24,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-script-tests-' + [Gu
 New-Item $root -ItemType Directory | Out-Null
 $script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = motor-prep,*S-1-5-32-544','SeDenyInteractiveLogonRight = *S-1-5-32-546')
 # The old installation's policy export names motor-prep, so resolve it to the recorded SID.
-$script:RunnerResolveTrusteeName = { param($name) if ($name -eq 'motor-prep') { 'S-1-5-21-111-222-333-1001' } else { throw "unknown account $name" } }
+$script:RunnerResolveTrusteeName = { param($name) if ($name -in @('motor-prep','motor-ssh',"$env:COMPUTERNAME\motor-ssh")) { 'S-1-5-21-111-222-333-1001' } else { throw "unknown account $name" } }
 function global:secedit.exe {
     $cfg = $args[[array]::IndexOf($args,'/cfg') + 1]
     if ($args -contains '/export') { $script:effective | ForEach-Object { $_ -replace '\*S-1-5-21-111-222-333-1001','motor-prep' } | Set-Content -LiteralPath $cfg -Encoding Unicode }
@@ -65,6 +65,66 @@ try {
 }
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    if ((Resolve-RunnerTrusteeSid 'motor-ssh') -cne 'S-1-5-21-111-222-333-1001' -or (Resolve-RunnerTrusteeSid "$env:COMPUTERNAME\motor-ssh") -cne 'S-1-5-21-111-222-333-1001') { throw 'FAIL sshd-account-name-resolves-to-recorded-sid' }
+    Write-Host 'PASS sshd-account-name-resolves-to-recorded-sid'
+    $count++
+    $nativeFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-native-tests-' + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $nativeFixtureRoot | Out-Null
+    try {
+        $nativeLog = Join-Path $nativeFixtureRoot 'native-commands.jsonl'
+        $nativeScript = Join-Path $nativeFixtureRoot 'stderr-success.cmd'
+        [IO.File]::WriteAllText($nativeScript, "@echo off`r`necho stderr-success-probe 1>&2`r`nexit /b 0`r`n", [Text.Encoding]::ASCII)
+        $native = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/d', '/c', $nativeScript) -Operation 'stderr-success-fixture' -LogPath $nativeLog
+        if ($native.exit_code -ne 0 -or $native.stderr -notmatch 'stderr-success-probe' -or (Get-Content -LiteralPath $nativeLog -Raw) -notmatch 'stderr-success-probe') {
+            throw 'FAIL native-command-exit-code-ignores-stderr-and-logs-it'
+        }
+        Write-Host 'PASS native-command-exit-code-ignores-stderr-and-logs-it'
+        $count++
+
+        $partialRoot = Join-Path $nativeFixtureRoot 'partial-install'
+        New-Item -ItemType Directory -Path $partialRoot | Out-Null
+        $partialSid = 'S-1-5-21-111-222-333-1001'
+        $sshHomeFixture = "C:\Users\motor-ssh.test-$([Guid]::NewGuid().ToString('N'))"
+        if (Test-Path -LiteralPath $sshHomeFixture) { throw 'FAIL partial-install-test-profile-path-not-fresh' }
+        $partialRecord = @{schema=1; accounts=@{'motor-ssh'=$partialSid}; ssh_home=$sshHomeFixture}
+        $partialRecordPath = Join-Path $partialRoot 'installation.json'
+        [IO.File]::WriteAllText($partialRecordPath, (ConvertTo-Json -InputObject $partialRecord -Compress), [Text.UTF8Encoding]::new($false))
+        $originalSshd = "Port 22`r`n"
+        $ownedSshd = $originalSshd + "# BEGIN MOTOR RUNNER`r`nMatch User motor-ssh`r`n    ForceCommand C:/ProgramData/MotorRunner/bin/motor-runner.exe connect`r`nMatch all`r`n# END MOTOR RUNNER`r`n"
+        $sshdConfig = Join-Path $partialRoot 'sshd_config'
+        [IO.File]::WriteAllText($sshdConfig, $ownedSshd, [Text.UTF8Encoding]::new($false))
+        $partialRecordRead = Get-Content -LiteralPath $partialRecordPath -Raw | ConvertFrom-Json
+        if ($partialRecordRead.PSObject.Properties['ssh_block']) { throw 'FAIL partial-install-fixture-omits-late-ssh-block-flag' }
+        $global:partialSshSid = $partialSid
+        $global:partialSshAccountRemoved = $false
+        $global:partialSshdRestarted = $false
+        function global:Get-LocalUser {
+            [CmdletBinding()]
+            param([string]$Name)
+            if ($Name -eq 'motor-ssh') { return [pscustomobject]@{SID=[pscustomobject]@{Value=$global:partialSshSid}} }
+            return $null
+        }
+        function global:Remove-LocalUser {
+            param([string]$Name)
+            if ($Name -eq 'motor-ssh') { $global:partialSshAccountRemoved = $true }
+        }
+        function global:Get-CimInstance { return @() }
+        function global:Restart-Service {
+            param([string]$Name)
+            if ($Name -eq 'sshd') { $global:partialSshdRestarted = $true }
+        }
+        try {
+            $removedSshState = Remove-RunnerSshInstallState -Installation $partialRecordRead -SshdConfig $sshdConfig -LogPath $nativeLog -SshdPath "$env:SystemRoot\System32\cmd.exe" -SshdArguments @('/d', '/c', $nativeScript)
+            if (-not $removedSshState -or [IO.File]::ReadAllText($sshdConfig) -cne $originalSshd -or -not $global:partialSshAccountRemoved -or -not $global:partialSshdRestarted) {
+                throw 'FAIL partial-install-ssh-account-and-block-cleanup'
+            }
+        } finally {
+            Remove-Item Function:\Get-LocalUser,Function:\Remove-LocalUser,Function:\Get-CimInstance,Function:\Restart-Service
+            Remove-Variable -Name partialSshAccountRemoved,partialSshdRestarted,partialSshSid -Scope Global -ErrorAction SilentlyContinue
+        }
+        Write-Host 'PASS partial-install-ssh-account-and-block-cleanup-without-ssh-block-record'
+        $count++
+    } finally { Remove-Item -LiteralPath $nativeFixtureRoot -Recurse -Force }
     . "$PSScriptRoot\guest-agent-identity.ps1"
     $parentAgentHash = 'A' * 64
     $otherAgentHash = 'B' * 64

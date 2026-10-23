@@ -30,6 +30,34 @@ class InstallScriptTests(unittest.TestCase):
                                      f"{script.name}: {match.group(1)!r}")
         self.assertGreater(found, 0, "no New-LocalUser -Description literal found to check")
 
+    def test_installer_native_commands_capture_stderr_and_check_exit_code(self):
+        install = (HERE / "install.ps1").read_text()
+        accounts = (HERE / "accounts.ps1").read_text()
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("Invoke-RunnerNative", install)
+        self.assertIn("installation-native.jsonl", install)
+        self.assertNotRegex(install, r"(?m)^\s*&\s*(?:[^\r\n]*\\)?['\"]?(?:icacls|sshd|powercfg|sc)\.exe")
+        self.assertIn("RedirectStandardError = $true", accounts)
+        self.assertIn("stderr = $stderr", accounts)
+        self.assertIn("if ($exitCode -ne 0)", accounts)
+        self.assertIn("native-command-exit-code-ignores-stderr-and-logs-it", fixture)
+        self.assertIn("stderr-success-probe 1>&2", fixture)
+        self.assertIn("exit /b 0", fixture)
+        self.assertIn('Invoke-RunnerNative -FilePath "$env:SystemRoot\\System32\\cmd.exe"', fixture)
+
+
+    def test_ssh_account_resolution_precedes_config_rewrite(self):
+        install = (HERE / "install.ps1").read_text()
+        create = install.index("$null = New-OwnedUser 'motor-ssh'")
+        self.assertIn("Resolve-RunnerTrusteeSid 'motor-ssh'", install)
+        resolve = install.index("Resolve-RunnerTrusteeSid 'motor-ssh'")
+        local_resolve = install.index(r'Resolve-RunnerTrusteeSid "$env:COMPUTERNAME\motor-ssh"')
+        rewrite = install.index("[IO.File]::WriteAllText($sshdConfig")
+        self.assertLess(create, resolve)
+        self.assertLess(resolve, local_resolve)
+        self.assertLess(local_resolve, rewrite)
+        self.assertIn("motor-ssh name resolution returned short=", install)
+
     def test_installer_pins_guest_agent_hash_from_sealed_provisioning_record(self):
         install = (HERE / "install.ps1").read_text()
         identity = (HERE / "guest-agent-identity.ps1").read_text()
@@ -64,6 +92,19 @@ class InstallScriptTests(unittest.TestCase):
         qualification = (HERE / "qualify-jobs.py").read_text()
         self.assertIn("self.request_status(hello_timeout)", qualification)
         self.assertIn("require_windows_guest_agent_ready", qualification)
+
+    def test_uninstaller_cleans_partial_ssh_block_without_late_install_flag(self):
+        uninstall = (HERE / "uninstall.ps1").read_text()
+        ssh_cleanup = uninstall.split("$sshdConfig = ", 1)[1].split("if ($record.PSObject.Properties['power'])", 1)[0]
+        self.assertIn("Remove-RunnerSshInstallState", ssh_cleanup)
+        self.assertNotIn("Properties['ssh_block']", ssh_cleanup)
+        self.assertIn("if ($service) {", uninstall)
+        self.assertLess(uninstall.index("if ($service) {"), uninstall.index("Remove-RunnerSshInstallState"))
+        accounts = (HERE / "accounts.ps1").read_text().split("function Remove-RunnerSshInstallState", 1)[1]
+        self.assertLess(accounts.index("Remove-RunnerSshConfigBlock"), accounts.index("Remove-LocalUser motor-ssh"))
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("partial-install-ssh-account-and-block-cleanup-without-ssh-block-record", fixture)
+        self.assertIn("native-command-exit-code-ignores-stderr-and-logs-it", fixture)
 
     def test_cmd_never_echoes_a_variable_straight_into_a_redirect(self):
         # In cmd, `echo %errorlevel%>file` with a one-digit value reads as a

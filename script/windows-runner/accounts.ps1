@@ -67,7 +67,138 @@ function Remove-RunnerPrepAccount([string]$Root, [string]$Sid) {
     }
     if ($account) { Remove-LocalUser motor-prep }
 }
-function Protect-RunnerPath([string]$Path) {
-    & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Cannot protect $Path" }
+function Protect-RunnerPath {
+    param([string]$Path, [string]$LogPath)
+    if (-not $LogPath) { $LogPath = Join-Path $Path 'native-command.jsonl' }
+    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @(
+        $Path, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '/Q'
+    ) -Operation "protect runner path $Path" -LogPath $LogPath
+}
+
+function ConvertTo-RunnerNativeArgument {
+    param([AllowNull()][string]$Argument)
+    if ($null -eq $Argument -or $Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append([char]34)
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char]92) { $backslashes++; continue }
+        if ($character -eq [char]34) {
+            for ($index = 0; $index -lt ($backslashes * 2 + 1); $index++) { [void]$builder.Append([char]92) }
+            [void]$builder.Append([char]34)
+        } else {
+            for ($index = 0; $index -lt $backslashes; $index++) { [void]$builder.Append([char]92) }
+            [void]$builder.Append($character)
+        }
+        $backslashes = 0
+    }
+    for ($index = 0; $index -lt ($backslashes * 2); $index++) { [void]$builder.Append([char]92) }
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
+}
+
+function Invoke-RunnerNative {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [Parameter(Mandatory)][string]$Operation,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $quotedArguments = @($ArgumentList | ForEach-Object { ConvertTo-RunnerNativeArgument $_ })
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = [string]::Join(' ', [string[]]$quotedArguments)
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "Cannot start native command $Operation" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+    $entry = [ordered]@{
+        utc = [DateTime]::UtcNow.ToString('o')
+        operation = $Operation
+        executable = $FilePath
+        arguments = [string]::Join(' ', [string[]]$quotedArguments)
+        exit_code = $exitCode
+        stderr = $stderr
+    }
+    [IO.File]::AppendAllText($LogPath, (ConvertTo-Json -InputObject $entry -Compress) + "`r`n", [Text.UTF8Encoding]::new($false))
+    if ($exitCode -ne 0) { throw "Native command $Operation failed exit=$exitCode; see $LogPath" }
+    return [pscustomobject]@{ exit_code=$exitCode; stdout=$stdout; stderr=$stderr }
+}
+
+function Remove-RunnerSshConfigBlock {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$LogPath,
+        [string]$SshdPath,
+        [string[]]$SshdArguments
+    )
+    $config = [IO.File]::ReadAllText($ConfigPath)
+    $pattern = '(?ms)^# BEGIN MOTOR RUNNER\r?\n.*?^# END MOTOR RUNNER\r?\n?'
+    $matches = [regex]::Matches($config, $pattern)
+    if ($matches.Count -gt 1) { throw 'Multiple SSH ownership blocks; manual reconciliation required' }
+    if ($matches.Count -eq 0) { return $false }
+    $updated = [regex]::Replace($config, $pattern, '')
+    [IO.File]::WriteAllText($ConfigPath, $updated, [Text.UTF8Encoding]::new($false))
+    if (-not $SshdPath) { $SshdPath = "$env:SystemRoot\System32\OpenSSH\sshd.exe" }
+    if (-not $PSBoundParameters.ContainsKey('SshdArguments')) { $SshdArguments = @('-t', '-f', $ConfigPath) }
+    try {
+        $null = Invoke-RunnerNative -FilePath $SshdPath -ArgumentList $SshdArguments -Operation 'validate SSH config after runner block removal' -LogPath $LogPath
+    } catch {
+        [IO.File]::WriteAllText($ConfigPath, $config, [Text.UTF8Encoding]::new($false))
+        throw "SSH configuration removal failed validation; original restored: $_"
+    }
+    return $true
+}
+
+
+function Remove-RunnerSshInstallState {
+    param(
+        [Parameter(Mandatory)]$Installation,
+        [Parameter(Mandatory)][string]$SshdConfig,
+        [Parameter(Mandatory)][string]$LogPath,
+        [string]$SshdPath,
+        [string[]]$SshdArguments
+    )
+    $sshValidation = @{ConfigPath=$SshdConfig; LogPath=$LogPath}
+    if ($SshdPath) { $sshValidation.SshdPath = $SshdPath }
+    if ($PSBoundParameters.ContainsKey('SshdArguments')) { $sshValidation.SshdArguments = $SshdArguments }
+    $removedBlock = Remove-RunnerSshConfigBlock @sshValidation
+    if ($removedBlock) { Restart-Service sshd }
+    if ($Installation.PSObject.Properties['ssh_home']) {
+        if ($Installation.ssh_home -notmatch '^C:\\Users\\motor-ssh(?:\.[^\\]+)?$') { throw 'Unexpected SSH home path' }
+        $sidRecord = $Installation.accounts.PSObject.Properties['motor-ssh']
+        if (-not $sidRecord) { throw 'SSH profile lacks an owned account SID' }
+        $sid = $sidRecord.Value
+        $profiles = @(Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid)
+        if ($profiles.Count -gt 1) { throw 'Ambiguous SSH profile ownership' }
+        if ($profiles.Count -eq 1) {
+            if ($profiles[0].LocalPath -ine $Installation.ssh_home -or $profiles[0].Loaded) { throw 'SSH profile path changed or is still loaded; close its sessions and retry removal' }
+            $profiles[0] | Remove-CimInstance
+        }
+        if (Test-Path -LiteralPath $Installation.ssh_home) {
+            if ((Get-Item -LiteralPath $Installation.ssh_home -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a reparse SSH home' }
+            Remove-Item -LiteralPath $Installation.ssh_home -Recurse -Force
+        }
+    }
+    $sshAccount = $Installation.accounts.PSObject.Properties['motor-ssh']
+    if ($sshAccount) {
+        $account = Get-LocalUser motor-ssh -ErrorAction SilentlyContinue
+        if ($account -and $account.SID.Value -ne $sshAccount.Value) { throw 'Account SID changed: motor-ssh; refusing deletion' }
+        if ($account) { Remove-LocalUser motor-ssh }
+    }
+    return $removedBlock
 }
