@@ -69,6 +69,8 @@ impl TenantConnection {
     /// Logs why this tenant connection is being closed. `frame` names the
     /// refused frame's type (or why no frame could be decoded), never its
     /// contents, so a refusal names itself without copying peer data.
+    /// `reason` is a snake_case label, so the tenant diagnostics journal
+    /// filter can pass it through.
     fn operation_refused(&self, frame: &str, reason: &'static str) {
         tracing::warn!(jti = %self.lease.jti, frame, reason, "operation_refused");
     }
@@ -186,11 +188,11 @@ async fn reader<R: AsyncRead + Unpin>(
                 result = read_record_async(&mut read) => match result {
                     Ok(Some(DecodedFrame::Frame(frame))) => Ok(Some(frame)),
                     Ok(None) => Ok(None),
-                    Ok(Some(DecodedFrame::Unknown(_))) => { trace.reason = "unknown_frame"; ctx.operation_refused("unknown", "unknown frame type"); break; }
+                    Ok(Some(DecodedFrame::Unknown(_))) => { trace.reason = "unknown_frame"; ctx.operation_refused("unknown", "unknown_frame_type"); break; }
                     Err(error) => {
                         // The decode error text can quote peer bytes; log its kind only.
                         tracing::warn!(jti = %ctx.lease.jti, kind = ?error.kind(), "tenant frame read failed");
-                        ctx.operation_refused("undecodable", "frame read failed");
+                        ctx.operation_refused("undecodable", "frame_read_failed");
                         trace.reason = "read_error";
                         trace.error_kind = Some(error.kind());
                         break;
@@ -220,7 +222,7 @@ async fn reader<R: AsyncRead + Unpin>(
         trace.frame(&frame);
         if let Some(ctx) = &tenant {
             if !ctx.allowed(&frame, &mut hello, &mut ran) {
-                ctx.operation_refused(&frame_type(&frame), "not allowed on this tenant connection");
+                ctx.operation_refused(&frame_type(&frame), "not_allowed_on_tenant_connection");
                 trace.reason = "operation_refused";
                 break;
             }
@@ -462,6 +464,17 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         tenant.as_ref(),
     )
     .await;
+    if let Some(ctx) = &tenant {
+        // The session's own end, beside the reader's and writer's
+        // runner_channel_closed: "returned" covers a delivered terminal, a
+        // refusal and the reader closing first. The error text can quote peer
+        // data, so only its kind is logged.
+        let (reason, error_kind) = match &result {
+            Ok(()) => ("returned", None),
+            Err(error) => ("error", Some(error.kind())),
+        };
+        tracing::info!(jti = %ctx.lease.jti, reason, error_kind = ?error_kind, "tenant_job_stream_ended");
+    }
     reading.abort();
     drop(tx);
     while tasks.join_next().await.is_some() {}
@@ -580,7 +593,7 @@ async fn session(
                 match locked(&runner, move |r| r.accept(admitted)).await? {
                     Admission::Duplicate => {
                         if let Some(ctx) = tenant {
-                            ctx.operation_refused("run", "job already has a record");
+                            ctx.operation_refused("run", "job_already_has_record");
                         }
                         return Ok(());
                     }
@@ -1037,7 +1050,12 @@ async fn attach(
                     let outcome = locked(runner, move |r| r.withdraw_for(id, reason, spill)).await?;
                     send(tx, Frame::WithdrawReply { outcome }).await?;
                 },
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected attach frame")),
+                Some(other) => {
+                    // Name the frame's type, never its contents, so the
+                    // tenant's journal says which frame ended the stream.
+                    tracing::warn!(job_id = %id, frame = %frame_type(&other), "runner job stream refused frame");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected attach frame"));
+                }
             }
         }
     }

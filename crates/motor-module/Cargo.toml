@@ -54,6 +54,8 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+# motor-host's helper trait returns anyhow results; the hosted relay test implements it.
+anyhow = "1"
 rcgen = "0.13"
 subc-transport = { workspace = true }
 motor-runner = { path = "../motor-runner" }

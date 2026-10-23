@@ -257,6 +257,37 @@ part of a rollback.
 
 To return to service, run `--check`, then `--start`.
 
+## Read the tenant runner's log
+
+The tenant runner logs inside the VM, where there is no SSH or exec. The
+host reads its journal through the read-only `diagnostics` operation on
+`motor-host`'s admin socket, which the guest answers on port 54. For a time
+window, optionally narrowed to one job:
+
+```sh
+sudo python3 /srv/build/src/motor/script/hosted-host/hosted_host.py runner-log \
+  --tenant tenant-1 --since 2026-10-23T14:00:00Z --until 2026-10-23T14:05:00Z \
+  --job <job id>
+```
+
+`--since` and `--until` take Unix seconds or ISO 8601 (UTC when no zone is
+given); `--job` keeps only entries naming that job id. The guest returns at
+most 1000 entries and ends the output with a `# truncated` line when the window
+held more. It redacts every line to the runner's own fixed messages with their
+labels, counters and job ids. For a job stream these are
+`runner_channel_closed` (one each for the read and write sides: `reason`,
+`error_kind`, the last `frame_type` and `seq`), `operation_refused` (the
+refused frame's type), `runner job stream refused frame`,
+`tenant frame read failed` and `tenant_job_stream_ended`. Other text appears
+as `[message omitted]`. On the host side, `motor-host` logs `relay_finished`
+and, when the guest closed its input first, `guest_input_closed`.
+
+The guest journal is in the VM's memory. It survives suspend and restore but
+not a fresh start of the VM. The window and job filter need this change in
+both `motor-host` (which forwards the request) and the guest image (which
+answers it); an older guest returns only its last 64 entries, whatever the
+window, with the job-stream lines omitted.
+
 ## Remove a departed customer's tenant
 
 The public privacy page promises that a departed customer's tenant VM disk is
