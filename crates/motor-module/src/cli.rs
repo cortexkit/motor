@@ -32,6 +32,7 @@ use tokio::{
     time::Instant,
 };
 
+mod records;
 #[cfg(test)]
 mod return_tests;
 mod returned_files;
@@ -97,6 +98,8 @@ and stderr here as they arrive.
   --return-max-bytes N  cap total returned raw bytes (default/maximum 10485760;
                        legacy runners are capped at 262144)
   --secret-file PATH  save the reattach secret in this new 0600 file (optional)
+  --record-file PATH  save Accepted/Started/Output/Terminal JSONL to a new 0600
+                      file, without route credentials (output may be sensitive)
   --allow-spill       allow this gate job to spill to hosted capacity when configured
   --hosted            operator test of the hosted path: run this one job on a
                       hosted runner, never on the build server; a lease that
@@ -146,6 +149,7 @@ pub struct RunArgs {
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
     pub secret_file: Option<PathBuf>,
+    pub record_file: Option<PathBuf>,
     pub return_paths: Vec<String>,
     pub return_max_bytes: Option<u64>,
     pub allow_spill: bool,
@@ -207,6 +211,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 | "--timeout"
                 | "--cwd"
                 | "--secret-file"
+                | "--record-file"
                 | "--return-path"
                 | "--return-max-bytes"
         ) {
@@ -259,6 +264,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "--sibling" => parsed.siblings.push(PathBuf::from(value)),
             "--cwd" => parsed.cwd = Some(PathBuf::from(value)),
             "--secret-file" => parsed.secret_file = Some(PathBuf::from(value)),
+            "--record-file" => parsed.record_file = Some(PathBuf::from(value)),
             "--return-path" => parsed.return_paths.push(value),
             "--return-max-bytes" => {
                 parsed.return_max_bytes = Some(value.parse().map_err(|_| {
@@ -767,6 +773,18 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
+    drive_run_recorded(client, request, secret_file, None, out, err, interrupts).await
+}
+
+async fn drive_run_recorded<C: ExecClient + ?Sized>(
+    client: &C,
+    request: &RunRequest,
+    secret_file: Option<SecretFile>,
+    records: Option<records::Capture>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
     let default_secret_directory = if secret_file.is_none() {
         match prepare_default_secret_directory() {
             Ok(directory) => Some(directory),
@@ -781,7 +799,7 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     drive_run_with_secret_directory(
         client,
         request,
-        secret_file,
+        (secret_file, records),
         default_secret_directory,
         out,
         err,
@@ -793,7 +811,7 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
 async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
     client: &C,
     request: &RunRequest,
-    secret_file: Option<SecretFile>,
+    files: (Option<SecretFile>, Option<records::Capture>),
     default_secret_directory: Option<PathBuf>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -826,7 +844,8 @@ async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
             ),
             job_id: None,
             secret: None,
-            secret_file,
+            secret_file: files.0,
+            records: files.1,
             default_secret_directory,
             default_secret_file: None,
         },
@@ -838,6 +857,7 @@ async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
 }
 
 struct Session {
+    records: Option<records::Capture>,
     returns: returned_files::Returns,
     job_id: Option<Uuid>,
     secret: Option<String>,
@@ -892,6 +912,7 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
         client,
         stream,
         Session {
+            records: None,
             returns: returned_files::Returns::new(
                 client
                     .local_workspace()
@@ -1154,6 +1175,12 @@ async fn consume<C: ExecClient + ?Sized>(
                 continue;
             }
         };
+        if let Some(capture) = &mut session.records {
+            if let Err(error) = capture.record(&record) {
+                let _ = writeln!(err, "ck motor {name}: record capture failed: {error}");
+                return EXIT_UNKNOWN;
+            }
+        }
         match record {
             StreamRecord::Accepted(accepted) => {
                 if let Some(state) = &hosted {
@@ -1598,6 +1625,18 @@ pub async fn main(args: &[String]) -> u8 {
             return EXIT_USAGE;
         }
     };
+    let records = match args
+        .record_file
+        .as_deref()
+        .map(records::Capture::create)
+        .transpose()
+    {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("ck motor run: cannot create record file: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let mut interrupts = match interrupt_signals() {
         Ok(interrupts) => interrupts,
         Err(error) => {
@@ -1623,10 +1662,11 @@ pub async fn main(args: &[String]) -> u8 {
     client.hosted = args.hosted;
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    drive_run(
+    drive_run_recorded(
         &client,
         &request,
         secret_file,
+        records,
         &mut out,
         &mut err,
         &mut interrupts,
@@ -2018,7 +2058,7 @@ mod tests {
     #[test]
     fn arguments_map_onto_the_run_request_fields() {
         let Ok(Invocation::Run(args)) = parse_args(&words(
-            "--vcpus 4 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w -- cargo test -p x",
+            "--vcpus 4 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w --record-file=/evidence.jsonl -- cargo test -p x",
         )) else {
             panic!("expected a run")
         };
@@ -2037,6 +2077,7 @@ mod tests {
                 cwd: Some("/w".into()),
                 command: words("cargo test -p x"),
                 secret_file: None,
+                record_file: Some("/evidence.jsonl".into()),
                 return_paths: Vec::new(),
                 return_max_bytes: None,
                 allow_spill: false,
@@ -2449,6 +2490,7 @@ mod hosted_cli_tests {
                 &UnusedClient,
                 Box::new(records),
                 Session {
+                    records: None,
                     returns: returned_files::Returns::new(
                         None,
                         None,
@@ -2471,6 +2513,72 @@ mod hosted_cli_tests {
     }
 
     #[tokio::test]
+    async fn record_file_captures_protocol_without_cli_diagnostics_or_credentials() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-record-file");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let path = scratch.join("records.jsonl");
+        let id = Uuid::now_v7();
+        let mut accepted =
+            json!({"type":"accepted", "job_id":id, "queue_position":0, "platform":"macos"});
+        accepted["direct_job"] = json!({"job_id":id,"secret":"private-reattach-token"});
+        let records = [
+            accepted,
+            json!(StreamRecord::Started(motor_protocol::Started::new(0, 0, 1))),
+            json!(StreamRecord::Output(motor_protocol::Output::new(
+                1,
+                OutputStream::Stdout,
+                motor_protocol::BytePayload(vec![0, 255, 10])
+            ))),
+            json!(StreamRecord::Output(motor_protocol::Output::new(
+                2,
+                OutputStream::Stderr,
+                motor_protocol::BytePayload(b"guest error\n".to_vec())
+            ))),
+            json!(StreamRecord::Terminal(TerminalRecord::new(
+                id,
+                Outcome::Exit { code: 23 },
+                1,
+                0,
+                0
+            ))),
+        ];
+        let client = DirectRunClient(
+            records
+                .iter()
+                .map(|r| serde_json::to_vec(r).unwrap())
+                .collect(),
+        );
+        let request = RunRequest::new("workspace", "repository", "workspace", "false");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            (None, Some(records::Capture::create(&path).unwrap())),
+            Some(directory),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 23);
+        assert_eq!(out, vec![0, 255, 10]);
+        assert!(String::from_utf8_lossy(&err).contains("secret-file="));
+        let capture = std::fs::read_to_string(path).unwrap();
+        assert!(!capture.contains("private-reattach-token") && !capture.contains("secret-file="));
+        let saved: Vec<serde_json::Value> = capture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 5);
+        assert_eq!(saved[0]["platform"], "macos");
+        assert_eq!(saved[1]["type"], "started");
+        assert_eq!(saved[2]["bytes"], "AP8K");
+        assert_eq!(saved[3]["bytes"], "Z3Vlc3QgZXJyb3IK");
+        assert_eq!(saved[4]["outcome"], json!({"type":"exit", "code":23}));
+    }
+
+    #[tokio::test]
     async fn default_run_secret_never_reaches_output_and_attach_finds_it_by_id() {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-default-secret");
         let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
@@ -2488,7 +2596,7 @@ mod hosted_cli_tests {
         let code = drive_run_with_secret_directory(
             &client,
             &request,
-            None,
+            (None, None),
             Some(directory.clone()),
             &mut out,
             &mut err,
@@ -2560,7 +2668,7 @@ mod hosted_cli_tests {
         let code = drive_run_with_secret_directory(
             &client,
             &request,
-            None,
+            (None, None),
             Some(directory),
             &mut out,
             &mut err,

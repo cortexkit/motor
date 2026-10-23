@@ -171,7 +171,7 @@ file or failed native probe is a refusal, not a skipped check.
 Portable contracts:
 
 ```sh
-python3 -m unittest -v script/macos-runner/test_macos_runner.py script/runner/test_toolchain_parity.py
+python3 -m unittest -v script/macos-runner/test_macos_runner.py script/macos-runner/test_qualification.py script/runner/test_toolchain_parity.py
 ```
 
 Inside a real job VM, as `motorjob`, from the repository snapshot:
@@ -196,3 +196,54 @@ Portable checks and Swift typechecking do not qualify a real VM. Run all install
 root-daemon startup, libproc identity, actual internal-disk clones and guest mounts,
 vsock/nonce isolation, key deletion and Remote Login shutdown. No such privileged
 or live-VM qualification is claimed by this recipe's portable tests.
+
+### Operator evidence tools
+
+Install the reviewed `ck-motor` as well as the runner/helper. `ck motor run
+--record-file <new-path>` saves Accepted/Started/Output/Terminal as 0600 JSONL,
+separate from CLI diagnostic stderr. These are typed protocol records, not the
+route envelope containing the reattach secret; Output bytes remain base64 and
+can themselves be sensitive. The actual `Accepted.platform` is retained.
+
+On an idle dedicated instance, set `MOTOR_MACOS_QUALIFICATION_EVIDENCE` to a
+persistent writable directory outside build/cache trees. The ignored native
+lanes retain per-job protocol records, CLI streams/exits, observed ownership
+records and live helper VM requests there. The concurrent lane also requires
+`MOTOR_MACOS_QUALIFICATION_WORKSPACE_SECOND`: a separate canonical Git root,
+not another cwd inside the first checkout. Only the two Accepted job IDs' live
+service identities count toward overlap; ambient VMs cannot satisfy it.
+
+`guest_capture.py` wraps each concurrent build once, captures its raw streams,
+wait status and build duration, then waits for host collection before exiting.
+The host copies those files out of the job tree before acknowledging.
+`python3 script/macos-runner/qualification.py <job-evidence-directory>` checks
+independent guest bytes/status against decoded Output, Terminal and CLI exit.
+It tolerates identical replay, not output gaps, reordering or changed replay.
+`test_qualification.py` tests both the independent capture handshake and negative
+stream/status comparisons; these are not live VM proofs.
+
+Create reviewed disposable fixtures with
+`python3 script/macos-runner/fixtures.py <new-directory-under-/Users>`.
+The generator performs no fetch, refuses an existing destination, and creates
+committed workspace/sibling repositories with a locked Darwin-arm64 esbuild
+package and both Bun `file:../sibling` and Cargo `path="../sibling"` dependencies.
+Use their paths for the Bun lane with cold dedicated caches; `bun verify.js`
+uses both the JS sibling and the native package, while Cargo tests the Rust
+sibling. Locks are tracked and hashed before/after the guest build.
+
+The generator also creates private-good/private-missing repositories with an
+unreachable loopback HTTPS source, two distinct locked commits, and a separate
+client Cargo cache holding only the positive commit. Configure that cache as
+`CARGO_HOME` in the **installed private ck-motor service** before the private lane;
+a test-shell variable does not configure the service. Set the lane's
+`MOTOR_MACOS_QUALIFICATION_PRIVATE_GOOD`, `_PRIVATE_MISSING` and `_PRIVATE_URL`
+from `fixtures.json`. Retain an owner-controlled host network capture with a
+labelled control connection showing it records traffic; verify prep did not
+contact that URL. The negative
+job must refuse with its source named and no Started record. The guest's absent
+NIC alone cannot prove host prep stayed offline. Run host tests as `motor` with
+read access to the configured state root's ownership records and job trees.
+Provision the installed private ck-motor service with vault SSH signing
+access for the `motor` runner route. That service setup, cold-cache provisioning
+and live network observation remain owner work; never open state permissions or
+evict shared live caches to make a lane start.

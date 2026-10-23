@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "motor-macos-qualification",
+      "dependencies": {
+        "@esbuild/darwin-arm64": "0.25.5",
+        "motor-qualification-sibling": "file:../sibling",
+      },
+    },
+  },
+  "packages": {
+    "@esbuild/darwin-arm64": ["@esbuild/darwin-arm64@0.25.5", "", { "os": "darwin", "cpu": "arm64" }, "sha512-GtaBgammVvdF7aPIgH2jxMDdivezgFu6iKpmT+48+F8Hhg5J/sfnDieg0aeG/jfSvkYQU2/pceFPDKlqZzwnfQ=="],
+    "motor-qualification-sibling": ["motor-qualification-sibling@file:../sibling", {}],
+  }
+}

@@ -156,7 +156,7 @@ as degraded status and a warning; direct runner admission can still use free slo
 Recovery ignores unrelated/temp record-directory entries, while valid ownership
 records with invalid resource paths still fail closed.
 
-The four job-level ignored `macos_qualification_*` integration tests run on the VM host
+The five job-level ignored `macos_qualification_*` integration tests run on the VM host
 against the **installed** launchd daemon through `ck motor run --platform macos`,
 not a test-owned runner or an SSH command shell. Set
 `MOTOR_MACOS_QUALIFICATION_WORKSPACE`, `MOTOR_MACOS_QUALIFICATION_STATE_ROOT`, and
@@ -170,6 +170,15 @@ vsock connection probe using the sealed image's Command Line Tools. The env lane
 checks that tool version against `script/macos-runner/toolchain.json`. The isolation
 lane also observes a guest-written file in the live host job tree and checks its
 motor ownership.
+Run host qualification as `motor`, with `MOTOR_MACOS_QUALIFICATION_EVIDENCE`
+naming a persistent writable evidence directory outside build/cache trees. The
+installed client must include `--record-file`: every job retains credential-free
+Accepted/Started/Output/Terminal JSONL, CLI streams and exit status. Concurrent
+builds also retain independent guest streams/status before job-tree cleanup;
+`script/macos-runner/qualification.py` compares bytes, sequence order and status.
+Set `MOTOR_MACOS_QUALIFICATION_WORKSPACE_SECOND` to a second canonical Git root
+for concurrency. The lane rejects two cwds in one checkout and counts only the
+two Accepted job IDs' live recorded services, never ambient VMs.
 Keep the provider's existing SYNAPSE workload (its `synapse-work` checkout) active
 for the concurrent lane, and retain the provider operator's confirmation that it
 ran throughout the measurement. This deliberately measures memory and swap while
@@ -179,6 +188,19 @@ minimum free memory, swap observations and service owners. The nonce permission
 probe uses an aligned 4096-byte read and accepts only EACCES or EPERM, never an
 alignment failure such as EINVAL. The Bun fixture must have
 locked local sibling dependencies and a darwin-arm64-only package.
+`script/macos-runner/fixtures.py <new-directory-under-/Users>` supplies committed
+Bun/Cargo sibling fixtures and a pinned Darwin-arm64 esbuild package. The Bun
+lane executes that package and both sibling dependencies, and compares lock
+hashes. The generator also supplies positive/missing-commit private dependency
+fixtures and an isolated client Cargo cache. Run
+`macos_qualification_private_bundle` with `_PRIVATE_GOOD`, `_PRIVATE_MISSING` and
+`_PRIVATE_URL` variables prefixed by `MOTOR_MACOS_QUALIFICATION`; configure the
+reported Cargo cache in the installed ck-motor service, not just the test shell.
+The positive job builds offline; the negative must refuse before Started and
+name the source. A host packet capture with a known control connection must
+separately prove prep did not contact the unreachable source. Fixture setup,
+cache requirements and evidence commands are in
+[`script/macos-runner/README.md`](../script/macos-runner/README.md#operator-evidence-tools).
 
 ## Host helper and sealed-image layout
 
@@ -280,24 +302,21 @@ an image-build option.
 The following checks require the installed daemon and a dedicated operator host;
 they are not portable tests and are not run by ordinary crate tests:
 
-- `macos_qualification_helper_identity`: start two job helpers, prove that each
-  reports its own same-`motor`-UID service holding its clone disk, and verify the
-  optional responsible-PID answer when available. Confirm that the headless job
-  configuration validates, and confirm the exact disk/share/device layout.
+- `macos_qualification_helper_identity`: start one job through the installed
+  daemon and prove its helper reports its own same-`motor`-UID service holding
+  its clone disk. This single-helper lane does not prove two-helper disambiguation.
 - `macos_qualification_helper_sigkill`: SIGKILL a helper with a running VM; verify
   its service exits and releases boot, auxiliary and nonce vnode references
   within two seconds. Prove `release_proven` succeeds only after release. If this
   fails, retain resources/slots and choose an operator-approved fallback before
   rollout; never replace proof with a host-wide VM count or advisory lock.
-- `macos_qualification_helper_gate`: kill the runner before opening a recorded
-  gate, and again after opening it; confirm no VM starts in the first case and
-  the second helper stops its VM before exiting. A failed stop remains degraded.
-- `macos_qualification_nonce_channel`: verify in the guest that both raw and
-  block nonce devices are root-owned and unreadable by `motorjob` (distinct from
-  the host's motor-owned 0400 image file). Confirm correct-Hello authentication,
-  refusal of a second connection, and that a bad first Hello fails the job.
-  Verify the guest mount setup honors every plan tag,
-  guest destination and access mode before any job starts.
+- `macos_qualification_helper_gate`: drive the exact installed signed helper
+  directly, closing gate stdin before and after opening it; no VM may start in
+  the first case, and EOF must stop the second VM before cleanup escalation.
+  This tests the gate primitive, not an actual runner SIGKILL.
+- `macos_qualification_isolation`: deny guest raw-disk reads and guest vsock
+  access, and check exact mounts, guest identity and host file ownership. There
+  is no separate `macos_qualification_nonce_channel` integration test.
 
 ### Audit limits retained deliberately
 
@@ -332,7 +351,7 @@ successfully with `Stopped { reason: GateEof }`, and its VM/service/disk referen
 must be gone within two seconds of EOF, before any escalation exists. Cleanup
 fallback runs only after the proof passed or failed and retains the inventory if
 release cannot be established. It never turns a failed EOF proof into a pass.
-All seven host qualification tests serialize their lanes, except the concurrent
+All eight host qualification tests serialize their lanes, except the concurrent
 lane's deliberate two-job pair. Real job qualification remains daemon-based;
 this separately authorized primitive directly drives the installed helper so
 that daemon cancellation escalation cannot mask an EOF failure. The native macvm

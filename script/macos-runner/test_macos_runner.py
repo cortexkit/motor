@@ -30,8 +30,12 @@ import pinlock
 SERVER = json.loads((HERE.parent / "runner/toolchain.json").read_text())
 
 
+def pending():
+    return pinlock.seed(SERVER)
+
+
 def ready():
-    manifest = pinlock.seed(SERVER)
+    manifest = pending()
 
     def fill(value) -> Any:
         if isinstance(value, dict):
@@ -70,7 +74,7 @@ class ParityTests(unittest.TestCase):
         self.actual = observed(self.manifest, Path(self.scratch.name))
 
     def test_pending_lock_cannot_be_deployed_or_checked(self):
-        manifest = json.loads((HERE / "toolchain.json").read_text())
+        manifest = pending()
         self.assertEqual(manifest["ipsw"]["build"], "26A434")
         self.assertEqual(manifest["ipsw"]["size"], 26637307067)
         self.assertEqual(manifest["ipsw"]["sha256"], "2f016638293c3e641b8b25391a76fbc16563b3711915a5551cf8aa0f5598a5c1")
@@ -426,7 +430,7 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_all_image_seal_entrypoints_reject_pending_lock(self):
-        manifest = json.loads((HERE / "toolchain.json").read_text())
+        manifest = pending()
         for operation in (image.seal, image.finalize):
             with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, "not reviewed"):
                 operation(None, manifest)
