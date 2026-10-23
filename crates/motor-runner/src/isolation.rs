@@ -1,6 +1,7 @@
 //! Linux jobs are transient system services, not children with the daemon's UID.
 //! The existing administrative sudo grant is used only by the trusted daemon;
 //! no setuid helper, job sudo grant, or new privileged service is installed.
+use crate::remote_cache::transport::{self, Transport};
 use crate::{platform, workspace};
 use motor_protocol::SiblingSnapshot;
 use sha2::Digest;
@@ -1605,6 +1606,39 @@ fn job_bun_mount(javascript: &JavascriptTools) -> io::Result<Option<(String, Pat
     Ok(Some((mount, destination)))
 }
 
+/// The start of every unit shell: wait at the durable gate, then set the
+/// umask.
+const SHELL_GATE: &str = "IFS= read -r -n 1 || exit 125; umask 022; ";
+
+/// Inserts the start of each remote cache forwarder right after the gate, so
+/// the forwarders are listening before anything else of the unit runs, the
+/// writer's preflight included. Without forwarders the shell is unchanged.
+fn with_cache_forwarders(
+    shell: &'static str,
+    forwarders: &[transport::Forwarder],
+) -> io::Result<std::borrow::Cow<'static, str>> {
+    if forwarders.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(shell));
+    }
+    let rest = shell
+        .strip_prefix(SHELL_GATE)
+        .ok_or_else(|| io::Error::other("unit shell does not start at its gate"))?;
+    let starts: String = forwarders.iter().map(transport::Forwarder::start).collect();
+    Ok(std::borrow::Cow::Owned(format!(
+        "{SHELL_GATE}{starts}{rest}"
+    )))
+}
+
+/// Lets `account` connect to each socket in `paths`, without following
+/// symlinks.
+fn grant_sockets(paths: &[PathBuf], account: &str) -> io::Result<()> {
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-P", "-m", &format!("u:{account}:rw"), "--"])
+            .args(paths),
+    )
+}
+
 fn grant(path: &Path) -> io::Result<()> {
     grant_paths(&[path])
 }
@@ -1956,15 +1990,23 @@ pub(crate) struct Sandbox {
     /// init drops to (see `pid_init`).
     pid_init: Option<pid_init::JobIdentity>,
     provider_unset_env: Vec<String>,
+    /// The remote cache forwarders the unit's shell starts before its
+    /// command, one per active tool; empty when the unit has no remote cache.
+    cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
 }
 
 pub(crate) struct RuntimeDir(
     PathBuf,
     std::sync::OnceLock<crate::cleanup::BackgroundDelete>,
+    /// The unit's remote cache sockets, when it has any. They are served until
+    /// this directory is reclaimed, which waits for the unit's last launch
+    /// handle.
+    std::sync::OnceLock<crate::remote_cache::transport::Sockets>,
 );
 pub(crate) fn recovered_runtime(state: &Path, id: Uuid) -> RuntimeDir {
     RuntimeDir(
         state.join("sandboxes").join(id.to_string()),
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
     )
 }
@@ -1982,6 +2024,9 @@ impl RuntimeDir {
 }
 impl Drop for RuntimeDir {
     fn drop(&mut self) {
+        // Stop serving the unit's cache sockets and remove them before the
+        // directory holding them is reclaimed.
+        drop(self.2.take());
         let _access = crate::tree_access::lock(&self.0);
         // A job can create mode-0700 temporary directories. Reclaim its private
         // home/tmp only after the last launch handle (and its cgroup) is gone.
@@ -2434,6 +2479,7 @@ impl Sandbox {
             true,
             None,
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
+            None,
         )
     }
 
@@ -2457,6 +2503,7 @@ impl Sandbox {
         shared_compile_cache: bool,
         snapshots: Option<&SnapshotSiblings<'_>>,
         javascript: &JavascriptTools,
+        remote: Option<&Transport>,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2475,6 +2522,7 @@ impl Sandbox {
             shared_compile_cache,
             snapshots,
             javascript,
+            remote,
         )
     }
 
@@ -2491,6 +2539,7 @@ impl Sandbox {
         tree: &str,
         javascript: &JavascriptTools,
         boat_profile: bool,
+        remote: Option<&Transport>,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2509,6 +2558,7 @@ impl Sandbox {
             true,
             None,
             javascript,
+            remote,
         )
         .map(|sandbox| sandbox.with_boat_profile(boat_profile, true, None))
     }
@@ -2531,6 +2581,7 @@ impl Sandbox {
         shared_compile_cache: bool,
         snapshots: Option<&SnapshotSiblings<'_>>,
         javascript: &JavascriptTools,
+        remote: Option<&Transport>,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -2612,6 +2663,7 @@ impl Sandbox {
         // writable home directory.
         let runtime = std::sync::Arc::new(RuntimeDir(
             state.join("sandboxes").join(id.to_string()),
+            std::sync::OnceLock::new(),
             std::sync::OnceLock::new(),
         ));
         let root = runtime.0.join("root");
@@ -2751,7 +2803,9 @@ impl Sandbox {
             mount_destinations.push(destination);
         }
         let tools = runtime.0.join("tools");
-        if cached_rust || wrapper.is_some() {
+        // With a remote cache the tool directory carries the forwarder, so it
+        // is mounted even where the shared compile cache is off.
+        if cached_rust || wrapper.is_some() || remote.is_some() {
             use std::os::unix::fs::PermissionsExt;
             fs::create_dir_all(&tools)?;
             fs::set_permissions(&tools, fs::Permissions::from_mode(0o755))?;
@@ -2790,8 +2844,35 @@ impl Sandbox {
                     )?;
                 }
             }
+            if remote.is_some() {
+                // The forwarder holds no key, so the unit may read and run it.
+                let forwarder = tools.join(transport::FORWARDER_NAME);
+                fs::copy(prepare_cache_forwarder(state)?, &forwarder)?;
+                fs::set_permissions(&forwarder, fs::Permissions::from_mode(0o755))?;
+            }
             read_only.push(bind(&tools, Path::new("/motor-tools"))?);
             mount_destinations.push(PathBuf::from("/motor-tools"));
+        }
+        let mut cache_forwarders = Vec::new();
+        if let Some(remote) = remote {
+            let directory = runtime.0.join("gateway");
+            let job = id.to_string();
+            let (role, account) = if writer {
+                (transport::Role::Fill, WRITER_USER)
+            } else {
+                (transport::Role::Job(&job), USER)
+            };
+            let sockets = remote.open(&directory, role)?;
+            // Connecting needs write access to the socket file. Only this
+            // unit's account gets it, and the directory is bound into this
+            // unit's sandbox alone.
+            grant_sockets(&sockets.paths(), account)?;
+            read_only.push(bind(&directory, Path::new(transport::SANDBOX_SOCKETS))?);
+            mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
+            cache_forwarders = sockets.forwarders().to_vec();
+            if runtime.2.set(sockets).is_err() {
+                return Err(io::Error::other("sandbox cache sockets were opened twice"));
+            }
         }
         // Copy the supervisor into the read-only tool mount. Bind only existing
         // slot locks read-write so jobs can acquire slots but cannot replace
@@ -2896,6 +2977,7 @@ impl Sandbox {
             boat_memory_max: None,
             pid_init: None,
             provider_unset_env: Vec::new(),
+            cache_forwarders,
         })
     }
 
@@ -3012,6 +3094,7 @@ impl Sandbox {
         } else {
             "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
         };
+        let shell = with_cache_forwarders(shell, &self.cache_forwarders)?;
         cmd.args([
             "--wait",
             "--service-type=exec",
@@ -3190,7 +3273,7 @@ impl Sandbox {
         // one-byte release switches the command's stdin to /dev/null so the
         // still-open gate writer cannot block ordinary input reads.
         // Cancellation cannot precede creation of an untracked privileged job.
-        let wrapper = ["/bin/bash", "-c", shell, user, command];
+        let wrapper = ["/bin/bash", "-c", &*shell, user, command];
         match pid_init {
             Some(identity) => cmd.args(pid_init::exec_start(identity, &wrapper)),
             None => cmd.args(wrapper),
@@ -3379,11 +3462,25 @@ pub(crate) fn compile_cache_mounts(
 }
 
 fn prepare_cache_readiness_probe(state: &Path) -> io::Result<PathBuf> {
+    prepare_embedded_tool(state, "sccache-ready", include_str!("sccache-ready.rs.in"))
+}
+
+/// The remote cache forwarder, built from the source embedded in the runner.
+pub(crate) fn prepare_cache_forwarder(state: &Path) -> io::Result<PathBuf> {
+    prepare_embedded_tool(
+        state,
+        transport::FORWARDER_NAME,
+        include_str!("cache-forwarder.rs.in"),
+    )
+}
+
+/// Compiles a dependency-free helper from `source`, embedded in the runner,
+/// into the state directory once per source digest.
+fn prepare_embedded_tool(state: &Path, name: &str, source: &str) -> io::Result<PathBuf> {
     use fs2::FileExt;
     use sha2::{Digest, Sha256};
-    let source = include_str!("sccache-ready.rs.in");
     let digest = format!("{:x}", Sha256::digest(source));
-    let output = state.join(format!("sccache-ready-{digest}"));
+    let output = state.join(format!("{name}-{digest}"));
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)

@@ -435,6 +435,35 @@ impl Drop for Listener {
     }
 }
 
+/// The longest path a Unix socket address holds, its terminating NUL
+/// excluded.
+const MAX_SOCKET_PATH: usize = 107;
+
+/// Binds a Unix listener at `path`. A socket address holds at most
+/// [`MAX_SOCKET_PATH`] bytes, and a sandbox's runtime directory under the
+/// runner's state directory can be longer. On Linux such a path is bound
+/// through `/proc/self/fd/<fd>/<name>`, an alias of the same directory held
+/// open for the call, so the socket file still lands at `path`.
+fn bind_unix(path: &Path) -> io::Result<tokio::net::UnixListener> {
+    #[cfg(target_os = "linux")]
+    if path.as_os_str().len() > MAX_SOCKET_PATH {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::other("socket path has no directory"));
+        };
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent)?;
+        let alias = Path::new("/proc/self/fd")
+            .join(directory.as_raw_fd().to_string())
+            .join(name);
+        return tokio::net::UnixListener::bind(alias);
+    }
+    tokio::net::UnixListener::bind(path)
+}
+
 /// Whether a connection can carry another request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Next {
@@ -719,7 +748,7 @@ impl Gateway {
     /// runner binds it into. Dropping the returned listener also ends every
     /// connection accepted on it.
     pub(crate) fn listen(&self, path: &Path, binding: Arc<Binding>) -> io::Result<Listener> {
-        let listener = tokio::net::UnixListener::bind(path)?;
+        let listener = bind_unix(path)?;
         let gateway = self.clone();
         let served = binding.clone();
         let task = tokio::spawn(async move {
@@ -1443,5 +1472,6 @@ impl Gateway {
     }
 }
 
+// The transport tests drive a real gateway against this module's fake store.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

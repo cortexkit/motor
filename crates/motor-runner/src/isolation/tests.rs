@@ -10,6 +10,9 @@ mod privilege;
 #[path = "command_golden_tests.rs"]
 mod command_golden;
 
+#[path = "remote_cache_tests.rs"]
+mod remote_cache;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.
@@ -317,8 +320,44 @@ fn boat_writer_unit_is_structurally_refused_even_if_cache_is_requested() {
     });
 }
 
-fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandbox)) {
+/// The answer to a command sandbox preparation runs that needs sudo or the
+/// job accounts, so the real mount construction can run without either:
+/// `id` reports made-up account ids, and sudo, setfacl, chown and chmod
+/// succeed without doing anything. Every other command gets `None` and runs.
+fn fake_privileged_output(command: &Command) -> Option<io::Result<std::process::Output>> {
     use std::os::unix::process::ExitStatusExt;
+    let program = command.get_program().to_string_lossy();
+    if program.ends_with("/id") {
+        let args: Vec<_> = command.get_args().collect();
+        let stdout = if args[0] == "-u" {
+            format!(
+                "{}\n",
+                unsafe { libc::geteuid() } + if args[1] == WRITER_USER { 10002 } else { 10001 }
+            )
+        } else {
+            format!("{}\n", args[1].to_string_lossy())
+        };
+        return Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }));
+    }
+    if ["sudo", "setfacl", "chown", "chmod"].iter().any(|name| {
+        Path::new(command.get_program())
+            .file_name()
+            .is_some_and(|actual| actual == *name)
+    }) {
+        return Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+    }
+    None
+}
+
+fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandbox)) {
     let f = Fixture::new();
     fs::create_dir_all(f.workspace.join("src")).unwrap();
     fs::write(f.workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
@@ -341,38 +380,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
     // Exercise the real mount construction. Only account/privileged operations
     // are substituted; Git, Cargo fetch and the filesystem layout remain real.
     crate::systemd::with_process_hook(
-        Box::new(|command| {
-            let program = command.get_program().to_string_lossy();
-            if program.ends_with("/id") {
-                let args: Vec<_> = command.get_args().collect();
-                let stdout = if args[0] == "-u" {
-                    format!(
-                        "{}\n",
-                        unsafe { libc::geteuid() }
-                            + if args[1] == WRITER_USER { 10002 } else { 10001 }
-                    )
-                } else {
-                    format!("{}\n", args[1].to_string_lossy())
-                };
-                return Ok(std::process::Output {
-                    status: std::process::ExitStatus::from_raw(0),
-                    stdout: stdout.into_bytes(),
-                    stderr: Vec::new(),
-                });
-            }
-            if ["sudo", "setfacl", "chown", "chmod"].iter().any(|name| {
-                Path::new(command.get_program())
-                    .file_name()
-                    .is_some_and(|actual| actual == *name)
-            }) {
-                return Ok(std::process::Output {
-                    status: std::process::ExitStatus::from_raw(0),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                });
-            }
-            command.output()
-        }),
+        Box::new(|command| fake_privileged_output(command).unwrap_or_else(|| command.output())),
         || {
             let javascript = JavascriptTools::for_role(ToolchainRole::Boat);
             let sandbox = if writer {
@@ -388,6 +396,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     &tree,
                     &javascript,
                     true,
+                    None,
                 )
             } else {
                 Sandbox::prepare_role(
@@ -407,6 +416,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     false,
                     None,
                     &javascript,
+                    None,
                 )
                 .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
             }
@@ -655,6 +665,7 @@ impl Fixture {
             runtime: std::sync::Arc::new(RuntimeDir(
                 self.scratch.join("unprepared"),
                 std::sync::OnceLock::new(),
+                std::sync::OnceLock::new(),
             )),
             retain_failed: false,
             network: false,
@@ -664,6 +675,7 @@ impl Fixture {
             boat_memory_max: None,
             pid_init: None,
             provider_unset_env: Vec::new(),
+            cache_forwarders: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
             user: USER,
@@ -783,6 +795,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
         )),
         retain_failed: false,
         network: false,
@@ -792,6 +805,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         boat_memory_max: None,
         pid_init: None,
         provider_unset_env: Vec::new(),
+        cache_forwarders: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -1283,6 +1297,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 boat_memory_max: None,
                 pid_init: None,
                 provider_unset_env: Vec::new(),
+                cache_forwarders: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1336,6 +1351,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 boat_memory_max: None,
                 pid_init: None,
                 provider_unset_env: Vec::new(),
+                cache_forwarders: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1768,6 +1784,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
         )),
         retain_failed: false,
         network: false,
@@ -1777,6 +1794,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         boat_memory_max: None,
         pid_init: None,
         provider_unset_env: Vec::new(),
+        cache_forwarders: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -2236,6 +2254,7 @@ fn runtime_cleanup_reservation_survives_until_last_handle_is_dropped() {
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = std::sync::Arc::new(RuntimeDir(
         scratch.join("absent-runtime"),
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
     ));
     runtime.track(count.clone());
