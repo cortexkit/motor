@@ -1771,8 +1771,9 @@ impl Runner {
         // cache found empty here was emptied while the runner was down: by
         // hand, or by an eviction that moved it aside but did not live to
         // save the catalog. Its fills are gone, so each repository's next
-        // pass must fill it again rather than reuse its record. A runner with
-        // no cache directory has never filled one.
+        // pass must fill it again rather than reuse its record. With a writer
+        // account the directory always exists by now (prepared just above);
+        // without one no job mounts it, so an absent directory is left alone.
         let fleet = config.sccache_dir();
         if !config.windows_instance() && fleet.is_dir() {
             match crate::compile_cache::holds_entries(&fleet) {
