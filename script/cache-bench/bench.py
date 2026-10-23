@@ -219,6 +219,13 @@ def signed_headers(method, path, query, body, access, secret, now=None, extra=No
     return headers
 
 
+class _Transport(Exception):
+    """A request that failed below HTTP, before or while reading the response."""
+    def __init__(self, message, reused):
+        super().__init__(message)
+        self.message, self.reused = message, reused
+
+
 class S3:
     """One persistent TLS connection per calling thread, no redirects or SDK retries."""
     def __init__(self, endpoint, access, secret, config):
@@ -235,10 +242,27 @@ class S3:
     def request(self, method, path, query='', body=b'', extra=None, fresh=False, timeout=120):
         if self.config['addressing'] == 'virtual-host':
             path = path.removeprefix('/' + self.bucket) or '/'
+        try:
+            return self._send(method, path, query, body, extra, fresh, timeout)
+        except _Transport as first:
+            # A kept-alive connection can sit idle through a whole build, and
+            # providers close idle connections after different times (OVH and
+            # Hetzner sooner than R2). Every request the bench sends is
+            # idempotent, so a reused connection that fails is retried once on
+            # a new one; a failure on a new connection is real.
+            if not first.reused:
+                raise BenchError(first.message) from None
+            try:
+                return self._send(method, path, query, body, extra, True, timeout)
+            except _Transport as second:
+                raise BenchError(second.message) from None
+
+    def _send(self, method, path, query, body, extra, fresh, timeout):
         if fresh and getattr(self.local, 'connection', None):
             self.local.connection.close()
             self.local.connection = None
-        if not getattr(self.local, 'connection', None):
+        reused = getattr(self.local, 'connection', None) is not None
+        if not reused:
             self.local.connection = http.client.HTTPSConnection(self.host, timeout=timeout)
         connection = self.local.connection
         if connection is None:
@@ -254,10 +278,14 @@ class S3:
             headers = {k.lower(): v for k, v in response.getheaders()}
             data = response.read()
             return status, headers, data
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException) as error:
             connection.close()
             self.local.connection = None
-            raise BenchError('object-storage transport failure (details withheld)') from None
+            # The exception's class and the method are safe to report; its text
+            # may carry the signed URL, so it stays withheld.
+            raise _Transport(f'object-storage transport failure: {method} {type(error).__name__}'
+                             f' on a {"reused" if reused else "new"} connection (details withheld)',
+                             reused) from None
         finally:
             with self.lock:
                 self.events.append({'method': method, 'status': status, 'bytes_downloaded': len(data),

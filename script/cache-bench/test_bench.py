@@ -22,6 +22,60 @@ spec.loader.exec_module(bench)
 PREFIX = 'cache-bench/fixture/'
 
 
+class _Response:
+    status = 200
+    def getheaders(self):
+        return [('Content-Length', '2')]
+    def read(self):
+        return b'ok'
+
+
+class _Connection:
+    """Fails the first request sent on each instance that the test marks stale."""
+    made = []
+    stale = set()
+    def __init__(self, host, timeout):
+        self.number = len(_Connection.made)
+        _Connection.made.append(self)
+        self.sent = 0
+    def request(self, *args):
+        self.sent += 1
+        if self.number in _Connection.stale and self.sent > 1:
+            raise http.client.RemoteDisconnected('Remote end closed connection without response')
+    def getresponse(self):
+        return _Response()
+    def close(self):
+        pass
+
+
+class TransportRetryTests(unittest.TestCase):
+    def client(self):
+        _Connection.made, _Connection.stale = [], set()
+        return bench.S3('https://s3.de.io.cloud.ovh.net', 'ACCESS', 'SECRET',
+                        {'bucket': 'motor-cache-test', 'addressing': 'path', 'region': 'de'})
+
+    def test_reused_connection_closed_while_idle_is_retried_once_on_a_new_one(self):
+        s3 = self.client()
+        with patch.object(bench.http.client, 'HTTPSConnection', _Connection):
+            s3.request('GET', '/motor-cache-test/a')
+            _Connection.stale.add(0)
+            status, _, data = s3.request('GET', '/motor-cache-test/b')
+        self.assertEqual((status, data), (200, b'ok'))
+        self.assertEqual(len(_Connection.made), 2)
+
+    def test_failure_on_a_new_connection_is_not_retried_and_names_its_type(self):
+        class Refused(_Connection):
+            def request(self, *args):
+                raise ConnectionRefusedError('refused https://secret-signed-url')
+        s3 = self.client()
+        with patch.object(bench.http.client, 'HTTPSConnection', Refused):
+            with self.assertRaises(bench.BenchError) as raised:
+                s3.request('GET', '/motor-cache-test/a')
+        self.assertEqual(len(_Connection.made), 1)
+        self.assertIn('GET ConnectionRefusedError on a new connection', str(raised.exception))
+        self.assertNotIn('secret-signed-url', str(raised.exception))
+
+
 class ArgumentsTests(unittest.TestCase):
     def parse(self, *argv):
         with contextlib.redirect_stderr(io.StringIO()):
