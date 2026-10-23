@@ -20,9 +20,9 @@ unit files, and must match your host.
   system services; do not share the machine with unrelated workloads.
 - An XFS filesystem with reflink support mounted at `/srv/build`. The runner
   clones workspaces and targets with reflinks, which work only within one
-  filesystem, so caller paths (`/Users`) must live on the same filesystem.
-  `setup.sh` bind-mounts `/srv/build/Users` at `/Users` and probes a reflink
-  copy across them.
+  filesystem, so caller paths must live on the same filesystem. `setup.sh`
+  prepares only `/Users`, the macOS client location: it bind-mounts
+  `/srv/build/Users` at `/Users` and probes a reflink copy across them.
 - systemd with `PrivatePIDs=` support (systemd 257 or newer; the runner does
   not check the version). The CPU
   accounting parser is tested against output captured from systemd 259. Also
