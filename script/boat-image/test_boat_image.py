@@ -543,6 +543,29 @@ class RecipeTests(unittest.TestCase):
                 start.watch_storage(pause=pause)
             self.assertEqual(polls, ['unhealthy', 'unhealthy', 'healthy'])
 
+    def test_capacity_sample_cannot_overwrite_a_newer_locked_withdrawal(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            available = {'root': 64 << 30}
+            locks = []
+            @contextlib.contextmanager
+            def ordered_lock():
+                locks.append(True)
+                if len(locks) == 2:
+                    # A setup acquired the lock after an old healthy sample,
+                    # withdrew readiness, and released it before publication.
+                    available['root'] = (32 << 30) - 1
+                    marker.unlink(missing_ok=True)
+                    start.write_storage_health('unhealthy', reason='newer setup withdrawal')
+                yield
+            def stats(path):
+                return Mock(f_bavail=available['root'] if str(path) == '/' else 64 << 30, f_frsize=1, f_favail=10000)
+            def pause(_):
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy', 'stale healthy sample replaced the newer withdrawal')
+                raise InterruptedError('publication observed')
+            with patch.object(start, 'storage_lock', ordered_lock), patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
     def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
         with self.storage_watch_paths() as (_, marker, health):
             def read_evidence():

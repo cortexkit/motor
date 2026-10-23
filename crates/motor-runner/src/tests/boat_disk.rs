@@ -239,6 +239,51 @@ async fn cold_quota_shortage_refuses_before_start_and_withdraws_ready_marker() {
         .is_none());
 }
 
+#[test]
+fn boat_reserve_restore_never_allocates_beside_live_or_starting_work() {
+    for starting in [false, true] {
+        let f = Fixture::new();
+        let runner = Runner::open(boat_config(&f, |_| Ok(63 * GIB))).unwrap();
+        runner.disk_upkeep().unwrap();
+        let reserve = runner.core.trees.state.join("disk-reserve");
+        fs::remove_file(&reserve).unwrap();
+        let (request, _) = f.run("true");
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            if starting {
+                inner.jobs.get_mut(&request.job_id).unwrap().terminal(Outcome::Exit { code: 0 }, runner.now());
+                inner.starting.insert(request.job_id);
+            } else { inner.jobs.get_mut(&request.job_id).unwrap().state = JobState::Running; }
+        }
+        runner.disk_upkeep().unwrap();
+        assert!(!reserve.exists(), "reserve allocation overlapped a sampled job cap");
+    }
+}
+
+#[tokio::test]
+async fn boat_persisted_fill_is_refused_before_claiming_writer_or_setup() {
+    let f = Fixture::new();
+    let runner = Runner::open(boat_config(&f, |_| Ok(63 * GIB))).unwrap();
+    let (mut request, _) = f.run("touch writer-should-not-run");
+    request.siblings.clear();
+    let id = request.job_id;
+    let observed = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.catalog.repositories.insert(request.repository_root.clone(), Repository::default());
+        let mut job = Job::new(id, Some(request), runner.now(), 1, 1);
+        job.base = true; job.state = JobState::Queued;
+        inner.jobs.insert(id, job);
+        runner.start(&mut inner, id, &BTreeMap::new()).unwrap();
+        (inner.jobs[&id].terminal.clone(), inner.starting.contains(&id), inner.writer)
+    };
+    if observed.0.is_none() { let _ = terminal(&runner, id).await; }
+    assert!(matches!(observed.0.map(|record| record.outcome), Some(Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed })), "Boat fill entered setup instead of a synchronous no-start refusal");
+    assert!(!observed.1);
+    assert!(observed.2.is_none());
+    assert!(!Path::new(&f.key).join("writer-should-not-run").exists());
+}
+
 fn workspace(runner: &Runner, path: &Path, used_ms: u64) {
     fs::create_dir_all(path.join("target")).unwrap();
     fs::write(path.join("target/artifact"), vec![1; 8192]).unwrap();

@@ -296,6 +296,17 @@ fn boat_var_tmp_bind_uses_the_same_quota_covered_runtime_as_tmp() {
 }
 
 #[test]
+fn boat_writer_unit_is_structurally_refused_even_if_cache_is_requested() {
+    let f = Fixture::new();
+    let mut sandbox = f.command_sandbox().with_boat_profile(true, false, Some(14 << 30)).with_pid_init(Some(test_identity()));
+    sandbox.writer = true;
+    sandbox.user = WRITER_USER;
+    let env = [("SCCACHE_DIR".into(), "/motor-cache".into())];
+    let error = sandbox.command("touch /motor-cache/unlimited", &f.workspace, &env, true, &[1], 1).err();
+    assert!(error.is_some(), "Boat emitted a writer unit with a possible unlabelled cache mount");
+}
+
+#[test]
 fn boat_pid_init_unit_refuses_loader_variables_and_a_missing_identity() {
     let f = Fixture::new();
     let sandbox = || {
