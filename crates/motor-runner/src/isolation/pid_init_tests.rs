@@ -385,6 +385,7 @@ fn loader_and_allocator_variables_are_refused() {
 /// An errno the filter returns in tests, so a refusal from this filter is
 /// told apart from the kernel's or another filter's EPERM.
 const TEST_ERRNO: u16 = libc::EUCLEAN as u16;
+const TEST_SETATTR_ERRNO: u16 = libc::EREMOTEIO as u16;
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
 /// Run a classic-BPF seccomp program the way the kernel does, for the opcodes
@@ -433,7 +434,7 @@ fn evaluate(
 
 #[test]
 fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
-    let program = namespace_filter(TEST_ERRNO);
+    let program = namespace_filter_with_setattr_errno(TEST_ERRNO, TEST_SETATTR_ERRNO);
     let deny = SECCOMP_RET_ERRNO | u32::from(TEST_ERRNO);
     let pid = u64::from(CLONE_NEWPID);
     let net = 0x4000_0000_u64;
@@ -526,8 +527,10 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
         let result = evaluate(&program, arch, nr, args, &mut seen, &mut branches);
         let expected = if arch != x86 && arch != i386 {
             SECCOMP_RET_KILL_PROCESS
-        } else if matches!(nr & !x32, CLONE3 | 469) {
+        } else if nr & !x32 == CLONE3 {
             SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+        } else if nr & !x32 == 469 {
+            SECCOMP_RET_ERRNO | u32::from(TEST_SETATTR_ERRNO)
         } else if refused {
             deny
         } else {
@@ -552,12 +555,14 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
         })
         .collect();
     assert_eq!(branches, every_branch, "both arms of every jump must run");
-    // The production program differs only in the errno it returns.
+    // Only the two refusal errnos differ from the production program.
     let production = namespace_filter(libc::EPERM as u16);
     assert_eq!(production.len(), program.len());
     for (real, tested) in production.iter().zip(&program) {
         if tested.k == deny {
             assert_eq!(real.k, SECCOMP_RET_ERRNO | libc::EPERM as u32);
+        } else if tested.k == SECCOMP_RET_ERRNO | u32::from(TEST_SETATTR_ERRNO) {
+            assert_eq!(real.k, SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
         } else {
             assert_eq!(real, tested);
         }
@@ -566,27 +571,65 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
 
 /// Install the filter in a forked child and make real system calls. The child
 /// exits 0 when every call behaves as expected, or with the number of the
-/// first unexpected one. x32 and i386 calls run in grandchildren: a kernel
-/// without that emulation, or another seccomp filter that kills foreign
-/// architectures (systemd's `SystemCallArchitectures=native`, which Boat's
-/// tenant units set), ends them with a signal instead of returning. Those
-/// paths are then covered only by the interpreter test above.
+/// first unexpected one. An unimplemented x32 ABI returns ENOSYS; an inherited
+/// filter may instead kill foreign-ABI calls. Report those outcomes separately
+/// from ABIs that actually executed the checks. The interpreter covers any ABI
+/// that cannot execute here.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
-    const X32_UNAVAILABLE: i32 = 1 << 5;
-    const I386_UNAVAILABLE: i32 = 1 << 6;
-    let program = namespace_filter(TEST_ERRNO);
+    const ABI_UNAVAILABLE: i32 = 77;
+    // Invalid flags are rejected before pointers are used on supporting kernels.
+    // This child has not installed the test filter. ENOSYS means the syscall is
+    // unavailable in its inherited environment, not necessarily in the kernel.
+    let kernel_status = unsafe {
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            // Pin the ABI independently of the production filter constant.
+            let result = libc::syscall(469, -1, 0, 0, 0, u32::MAX);
+            libc::_exit(if result == -1 {
+                *libc::__errno_location()
+            } else {
+                0
+            });
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        status
+    };
+    assert!(
+        libc::WIFEXITED(kernel_status),
+        "unfiltered file_setattr child died: {kernel_status:#x}"
+    );
+    let kernel_errno = libc::WEXITSTATUS(kernel_status);
+    assert!(
+        matches!(kernel_errno, libc::EINVAL | libc::ENOSYS),
+        "unexpected unfiltered file_setattr errno {kernel_errno}"
+    );
+    eprintln!(
+        "unfiltered file_setattr: {} (errno {kernel_errno})",
+        if kernel_errno == libc::EINVAL {
+            "syscall available"
+        } else {
+            "syscall unavailable (kernel or inherited policy)"
+        }
+    );
+    let program = namespace_filter_with_setattr_errno(TEST_ERRNO, TEST_SETATTR_ERRNO);
     let filter = SockFprog {
         len: program.len() as u16,
         filter: program.as_ptr(),
     };
     // SAFETY: the child runs only system calls and _exit; nothing allocates
     // after fork.
+    let mut abi_statuses = [0i32; 2];
     let status = unsafe {
+        let mut telemetry = [0; 2];
+        assert_eq!(libc::pipe2(telemetry.as_mut_ptr(), libc::O_CLOEXEC), 0);
         let child = libc::fork();
         assert!(child >= 0);
         if child == 0 {
+            libc::close(telemetry[0]);
             if libc::prctl(PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) != 0 {
                 libc::_exit(30);
             }
@@ -599,6 +642,7 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
                 libc::_exit(31);
             }
             let ours = libc::c_int::from(TEST_ERRNO);
+            let setter_errno = libc::c_int::from(TEST_SETATTR_ERRNO);
             let refused_here =
                 |result: libc::c_long| result == -1 && *libc::__errno_location() == ours;
             // errno belongs to the most recent syscall, not to its saved
@@ -677,38 +721,60 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
             {
                 libc::_exit(8);
             }
-            if libc::syscall(FILE_SETATTR as libc::c_long, -1, 0, 0, 0, 0) != -1
-                || *libc::__errno_location() != libc::ENOSYS
+            if libc::syscall(469, -1, 0, 0, 0, 0) != -1 || *libc::__errno_location() != setter_errno
             {
                 libc::_exit(40);
             }
-            if refused_here(libc::syscall(468, -1, 0, 0, 0, 0)) {
+            let getter = observed(libc::syscall(468, -1, 0, 0, 0, 0));
+            if getter == (-1, ours) || getter == (-1, setter_errno) {
                 libc::_exit(41);
             }
-            // Runs `check` in a grandchild: Some(passed), or None when the
-            // grandchild was killed before it could answer.
-            let isolated = |check: &dyn Fn() -> bool| -> Option<bool> {
+            // Preserve the raw wait status, including the signal number.
+            let isolated = |check: &dyn Fn() -> i32| -> i32 {
                 let grandchild = libc::fork();
                 if grandchild == 0 {
-                    libc::_exit(if check() { 0 } else { 1 });
+                    libc::_exit(check());
+                }
+                if grandchild < 0 {
+                    libc::_exit(32);
                 }
                 let mut status = 0;
-                libc::waitpid(grandchild, &mut status, 0);
-                libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status) == 0)
+                if libc::waitpid(grandchild, &mut status, 0) != grandchild {
+                    libc::_exit(33);
+                }
+                status
             };
             let x32 = isolated(&|| {
+                let available = libc::syscall((39 | X32_SYSCALL_BIT) as libc::c_long);
+                if available == -1 && *libc::__errno_location() == libc::ENOSYS {
+                    return ABI_UNAVAILABLE;
+                }
+                if available <= 0 {
+                    return 1;
+                }
                 let x32_unshare = libc::c_long::from(X86_64_UNSHARE | X32_SYSCALL_BIT);
-                refused_here(libc::syscall(x32_unshare, pid))
-                    && libc::syscall((469 | X32_SYSCALL_BIT) as libc::c_long, -1, 0, 0, 0, 0) == -1
-                    && *libc::__errno_location() == libc::ENOSYS
-                    && !refused_here(libc::syscall(
-                        (468 | X32_SYSCALL_BIT) as libc::c_long,
-                        -1,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ))
+                let setter = observed(libc::syscall(
+                    (469 | X32_SYSCALL_BIT) as libc::c_long,
+                    -1,
+                    0,
+                    0,
+                    0,
+                    u32::MAX,
+                ));
+                let getter = observed(libc::syscall(
+                    (468 | X32_SYSCALL_BIT) as libc::c_long,
+                    -1,
+                    0,
+                    0,
+                    0,
+                    u32::MAX,
+                ));
+                i32::from(
+                    !(refused_here(libc::syscall(x32_unshare, pid))
+                        && setter == (-1, setter_errno)
+                        && getter != (-1, ours)
+                        && getter != (-1, setter_errno)),
+                )
             });
             let i386 = isolated(&|| {
                 let call = |nr: u32, arg: u32| -> i32 {
@@ -720,28 +786,59 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
                         "pop rbx",
                         arg = in(reg) arg,
                         inlateout("eax") nr as i32 => result,
+                        in("ecx") 0u32,
+                        in("edx") 0u32,
+                        in("esi") 0u32,
+                        in("edi") u32::MAX,
                         out("r8") _, out("r9") _, out("r10") _, out("r11") _,
                     );
                     result
                 };
-                call(I386_UNSHARE, CLONE_NEWPID) == -ours
-                    && call(I386_UNSHARE, libc::CLONE_NEWUTS as u32) != -ours
-                    && call(469, u32::MAX) == -libc::ENOSYS
-                    && call(468, u32::MAX) != -ours
+                let available = call(20, 0);
+                if available == -libc::ENOSYS {
+                    return ABI_UNAVAILABLE;
+                }
+                if available <= 0 {
+                    return 1;
+                }
+                let getter = call(468, u32::MAX);
+                i32::from(
+                    !(call(I386_UNSHARE, CLONE_NEWPID) == -ours
+                        && call(I386_UNSHARE, libc::CLONE_NEWUTS as u32) != -ours
+                        && call(469, u32::MAX) == -setter_errno
+                        && getter != -ours
+                        && getter != -setter_errno),
+                )
             });
-            if x32 == Some(false) {
+            if libc::WIFEXITED(x32) && !matches!(libc::WEXITSTATUS(x32), 0 | ABI_UNAVAILABLE) {
                 libc::_exit(20);
             }
-            if i386 == Some(false) {
+            if libc::WIFEXITED(i386) && !matches!(libc::WEXITSTATUS(i386), 0 | ABI_UNAVAILABLE) {
                 libc::_exit(21);
             }
-            libc::_exit(
-                if x32.is_none() { X32_UNAVAILABLE } else { 0 }
-                    | if i386.is_none() { I386_UNAVAILABLE } else { 0 },
-            );
+            let statuses = [x32, i386];
+            if libc::write(
+                telemetry[1],
+                statuses.as_ptr().cast(),
+                std::mem::size_of_val(&statuses),
+            ) != std::mem::size_of_val(&statuses) as isize
+            {
+                libc::_exit(34);
+            }
+            libc::_exit(0);
         }
+        libc::close(telemetry[1]);
         let mut status = 0;
         assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        let count = libc::read(
+            telemetry[0],
+            abi_statuses.as_mut_ptr().cast(),
+            std::mem::size_of_val(&abi_statuses),
+        );
+        libc::close(telemetry[0]);
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            assert_eq!(count, std::mem::size_of_val(&abi_statuses) as isize);
+        }
         status
     };
     assert!(
@@ -749,16 +846,24 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
         "filter test child died: {status:#x}"
     );
     let code = libc::WEXITSTATUS(status);
-    assert_eq!(
-        code & !(X32_UNAVAILABLE | I386_UNAVAILABLE),
-        0,
-        "filter test check {code} behaved unexpectedly"
-    );
-    for (bit, name) in [(X32_UNAVAILABLE, "x32"), (I386_UNAVAILABLE, "i386")] {
-        if code & bit != 0 {
+    assert_eq!(code, 0, "filter test check {code} behaved unexpectedly");
+    eprintln!("native ABI: filtered setter/getter checks ran");
+    for (raw, name) in abi_statuses.into_iter().zip(["x32", "i386"]) {
+        if libc::WIFSIGNALED(raw) {
             eprintln!(
-                "{name} system calls cannot run here; that path is checked by the interpreter only"
+                "{name} ABI: blocked by signal {}; checks did not run, interpreter coverage only",
+                libc::WTERMSIG(raw)
             );
+        } else if libc::WIFEXITED(raw) && libc::WEXITSTATUS(raw) == ABI_UNAVAILABLE {
+            eprintln!(
+                "{name} ABI: getpid returned ENOSYS; checks did not run, interpreter coverage only"
+            );
+        } else {
+            assert!(
+                libc::WIFEXITED(raw) && libc::WEXITSTATUS(raw) == 0,
+                "unexpected {name} wait status {raw:#x}"
+            );
+            eprintln!("{name} ABI: filtered setter/getter checks ran");
         }
     }
 }

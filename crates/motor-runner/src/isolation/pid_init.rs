@@ -944,6 +944,12 @@ enum Step {
 /// Attribute getters and unrelated ioctl requests remain available.
 /// Tests exercise both arms of every BPF jump.
 fn namespace_filter(errno: u16) -> Vec<SockFilter> {
+    namespace_filter_with_setattr_errno(errno, libc::ENOSYS as u16)
+}
+
+// A distinct setter errno lets tests prove interception even on kernels that
+// predate file_setattr and would return ENOSYS without any filter.
+fn namespace_filter_with_setattr_errno(errno: u16, setter_errno: u16) -> Vec<SockFilter> {
     use Step::*;
     let steps = [
         Load(DATA_ARCH),
@@ -955,7 +961,7 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         And(!X32_SYSCALL_BIT),
         JumpIfEqual(CLONE3, "enosys", "x86_64_file_attr"),
         Label("x86_64_file_attr"),
-        JumpIfEqual(FILE_SETATTR, "enosys", "x86_64_calls"),
+        JumpIfEqual(FILE_SETATTR, "file_setattr_denied", "x86_64_calls"),
         Label("x86_64_calls"),
         JumpIfEqual(X86_64_UNSHARE, "flags", "x86_64_not_unshare"),
         Label("x86_64_not_unshare"),
@@ -970,7 +976,7 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         Load(DATA_NR),
         JumpIfEqual(CLONE3, "enosys", "i386_file_attr"),
         Label("i386_file_attr"),
-        JumpIfEqual(FILE_SETATTR, "enosys", "i386_calls"),
+        JumpIfEqual(FILE_SETATTR, "file_setattr_denied", "i386_calls"),
         Label("i386_calls"),
         JumpIfEqual(I386_UNSHARE, "flags", "i386_not_unshare"),
         Label("i386_not_unshare"),
@@ -998,6 +1004,8 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         Return(SECCOMP_RET_ERRNO | u32::from(errno)),
         Label("enosys"),
         Return(SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+        Label("file_setattr_denied"),
+        Return(SECCOMP_RET_ERRNO | u32::from(setter_errno)),
         Label("kill"),
         Return(SECCOMP_RET_KILL_PROCESS),
         Label("allow"),
