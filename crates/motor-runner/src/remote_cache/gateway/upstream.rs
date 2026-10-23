@@ -109,8 +109,8 @@ const MAX_RESPONSE_HEADERS: usize = 100;
 /// Why an exchange with the store failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Failure {
-    /// The connection was refused or reset before any response byte; the
-    /// one case a retry is allowed.
+    /// The connection was refused, reset or closed before any response
+    /// byte; the one case a retry is allowed.
     BeforeResponse,
     /// No response byte within the first-byte limit (connecting included).
     FirstByteTimeout,
@@ -188,6 +188,9 @@ impl Conn {
             let mut response = httparse::Response::new(&mut headers);
             match response.parse(&self.buf[self.pos..]) {
                 Ok(httparse::Status::Complete(length)) => {
+                    if length > MAX_RESPONSE_HEAD {
+                        return Err(Failure::Transport);
+                    }
                     let status = response.code.ok_or(Failure::Transport)?;
                     let mut head = ResponseHead {
                         status,

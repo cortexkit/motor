@@ -1,7 +1,7 @@
 //! The runner-owned gateway between build tools and the remote cache store.
 //!
 //! It runs inside the runner process and is the only part of the runner that
-//! holds a cache key. Tools reach it through Unix sockets the runner binds into
+//! signs with a cache key; the provisioning layer only reads the keys for it. Tools reach it through Unix sockets the runner binds into
 //! their sandbox: a read socket per job and tool, signing with the read-only
 //! key and allowing GET and HEAD, and a write socket per trusted fill and
 //! tool, signing with the read-write key and also allowing PUT. Each socket is
@@ -13,7 +13,7 @@
 //! (the one active when the request was admitted) and streams bodies through
 //! a bounded buffer. Failures answer so that tools carry on uncached: the read
 //! endpoint answers a failure before response headers with 404 (a miss) and
-//! resets the connection after them; the write endpoint answers 503; method,
+//! ends the connection after them; the write endpoint answers 503; method,
 //! query, encoding and path refusals get 403 on both.
 mod breaker;
 mod inbound;
@@ -38,8 +38,8 @@ use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 use upstream::{Conn, Failure, Pool, ResponseHead};
 
-/// The read sccache makes at startup to check its storage. It is counted as a
-/// probe, never as a hit or a miss.
+/// The read sccache makes at startup to check its storage. When the store
+/// answers it (below 500) it is counted as a probe, never as a hit or a miss.
 pub(crate) const SCCACHE_CHECK_KEY: &str = ".sccache_check";
 /// A read slower than the throughput floor counts against the read breaker
 /// only after this much measured time.
@@ -152,8 +152,9 @@ pub(crate) struct Limits {
     pub(crate) first_byte_timeout: Duration,
     /// From receipt of a request to its last byte, retries included.
     pub(crate) deadline: Duration,
-    /// Retries, made only when the store refuses or resets the connection
-    /// before any response byte.
+    /// Retries, made only when the connection to the store is refused,
+    /// reset or closed before any response byte (and, for a PUT, before any
+    /// body byte was sent).
     pub(crate) max_retries: u32,
     /// A GET body arriving slower than this counts against the read breaker.
     pub(crate) min_upstream_bytes_per_s: u64,
@@ -517,7 +518,8 @@ enum AttemptError {
 }
 
 impl Gateway {
-    /// A gateway connecting to the store over TCP and TLS.
+    /// A gateway connecting to the store over TCP, with TLS for `https`
+    /// endpoints.
     pub(crate) fn new(limits: Limits, generations: Arc<dyn Generations>) -> io::Result<Self> {
         Ok(Self::with_connector(
             limits,

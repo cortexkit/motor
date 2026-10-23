@@ -80,6 +80,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
                 let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
                 let mut request = httparse::Request::new(&mut headers);
                 match request.parse(&self.buf[self.pos..]) {
+                    Ok(httparse::Status::Complete(length)) if length > MAX_REQUEST_HEAD => {
+                        return Err(HeadError::Malformed);
+                    }
                     Ok(httparse::Status::Complete(length)) => {
                         let head = RequestHead {
                             method: request.method.unwrap_or_default().to_string(),

@@ -2,7 +2,7 @@
 //!
 //! Bodies are streamed through a bounded buffer and never held whole, so the
 //! payload is declared `UNSIGNED-PAYLOAD` rather than hashed; TLS protects it
-//! in transit.
+//! in transit to an `https` endpoint (production stores use one).
 use super::super::provisioning::Credential;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};

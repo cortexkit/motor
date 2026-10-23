@@ -666,6 +666,11 @@ async fn both_endpoints_refuse_other_methods_queries_encodings_and_bad_paths() {
         request("GET /other-bucket/ok", ""),
         request(&format!("GET {}", s3("ok")), "range: items=0-1\r\n"),
         "NOT HTTP AT ALL\r\n\r\n".to_string(),
+        // A request head over the 16 KiB limit.
+        request(
+            &format!("GET {}", s3("ok")),
+            &format!("x-filler: {}\r\n", "f".repeat(17 * 1024)),
+        ),
     ];
     for raw in &common {
         assert_eq!(

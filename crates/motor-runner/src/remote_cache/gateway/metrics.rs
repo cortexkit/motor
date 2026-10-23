@@ -21,7 +21,8 @@ const BOUNDS_MS: [u64; 24] = [
 pub(crate) struct ToolStats {
     /// GETs answered 200 or 206 by the store, excluding probes.
     pub(crate) hits: u64,
-    /// Reads of sccache's `.sccache_check` startup key, whatever their answer.
+    /// Reads of sccache's `.sccache_check` startup key the store answered with
+    /// a status below 500, whatever that status.
     pub(crate) probes: u64,
     /// Reads the store answered 404, excluding probes.
     pub(crate) misses: u64,
@@ -35,8 +36,9 @@ pub(crate) struct ToolStats {
     pub(crate) write_refusals: u64,
     /// Upstream responses aborted because the object exceeded the size limit.
     pub(crate) oversize: u64,
-    /// The 95th percentile of request latency over the trailing 60 minutes,
-    /// as the upper bound of its histogram bin; `None` with no requests.
+    /// The 95th percentile latency, over the trailing 60 minutes, of requests
+    /// that reached the store (refusals and breaker answers are excluded), as
+    /// the upper bound of its histogram bin; `None` with no such requests.
     pub(crate) p95_ms: Option<u64>,
 }
 
