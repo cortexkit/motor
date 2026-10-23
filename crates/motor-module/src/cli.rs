@@ -74,13 +74,15 @@ See `ck motor run --help` for the options and exit statuses.";
 pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
                     [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
-                    [--net] [--allow-spill | --hosted] -- COMMAND...
+                    [--platform linux|windows|macos] [--net]
+                    [--allow-spill | --hosted] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
 that contains --cwd (default: the current directory), and streams its stdout
 and stderr here as they arrive.
 
   --vcpus N           vCPUs to reserve (the runner's default when omitted)
+  --platform NAME     linux (default), windows or macos; macos is direct-only
   --net               allow outbound IPv4 internet (package and tool fetches);
                       jobs are offline without it
   --sibling PATH      also send this sibling repository (repeatable)
@@ -125,6 +127,9 @@ workspace at a time.";
 
 /// What `ck motor run` was asked to do.
 #[derive(Debug, PartialEq, Eq)]
+// Parsed once per CLI invocation; boxing the only data-bearing variant adds
+// an allocation without reducing a collection or long-lived object's size.
+#[allow(clippy::large_enum_variant)]
 pub enum Invocation {
     Help,
     Run(RunArgs),
@@ -134,6 +139,7 @@ pub enum Invocation {
 pub struct RunArgs {
     pub vcpus: Option<u32>,
     pub net: bool,
+    pub platform: Option<motor_protocol::Platform>,
     pub siblings: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub timeout: u64,
@@ -163,6 +169,13 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             if parsed.hosted && parsed.allow_spill {
                 return Err("--hosted and --allow-spill cannot be combined".into());
             }
+            if parsed.platform == Some(motor_protocol::Platform::Macos)
+                && (parsed.hosted || parsed.allow_spill)
+            {
+                return Err(
+                    "--platform macos cannot be combined with --hosted or --allow-spill".into(),
+                );
+            }
             validate_return_args(&parsed)?;
             return Ok(Invocation::Run(parsed));
         }
@@ -188,6 +201,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         if !matches!(
             name,
             "--vcpus"
+                | "--platform"
                 | "--sibling"
                 | "--env"
                 | "--timeout"
@@ -210,6 +224,18 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 .ok_or_else(|| format!("{name} needs a value"))?,
         };
         match name {
+            "--platform" => {
+                parsed.platform = Some(match value.as_str() {
+                    "linux" => motor_protocol::Platform::Linux,
+                    "windows" => motor_protocol::Platform::Windows,
+                    "macos" => motor_protocol::Platform::Macos,
+                    _ => {
+                        return Err(format!(
+                            "--platform needs linux, windows or macos, got {value:?}"
+                        ))
+                    }
+                });
+            }
             "--vcpus" => {
                 parsed.vcpus = Some(
                     value
@@ -592,6 +618,9 @@ pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
     }
     if args.net {
         request = request.with_network(motor_protocol::Network::Outbound);
+    }
+    if let Some(platform) = &args.platform {
+        request = request.with_platform(platform.clone());
     }
     Ok(request)
 }
@@ -1998,6 +2027,7 @@ mod tests {
             RunArgs {
                 vcpus: Some(4),
                 net: false,
+                platform: None,
                 siblings: vec!["/a".into(), "/b".into()],
                 env: [("CI", "1"), ("RUSTFLAGS", "-D=warnings")]
                     .into_iter()

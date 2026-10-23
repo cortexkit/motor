@@ -41,6 +41,9 @@ pub trait Connector: Send + Sync {
     fn windows_refusal(&self) -> Option<&'static str> {
         self.refusal()
     }
+    fn macos_refusal(&self) -> Option<&'static str> {
+        self.refusal()
+    }
     /// The `retry_after_ms` hint for a job this connector refused with
     /// `code`: how long until the refusal may clear without an operator.
     /// `None` unless the refusal is transient.
@@ -70,6 +73,9 @@ pub trait Connector: Send + Sync {
     ) -> ConnectFuture<'a> {
         self.connect_to(id, &runner.instance, Some(&runner.state_root))
     }
+    fn connect_macos<'a>(&'a self, id: Uuid, runner: &'a crate::MacosRunner) -> ConnectFuture<'a> {
+        self.connect_to(id, &runner.instance, Some(&runner.state_root))
+    }
 }
 
 pub(crate) struct InstanceConnector {
@@ -80,6 +86,8 @@ impl Connector for InstanceConnector {
     fn refusal(&self) -> Option<&'static str> {
         if self.target.windows.is_some() {
             self.connector.windows_refusal()
+        } else if self.target.macos.is_some() {
+            self.connector.macos_refusal()
         } else {
             self.connector.refusal()
         }
@@ -93,6 +101,8 @@ impl Connector for InstanceConnector {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
         if let Some(runner) = &self.target.windows {
             self.connector.connect_windows(id, runner)
+        } else if let Some(runner) = &self.target.macos {
+            self.connector.connect_macos(id, runner)
         } else {
             self.connector
                 .connect_to(id, &self.target.instance, self.target.state_root.as_deref())
@@ -460,7 +470,7 @@ struct SshPipe {
     read: tokio::process::ChildStdout,
     write: tokio::process::ChildStdin,
     _child: Child,
-    _pin: Option<WindowsPin>,
+    _pin: Option<EndpointPin>,
 }
 impl AsyncRead for SshPipe {
     fn poll_read(
@@ -493,6 +503,9 @@ impl AsyncWrite for SshPipe {
     }
 }
 impl Connector for SshConnector {
+    fn macos_refusal(&self) -> Option<&'static str> {
+        self.windows_refusal()
+    }
     fn windows_refusal(&self) -> Option<&'static str> {
         match self.refusal() {
             Some("runner_ssh_config_invalid") => self
@@ -578,26 +591,56 @@ impl Connector for SshConnector {
             }) as Box<dyn Duplex>)
         })
     }
+    fn connect_macos<'a>(&'a self, id: Uuid, runner: &'a crate::MacosRunner) -> ConnectFuture<'a> {
+        Box::pin(async move {
+            if self.credentials.unresolved() {
+                self.credentials.refresh().await;
+            }
+            if let Some(reason) = self.macos_refusal() {
+                return Err(io::Error::other(reason));
+            }
+            let agent = self
+                .credentials
+                .current
+                .lock()
+                .unwrap()
+                .agent
+                .clone()
+                .ok_or_else(|| io::Error::other("runner_credential_unavailable"))?;
+            let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key)?;
+            let mut child =
+                macos_command(id, runner, &agent.socket, &agent.identity, &pin.0).spawn()?;
+            Ok(Box::new(SshPipe {
+                read: child.stdout.take().unwrap(),
+                write: child.stdin.take().unwrap(),
+                _child: child,
+                _pin: Some(pin),
+            }) as Box<dyn Duplex>)
+        })
+    }
 }
 
-struct WindowsPin(std::path::PathBuf);
-impl WindowsPin {
+struct EndpointPin(std::path::PathBuf);
+type WindowsPin = EndpointPin;
+impl EndpointPin {
     fn new(runner: &crate::WindowsRunner) -> io::Result<Self> {
+        Self::for_endpoint("motor-windows", &runner.host_key)
+    }
+    fn for_endpoint(alias: &str, host_key: &str) -> io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path =
-            std::env::temp_dir().join(format!("motor-windows-{}.known_hosts", Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("{alias}-{}.known_hosts", Uuid::now_v7()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
         let pin = Self(path);
-        writeln!(file, "motor-windows {}", runner.host_key)?;
+        writeln!(file, "{alias} {host_key}")?;
         Ok(pin)
     }
 }
-impl Drop for WindowsPin {
+impl Drop for EndpointPin {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -624,6 +667,60 @@ fn windows_ssh_command(
     identity: &Path,
     known_hosts: &Path,
 ) -> Command {
+    endpoint_ssh_command(
+        ExplicitEndpoint {
+            host: &runner.host,
+            port: runner.port,
+            user: &runner.user,
+            alias: "motor-windows",
+            timeout: 3,
+        },
+        socket,
+        identity,
+        known_hosts,
+    )
+}
+
+fn macos_command(
+    id: Uuid,
+    runner: &crate::MacosRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
+    let mut command = endpoint_ssh_command(
+        ExplicitEndpoint {
+            host: &runner.host,
+            port: runner.port,
+            user: &runner.user,
+            alias: "motor-macos",
+            timeout: 10,
+        },
+        socket,
+        identity,
+        known_hosts,
+    );
+    command.arg(format!(
+        "~/.cargo/bin/motor-runner connect --instance {} --state-root {} --job {id}",
+        runner.instance, runner.state_root
+    ));
+    command
+}
+
+struct ExplicitEndpoint<'a> {
+    host: &'a str,
+    port: u16,
+    user: &'a str,
+    alias: &'a str,
+    timeout: u64,
+}
+
+fn endpoint_ssh_command(
+    endpoint: ExplicitEndpoint<'_>,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
     let mut command = Command::new("ssh");
     // Each explicit endpoint has its own pin and no shared master. In particular,
     // the legacy build-server master must never carry an explicit endpoint's connection.
@@ -642,18 +739,18 @@ fn windows_ssh_command(
             "-o",
             "GlobalKnownHostsFile=/dev/null",
             "-o",
-            "HostKeyAlias=motor-windows",
-            "-o",
             "ControlMaster=no",
             "-o",
             "ControlPath=none",
-            "-o",
-            "ConnectTimeout=3",
             "-o",
             "PasswordAuthentication=no",
             "-o",
             "KbdInteractiveAuthentication=no",
         ])
+        .arg("-o")
+        .arg(format!("HostKeyAlias={}", endpoint.alias))
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", endpoint.timeout))
         .arg("-o")
         .arg(format!("IdentityAgent={}", socket.display()))
         .arg("-o")
@@ -661,10 +758,10 @@ fn windows_ssh_command(
         .arg("-i")
         .arg(identity)
         .arg("-p")
-        .arg(runner.port.to_string())
+        .arg(endpoint.port.to_string())
         .arg("-l")
-        .arg(&runner.user)
-        .arg(&runner.host)
+        .arg(endpoint.user)
+        .arg(endpoint.host)
         .env_remove("SSH_AUTH_SOCK")
         .env_remove("SSH_AGENT_PID")
         .env_remove("SUBC_LAUNCH_NONCE")
@@ -736,6 +833,83 @@ mod windows_command_tests {
                 .get_envs()
                 .any(|(n, v)| n == name && v.is_none()));
         }
+    }
+}
+
+#[cfg(test)]
+mod macos_command_tests {
+    use super::*;
+
+    #[test]
+    fn macos_endpoint_uses_its_own_pin_vault_identity_and_ten_second_timeout() {
+        let runner = crate::MacosRunner {
+            host: "macos.example.invalid".into(),
+            port: 25578,
+            user: "motor".into(),
+            instance: "macos".into(),
+            state_root: "/Users/motor/state".into(),
+            host_key: "ssh-ed25519 test-pin".into(),
+        };
+        let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pin.0).unwrap(),
+            "motor-macos ssh-ed25519 test-pin\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&pin.0).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let path = pin.0.clone();
+        let command = macos_command(
+            Uuid::nil(),
+            &runner,
+            Path::new("/vault/s"),
+            Path::new("/vault/identity.pub"),
+            &pin.0,
+        );
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        for required in [
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "IdentitiesOnly=yes",
+            "StrictHostKeyChecking=yes",
+            "GlobalKnownHostsFile=/dev/null",
+            "HostKeyAlias=motor-macos",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ConnectTimeout=10",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "IdentityAgent=/vault/s",
+            "motor",
+            "25578",
+            "macos.example.invalid",
+        ] {
+            assert!(args.contains(&required), "missing {required}: {args:?}");
+        }
+        assert_eq!(args.iter().filter(|a| **a == "-F").count(), 1);
+        assert!(args.windows(2).any(|a| a == ["-F", "/dev/null"]));
+        assert_eq!(args.iter().filter(|a| **a == "-i").count(), 1);
+        assert!(args.windows(2).any(|a| a == ["-i", "/vault/identity.pub"]));
+        assert!(args.contains(&format!("UserKnownHostsFile={}", path.display()).as_str()));
+        assert!(!args.contains(&"alfonso-runner"));
+        assert!(args
+            .last()
+            .unwrap()
+            .contains("--instance macos --state-root /Users/motor/state"));
+        for name in ["SSH_AUTH_SOCK", "SSH_AGENT_PID", "SUBC_LAUNCH_NONCE"] {
+            assert!(command
+                .as_std()
+                .get_envs()
+                .any(|(n, v)| n == name && v.is_none()));
+        }
+        drop(pin);
+        assert!(!path.exists());
     }
 }
 
