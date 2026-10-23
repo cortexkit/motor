@@ -25,6 +25,8 @@ MARGIN = 180
 # Hydration/uploads, two routes' network probes per repository/class, and cleanup
 # are outside Cargo wall time. This is an admission allowance, not a runtime guarantee.
 NON_BUILD_ALLOWANCE = 360
+# Read-only samples per class, most preferred first; a repository uses the largest that fits.
+SAMPLE_CHOICES = (3, 2)
 
 REMOTE = '''import sys,json,argparse
 payload=json.load(sys.stdin)
@@ -122,7 +124,7 @@ def backend_pair(path):
     return configs
 
 
-def boat(args, directory, repositories, configs, key, baseline=False, profile='hourly'):
+def boat(args, directory, repositories, configs, key, baseline=False, profile='hourly', samples=None):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     repos_path = directory / 'repositories.json'
     backends_path = directory / 'backends.json'
@@ -133,6 +135,8 @@ def boat(args, directory, repositories, configs, key, baseline=False, profile='h
             '--cache-backends', str(backends_path), '--cache-profile', profile, '--output', str(directory / 'probe')]
     if baseline:
         argv.append('--cache-baseline')
+    if samples:
+        argv += ['--cache-samples', str(int(samples))]
     try:
         result = subprocess.run(argv, input=key, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 timeout=TTL + 180, env=transport_env())
@@ -205,25 +209,64 @@ def fill(args, repositories, configs):
     return report['complete']
 
 
+def sandbox_budget(cold_seconds, builds):
+    """Conservative admission estimate for one sandbox running `builds` cold-length builds."""
+    return builds * cold_seconds + NON_BUILD_ALLOWANCE + MARGIN
+
+
+def sizing(cold_seconds):
+    """Choose one repository's read-only samples per class, or None when it cannot fit.
+
+    Each repository has its own sandbox every hour, holding both classes. R is the
+    largest of SAMPLE_CHOICES whose busiest hour (2R samples plus the sixth-hour
+    uncached baseline) fits the TTL. When even R=2 cannot also hold the baseline,
+    the baseline moves to a separate baseline-only sandbox in the same slot; it is
+    never skipped. R is the same in every hour so samples stay comparable.
+    """
+    for samples in SAMPLE_CHOICES:
+        budget = sandbox_budget(cold_seconds, 2 * samples + 1)
+        if budget <= TTL:
+            return dict(samples=samples, baseline_sandbox=False,
+                        sandbox_budget_seconds=sandbox_budget(cold_seconds, 2 * samples),
+                        baseline_hour_budget_seconds=budget, baseline_sandbox_budget_seconds=None)
+    samples = SAMPLE_CHOICES[-1]
+    budget = sandbox_budget(cold_seconds, 2 * samples)
+    alone = sandbox_budget(cold_seconds, 1)
+    if budget <= TTL and alone <= TTL:
+        return dict(samples=samples, baseline_sandbox=True, sandbox_budget_seconds=budget,
+                    baseline_hour_budget_seconds=budget, baseline_sandbox_budget_seconds=alone)
+    return None
+
+
 def selection(records):
-    """Admit only measured heavier dependencies with room for worst-case cold repeats."""
+    """Pick the heavier-dependency candidate that fits its own sandbox, preferring more dependency work.
+
+    Only candidates with more measured dependency unit-seconds than motor qualify:
+    the point of the comparison is a repository whose dependency builds dominate.
+    """
     motor = records['motor']
-    candidates = []
-    for name in ('prefrontal', 'broca'):
-        record = records[name]
-        budget = 7 * (motor['cold_seconds'] + record['cold_seconds']) + NON_BUILD_ALLOWANCE + MARGIN
-        if record['dependency_unit_seconds'] > motor['dependency_unit_seconds'] and budget <= TTL:
-            candidates.append((budget, name))
-    if not candidates:
+    if sizing(motor['cold_seconds']) is None:
         return None
-    return min(candidates)[1]
+    candidates = sorted((name for name in ('prefrontal', 'broca')
+                         if records[name]['dependency_unit_seconds'] > motor['dependency_unit_seconds']),
+                        key=lambda name: records[name]['dependency_unit_seconds'], reverse=True)
+    for name in candidates:
+        if sizing(records[name]['cold_seconds']) is not None:
+            return name
+    return None
+
+
+def scheduled_sizing(records, selected):
+    """Per-repository sizing for motor and the selected repository, motor first."""
+    return {name: sizing(records[name]['cold_seconds']) for name in ('motor', selected)}
 
 
 def calibrate(args, repositories, configs):
     if {r['name'] for r in repositories} != {'motor', 'prefrontal', 'broca'}:
         raise bench.BenchError('calibration requires motor, prefrontal and broca pinned bundles')
-    evidence = {'schema': 1, 'image': args.image, 'size': 'large', 'repositories': repositories,
-                'margin_seconds': MARGIN, 'non_build_allowance_seconds': NON_BUILD_ALLOWANCE, 'records': {}}
+    evidence = {'schema': 2, 'image': args.image, 'size': 'large', 'repositories': repositories,
+                'ttl_seconds': TTL, 'margin_seconds': MARGIN, 'non_build_allowance_seconds': NON_BUILD_ALLOWANCE,
+                'sample_choices': list(SAMPLE_CHOICES), 'records': {}}
     for repo in repositories:
         directory = args.output / ('calibration-' + repo['name'])
         result = boat(args, directory, [repo], configs[:1], read_key(args.key_reader), profile='baseline')
@@ -238,23 +281,33 @@ def calibrate(args, repositories, configs):
                                                       dependency_unit_seconds=sum(dependency), evidence=result)
         else:
             evidence['records'][repo['name']] = dict(cold_seconds=TTL, dependency_unit_seconds=0, evidence=result)
+        evidence['records'][repo['name']]['sizing'] = sizing(evidence['records'][repo['name']]['cold_seconds'])
         atomic(args.output / 'calibration.json', evidence)
     selected = selection(evidence['records'])
     evidence.update(selected=selected, complete=bool(selected),
-                    reason='Smallest conservative hourly budget among measured heavier dependency builds that fit with 180s margin.'
-                    if selected else 'Neither candidate has measured heavier dependencies and fits with margin.')
+                    sizing=scheduled_sizing(evidence['records'], selected) if selected else None,
+                    reason='Candidate with the most measured dependency unit-seconds above motor whose own '
+                           'per-repository sandbox fits the TTL with margin at R=3 or R=2.'
+                    if selected else 'No candidate has measured heavier dependencies than motor and fits its own '
+                                     'sandbox at R=2, even with a separate baseline sandbox.')
     atomic(args.output / 'calibration.json', evidence)
-    print(json.dumps({'selected': selected, 'calibration': str(args.output / 'calibration.json')}))
+    print(json.dumps({'selected': selected, 'sizing': evidence['sizing'],
+                      'calibration': str(args.output / 'calibration.json')}))
     return bool(selected)
 
 
 def admitted(args, repositories):
     evidence = json.loads(args.calibration.read_text())
-    if (not evidence.get('complete') or evidence.get('selected') not in ('prefrontal', 'broca') or
+    if (evidence.get('schema') != 2 or not evidence.get('complete') or
+            evidence.get('selected') not in ('prefrontal', 'broca') or
             evidence.get('image') != args.image or evidence.get('size') != 'large' or
-            evidence.get('margin_seconds') != MARGIN or selection(evidence['records']) != evidence['selected']):
+            evidence.get('ttl_seconds') != TTL or evidence.get('margin_seconds') != MARGIN or
+            evidence.get('non_build_allowance_seconds') != NON_BUILD_ALLOWANCE or
+            selection(evidence['records']) != evidence['selected'] or
+            evidence.get('sizing') != scheduled_sizing(evidence['records'], evidence['selected'])):
         raise bench.BenchError('a successful matching Boat-large calibration is required')
-    chosen = [r for r in repositories if r['name'] in ('motor', evidence['selected'])]
+    order = ('motor', evidence['selected'])
+    chosen = sorted((r for r in repositories if r['name'] in order), key=lambda r: order.index(r['name']))
     if len(chosen) != 2 or any(r not in evidence['repositories'] for r in chosen):
         raise bench.BenchError('source bundle/prefix changed since calibration; recalibrate')
     for repo in chosen:
@@ -262,7 +315,7 @@ def admitted(args, repositories):
         report = args.calibration.parent / record['evidence']['report']
         if not record['evidence']['complete'] or not json.loads(report.read_text()).get('complete'):
             raise bench.BenchError('calibration raw evidence is missing or incomplete')
-    return chosen
+    return chosen, evidence['sizing']
 
 
 def verify_fills(args, repositories, configs):
@@ -283,7 +336,26 @@ def verify_fills(args, repositories, configs):
                 raise bench.BenchError('fill evidence does not match the pinned repository/classes/prefixes')
 
 
-def plan(output, fingerprint, now):
+def slot_sandboxes(repositories, sizes, baseline):
+    """The Boat sandboxes of one slot, run one after another in this order.
+
+    Each repository gets its own fresh sandbox holding only its samples for both
+    classes. In a sixth-hour slot, a repository whose baseline does not fit beside
+    its samples gets a baseline-only sandbox first, so the baseline still precedes
+    that repository's first class as it does when it fits inline.
+    """
+    sandboxes = []
+    for repo in repositories:
+        size = sizes[repo['name']]
+        if baseline and size['baseline_sandbox']:
+            sandboxes.append(dict(name=repo['name'] + '-baseline', repository=repo['name'], profile='baseline',
+                                  samples=None, baseline=True))
+        sandboxes.append(dict(name=repo['name'], repository=repo['name'], profile='hourly', samples=size['samples'],
+                              baseline=baseline and not size['baseline_sandbox']))
+    return sandboxes
+
+
+def plan(output, fingerprint, now, repositories=(), sizes=None):
     path = output / 'state.json'
     if path.exists():
         state = json.loads(path.read_text())
@@ -293,22 +365,36 @@ def plan(output, fingerprint, now):
             if item['status'] == 'running':
                 item.update(status='failed', error='scheduler interrupted; sample not repeated', finished_at=now)
     else:
-        state = {'schema': 1, 'fingerprint': fingerprint, 'started_at': now,
+        sizes = sizes or {}
+        samples = {repo['name']: sizes[repo['name']]['samples'] for repo in repositories}
+        state = {'schema': 2, 'fingerprint': fingerprint, 'started_at': now, 'sizing': sizes,
                  'iterations': [{'hour': i + 1, 'due_at': now + i * INTERVAL, 'status': 'pending',
-                                 'baseline': (i + 1) % 6 == 0, 'reverse': bool(i % 2)} for i in range(HOURS)]}
+                                 'baseline': (i + 1) % 6 == 0, 'reverse': bool(i % 2), 'samples': dict(samples),
+                                 'sandboxes': slot_sandboxes(repositories, sizes, (i + 1) % 6 == 0)}
+                                for i in range(HOURS)]}
     atomic(path, state)
     return state
 
 
-def run_schedule(args, repositories, configs, clock=time.time, wait=time.sleep, boat_leg=boat, server_leg=server):
-    identity = dict(repositories=repositories, backends=configs, image=args.image, server=args.server,
+def resolve_cleanups(args, key):
+    """Retry unresolved cleanup of any earlier sandbox before creating another one."""
+    for lifecycle in sorted(args.output.glob('hour-*/boat-*/probe/results.json')):
+        data = json.loads(lifecycle.read_text())
+        if not data.get('cleanup_complete', False):
+            if not cleanup(args, lifecycle, key):
+                raise bench.BenchError('previous sandbox cleanup unresolved')
+
+
+def run_schedule(args, repositories, configs, sizes, clock=time.time, wait=time.sleep, boat_leg=boat, server_leg=server):
+    identity = dict(repositories=repositories, backends=configs, image=args.image, server=args.server, sizing=sizes,
                     calibration_sha256=bench.sha(args.calibration), driver_sha256=bench.sha(HERE / 'bench.py'),
                     scheduler_sha256=bench.sha(Path(__file__)), probe_sha256=bench.sha(PROBE),
                     boat_driver_sha256=bench.sha(PROBE.with_name('cache_bench.py')),
                     boat_helpers={p.name: bench.sha(p) for p in sorted(PROBE.parent.glob('*.py')) if not p.name.startswith('test_')},
                     key_reader_sha256=hashlib.sha256(args.key_reader.encode()).hexdigest())
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    state = plan(args.output, fingerprint, clock())
+    state = plan(args.output, fingerprint, clock(), repositories, sizes)
+    by_name = {repo['name']: repo for repo in repositories}
     for item in state['iterations']:
         if item['status'] != 'pending':
             continue
@@ -317,32 +403,39 @@ def run_schedule(args, repositories, configs, clock=time.time, wait=time.sleep, 
             atomic(args.output / 'state.json', state)
             continue
         wait(max(0, item['due_at'] - clock()))
-        item.update(status='running', started_at=clock())
+        item.update(status='running', started_at=clock(), boat={})
         atomic(args.output / 'state.json', state)
         directory = args.output / f"hour-{item['hour']:03d}"
         directory.mkdir(mode=0o700, exist_ok=True)
         ordered = list(reversed(configs)) if item['reverse'] else list(configs)
         item['order'] = [c['name'] for c in ordered]
-        # Each leg is independent: a failed Boat sample must not suppress server evidence.
-        for name in ('boat', 'server'):
+        # Each sandbox and the server leg are independent: one failure must not
+        # suppress the other repository's sandbox or the server evidence.
+        for sandbox in item['sandboxes']:
+            repo = by_name[sandbox['repository']]
             try:
-                if name == 'boat':
-                    key = read_key(args.key_reader)
-                    previous = sorted(args.output.glob('hour-*/boat/probe/results.json'))
-                    for lifecycle in previous:
-                        data = json.loads(lifecycle.read_text())
-                        if not data.get('cleanup_complete', False):
-                            if not cleanup(args, lifecycle, key):
-                                raise bench.BenchError('previous sandbox cleanup unresolved')
-                    result = boat_leg(args, directory / 'boat', repositories, ordered, key, item['baseline'])
+                # A fresh key read per sandbox lets a rotated key take effect mid-hour.
+                key = read_key(args.key_reader)
+                resolve_cleanups(args, key)
+                target = directory / ('boat-' + sandbox['name'])
+                if sandbox['profile'] == 'baseline':
+                    # Uncached builds touch no cache, so one class's credentials suffice, as in calibration.
+                    result = boat_leg(args, target, [repo], configs[:1], key, profile='baseline')
                 else:
-                    result = server_leg(args, directory, repositories, ordered)
-                item[name] = result
+                    result = boat_leg(args, target, [repo], ordered, key, baseline=sandbox['baseline'],
+                                      samples=sandbox['samples'])
             except Exception as error:
-                item[name] = dict(complete=False, error=type(error).__name__)
+                result = dict(complete=False, error=type(error).__name__)
+            item['boat'][sandbox['name']] = dict(result, repository=sandbox['repository'], profile=sandbox['profile'],
+                                                 samples=sandbox['samples'])
             atomic(args.output / 'state.json', state)
-        item.update(status='passed' if all(item[n]['complete'] for n in ('boat', 'server')) else 'failed',
-                    finished_at=clock())
+        try:
+            item['server'] = server_leg(args, directory, repositories, ordered)
+        except Exception as error:
+            item['server'] = dict(complete=False, error=type(error).__name__)
+        atomic(args.output / 'state.json', state)
+        complete = all(leg['complete'] for leg in item['boat'].values()) and item['server']['complete']
+        item.update(status='passed' if complete else 'failed', finished_at=clock())
         atomic(args.output / 'state.json', state)
         print(f"hour {item['hour']:02d}/{HOURS}: {item['status']}", flush=True)
     return all(item['status'] == 'passed' for item in state['iterations'])
@@ -382,11 +475,11 @@ def main(argv=None):
             return calibrate(args, repositories, configs)
         if not (args.calibration and args.server and (args.fill or args.fills)):
             parser.error('schedule requires --calibration, --fills and --server')
-        repositories = admitted(args, repositories)
+        repositories, sizes = admitted(args, repositories)
         if args.fill:
             return fill(args, repositories, configs)
         verify_fills(args, repositories, configs)
-        return run_schedule(args, repositories, configs)
+        return run_schedule(args, repositories, configs, sizes)
 
 
 if __name__ == '__main__':

@@ -696,7 +696,7 @@ def render(data):
     if 'backends' not in data:
         return render_backend(data)
     rows = ['# Compile cache: placement × backend', '',
-            '| Placement | Backend | Status | Returned class (requested) | No cache s | Fill s | RO s (3) | Local warm s | RO hits/misses/errors | RO bytes/requests | Full GET direct p50/p95 ms | Full GET gateway p50/p95 ms | TCP direct p50/p95 ms | TCP gateway p50/p95 ms | Tiny GET direct p50/p95 ms | Tiny GET gateway p50/p95 ms |',
+            '| Placement | Backend | Status | Returned class (requested) | No cache s | Fill s | RO s | Local warm s | RO hits/misses/errors | RO bytes/requests | Full GET direct p50/p95 ms | Full GET gateway p50/p95 ms | TCP direct p50/p95 ms | TCP gateway p50/p95 ms | Tiny GET direct p50/p95 ms | Tiny GET gateway p50/p95 ms |',
             '|---|---|---|---|---:|---:|---|---:|---|---|---|---|---|---|---|---|']
     def pair(value, a, b):
         if not value or value.get(a) is None or value.get(b) is None:
@@ -721,7 +721,8 @@ def render(data):
         row += [pair(rtt.get(route, {}).get(kind), 'p50_ms', 'p95_ms')
                 for kind in ('tcp_connect', 'tiny_get') for route in ('direct', 'gateway')]
         rows.append('| ' + ' | '.join(row) + ' |')
-    rows += ['', 'RO: three cold-target repetitions; errors shown cache+read+write. Full GET: 200 real objects per route.',
+    rows += ['', 'RO: cold-target repetitions (three, or the hourly --samples count); errors shown cache+read+write.',
+             'Full GET: 200 real objects per route.',
              'TCP gateway measures loopback, not endpoint RTT. Tiny GET gateway includes fresh upstream TLS.',
              'See JSON for all raw stats/durations, 30-second probes, errors, skip reasons, and sampled HEAD headers.',
              'No live speed conclusion is implied by this report.', '']
@@ -859,7 +860,10 @@ def benchmark(args, s3):
         if profile == 'fill':
             data['complete'] = True
             return data
-        for number in range(1, 4):
+        # The hourly schedule may lower the read-only count for a repository whose
+        # cold build would not otherwise fit one sandbox TTL; other profiles keep three.
+        data['read_only_samples'] = getattr(args, 'samples', None) or 3
+        for number in range(1, data['read_only_samples'] + 1):
             run(f'remote-read-only-{number}', 'remote')
         def record_probes(partial):
             data.update({key: partial[key] for key in ('class_audit', 'latency', 'rtt')})
@@ -907,6 +911,7 @@ def matrix(args, configs, clients=None):
             backend_args = argparse.Namespace(placement=args.placement, output=args.output / config['name'],
                                               prefix=args.prefix + config['name'] + '/',
                                               profile=getattr(args, 'profile', 'legacy'),
+                                              samples=getattr(args, 'samples', None),
                                               baseline=getattr(args, 'baseline', False) and not report['backends'][:-1])
             entry['result'] = benchmark(backend_args, s3)
             result = entry['result']
@@ -940,23 +945,50 @@ def measured_records(result):
             yield route, kind, probes[kind].get('records', [])
 
 
+def scheduled_reports(hour):
+    """Yield (placement, leg) for each recorded leg of one schedule slot, with or without a report.
+
+    Every slot runs one Boat sandbox per repository (plus, for a repository whose
+    baseline does not fit beside its samples, a separate baseline-only sandbox),
+    then the server network leg covering all repositories.
+    """
+    for leg in (hour.get('boat') or {}).values():
+        yield 'B', leg
+    if hour.get('server'):
+        yield 'A', hour['server']
+
+
 def summarize_data(directory):
     state = json.loads((directory / 'state.json').read_text())
     groups, hourly = {}, []
+    # Uncached builds from baseline-only sandboxes; they have no class or cache
+    # samples, so they join the repository's baseline pool and nothing else.
+    separate_baselines = {}
+    sizing = state.get('sizing', {})
     for hour in state['iterations']:
-        for leg, placement in (('boat', 'B'), ('server', 'A')):
-            path = hour.get(leg, {}).get('report')
+        for placement, leg in scheduled_reports(hour):
+            path = leg.get('report')
             if not path:
                 continue
             report = json.loads((directory / path).read_text())
+            if leg.get('profile') == 'baseline':
+                for entry in report['backends']:
+                    for run in entry.get('result', {}).get('runs', []):
+                        if run['name'] == 'no-cache':
+                            separate_baselines.setdefault((placement, entry.get('repository', 'motor')), []).append(
+                                run['wall_seconds'])
+                continue
             for entry in report['backends']:
                 repo = entry.get('repository', 'motor')
                 storage = entry.get('storage_class')
                 key = (storage, placement, repo)
                 group = groups.setdefault(key, {'storage_class': storage, 'placement': placement, 'repository': repo,
+                                                'read_only_samples_per_class': set(),
                                                 'rebuild_seconds': [], 'baseline_seconds': [], 'hits': 0, 'misses': 0,
                                                 'cache_errors': 0, 'probes': {}, 'hours': 0, 'failed_hours': 0})
                 group['hours'] += 1
+                if placement == 'B' and hour.get('samples', {}).get(repo):
+                    group['read_only_samples_per_class'].add(hour['samples'][repo])
                 group['failed_hours'] += entry['status'] != 'passed'
                 result = entry.get('result', {})
                 row = {'hour': hour['hour'], 'due_at': hour['due_at'], 'iteration_status': hour['status'],
@@ -1015,7 +1047,7 @@ def summarize_data(directory):
                      'median difference does not exceed observed paired-hour IQR')
         variation.append(dict(placement=placement, repository=repo, metric=metric, paired_hours=len(values),
                               median_difference=median, paired_hour_iqr=iqr, statement=statement))
-    baselines = {}
+    baselines = {key: list(values) for key, values in separate_baselines.items()}
     for group in groups.values():
         group['hours_without_report'] = len(state['iterations']) - group['hours']
         baselines.setdefault((group['placement'], group['repository']), []).extend(group['baseline_seconds'])
@@ -1023,8 +1055,12 @@ def summarize_data(directory):
         group['rebuild_seconds'] = distribution(group['rebuild_seconds'])
         group['baseline_seconds'] = distribution(baselines[(group['placement'], group['repository'])])
         group['probes'] = {key: probe_distribution(value) for key, value in group['probes'].items()}
-    return {'schema': 1, 'groups': list(groups.values()), 'hourly': hourly, 'paired': paired,
-            'variation': variation, 'schedule': state['iterations']}
+        group['read_only_samples_per_class'] = sorted(group['read_only_samples_per_class'])
+    repositories = {}
+    for group in groups.values():
+        repositories.setdefault(group['repository'], dict(sizing.get(group['repository'], {})))
+    return {'schema': 2, 'repositories': repositories, 'groups': list(groups.values()), 'hourly': hourly,
+            'paired': paired, 'variation': variation, 'schedule': state['iterations']}
 
 
 def probe_distribution(records):
@@ -1051,21 +1087,42 @@ def summarize(directory):
              'Paired difference = EXPRESS_ONEZONE minus STANDARD; negative latency/time favors EXPRESS_ONEZONE.',
              'Variation rule: absolute median paired difference > paired-hour IQR, with at least 6 pairs.',
              'This descriptive rule is not a significance test or a production-readiness claim.', '',
-             '| Class | Placement | Repository | Observed hours/failed | Slots without report (including pending) | Rebuild p50/p95/p99 s (n) | Baseline p50/p95/p99 s (n) | Hits/misses/cache errors |',
-             '|---|---|---|---|---|---|---|---|']
-    for g in report['groups']:
-        lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {g['hours']}/{g['failed_hours']} | {g['hours_without_report']} | "
-                     f"{dist(g['rebuild_seconds'])} ({g['rebuild_seconds']['n']}) | "
-                     f"{dist(g['baseline_seconds'])} ({g['baseline_seconds']['n']}) | {g['hits']}/{g['misses']}/{g['cache_errors']} |")
-    lines += ['', '| Class | Placement | Repository | Route/probe | p50/p95/p99 ms | Errors/attempts | Timeouts/attempts | Error/timeout rate |', '|---|---|---|---|---|---|---|---|']
-    for g in report['groups']:
-        for label, p in sorted(g['probes'].items()):
-            lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {label} | {dist(p)} | "
-                         f"{p['errors']}/{p['attempts']} | {p['timeouts']}/{p['attempts']} | {fmt(p['error_rate'])}/{fmt(p['timeout_rate'])} |")
-    lines += ['', '## Schedule (including missing/failed hours)', '', '| Hour | Due UTC | Status | Boat | Server |', '|---|---|---|---|---|']
+             'Each repository runs in its own Boat sandbox each hour; R is its fixed read-only samples per class.',
+             'Rebuild statistics are comparable within a repository, not across repositories with different R.', '']
+    names = sorted({g['repository'] for g in report['groups']}, key=lambda name: (name != 'motor', name))
+    for name in names:
+        rows = [g for g in report['groups'] if g['repository'] == name]
+        sizing = report['repositories'].get(name, {})
+        counts = sorted({r for g in rows for r in g['read_only_samples_per_class']})
+        samples = sizing.get('samples') or '/'.join(map(str, counts)) or 'n/a'
+        separate = ' Its sixth-hour baseline runs in a separate baseline-only sandbox.' if sizing.get('baseline_sandbox') else ''
+        lines += [f'## Repository {name}', '',
+                  f'R = {samples} Boat read-only samples per class per hour.{separate}', '',
+                  '| Class | Placement | Observed hours/failed | Slots without report (including pending) | Rebuild p50/p95/p99 s (n) | Baseline p50/p95/p99 s (n) | Hits/misses/cache errors |',
+                  '|---|---|---|---|---|---|---|']
+        for g in rows:
+            lines.append(f"| {g['storage_class']} | {g['placement']} | {g['hours']}/{g['failed_hours']} | {g['hours_without_report']} | "
+                         f"{dist(g['rebuild_seconds'])} ({g['rebuild_seconds']['n']}) | "
+                         f"{dist(g['baseline_seconds'])} ({g['baseline_seconds']['n']}) | {g['hits']}/{g['misses']}/{g['cache_errors']} |")
+        lines += ['', '| Class | Placement | Route/probe | p50/p95/p99 ms | Errors/attempts | Timeouts/attempts | Error/timeout rate |',
+                  '|---|---|---|---|---|---|---|']
+        for g in rows:
+            for label, p in sorted(g['probes'].items()):
+                lines.append(f"| {g['storage_class']} | {g['placement']} | {label} | {dist(p)} | "
+                             f"{p['errors']}/{p['attempts']} | {p['timeouts']}/{p['attempts']} | {fmt(p['error_rate'])}/{fmt(p['timeout_rate'])} |")
+        lines += ['', f'### Class comparison for {name} (HP minus Standard, R = {samples})', '']
+        comparison = [row for row in report['variation'] if row['repository'] == name]
+        for row in comparison:
+            lines.append(f"- {row['placement']}/{row['metric']}: median {fmt(row['median_difference'])}, "
+                         f"paired-hour IQR {fmt(row['paired_hour_iqr'])}, {row['paired_hours']} pairs: {row['statement']}.")
+        if not comparison:
+            lines.append('- No paired hours.')
+        lines.append('')
+    lines += ['## Schedule (including missing/failed hours)', '', '| Hour | Due UTC | Status | Boat sandboxes | Server |', '|---|---|---|---|---|']
     for h in report['schedule']:
         due = datetime.fromtimestamp(h['due_at'], timezone.utc).isoformat()
-        lines.append(f"| {h['hour']} | {due} | {h['status']} | {h.get('boat', {}).get('complete', 'n/a')} | {h.get('server', {}).get('complete', 'n/a')} |")
+        boat = ', '.join(f"{name}: {leg.get('complete', 'n/a')}" for name, leg in (h.get('boat') or {}).items()) or 'n/a'
+        lines.append(f"| {h['hour']} | {due} | {h['status']} | {boat} | {h.get('server', {}).get('complete', 'n/a')} |")
     lines += ['', '## Hour-by-hour measurements', '', '| Hour | Class | Placement | Repository | Status | Rebuild p50/p95/p99 s | Hits/misses/errors | Route/probe | p50/p95/p99 ms | Errors/attempts (timeouts) |', '|---|---|---|---|---|---|---|---|---|---|']
     for h in report['hourly']:
         for label, p in h['probes'].items():
@@ -1076,10 +1133,6 @@ def summarize(directory):
     for row in report['paired']:
         for metric, delta in sorted(row['difference'].items()):
             lines.append(f"| {row['hour']} | {row['placement']} | {row['repository']} | {metric} | {fmt(delta)} |")
-    lines += ['', '## Difference versus variation', '']
-    for row in report['variation']:
-        lines.append(f"- {row['placement']}/{row['repository']}/{row['metric']}: median {fmt(row['median_difference'])}, "
-                     f"paired-hour IQR {fmt(row['paired_hour_iqr'])}, {row['paired_hours']} pairs: {row['statement']}.")
     (directory / 'summary.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     (directory / 'summary.md').write_text('\n'.join(lines) + '\n')
     print(str(directory / 'summary.md'))
@@ -1095,6 +1148,8 @@ def parser():
     mode.add_argument('--summarize', type=Path, help='summarize a scheduler output directory offline')
     result.add_argument('--profile', choices=('legacy', 'fill', 'hourly', 'network', 'baseline'), default='legacy')
     result.add_argument('--baseline', action='store_true', help='include one uncached sample in an hourly matrix')
+    result.add_argument('--samples', type=int, choices=(2, 3),
+                        help='read-only samples per class in an hourly matrix (default 3)')
     result.add_argument('--repository', default='motor', choices=('motor', 'prefrontal', 'broca'))
     result.add_argument('--credentials', type=Path)
     result.add_argument('--backends', type=Path, help='JSON backend manifest; unavailable credential files are skipped')
@@ -1120,13 +1175,15 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.summarize:
         if any((args.credentials, args.backends, args.prefix, args.placement, args.output, args.source,
-                args.commit, args.cargo_home, args.toolchain, args.bundle)):
+                args.commit, args.cargo_home, args.toolchain, args.bundle, args.samples)):
             p.error('--summarize accepts only the scheduler directory')
         return args
-    if (args.profile != 'legacy' or args.baseline) and not args.run:
-        p.error('--profile/--baseline require --run')
+    if (args.profile != 'legacy' or args.baseline or args.samples) and not args.run:
+        p.error('--profile/--baseline/--samples require --run')
     if args.baseline and args.profile != 'hourly':
         p.error('--baseline requires --profile hourly')
+    if args.samples and args.profile != 'hourly':
+        p.error('--samples requires --profile hourly')
     if args.combine:
         if not args.output or any((args.credentials, args.backends, args.prefix, args.placement, args.bucket,
                                    args.backend_name, args.region, args.addressing, args.storage_class,

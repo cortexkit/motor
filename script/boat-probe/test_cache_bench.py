@@ -39,7 +39,8 @@ class ArgumentTests(unittest.TestCase):
         cache_bench.validate(argparse.ArgumentParser(), args())
         for changes in ({'cache_bench': False}, {'cache_image': None}, {'cache_image': '../image'},
                         {'cache_bundle_sha256': 'main'}, {'cache_prefix': '/'}, {'max_minutes': 60},
-                        {'cache_baseline': True}, {'cache_repositories': Path('/manifest')}):
+                        {'cache_baseline': True}, {'cache_repositories': Path('/manifest')},
+                        {'cache_samples': 2}):
             with self.subTest(changes=changes), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 cache_bench.validate(argparse.ArgumentParser(), args(**changes))
 
@@ -85,6 +86,7 @@ class SSHTests(unittest.TestCase):
                 options.cache_repositories = root / 'repositories.json'
                 options.cache_profile = 'hourly'
                 options.cache_baseline = True
+                options.cache_samples = 2
             runner = SimpleNamespace(data={}, results_path=root / 'results.json', deadline=time.monotonic() + 1800,
                                      size='large', checkpoint=MagicMock(), wait_hydrated=MagicMock(),
                                      create=MagicMock(return_value=({'id': 'bx_fixture', 'vcpu': 8, 'memoryGB': 16}, {})))
@@ -126,7 +128,7 @@ class SSHTests(unittest.TestCase):
             if multi:
                 runs = [command for command in commands if ' --run ' in command]
                 self.assertEqual(len(runs), 2)
-                self.assertTrue(all('--profile hourly --baseline' in command for command in runs))
+                self.assertTrue(all('--profile hourly --samples 2 --baseline' in command for command in runs))
                 self.assertEqual([e['repository'] for e in runner.data['cache_bench']['result']['backends']], ['motor', 'prefrontal'])
             self.assertEqual(commands[-1], 'rm -f /dev/shm/motor-cache-credentials-fixture')
             for argv, kwargs in calls:
