@@ -75,6 +75,8 @@ pub(crate) fn reader_environment(env: &mut BTreeMap<String, String>, size_gib: u
 /// stores each entry under such a directory (see `writer::cache`), and the
 /// only other directory the runner creates there, `preprocessor/`, holds no
 /// Rust entries, so a cache without one is empty. A missing cache is empty.
+/// Only the Linux runner has a shared cache to inspect.
+#[cfg(target_os = "linux")]
 pub(crate) fn holds_entries(fleet: &Path) -> io::Result<bool> {
     for shard in "0123456789abcdef".chars() {
         match fs::symlink_metadata(fleet.join(shard.to_string())) {

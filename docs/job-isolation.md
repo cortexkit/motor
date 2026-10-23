@@ -206,6 +206,29 @@ Tests: `post_credential_drop_rearms_parent_death_signal`,
 `supervisor_wait_failure_cannot_write_a_setup_record`,
 `proc_protections_must_equal_the_independent_reference_after_moves`.
 
+4.4.2. How a job can tell it is inside a motor job sandbox. On every Linux
+host that runs jobs (the build server, a Boat sandbox and a hosted tenant VM)
+these hold, and callers may rely on them:
+
+- The job's process runs in the cgroup of its own transient system service,
+  `/proc/self/cgroup` reads `0::/system.slice/motor-job-<uuid>.service`, with a
+  UUID in lowercase hyphenated form. It is the id of the runner that started the
+  unit and need not equal the job id the caller sees: a hosted job runs under
+  the tenant runner's own id. The name comes from one function, `host_unit_name`
+  in `crates/motor-runner/src/backend.rs`.
+- That cgroup is not delegated to the job: its directory and control files are
+  owned by root, so the job cannot change its own limits.
+- PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
+  account.
+- The job account is `motor-job` (2.1). The Boat and tenant image recipes pin
+  it to the build server's uid and gid (999 and 986), but an image built before
+  that pin may differ, so prefer the properties above to the number.
+
+A caller that checks these should check the full shape (slice, prefix, UUID
+and suffix), not a prefix, and refuse when any of them differs. The live Boat
+probe checks PID 1 and `/proc/1/cgroup` (4.1); the cgroup path shape and
+ownership are not covered by a test.
+
 4.5. The command runs as `bash -c <command>` with the request's working
 directory. Its environment is the request's filtered variables (5.1) with the
 runner's values forced for `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
