@@ -76,6 +76,58 @@ def tool_version(path, env, observed, version_from=None):
     return binary_version(path, env)
 
 
+def role_manifest(manifest, role, job=False):
+    """Select the role's toolchain roots; jobs keep registry caches in /motor-home/cargo."""
+    return {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
+
+
+def runtime_capture():
+    import tempfile
+
+    runtime = {'proc': {}, 'inotify': {}, 'tmpdir': tempfile.gettempdir()}
+    for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
+        try:
+            runtime['proc'][name] = bool(Path('/proc', name).read_text())
+        except OSError:
+            runtime['proc'][name] = False
+    for name in ('max_user_instances', 'max_user_watches', 'max_queued_events'):
+        value = optional_text('/proc/sys/fs/inotify/' + name)
+        runtime['inotify'][name] = int(value) if value else None
+    try:
+        with tempfile.TemporaryFile(dir='/dev/shm') as shared:
+            shared.write(b'shared memory probe')
+        runtime['dev_shm_writable'] = True
+    except OSError:
+        runtime['dev_shm_writable'] = False
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'exec-probe'
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o700)
+            runtime['tmpdir_exec'] = subprocess.run([str(executable)], timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        runtime['tmpdir_exec'] = False
+    runtime['sshd_executable'] = os.access('/usr/sbin/sshd', os.X_OK)
+    runtime['api_mounts'] = [line for line in (optional_text('/proc/self/mountinfo') or '').splitlines()
+                             if line.split()[4] in ('/proc', '/dev/shm')]
+    try:
+        runtime['visible_pids'] = len([path for path in Path('/proc').iterdir() if path.name.isdigit()])
+    except OSError:
+        runtime['visible_pids'] = None
+    return runtime
+
+
+def job_identity(job):
+    if job:
+        return {'uid': os.getuid(), 'gid': os.getgid()}
+    import pwd
+    try:
+        account = pwd.getpwnam('motor-job')
+        return {'uid': account.pw_uid, 'gid': account.pw_gid}
+    except KeyError:
+        return None
+
+
 def capture(manifest=None, job=False):
     paths = manifest or {}
     cargo_home = Path(paths.get("cargo_home", os.environ.get("CARGO_HOME", "/srv/build/cargo-home")))
@@ -176,6 +228,8 @@ def capture(manifest=None, job=False):
         "job_environment": {name: os.environ.get(name) for name in sorted(job_names)},
         "compile_wrapper": wrapper,
         "mountinfo": mountinfo,
+        "runtime": runtime_capture() if job else {},
+        "job_identity": job_identity(job),
         "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
     }
 
@@ -187,6 +241,9 @@ def first_line(text):
 def validate(manifest):
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
+    if (set(manifest.get('job_identity', {})) != {'uid', 'gid'}
+            or any(type(value) is not int or value <= 0 for value in manifest['job_identity'].values())):
+        raise ValueError('invalid numeric job identity')
     for key in ("rustup",):
         if not re.fullmatch(r"\d+\.\d+\.\d+", manifest[key]):
             raise ValueError("unpinned version: " + key)
@@ -283,7 +340,7 @@ def validate(manifest):
 
 def validate_git(spec):
     """Boat and tenant images build the server's git release from source. Tie
-    the source URL, install directory and Boat paths to the measured version,
+    the source URL, install directory and image paths to the measured version,
     so refreshing the server's version without new source pins fails here."""
     match = re.fullmatch(r"git version (\d+\.\d+\.\d+)", spec.get("version", ""))
     if not match:
@@ -295,8 +352,9 @@ def validate_git(spec):
             or not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", ""))):
         raise ValueError("invalid pinned git source: " + release)
     if (source.get("install_dir") != install_dir
-            or spec.get("path_by_role") != {"boat": "/usr/local/bin/git"}
-            or spec.get("realpath_suffix_by_role", {}).get("boat") != install_dir + "/bin/git"):
+            or spec.get("path_by_role") != {role: "/usr/local/bin/git" for role in ("boat", "tenant")}
+            or any(spec.get("realpath_suffix_by_role", {}).get(role) != install_dir + "/bin/git"
+                   for role in ("boat", "tenant"))):
         raise ValueError("invalid git install layout: " + release)
     packages = source.get("build_packages")
     if not packages or not all(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) for name in packages):
@@ -310,11 +368,14 @@ def readonly_mount(path, mountinfo):
 
 
 def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None):
+    manifest = role_manifest(manifest, role, job)
     errors = []
 
     def equal(name, expected, observed):
         if expected != observed:
             errors.append(f"{name}: expected {expected!r}, observed {observed!r}")
+
+    equal('motor-job identity', manifest['job_identity'], actual.get('job_identity'))
 
     for key in ("rust_default", "rust_profile", "cargo_home", "rustup_home"):
         equal(key, manifest[key], actual.get(key))
@@ -398,6 +459,15 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
         for name, expected in environment.items():
             equal("job " + name, expected, actual.get("job_environment", {}).get(name))
+        runtime = actual.get('runtime', {})
+        for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
+            equal('/proc/' + name + ' readable', True, runtime.get('proc', {}).get(name))
+        for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):
+            equal('job ' + name, True, runtime.get(name))
+        for name, minimum in manifest.get('inotify_minimum', {}).items():
+            value = runtime.get('inotify', {}).get(name)
+            if not isinstance(value, int) or value < minimum:
+                errors.append(f'inotify {name}: expected at least {minimum}, observed {value!r}')
         # Only build-server jobs read the shared compile cache through the
         # runner's wrapper. Boat jobs compile directly: no cache is filled there,
         # and an empty read-only cache breaks C builds that cc-rs routes to it.
@@ -416,7 +486,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         for name in required:
             if name not in actual.get("apt_packages", {}):
                 errors.append("missing apt package: " + name)
-        if role == "boat":
+        if role in ("boat", "tenant"):
             equal("sccache build inputs", manifest["sccache"]["inputs_sha256"], actual.get("sccache_inputs_sha256"))
             artifacts = actual.get('sccache_artifacts') or {}
             equal('sccache artifact inputs', manifest['sccache']['inputs_sha256'], artifacts.get('inputs_sha256'))
@@ -427,11 +497,12 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
 
 def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None):
     validate(manifest)
-    actual = capture(manifest, job=job)
-    if role == "boat" and not job:
-        marker = Path("/srv/build/sccache-inputs.sha256")
+    actual = capture(role_manifest(manifest, role, job), job=job)
+    if role in ("boat", "tenant") and not job:
+        state = Path('/usr/local/lib/motor' if role == 'tenant' else '/srv/build')
+        marker = state / "sccache-inputs.sha256"
         actual["sccache_inputs_sha256"] = marker.read_text() if marker.is_file() else None
-        artifacts = Path('/srv/build/sccache-artifacts.json')
+        artifacts = state / 'sccache-artifacts.json'
         actual['sccache_artifacts'] = json.loads(artifacts.read_text()) if artifacts.is_file() else None
     errors = differences(manifest, actual, role, job, gnu_test_sha256)
     registry = None
@@ -512,7 +583,7 @@ def main():
     modes.add_argument("--check", action="store_true", help="compare live state with the manifest; exit nonzero on drift")
     modes.add_argument("--from-capture", type=Path, help="refresh measured manifest fields from captured JSON to stdout")
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
-    parser.add_argument("--role", choices=("build-server", "boat"), default="build-server")
+    parser.add_argument("--role", choices=("build-server", "boat", "tenant"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
     parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='trusted server seed inventory; required for Boat parity')
@@ -524,7 +595,7 @@ def main():
         # The manifest names tools beyond the built-in list (pinned variants such
         # as bun-1.3.14) and the GNU coreutils locations; without it the capture
         # omits them and --from-capture refuses it as unmeasured.
-        result = capture(json.loads(args.manifest.read_text()))
+        result = capture(role_manifest(json.loads(args.manifest.read_text()), args.role, args.job), job=args.job)
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(

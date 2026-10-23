@@ -87,7 +87,9 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(set(), missing)
         self.assertIn("script/runner/build-git.sh", image.RUNNER_INPUTS)
         installer = (HERE / "install-guest.py").read_text()
-        self.assertIn('run("bash", str(BUILD / "script/runner/build-git.sh"))', installer)
+        self.assertIn('shared.tools(manifest, role="tenant")', installer)
+        shared = (image.REPO / 'script/boat-image/install.py').read_text()
+        self.assertIn('run("bash", str(ROOT / "script/runner/build-git.sh"))', shared)
 
     def test_guest_git_must_be_the_pinned_build_first_on_the_agent_path(self):
         manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
@@ -100,7 +102,7 @@ class ImageTests(unittest.TestCase):
         with mock.patch.object(guest, "run", return_value="git version 2.53.0") as run:
             self.assertEqual("git version 2.53.0", guest.verify_git(manifest, unit, which))
         run.assert_called_once_with("/usr/local/bin/git", "--version", capture=True)
-        self.assertEqual(["/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"], searched)
+        self.assertEqual(["/home/ubuntu/.bun/bin:/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"], searched)
         with mock.patch.object(guest, "run", return_value="git version 2.47.3"):
             with self.assertRaisesRegex(ValueError, "git version differs"):
                 guest.verify_git(manifest, unit, which)
@@ -116,7 +118,8 @@ class ImageTests(unittest.TestCase):
         self.assertIn('script/runner/install-binaryen.py', image.RUNNER_INPUTS)
         installer = (HERE / 'install-guest.py').read_text()
         self.assertIn('run("apt-get", "purge", "-y", "binaryen")', installer)
-        self.assertIn('script/runner/install-binaryen.py', installer)
+        shared = (image.REPO / 'script/boat-image/install.py').read_text()
+        self.assertIn('script/runner/install-binaryen.py', shared)
         self.assertEqual('/usr/local/bin/wasm-opt', spec['path_by_role']['tenant'])
         self.assertEqual('wasm-opt version 120', spec['version'])
         observed = 'wasm-opt version 120 (version_120)'
@@ -453,7 +456,7 @@ class ImageTests(unittest.TestCase):
         unit = (HERE / "guest/motor-tenant-agent.service").read_text()
         self.assertIn("Environment=CARGO_HOME=/usr/local/lib/motor/cargo\n", unit)
         self.assertIn("Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup\n", unit)
-        self.assertIn("Environment=HOME=/tenant\n", unit)
+        self.assertIn("Environment=HOME=/home/ubuntu\n", unit)
         self.assertIn("ExecStart=/usr/local/bin/motor-runner tenant-agent\n", unit)
 
     def test_capture_resolves_stable_alias_to_release_and_captures_all_targets(self):
@@ -494,6 +497,8 @@ class ImageTests(unittest.TestCase):
         bins.mkdir()
         (stage / "versions.json").write_bytes(self.versions.read_bytes())
         (stage / "script").mkdir()
+        (stage / "script/runner").mkdir()
+        (stage / "script/runner/toolchain.json").write_bytes((image.REPO / "script/runner/toolchain.json").read_bytes())
         (stage / "guest").mkdir()
         (stage / "motor-runner").write_bytes(b"test runner")
         log = self.root / "commands.jsonl"
@@ -549,6 +554,12 @@ elif name in ("truncate", "mkfs.ext4"):
     def test_rootfs_shell_clears_host_env_and_unmounts_before_packing(self):
         result, calls, stage = self.rootfs_shell()
         self.assertEqual(result.returncode, 0, result.stderr)
+        debootstrap = next(call for call in calls if call[0] == 'debootstrap')
+        included = next(arg.removeprefix('--include=') for arg in debootstrap if arg.startswith('--include=')).split(',')
+        manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
+        self.assertIn('openssh-server', included)
+        self.assertTrue(set(manifest['apt_packages']['required']).issubset(included))
+        self.assertTrue(set(manifest['apt_packages']['by_role']['tenant']).issubset(included))
         chroot = next(call for call in calls if call[0] == "chroot")
         self.assertEqual(chroot[2:4], ["/usr/bin/env", "-i"])
         self.assertIn("RUSTC_WRAPPER=", chroot)
@@ -712,7 +723,7 @@ class RootPathTests(unittest.TestCase):
         self.assertEqual(self.check()["offenders"], [f"{self.image}/usr/sbin/init: uid={FOREIGN_UID} gid={FOREIGN_UID}"])
 
     def test_missing_roots_are_listed_and_escaping_links_fail(self):
-        report = self.check((*root_paths.TENANT_ROOTS, "/home/ubuntu/.bun/bin"))
+        report = self.check()
         self.assertEqual((report["offenders"], report["missing"]), ([], ["/home/ubuntu/.bun/bin"]))
         (self.image / "usr/local/sbin").symlink_to("/")
         report = self.check(("/usr/local/sbin",))

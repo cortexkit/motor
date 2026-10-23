@@ -5,10 +5,10 @@ Requires=motor-net-rules.service
 
 [Service]
 User=root
-Environment=HOME=/tenant
+Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/usr/local/lib/motor/cargo
 Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup
-Environment=PATH=/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=PATH=/home/ubuntu/.bun/bin:/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ExecStart=/usr/local/bin/motor-runner tenant-agent
 StandardOutput=journal+console
 StandardError=journal+console

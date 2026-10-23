@@ -44,10 +44,11 @@ NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files
                 "sudo and lookup fast with an unreachable resolver, runner ready within 10 s")
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
 ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
+PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-         "tool trees", "root paths", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+          "tool trees", "root paths", "toolchain parity", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
          "guest units", "teardown")
 
 
@@ -232,6 +233,25 @@ def run_request(identifier, commit, tree, bundle, command):
                 cwd=WORKSPACE, command=command, env={}, weight_hint=1, timeout=30, queue_wait_limit_s=30,
                 snapshot_commit=commit, tree_hash=tree, integration_tip="", siblings=[],
                 bundles=[dict(index=0, repository=WORKSPACE, length=len(bundle), sha256=hashlib.sha256(bundle).hexdigest())])
+
+
+def parity_job_command(gnu_test_sha256, number):
+    if not re.fullmatch(r'[a-f0-9]{64}', gnu_test_sha256):
+        raise ValueError('image inventory lacks the package-qualified gnutest hash')
+    return ("python3 toolchain-parity.py --check --role tenant --job "
+            f"--gnu-test-sha256 {gnu_test_sha256} > \"$d/parity-job-{number}.json\" "
+            f'|| {{ cat "$d/parity-job-{number}.json" >&2; exit 1; }}; ')
+
+
+def parity_inputs(image, repo=REPO):
+    manifest = json.loads((image / 'manifest.json').read_text())
+    inventory = json.loads((image / 'tools.json').read_text())['parity']
+    for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py'):
+        relative = 'script/runner/' + name
+        actual = hashlib.sha256((repo / relative).read_bytes()).hexdigest()
+        if actual != manifest['versions']['runner_inputs_sha256'][relative]:
+            raise RuntimeError(f'qualification parity input differs from built image: {relative}')
+    return inventory['observed']['tools']['gnutest']['sha256']
 
 
 def helper_unit_command(unit, binary, config):
@@ -477,6 +497,7 @@ class Harness:
         self.record("staged_program", **stage_program(Path("/usr/bin/true"), self.binary_dir / "unused-job-loader"))
         self.image.mkdir(mode=0o755)
         source = self.args.image.resolve()
+        self.gnu_test_sha256 = parity_inputs(source)
         manifest = json.loads((source / "manifest.json").read_text())
         original = dict(manifest)
         manifest.update(version=self.name, boot_args=qualification_args(manifest["boot_args"]))
@@ -501,6 +522,9 @@ class Harness:
             shutil.copyfile(HERE / "guest/hosted_qualify.py", dest / "run.py")
             # The guest checks ownership with this checkout's rule, not the image's copy.
             shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")
+            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py"):
+                shutil.copyfile(REPO / "script/runner" / name, dest / name)
+            (dest / "gnutest.sha256").write_text(self.gnu_test_sha256)
             shutil.copyfile(self.args.runner_test_binary.resolve(), dest / "runner-tests")
             (dest / "runner-tests").chmod(0o700)
 
@@ -581,7 +605,9 @@ class Harness:
             fixture.mkdir()
             self.run("git", "init", "--quiet", fixture)
             (fixture / "input").write_text("tenant image qualification\n")
-            self.run("git", "-C", fixture, "add", "input")
+            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py"):
+                shutil.copyfile(REPO / "script/runner" / name, fixture / name)
+            self.run("git", "-C", fixture, "add", ".")
             self.run("git", "-C", fixture, "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid",
                      "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
         commit = self.run("git", "-C", fixture, "rev-parse", "HEAD").decode().strip()
@@ -595,7 +621,7 @@ class Harness:
         lease_body = dict(job_id=identifier, vcpus=1, platform="linux-x64", net=False,
                           workspace_key_hash=b64(hmac.digest(self.salt, ("ck-ws-v1\n" + WORKSPACE).encode(), "sha256")),
                           repo_hash=b64(hmac.digest(self.salt, ("ck-repo-v1\n" + WORKSPACE).encode(), "sha256")),
-                          placement_hint=None, avoid_host=None, timeout_s=30, requester_jwk=self.requester_jwk)
+                           placement_hint=None, avoid_host=None, timeout_s=180, requester_jwk=self.requester_jwk)
         request = urllib.request.Request(f"http://127.0.0.1:{self.broker_port}/v1/leases",
                                          data=json.dumps(lease_body).encode(),
                                          headers={"Authorization": "Bearer " + self.bearer, "Content-Type": "application/json"})
@@ -605,6 +631,7 @@ class Harness:
             raise RuntimeError("fake broker returned an unexpected endpoint or placement")
         self.record("lease", job_id=identifier, placement=lease["placement"], max_s=lease["max_s"])
         command = 'set -eu; d="${CARGO_TARGET_DIR:?}"; mkdir -p "$d"; '
+        command += parity_job_command(self.gnu_test_sha256, number)
         if number == 1:
             command += f'printf "%s" {self.name} > "$d/qualification-sentinel"; '
         else:
@@ -803,6 +830,7 @@ class Harness:
             self.step("name service", lambda: self.expect_console(NAME_SERVICE))
             self.step("tool trees", lambda: self.expect_console(TOOL_TREES))
             self.step("root paths", lambda: self.expect_console(ROOT_PATHS))
+            self.step("toolchain parity", lambda: self.expect_console(PARITY))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,

@@ -21,7 +21,54 @@ parity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parity)
 
 
+class JobAccountTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('job_account', parity.HERE / 'job-account.py')
+        assert spec is not None and spec.loader is not None
+        self.account = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.account)
+        self.identity = {'uid': 999, 'gid': 986}
+
+    def test_fresh_identity_is_created_with_exact_uid_and_gid(self):
+        with patch.object(self.account.pwd, 'getpwuid', side_effect=KeyError), \
+             patch.object(self.account.grp, 'getgrgid', side_effect=KeyError), \
+             patch.object(self.account.pwd, 'getpwnam', side_effect=KeyError), \
+             patch.object(self.account.grp, 'getgrnam', side_effect=KeyError), \
+             patch.object(parity, 'output') as run:
+            self.account.ensure(self.identity, run)
+        self.assertEqual([('groupadd', '--system', '--gid', '986', 'motor-job'),
+                          ('useradd', '--system', '--uid', '999', '--gid', '986', '--home-dir',
+                           '/nonexistent', '--shell', '/usr/sbin/nologin', 'motor-job')],
+                         [call.args for call in run.call_args_list])
+
+    def test_numeric_collisions_name_the_owner_and_do_not_create_accounts(self):
+        for namespace in ('uid', 'gid'):
+            with self.subTest(namespace=namespace), \
+                 patch.object(self.account.pwd, 'getpwuid', side_effect=KeyError if namespace == 'gid' else None,
+                              return_value=('base-user',)), \
+                 patch.object(self.account.grp, 'getgrgid', return_value=('base-group',)), \
+                 patch.object(parity, 'output') as run:
+                with self.assertRaisesRegex(ValueError, 'already owned by base-' + ('user' if namespace == 'uid' else 'group')):
+                    self.account.ensure(self.identity, run)
+                run.assert_not_called()
+
+
 class CaptureTests(unittest.TestCase):
+    def test_job_identity_is_the_process_not_a_host_account_lookup(self):
+        with patch.object(parity.os, 'getuid', return_value=997), patch.object(parity.os, 'getgid', return_value=996):
+            self.assertEqual({'uid': 997, 'gid': 996}, parity.job_identity(True))
+
+    def test_runtime_capture_executes_in_tmpdir_and_records_noexec_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, TMPDIR=tmp), \
+             patch.object(parity.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            # tempfile caches its selected directory, so reset it for this probe.
+            with patch.object(tempfile, 'tempdir', tmp):
+                runtime = parity.runtime_capture()
+        self.assertTrue(runtime['tmpdir_exec'])
+        self.assertTrue(str(run.call_args.args[0][0]).startswith(tmp + '/'))
+        with patch.object(parity.subprocess, 'run', side_effect=PermissionError('noexec')):
+            self.assertFalse(parity.runtime_capture()['tmpdir_exec'])
+
     def test_timeout_and_missing_binary_are_recorded(self):
         for error, message in ((subprocess.TimeoutExpired("tool", 30), "timeout"),
                                (FileNotFoundError("missing"), "missing")):
@@ -117,7 +164,7 @@ class ParityTests(unittest.TestCase):
                 'files': {path: {'sha256': checksum, 'bytes': 7}}}
 
     def observed(self, role='build-server'):
-        manifest = self.manifest
+        manifest = parity.role_manifest(self.manifest, role, job=True)
         bins = {}
         for name, expected in manifest['cargo_binaries'].items():
             bins[name] = {'symlink': 'rustup' if expected.get('proxy') else None,
@@ -144,6 +191,10 @@ class ParityTests(unittest.TestCase):
                                  + manifest['apt_packages']['by_role'][role] + ['coreutils', 'gnu-coreutils']},
                 'sccache_inputs_sha256': manifest['sccache']['inputs_sha256'],
                 'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
+                'runtime': {'proc': {name: True for name in ('self/mountinfo', 'cpuinfo', 'meminfo')},
+                            'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
+                            'tmpdir_exec': True, 'sshd_executable': True},
+                'job_identity': dict(manifest['job_identity']),
                 'compile_wrapper': {
                     **manifest['compile_wrapper'],
                     'resolved': '/motor-tools/sccache' if role == 'boat' else '/motor-tools/prefrontal-build-slot',
@@ -152,7 +203,7 @@ class ParityTests(unittest.TestCase):
                 },
                 'local_bin_entries': sorted(name for name, spec in manifest['tools'].items()
                                             if spec['path'].startswith('/usr/local/bin/')),
-                'mountinfo': '1 0 0:0 / /home/ubuntu/.rustup ro - ext4 /dev/example rw',
+                'mountinfo': '1 0 0:0 / ' + manifest['rustup_home'] + ' ro - ext4 /dev/example rw',
                 'cargo_registry': self.registry()}
 
     def report(self, actual, job=False, role='build-server'):
@@ -186,6 +237,54 @@ class ParityTests(unittest.TestCase):
     def test_measured_contract_passes(self):
         self.assertTrue(self.report(self.observed())['passed'])
         self.assertTrue(self.report(self.observed(), job=True)['passed'])
+
+    def test_tenant_role_checks_the_job_layout_without_compile_cache(self):
+        actual = self.observed('tenant')
+        actual['compile_wrapper'] = {}
+        self.assertEqual([], self.report(actual, job=True, role='tenant')['errors'])
+        for name, value in (('PATH', '/tenant/cargo-home/bin:/usr/local/bin:/usr/bin:/bin'),
+                            ('RUSTUP_HOME', '/home/ubuntu/.rustup'), ('RUSTC_WRAPPER', 'sccache')):
+            with self.subTest(name=name):
+                drift = copy.deepcopy(actual)
+                drift['job_environment'][name] = value
+                self.assertTrue(self.report(drift, job=True, role='tenant')['errors'])
+
+    def test_tenant_job_requires_sshd_and_runtime_capabilities(self):
+        for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):
+            with self.subTest(name=name):
+                actual = self.observed('tenant')
+                actual['runtime'][name] = False
+                self.assertEqual([f'job {name}: expected True, observed False'],
+                                 self.report(actual, job=True, role='tenant')['errors'])
+        actual = self.observed('tenant')
+        actual['runtime']['proc']['meminfo'] = False
+        actual['runtime']['inotify']['max_user_instances'] = 128
+        self.assertEqual(['/proc/meminfo readable: expected True, observed False',
+                          'inotify max_user_instances: expected at least 8192, observed 128'],
+                         self.report(actual, job=True, role='tenant')['errors'])
+
+    def test_tenant_host_requires_openssh_package_and_cache_provenance(self):
+        actual = self.observed('tenant')
+        actual.update(self.manifest['layout_by_role']['tenant']['host'])
+        actual['sccache_artifacts'] = {'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
+                                     'binaries': {name: actual['cargo_binaries'][name]['sha256']
+                                                  for name in self.manifest['sccache']['build_server_sha256']}}
+        self.assertEqual([], parity.differences(self.manifest, actual, role='tenant'))
+        del actual['apt_packages']['openssh-server']
+        self.assertEqual(['missing apt package: openssh-server'],
+                         parity.differences(self.manifest, actual, role='tenant'))
+        actual['cargo_binaries']['sccache']['sha256'] = 'replaced'
+        self.assertIn('sccache built artifact hash', '\n'.join(parity.differences(self.manifest, actual, role='tenant')))
+
+    def test_every_role_checks_exact_job_uid_and_gid(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            for field in ('uid', 'gid'):
+                with self.subTest(role=role, field=field):
+                    actual = self.observed(role)
+                    actual['job_identity'][field] = 997
+                    errors = self.report(actual, job=True, role=role)['errors']
+                    self.assertEqual(1, len(errors))
+                    self.assertIn('motor-job identity:', errors[0])
 
     def test_gnu_dd_and_test_exact_server_outputs_are_accepted(self):
         actual = self.observed()
@@ -343,11 +442,19 @@ class ParityTests(unittest.TestCase):
     def test_capture_cli_measures_the_tools_the_manifest_names(self):
         seen = []
         with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture']), \
-             patch.object(parity, 'capture', side_effect=lambda manifest=None: seen.append(manifest) or {}), \
+             patch.object(parity, 'capture', side_effect=lambda manifest=None, job=False: seen.append(manifest) or {}), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(parity.main(), 0)
         self.assertEqual(1, len(seen))
         self.assertIn('bun-1.3.14', seen[0]['tools'])
+
+    def test_capture_cli_honors_tenant_and_job_without_rewriting_path(self):
+        with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture', '--job', '--role', 'tenant']), \
+             patch.object(parity, 'capture', return_value={}) as capture, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, parity.main())
+        self.assertEqual('/tenant/cargo-home', capture.call_args.args[0]['cargo_home'])
+        self.assertEqual({'job': True}, capture.call_args.kwargs)
 
     def test_check_cli_fails_when_git_version_differs_from_the_server(self):
         actual = self.observed()

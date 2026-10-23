@@ -20,13 +20,12 @@ from pathlib import Path
 import stat
 
 # The tenant units (motor-tenant-agent.service, motor-qualification.service)
-# run with PATH=/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin,
-# and the toolchains behind the Cargo proxies live under /usr/local as well.
-TENANT_ROOTS = ("/usr/local", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+# execute Bun from /home/ubuntu/.bun/bin and Cargo/toolchains from /usr/local.
+TENANT_ROOTS = ("/usr/local", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/home/ubuntu/.bun/bin")
 # motor-boat.service runs as root with
 # PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # and RUSTUP_HOME=/home/ubuntu/.rustup, whose toolchains the Cargo proxies run.
-BOAT_ROOTS = (*TENANT_ROOTS, "/srv/build/cargo-home/bin", "/home/ubuntu/.bun/bin", "/home/ubuntu/.rustup")
+BOAT_ROOTS = (*TENANT_ROOTS, "/srv/build/cargo-home/bin", "/home/ubuntu/.rustup")
 # Files Boat's own agent writes into a sandbox each time it restores a
 # snapshot, owned by its sandbox account (uid 1000), so no image recipe can make
 # them root's: the idle-reclaim helper that stops idle sandboxes. That account

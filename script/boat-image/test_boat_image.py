@@ -666,10 +666,13 @@ class RecipeTests(unittest.TestCase):
         writes = {}
         with patch.object(install, 'target_directories'), patch.object(install, 'accounts'), \
              patch.object(install, 'install_units'), patch.object(install, 'state'), \
-             patch.object(install, 'run', return_value='8'), patch.object(Path, 'mkdir'), patch.object(Path, 'unlink'), \
+             patch.object(install, 'run', return_value='8') as run, patch.object(install.shutil, 'copy2') as copy, \
+             patch.object(Path, 'mkdir'), patch.object(Path, 'unlink'), \
              patch.object(Path, 'read_text', return_value='Include /etc/ssh/sshd_config.d/*.conf\n'), \
              patch.object(Path, 'write_text', lambda path, text: writes.__setitem__(str(path), text)):
             install.configure(self.pins, 'revision')
+        copy.assert_called_once_with(install.ROOT / 'script/runner/sysctl/60-motor-inotify.conf', '/etc/sysctl.d/60-motor-inotify.conf')
+        run.assert_any_call('sysctl', '-p', '/etc/sysctl.d/60-motor-inotify.conf')
         config = json.loads(writes['/etc/motor/sandbox.json'])
         self.assertEqual(config['ready_marker'], str(start.ENDPOINT_READY))
         self.assertEqual(config['storage_health'], {'state_file': str(start.STORAGE_HEALTH),
