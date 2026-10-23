@@ -23,12 +23,23 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
     config.tenant_vm = tenant_vm;
     config.boat_profile = boat_profile;
     config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
+    if boat_profile {
+        config.free_space_probe = Arc::new(|_| Ok(63 << 30));
+    }
     config.max_weight = 4;
     config.base_commands = vec![format!(
         "while test ! -e '{}'; do sleep .02; done",
         release.display()
     )];
-    let runner = Runner::open(config).unwrap();
+    let runner = if boat_profile {
+        Runner::open_with_backend(
+            config,
+            Box::new(super::boat_disk::SchedulerFixtureBackend::default()),
+        )
+        .unwrap()
+    } else {
+        Runner::open(config).unwrap()
+    };
     let (request, bytes) = f.run("true");
     let upload = f.spool(&runner, &request, &bytes);
     let mut prepare = prepare_for(&request);

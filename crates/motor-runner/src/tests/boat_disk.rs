@@ -7,7 +7,7 @@ const GIB: u64 = 1 << 30;
 // Exercise scheduling with native fixture processes, without requiring a root
 // XFS quota mount. The production host backend has no such quota bypass.
 #[derive(Default)]
-struct SchedulerFixtureBackend {
+pub(super) struct SchedulerFixtureBackend {
     #[cfg(target_os = "linux")]
     policy: Option<Arc<FixtureCachePolicy>>,
 }
