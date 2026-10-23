@@ -252,12 +252,21 @@ fn boat_reserve_restore_never_allocates_beside_live_or_starting_work() {
         {
             let mut inner = runner.core.inner.lock().unwrap();
             if starting {
-                inner.jobs.get_mut(&request.job_id).unwrap().terminal(Outcome::Exit { code: 0 }, runner.now());
+                inner
+                    .jobs
+                    .get_mut(&request.job_id)
+                    .unwrap()
+                    .terminal(Outcome::Exit { code: 0 }, runner.now());
                 inner.starting.insert(request.job_id);
-            } else { inner.jobs.get_mut(&request.job_id).unwrap().state = JobState::Running; }
+            } else {
+                inner.jobs.get_mut(&request.job_id).unwrap().state = JobState::Running;
+            }
         }
         runner.disk_upkeep().unwrap();
-        assert!(!reserve.exists(), "reserve allocation overlapped a sampled job cap");
+        assert!(
+            !reserve.exists(),
+            "reserve allocation overlapped a sampled job cap"
+        );
     }
 }
 
@@ -270,15 +279,33 @@ async fn boat_persisted_fill_is_refused_before_claiming_writer_or_setup() {
     let id = request.job_id;
     let observed = {
         let mut inner = runner.core.inner.lock().unwrap();
-        inner.catalog.repositories.insert(request.repository_root.clone(), Repository::default());
+        inner
+            .catalog
+            .repositories
+            .insert(request.repository_root.clone(), Repository::default());
         let mut job = Job::new(id, Some(request), runner.now(), 1, 1);
-        job.base = true; job.state = JobState::Queued;
+        job.base = true;
+        job.state = JobState::Queued;
         inner.jobs.insert(id, job);
         runner.start(&mut inner, id, &BTreeMap::new()).unwrap();
-        (inner.jobs[&id].terminal.clone(), inner.starting.contains(&id), inner.writer)
+        (
+            inner.jobs[&id].terminal.clone(),
+            inner.starting.contains(&id),
+            inner.writer,
+        )
     };
-    if observed.0.is_none() { let _ = terminal(&runner, id).await; }
-    assert!(matches!(observed.0.map(|record| record.outcome), Some(Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed })), "Boat fill entered setup instead of a synchronous no-start refusal");
+    if observed.0.is_none() {
+        let _ = terminal(&runner, id).await;
+    }
+    assert!(
+        matches!(
+            observed.0.map(|record| record.outcome),
+            Some(Outcome::RefusedBeforeStart {
+                reason: RefusalReason::WorkspaceSetupFailed
+            })
+        ),
+        "Boat fill entered setup instead of a synchronous no-start refusal"
+    );
     assert!(!observed.1);
     assert!(observed.2.is_none());
     assert!(!Path::new(&f.key).join("writer-should-not-run").exists());

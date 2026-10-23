@@ -383,8 +383,14 @@ def watch_storage(pause=time.sleep, notify=None):
                 capacity_withdrawn = True
             else:
                 with storage_lock():
-                    write_storage_health('healthy', expected)
-                capacity_withdrawn = False
+                    # A setup can withdraw readiness after the first sample.
+                    # Never publish that older sample over its locked withdrawal.
+                    capacity_withdrawn = not quota_capacity_ready()
+                    if capacity_withdrawn:
+                        ENDPOINT_READY.unlink(missing_ok=True)
+                        write_storage_health('unhealthy', reason='cold_quota_capacity_below_floor')
+                    else:
+                        write_storage_health('healthy', expected)
             pause(1)
             notify('WATCHDOG=1')
     except BaseException as error:

@@ -337,14 +337,10 @@ fn release_before_successor_clears_owned_roots_and_preserves_new_assignment() {
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
     fixture.prepare(a).unwrap();
     let first: Lease = serde_json::from_slice(&fs::read(fixture.manifest(a)).unwrap()).unwrap();
+    let output = File::open(fixture.runtime(a).join("output/stdout")).unwrap();
     release_runtime_with(fixture.system.as_ref(), &fixture.runtime(a)).unwrap();
     assert_eq!(fixture.system.project(&fixture.workspace), 0);
-    assert_eq!(
-        fixture
-            .system
-            .project(&fixture.runtime(a).join("output/stdout")),
-        0
-    );
+    assert_eq!(fixture.system.attributes(&output).unwrap().project, 0);
     assert!(usage(fixture.system.as_ref(), first.project)
         .unwrap()
         .is_none());
@@ -770,11 +766,19 @@ fn failed_quarantine_keeps_retirement_durable_until_detachment() {
     let id = Uuid::now_v7();
     fixture.prepare(id).unwrap();
     let lease: Lease = serde_json::from_slice(&fs::read(fixture.manifest(id)).unwrap()).unwrap();
-    let _tree = DeepTree::new(&fixture.runtime(id).join("tmp"), 2200, 1, Some((fixture.system.as_ref(), lease.project)));
+    let _tree = DeepTree::new(
+        &fixture.runtime(id).join("tmp"),
+        2200,
+        1,
+        Some((fixture.system.as_ref(), lease.project)),
+    );
     let blocked = fixture.state.join("boat-quarantine");
     fs::write(&blocked, b"block the rename destination").unwrap();
     assert!(release_runtime_with(fixture.system.as_ref(), &fixture.runtime(id)).is_err());
-    assert!(fixture.manifest(id).exists(), "retirement state vanished before runtime detachment");
+    assert!(
+        fixture.manifest(id).exists(),
+        "retirement state vanished before runtime detachment"
+    );
     fs::remove_file(blocked).unwrap();
     release_runtime_with(fixture.system.as_ref(), &fixture.runtime(id)).unwrap();
     assert!(!fixture.runtime(id).exists());
@@ -787,12 +791,21 @@ fn manifest_free_crash_recovery_never_uses_unbounded_permission_repair() {
     let id = Uuid::now_v7();
     fixture.prepare(id).unwrap();
     let lease: Lease = serde_json::from_slice(&fs::read(fixture.manifest(id)).unwrap()).unwrap();
-    let _tree = DeepTree::new(&fixture.runtime(id).join("tmp"), 2200, 1, Some((fixture.system.as_ref(), lease.project)));
+    let _tree = DeepTree::new(
+        &fixture.runtime(id).join("tmp"),
+        2200,
+        1,
+        Some((fixture.system.as_ref(), lease.project)),
+    );
     fixture.system.quota(lease.project, Some((0, 0))).unwrap();
-    fs::remove_file(fixture.manifest(id)).unwrap(); // Crash at the old unlink-before-detach window.
-    crate::systemd::with_process_hook(Box::new(|_| panic!("ordinary recursive permission helper reached during Boat recovery")), || {
-        crate::isolation::reclaim_runtime(&fixture.runtime(id)).unwrap();
-    });
+    // Simulate a crash after lease removal, before the runtime was detached.
+    fs::remove_file(fixture.manifest(id)).unwrap();
+    crate::systemd::with_process_hook(
+        Box::new(|_| panic!("ordinary recursive permission helper reached during Boat recovery")),
+        || {
+            crate::isolation::reclaim_runtime(&fixture.runtime(id)).unwrap();
+        },
+    );
     assert!(!fixture.runtime(id).exists());
 }
 
@@ -802,10 +815,21 @@ fn long_named_boat_runtime_reclamation_is_bounded_after_lease_removal() {
     let id = Uuid::now_v7();
     fixture.prepare(id).unwrap();
     let lease: Lease = serde_json::from_slice(&fs::read(fixture.manifest(id)).unwrap()).unwrap();
-    let _tree = DeepTree::new(&fixture.runtime(id).join("tmp"), 30, 200, Some((fixture.system.as_ref(), lease.project)));
-    release_runtime_with(fixture.system.as_ref(), &fixture.runtime(id)).unwrap();
-    crate::systemd::with_process_hook(Box::new(|_| panic!("PATH_MAX-sensitive permission helper reached for Boat runtime")), || {
-        crate::isolation::reclaim_runtime(&fixture.runtime(id)).unwrap();
-    });
+    let _tree = DeepTree::new(
+        &fixture.runtime(id).join("tmp"),
+        30,
+        200,
+        Some((fixture.system.as_ref(), lease.project)),
+    );
+    // Leave the long tree in place without a lease so reclamation itself, not
+    // an earlier successful release, must keep it away from path-based helpers.
+    fixture.system.quota(lease.project, Some((0, 0))).unwrap();
+    fs::remove_file(fixture.manifest(id)).unwrap();
+    crate::systemd::with_process_hook(
+        Box::new(|_| panic!("PATH_MAX-sensitive permission helper reached for Boat runtime")),
+        || {
+            crate::isolation::reclaim_runtime(&fixture.runtime(id)).unwrap();
+        },
+    );
     assert!(!fixture.runtime(id).exists());
 }

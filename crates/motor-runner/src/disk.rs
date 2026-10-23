@@ -1263,23 +1263,29 @@ impl Runner {
         if self.core.config.disk_reserve_bytes == 0 || floor == 0 {
             return Ok(());
         }
+        let idle = |inner: &Inner| {
+            inner.jobs.values().all(|job| job.terminal.is_some())
+                && inner.starting.is_empty()
+                && inner.admitting.is_empty()
+                && inner.preparing.is_empty()
+                && inner.transfers.is_empty()
+        };
+        if !idle(&self.core.inner.lock().unwrap()) {
+            return Ok(());
+        }
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         if probe()? < floor {
-            let idle = {
-                let inner = self.core.inner.lock().unwrap();
-                inner.jobs.values().all(|job| job.terminal.is_some())
-                    && inner.starting.is_empty()
-                    && inner.admitting.is_empty()
-                    && inner.preparing.is_empty()
-                    && inner.transfers.is_empty()
-            };
-            if !idle {
-                return Ok(());
-            }
             self.ensure_disk_space()?;
             if probe()? < floor {
                 return Ok(());
             }
+        }
+        // Setup samples free space for the job's cap. Keep admission/setup
+        // excluded until this uncharged allocation has finished, including when
+        // the disk was already above its floor and no eviction was needed.
+        let inner = self.core.inner.lock().unwrap();
+        if !idle(&inner) {
+            return Ok(());
         }
         self.restore_disk_reserve()
     }

@@ -413,10 +413,10 @@ fn next_project(
     Ok(project)
 }
 
-fn quarantine_runtime(runtime: &Path) -> io::Result<()> {
+fn quarantine_runtime(runtime: &Path) -> io::Result<Option<PathBuf>> {
     use std::os::unix::fs::DirBuilderExt;
     if !runtime.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(sandboxes) = runtime
         .parent()
@@ -437,7 +437,19 @@ fn quarantine_runtime(runtime: &Path) -> io::Result<()> {
         Uuid::now_v7()
     ));
     fs::rename(runtime, &target)?;
-    tracing::warn!(path = %runtime.display(), quarantine = %target.display(), "quarantined hostile Boat runtime without retaining its quota reservation");
+    // Persist detachment before dropping the lease that makes retirement retryable.
+    File::open(&directory)?.sync_all()?;
+    File::open(sandboxes)?.sync_all()?;
+    tracing::info!(path = %runtime.display(), quarantine = %target.display(), "detached retired Boat runtime for bounded garbage collection");
+    Ok(Some(target))
+}
+
+fn retire_runtime(runtime: &Path) -> io::Result<()> {
+    if let Some(retired) = quarantine_runtime(runtime)? {
+        if let Err(error) = remove_retired_tree(&retired) {
+            tracing::warn!(path = %retired.display(), %error, "bounded Boat runtime collection will continue during disk upkeep");
+        }
+    }
     Ok(())
 }
 
@@ -446,7 +458,7 @@ pub(crate) fn prepare(state: &Path, id: Uuid, roots: Vec<PathBuf>, cold: bool) -
 }
 
 pub(crate) fn preflight_cached_tree(path: &Path) -> io::Result<()> {
-    let mut budget = walk::Budget::default();
+    let mut budget = walk::Budget::before_path_helpers(path);
     let root = walk::physical_root(path, &budget)?;
     let device = root.metadata()?.dev();
     walk::visit(root, device, &mut budget, &mut |_, _| Ok(true))
@@ -612,8 +624,19 @@ fn prepare_with(
 }
 
 // Called only after the cgroup is gone, including recovered-runtime cleanup.
-pub(crate) fn release_runtime(runtime: &Path) -> io::Result<()> {
-    release_runtime_with(&System, runtime)
+// The persistent boat-quotas directory identifies Boat state even after this
+// runtime's lease manifest is removed.
+pub(crate) fn reclaim_runtime(runtime: &Path) -> io::Result<bool> {
+    let boat = runtime
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|state| state.join("boat-quotas").is_dir());
+    if !boat {
+        return Ok(false);
+    }
+    release_runtime_with(&System, runtime)?;
+    retire_runtime(runtime)?;
+    Ok(true)
 }
 
 fn release_runtime_with(system: &impl QuotaSystem, runtime: &Path) -> io::Result<()> {
@@ -659,11 +682,14 @@ fn release_runtime_with(system: &impl QuotaSystem, runtime: &Path) -> io::Result
     if hit_observed {
         let _ = fs::remove_file(manifest.with_extension("hit"));
     }
-    fs::remove_file(manifest)?;
     if let Err(error) = relabel {
         tracing::warn!(project = lease.project, bounded_walk = walk::is_limit(&error), %error, "retired Boat tree could not be relabelled");
-        quarantine_runtime(runtime)?;
     }
+    // Detach even after a successful relabel: a retry may have already cleared
+    // the root label before its first detachment failed. The lease must survive
+    // every failure until the private path is no longer exposed.
+    retire_runtime(runtime)?;
+    fs::remove_file(manifest)?;
     Ok(())
 }
 

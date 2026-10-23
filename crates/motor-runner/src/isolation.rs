@@ -1847,10 +1847,10 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
 
 pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
     let _access = crate::tree_access::lock(path);
-    crate::boat_quota::release_runtime(path)?;
-    // Quota cleanup may atomically quarantine an over-budget hostile tree.
-    // It no longer has a reservation or a path exposed to a future job.
-    if !path.exists() {
+    // Boat uses bounded, descriptor-relative private GC even after a crash has
+    // removed its lease. Recursive permission helpers cannot handle every legal
+    // job-created path and must not strand its private data during recovery.
+    if crate::boat_quota::reclaim_runtime(path)? || !path.exists() {
         return Ok(());
     }
     // ACLs alone cannot override sticky-directory unlink rules. Once the job's
@@ -2978,6 +2978,11 @@ impl Sandbox {
         cpus: &[u32],
         requested_vcpus: u32,
     ) -> io::Result<Command> {
+        if self.boat_profile && self.writer {
+            return Err(io::Error::other(
+                "Boat jobs cannot use dependency writer units",
+            ));
+        }
         let user = self.user;
         let pid_init = if self.uses_pid_init() {
             Some(self.pid_init.as_ref().ok_or_else(|| {

@@ -5721,8 +5721,17 @@ impl Runner {
     ) -> io::Result<()> {
         let job = inner.jobs[&id].clone();
         let r = job.request.clone().unwrap();
-        // Internal warm builds bypass external admission, but share its CPU limit.
-        if let Some((reason, detail)) = self.cpu_refusal(job.weight) {
+        // Recovered warm builds bypass external admission. Boat must never run
+        // them: writer units expose a shared cache outside the job project.
+        let refusal = if self.core.config.boat_profile && job.base {
+            Some((
+                RefusalReason::WorkspaceSetupFailed,
+                "Boat jobs cannot use dependency writer units".to_owned(),
+            ))
+        } else {
+            self.cpu_refusal(job.weight)
+        };
+        if let Some((reason, detail)) = refusal {
             let safe_detail = self.safe_refusal_detail(&detail, r.env.values().cloned());
             let mut refused = job.clone();
             refuse_before_start(

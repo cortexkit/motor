@@ -707,13 +707,21 @@ that lease's project, so delayed A cleanup cannot unquota successor B. Durable
 pending/active/releasing phases and missing-record recovery make interrupted
 setup and double release idempotent. Launch independently requires the active
 lease, matching kernel limits, and owned writable roots.
+Boat refuses dependency-writer jobs before setup, including recovered fills,
+and independently refuses writer-unit construction. Shared writer-cache mounts
+must never bypass the job project. The unit mount test enumerates every writable
+bind's host source against the quota roots rather than accepting known destinations.
 
 Quota walking is iterative and descriptor-relative, validates all physical
 roots first, deduplicates `(dev, ino)`, and is limited to 262,144 entries, depth
-128 and five seconds. Cached-tree preflight precedes permission repair. A hostile
-retired runtime is quarantined without retaining a quota reservation; IDs are
-not recycled into quarantined usage. Private GC is bounded and can lift deep
-subtrees within private storage so later passes make progress without recursion.
+128 and five seconds. Cached-tree preflight precedes permission repair and
+requests cold eviction for cached pathnames beyond PATH_MAX, before whole-path
+checkout or permission tools encounter them. Every retired runtime is detached
+into private quarantine before its lease is removed; failed detachment keeps the
+retirement durable. Manifest-free crash recovery also uses bounded deletion,
+never recursive permission helpers. IDs are not recycled into quarantined usage.
+Private GC is bounded and can lift deep subtrees within private storage so later
+passes make progress without recursion.
 
 Block/inode hard-limit failures stay inside the job as EDQUOT (or ENOSPC).
 Start logs include both filesystems' available bytes and the job allowance.
@@ -728,6 +736,10 @@ existing storage. The separate runner reserve file is outside the project and
 remains available for terminal bookkeeping. After the cgroup is gone, runtime
 cleanup clears tree assignments, limits, hit markers and the lease. Workspace
 contents remain reusable and subject to normal idle/pressure eviction.
+Reserve-file restoration runs only while idle, with admission and setup excluded
+through the allocation, so it cannot spend headroom after a job samples its cap.
+Storage-health publication rechecks both filesystems under the readiness lock;
+an older healthy sample cannot overwrite a newer setup withdrawal.
 
 Runner-written replay chunks/records and returned-file copies are not job
 writable mounts and retain their existing bounds; the fixed reserve protects

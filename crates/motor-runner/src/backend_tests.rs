@@ -109,6 +109,37 @@ fn boat_cached_depth_is_bounded_before_permission_repair() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_cached_long_names_request_cold_eviction_before_path_based_helpers() {
+    let scratch = ScratchDir::new("boat-preflight-long-names");
+    let workspace = scratch.join("remote/worktrees/long");
+    fs::create_dir_all(&workspace).unwrap();
+    let _tree = crate::boat_quota::DeepTree::unlabelled(&workspace, 30, 200);
+    let mut config = Config::new(scratch.join("runner"), "boat");
+    config.boat_profile = true;
+    config.isolate_jobs = true;
+    config.workspace_roots = vec![scratch.join("remote/worktrees")];
+    config.owned_workspace_roots = vec![scratch.join("remote")];
+    crate::systemd::with_process_hook(
+        Box::new(|_| panic!("path-based permission helper reached an over-PATH_MAX cached tree")),
+        || {
+            let error = HostBackend
+                .materialize(&config, &trees(&config), &setup(&workspace))
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("pathname-length budget"),
+                "{error}"
+            );
+            assert!(
+                crate::boat_quota::cold_cache(&error).is_some(),
+                "cached path rejection must request the ordinary cold eviction"
+            );
+        },
+    );
+}
+
 fn trees(config: &Config) -> Trees {
     Trees {
         dependency_locks: Mutex::new(BTreeMap::new()),

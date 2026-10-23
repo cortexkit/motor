@@ -49,6 +49,7 @@ pub(super) struct Budget {
     started: Instant,
     entries: usize,
     seen: BTreeSet<(u64, u64)>,
+    path_limit: Option<usize>,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -62,6 +63,15 @@ impl Budget {
             started: Instant::now(),
             entries: 0,
             seen: BTreeSet::new(),
+            path_limit: None,
+        }
+    }
+    pub(super) fn before_path_helpers(path: &Path) -> Self {
+        // Checkout and access-control-list helpers use whole pathnames, which
+        // can exceed PATH_MAX. Evict an overlong warm tree before invoking them.
+        Self {
+            path_limit: Some((libc::PATH_MAX as usize).saturating_sub(path.as_os_str().len() + 1)),
+            ..Self::default()
         }
     }
     fn check_time(&self) -> io::Result<()> {
@@ -141,6 +151,7 @@ pub(super) fn pin_roots(
 struct Frame {
     pin: File,
     entries: fs::ReadDir,
+    path_bytes: usize,
 }
 
 fn node(
@@ -176,6 +187,7 @@ fn node(
         return Ok(Some(Frame {
             entries: fs::read_dir(&link)?,
             pin,
+            path_bytes: 0,
         }));
     }
     Ok(None)
@@ -200,12 +212,17 @@ pub(super) fn visit(
         };
         let name = entry?.file_name();
         budget.entry()?;
+        let path_bytes = parent.path_bytes + 1 + name.len();
+        if budget.path_limit.is_some_and(|limit| path_bytes > limit) {
+            return Err(io::Error::other(WalkLimit("pathname-length")));
+        }
         let child = match open_at(parent.pin.as_raw_fd(), &name, false) {
             Ok(child) => child,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        if let Some(frame) = node(child, device, budget, update)? {
+        if let Some(mut frame) = node(child, device, budget, update)? {
+            frame.path_bytes = path_bytes;
             if stack.len() >= budget.limits.depth {
                 return Err(io::Error::other(WalkLimit("depth")));
             }
