@@ -54,8 +54,9 @@ pub(crate) struct Job {
     /// back into the cwd-relative paths the caller asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_cwd: Option<String>,
-    /// The returned-file paths of a chunked `exec-remote/v1` request, exactly
-    /// as the caller sent them, so its `return_manifest` echoes them unchanged.
+    /// The returned-file paths of a chunked agent request or a direct CLI
+    /// request, exactly as sent. Manifests echo these spellings; direct attach
+    /// also needs the list to report a legacy all-or-nothing return failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_requested: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

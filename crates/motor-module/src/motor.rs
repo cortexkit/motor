@@ -313,6 +313,10 @@ impl Motor {
         }
         self.storage
             .retain_job(id, Some(request.workspace_key.clone()))?;
+        if gate_job && !returns.return_paths.is_empty() {
+            self.storage
+                .return_requested(id, returns.return_paths.clone())?;
+        }
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
@@ -697,7 +701,7 @@ impl Motor {
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
-        let (mut request, returns) = submission;
+        let (mut request, mut returns) = submission;
         // A repository-routed job the broker could never place runs on the
         // build server under the queue-wait limit it has left; see
         // `Storage::routed_direct_no_host_fits`.
@@ -946,6 +950,20 @@ impl Motor {
                     )
                     .await
                     .map(|_| false);
+            }
+            // Direct CLI callers can consume either return format. Negotiate
+            // before sending Run, without resubmitting a command that ran.
+            if returns.return_chunked
+                && !channel.return_chunked
+                && self
+                    .storage
+                    .job(id)
+                    .is_some_and(|job| job.direct_secret_hash.is_some())
+            {
+                returns.return_chunked = false;
+                returns.return_max_bytes = returns
+                    .return_max_bytes
+                    .min(motor_protocol::RETURN_MAX_BYTES);
             }
             // A runner from before chunked returned files would ignore
             // Run.return_chunked and refuse its larger cap, or send one

@@ -1188,6 +1188,7 @@ async fn pump_direct_secret(
     let id = stream.job_id;
     let storage = stream.storage();
     let mut terminal = false;
+    let mut return_context_sent = false;
     let result = forward(ctx.cancelled(), stream, |record| {
         match &record {
             StreamRecord::Accepted(_) => {
@@ -1208,6 +1209,15 @@ async fn pump_direct_secret(
             .map(|secret| serde_json::json!({"job_id": id, "secret": secret.expose()}));
         let hosted = storage.job(id).and_then(|j| j.hosted_route());
         let return_result = storage.job(id).and_then(|j| j.return_result);
+        let return_paths = if return_context_sent {
+            None
+        } else {
+            storage.job(id).and_then(|j| j.return_requested)
+        };
+        return_context_sent = true;
+        let return_workspace = return_paths
+            .as_ref()
+            .and_then(|_| storage.job(id)?.workspace_key);
         async move {
             let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
             if let Some(direct_job) = direct_job {
@@ -1218,6 +1228,13 @@ async fn pump_direct_secret(
             }
             if let Some(result) = return_result {
                 value["return_result"] = serde_json::to_value(result).map_err(io::Error::other)?;
+            }
+            if let Some(paths) = return_paths {
+                value["return_paths"] = serde_json::to_value(paths).map_err(io::Error::other)?;
+            }
+            if let Some(workspace) = return_workspace {
+                value["return_workspace"] =
+                    serde_json::to_value(workspace).map_err(io::Error::other)?;
             }
             reply(ctx, value).await
         }
