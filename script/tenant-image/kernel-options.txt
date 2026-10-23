@@ -13,6 +13,11 @@ VIRTIO_NET=y
 VIRTIO_CONSOLE=y
 VSOCKETS=y
 VIRTIO_VSOCKETS=y
+# Selected by VIRTIO_VSOCKETS; verify its common transport stays built in too.
+VIRTIO_VSOCKETS_COMMON=y
+# Firecracker's virtio-rng device needs both the core and driver without modules.
+HW_RANDOM=y
+HW_RANDOM_VIRTIO=y
 EXT4_FS=y
 XFS_FS=y
 XFS_POSIX_ACL=y
@@ -76,3 +81,5 @@ DEVTMPFS=y
 DEVTMPFS_MOUNT=y
 SERIAL_8250=y
 SERIAL_8250_CONSOLE=y
+# The ttyS0 console also needs printk to deliver kernel boot and panic logs.
+PRINTK=y

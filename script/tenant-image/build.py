@@ -56,10 +56,10 @@ def load_versions(path):
     for name in ("node", "npm", "bun", "pnpm", "rust_default", "kernel", "kernel_gcc", "rustup"):
         if not re.fullmatch(r"\d+\.\d+\.\d+", pins[name]):
             raise ValueError(f"invalid release pin: {name}")
-    # Descriptor-relative cleanup needs fchmodat2 with AT_EMPTY_PATH. No kernel
-    # config option can provide that syscall on the older 6.1 LTS series.
-    if tuple(map(int, pins['kernel'].split('.'))) < (6, 6, 0):
-        raise ValueError('kernel must be >=6.6.0 for fchmodat2(AT_EMPTY_PATH)')
+    # Cleanup needs fchmodat2 with AT_EMPTY_PATH (Linux 6.6+). Firecracker's
+    # supported guest series with that syscall starts at 6.18, not 6.12.
+    if tuple(map(int, pins['kernel'].split('.'))) < (6, 18, 0):
+        raise ValueError('kernel must be >=6.18.0 for a Firecracker-supported guest with fchmodat2(AT_EMPTY_PATH)')
     if pins["rust_default"] not in pins["rust_toolchains"]:
         raise ValueError("default Rust must be an installed pinned toolchain")
     for toolchain, targets in pins["rust_toolchains"].items():
