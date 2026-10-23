@@ -321,13 +321,24 @@ pub(crate) fn live_job_units(config: &Config) -> io::Result<std::collections::BT
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    if output.stdout.len() > 1024 * 1024 {
+    parse_live_job_units(&output.stdout)
+}
+
+/// Each row ends with the unit's description, which systemd-run fills with the
+/// job's whole command line, so a row can be as long as any command a caller
+/// sends. Only the four leading fields are read; the bounds cover the listing
+/// as a whole, never one row, so one long command can't refuse every job.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_live_job_units(
+    stdout: &[u8],
+) -> io::Result<std::collections::BTreeSet<String>> {
+    if stdout.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("live job unit listing exceeds size limit"));
     }
-    let text = std::str::from_utf8(&output.stdout).map_err(io::Error::other)?;
+    let text = std::str::from_utf8(stdout).map_err(io::Error::other)?;
     let mut units = std::collections::BTreeSet::new();
     for (index, line) in text.lines().enumerate() {
-        if index >= 10_000 || line.len() > 4096 {
+        if index >= 10_000 {
             return Err(io::Error::other("live job unit listing exceeds row limit"));
         }
         let mut fields = line.split_whitespace();

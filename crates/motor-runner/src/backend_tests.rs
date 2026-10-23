@@ -509,3 +509,30 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
         }
     }
 }
+
+#[test]
+fn a_long_job_command_in_the_unit_description_does_not_refuse_the_listing() {
+    // systemd-run puts the whole command line in the description column, so
+    // a caller's long command produced a row of several kilobytes and every
+    // later admission failed with "listing exceeds row limit".
+    let long = "x".repeat(64 * 1024);
+    let listing = format!(
+        "motor-job-a.service loaded active running [systemd-run] /bin/bash -c {long}\n\
+         motor-job-b.service loaded inactive dead [systemd-run] /bin/bash -c true\n"
+    );
+    let units = super::parse_live_job_units(listing.as_bytes()).unwrap();
+    assert_eq!(
+        units.into_iter().collect::<Vec<_>>(),
+        vec!["motor-job-a.service"]
+    );
+}
+
+#[test]
+fn the_listing_stays_bounded_by_rows_and_total_size() {
+    let rows: String = (0..10_001)
+        .map(|i| format!("motor-job-{i}.service loaded active running d\n"))
+        .collect();
+    assert!(super::parse_live_job_units(rows.as_bytes()).is_err());
+    let huge = vec![b'x'; 64 * 1024 * 1024 + 1];
+    assert!(super::parse_live_job_units(&huge).is_err());
+}
