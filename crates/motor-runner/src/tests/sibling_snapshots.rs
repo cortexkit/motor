@@ -321,12 +321,14 @@ async fn isolated_snapshot_sibling_in_another_allowed_root_is_read_only_at_its_p
     config.owned_workspace_roots.push(side_root);
     let runner = Runner::open(config).unwrap();
     let (run, bytes) = f.run(&format!(
-        "set -eu; cat '{0}/source'; cat ../commons/source; if printf changed > '{0}/source'; then exit 41; fi; if touch ../commons/new-file; then exit 42; fi; cat '{0}/source'", f.canonical
+        "set -eu; cat '{0}/source'; cat ../commons/source; if {{ printf changed > '{0}/source'; }} 2>/dev/null; then exit 41; fi; if touch ../commons/new-file 2>/dev/null; then exit 42; fi; cat '{0}/source'", f.canonical
     ));
     f.submit(&runner, &run, &bytes);
     let terminal = terminal(&runner, run.job_id).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 0 }, "{terminal:?}");
     let output = job_output(&runner, run.job_id);
+    // The refused writes' errors are discarded: job output merges stderr by
+    // arrival, so an error line could otherwise land after the final read.
     assert!(output.starts_with("first\nfirst\n"), "{output}");
     assert_eq!(output.lines().last(), Some("first"), "{output}");
     assert!(!Path::new(&f.canonical).exists());
