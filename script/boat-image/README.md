@@ -382,11 +382,11 @@ The operator's prerequisite pass measured systemd **255.4**, which rejects
 `PrivatePIDs=yes`. `--boat-profile` is an explicit, **one-job-per-sandbox**
 compatibility choice approved for this provider. The runner queries the actual
 system manager's version. Without the flag, systemd <257 refuses startup; the
-build server never silently loses PID isolation. On newer systemd even the Boat
-profile retains PrivatePIDs. The flag requires the Linux host backend; tenant
+build server never silently loses PID isolation. Boat uses the runner init on
+newer systemd too, to enforce its quota-inheritance filter. The flag requires the Linux host backend; tenant
 mode additionally requires root-private local sockets rather than vsock.
 
-On systemd 255, the unit runs the installed, root-owned
+In Boat mode, the unit runs the installed, root-owned
 `/usr/local/bin/motor-runner job-pid-init <uid> <gid> <groups> <proc-reference-json> -- <wrapper argv>`.
 The runner refuses startup if that installed executable is missing, unsafe or
 different from the running executable. The init starts as root with only
@@ -395,7 +395,8 @@ creates a PID namespace, then forks its PID 1. That child mounts a fresh
 `nosuid,nodev,noexec,hidepid=invisible` proc and moves systemd's protected proc
 submounts into it. It drops to the exact `motor-job` UID, GID and supplementary
 groups, empties all capability sets, joins a fresh session keyring as that user,
-and stacks a filter restoring `RestrictNamespaces=yes` equivalence. Only then
+and stacks a filter restoring `RestrictNamespaces=yes` namespace restrictions
+and protecting quota inheritance. Only then
 does it exec the unchanged bash wrapper as PID 1; the command is PID 2.
 `NoNewPrivileges=yes` and all other filesystem/network restrictions apply
 throughout. Loader/allocator environment controls (`LD_*`, `GLIBC_TUNABLES`,
@@ -414,9 +415,8 @@ outcome is unknown, never an assumed retry-safe refusal or job exit 226. A
 wrapper-recorded exit 226 remains a normal exit. A supervisor wait failure uses
 status 227 and cannot write a setup-failure record; without a wrapper exit file
 it is an unknown outcome, never a retry-safe refusal. These changes apply only
-when Boat mode is enabled and systemd lacks PrivatePIDs, including Boat-plus-
-tenant deployments on older systemd. Ordinary build-server, non-Boat tenant
-and systemd >=257 units are unchanged.
+when Boat mode is enabled, including Boat-plus-tenant deployments. Ordinary
+build-server and non-Boat tenant units are unchanged.
 
 The init starts a separate session/process group, re-arms its parent-death
 SIGKILL after dropping credentials, and checks both PPid and an inherited
@@ -427,7 +427,7 @@ JSON telemetry recording credentials, post-drop PDEATHSIG, SID/PGID, descriptors
 that survive exec and proc protections. The live root observer checks it and
 the actual host-view session separation while a job runs.
 
-Before serving Boat fallback jobs, the runner measures protected proc mounts
+Before serving Boat jobs, the runner measures protected proc mounts
 in an independent systemd reference unit using the probe's protection policy.
 The measured path/read-only set is passed in the init argv; after moving the
 mounts, the init requires exact equality or refuses before start. No guessed
@@ -662,6 +662,20 @@ The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
 `--free-space-floor-bytes` flag sets the floor; new
 `--free-space-eviction-bytes` optionally overrides the soft goal and must exceed
 the floor, otherwise the original twice-floor rule applies.
+
+### Project-inheritance protection
+
+Boat jobs always enter through the runner's PID namespace init, even when the
+system manager supports `PrivatePIDs`. Its existing seccomp filter also rejects
+filesystem-attribute setter ioctls (`FS_IOC_FSSETXATTR`, native and compat
+`FS_IOC_SETFLAGS`) with `EPERM`. An inode owner can otherwise clear XFS project
+inheritance on a newly created directory and allocate uncharged project-0 files.
+The x86-64, x32 and i386 paths are covered; attribute getters and unrelated
+ioctls remain allowed. `chattr` **setting** flags may notice this restriction;
+normal builds do not need these setters. Non-Boat build-server and tenant units are
+unchanged. The filter interpreter exercises both sides of every jump, and a
+forked-child test checks actual setter/getter syscalls. The operator disk-quota
+probe also attempts to clear inheritance before filling the same directory.
 
 ## Fast startup checks and failure evidence
 

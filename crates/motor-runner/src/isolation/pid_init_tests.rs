@@ -487,6 +487,24 @@ fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
         // unshare and clone.
         ("i386 x86_64 numbers", i386, X86_64_UNSHARE, [pid, 0], false),
         ("i386 other call", i386, 20, [pid, 0], false),
+        ("native fssetxattr", x86, 16, [3, 0x401c_5820], true),
+        ("native setflags", x86, 16, [3, 0x4008_6602], true),
+        ("compat setflags", i386, 54, [3, 0x4004_6602], true),
+        ("compat fssetxattr", i386, 54, [3, 0x401c_5820], true),
+        ("x32 fssetxattr", x86, 514 | x32, [3, 0x401c_5820], true),
+        ("x32 setflags", x86, 514 | x32, [3, 0x4004_6602], true),
+        ("fsgetxattr", x86, 16, [3, 0x801c_581f], false),
+        ("getflags", x86, 16, [3, 0x8008_6601], false),
+        ("compat getflags", i386, 54, [3, 0x8004_6601], false),
+        ("x32 getter", x86, 514 | x32, [3, 0x801c_581f], false),
+        ("unrelated ioctl", x86, 16, [3, 0x5413], false),
+        (
+            "ioctl high bits",
+            x86,
+            16,
+            [3, (1 << 40) | 0x401c_5820],
+            true,
+        ),
         ("x86 clone3", x86, CLONE3, [pid, 88], false),
         ("x32 clone3", x86, CLONE3 | x32, [pid, 88], false),
         ("i386 clone3", i386, CLONE3, [pid, 88], false),
@@ -582,6 +600,26 @@ fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
             let observed = |result: libc::c_long| (result, *libc::__errno_location());
             let pid = libc::c_long::from(CLONE_NEWPID);
             let checks = [
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x401c_5820_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x4008_6602_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x4004_6602_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x801c_581f_u32, 0)),
+                    false,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x8008_6601_u32, 0)),
+                    false,
+                ),
                 (observed(libc::syscall(libc::SYS_unshare, pid)), true),
                 (
                     observed(libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUTS)),
