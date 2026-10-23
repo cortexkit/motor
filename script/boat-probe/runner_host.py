@@ -35,6 +35,7 @@ PORT = 19443
 PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
 PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
 CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
+SYSCALL_SURFACE_SCRIPT = ROOT / 'script/runner/syscall-surface.py'
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
 GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
 WASM_OPT_PROBE = ROOT / 'script/runner/wasm-opt-probe.py'
@@ -842,7 +843,9 @@ def parity_source(job=False, gnu_test_sha256=None, cargo_seed_sha256=None):
     return ("import json, types\n"
             "seed_scope = {'__name__': 'cargo_seed'}\n"
             f"exec({CARGO_SEED_SCRIPT.read_text()!r}, seed_scope)\n"
-            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py', 'seed': types.SimpleNamespace(**seed_scope)}\n"
+            "syscall_scope = {'__name__': 'syscall_surface'}\n"
+            f"exec({SYSCALL_SURFACE_SCRIPT.read_text()!r}, syscall_scope)\n"
+            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py', 'seed': types.SimpleNamespace(**seed_scope), 'syscall_surface': types.SimpleNamespace(**syscall_scope)}\n"
             f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
             f"registry = seed_scope['verified_manifest']({'cargo-seed-expected.json' if job else '/home/user/cargo-seed-expected.json'!r}, {cargo_seed_sha256!r}) if {cargo_seed_sha256!r} else None\n"
             f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r}, cargo_registry=registry)\n"

@@ -149,6 +149,13 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             image.load_versions(self.versions)
 
+    def test_kernel_must_implement_descriptor_relative_chmod(self):
+        self.change_pin('kernel', '6.1.128')
+        with self.assertRaisesRegex(ValueError, 'fchmodat2'):
+            image.load_versions(self.versions)
+        self.change_pin('kernel', '6.6.0')
+        self.assertEqual('6.6.0', image.load_versions(self.versions)['kernel'])
+
     def test_source_digest_is_checked_before_copying(self):
         source, dest = self.root / "source", self.root / "destination"
         source.write_text("drifted installer")

@@ -30,15 +30,19 @@ There is no automatic capture in the build path.
 
 The other inputs are:
 
-- Linux 6.1.128 with a recorded kernel.org SHA-256, built with GCC 13.4.0.
+- Linux 6.12.114 with a recorded kernel.org SHA-256, built with GCC 13.4.0.
+  Descriptor-relative cleanup requires `fchmodat2(AT_EMPTY_PATH)`, introduced
+  in Linux 6.6; the 6.1 series cannot provide it through a config change.
   `kernel-options.txt` requests built-in XFS (including reflink), overlayfs,
   ext4, virtio block/network/vsock and the systemd job-isolation prerequisites.
   The resolved configuration, not just the requested options, is checked.
   All nftables inet reject variants and IPv4/IPv6 reject helpers are required
   built-in: defconfig otherwise leaves reject expressions modular, which cannot
   work with the locked, module-store-free guest. Counter, metadata, payload and
-  interval-set expressions are part of `NF_TABLES` itself in Linux 6.1; there is
+  interval-set expressions are part of `NF_TABLES` itself in Linux 6.12; there is
   no separate `NFT_COUNTER` option at this pin.
+  CPU entropy is trusted by default in 6.12; the old `RANDOM_TRUST_CPU` config
+  option no longer exists.
 - Debian trixie from the dated Debian snapshot in `versions.txt`. Packages,
   including Python 3, C/clang/lld, SQLite, mingw win32 and hivex, are resolved
   from that signed snapshot. Systemd must be at least 257 for `PrivatePIDs`.
@@ -228,6 +232,20 @@ Resolve the actual pinned kernel configuration without compiling a kernel
 ```sh
 python3 script/tenant-image/build.py kernel-config /absolute/scratch/kernel-config
 ```
+
+Toolchain parity runs `script/runner/syscall-surface.py`'s direct-syscall probes
+in every role, on the host and in jobs. To check only the syscall contract in
+a real job (with reflink-capable `TMPDIR`), run:
+
+```sh
+python3 script/runner/syscall-surface.py --check --job
+```
+
+The probe must reject an old 6.1 tenant kernel at `fchmodat2.EMPTY_PATH` and
+pass after rebuilding and qualifying a new image version. In `--job` mode,
+the probe expects `ENOSYS` for `clone3` in every role because PID-init's seccomp
+policy deliberately denies it. Outside job mode, the invalid call must reach
+the kernel and return `EINVAL`.
 
 The portable tests cover immutable-version refusal through the real CLI,
 repeat builds into different names, real artifact hashing, pin drift, failed

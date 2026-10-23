@@ -246,7 +246,7 @@ def parity_job_command(gnu_test_sha256, number):
 def parity_inputs(image, repo=REPO):
     manifest = json.loads((image / 'manifest.json').read_text())
     inventory = json.loads((image / 'tools.json').read_text())['parity']
-    for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py'):
+    for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py', 'syscall-surface.py'):
         relative = 'script/runner/' + name
         actual = hashlib.sha256((repo / relative).read_bytes()).hexdigest()
         if actual != manifest['versions']['runner_inputs_sha256'][relative]:
@@ -522,7 +522,7 @@ class Harness:
             shutil.copyfile(HERE / "guest/hosted_qualify.py", dest / "run.py")
             # The guest checks ownership with this checkout's rule, not the image's copy.
             shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")
-            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py"):
+            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py", "syscall-surface.py"):
                 shutil.copyfile(REPO / "script/runner" / name, dest / name)
             (dest / "gnutest.sha256").write_text(self.gnu_test_sha256)
             shutil.copyfile(self.args.runner_test_binary.resolve(), dest / "runner-tests")
@@ -605,7 +605,7 @@ class Harness:
             fixture.mkdir()
             self.run("git", "init", "--quiet", fixture)
             (fixture / "input").write_text("tenant image qualification\n")
-            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py"):
+            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py", "syscall-surface.py"):
                 shutil.copyfile(REPO / "script/runner" / name, fixture / name)
             self.run("git", "-C", fixture, "add", ".")
             self.run("git", "-C", fixture, "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid",

@@ -26,6 +26,7 @@ RUNNER_INPUTS = (
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
     "script/runner/build-git.sh", "script/runner/install-binaryen.py",
     "script/runner/toolchain-parity.py", "script/runner/cargo-seed.py",
+    "script/runner/syscall-surface.py",
     "script/runner/job-account.py",
     "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
     "script/tenant-image/guest/root_paths.py",
@@ -55,6 +56,10 @@ def load_versions(path):
     for name in ("node", "npm", "bun", "pnpm", "rust_default", "kernel", "kernel_gcc", "rustup"):
         if not re.fullmatch(r"\d+\.\d+\.\d+", pins[name]):
             raise ValueError(f"invalid release pin: {name}")
+    # Descriptor-relative cleanup needs fchmodat2 with AT_EMPTY_PATH. No kernel
+    # config option can provide that syscall on the older 6.1 LTS series.
+    if tuple(map(int, pins['kernel'].split('.'))) < (6, 6, 0):
+        raise ValueError('kernel must be >=6.6.0 for fchmodat2(AT_EMPTY_PATH)')
     if pins["rust_default"] not in pins["rust_toolchains"]:
         raise ValueError("default Rust must be an installed pinned toolchain")
     for toolchain, targets in pins["rust_toolchains"].items():
