@@ -34,7 +34,7 @@ pub enum BillingStatus {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedJobState {
     pub hosted_no_fallback: bool,
     pub hosted_code: Option<String>,

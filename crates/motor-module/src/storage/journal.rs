@@ -16,6 +16,10 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "journal_delta_tests.rs"]
+mod delta_tests;
+
 pub(super) const SOFT_BYTES: u64 = 1024 * 1024;
 pub(super) const HARD_BYTES: u64 = 8 * SOFT_BYTES;
 pub(super) const MAX_AGE: Duration = Duration::from_secs(5 * 60);
@@ -57,29 +61,49 @@ pub(super) struct Position {
 struct Delta(BTreeMap<String, BTreeMap<String, Option<Value>>>);
 impl Delta {
     fn between(before: &State, after: &State) -> io::Result<Self> {
-        let before = serde_json::to_value(before).map_err(io::Error::other)?;
-        let after = serde_json::to_value(after).map_err(io::Error::other)?;
         let mut delta = BTreeMap::new();
-        for name in ["jobs", "snapshots", "snapshot_used_at_ms", "verified_tips"] {
-            let empty = serde_json::Map::new();
-            let old = before[name].as_object().unwrap_or(&empty);
-            let new = after[name].as_object().unwrap_or(&empty);
-            let mut changes = BTreeMap::new();
-            for (key, value) in new {
-                if old.get(key) != Some(value) {
-                    changes.insert(key.clone(), Some(value.clone()));
-                }
-            }
-            for key in old.keys() {
-                if !new.contains_key(key) {
-                    changes.insert(key.clone(), None);
-                }
-            }
-            if !changes.is_empty() {
-                delta.insert(name.to_owned(), changes);
+        Self::map_changes(&mut delta, "jobs", &before.jobs, &after.jobs)?;
+        Self::map_changes(&mut delta, "snapshots", &before.snapshots, &after.snapshots)?;
+        Self::map_changes(
+            &mut delta,
+            "snapshot_used_at_ms",
+            &before.snapshot_used_at_ms,
+            &after.snapshot_used_at_ms,
+        )?;
+        Self::map_changes(
+            &mut delta,
+            "verified_tips",
+            &before.verified_tips,
+            &after.verified_tips,
+        )?;
+        Ok(Self(delta))
+    }
+
+    fn map_changes<K: Ord + ToString, V: PartialEq + Serialize>(
+        delta: &mut BTreeMap<String, BTreeMap<String, Option<Value>>>,
+        name: &str,
+        before: &BTreeMap<K, V>,
+        after: &BTreeMap<K, V>,
+    ) -> io::Result<()> {
+        let mut changes = BTreeMap::new();
+        // Compare stored records without allocating JSON trees for unchanged entries.
+        for (key, value) in after {
+            if before.get(key) != Some(value) {
+                changes.insert(
+                    key.to_string(),
+                    Some(serde_json::to_value(value).map_err(io::Error::other)?),
+                );
             }
         }
-        Ok(Self(delta))
+        for key in before.keys() {
+            if !after.contains_key(key) {
+                changes.insert(key.to_string(), None);
+            }
+        }
+        if !changes.is_empty() {
+            delta.insert(name.to_owned(), changes);
+        }
+        Ok(())
     }
     fn apply(self, state: &mut Value) -> io::Result<()> {
         for (name, changes) in self.0 {
@@ -167,16 +191,22 @@ impl Backend {
             ));
         }
         let delta = Delta::between(before, after)?;
+        j.append_delta(delta, metrics)
+    }
+}
+
+impl Journal {
+    fn append_delta(&mut self, delta: Delta, metrics: &Metrics) -> io::Result<()> {
         if delta.0.is_empty() {
             return Ok(());
         }
-        let seq = j
+        let seq = self
             .position
             .seq
             .checked_add(1)
             .ok_or_else(|| invalid("journal sequence exhausted"))?;
         let payload = serde_json::to_vec(&Frame {
-            epoch: j.position.epoch,
+            epoch: self.position.epoch,
             seq,
             delta,
         })
@@ -184,23 +214,24 @@ impl Backend {
         let mut bytes = format!("{:x}\t", Sha256::digest(&payload)).into_bytes();
         bytes.extend(payload);
         bytes.push(b'\n');
-        let old_len = j.segments.last().unwrap().bytes;
-        let result =
-            write(&mut j.file, &bytes, &metrics.append_bytes).and_then(|()| j.file.sync_all());
+        let old_len = self.segments.last().unwrap().bytes;
+        let result = write(&mut self.file, &bytes, &metrics.append_bytes)
+            .and_then(|()| self.file.sync_all());
         if let Err(error) = result {
             // Never put a valid later frame behind an uncertain append.
-            if j.file
+            if self
+                .file
                 .set_len(old_len)
-                .and_then(|()| j.file.sync_all())
+                .and_then(|()| self.file.sync_all())
                 .is_err()
             {
-                j.poisoned = true;
+                self.poisoned = true;
             }
             return Err(error);
         }
         metrics.syncs.fetch_add(1, Ordering::Relaxed);
-        j.position.seq = seq;
-        j.segments.last_mut().unwrap().bytes += bytes.len() as u64;
+        self.position.seq = seq;
+        self.segments.last_mut().unwrap().bytes += bytes.len() as u64;
         Ok(())
     }
 }
