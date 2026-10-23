@@ -209,8 +209,8 @@ tests.
   the permits, it still waits until no foreground job is queued. A fill that
   may start is tried before every queued foreground job except gates, takes
   only permits that are free, and holds back later jobs while it waits for
-  them, as a job past its backfill grace does. It never takes permits from a
-  placed job. The next fill is for the repository whose jobs arrived most
+  them, as a job past its backfill grace does. It never takes permits already
+  held by a running or starting job. The next fill is for the repository whose jobs arrived most
   recently. Tests:
   `writer_is_a_singleton_that_waits_for_free_permits_on_large_and_small_hosts`,
   `one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit`.

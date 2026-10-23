@@ -4285,7 +4285,8 @@ impl Runner {
     /// being saved; or a gate job, a cache fill that may start (the writer
     /// slot is free, the cache is not being evicted, and the fill may pass
     /// queued foreground jobs; see `fill_passes_queue`), or a non-base job
-    /// queued past BACKFILL_GRACE_MS, that doesn't fit in `held` permits or
+    /// queued past BACKFILL_GRACE_MS, whose weight added to the `held`
+    /// (already occupied) permits exceeds the runner's permit limit, or that
     /// is waiting out its start retry delay (such a head keeps its claim on
     /// capacity, as if it were waiting for permits). A head whose earlier
     /// attempt is still being cleaned up is skipped like a checkout conflict
