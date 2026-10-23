@@ -20,8 +20,8 @@ host can also call `Nonces::prune` explicitly.
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
 `test-vectors/runners/`. `contracts/cloud/` mirrors eleven canonical files
-verbatim: the contract and `account-closure.json` at commit `e961a71`,
-`lease.json`, `boat-lease.json`, `shadow-lease.json` and
+verbatim: the contract at commit `5632339`, `account-closure.json` at
+`e961a71`, `lease.json`, `boat-lease.json`, `shadow-lease.json` and
 `settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
 `916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
 `00e688e`. `contracts/digest-manifest.json` records source paths,
