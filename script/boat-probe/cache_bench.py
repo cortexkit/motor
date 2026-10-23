@@ -15,6 +15,7 @@ from probe import ProbeError, provider_sizing_matches, sizing_error
 from ssh_reach import SSHReach, endpoint, pin_host, ssh_argv
 
 SOURCE = Path(__file__).resolve().parents[1] / 'cache-bench' / 'bench.py'
+ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('motor_cache_bench', SOURCE)
 if spec is None or spec.loader is None:
     raise ImportError('cannot load cache benchmark driver')
@@ -113,7 +114,22 @@ def run(runner, args):
             with manifest.open('rb') as stream:
                 remote('umask 077; cat > /dev/shm/motor-cache-backends.json', stream)
             prefix = shlex.quote(args.cache_prefix)
-            result = remote('python3 /dev/shm/motor-cache-bench.py --run --placement B '
+            # The operator SSH session is not a job: its PATH lacks the image's Cargo
+            # bin and its default RUSTUP_HOME is the session user's own. Run A's
+            # operator script exports both the same way, from the build server's
+            # layout, which the Boat image shares (script/runner/toolchain.json).
+            layout = json.loads((ROOT / 'script/runner/toolchain.json').read_text())
+            tools = (f"PATH={shlex.quote(layout['cargo_home'] + '/bin')}:\"$PATH\" "
+                     f"RUSTUP_HOME={shlex.quote(layout['rustup_home'])} ")
+            # Name a missing tool here: the driver reports only an exception's
+            # type, so a missing executable would surface as a bare FileNotFoundError.
+            found = remote('env ' + tools + 'sh -c ' + shlex.quote(
+                'for t in cargo rustc sccache; do command -v "$t" >/dev/null || echo "$t"; done'),
+                checked=False)
+            missing = found.stdout.decode(errors='replace').split()
+            if missing or found.returncode:
+                raise ProbeError('cache-bench tools missing in the sandbox: ' + (' '.join(missing) or 'check failed'))
+            result = remote('env ' + tools + 'python3 /dev/shm/motor-cache-bench.py --run --placement B '
                             '--backends /dev/shm/motor-cache-backends.json '
                             f'--prefix {prefix} --output /dev/shm/motor-cache-results > /dev/null', checked=False)
             fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False)
