@@ -157,18 +157,25 @@ pub(super) fn prepare(
         let output = run_preparation(config, setup.id, &args).map_err(|error| {
             super::vm::path_error("run trusted preparation for", staging, error)
         })?;
+        super::prep_error::log_warnings(&output.stderr);
         if !output.status.success() {
-            return Err(invalid(format!(
-                "Windows trusted preparation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+            return Err(super::prep_error::refused(&output));
         }
         super::vm::restore_staging_access(config, staging)?;
     }
     #[cfg(windows)]
-    execute_with_fetch(&plan_path, |cmd| {
-        super::trusted_prep::prepare_fetch(config, staging, cmd)
-    })?;
+    {
+        let mut root_fetch = true;
+        execute_with_fetch_and_finish(
+            &plan_path,
+            |cmd| {
+                let timeout = std::time::Duration::from_secs(if root_fetch { 600 } else { 30 });
+                root_fetch = false;
+                super::trusted_prep::prepare_fetch(config, staging, cmd, timeout)
+            },
+            |staging| super::trusted_prep::stage_cache(config, staging),
+        )?;
+    }
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
@@ -189,6 +196,7 @@ fn prep_args(
         "-n".into(),
         "/usr/bin/systemd-run".into(),
         "--wait".into(),
+        "--pipe".into(),
         "--collect".into(),
         format!("--unit=motor-windows-{}-prep-{id}.service", config.instance),
         "--property=User=motor-prep".into(),
@@ -337,7 +345,7 @@ fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
     command.env("SYSTEMROOT", "C:\\Windows");
     let output = command.output()?;
     if !output.status.success() {
-        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+        return Err(invalid(format!("git {}: {}", args[0], output.status)));
     }
     Ok(output)
 }
@@ -348,7 +356,7 @@ pub(crate) fn execute(plan_path: &Path) -> io::Result<()> {
     execute_with_fetch(plan_path, |cmd| {
         let output = cmd.output()?;
         if !output.status.success() {
-            return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+            return Err(invalid(format!("cargo fetch: {}", output.status)));
         }
         Ok(())
     })
@@ -372,6 +380,8 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
         )
         .env("CARGO_HOME", plan.staging.join("cargo-home"))
         .env("RUSTUP_HOME", &plan.rustup)
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .args(args)
         .arg("--manifest-path")
         .arg(manifest)
@@ -381,108 +391,166 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
 
 pub(crate) fn execute_with_fetch(
     plan_path: &Path,
-    fetch: impl FnOnce(&mut Command) -> io::Result<()>,
+    fetch: impl FnMut(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
+    execute_with_fetch_and_finish(plan_path, fetch, |_| Ok(()))
+}
+
+fn execute_with_fetch_and_finish(
+    plan_path: &Path,
+    mut fetch: impl FnMut(&mut Command) -> io::Result<()>,
+    finish: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let plan: Plan = read_json(plan_path)?;
     let mut roots = Vec::new();
     let mut cases = BTreeMap::new();
     let mut members = BTreeSet::new();
-    for (index, snapshot) in plan.snapshots.iter().enumerate() {
-        let root = plan.staging.join(mapped(&snapshot.destination)?);
-        if roots
-            .iter()
-            .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
-        {
-            return Err(invalid(format!(
-                "overlapping snapshot: {}",
-                snapshot.destination
-            )));
-        }
-        if index == 0 {
-            let tree = git(
-                snapshot,
-                &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)],
-            )?;
-            let computed = String::from_utf8_lossy(&tree.stdout);
-            if computed.trim() != plan.tree_hash {
-                return Err(Trees::tree_hash_mismatch(
-                    &snapshot.mirror,
-                    &plan.tree_hash,
-                    computed.trim(),
-                ));
-            }
-        }
-        fs::create_dir_all(&root)?;
-        let archive = git(
-            snapshot,
-            &[
-                "archive",
-                "--format=tar",
-                &format!("{}^{{tree}}", snapshot.commit),
-            ],
-        )?;
-        for entry in tar::Archive::new(io::Cursor::new(archive.stdout)).entries()? {
-            let mut entry = entry?;
-            let name = entry
-                .path()?
-                .to_str()
-                .ok_or_else(|| invalid("non-UTF8 snapshot path"))?
-                .trim_end_matches('/')
-                .to_owned();
-            let transferred = format!("{}/{}", mapped(&snapshot.destination)?.display(), name);
-            #[cfg(windows)]
-            let transferred = transferred.replace('\\', "/");
-            motor_winagent::validate_archive_path(&transferred)?;
-            check_case(&transferred, &mut cases)?;
-            if !members.insert(transferred.clone()) {
-                return Err(invalid(format!("duplicate snapshot path: {transferred}")));
-            }
-            let kind = entry.header().entry_type();
-            if kind.is_symlink() {
-                // Stage a tracked symlink as a regular file holding its target
-                // text, as Git for Windows checks it out by default
-                // (core.symlinks=false). The staged tree then holds only files
-                // and directories, so nothing in it can point outside the job.
-                let target = entry
-                    .link_name_bytes()
-                    .ok_or_else(|| invalid(format!("snapshot link without target: {transferred}")))?
-                    .into_owned();
-                let path = root.join(&name);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)?
-                    .write_all(&target)?;
-                continue;
-            }
-            if !kind.is_file() && !kind.is_dir() {
+    let mut regular_files = BTreeSet::new();
+    super::prep_error::step("extract snapshots", &plan.staging, || {
+        for (index, snapshot) in plan.snapshots.iter().enumerate() {
+            let root = plan.staging.join(mapped(&snapshot.destination)?);
+            if roots
+                .iter()
+                .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
+            {
                 return Err(invalid(format!(
-                    "snapshot special file: {}/{name}",
+                    "overlapping snapshot: {}",
                     snapshot.destination
                 )));
             }
-            entry.unpack_in(&root)?;
+            if index == 0 {
+                let tree = git(
+                    snapshot,
+                    &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)],
+                )?;
+                let computed = String::from_utf8_lossy(&tree.stdout);
+                if computed.trim() != plan.tree_hash {
+                    return Err(Trees::tree_hash_mismatch(
+                        &snapshot.mirror,
+                        &plan.tree_hash,
+                        computed.trim(),
+                    ));
+                }
+            }
+            fs::create_dir_all(&root)?;
+            let archive = git(
+                snapshot,
+                &[
+                    "archive",
+                    "--format=tar",
+                    &format!("{}^{{tree}}", snapshot.commit),
+                ],
+            )?;
+            for entry in tar::Archive::new(io::Cursor::new(archive.stdout)).entries()? {
+                let mut entry = entry?;
+                let name = entry
+                    .path()?
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF8 snapshot path"))?
+                    .trim_end_matches('/')
+                    .to_owned();
+                let transferred = format!("{}/{}", mapped(&snapshot.destination)?.display(), name);
+                #[cfg(windows)]
+                let transferred = transferred.replace('\\', "/");
+                motor_winagent::validate_archive_path(&transferred)?;
+                check_case(&transferred, &mut cases)?;
+                if !members.insert(transferred.clone()) {
+                    return Err(invalid(format!("duplicate snapshot path: {transferred}")));
+                }
+                let kind = entry.header().entry_type();
+                if kind.is_symlink() {
+                    // Stage a tracked symlink as a regular file holding its target
+                    // text, as Git for Windows checks it out by default
+                    // (core.symlinks=false). The staged tree then holds only files
+                    // and directories, so nothing in it can point outside the job.
+                    let target = entry
+                        .link_name_bytes()
+                        .ok_or_else(|| {
+                            invalid(format!("snapshot link without target: {transferred}"))
+                        })?
+                        .into_owned();
+                    let path = root.join(&name);
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?
+                        .write_all(&target)?;
+                    continue;
+                }
+                if !kind.is_file() && !kind.is_dir() {
+                    return Err(invalid(format!(
+                        "snapshot special file: {}/{name}",
+                        snapshot.destination
+                    )));
+                }
+                if kind.is_file() {
+                    regular_files.insert(transferred);
+                }
+                entry.unpack_in(&root)?;
+            }
+            roots.push(root);
         }
-        roots.push(root);
-    }
+        Ok(())
+    })?;
     let workspace = plan.staging.join(mapped(&plan.workspace)?);
-    if !workspace.join("Cargo.lock").is_file() {
-        return Err(invalid(format!(
-            "snapshot has no Cargo.lock: {}",
-            plan.workspace
-        )));
+    super::prep_error::step("validate manifests", &plan.staging, || {
+        if !workspace.join("Cargo.lock").is_file() {
+            return Err(invalid(format!(
+                "snapshot has no Cargo.lock: {}",
+                mapped(&plan.workspace)?.display()
+            )));
+        }
+        for root in &roots {
+            validate_manifests(root, &roots, &plan.routes)?;
+        }
+        Ok(())
+    })?;
+    super::prep_error::step("fetch dependencies", &plan.staging, || {
+        fs::create_dir_all(plan.staging.join("cargo-home"))?;
+        fs::create_dir_all(plan.staging.join("home"))?;
+        fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
+    })?;
+    // Archive members are tracked snapshot paths, not files introduced by Cargo
+    // or by a dependency checkout. Independent nested workspaces need their own
+    // fetch, but a stale optional lockfile must not prevent the root build.
+    for name in members.iter().filter(|name| name.ends_with("/Cargo.lock")) {
+        let lockfile = plan.staging.join(name);
+        if lockfile == workspace.join("Cargo.lock") {
+            continue;
+        }
+        let manifest = lockfile.with_file_name("Cargo.toml");
+        let manifest_name = format!("{}Cargo.toml", name.strip_suffix("Cargo.lock").unwrap());
+        let fetched = if !regular_files.contains(name) || !regular_files.contains(&manifest_name) {
+            Err(invalid(
+                "lockfile and manifest must both be tracked regular files",
+            ))
+        } else {
+            fetch_manifest(&plan, &manifest, &mut fetch)
+        };
+        if let Err(error) = fetched {
+            let warning = super::prep_error::nested_warning(&plan.staging, &lockfile, error);
+            eprintln!("{warning}");
+            #[cfg(windows)]
+            super::prep_error::log_warnings(warning.as_bytes());
+        }
     }
-    for root in &roots {
-        validate_manifests(root, &roots, &plan.routes)?;
-    }
-    fs::create_dir_all(plan.staging.join("cargo-home"))?;
-    fs::create_dir_all(plan.staging.join("home"))?;
+    super::prep_error::step("stage dependencies", &plan.staging, || {
+        finish(&plan.staging)?;
+        build_tar(&plan.staging)
+    })
+}
+
+fn fetch_manifest(
+    plan: &Plan,
+    manifest: &Path,
+    fetch: &mut impl FnMut(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
     let mut cmd = cargo_command(
-        &plan,
-        &workspace.join("Cargo.toml"),
+        plan,
+        manifest,
         &["fetch", "--locked", "--target", "x86_64-pc-windows-msvc"],
     );
     cmd.args(["--config", "net.git-fetch-with-cli=true"]);
@@ -498,8 +566,7 @@ pub(crate) fn execute_with_fetch(
         n += 1;
     }
     cmd.env("GIT_CONFIG_COUNT", n.to_string());
-    fetch(&mut cmd)?;
-    build_tar(&plan.staging)
+    fetch(&mut cmd)
 }
 
 fn check_case(path: &str, cases: &mut BTreeMap<String, String>) -> io::Result<()> {
@@ -529,8 +596,8 @@ fn validate_manifests(
         if metadata.is_dir() {
             validate_manifests(&path, roots, routes)?;
         } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
-            let value: toml::Value =
-                toml::from_str(&fs::read_to_string(&path)?).map_err(invalid)?;
+            let value: toml::Value = toml::from_str(&fs::read_to_string(&path)?)
+                .map_err(|_| invalid("invalid Cargo.toml"))?;
             validate_dependencies(&value, path.parent().unwrap(), roots, routes)?;
         }
     }
@@ -639,7 +706,18 @@ fn append(
         return Err(invalid(format!("case collision: {name}")));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
+    if !metadata.is_symlink() {
+        crate::filesystem::identity(path)?;
+    }
+    if metadata.is_symlink() {
+        let text = super::staging::link_text(path)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(text.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, relative, text.as_slice())?;
+    } else if metadata.is_dir() {
         builder.append_dir(relative, path)?;
         let mut entries = fs::read_dir(path)?
             .map(|e| e.map(|e| e.path()))
@@ -649,9 +727,9 @@ fn append(
             append(builder, staging, &entry, seen)?;
         }
     } else if metadata.is_file() {
-        builder.append_file(relative, &mut File::open(path)?)?;
+        builder.append_file(relative, &mut crate::filesystem::read_nofollow(path)?)?;
     } else {
-        return Err(invalid(format!("link or special file: {}", path.display())));
+        return Err(invalid(format!("special file: {name}")));
     }
     Ok(())
 }
@@ -705,6 +783,124 @@ pub(crate) fn store_collection(
 
 #[cfg(test)]
 mod trusted_cargo_config_tests {
+    #[cfg(unix)]
+    #[test]
+    fn nested_workspace_prefetch_supplies_its_git_dependency_to_offline_cargo() {
+        let scratch = ScratchDir::new("windows-nested-offline");
+        let git = |root: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let dependency = scratch.path().join("dependency");
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname='nested-dependency'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(dependency.join("src/lib.rs"), "").unwrap();
+        fs::write(dependency.join("README.md"), "dependency readme").unwrap();
+        std::os::unix::fs::symlink("README.md", dependency.join("AGENTS.md")).unwrap();
+        git(&dependency, &["init", "-q"]);
+        git(&dependency, &["add", "."]);
+        git(
+            &dependency,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "git dependency",
+            ],
+        );
+        let rev = git(&dependency, &["rev-parse", "HEAD"]);
+        let repository = scratch.path().join("repository");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("playground/src")).unwrap();
+        fs::write(
+            repository.join("Cargo.toml"),
+            "[workspace]\n[package]\nname='root'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("Cargo.lock"),
+            "version=4\n[[package]]\nname='root'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(repository.join("src/lib.rs"), "").unwrap();
+        let url = "https://example.invalid/nested-dependency";
+        fs::write(repository.join("playground/Cargo.toml"), format!("[workspace]\n[package]\nname='playground'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nnested-dependency={{git='{url}',rev='{rev}'}}\n")).unwrap();
+        fs::write(repository.join("playground/Cargo.lock"), format!("version=4\n[[package]]\nname='playground'\nversion='0.1.0'\ndependencies=['nested-dependency']\n[[package]]\nname='nested-dependency'\nversion='0.1.0'\nsource='git+{url}?rev={rev}#{rev}'\n")).unwrap();
+        fs::write(repository.join("playground/src/lib.rs"), "").unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["add", "."]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "nested workspace",
+            ],
+        );
+        let cargo = PathBuf::from(env!("CARGO"));
+        let plan = Plan {
+            staging: scratch.path().join("staging"),
+            snapshots: vec![Snapshot {
+                mirror: repository.join(".git"),
+                commit: git(&repository, &["rev-parse", "HEAD"]),
+                destination: "/repository".into(),
+            }],
+            routes: BTreeMap::from([(url.into(), dependency.join(".git"))]),
+            workspace: "/repository".into(),
+            tree_hash: git(&repository, &["rev-parse", "HEAD^{tree}"]),
+            cargo: cargo.clone(),
+            rustup: std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rustup")
+                }),
+            toolchain_bin: cargo.parent().unwrap().to_path_buf(),
+            toolchain_source: PathBuf::new(),
+        };
+        fs::create_dir_all(&plan.staging).unwrap();
+        let path = plan.staging.join("prepare.json");
+        atomic_json(&path, &plan).unwrap();
+        execute(&path).unwrap();
+        let output = cargo_command(
+            &plan,
+            &plan.staging.join("m/repository/playground/Cargo.toml"),
+            &["metadata", "--locked", "--offline", "--format-version", "1"],
+        )
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "nested-dependency"));
+    }
+
     #[test]
     fn collected_links_are_only_inert_tar_bytes_on_the_host() {
         let root = ScratchDir::new("windows-collected-links");

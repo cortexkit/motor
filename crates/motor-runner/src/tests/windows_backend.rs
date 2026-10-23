@@ -197,9 +197,10 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
         }
         if args.iter().any(|s| s == "windows-prepare") {
             assert!(args.iter().any(|s| s == "--property=User=motor-prep"));
+            assert!(args.iter().any(|s| s == "--pipe"));
             assert!(!args.iter().any(|s| s.contains("PrivateNetwork")));
             let plan = Path::new(args.last().unwrap());
-            prep::execute_with_fetch(plan, |cmd| {
+            let prepared = prep::execute_with_fetch(plan, |cmd| {
                 let args = cmd
                     .get_args()
                     .map(|s| s.to_str().unwrap())
@@ -225,7 +226,14 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     fs::write(home.join(name), data)?;
                 }
                 Ok(())
-            })?;
+            });
+            if let Err(error) = prepared {
+                return Ok(output(
+                    1,
+                    Vec::new(),
+                    format!("{}\n", crate::windows::prep_error::error_line(&error)).into_bytes(),
+                ));
+            }
         }
         Ok(output(0, Vec::new(), Vec::new()))
     }));
@@ -1540,6 +1548,154 @@ async fn windows_backend_tar_contains_only_m_and_selected_cargo_home_members() {
     assert!(names
         .iter()
         .all(|name| !name.contains("/.git/") && !name.ends_with(".json")));
+}
+
+#[tokio::test]
+async fn windows_backend_fetches_tracked_nested_workspaces_and_tolerates_a_failed_nested_fetch() {
+    let f = Fixture::new();
+    source(&f);
+    for name in ["broken", "playground"] {
+        fs::create_dir_all(f.main.join(name).join("src")).unwrap();
+        fs::write(
+            f.main.join(name).join("Cargo.toml"),
+            format!("[workspace]\n[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        fs::write(f.main.join(name).join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(f.main.join(name).join("src/lib.rs"), "").unwrap();
+    }
+    fs::create_dir_all(f.main.join("malformed")).unwrap();
+    fs::write(f.main.join("malformed/Cargo.lock"), "version = 3\n").unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "nested workspaces"]);
+    fs::create_dir_all(f.main.join("untracked")).unwrap();
+    fs::write(f.main.join("untracked/Cargo.lock"), "version = 3\n").unwrap();
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let fetched = Arc::new(Mutex::new(Vec::new()));
+    let observed = fetched.clone();
+    let original = c.windows_command.take().unwrap();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
+                let args: Vec<_> = cmd.get_args().collect();
+                let manifest = Path::new(
+                    args[args
+                        .iter()
+                        .position(|arg| *arg == "--manifest-path")
+                        .unwrap()
+                        + 1],
+                );
+                let name = manifest
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                observed.lock().unwrap().push(name.clone());
+                if name == "broken" {
+                    return Err(io::Error::other("stale optional lockfile"));
+                }
+                let home = cmd
+                    .get_envs()
+                    .find(|(key, _)| *key == "CARGO_HOME")
+                    .unwrap()
+                    .1
+                    .unwrap();
+                let path = Path::new(home).join(format!("registry/cache/fixture/{name}.crate"));
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, b"fetched dependency")?;
+                Ok(())
+            })?;
+            return Ok(output(0, Vec::new(), Vec::new()));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert_eq!(
+        t.outcome,
+        Outcome::WindowsExit { code: 0 },
+        "{:?}",
+        t.refusal_detail
+    );
+    assert_eq!(*fetched.lock().unwrap(), ["a", "broken", "playground"]);
+    let tree = a.tree.lock().unwrap();
+    let names: Vec<_> = tar::Archive::new(io::Cursor::new(&*tree))
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        names.contains(&"cargo-home/registry/cache/fixture/playground.crate".into()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"cargo-home/registry/cache/fixture/a.crate".into()),
+        "{names:?}"
+    );
+}
+
+#[tokio::test]
+async fn windows_backend_prep_step_failure_reaches_refusal_without_host_paths() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let original = c.windows_command.take().unwrap();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            assert!(args.iter().any(|arg| arg == "--pipe"));
+            let error = prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
+                let home = cmd
+                    .get_envs()
+                    .find(|(key, _)| *key == "CARGO_HOME")
+                    .unwrap()
+                    .1
+                    .unwrap();
+                let checkout = Path::new(home).join("git/checkouts/dependency/rev");
+                fs::create_dir_all(&checkout)?;
+                let path =
+                    std::ffi::CString::new(checkout.join("fifo").as_os_str().as_encoded_bytes())
+                        .unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                Ok(())
+            })
+            .unwrap_err();
+            return Ok(output(
+                1,
+                Vec::new(),
+                format!(
+                    "Running as unit: motor-prep.service\n{}\nFinished with result: exit-code\n",
+                    crate::windows::prep_error::error_line(&error)
+                )
+                .into_bytes(),
+            ));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
+    let detail = t.refusal_detail.unwrap();
+    assert!(detail.contains("windows prep: stage dependencies: special file: cargo-home/git/checkouts/dependency/rev/fifo"), "{detail}");
+    assert!(detail.contains("exit status: 1"), "{detail}");
+    assert!(
+        !detail.contains(f.scratch.path().to_str().unwrap()),
+        "{detail}"
+    );
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+    assert!(a.units.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

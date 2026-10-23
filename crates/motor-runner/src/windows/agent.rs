@@ -559,7 +559,11 @@ fn materialize_attempt(
     )
     .map_err(|error| super::vm::path_error("prepare job staging", &staging, error))?;
     let tar = super::prep::prepare(config, trees, setup, &resources.staging).map_err(|error| {
-        super::vm::path_error("materialize job staging", &resources.staging, error)
+        if super::prep_error::is_reported(&error) {
+            error
+        } else {
+            super::vm::path_error("materialize job staging", &resources.staging, error)
+        }
     })?;
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
