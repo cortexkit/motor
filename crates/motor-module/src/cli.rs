@@ -81,7 +81,8 @@ that contains --cwd (default: the current directory), and streams its stdout
 and stderr here as they arrive.
 
   --vcpus N           vCPUs to reserve (the runner's default when omitted)
-  --net  allow outbound IPv4 internet (package and tool fetches); jobs are offline without it
+  --net               allow outbound IPv4 internet (package and tool fetches);
+                      jobs are offline without it
   --sibling PATH      also send this sibling repository (repeatable)
   --env NAME=VALUE    set an environment variable for the job (repeatable).
                       Nothing is inherited from this shell; ck-motor forwards
