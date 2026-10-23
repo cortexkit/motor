@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn restart_discards_unpublished_records_but_quarantines_missing_published_records() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    let (request, _) = f.run("true");
+    let state = config.state_dir();
+    let staging = state.join("job-staging").join(request.job_id.to_string());
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("record.tmp"), b"half a record").unwrap();
+    let published = Uuid::now_v7();
+    fs::create_dir_all(state.join("jobs").join(published.to_string())).unwrap();
+    let runner = Runner::open(config).unwrap();
+    assert!(!state.join("job-staging").exists());
+    assert!(!runner.core.quarantined.contains_key(&request.job_id));
+    assert!(runner.core.quarantined.contains_key(&published));
+    assert!(!runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .contains_key(&request.job_id));
+}
+
 fn running_record(f: &Fixture, runner: &Runner) -> Uuid {
     let (request, _) = f.run("true");
     runner.accept(request.clone()).unwrap();

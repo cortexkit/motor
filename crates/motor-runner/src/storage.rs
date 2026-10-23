@@ -542,6 +542,41 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()>
     atomic_json_mode(path, value, false)
 }
 
+pub(crate) fn atomic_job_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    atomic_job_json_and(path, value, |_| Ok(()))
+}
+
+fn atomic_job_json_and(
+    path: &Path,
+    value: &impl Serialize,
+    before_publish: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("job has no directory"))?;
+    if directory.try_exists()? {
+        return atomic_json(path, value);
+    }
+    let jobs = directory
+        .parent()
+        .ok_or_else(|| invalid("job has no root"))?;
+    // Keep incomplete first records outside jobs: rollback binaries scan every
+    // directory there, even entries whose names are not UUIDs.
+    let staging = jobs
+        .with_file_name("job-staging")
+        .join(Uuid::now_v7().to_string());
+    let result = (|| {
+        atomic_json(&staging.join("record.json"), value)?;
+        before_publish(&staging)?;
+        crate::filesystem::rename(&staging, directory)?;
+        crate::filesystem::sync_directory(jobs)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
 pub(crate) fn atomic_json_private(path: &Path, value: &impl Serialize) -> io::Result<()> {
     atomic_json_mode(path, value, true)
 }
@@ -676,6 +711,51 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn first_job_record_is_complete_before_uuid_directory_is_published() {
+        let scratch = ScratchDir::new("runner-first-record");
+        let jobs = scratch.join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        let path = jobs.join(job.id.to_string()).join("record.json");
+        let mut inspected = false;
+        atomic_job_json_and(&path, &job, |staging| {
+            inspected = true;
+            assert!(!path.parent().unwrap().exists());
+            assert_eq!(fs::read_dir(&jobs)?.count(), 0);
+            assert_eq!(read_json::<Job>(&staging.join("record.json"))?.id, job.id);
+            Ok(())
+        })
+        .unwrap();
+        assert!(inspected);
+        assert_eq!(read_json::<Job>(&path).unwrap().id, job.id);
+        let chunk = path.with_file_name("chunk-0");
+        fs::write(&chunk, b"retained").unwrap();
+        atomic_job_json(&path, &job).unwrap();
+        assert_eq!(fs::read(chunk).unwrap(), b"retained");
+    }
+
+    #[test]
+    fn interrupted_first_job_record_never_leaves_a_canonical_directory() {
+        let scratch = ScratchDir::new("runner-interrupted-record");
+        let jobs = scratch.join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        let path = jobs.join(job.id.to_string()).join("record.json");
+        let interrupted = std::panic::catch_unwind(|| {
+            let _ = atomic_job_json_and(&path, &job, |_| panic!("interrupted publication"));
+        });
+        assert!(interrupted.is_err());
+        assert!(!path.parent().unwrap().exists());
+        assert_eq!(fs::read_dir(&jobs).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(scratch.join("job-staging")).unwrap().count(),
+            1
+        );
+        atomic_job_json(&path, &job).unwrap();
+        assert_eq!(read_json::<Job>(&path).unwrap().id, job.id);
+    }
 
     #[test]
     fn chunk_metadata_clone_shares_until_mutation_and_keeps_legacy_array_format() {

@@ -1574,6 +1574,13 @@ impl Runner {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        // An unpublished first record cannot have launched a job. Old runners
+        // also ignore this separate staging root during a rollback.
+        match fs::remove_dir_all(state.join("job-staging")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         for entry in fs::read_dir(state.join("jobs"))? {
             let path = entry?.path();
             if !path.is_dir() {
@@ -2211,7 +2218,7 @@ impl Runner {
         if let Some(write) = &self.core.config.before_job_write {
             write(&self.record_path(job.id))?;
         }
-        atomic_json(&self.record_path(job.id), job)?;
+        crate::storage::atomic_job_json(&self.record_path(job.id), job)?;
         if let Some(log) = &self.core.tenant_events {
             log.observe(job)?;
         }
