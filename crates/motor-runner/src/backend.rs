@@ -721,7 +721,8 @@ impl Backend for HostBackend {
                 }),
             )?;
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
-            if config.boat_profile {
+            let sandbox = if config.boat_profile {
+                let sandbox = sandbox.with_boat_temporary_paths()?;
                 let runtime = trees.state.join("sandboxes").join(s.id.to_string());
                 let spool = trees.state.join("spools").join(s.id.to_string());
                 fs::create_dir_all(&spool)?;
@@ -730,10 +731,13 @@ impl Backend for HostBackend {
                     crate::boat_quota::prepare(
                         &trees.state,
                         s.id,
-                        vec![path.clone(), target.clone(), runtime, spool],
+                        crate::boat_quota::job_roots(&path, &target, &runtime, &spool),
                     ),
                 )?;
-            }
+                sandbox
+            } else {
+                sandbox
+            };
             wrapper = sandbox.wrapper.clone();
             Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
         } else {

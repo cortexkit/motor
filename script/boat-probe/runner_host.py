@@ -1460,16 +1460,22 @@ class RunnerHost:
         argv = self.route(sid, directory, public)
         with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
             with tempfile.TemporaryDirectory(prefix='boat-quota-client-') as storage:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    command = 'python3 -c ' + shlex.quote(disk_quota.JOB)
-                    pending = executor.submit(process, [str(client), address, str(repository), storage, command, '1'], timeout=1000)
-                    record['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.OBSERVER), timeout=950)['stdout'])
-                    result = pending.result()
-                record['client'] = result
-                record['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
-                record['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
-                for name, passed in disk_quota.checks(record['result'], record['at_limit'], record['cleanup']).items():
-                    self.check('disk_quota.' + name, passed, record)
+                for lane in disk_quota.LANES:
+                    row = record.setdefault('lanes', {})[lane] = {}
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        command = 'python3 -c ' + shlex.quote(disk_quota.job(lane))
+                        pending = executor.submit(process, [str(client), address, str(repository), storage, command, '1', '900'], timeout=1000)
+                        row['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.OBSERVER), timeout=950)['stdout'])
+                        result = pending.result()
+                    row['client'] = result
+                    row['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
+                    row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                    for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup']).items():
+                        self.check('disk_quota.' + lane + '.' + name, passed, row)
+                    if lane == 'tmp':
+                        record['at_limit'] = row['at_limit']
+                    if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
+                        raise ValueError('disk quota lane failed: ' + lane)
                 normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
                 record['next_job'] = normal
                 self.check_job('disk_quota.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')

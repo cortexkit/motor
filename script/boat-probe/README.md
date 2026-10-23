@@ -334,6 +334,18 @@ resume, and a normal resumed job. Probe results retain `runner_host.disk_quota`,
 including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes`, so the
 provisional 24-GiB reserve can be tuned empirically rather than called measured.
 
+Separate jobs exhaust scratch, HOME and `/var/tmp`, and allocate past the same
+limit on the existing root-created `/motor-output/stdout` inode. The stdout lane
+uses `fallocate(KEEP_SIZE)`: it must allocate nearly the entire allowance before
+EDQUOT/ENOSPC and a kernel project-limit warning, while preserving the root-disk
+reserve. It verifies `st_blocks` as well as project ID, so a refused no-op is not
+a pass. Keeping the file size at zero avoids streaming tens of GiB into the
+operator client; the lane punches its unwritten extents before reporting. Every
+lane checks project IDs for workspace, target, HOME, `/tmp`, `/var/tmp`, stdout,
+stderr, exit and cache-stats. Only quota jobs request the operator example's
+optional bounded 900-second deadline; existing probe invocations still default
+to 120 seconds. `phases[].kernel_release` records `uname -r`.
+
 Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
 image. Use the existing credential reader and seed arguments:
 

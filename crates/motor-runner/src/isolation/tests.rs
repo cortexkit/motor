@@ -262,6 +262,40 @@ fn boat_pid_init_unit_changes_only_what_the_init_needs() {
 }
 
 #[test]
+fn boat_var_tmp_bind_uses_the_same_quota_covered_runtime_as_tmp() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let sandbox = f
+        .command_sandbox()
+        .with_boat_profile(true, false, Some(14 << 30));
+    fs::create_dir_all(&sandbox.root).unwrap();
+    crate::systemd::with_process_hook(
+        Box::new(|_| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }),
+        || {
+            let sandbox = sandbox.with_boat_temporary_paths().unwrap();
+            assert_eq!(
+                sandbox.read_write,
+                [format!(
+                    "{}:/var/tmp",
+                    f.scratch.join("unprepared/tmp").display()
+                )]
+            );
+            assert!(sandbox.root.join("var").is_dir());
+            assert!(!fs::symlink_metadata(sandbox.root.join("var"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        },
+    );
+}
+
+#[test]
 fn boat_pid_init_unit_refuses_loader_variables_and_a_missing_identity() {
     let f = Fixture::new();
     let sandbox = || {

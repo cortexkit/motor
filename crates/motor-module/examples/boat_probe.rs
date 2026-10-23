@@ -28,9 +28,9 @@ async fn main() -> io::Result<()> {
         eprintln!("boat_probe +{:.3}s {text}", began.elapsed().as_secs_f64());
     };
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(4..=5).contains(&args.len()) {
+    if !(4..=6).contains(&args.len()) {
         return Err(io::Error::other(
-            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND [VCPUS]",
+            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND [VCPUS [TIMEOUT_SECONDS]]",
         ));
     }
     // The probe passes the sandbox's measured vCPU count as the job weight, so a job fits
@@ -39,6 +39,7 @@ async fn main() -> io::Result<()> {
         Some(text) => text.parse().map_err(io::Error::other)?,
         None => 8,
     };
+    let timeout = job_timeout(args.get(5).map(String::as_str))?;
     let address: std::net::SocketAddr = args[0].parse().map_err(io::Error::other)?;
     if !address.ip().is_loopback() {
         return Err(io::Error::other("probe requires a loopback SSH forward"));
@@ -49,7 +50,7 @@ async fn main() -> io::Result<()> {
         Arc::new(Forward(address)),
     )?;
     let request = RunRequest::new(&args[1], &args[1], &args[1], &args[3])
-        .with_timeout(120)
+        .with_timeout(timeout)
         .with_weight_hint(vcpus);
     let mut stream = motor.run(request)?;
     stage(format_args!("job submitted"));
@@ -95,6 +96,36 @@ async fn main() -> io::Result<()> {
         }
     }
     Err(io::Error::other("job stream ended without a terminal"))
+}
+
+fn job_timeout(value: Option<&str>) -> io::Result<u64> {
+    let seconds = value
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(io::Error::other)?
+        .unwrap_or(120);
+    if !(1..=900).contains(&seconds) {
+        return Err(io::Error::other(
+            "probe job timeout must be between 1 and 900 seconds",
+        ));
+    }
+    Ok(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn existing_probe_deadline_stays_120_seconds() {
+        assert_eq!(job_timeout(None).unwrap(), 120);
+    }
+    #[test]
+    fn quota_deadline_is_explicit_and_bounded() {
+        assert_eq!(job_timeout(Some("900")).unwrap(), 900);
+        for value in ["0", "901", "not-a-number"] {
+            assert!(job_timeout(Some(value)).is_err());
+        }
+    }
 }
 
 /// The record's variant name, for the stage log.

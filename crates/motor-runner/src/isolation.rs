@@ -2909,6 +2909,18 @@ impl Sandbox {
         self.boat_memory_max = if enabled { memory_max } else { None };
         self
     }
+    pub(crate) fn with_boat_temporary_paths(mut self) -> io::Result<Self> {
+        // Do not depend on systemd's version-specific PrivateTmp /var/tmp
+        // backing. Bind /var/tmp to runtime/tmp, the same quota-covered XFS
+        // scratch already mounted at /tmp.
+        let destination = Path::new("/var/tmp");
+        prepare_root_owned_mount_ancestors(&self.root, destination)?;
+        let ancestors = root_owned_mount_ancestors(&self.root, destination)?;
+        set_sandbox_directory_owner_modes(&[(&ancestors, "0755")])?;
+        self.read_write
+            .push(bind(&self.runtime.0.join("tmp"), destination)?);
+        Ok(self)
+    }
     /// The job identity for Boat units that cannot use PrivatePIDs. Only those
     /// units use it; see [`Sandbox::uses_pid_init`].
     pub(crate) fn with_pid_init(mut self, identity: Option<pid_init::JobIdentity>) -> Self {

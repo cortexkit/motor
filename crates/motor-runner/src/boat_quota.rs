@@ -18,6 +18,20 @@ const BLOCK_CAP: u64 = 32 * 1024 * 1024 * 1024;
 const INODE_CAP: u64 = 65_536;
 const INODE_RESERVE: u64 = 8192;
 
+pub(crate) fn job_roots(
+    workspace: &Path,
+    target: &Path,
+    runtime: &Path,
+    spool: &Path,
+) -> Vec<PathBuf> {
+    // Relabel existing inodes too: targets and workspaces survive earlier jobs.
+    // The complete runtime includes HOME, /tmp, and root-created output files.
+    [workspace, target, runtime, spool]
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 #[derive(Default)]
 #[repr(C)]
 struct DiskQuota {
@@ -295,6 +309,23 @@ pub(crate) fn release_runtime(runtime: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn job_roots_include_reused_trees_and_all_private_writable_storage() {
+        assert_eq!(
+            job_roots(
+                Path::new("/workspace"),
+                Path::new("/target"),
+                Path::new("/state/sandboxes/job"),
+                Path::new("/state/spools/job")
+            ),
+            [
+                PathBuf::from("/workspace"),
+                PathBuf::from("/target"),
+                PathBuf::from("/state/sandboxes/job"),
+                PathBuf::from("/state/spools/job")
+            ]
+        );
+    }
     #[test]
     fn budget_preserves_reserve_on_both_disks_and_caps_growth() {
         assert_eq!(budget(100, 80, 10, 90, 24).unwrap(), 46);

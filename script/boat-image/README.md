@@ -673,11 +673,14 @@ remount cannot safely enable XFS project quotas.
 
 For **Boat only**, after trusted checkout/dependency preparation and before job
 code, the runner assigns the workspace (including its target bind), private
-runtime (HOME, both temporary directories, raw stdout/stderr and the preallocated
+runtime (HOME, temporary directories, raw stdout/stderr and the preallocated
 exit inode), and incoming spool to one project. Shared Cargo registry/Git,
 rustup and tool binaries are read-only job mounts. Private Cargo/Bun cache writes
 are under HOME. `/dev/shm` is a separate, memory-cgroup-bounded tmpfs: it cannot
-be charged to XFS and remains memory-limited instead. Binds of an unexpected
+be charged to XFS and remains memory-limited instead. Boat explicitly binds
+`/var/tmp` to the same XFS scratch as `/tmp`, avoiding any dependency on the
+systemd version's private-temporary backing. The live probe verifies project IDs
+on both spellings. Binds of an unexpected
 filesystem fail setup, rather than silently escaping the quota.
 
 Additional growth is capped at 32 GiB and calculated from
