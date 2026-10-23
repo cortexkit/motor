@@ -319,6 +319,19 @@ value or Cargo's `--target-dir` selects a different path. Tests:
 A disk is keyed by the workspace, the baseline name
 and the toolchain version, so a new baseline or toolchain starts cold.
 
+The host creates a new disk empty. On its first use the guest agent rechecks
+the disk's serial, that Windows does not run from it, and that it is RAW, then
+writes a GPT with one Basic Data partition through native disk IOCTLs and
+quick-formats it NTFS with `format.com`, all within the 30-second
+`InitializeRaw` step. It never initializes a disk that already has a partition
+table. A disk whose initialization stopped part-way therefore fails the job's
+preparation, and like any failed preparation the host discards it, so the
+workspace's next job starts on a new disk. Tests:
+`formatter_refuses_every_initialized_layout_including_interrupted_ones`,
+`stranded_partition_without_ntfs_volume_is_refused_not_reformatted`,
+`natively_initialized_layout_passes_the_reuse_checks`,
+`windows_backend_interrupted_cache_initialization_discards_disk_and_next_job_recreates_it`.
+
 A disk is kept for the next job only when the command reached a known outcome
 (any exit code counts), the guest dismounted the disk cleanly, and the VM unit
 exited normally. Otherwise the disk is discarded. Disks are evicted least
