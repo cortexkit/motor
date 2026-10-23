@@ -1117,14 +1117,17 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
             if allow_spill.is_some() {
                 drop(result.unwrap().0);
             } else {
-                // A request stored before ck-motor always sent allow_spill is
-                // re-sent unchanged; the broker now requires the member and
-                // refuses it as malformed, which the client reports as rejected.
-                assert_eq!(result.err(), Some(Error::Rejected));
+                // A stored request missing allow_spill, which the broker
+                // requires, is never sent: the client refuses it itself,
+                // naming the member, instead of collecting the broker's 400.
+                assert_eq!(
+                    result.err(),
+                    Some(Error::RequestInvalid(Some("allow_spill")))
+                );
             }
         }
         let bodies = h.lease_bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies.len(), if allow_spill.is_some() { 2 } else { 0 });
         for bytes in bodies.iter() {
             let sent: motor_lease::LeaseRequest = serde_json::from_slice(bytes).unwrap();
             assert_eq!(sent.allow_spill, allow_spill);
@@ -1294,4 +1297,117 @@ async fn closed_account_rerequest_of_a_placed_job_still_runs_but_a_new_job_is_re
             .count(),
         3
     );
+}
+
+/// `invalid_lease_field` names the member CLOUD's lease parser refuses with
+/// 400 `bad_request`, for each rule of the pinned runners contract, and
+/// accepts the bounds and the `boat:` placement hint the contract allows.
+#[test]
+fn invalid_lease_field_names_each_member_the_broker_refuses() {
+    let request =
+        RunRequest::new("/home/a/repo", "/home/a/repo", "/home/a/repo", "true").with_timeout(30);
+    let valid = lease_body(
+        Uuid::now_v7(),
+        &request,
+        ("A".repeat(43), "b-_9".repeat(10) + "abc"),
+        None,
+        Some("build-server-1".into()),
+        RequesterJwk::from_key(&SigningKey::from_bytes(&[7; 32]).verifying_key()),
+        Some(true),
+    )
+    .unwrap();
+    assert_eq!(invalid_lease_field(&valid, false), None);
+    assert_eq!(invalid_lease_field(&valid, true), None);
+    type Mutation = fn(&mut LeaseRequest);
+    let accepted: [(&str, Mutation); 6] = [
+        ("timeout_s 10", |b| b.timeout_s = 10),
+        ("timeout_s 7200", |b| b.timeout_s = 7200),
+        ("vcpus 1", |b| b.vcpus = 1),
+        ("vcpus 64", |b| b.vcpus = 64),
+        ("avoid_host null", |b| b.avoid_host = None),
+        ("boat hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "boat:bx_1".into(),
+                vm: Some("bx_1".into()),
+            })
+        }),
+    ];
+    for (name, mutate) in accepted {
+        let mut body = valid.clone();
+        mutate(&mut body);
+        assert_eq!(invalid_lease_field(&body, false), None, "{name}");
+    }
+    let refused: [(&str, Mutation); 17] = [
+        ("job_id", |b| b.job_id.replace_range(14..15, "4")),
+        ("job_id", |b| {
+            b.job_id = "0190f0e2-1b2c-7d3e-8f4a-5b6c7d8e9F0a".into()
+        }),
+        ("vcpus", |b| b.vcpus = 0),
+        ("vcpus", |b| b.vcpus = 65),
+        ("platform", |b| b.platform = "linux x64".into()),
+        ("workspace_key_hash", |b| {
+            b.workspace_key_hash = "A".repeat(42)
+        }),
+        ("repo_hash", |b| {
+            b.repo_hash = format!("{}=", "A".repeat(42))
+        }),
+        ("placement_hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "host-1".into(),
+                vm: None,
+            })
+        }),
+        ("placement_hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "host/1".into(),
+                vm: Some("vm".into()),
+            })
+        }),
+        ("avoid_host", |b| b.avoid_host = Some("boat:bx_1".into())),
+        ("timeout_s", |b| b.timeout_s = 9),
+        ("timeout_s", |b| b.timeout_s = 7201),
+        ("timeout_s", |b| b.timeout_s = 10_800),
+        ("requester_jwk", |b| b.requester_jwk.kty = "EC".into()),
+        ("requester_jwk", |b| b.requester_jwk.crv = "X25519".into()),
+        ("requester_jwk", |b| b.requester_jwk.x = "B".repeat(43)),
+        ("allow_spill", |b| b.allow_spill = None),
+    ];
+    for (field, mutate) in refused {
+        let mut body = valid.clone();
+        mutate(&mut body);
+        assert_eq!(invalid_lease_field(&body, false), Some(field), "{body:?}");
+    }
+    let mut no_spill = valid.clone();
+    no_spill.allow_spill = Some(false);
+    assert_eq!(invalid_lease_field(&no_spill, false), None);
+    assert_eq!(invalid_lease_field(&no_spill, true), Some("shadow"));
+}
+
+/// A run request whose timeout or vCPU count no lease body can carry is
+/// refused before any lease, naming the member; a missing timeout keeps its
+/// own refusal.
+#[test]
+fn validate_refuses_requests_no_valid_lease_body_can_carry() {
+    let request = |timeout: Option<u64>, weight: Option<u32>| {
+        let mut request = RunRequest::new("/home/a/repo", "/home/a/repo", "/home/a/repo", "true");
+        request.timeout = timeout;
+        request.weight_hint = weight;
+        request
+    };
+    assert_eq!(validate(&request(None, None)), Err(Error::NoTimeout));
+    assert_eq!(validate(&request(Some(10), None)), Ok(()));
+    assert_eq!(validate(&request(Some(7200), Some(64))), Ok(()));
+    for (timeout, weight, field) in [
+        (9, None, "timeout_s"),
+        (7201, None, "timeout_s"),
+        (30, Some(0), "vcpus"),
+        (30, Some(65), "vcpus"),
+    ] {
+        let refused = validate(&request(Some(timeout), weight));
+        assert_eq!(refused, Err(Error::RequestInvalid(Some(field))));
+        assert_eq!(
+            refused.unwrap_err().detail(),
+            format!("hosted_request_invalid: {field}")
+        );
+    }
 }

@@ -587,7 +587,7 @@ impl Motor {
         if hosted {
             if let Err(error) = crate::hosted::validate(&request) {
                 return self
-                    .refused(id, error.reason(), None, Some(error.code().into()), tx)
+                    .refused(id, error.reason(), None, Some(error.detail()), tx)
                     .await;
             }
         }
@@ -834,6 +834,9 @@ impl Motor {
                         // failure proves the job did not start anywhere. A
                         // closed account or a deliberately rejected request
                         // must still stay final rather than bypass the refusal.
+                        // A lease body the broker could not parse (or that
+                        // ck-motor would not send) booked nothing, so it is
+                        // not among them: a spilled job goes back.
                         if !matches!(
                             error,
                             crate::hosted::Error::AccountClosed

@@ -883,12 +883,24 @@ pub(crate) async fn run_spilled(
     wait: u64,
     limit: Duration,
 ) -> Vec<StreamRecord> {
+    run_spilled_with_timeout(motor, id, repo, wait, limit, 30).await
+}
+
+/// [`run_spilled`] for a job with the given timeout in seconds.
+async fn run_spilled_with_timeout(
+    motor: &Motor,
+    id: Uuid,
+    repo: &Path,
+    wait: u64,
+    limit: Duration,
+    timeout: u64,
+) -> Vec<StreamRecord> {
     motor
         .storage
         .create(id, wait, None, Some("test".into()), false)
         .unwrap();
     let path = repo.to_str().unwrap();
-    let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+    let request = RunRequest::new(path, path, path, "true").with_timeout(timeout);
     let (tx, mut rx) = mpsc::channel(32);
     let (_wake, wake) = watch::channel(false);
     let job = motor.clone();
@@ -1103,12 +1115,6 @@ async fn spilled_deliberate_refusals_stay_final() {
             "hosted_account_closed",
         ),
         (
-            400,
-            "bad_request",
-            RefusalReason::RequestRejected,
-            "lease_mismatch",
-        ),
-        (
             409,
             "job_conflict",
             RefusalReason::RequestRejected,
@@ -1177,7 +1183,146 @@ async fn spilled_deliberate_refusals_stay_final() {
             "{text}"
         );
         assert!(!text.contains("outcome=returned_to_build_server"), "{text}");
+        // Every lease 4xx is logged with the body's non-secret members.
+        assert!(
+            text.lines()
+                .any(|line| line.contains("hosted lease body refused by broker")
+                    && line.contains(&format!("http_status={status}"))
+                    && line.contains("timeout_s=30")
+                    && line.contains("vcpus=2")),
+            "{text}"
+        );
+        assert!(!text.contains("requester_jwk"), "{text}");
     }
+}
+
+/// A broker that cannot parse a spilled job's lease body (400 `bad_request`)
+/// booked nothing, so the job goes back to the build-server queue the way a
+/// spill the broker could not place does. A warning names the job and the
+/// body's non-secret members, never the requester key.
+#[tokio::test]
+async fn spilled_bad_request_returns_to_build_server_and_logs_the_body() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (400, serde_json::json!({"error": "bad_request"}))
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-bad-request");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    // A 400 is not retried: the same body would be refused again.
+    assert_eq!(lease_requests(&broker.requests), 1);
+    assert!(motor.hosted_state(id).is_none());
+    let x = broker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path == "/v1/leases")
+        .map(|(_, body)| body["requester_jwk"]["x"].as_str().unwrap().to_owned())
+        .unwrap();
+    let text = captured.text();
+    let refused: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("hosted lease body refused by broker"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    for field in [
+        "WARN".to_owned(),
+        format!("job_id={id}"),
+        "route=spill".into(),
+        "http_status=400".into(),
+        "broker_code=bad_request".into(),
+        "vcpus=2".into(),
+        "timeout_s=30".into(),
+        "platform=linux-x64".into(),
+        "net=false".into(),
+        "allow_spill=true".into(),
+        "placement_hint=none".into(),
+    ] {
+        assert!(refused[0].contains(&field), "{field}: {text}");
+    }
+    assert!(!text.contains(&x), "requester key logged: {text}");
+    assert!(!text.contains("requester_jwk"), "{text}");
+    assert!(!text.contains("lease_mismatch"), "{text}");
+    let returned: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("outcome=returned_to_build_server"))
+        .collect();
+    assert_eq!(returned.len(), 1, "{text}");
+    assert!(
+        returned[0].contains("broker_code=hosted_request_invalid"),
+        "{text}"
+    );
+}
+
+/// A spilled job whose timeout no lease body can carry (CLOUD takes 10 to
+/// 7200 seconds) is never sent to the broker: it goes straight back to the
+/// build-server queue, and a warning names the job, the member and the
+/// body's non-secret members.
+#[tokio::test]
+async fn spilled_job_with_an_unsendable_timeout_returns_without_a_lease_request() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        assert_ne!(path, "/v1/leases", "an invalid lease body was sent");
+        (404, serde_json::json!({"error": "job_unknown"}))
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-unsendable-timeout");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records =
+        run_spilled_with_timeout(&motor, id, &repo, 30, Duration::from_secs(30), 10_800).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    assert!(broker.requests.lock().unwrap().is_empty());
+    assert!(motor.hosted_state(id).is_none());
+    let text = captured.text();
+    let invalid: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("hosted lease body invalid; not sent"))
+        .collect();
+    assert_eq!(invalid.len(), 1, "{text}");
+    for field in [
+        "WARN".to_owned(),
+        format!("job_id={id}"),
+        "field=timeout_s".into(),
+        "timeout_s=10800".into(),
+        "vcpus=2".into(),
+        "allow_spill=true".into(),
+    ] {
+        assert!(invalid[0].contains(&field), "{field}: {text}");
+    }
+    assert!(!text.contains("requester_jwk"), "{text}");
+    assert!(
+        text.contains("broker_code=hosted_request_invalid"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

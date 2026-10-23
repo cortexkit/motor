@@ -185,6 +185,11 @@ pub(crate) enum Error {
     AccountTransient(Option<u64>),
     AccountPermanent,
     AccountInvalid,
+    /// The lease body breaks CLOUD's lease schema, so the broker would refuse
+    /// it, or did, with 400 `bad_request`. Carries the offending body member
+    /// when ck-motor found it before sending; the broker's refusal does not
+    /// name one. Nothing was booked either way.
+    RequestInvalid(Option<&'static str>),
 }
 /// How long a shadow waits for the broker to provision its sandbox. Resuming a
 /// stopped Boat sandbox takes about 100 s and a cold start from the prepared
@@ -244,6 +249,7 @@ impl Error {
             Self::AccountTransient(_) => "hosted_account_transient",
             Self::AccountPermanent => "hosted_account_permanent",
             Self::AccountInvalid => "hosted_account_invalid",
+            Self::RequestInvalid(_) => "hosted_request_invalid",
         }
     }
     pub(crate) fn reason(self) -> RefusalReason {
@@ -274,6 +280,8 @@ impl Error {
             format!("{}: a person must run `ck account login`", self.code())
         } else if self == Self::AccountClosed {
             format!("{}: hosted account closed", self.code())
+        } else if let Self::RequestInvalid(Some(field)) = self {
+            format!("{}: {field}", self.code())
         } else {
             self.code().into()
         }
@@ -325,9 +333,29 @@ fn lease_platform(platform: Option<&motor_protocol::Platform>) -> Result<&'stati
         _ => Err(Error::Rejected),
     }
 }
+/// CLOUD's inclusive bounds on a lease body's `timeout_s` (seconds) and
+/// `vcpus`. A body outside them is refused with 400 `bad_request`.
+const LEASE_TIMEOUT_S: std::ops::RangeInclusive<u64> = 10..=7200;
+const LEASE_VCPUS: std::ops::RangeInclusive<u32> = 1..=64;
+/// The vCPU count a lease for `request` asks for.
+fn lease_vcpus(request: &RunRequest) -> u32 {
+    request.weight_hint.unwrap_or(2)
+}
 pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
     if request.timeout.is_none_or(|s| s == 0) {
         return Err(Error::NoTimeout);
+    }
+    // Fields of the lease body that come straight from the request. A job
+    // whose lease the broker would refuse never spills or shadows, and a job
+    // routed to hosted is refused naming the field instead of sending it.
+    if !request
+        .timeout
+        .is_some_and(|s| LEASE_TIMEOUT_S.contains(&s))
+    {
+        return Err(Error::RequestInvalid(Some("timeout_s")));
+    }
+    if !LEASE_VCPUS.contains(&lease_vcpus(request)) {
+        return Err(Error::RequestInvalid(Some("vcpus")));
     }
     let paths = [
         &request.workspace_key,
@@ -423,6 +451,97 @@ fn resource_mismatch(
         None
     }
 }
+/// Whether CLOUD accepts `placement` as a lease's `placement_hint`: a host in
+/// the name grammar, optionally with the `boat:` prefix of a Boat placement,
+/// and a vm in the name grammar (never null).
+fn valid_hint(placement: &Placement) -> bool {
+    let host = placement
+        .host
+        .strip_prefix("boat:")
+        .unwrap_or(&placement.host);
+    motor_lease::valid_name(host) && placement.vm.as_deref().is_some_and(motor_lease::valid_name)
+}
+/// The first member of a lease body that CLOUD's lease parser refuses with
+/// 400 `bad_request`, or `None` when it accepts the body. It mirrors the
+/// rules of the pinned runners contract (POST /v1/leases and the common wire
+/// grammar). `shadow` says the body is sent with `"shadow": true`. Every
+/// lease request (spill, shadow, repository-routed and direct hosted) is
+/// checked here before it is sent.
+pub(crate) fn invalid_lease_field(body: &LeaseRequest, shadow: bool) -> Option<&'static str> {
+    let base64url_43 = |value: &str| {
+        value.len() == 43
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    // An unpadded base64url encoding of 32 bytes is 43 characters whose last
+    // one carries only 2 data bits, so it is one of these 16.
+    let jwk_x = |x: &str| base64url_43(x) && x.ends_with(|c| "AEIMQUYcgkosw048".contains(c));
+    let jwk = &body.requester_jwk;
+    if !motor_lease::valid_job_id(&body.job_id) {
+        Some("job_id")
+    } else if !LEASE_VCPUS.contains(&body.vcpus) {
+        Some("vcpus")
+    } else if !motor_lease::valid_name(&body.platform) {
+        Some("platform")
+    } else if !base64url_43(&body.workspace_key_hash) {
+        Some("workspace_key_hash")
+    } else if !base64url_43(&body.repo_hash) {
+        Some("repo_hash")
+    } else if body.placement_hint.as_ref().is_some_and(|p| !valid_hint(p)) {
+        Some("placement_hint")
+    } else if body
+        .avoid_host
+        .as_deref()
+        .is_some_and(|host| !motor_lease::valid_name(host))
+    {
+        Some("avoid_host")
+    } else if !LEASE_TIMEOUT_S.contains(&body.timeout_s) {
+        Some("timeout_s")
+    } else if jwk.kty != "OKP" || jwk.crv != "Ed25519" || !jwk_x(&jwk.x) {
+        Some("requester_jwk")
+    } else if body.allow_spill.is_none() {
+        Some("allow_spill")
+    } else if shadow && body.allow_spill == Some(false) {
+        Some("shadow")
+    } else {
+        None
+    }
+}
+/// Logs a lease body by its non-secret members, as a warning: either
+/// ck-motor found it invalid and did not send it (`http_status` is `None`,
+/// `field` names the member), or the broker refused it with a 4xx status.
+/// The requester key and the keyed path hashes are never logged. `route`
+/// says why the job wanted a hosted lease (spill, repository_routed,
+/// hosted_test, hosted or shadow).
+fn warn_lease_body(
+    id: Uuid,
+    body: &LeaseRequest,
+    route: &'static str,
+    http_status: Option<u16>,
+    broker_code: Option<&str>,
+    field: Option<&str>,
+) {
+    let placement_hint = body.placement_hint.as_ref().map_or_else(
+        || "none".to_owned(),
+        |p| format!("{}/{}", p.host, p.vm.as_deref().unwrap_or("none")),
+    );
+    let allow_spill = body
+        .allow_spill
+        .map_or("missing", |b| if b { "true" } else { "false" });
+    let avoid_host = body.avoid_host.as_deref().unwrap_or("none");
+    match http_status {
+        None => tracing::warn!(job_id = %id, route, field = field.unwrap_or("unknown"),
+            vcpus = body.vcpus, timeout_s = body.timeout_s, platform = %body.platform,
+            net = body.net, allow_spill, placement_hint = %placement_hint, avoid_host,
+            "hosted lease body invalid; not sent"),
+        Some(http_status) => tracing::warn!(job_id = %id, route, http_status,
+            broker_code = broker_code.unwrap_or("none"),
+            vcpus = body.vcpus, timeout_s = body.timeout_s, platform = %body.platform,
+            net = body.net, allow_spill, placement_hint = %placement_hint, avoid_host,
+            "hosted lease body refused by broker"),
+    }
+}
 fn lease_body(
     id: Uuid,
     request: &RunRequest,
@@ -434,12 +553,14 @@ fn lease_body(
 ) -> Result<LeaseRequest, Error> {
     Ok(LeaseRequest {
         job_id: id.to_string(),
-        vcpus: request.weight_hint.unwrap_or(2),
+        vcpus: lease_vcpus(request),
         platform: lease_platform(request.platform.as_ref())?.into(),
         net: request.network.is_some(),
         workspace_key_hash: hashes.0,
         repo_hash: hashes.1,
-        placement_hint: hint.filter(|placement| placement.vm.is_some()),
+        // The hint is optional: one the broker would refuse is left out
+        // rather than costing the job its lease.
+        placement_hint: hint.filter(valid_hint),
         avoid_host,
         timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
         requester_jwk,
@@ -467,6 +588,9 @@ pub(crate) struct Client {
     /// The `error` code of the broker's last refusal, when it was a valid
     /// name. A direct hosted test shows it to the operator.
     broker_code: std::sync::Mutex<Option<String>>,
+    /// The HTTP status of the broker's answer to the latest request when it
+    /// was not a success, so a lease refusal can be logged with its body.
+    broker_status: std::sync::Mutex<Option<u16>>,
     broker_failure: std::sync::Mutex<Option<String>>,
 }
 impl Client {
@@ -480,12 +604,20 @@ impl Client {
             route,
             account_tokens: None,
             broker_code: std::sync::Mutex::new(None),
+            broker_status: std::sync::Mutex::new(None),
             broker_failure: std::sync::Mutex::new(None),
         }
     }
     /// The `error` code of the broker's last refusal seen by this client.
     pub(crate) fn broker_code(&self) -> Option<String> {
         self.broker_code.lock().unwrap().clone()
+    }
+    /// The broker's 4xx status for the latest request, if it answered one.
+    fn broker_client_error(&self) -> Option<u16> {
+        self.broker_status
+            .lock()
+            .unwrap()
+            .filter(|status| (400..500).contains(status))
     }
     pub(crate) fn with_account_tokens(
         mut self,
@@ -527,6 +659,7 @@ impl Client {
         bearer: String,
     ) -> Result<R, Error> {
         *self.broker_failure.lock().unwrap() = Some("broker HTTP request pending".into());
+        *self.broker_status.lock().unwrap() = None;
         let reply = self
             .http
             .post(format!(
@@ -582,6 +715,7 @@ impl Client {
                 "hosted broker refused"
             );
             *self.broker_code.lock().unwrap() = broker_code.map(str::to_owned);
+            *self.broker_status.lock().unwrap() = Some(status);
             *self.broker_failure.lock().unwrap() =
                 Some(format!("HTTP {status}, broker_code={broker_code:?}"));
             // A closed account's new lease is the one 403 that is not an
@@ -634,6 +768,12 @@ impl Client {
                     Some("budget_exhausted") => Error::Budget,
                     Some("platform_unsupported") => Error::Platform,
                     Some("sandbox_lost") if status == 409 => Error::SandboxLost,
+                    // The broker could not parse the lease body. Nothing was
+                    // booked, so a spilled job can go back to the build
+                    // server; the refusal does not say which member was wrong.
+                    Some("bad_request") if status == 400 && path == "/v1/leases" => {
+                        Error::RequestInvalid(None)
+                    }
                     Some("job_conflict" | "bad_request") => Error::Rejected,
                     other if status == 409 => {
                         let broker_code = other
@@ -722,6 +862,17 @@ impl Client {
             .hosted
             .as_ref()
             .is_some_and(|state| state.repository_routed);
+        let route = job.hosted.as_ref().map_or("hosted", |state| {
+            if state.spill_wait_ms.is_some() {
+                "spill"
+            } else if state.repository_routed {
+                "repository_routed"
+            } else if state.hosted_test {
+                "hosted_test"
+            } else {
+                "hosted"
+            }
+        });
         let mut body = match job.hosted.and_then(|state| state.lease_request) {
             Some(request) => request,
             None => lease_body(
@@ -739,6 +890,12 @@ impl Client {
                 Some(allow_spill),
             )?,
         };
+        // Never send a body the broker would refuse. The requester key that
+        // each attempt below puts in is freshly generated and always valid.
+        if let Some(field) = invalid_lease_field(&body, false) {
+            warn_lease_body(id, &body, route, None, None, Some(field));
+            return Err(Error::RequestInvalid(Some(field)));
+        }
         storage
             .hosted_update(id, |state| state.lease_request = Some(body.clone()))
             .map_err(|_| Error::Broker)?;
@@ -805,6 +962,16 @@ impl Client {
                 Ok(l) => l,
                 Err(error) => {
                     tracing::info!(job_id = %id, attempt, code = error.code(), "hosted lease not granted");
+                    if let Some(status) = self.broker_client_error() {
+                        warn_lease_body(
+                            id,
+                            &body,
+                            route,
+                            Some(status),
+                            self.broker_code().as_deref(),
+                            None,
+                        );
+                    }
                     match error {
                         // No host can ever hold this many vCPUs, so the same
                         // request would be refused again. The caller decides
@@ -928,6 +1095,10 @@ impl Client {
             request: &body,
             shadow: true,
         };
+        if let Some(field) = invalid_lease_field(&body, true) {
+            warn_lease_body(id, &body, "shadow", None, None, Some(field));
+            return Err(Error::RequestInvalid(Some(field)));
+        }
         let deadline = tokio::time::Instant::now() + SHADOW_PROVISIONING_BUDGET;
         let lease: Lease = self
             .post_ready_authorized(
@@ -937,7 +1108,19 @@ impl Client {
                 deadline,
                 Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
             )
-            .await?;
+            .await
+            .inspect_err(|_| {
+                if let Some(status) = self.broker_client_error() {
+                    warn_lease_body(
+                        id,
+                        &body,
+                        "shadow",
+                        Some(status),
+                        self.broker_code().as_deref(),
+                        None,
+                    );
+                }
+            })?;
         *booked = Some(lease.clone());
         let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
         if lease.ssh.is_none()

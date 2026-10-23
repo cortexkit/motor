@@ -123,6 +123,42 @@ mod tests {
         request.weight_hint = Some(9);
         assert!(!eligible(&config, &request, false, false));
     }
+    /// A job whose lease the broker would refuse with 400 `bad_request`
+    /// never spills; it stays queued on the build server. CLOUD takes
+    /// `timeout_s` only in 10..=7200 and `vcpus` only in 1..=64.
+    #[test]
+    fn spill_skips_jobs_whose_lease_body_the_broker_would_refuse() {
+        let config = crate::Config {
+            spill_to_hosted: true,
+            ..crate::Config::default()
+        };
+        for (timeout, weight, ok) in [
+            (Some(10), None, true),
+            (Some(7200), None, true),
+            (None, None, false),
+            (Some(9), None, false),
+            (Some(7201), None, false),
+            (Some(10_800), None, false),
+            // A 4-hour timeout, as in a production spill the broker refused.
+            (Some(14_400), None, false),
+            (Some(30), Some(0), false),
+            (Some(30), Some(1), true),
+        ] {
+            let mut request = RunRequest::new(
+                "/home/test/repo",
+                "/home/test/repo",
+                "/home/test/repo",
+                "true",
+            );
+            request.timeout = timeout;
+            request.weight_hint = weight;
+            assert_eq!(
+                eligible(&config, &request, false, false),
+                ok,
+                "timeout {timeout:?}, weight {weight:?}"
+            );
+        }
+    }
     #[tokio::test(start_paused = true)]
     async fn permits_only_spill_fence_rejects_busy_workspace_and_unobserved_wait() {
         let terminal = TerminalRecord::new(
