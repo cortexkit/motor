@@ -41,6 +41,10 @@ struct Knobs {
     /// PUT bodies are read this many bytes at a time, with this pause after
     /// each piece.
     slow_put: Option<(usize, Duration)>,
+    /// The next request is answered with exactly these bytes, each piece
+    /// followed by its pause, instead of a normal response; the connection
+    /// then serves on.
+    script: Option<Vec<(Vec<u8>, Duration)>>,
 }
 
 /// One request the fake store received.
@@ -165,6 +169,16 @@ impl FakeStore {
                 headers,
                 body: body.clone(),
             });
+            let script = self.knobs.lock().unwrap().script.take();
+            if let Some(pieces) = script {
+                for (bytes, pause) in pieces {
+                    if io.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(pause).await;
+                }
+                continue;
+            }
             if knobs.silent {
                 std::future::pending::<()>().await;
             }
@@ -261,7 +275,7 @@ impl Connector for FakeConnector {
         let store = self.0.clone();
         Box::pin(async move {
             assert_eq!(target.host, "store.test");
-            assert!(!target.tls);
+            assert!(target.tls, "only https endpoints are ever used");
             store.connects.fetch_add(1, Ordering::SeqCst);
             let knobs = store.knobs();
             if knobs.refuse {
@@ -302,7 +316,7 @@ fn generation(name: &str, tenant: &str) -> ActiveGeneration {
     ActiveGeneration {
         generation: Generation(name.to_string()),
         tenant: tenant.to_string(),
-        endpoint: "http://store.test".to_string(),
+        endpoint: "https://store.test".to_string(),
         region: "de".to_string(),
         bucket: BUCKET.to_string(),
         prefix: derived_prefix(tenant),
@@ -354,17 +368,26 @@ impl Harness {
         }
     }
     fn reader(&self, job: &str) -> Arc<Binding> {
-        self.gateway.read_binding(job, Tool::Sccache, Adapter::S3)
+        self.gateway
+            .read_binding(job, TENANT, Tool::Sccache, Adapter::S3)
     }
     fn writer(&self) -> Arc<Binding> {
-        self.gateway.write_binding(Tool::Sccache, Adapter::S3)
+        self.gateway
+            .write_binding(TENANT, Tool::Sccache, Adapter::S3)
+    }
+    /// A new connection admitted under the connection caps, or `None`
+    /// when they refuse it. `buffer` bounds the bytes in flight each way.
+    fn try_open_sized(&self, binding: &Arc<Binding>, buffer: usize) -> Option<DuplexStream> {
+        let (client, server) = tokio::io::duplex(buffer);
+        let serve = self.gateway.admit_connection(binding, server)?;
+        tokio::spawn(serve);
+        Some(client)
+    }
+    fn try_open(&self, binding: &Arc<Binding>) -> Option<DuplexStream> {
+        self.try_open_sized(binding, 64 * 1024)
     }
     fn open(&self, binding: &Arc<Binding>) -> DuplexStream {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let gateway = self.gateway.clone();
-        let binding = binding.clone();
-        tokio::spawn(async move { gateway.serve(binding, server).await });
-        client
+        self.try_open(binding).expect("connection admitted")
     }
     /// Sends one raw request on a new connection and reads the reply.
     async fn raw(&self, binding: &Arc<Binding>, request: &[u8], head: bool) -> Reply {
@@ -604,8 +627,10 @@ async fn write_endpoint_puts_with_the_storage_class_and_the_write_key() {
 #[tokio::test(start_paused = true)]
 async fn http_adapter_maps_bare_keys_under_the_ccache_prefix() {
     let h = Harness::new();
-    let writer = h.gateway.write_binding(Tool::Ccache, Adapter::Http);
-    let reader = h.gateway.read_binding("job-a", Tool::Ccache, Adapter::Http);
+    let writer = h.gateway.write_binding(TENANT, Tool::Ccache, Adapter::Http);
+    let reader = h
+        .gateway
+        .read_binding("job-a", TENANT, Tool::Ccache, Adapter::Http);
     assert_eq!(
         h.put(&writer, "/0f/abcdef", b"ccache entry").await.status,
         200
@@ -641,7 +666,9 @@ async fn both_endpoints_refuse_other_methods_queries_encodings_and_bad_paths() {
     h.store.put_object(&stored(Tool::Sccache, "ok"), b"x");
     let reader = h.reader("job-a");
     let writer = h.writer();
-    let http = h.gateway.read_binding("job-a", Tool::Ccache, Adapter::Http);
+    let http = h
+        .gateway
+        .read_binding("job-a", TENANT, Tool::Ccache, Adapter::Http);
     let request = |line: &str, extra: &str| format!("{line} HTTP/1.1\r\nhost: x\r\n{extra}\r\n");
     let common = [
         request(&format!("DELETE {}", s3("ok")), ""),
@@ -819,7 +846,9 @@ async fn sccache_check_reads_count_as_probes() {
     let stats = h.gateway.stats(Tool::Sccache);
     assert_eq!((stats.probes, stats.hits, stats.misses), (2, 0, 0));
     // The same key under ccache is an ordinary object.
-    let ccache = h.gateway.read_binding("job-a", Tool::Ccache, Adapter::Http);
+    let ccache = h
+        .gateway
+        .read_binding("job-a", TENANT, Tool::Ccache, Adapter::Http);
     assert_eq!(h.get(&ccache, "/.sccache_check").await.status, 404);
     assert_eq!(h.gateway.stats(Tool::Ccache).misses, 1);
 }
@@ -1511,24 +1540,22 @@ async fn each_put_is_tagged_with_the_store_identity_that_signed_it() {
     // A rotation keeps the identity.
     h.generations.set(Some(generation("2", TENANT)));
     assert_eq!(h.put(&writer, &s3("b"), b"v").await.status, 200);
-    // A different cache tenant is a different prefix, so another identity.
-    let other = "acct:01KXJJHK4V6DB42W1YAN2XD9QM";
-    h.generations.set(Some(generation("3", other)));
-    assert_eq!(h.put(&writer, &s3("c"), b"v").await.status, 200);
+    // Another bucket is another store identity.
+    let mut moved = generation("3", TENANT);
+    moved.bucket = "fleet-cache-2".to_string();
+    h.generations.set(Some(moved.clone()));
+    assert_eq!(h.put(&writer, "/fleet-cache-2/c", b"v").await.status, 200);
     let seen = h.store.seen();
     assert_eq!(seen[1].access_key_id(), "WRITE-2");
     assert_eq!(
         seen[2].path,
-        format!("/{BUCKET}/{}sccache/c", derived_prefix(other))
+        format!("/fleet-cache-2/{}sccache/c", derived_prefix(TENANT))
     );
     assert_eq!(seen[2].access_key_id(), "WRITE-3");
     let ledger = writer.ledger().unwrap().summary();
     assert_eq!(
         ledger.identities,
-        vec![
-            generation("1", TENANT).identity(),
-            generation("3", other).identity()
-        ]
+        vec![generation("1", TENANT).identity(), moved.identity()]
     );
     assert_eq!(ledger.key_sample, ["a", "b", "c"]);
     assert_eq!(ledger.puts_stored, 3);
@@ -1641,7 +1668,7 @@ impl Provisioned {
             serde_json::json!({
                 "generation": generation,
                 "tenant": TENANT,
-                "endpoint": "http://store.test",
+                "endpoint": "https://store.test",
                 "region": "de",
                 "bucket": BUCKET,
                 "prefix": derived_prefix(TENANT),
@@ -1770,15 +1797,18 @@ async fn the_tcp_connector_reaches_an_http_endpoint_with_its_port() {
     });
     let generations = Arc::new(Switchable::default());
     let mut active = generation("1", TENANT);
-    active.endpoint = format!("http://127.0.0.1:{port}/");
+    // The endpoint is https, as every endpoint must be; the test connector
+    // skips the handshake to reach this plain server.
+    active.endpoint = format!("https://127.0.0.1:{port}/");
     generations.set(Some(active));
-    let gateway = Gateway::new(Limits::default(), generations).unwrap();
-    let reader = gateway.read_binding("job-a", Tool::Sccache, Adapter::S3);
+    let gateway = Gateway::with_connector(
+        Limits::default(),
+        generations,
+        Arc::new(TcpConnector::plaintext_for_tests().unwrap()),
+    );
+    let reader = gateway.read_binding("job-a", TENANT, Tool::Sccache, Adapter::S3);
     let (mut client, server_half) = tokio::io::duplex(64 * 1024);
-    tokio::spawn({
-        let gateway = gateway.clone();
-        async move { gateway.serve(reader, server_half).await }
-    });
+    tokio::spawn(gateway.admit_connection(&reader, server_half).unwrap());
     client
         .write_all(format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("k")).as_bytes())
         .await
@@ -1794,4 +1824,373 @@ async fn the_tcp_connector_reaches_an_http_endpoint_with_its_port() {
         request.contains(&format!("host: 127.0.0.1:{port}\r\n")),
         "{request}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Connection limits, buffering, probe release, framing, tenant pinning
+// ---------------------------------------------------------------------------
+
+/// Reads until the gateway closes the connection; returns what arrived.
+async fn read_to_close(conn: &mut DuplexStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match conn.read(&mut chunk).await {
+            Ok(0) | Err(_) => return out,
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_connections_are_closed_after_the_idle_timeout() {
+    let h = Harness::new();
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"v");
+    let reader = h.reader("job-a");
+    // A connection that never sends anything.
+    let mut silent = h.open(&reader);
+    let started = Instant::now();
+    assert!(read_to_close(&mut silent).await.is_empty());
+    assert!(
+        around(started.elapsed(), Duration::from_secs(30)),
+        "{:?}",
+        started.elapsed()
+    );
+    // A kept-alive connection idle after its request.
+    let mut kept = h.open(&reader);
+    kept.write_all(format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("k")).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut kept, false).await.unwrap().status, 200);
+    let answered = Instant::now();
+    assert!(read_to_close(&mut kept).await.is_empty());
+    assert!(around(answered.elapsed(), Duration::from_secs(30)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slowly_dribbled_head_times_out() {
+    let h = Harness::new();
+    let mut conn = h.open(&h.reader("job-a"));
+    let request = format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("k"));
+    let started = Instant::now();
+    let dribble = async {
+        for byte in request.bytes() {
+            if conn.write_all(&[byte]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    };
+    dribble.await;
+    // The head's first byte went out at once, so it had 10 s to complete.
+    assert!(read_to_close(&mut conn).await.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(h.store.seen_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn connection_caps_hold_per_job_and_across_the_gateway() {
+    let h = Harness::new();
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"v");
+    let cap = Limits::default().max_job_connections;
+    // Job A's connections across two of its sockets.
+    let first = h.reader("job-a");
+    let second = h.reader("job-a");
+    let held: Vec<_> = (0..cap)
+        .map(|i| h.open(if i % 2 == 0 { &first } else { &second }))
+        .collect();
+    assert!(h.try_open(&first).is_none());
+    assert!(h.try_open(&second).is_none());
+    assert_eq!(h.gateway.stats(Tool::Sccache).read_refusals, 2);
+    // Job B still connects and reads.
+    assert_eq!(h.get(&h.reader("job-b"), &s3("k")).await.status, 200);
+    // Closing one of A's connections frees its place.
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(h.get(&first, &s3("k")).await.status, 200);
+
+    let small = Harness::with_limits(Limits {
+        max_total_connections: 2,
+        ..Limits::default()
+    });
+    let _a = small.open(&small.reader("job-a"));
+    let _b = small.open(&small.writer());
+    assert!(small.try_open(&small.reader("job-c")).is_none());
+    assert_eq!(small.gateway.stats(Tool::Sccache).read_refusals, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pipelined_leftovers_do_not_grow_the_request_buffer() {
+    // Each write completes a request and starts the next with one byte, so
+    // the buffer is never fully consumed between reads.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let mut inbound = inbound::Inbound::new(server);
+    let rounds = 2000;
+    let writer = tokio::spawn(async move {
+        client.write_all(b"GET /? HTTP/1.1\r\n\r\n").await.unwrap();
+        for _ in 0..rounds {
+            if client.write_all(b"GET /? HTTP/1.1\r\n\r\nG").await.is_err() {
+                return None;
+            }
+        }
+        Some(client)
+    });
+    let mut most = 0;
+    for _ in 0..rounds {
+        inbound
+            .read_head(Duration::from_secs(30), Duration::from_secs(10))
+            .await
+            .unwrap();
+        most = most.max(inbound.retained());
+    }
+    drop(writer);
+    assert!(most <= 8 * 1024, "the buffer grew to {most} bytes");
+}
+
+/// Opens the read breaker and lets its window pass, so the next read probes.
+async fn read_breaker_ready_to_probe(h: &Harness, reader: &Arc<Binding>) {
+    h.store.set(|k| k.status = Some(500));
+    for _ in 0..FAILURES_TO_OPEN {
+        h.get(reader, &s3("missing")).await;
+    }
+    assert!(h.gateway.read_breaker_open_until().is_some());
+    tokio::time::sleep(OPEN_WINDOW).await;
+    h.store.set(|k| k.status = None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_holder_that_stops_reading_the_body_releases_the_probe() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    h.store
+        .put_sized(&stored(Tool::Sccache, "large"), 8 * MIB as u64);
+    h.store.put_object(&stored(Tool::Sccache, "small"), b"v");
+    read_breaker_ready_to_probe(&h, &reader).await;
+    // Job A's GET is the probe, and A never reads the body.
+    let mut stalled = h.open(&reader);
+    stalled
+        .write_all(format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("large")).as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Job B is not refused behind A's stalled probe.
+    let other = h.reader("job-b");
+    assert_eq!(h.get(&other, &s3("small")).await.status, 200);
+    assert_eq!(h.gateway.read_breaker_open_until(), None);
+    drop(stalled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_holder_that_stops_reading_the_head_releases_the_probe() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    h.store.put_object(&stored(Tool::Sccache, "small"), b"v");
+    read_breaker_ready_to_probe(&h, &reader).await;
+    // A 16-byte pipe cannot take the response head while A does not read.
+    let mut stalled = h.try_open_sized(&reader, 16).unwrap();
+    stalled
+        .write_all(format!("HEAD {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("small")).as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.get(&h.reader("job-b"), &s3("small")).await.status, 200);
+    assert_eq!(h.gateway.read_breaker_open_until(), None);
+    drop(stalled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_without_a_length_is_never_reused() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"clean");
+    // A 404 whose body runs to the close and, a second later, looks like a
+    // response to the next request.
+    h.store.set(|k| {
+        k.script = Some(vec![
+            (
+                b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec(),
+                Duration::from_secs(1),
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nPOISN".to_vec(),
+                Duration::ZERO,
+            ),
+        ])
+    });
+    assert_eq!(h.get(&reader, &s3("missing")).await.status, 404);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let got = h.get(&reader, &s3("k")).await;
+    assert_eq!((got.status, got.body.as_slice()), (200, &b"clean"[..]));
+    // A chunked error body is not reused either.
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 403 Forbidden\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let connects = h.store.connects();
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 404);
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 200);
+    assert_eq!(h.store.connects(), connects + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_encoding_with_content_length_is_a_malformed_response() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let got = h.get(&reader, &s3("k")).await;
+    assert_eq!((got.status, got.body.len()), (404, 0));
+    let stats = h.gateway.stats(Tool::Sccache);
+    assert_eq!((stats.hits, stats.errors), (0, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_304_or_204_carries_no_body_whatever_its_length_says() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    let writer = h.writer();
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"clean");
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 304 Not Modified\r\ncontent-length: 10\r\n\r\n".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let started = Instant::now();
+    assert_eq!(h.put(&writer, &s3("p"), b"v").await.status, 503);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 10\r\n\r\n".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let started = Instant::now();
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 404);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // A GET answered 304 leaves the connection usable for the next one.
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 304 Not Modified\r\ncontent-length: 10\r\netag: \"e\"\r\n\r\n".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let not_modified = h.get(&reader, &s3("k")).await;
+    assert_eq!((not_modified.status, not_modified.body.len()), (304, 0));
+    let connects = h.store.connects();
+    let got = h.get(&reader, &s3("k")).await;
+    assert_eq!((got.status, got.body.as_slice()), (200, &b"clean"[..]));
+    assert_eq!(h.store.connects(), connects, "the connection was reused");
+    assert_eq!(h.gateway.stats(Tool::Sccache).errors, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn interim_1xx_answers_are_skipped_and_a_protocol_switch_refused() {
+    let h = Harness::new();
+    let reader = h.reader("job-a");
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    let got = h.get(&reader, &s3("k")).await;
+    assert_eq!((got.status, got.body.as_slice()), (200, &b"ok"[..]));
+    h.store.set(|k| {
+        k.script = Some(vec![(
+            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: x\r\n\r\n".to_vec(),
+            Duration::ZERO,
+        )])
+    });
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 404);
+    assert_eq!(h.gateway.stats(Tool::Sccache).errors, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn plain_http_endpoints_are_never_used() {
+    let h = Harness::new();
+    let mut plain = generation("1", TENANT);
+    plain.endpoint = "http://store.test".to_string();
+    h.generations.set(Some(plain));
+    assert_eq!(h.get(&h.reader("job-a"), &s3("k")).await.status, 404);
+    assert_eq!(h.put(&h.writer(), &s3("k"), b"v").await.status, 503);
+    assert_eq!(h.store.connects(), 0);
+    // The production gateway refuses it the same way.
+    let gateway = Gateway::new(Limits::default(), h.generations.clone()).unwrap();
+    let reader = gateway.read_binding("job-a", TENANT, Tool::Sccache, Adapter::S3);
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(gateway.admit_connection(&reader, server).unwrap());
+    client
+        .write_all(format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("k")).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client, false).await.unwrap().status, 404);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_binding_never_signs_for_another_cache_tenant() {
+    let h = Harness::new();
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"v");
+    let reader = h.reader("job-a");
+    let writer = h.writer();
+    assert_eq!((reader.tenant(), writer.tenant()), (TENANT, TENANT));
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 200);
+    let seen = h.store.seen_count();
+    // The active generation moves to another cache tenant.
+    let other = "acct:01KXJJHK4V6DB42W1YAN2XD9QM";
+    h.generations.set(Some(generation("2", other)));
+    assert_eq!(h.get(&reader, &s3("k")).await.status, 404);
+    assert_eq!(h.put(&writer, &s3("k"), b"v").await.status, 503);
+    assert_eq!(
+        h.store.seen_count(),
+        seen,
+        "nothing signed for the other tenant"
+    );
+    let stats = h.gateway.stats(Tool::Sccache);
+    assert_eq!((stats.tenant_mismatch, stats.misses), (2, 0));
+    // Sockets created for the new tenant use it.
+    let other_reader = h
+        .gateway
+        .read_binding("job-b", other, Tool::Sccache, Adapter::S3);
+    assert_eq!(h.get(&other_reader, &s3("k")).await.status, 404);
+    assert_eq!(
+        h.store.seen().last().unwrap().path,
+        format!("/{BUCKET}/{}sccache/k", derived_prefix(other))
+    );
+}
+
+#[tokio::test]
+async fn dropping_a_listener_ends_its_open_connections() {
+    let scratch = cortexkit_test_support::ScratchDir::new("gateway");
+    let path = scratch.join("read.sock");
+    let h = Harness::new();
+    h.store.put_object(&stored(Tool::Sccache, "k"), b"v");
+    let listener = h.gateway.listen(&path, h.reader("job-a")).unwrap();
+    let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let request = format!("GET {} HTTP/1.1\r\nhost: x\r\n\r\n", s3("k"));
+    stream.write_all(request.as_bytes()).await.unwrap();
+    assert_eq!(read_reply(&mut stream, false).await.unwrap().status, 200);
+    drop(listener);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The kept-alive connection is gone with the listener.
+    let _ = stream.write_all(request.as_bytes()).await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), read_reply(&mut stream, false))
+        .await
+        .expect("the connection ends rather than hangs");
+    assert!(reply.is_none(), "{reply:?}");
 }

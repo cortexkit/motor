@@ -2,6 +2,7 @@
 //! from a tool, read with bounded buffers.
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::{Duration, Instant};
 
 /// Request heads larger than this are refused; a bare key is bounded by
 /// `max_key_bytes` anyway.
@@ -63,6 +64,13 @@ pub(super) enum HeadError {
     Gone,
     /// The bytes are not an HTTP/1 request head, or it is too large.
     Malformed,
+    /// No request began within the idle limit, or a begun head did not
+    /// complete within the head limit.
+    TimedOut,
+}
+
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "client write deadline passed")
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
@@ -74,7 +82,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
         }
     }
 
-    pub(super) async fn read_head(&mut self) -> Result<RequestHead, HeadError> {
+    /// Reads the next request head. The first byte must arrive within `idle`
+    /// of the call, and once one has, the whole head within `head_limit`, so
+    /// neither an idle nor a dribbling connection is held open for ever.
+    pub(super) async fn read_head(
+        &mut self,
+        idle: Duration,
+        head_limit: Duration,
+    ) -> Result<RequestHead, HeadError> {
+        let waiting_since = Instant::now();
+        // Bytes left over from the previous request already begin this head.
+        let mut head_by = (self.pos < self.buf.len()).then(|| waiting_since + head_limit);
         loop {
             if self.pos < self.buf.len() {
                 let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
@@ -107,14 +125,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
                     Err(_) => return Err(HeadError::Malformed),
                 }
             }
-            if self.pos == self.buf.len() {
-                self.buf.clear();
-                self.pos = 0;
-            }
+            // Drop what earlier requests consumed, so a client that keeps a
+            // few bytes of the next request in every read cannot make the
+            // buffer grow.
+            self.buf.drain(..self.pos);
+            self.pos = 0;
             let mut chunk = [0u8; 4 * 1024];
-            match self.stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => return Err(HeadError::Gone),
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+            let by = head_by.unwrap_or(waiting_since + idle);
+            match tokio::time::timeout_at(by, self.stream.read(&mut chunk)).await {
+                Err(_) => return Err(HeadError::TimedOut),
+                Ok(Ok(0)) | Ok(Err(_)) => return Err(HeadError::Gone),
+                Ok(Ok(n)) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    head_by.get_or_insert_with(|| Instant::now() + head_limit);
+                }
             }
         }
     }
@@ -130,9 +154,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
         self.stream.read(out).await
     }
 
-    pub(super) async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.stream.write_all(bytes).await?;
-        self.stream.flush().await
+    /// Bytes held in the read buffer, consumed or not.
+    #[cfg(test)]
+    pub(super) fn retained(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Writes all of `bytes`, failing with `TimedOut` if the client has not
+    /// taken them by `by`.
+    pub(super) async fn write_all(&mut self, bytes: &[u8], by: Instant) -> io::Result<()> {
+        tokio::time::timeout_at(by, async {
+            self.stream.write_all(bytes).await?;
+            self.stream.flush().await
+        })
+        .await
+        .unwrap_or_else(|_| Err(timed_out()))
     }
 
     /// Writes a response head. `content_length` is the length of the body
@@ -143,6 +179,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
         headers: &[(&str, &str)],
         content_length: u64,
         close: bool,
+        by: Instant,
     ) -> io::Result<()> {
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
         for (name, value) in headers {
@@ -153,11 +190,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Inbound<S> {
             head.push_str("connection: close\r\n");
         }
         head.push_str("\r\n");
-        self.write_all(head.as_bytes()).await
+        self.write_all(head.as_bytes(), by).await
     }
 
+    /// Shuts the write side down, giving up after a second on a client that
+    /// does not drain it.
     pub(super) async fn shutdown(&mut self) {
-        let _ = self.stream.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.stream.shutdown()).await;
     }
 }
 

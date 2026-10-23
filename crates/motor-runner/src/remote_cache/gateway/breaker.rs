@@ -182,6 +182,10 @@ impl Ticket {
     pub(super) fn reported(&self) -> bool {
         self.reported
     }
+    /// This request is the breaker's probe.
+    pub(super) fn is_probe(&self) -> bool {
+        self.probe
+    }
 }
 
 impl Drop for Ticket {

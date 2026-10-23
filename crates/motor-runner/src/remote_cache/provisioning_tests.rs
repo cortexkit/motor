@@ -374,6 +374,11 @@ fn raw_key_or_unknown_fields_leave_no_complete_generation() {
         ("tenant adds a path segment", "tenant", json!("acct/../x")),
         ("endpoint not http", "endpoint", json!("ftp://s3.example")),
         (
+            "endpoint without TLS",
+            "endpoint",
+            json!("http://s3.example"),
+        ),
+        (
             "endpoint with credentials",
             "endpoint",
             json!("https://a:b@s3.example"),

@@ -384,7 +384,9 @@ fn parse_config(bytes: &[u8]) -> Result<ConfigFile, String> {
     }
     let endpoint = url::Url::parse(&config.endpoint)
         .map_err(|e| format!("{CONFIG_FILE}: endpoint is not a URL: {e}"))?;
-    if !matches!(endpoint.scheme(), "https" | "http")
+    // Bodies are sent as UNSIGNED-PAYLOAD, so only TLS protects what a fill
+    // writes; a plain-http store could be fed altered objects on the way.
+    if endpoint.scheme() != "https"
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
@@ -392,7 +394,7 @@ fn parse_config(bytes: &[u8]) -> Result<ConfigFile, String> {
         || endpoint.fragment().is_some()
     {
         return Err(format!(
-            "{CONFIG_FILE}: endpoint must be an http(s) URL with a host and no credentials, query or fragment"
+            "{CONFIG_FILE}: endpoint must be an https URL with a host and no credentials, query or fragment"
         ));
     }
     for (field, value) in [

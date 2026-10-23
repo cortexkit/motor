@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
-use upstream::{Conn, Failure, Pool, ResponseHead};
+use upstream::{Conn, Failure, Framing, Pool, ResponseHead};
 
 /// The read sccache makes at startup to check its storage. When the store
 /// answers it (below 500) it is counted as a probe, never as a hit or a miss.
@@ -47,6 +47,8 @@ pub(crate) const SLOW_WINDOW: Duration = Duration::from_secs(10);
 /// How often a body transfer re-checks its throughput while the store sends
 /// nothing.
 const SLOW_TICK: Duration = Duration::from_secs(1);
+/// The pause after a failed accept (out of descriptors, for instance).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Keys written by a fill that its write ledger keeps as a sample.
 pub(crate) const KEY_SAMPLE: usize = 32;
 
@@ -158,6 +160,15 @@ pub(crate) struct Limits {
     pub(crate) max_retries: u32,
     /// A GET body arriving slower than this counts against the read breaker.
     pub(crate) min_upstream_bytes_per_s: u64,
+    /// How long a connection may wait for the first byte of a request, on a
+    /// new connection or between kept-alive requests, before it is closed.
+    pub(crate) idle_timeout: Duration,
+    /// How long a request head may take to arrive once its first byte has.
+    pub(crate) head_timeout: Duration,
+    /// Open connections one job (or one fill's socket) may hold.
+    pub(crate) max_job_connections: usize,
+    /// Open connections across the gateway.
+    pub(crate) max_total_connections: usize,
 }
 
 impl Default for Limits {
@@ -172,6 +183,10 @@ impl Default for Limits {
             deadline: Duration::from_secs(120),
             max_retries: 1,
             min_upstream_bytes_per_s: 1 << 20,
+            idle_timeout: Duration::from_secs(30),
+            head_timeout: Duration::from_secs(10),
+            max_job_connections: 64,
+            max_total_connections: 512,
         }
     }
 }
@@ -189,18 +204,35 @@ impl Generations for Watch {
     }
 }
 
+/// What a job's read sockets, or one fill's write socket, hold between them;
+/// the admission caps apply to these counts.
+#[derive(Debug, Default)]
+struct Owner {
+    /// In-flight read requests.
+    requests: AtomicUsize,
+    /// Open connections.
+    connections: AtomicUsize,
+}
+
 /// What one socket serves.
 #[derive(Debug)]
 pub(crate) struct Binding {
     endpoint: Endpoint,
     tool: Tool,
     adapter: Adapter,
-    /// The job's in-flight read count, shared by all its read sockets.
-    job: Option<Arc<AtomicUsize>>,
+    /// The cache tenant the socket was created for. A request is never
+    /// signed for any other tenant's prefix, even after the active
+    /// generation moves to another tenant.
+    tenant: String,
+    /// Shared by all of a job's read sockets.
+    owner: Arc<Owner>,
     ledger: Option<Arc<WriteLedger>>,
 }
 
 impl Binding {
+    pub(crate) fn tenant(&self) -> &str {
+        &self.tenant
+    }
     pub(crate) fn endpoint(&self) -> Endpoint {
         self.endpoint
     }
@@ -306,15 +338,55 @@ impl Drop for PutRecord {
     }
 }
 
-/// A read request's place under the admission caps.
-struct ReadSlot {
+/// A place under a pair of admission caps (one owner's, the gateway's),
+/// held until dropped.
+struct Slot {
     total: Arc<AtomicUsize>,
-    job: Arc<AtomicUsize>,
+    owner: Arc<Owner>,
+    connection: bool,
 }
 
-impl Drop for ReadSlot {
+impl Slot {
+    /// Takes a place if both counts are below their caps.
+    fn take(
+        total: &Arc<AtomicUsize>,
+        total_cap: usize,
+        owner: &Arc<Owner>,
+        owner_cap: usize,
+        connection: bool,
+    ) -> Option<Self> {
+        fn count(owner: &Owner, connection: bool) -> &AtomicUsize {
+            if connection {
+                &owner.connections
+            } else {
+                &owner.requests
+            }
+        }
+        if total.fetch_add(1, Ordering::AcqRel) >= total_cap {
+            total.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        if count(owner, connection).fetch_add(1, Ordering::AcqRel) >= owner_cap {
+            count(owner, connection).fetch_sub(1, Ordering::AcqRel);
+            total.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            total: total.clone(),
+            owner: owner.clone(),
+            connection,
+        })
+    }
+}
+
+impl Drop for Slot {
     fn drop(&mut self) {
-        self.job.fetch_sub(1, Ordering::AcqRel);
+        let count = if self.connection {
+            &self.owner.connections
+        } else {
+            &self.owner.requests
+        };
+        count.fetch_sub(1, Ordering::AcqRel);
         self.total.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -327,7 +399,8 @@ struct Shared {
     read_breaker: Arc<Breaker>,
     write_breaker: Arc<Breaker>,
     total_reads: Arc<AtomicUsize>,
-    jobs: Mutex<HashMap<String, Weak<AtomicUsize>>>,
+    total_connections: Arc<AtomicUsize>,
+    jobs: Mutex<HashMap<String, Weak<Owner>>>,
     counters: [ToolCounters; 2],
     origin: Instant,
 }
@@ -473,11 +546,11 @@ struct Upstream {
 
 fn upstream_of(generation: &ActiveGeneration) -> Option<Upstream> {
     let url = url::Url::parse(&generation.endpoint).ok()?;
-    let tls = match url.scheme() {
-        "https" => true,
-        "http" => false,
-        _ => return None,
-    };
+    // Bodies are sent as UNSIGNED-PAYLOAD, so only TLS keeps them intact:
+    // a plain-http endpoint is never used, whatever the config says.
+    if url.scheme() != "https" {
+        return None;
+    }
     let host_str = url.host_str()?;
     let host = host_str
         .strip_prefix('[')
@@ -490,7 +563,7 @@ fn upstream_of(generation: &ActiveGeneration) -> Option<Upstream> {
     };
     Some(Upstream {
         target: Target {
-            tls,
+            tls: true,
             host,
             port: url.port_or_known_default()?,
         },
@@ -508,6 +581,19 @@ struct Exchange<'a> {
     canonical_uri: String,
     storage_class: Option<&'a str>,
     deadline: Instant,
+    /// When set, every read from or write to the tool must make progress
+    /// within this long, or the request ends as if the tool went away.
+    client_stall: Option<Duration>,
+}
+
+impl Exchange<'_> {
+    /// When the next read from or write to the tool must complete by.
+    fn client_by(&self) -> Instant {
+        match self.client_stall {
+            Some(stall) => self.deadline.min(Instant::now() + stall),
+            None => self.deadline,
+        }
+    }
 }
 
 /// How an attempt to get a response head failed.
@@ -542,6 +628,7 @@ impl Gateway {
                 read_breaker: Breaker::new(WhileProbing::Answer),
                 write_breaker: Breaker::new(WhileProbing::Hold),
                 total_reads: Arc::new(AtomicUsize::new(0)),
+                total_connections: Arc::new(AtomicUsize::new(0)),
                 jobs: Mutex::new(HashMap::new()),
                 counters: Default::default(),
                 origin: Instant::now(),
@@ -549,35 +636,44 @@ impl Gateway {
         }
     }
 
-    /// A read socket's binding for one job. Every read binding of a job
-    /// shares its admission cap.
-    pub(crate) fn read_binding(&self, job: &str, tool: Tool, adapter: Adapter) -> Arc<Binding> {
+    /// A read socket's binding for one job and the cache tenant it was
+    /// created for. Every read binding of a job shares its admission caps.
+    pub(crate) fn read_binding(
+        &self,
+        job: &str,
+        tenant: &str,
+        tool: Tool,
+        adapter: Adapter,
+    ) -> Arc<Binding> {
         let mut jobs = self.shared.jobs.lock().unwrap();
-        jobs.retain(|_, count| count.strong_count() > 0);
-        let count = match jobs.get(job).and_then(Weak::upgrade) {
-            Some(count) => count,
+        jobs.retain(|_, owner| owner.strong_count() > 0);
+        let owner = match jobs.get(job).and_then(Weak::upgrade) {
+            Some(owner) => owner,
             None => {
-                let count = Arc::new(AtomicUsize::new(0));
-                jobs.insert(job.to_string(), Arc::downgrade(&count));
-                count
+                let owner = Arc::new(Owner::default());
+                jobs.insert(job.to_string(), Arc::downgrade(&owner));
+                owner
             }
         };
         Arc::new(Binding {
             endpoint: Endpoint::Read,
             tool,
             adapter,
-            job: Some(count),
+            tenant: tenant.to_string(),
+            owner,
             ledger: None,
         })
     }
 
-    /// A write socket's binding for one fill, with a fresh PUT ledger.
-    pub(crate) fn write_binding(&self, tool: Tool, adapter: Adapter) -> Arc<Binding> {
+    /// A write socket's binding for one fill and the cache tenant it was
+    /// created for, with a fresh PUT ledger.
+    pub(crate) fn write_binding(&self, tenant: &str, tool: Tool, adapter: Adapter) -> Arc<Binding> {
         Arc::new(Binding {
             endpoint: Endpoint::Write,
             tool,
             adapter,
-            job: None,
+            tenant: tenant.to_string(),
+            owner: Arc::new(Owner::default()),
             ledger: Some(Arc::new(WriteLedger {
                 tool,
                 state: Mutex::new(LedgerSummary::default()),
@@ -586,21 +682,64 @@ impl Gateway {
         })
     }
 
+    /// Admits a new tool connection under the connection caps. Returns the
+    /// future that serves it, or `None` (and counts a refusal) when the
+    /// binding's owner or the gateway already holds its cap; the stream is
+    /// then dropped, which closes it. Nothing is spawned for a refused
+    /// connection.
+    pub(crate) fn admit_connection<S>(
+        &self,
+        binding: &Arc<Binding>,
+        stream: S,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let limits = &self.shared.limits;
+        let Some(slot) = Slot::take(
+            &self.shared.total_connections,
+            limits.max_total_connections,
+            &binding.owner,
+            limits.max_job_connections,
+            true,
+        ) else {
+            self.refused(binding, "connection cap");
+            return None;
+        };
+        let gateway = self.clone();
+        let binding = binding.clone();
+        Some(async move {
+            let _slot = slot;
+            gateway.serve(binding, stream).await
+        })
+    }
+
     /// Binds a Unix socket at `path` and serves `binding` on it. Who may
     /// connect is decided by the socket file's mode and by which sandbox the
-    /// runner binds it into.
+    /// runner binds it into. Dropping the returned listener also ends every
+    /// connection accepted on it.
     pub(crate) fn listen(&self, path: &Path, binding: Arc<Binding>) -> io::Result<Listener> {
         let listener = tokio::net::UnixListener::bind(path)?;
         let gateway = self.clone();
         let served = binding.clone();
         let task = tokio::spawn(async move {
+            // Connection tasks live in this set, so aborting the accept task
+            // (when the listener is dropped) aborts them too.
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let gateway = gateway.clone();
-                let binding = served.clone();
-                tokio::spawn(async move { gateway.serve(binding, stream).await });
+                tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            if let Some(serve) = gateway.admit_connection(&served, stream) {
+                                connections.spawn(serve);
+                            }
+                        }
+                        // Out of descriptors or similar: retrying at once
+                        // would only spin.
+                        Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
+                    },
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                }
             }
         });
         Ok(Listener {
@@ -610,19 +749,29 @@ impl Gateway {
         })
     }
 
-    /// Serves requests on one tool connection until it closes.
-    pub(crate) async fn serve<S>(&self, binding: Arc<Binding>, stream: S)
+    /// Serves requests on one tool connection until it closes, times out
+    /// waiting for a request, or a request ends it.
+    async fn serve<S>(&self, binding: Arc<Binding>, stream: S)
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let limits = &self.shared.limits;
         let mut client = Inbound::new(stream);
         loop {
-            let head = match client.read_head().await {
+            let head = match client
+                .read_head(limits.idle_timeout, limits.head_timeout)
+                .await
+            {
                 Ok(head) => head,
                 Err(HeadError::Gone) => return,
+                Err(HeadError::TimedOut) => {
+                    client.shutdown().await;
+                    return;
+                }
                 Err(HeadError::Malformed) => {
-                    self.refused(&binding);
-                    let _ = client.respond(403, &[], 0, true).await;
+                    self.refused(&binding, "malformed request head");
+                    let by = Instant::now() + limits.first_byte_timeout;
+                    let _ = client.respond(403, &[], 0, true, by).await;
                     client.shutdown().await;
                     return;
                 }
@@ -656,28 +805,32 @@ impl Gateway {
         &self.shared.counters[tool.index()]
     }
 
-    fn refused(&self, binding: &Binding) {
+    /// Counts a refusal. The log line carries only the endpoint, the tool
+    /// and a fixed reason, never anything the job sent (paths and headers
+    /// can carry anything a job chooses to write into a log).
+    fn refused(&self, binding: &Binding, reason: &'static str) {
         let counters = self.counters(binding.tool);
         bump(match binding.endpoint {
             Endpoint::Read => &counters.read_refusals,
             Endpoint::Write => &counters.write_refusals,
         });
+        tracing::debug!(
+            endpoint = ?binding.endpoint,
+            tool = binding.tool.id(),
+            reason,
+            "remote cache request refused"
+        );
     }
 
-    fn admit_read(&self, binding: &Binding) -> Option<ReadSlot> {
-        let job = binding.job.clone()?;
-        let total = self.shared.total_reads.clone();
+    fn admit_read(&self, binding: &Binding) -> Option<Slot> {
         let limits = &self.shared.limits;
-        if total.fetch_add(1, Ordering::AcqRel) >= limits.max_total_requests {
-            total.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        if job.fetch_add(1, Ordering::AcqRel) >= limits.max_job_requests {
-            job.fetch_sub(1, Ordering::AcqRel);
-            total.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        Some(ReadSlot { total, job })
+        Slot::take(
+            &self.shared.total_reads,
+            limits.max_total_requests,
+            &binding.owner,
+            limits.max_job_requests,
+            false,
+        )
     }
 
     /// Records a counted failure on the ticket, once per request.
@@ -696,12 +849,13 @@ impl Gateway {
         status: u16,
         body_free: bool,
         close_requested: bool,
+        by: Instant,
     ) -> Next
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let close = !body_free || close_requested;
-        match client.respond(status, &[], 0, close).await {
+        match client.respond(status, &[], 0, close, by).await {
             Ok(()) if !close => Next::KeepAlive,
             _ => Next::Close,
         }
@@ -727,39 +881,52 @@ impl Gateway {
                 stored: false,
             });
         let Some(request) = parse_request(&head, endpoint) else {
-            self.refused(binding);
+            self.refused(binding, "method, query or encoding");
             return self
-                .answer(client, 403, body_free, head.close_requested())
+                .answer(client, 403, body_free, head.close_requested(), deadline)
                 .await;
         };
         let close_requested = request.close_requested;
         let Some(generation) = self.shared.generations.admit() else {
             return self
-                .answer(client, failure, body_free, close_requested)
+                .answer(client, failure, body_free, close_requested, deadline)
                 .await;
         };
+        // A socket serves the cache tenant it was created for and no other:
+        // after the active generation moves to another tenant it signs
+        // nothing, so a job can never read or write that tenant's prefix.
+        if generation.tenant != binding.tenant {
+            bump(&self.counters(binding.tool).tenant_mismatch);
+            return self
+                .answer(client, failure, body_free, close_requested, deadline)
+                .await;
+        }
         let Some(bare) = binding.adapter.bare_key(&request.path, &generation.bucket) else {
-            self.refused(binding);
-            return self.answer(client, 403, body_free, close_requested).await;
+            self.refused(binding, "path");
+            return self
+                .answer(client, 403, body_free, close_requested, deadline)
+                .await;
         };
         let key = format!("{}{}/{}", generation.prefix, binding.tool.id(), bare);
         if key.len() > limits.max_key_bytes {
-            self.refused(binding);
-            return self.answer(client, 403, body_free, close_requested).await;
+            self.refused(binding, "key length");
+            return self
+                .answer(client, 403, body_free, close_requested, deadline)
+                .await;
         }
         if request.content_length > limits.max_object_bytes {
-            self.refused(binding);
+            self.refused(binding, "object size");
             return self
-                .answer(client, failure, body_free, close_requested)
+                .answer(client, failure, body_free, close_requested, deadline)
                 .await;
         }
         let _slot = match endpoint {
             Endpoint::Read => match self.admit_read(binding) {
                 Some(slot) => Some(slot),
                 None => {
-                    self.refused(binding);
+                    self.refused(binding, "request cap");
                     return self
-                        .answer(client, failure, body_free, close_requested)
+                        .answer(client, failure, body_free, close_requested, deadline)
                         .await;
                 }
             },
@@ -773,14 +940,14 @@ impl Gateway {
                 // write endpoint cannot sign anything.
                 None => {
                     return self
-                        .answer(client, failure, body_free, close_requested)
+                        .answer(client, failure, body_free, close_requested, deadline)
                         .await
                 }
             },
         };
         let Some(upstream) = upstream_of(&generation) else {
             return self
-                .answer(client, failure, body_free, close_requested)
+                .answer(client, failure, body_free, close_requested, deadline)
                 .await;
         };
         let breaker = match endpoint {
@@ -792,7 +959,7 @@ impl Gateway {
             Admission::Refused => {
                 bump(&self.counters(binding.tool).breaker_open);
                 return self
-                    .answer(client, failure, body_free, close_requested)
+                    .answer(client, failure, body_free, close_requested, deadline)
                     .await;
             }
         };
@@ -817,6 +984,10 @@ impl Gateway {
             storage_class: (request.method == Method::Put)
                 .then_some(generation.storage_class.as_str()),
             deadline,
+            // A tool holding the breaker's probe must not hold it by
+            // stalling: other jobs' requests wait on, or are refused
+            // behind, its outcome.
+            client_stall: ticket.is_probe().then_some(limits.first_byte_timeout),
         };
         let probe = binding.tool == Tool::Sccache && bare == SCCACHE_CHECK_KEY;
         let next = self
@@ -940,7 +1111,7 @@ impl Gateway {
             if left > 0 && exchange.request.expect_continue && !*continue_sent {
                 *continue_sent = true;
                 if client
-                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n", exchange.client_by())
                     .await
                     .is_err()
                 {
@@ -951,8 +1122,11 @@ impl Gateway {
             let mut buf = vec![0u8; size];
             while left > 0 {
                 let want = (buf.len() as u64).min(left) as usize;
-                let n = match tokio::time::timeout_at(deadline, client.read_body(&mut buf[..want]))
-                    .await
+                let n = match tokio::time::timeout_at(
+                    exchange.client_by(),
+                    client.read_body(&mut buf[..want]),
+                )
+                .await
                 {
                     Ok(Ok(n)) if n > 0 => n,
                     _ => return Err(AttemptError::Client),
@@ -974,7 +1148,8 @@ impl Gateway {
             // large upload is bounded by the overall deadline instead.
             first_byte_by = Instant::now() + limits.first_byte_timeout;
         }
-        match conn.read_head(first_byte_by, deadline).await {
+        let head_request = exchange.request.method == Method::Head;
+        match conn.read_head(first_byte_by, deadline, head_request).await {
             // Bytes of the body already went to the store, so a reset is no
             // longer one a retry may repeat.
             Err(Failure::BeforeResponse) if *body_started => {
@@ -1025,7 +1200,13 @@ impl Gateway {
                     // cannot carry another request.
                     let body_free = request.method != Method::Put || request.content_length == 0;
                     return self
-                        .answer(client, failure, body_free, request.close_requested)
+                        .answer(
+                            client,
+                            failure,
+                            body_free,
+                            request.close_requested,
+                            deadline,
+                        )
                         .await;
                 }
                 Err(AttemptError::Client) => {
@@ -1038,15 +1219,18 @@ impl Gateway {
         let status = head.status;
         if status >= 500 {
             self.fail(ticket, binding.tool);
-            return self.answer(client, failure, true, close_requested).await;
+            return self
+                .answer(client, failure, true, close_requested, deadline)
+                .await;
         }
         // The store answered; whatever follows, it is reachable.
         if request.method == Method::Put {
             ticket.report(Outcome::Success);
-            let length = head.content_length.unwrap_or(0);
-            let reusable = !head.close && conn.discard(length, deadline).await;
+            let reusable = conn.discard(&head, deadline).await;
             if !(200..300).contains(&status) {
-                return self.answer(client, failure, true, close_requested).await;
+                return self
+                    .answer(client, failure, true, close_requested, deadline)
+                    .await;
             }
             if let Some(put) = put.as_mut() {
                 put.stored = true;
@@ -1057,7 +1241,7 @@ impl Gateway {
                 }
             }
             return match client
-                .respond(status, &forwarded(&head), 0, close_requested)
+                .respond(status, &forwarded(&head), 0, close_requested, deadline)
                 .await
             {
                 Ok(()) if !close_requested => Next::KeepAlive,
@@ -1080,7 +1264,7 @@ impl Gateway {
                 ticket.report(Outcome::Success);
                 reuse(conn, self);
                 return match client
-                    .respond(304, &forwarded(&head), 0, close_requested)
+                    .respond(304, &forwarded(&head), 0, close_requested, deadline)
                     .await
                 {
                     Ok(()) if !close_requested => Next::KeepAlive,
@@ -1092,33 +1276,49 @@ impl Gateway {
                 if status == 404 && !probe {
                     bump(&counters.misses);
                 }
-                let length = head.content_length.unwrap_or(0);
-                if request.method == Method::Head
-                    || (!head.close && conn.discard(length, deadline).await)
-                {
+                if conn.discard(&head, deadline).await {
                     reuse(conn, self);
                 }
                 // A 404 is a miss on both endpoints; anything else the store
                 // refuses gets the endpoint's failure answer.
                 let answer = if status == 404 { 404 } else { failure };
-                return self.answer(client, answer, true, close_requested).await;
+                return self
+                    .answer(client, answer, true, close_requested, deadline)
+                    .await;
             }
         }
         // 200 or 206: forward it when its length is known and within limits.
-        let Some(length) = head.content_length else {
+        // A GET body without a length runs to the end of the connection,
+        // which the tool cannot be given as a bounded object.
+        let length = match (request.method, head.framing) {
+            (Method::Head, _) => head.content_length,
+            (_, Framing::Length(length)) => Some(length),
+            _ => None,
+        };
+        let Some(length) = length else {
             ticket.report(Outcome::Success);
-            return self.answer(client, failure, true, close_requested).await;
+            return self
+                .answer(client, failure, true, close_requested, deadline)
+                .await;
         };
         if length > limits.max_object_bytes {
             ticket.report(Outcome::Success);
             bump(&counters.oversize);
-            return self.answer(client, failure, true, close_requested).await;
+            return self
+                .answer(client, failure, true, close_requested, deadline)
+                .await;
         }
         if request.method == Method::Get && !probe {
             bump(&counters.hits);
         }
         if client
-            .respond(status, &forwarded(&head), length, close_requested)
+            .respond(
+                status,
+                &forwarded(&head),
+                length,
+                close_requested,
+                exchange.client_by(),
+            )
             .await
             .is_err()
         {
@@ -1142,7 +1342,7 @@ impl Gateway {
                 length,
                 ticket,
                 endpoint == Endpoint::Read,
-                deadline,
+                exchange,
             )
             .await;
         if !streamed {
@@ -1176,12 +1376,13 @@ impl Gateway {
         length: u64,
         ticket: &mut Ticket,
         slow_counts: bool,
-        deadline: Instant,
+        exchange: &Exchange<'_>,
     ) -> bool
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let limits = &self.shared.limits;
+        let deadline = exchange.deadline;
         let size = (limits.stream_buffer_bytes as u64).min(length).max(1) as usize;
         let mut buf = vec![0u8; size];
         let mut left = length;
@@ -1216,8 +1417,8 @@ impl Gateway {
                     }
                     started = true;
                     left -= n as u64;
-                    match tokio::time::timeout_at(deadline, client.write_all(&buf[..n])).await {
-                        Ok(Ok(())) => {}
+                    match client.write_all(&buf[..n], exchange.client_by()).await {
+                        Ok(()) => {}
                         // A tool that stops reading or goes away says nothing
                         // about the store.
                         _ => {

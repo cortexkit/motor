@@ -36,6 +36,9 @@ pub(crate) struct Target {
 /// `https` endpoints.
 pub(crate) struct TcpConnector {
     tls: tokio_rustls::TlsConnector,
+    /// Set only by a test constructor, so tests can reach a plain local
+    /// server; production endpoints are always `https`.
+    plaintext: bool,
 }
 
 impl TcpConnector {
@@ -51,6 +54,17 @@ impl TcpConnector {
             .with_no_client_auth();
         Ok(Self {
             tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            plaintext: false,
+        })
+    }
+
+    /// A connector that skips TLS even for `https` targets, for tests
+    /// against a plain local server.
+    #[cfg(test)]
+    pub(crate) fn plaintext_for_tests() -> io::Result<Self> {
+        Ok(Self {
+            plaintext: true,
+            ..Self::new()?
         })
     }
 }
@@ -60,7 +74,7 @@ impl Connector for TcpConnector {
         Box::pin(async move {
             let tcp = tokio::net::TcpStream::connect((target.host.as_str(), target.port)).await?;
             tcp.set_nodelay(true)?;
-            if !target.tls {
+            if !target.tls || self.plaintext {
                 return Ok(Box::new(tcp) as BoxedIo);
             }
             let name = rustls::pki_types::ServerName::try_from(target.host.clone())
@@ -120,15 +134,29 @@ pub(super) enum Failure {
     Transport,
 }
 
+/// How a response's body is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Framing {
+    /// No body: a HEAD request, or a 204 or 304 answer.
+    Empty,
+    /// Exactly this many bytes.
+    Length(u64),
+    /// Chunked, or no length at all: the body runs to the end of the
+    /// connection, which therefore cannot be reused.
+    UntilClose,
+}
+
 /// A response's head, with the framing the gateway needs.
 #[derive(Debug)]
 pub(super) struct ResponseHead {
     pub(super) status: u16,
     /// Lowercase names.
     pub(super) headers: Vec<(String, String)>,
+    /// The `content-length` header; for a HEAD request the object's length.
     pub(super) content_length: Option<u64>,
-    /// The store asked to close, or framed the body some other way than by
-    /// length, so the connection cannot be reused.
+    pub(super) framing: Framing,
+    /// The store asked to close, or the body runs to the end of the
+    /// connection, so the connection cannot be reused.
     pub(super) close: bool,
 }
 
@@ -157,10 +185,9 @@ impl Conn {
     }
 
     async fn fill(&mut self) -> io::Result<usize> {
-        if self.pos == self.buf.len() {
-            self.buf.clear();
-            self.pos = 0;
-        }
+        // Drop what is consumed, so the buffer holds at most one head.
+        self.buf.drain(..self.pos);
+        self.pos = 0;
         let mut chunk = [0u8; 8 * 1024];
         let n = self.io.read(&mut chunk).await?;
         self.buf.extend_from_slice(&chunk[..n]);
@@ -168,12 +195,14 @@ impl Conn {
         Ok(n)
     }
 
-    /// Reads the response head. The first byte must arrive by
+    /// Reads the response head to a request (`head_request` for HEAD),
+    /// skipping interim 1xx answers. The first byte must arrive by
     /// `first_byte_by`, the rest by `deadline`.
     pub(super) async fn read_head(
         &mut self,
         first_byte_by: Instant,
         deadline: Instant,
+        head_request: bool,
     ) -> Result<ResponseHead, Failure> {
         if self.pos == self.buf.len() {
             match tokio::time::timeout_at(first_byte_by.min(deadline), self.fill()).await {
@@ -196,8 +225,10 @@ impl Conn {
                         status,
                         headers: Vec::new(),
                         content_length: None,
+                        framing: Framing::UntilClose,
                         close: response.version == Some(0),
                     };
+                    let mut chunked = false;
                     for header in response.headers.iter() {
                         let name = header.name.to_ascii_lowercase();
                         let value = std::str::from_utf8(header.value)
@@ -212,7 +243,7 @@ impl Conn {
                                 }
                                 head.content_length = Some(parsed);
                             }
-                            "transfer-encoding" => head.close = true,
+                            "transfer-encoding" => chunked = true,
                             "connection" if value.eq_ignore_ascii_case("close") => {
                                 head.close = true
                             }
@@ -221,10 +252,39 @@ impl Conn {
                         head.headers.push((name, value));
                     }
                     self.pos += length;
-                    // A 1xx answer is not the response; the store sends one
-                    // only when asked, and the gateway never asks.
                     if (100..200).contains(&status) {
+                        // An interim answer (100 Continue and the like)
+                        // precedes the real one; a protocol switch is never
+                        // acceptable.
+                        if status == 101 {
+                            return Err(Failure::Transport);
+                        }
+                        if self.pos == self.buf.len() {
+                            match tokio::time::timeout_at(deadline, self.fill()).await {
+                                Err(_) => return Err(Failure::Deadline),
+                                Ok(Ok(0)) | Ok(Err(_)) => return Err(Failure::Transport),
+                                Ok(Ok(_)) => {}
+                            }
+                        }
+                        continue;
+                    }
+                    // Both framings at once make the body's end ambiguous
+                    // (the classic request-smuggling shape): refused.
+                    if chunked && head.content_length.is_some() {
                         return Err(Failure::Transport);
+                    }
+                    head.framing = if head_request || status == 204 || status == 304 {
+                        Framing::Empty
+                    } else if chunked {
+                        Framing::UntilClose
+                    } else {
+                        match head.content_length {
+                            Some(length) => Framing::Length(length),
+                            None => Framing::UntilClose,
+                        }
+                    };
+                    if head.framing == Framing::UntilClose {
+                        head.close = true;
                     }
                     return Ok(head);
                 }
@@ -257,13 +317,19 @@ impl Conn {
         Ok(n)
     }
 
-    /// Reads and discards a body of `length` bytes when it is small, so the
-    /// connection can be reused; returns whether it was.
-    pub(super) async fn discard(&mut self, length: u64, deadline: Instant) -> bool {
+    /// Reads and discards the body of `head` when it is small and framed by
+    /// length, so the connection can be reused; returns whether it can be.
+    pub(super) async fn discard(&mut self, head: &ResponseHead, deadline: Instant) -> bool {
         const MAX_DISCARD: u64 = 64 * 1024;
-        if length > MAX_DISCARD {
+        if head.close {
             return false;
         }
+        let length = match head.framing {
+            Framing::Empty => return true,
+            Framing::UntilClose => return false,
+            Framing::Length(length) if length > MAX_DISCARD => return false,
+            Framing::Length(length) => length,
+        };
         let mut left = length as usize;
         let mut scratch = [0u8; 8 * 1024];
         while left > 0 {

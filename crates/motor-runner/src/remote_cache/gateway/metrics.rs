@@ -36,6 +36,9 @@ pub(crate) struct ToolStats {
     pub(crate) write_refusals: u64,
     /// Upstream responses aborted because the object exceeded the size limit.
     pub(crate) oversize: u64,
+    /// Requests answered without the store because the active generation
+    /// belongs to another cache tenant than the socket's.
+    pub(crate) tenant_mismatch: u64,
     /// The 95th percentile latency, over the trailing 60 minutes, of requests
     /// that reached the store (refusals and breaker answers are excluded), as
     /// the upper bound of its histogram bin; `None` with no such requests.
@@ -52,6 +55,7 @@ pub(super) struct ToolCounters {
     pub(super) read_refusals: AtomicU64,
     pub(super) write_refusals: AtomicU64,
     pub(super) oversize: AtomicU64,
+    pub(super) tenant_mismatch: AtomicU64,
     latency: Mutex<VecDeque<(u64, [u64; BOUNDS_MS.len() + 1])>>,
 }
 
@@ -118,6 +122,7 @@ impl ToolCounters {
             read_refusals: load(&self.read_refusals),
             write_refusals: load(&self.write_refusals),
             oversize: load(&self.oversize),
+            tenant_mismatch: load(&self.tenant_mismatch),
             p95_ms,
         }
     }
