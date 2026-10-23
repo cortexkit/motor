@@ -38,7 +38,8 @@ class ArgumentTests(unittest.TestCase):
     def test_options_must_belong_to_cache_mode_and_image_digest_prefix_are_validated(self):
         cache_bench.validate(argparse.ArgumentParser(), args())
         for changes in ({'cache_bench': False}, {'cache_image': None}, {'cache_image': '../image'},
-                        {'cache_bundle_sha256': 'main'}, {'cache_prefix': '/'}, {'max_minutes': 60}):
+                        {'cache_bundle_sha256': 'main'}, {'cache_prefix': '/'}, {'max_minutes': 60},
+                        {'cache_baseline': True}, {'cache_repositories': Path('/manifest')}):
             with self.subTest(changes=changes), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 cache_bench.validate(argparse.ArgumentParser(), args(**changes))
 
@@ -65,7 +66,7 @@ class ArgumentTests(unittest.TestCase):
 
 
 class SSHTests(unittest.TestCase):
-    def exercise(self, failed=False, multi=False):
+    def exercise(self, failed=False, multi=False, timed_out=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             credential = root / 'creds'
@@ -97,6 +98,8 @@ class SSHTests(unittest.TestCase):
                     path.write_text('private-fixture')
                     path.with_suffix('.pub').write_text('ssh-ed25519 Zml4dHVyZQ==')
                 elif ' --run ' in argv[-1]:
+                    if timed_out:
+                        raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
                     code = int(failed)
                 elif argv[-1] == 'cat /dev/shm/motor-cache-results/results.json':
                     stdout = json.dumps({'complete': not failed, 'runs': [], 'backends': [
@@ -107,13 +110,13 @@ class SSHTests(unittest.TestCase):
             with patch.object(cache_bench.subprocess, 'run', side_effect=execute), \
                     patch.object(cache_bench.bench, 'load_repositories', return_value=repositories), \
                     patch.object(cache_bench.SSHReach, 'authorize', return_value=authorization):
-                if failed:
+                if failed or timed_out:
                     with self.assertRaisesRegex(cache_bench.ProbeError, 'cache benchmark failed'):
                         cache_bench.run(runner, options)
                 else:
                     cache_bench.run(runner, options)
             self.assertTrue(runner.data['cache_bench']['credential_file_removed'])
-            self.assertEqual(runner.data['cache_bench']['complete'], not failed)
+            self.assertEqual(runner.data['cache_bench']['complete'], not (failed or timed_out))
             runner.create.assert_called_once_with('prepared-image')
             runner.wait_hydrated.assert_called_once_with('bx_fixture')
             self.assertFalse(list(root.glob('.cache-ssh-*')))
@@ -138,6 +141,9 @@ class SSHTests(unittest.TestCase):
 
     def test_two_repositories_share_one_fresh_sandbox_and_keep_hourly_profile(self):
         self.exercise(multi=True)
+
+    def test_timeout_fetches_partial_results_before_removing_credentials(self):
+        self.exercise(timed_out=True)
 
     def test_invalid_bundle_does_not_create_billable_sandbox(self):
         runner = SimpleNamespace(create=MagicMock())

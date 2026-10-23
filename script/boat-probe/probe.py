@@ -964,8 +964,9 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
-    if args.cache_bench or any((args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
-                                args.cache_backends, args.cache_prefix)):
+    if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or any((
+            args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
+            args.cache_backends, args.cache_prefix, args.cache_repositories)):
         from cache_bench import validate
         validate(parser, args)
     if (args.prepared_image or args.from_prepared_image or args.verify_prepared_image) and not args.runner_host:

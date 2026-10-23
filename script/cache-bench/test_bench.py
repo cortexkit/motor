@@ -349,6 +349,19 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(s3.calls[0][3]['extra'], {'range': 'bytes=0-0'})
         self.assertEqual(len(client.events), 1)
 
+    def test_gateway_upstream_timeout_is_preserved_in_tiny_get_records(self):
+        s3 = self.S3()
+        with patch.object(s3, 'request', side_effect=bench.BenchTimeout('withheld')), \
+                bench.Gateway(s3, PREFIX, False) as gateway:
+            client = bench.GatewayClient(gateway)
+            try:
+                result = bench.rtt_probe(client, PREFIX + 'hash', seconds=.05)
+            finally:
+                client.close()
+        records = result['tiny_get']['records']
+        self.assertGreater(len(records), 0)
+        self.assertTrue(all(not r['ok'] and r['timeout'] and r['status'] == 504 for r in records))
+
     def test_authentication_error_body_cannot_leak_access_id_to_sccache(self):
         s3 = self.S3()
         with patch.object(s3, 'request', return_value=(403, {}, b'<AccessKeyId>PRIVATE-ID</AccessKeyId>')), \
@@ -430,6 +443,10 @@ class WorkloadTests(unittest.TestCase):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_fill_profile_refuses_boat_before_any_measurement(self):
+        with self.assertRaisesRegex(bench.BenchError, 'Boat is read-only'):
+            bench.benchmark(argparse.Namespace(profile='fill', placement='B'), object())
+
     def exercise(self, placement, profile='legacy', baseline=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'fixed'

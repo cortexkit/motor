@@ -37,6 +37,8 @@ def validate(parser, args):
         if any(options) or getattr(args, 'cache_profile', 'legacy') != 'legacy' or getattr(args, 'cache_baseline', False):
             parser.error('--cache-* options require --cache-bench')
         return
+    if getattr(args, 'cache_baseline', False) and getattr(args, 'cache_profile', 'legacy') != 'hourly':
+        parser.error('--cache-baseline requires --cache-profile hourly')
     if not (args.cache_image and args.cache_backends and (repositories or
             args.cache_bundle and args.cache_bundle_sha256 and args.cache_prefix)):
         parser.error('--cache-bench requires --cache-image, --cache-bundle, --cache-bundle-sha256, --cache-backends and --cache-prefix')
@@ -80,7 +82,7 @@ def run(runner, args):
     with tempfile.TemporaryDirectory(prefix='.cache-ssh-', dir=runner.results_path.parent) as temporary:
         directory = Path(temporary)
         private = directory / 'identity'
-        environment = {k: v for k, v in os.environ.items() if k != 'BOAT_API_KEY'}
+        environment = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'USER', 'LOGNAME', 'SSH_AUTH_SOCK')}
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(private)],
                        check=True, capture_output=True, env=environment)
         response = Authorization(runner).authorize(item['id'], private.with_suffix('.pub').read_text().strip())
@@ -89,12 +91,17 @@ def run(runner, args):
         pin_host(known_hosts, alias, response)
         ssh = ssh_argv(endpoint(response), private, known_hosts, alias)
 
-        def remote(text, source=None, checked=True):
-            budget = int(runner.deadline - time.monotonic()) - 30
+        def remote(text, source=None, checked=True, reserve=30):
+            budget = int(runner.deadline - time.monotonic()) - reserve
             if budget <= 0:
                 raise ProbeError('cache benchmark exhausted the sandbox TTL (30s cleanup reserve)')
-            result = subprocess.run(ssh + [text], stdin=source or subprocess.DEVNULL,
-                                    capture_output=True, env=environment, timeout=budget)
+            try:
+                result = subprocess.run(ssh + [text], stdin=source or subprocess.DEVNULL,
+                                        capture_output=True, env=environment, timeout=budget)
+            except subprocess.TimeoutExpired:
+                if checked:
+                    raise ProbeError('cache-bench SSH step exceeded the sandbox budget') from None
+                result = subprocess.CompletedProcess(ssh, 124, b'', b'')
             if checked and result.returncode:
                 # Do not persist stdin, command stdout or exception bodies on failures.
                 raise ProbeError(f'cache-bench SSH step failed (exit {result.returncode})')
@@ -151,7 +158,7 @@ def run(runner, args):
                                 '--backends /dev/shm/motor-cache-backends.json '
                                 f"--prefix {shlex.quote(repository['prefix'])} --profile {profile}{baseline} "
                                 '--output /dev/shm/motor-cache-results > /dev/null', checked=False)
-                fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False)
+                fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False, reserve=5)
                 if fetched.returncode == 0:
                     report = json.loads(fetched.stdout)
                     if multi:
@@ -170,7 +177,7 @@ def run(runner, args):
             data['complete'] = True
         finally:
             try:
-                removed = remote('rm -f ' + paths, checked=False)
+                removed = remote('rm -f ' + paths, checked=False, reserve=0)
                 data['credential_file_removed'] = removed.returncode == 0
                 if not data['credential_file_removed']:
                     data['complete'] = False

@@ -563,12 +563,14 @@ def rtt_probe(client, key, seconds=30):
                 else:
                     status, _, body = client.request('GET', object_path(key, client.bucket), extra={'range': 'bytes=0-0'},
                                                      fresh=True, timeout=timeout)
+                    record['status'] = status
                     record['timeout'] = status in (408, 504)
                     if status != 206 or len(body) != 1:
                         raise BenchError('tiny GET did not return one ranged byte')
                 record['ok'] = True
             except (OSError, BenchError) as error:
                 record['timeout'] = record['timeout'] or isinstance(error, (TimeoutError, BenchTimeout))
+                record['error_kind'] = type(error).__name__
             record['seconds'] = time.perf_counter() - before
             records.append(record)
         time.sleep(min(.1, max(0, until - time.perf_counter())))
@@ -598,6 +600,7 @@ def latency_probe(s3, prefix, samples=200):
             record['timeout'] = status in (408, 504)
         except (OSError, BenchError) as error:
             record['timeout'] = isinstance(error, (TimeoutError, BenchTimeout))
+            record['error_kind'] = type(error).__name__
         record['seconds'] = time.perf_counter() - start
         records.append(record)
         if record['ok']:
@@ -732,20 +735,27 @@ def save(output, data):
     (output / 'results.md').write_text(render(data))
 
 
-def network_probes(s3, prefix, gateway=True):
+def network_probes(s3, prefix, gateway=True, checkpoint=lambda result: None):
     audit = verify_class(s3, prefix)
     key = audit['sampled_objects'][0]['key']
-    result = {'runs': [], 'warnings': [], 'class_audit': audit,
-              'latency': {'direct': latency_probe(s3, prefix)},
-              'rtt': {'direct': rtt_probe(s3, key)}, 'complete': True}
+    result = {'runs': [], 'warnings': [], 'class_audit': audit, 'latency': {}, 'rtt': {}, 'complete': False}
+    checkpoint(result)
+    result['latency']['direct'] = latency_probe(s3, prefix)
+    checkpoint(result)
+    result['rtt']['direct'] = rtt_probe(s3, key)
+    checkpoint(result)
     if gateway:
         with Gateway(s3, prefix, False) as proxy:
             client = GatewayClient(proxy)
             try:
                 result['latency']['gateway'] = latency_probe(client, prefix)
+                checkpoint(result)
                 result['rtt']['gateway'] = rtt_probe(client, key)
+                checkpoint(result)
             finally:
                 client.close()
+    result['complete'] = True
+    checkpoint(result)
     return result
 
 
@@ -761,9 +771,13 @@ def result_status(result):
 
 def benchmark(args, s3):
     profile = getattr(args, 'profile', 'legacy')
+    if profile == 'fill' and args.placement != 'A':
+        raise BenchError('fill profile requires server placement A; Boat is read-only')
     if profile == 'network':
         args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
-        data = dict(network_probes(s3, args.prefix, gateway=False), placement=args.placement)
+        data = dict(network_probes(s3, args.prefix, gateway=False,
+                                  checkpoint=lambda partial: save(args.output, dict(partial, placement=args.placement))),
+                    placement=args.placement)
         save(args.output, data)
         return data
     if ROOT.is_symlink() or ROOT.resolve() != ROOT or CHECKOUT.resolve() != CHECKOUT or CARGO_HOME.resolve() != CARGO_HOME:
@@ -847,7 +861,10 @@ def benchmark(args, s3):
             return data
         for number in range(1, 4):
             run(f'remote-read-only-{number}', 'remote')
-        probes = network_probes(s3, args.prefix)
+        def record_probes(partial):
+            data.update({key: partial[key] for key in ('class_audit', 'latency', 'rtt')})
+            save(output, data)
+        probes = network_probes(s3, args.prefix, checkpoint=record_probes)
         data.update({key: probes[key] for key in ('class_audit', 'latency', 'rtt')})
         save(output, data)
         if profile == 'legacy' and args.placement == 'A':
@@ -998,9 +1015,13 @@ def summarize_data(directory):
                      'median difference does not exceed observed paired-hour IQR')
         variation.append(dict(placement=placement, repository=repo, metric=metric, paired_hours=len(values),
                               median_difference=median, paired_hour_iqr=iqr, statement=statement))
+    baselines = {}
+    for group in groups.values():
+        group['hours_without_report'] = len(state['iterations']) - group['hours']
+        baselines.setdefault((group['placement'], group['repository']), []).extend(group['baseline_seconds'])
     for group in groups.values():
         group['rebuild_seconds'] = distribution(group['rebuild_seconds'])
-        group['baseline_seconds'] = distribution(group['baseline_seconds'])
+        group['baseline_seconds'] = distribution(baselines[(group['placement'], group['repository'])])
         group['probes'] = {key: probe_distribution(value) for key, value in group['probes'].items()}
     return {'schema': 1, 'groups': list(groups.values()), 'hourly': hourly, 'paired': paired,
             'variation': variation, 'schedule': state['iterations']}
@@ -1025,14 +1046,15 @@ def summarize(directory):
              'Nearest-rank p50/p95/p99. Latency milliseconds include body read and any retry; successful requests only.',
              'Error/timeout rates divide logical failed/timed-out probes by all attempted probes; timeouts are a subset of errors.',
              'Unobserved hours are not successes or network errors. Rebuilds are cold-target Cargo seconds.',
+             'Baselines are class-independent; their distribution is repeated across the two class rows, not two builds.',
              'Classes label requested tiers; raw hourly JSON retains audit validity/returned classes. Invalid/absent audits are excluded from pairing.',
              'Paired difference = EXPRESS_ONEZONE minus STANDARD; negative latency/time favors EXPRESS_ONEZONE.',
              'Variation rule: absolute median paired difference > paired-hour IQR, with at least 6 pairs.',
              'This descriptive rule is not a significance test or a production-readiness claim.', '',
-             '| Class | Placement | Repository | Hours/failed | Rebuild p50/p95/p99 s (n) | Baseline p50/p95/p99 s (n) | Hits/misses/cache errors |',
-             '|---|---|---|---|---|---|---|']
+             '| Class | Placement | Repository | Observed hours/failed | Slots without report (including pending) | Rebuild p50/p95/p99 s (n) | Baseline p50/p95/p99 s (n) | Hits/misses/cache errors |',
+             '|---|---|---|---|---|---|---|---|']
     for g in report['groups']:
-        lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {g['hours']}/{g['failed_hours']} | "
+        lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {g['hours']}/{g['failed_hours']} | {g['hours_without_report']} | "
                      f"{dist(g['rebuild_seconds'])} ({g['rebuild_seconds']['n']}) | "
                      f"{dist(g['baseline_seconds'])} ({g['baseline_seconds']['n']}) | {g['hits']}/{g['misses']}/{g['cache_errors']} |")
     lines += ['', '| Class | Placement | Repository | Route/probe | p50/p95/p99 ms | Errors/attempts | Timeouts/attempts | Error/timeout rate |', '|---|---|---|---|---|---|---|---|']
@@ -1129,6 +1151,8 @@ def parse_args(argv=None):
             p.error('preparation options require --prepare')
         if args.run and not (args.output and args.placement):
             p.error('--run requires --placement A|B and --output NEW_DIR')
+        if args.run and args.profile == 'fill' and args.placement != 'A':
+            p.error('--profile fill requires --placement A')
         if args.purge and (args.output or args.placement):
             p.error('--purge does not accept --output or --placement')
     return args
