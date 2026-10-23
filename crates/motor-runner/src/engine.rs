@@ -1051,6 +1051,11 @@ struct Reservation {
     since_ms: u64,
 }
 
+struct QuarantineCleanup {
+    blocked: Vec<Uuid>,
+    last_error_ms: Option<u64>,
+}
+
 struct Core {
     tenant_events: Option<Arc<crate::tenant::EventLog>>,
     draining: std::sync::atomic::AtomicBool,
@@ -1078,6 +1083,7 @@ struct Core {
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
     quarantine_admission: Mutex<Option<String>>,
     quarantine_probe: Mutex<Option<std::time::Instant>>,
+    quarantine_cleanup: Mutex<QuarantineCleanup>,
     /// Serialize pressure cleanup, without holding the output/persistence lock.
     disk: Mutex<()>,
     /// Numbers catalog snapshots in the order they were taken under the
@@ -1861,6 +1867,10 @@ impl Runner {
                         .then(|| "live unit ownership has not been inspected".into()),
                 ),
                 quarantine_probe: Mutex::new(None),
+                quarantine_cleanup: Mutex::new(QuarantineCleanup {
+                    blocked: quarantined.keys().copied().collect(),
+                    last_error_ms: None,
+                }),
                 quarantined,
                 disk: Mutex::new(()),
                 catalog_generation: std::sync::atomic::AtomicU64::new(0),

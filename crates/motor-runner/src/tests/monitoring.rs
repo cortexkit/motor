@@ -713,6 +713,9 @@ fn failed_workspace_expiry_preserves_catalog_and_continues_maintenance() {
 struct EnumeratingBackend;
 
 impl Backend for EnumeratingBackend {
+    fn failed_job_units(&self, _: &Config) -> io::Result<u64> {
+        Ok(0)
+    }
     fn live_units(&self, config: &Config) -> io::Result<Option<BTreeSet<String>>> {
         backend::live_job_units(config).map(Some)
     }
@@ -758,6 +761,15 @@ fn enumerated_quarantine(
     listing: &str,
     failed: bool,
 ) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>) {
+    enumerated_quarantine_with(f, listing, failed, |_, _| {})
+}
+
+fn enumerated_quarantine_with(
+    f: &Fixture,
+    listing: &str,
+    failed: bool,
+    configure: impl FnOnce(&mut Config, Uuid),
+) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>) {
     use std::os::unix::process::ExitStatusExt;
     let mut config = f.config();
     // A forced refresh bypasses throttling, not a busy probe. These fixtures
@@ -771,6 +783,7 @@ fn enumerated_quarantine(
         .join("record.json");
     fs::create_dir_all(record.parent().unwrap()).unwrap();
     fs::write(record, b"{broken job}").unwrap();
+    configure(&mut config, id);
     let state = Arc::new(Mutex::new(EnumeratedUnits {
         listing: listing.to_string(),
         failed,
@@ -805,6 +818,254 @@ fn enumerated_quarantine(
         id,
         state,
     )
+}
+
+fn quarantine_disk_fixture(
+    f: &Fixture,
+    owner: &str,
+) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>, PathBuf) {
+    let trash = f.config().state_dir().join("trash/evict-me");
+    let reclaim = trash.clone();
+    let (runner, id, state) = enumerated_quarantine_with(f, "", false, |config, id| {
+        config.disable_warm_builds = true;
+        config.free_space_floor_bytes = 100;
+        config.free_space_probe = Arc::new(move |_| Ok(if reclaim.exists() { 10 } else { 200 }));
+        let (mut request, _) = f.run("true");
+        request.job_id = id;
+        let marker = QuarantinedJob {
+            id,
+            request: (owner == "request").then_some(request),
+            process: (owner == "process").then_some(platform::ProcessIdentity {
+                pid: 1,
+                start: 1,
+                unit: Some(Uuid::now_v7()),
+            }),
+            observed_ms: 1,
+        };
+        atomic_json_private(
+            &config
+                .state_dir()
+                .join("quarantine")
+                .join(format!("{id}.json")),
+            &marker,
+        )
+        .unwrap();
+        atomic_json_private(
+            &config
+                .state_dir()
+                .join("jobs")
+                .join(id.to_string())
+                .join("record.json"),
+            &serde_json::json!({"quarantined_job": id}),
+        )
+        .unwrap();
+    });
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("discardable"), b"cache garbage").unwrap();
+    (runner, id, state, trash)
+}
+
+#[test]
+fn empty_placeholder_quarantine_does_not_turn_low_disk_into_permanent_full_disk() {
+    let f = Fixture::new();
+    let (runner, id, _, trash) = quarantine_disk_fixture(&f, "none");
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .cleanup_blocked_by_quarantine,
+        vec![id]
+    );
+    let logs = QuarantineLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+    });
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .matches("disk cleanup proceeding past ownerless quarantine")
+            .count(),
+        1,
+        "{output}"
+    );
+    assert!(
+        output.contains("WARN") && output.contains(&id.to_string()),
+        "{output}"
+    );
+    assert!(
+        !trash.exists(),
+        "an ownerless placeholder must not block eviction"
+    );
+    let health = runner.runner_status().health.unwrap();
+    assert!(health.cleanup_blocked_by_quarantine.is_empty());
+    let mut legacy = serde_json::to_value(&health).unwrap();
+    assert!(legacy.get("cleanup_blocked_by_quarantine").is_none());
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("cleanup_blocked_by_quarantine");
+    assert!(serde_json::from_value::<RunnerHealth>(legacy)
+        .unwrap()
+        .cleanup_blocked_by_quarantine
+        .is_empty());
+    assert!(runner
+        .config()
+        .state_dir()
+        .join("quarantine")
+        .join(format!("{id}.json"))
+        .exists());
+    assert_eq!(runner.job_status(id).unwrap().state, "quarantined");
+    assert!(runner.replay(id, 0).is_err());
+    assert!(runner.ensure_reconciled().is_err());
+    let (mut request, _) = f.run("true");
+    request.job_id = id;
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Duplicate
+    ));
+}
+
+#[test]
+fn recovered_quarantine_owner_keeps_disk_cleanup_and_health_fenced() {
+    for owner in ["request", "process"] {
+        let f = Fixture::new();
+        let (runner, id, _, trash) = quarantine_disk_fixture(&f, owner);
+        assert!(runner.ensure_disk_space().unwrap().is_some());
+        assert!(trash.exists());
+        let health = serde_json::to_value(runner.runner_status().health.unwrap()).unwrap();
+        assert_eq!(
+            health["cleanup_blocked_by_quarantine"],
+            serde_json::json!([id])
+        );
+    }
+}
+
+#[test]
+fn ownerless_quarantine_requires_fresh_complete_idle_inventory_and_no_sandbox() {
+    for blocker in [
+        "failed",
+        "malformed",
+        "unknown",
+        "busy",
+        "launching",
+        "sandbox",
+        "sandbox-error",
+    ] {
+        let f = Fixture::new();
+        let (runner, id, state, trash) = quarantine_disk_fixture(&f, "none");
+        match blocker {
+            "failed" => state.lock().unwrap().failed = true,
+            "malformed" => {
+                state.lock().unwrap().listing = "motor-job-broken.service loaded\n".into()
+            }
+            "unknown" => {
+                state.lock().unwrap().listing = format!(
+                    "{} loaded active running command\n",
+                    backend::host_unit_name(Uuid::now_v7())
+                )
+            }
+            "launching" => {
+                runner
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .launching
+                    .insert(Uuid::now_v7());
+            }
+            "sandbox" => {
+                fs::create_dir_all(
+                    runner
+                        .config()
+                        .state_dir()
+                        .join("sandboxes")
+                        .join(id.to_string()),
+                )
+                .unwrap();
+            }
+            "sandbox-error" => {
+                let path = runner.config().state_dir().join("sandboxes");
+                if path.exists() {
+                    fs::remove_dir_all(&path).unwrap();
+                }
+                fs::write(path, b"not a directory").unwrap();
+            }
+            _ => {}
+        }
+        let busy = (blocker == "busy").then(|| runner.core.quarantine_probe.lock().unwrap());
+        assert!(runner.ensure_disk_space().unwrap().is_some(), "{blocker}");
+        assert!(trash.exists(), "{blocker}");
+        assert_eq!(
+            runner
+                .runner_status()
+                .health
+                .unwrap()
+                .cleanup_blocked_by_quarantine,
+            vec![id]
+        );
+        drop(busy);
+        runner.core.inner.lock().unwrap().launching.clear();
+    }
+}
+
+#[derive(Clone, Default)]
+struct QuarantineLogs(Arc<Mutex<Vec<u8>>>);
+
+impl tracing::Subscriber for QuarantineLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut bytes = self.0.lock().unwrap();
+        write!(bytes, "{} ", event.metadata().level()).unwrap();
+        event.record(&mut QuarantineFields(&mut bytes));
+        writeln!(bytes).unwrap();
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct QuarantineFields<'a>(&'a mut Vec<u8>);
+impl tracing::field::Visit for QuarantineFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        write!(self.0, "{}={value:?} ", field.name()).unwrap();
+    }
+}
+
+#[test]
+fn quarantine_cleanup_errors_name_ids_and_are_limited_to_once_per_five_minutes() {
+    let f = Fixture::new();
+    let (runner, id, _, trash) = quarantine_disk_fixture(&f, "request");
+    let logs = QuarantineLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        fs::remove_dir_all(&trash).unwrap();
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+        assert!(
+            logs.0.lock().unwrap().is_empty(),
+            "no eviction was requested"
+        );
+        fs::create_dir_all(&trash).unwrap();
+        for advance in [0, 0, 299_999, 1] {
+            f.clock.fetch_add(advance, Ordering::SeqCst);
+            assert!(runner.ensure_disk_space().unwrap().is_some());
+        }
+    });
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .matches("runner disk cleanup blocked by quarantine")
+            .count(),
+        2,
+        "{output}"
+    );
+    assert_eq!(output.matches(&id.to_string()).count(), 2, "{output}");
+    assert_eq!(output.matches("ERROR").count(), 2, "{output}");
 }
 
 #[test]

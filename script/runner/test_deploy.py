@@ -48,7 +48,7 @@ class PermissionsPolicyTests(unittest.TestCase):
 class DeployTests(unittest.TestCase):
     def run_deploy(self, job, *, resume=True, drain="timeout", fail_start=False,
                     instance="main", default_state_root=False, decoys=False, drain_timeout=None,
-                    helper_valid=True, canary='pass', canary_timeout=None):
+                    helper_valid=True, canary='pass', canary_timeout=None, quarantine=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
@@ -59,6 +59,11 @@ class DeployTests(unittest.TestCase):
             state.mkdir(parents=True)
             (root / 'admission').write_text('open')
             (state / "record.json").write_text(json.dumps(job))
+            if quarantine is not None:
+                folder = state_root / instance / 'quarantine'
+                folder.mkdir()
+                for name in quarantine:
+                    (folder / name).write_text('{}')
             if decoys:
                 for decoy in (root / "state/windows/jobs/wrong-root",
                               state_root / "main/jobs/wrong-instance"):
@@ -144,6 +149,24 @@ fi
 
     def job(self, **extra):
         return dict(dict(id="survivor-job", state="Running", terminal=None, started_ms=1), **extra)
+
+    def test_swap_and_rollback_warn_with_quarantine_folder_listing(self):
+        for canary in ('pass', 'exit-1'):
+            for instance in ('main', 'e2e'):
+                with self.subTest(canary=canary, instance=instance):
+                    result, _, _ = self.run_deploy(self.job(), drain='complete', canary=canary,
+                                                  instance=instance, quarantine=['damaged-job.json'])
+                    self.assertEqual(result.returncode, 0 if canary == 'pass' else 1)
+                    self.assertIn('WARNING: runner quarantine is not empty:', result.stderr)
+                    self.assertIn(f'/{instance}/quarantine', result.stderr)
+                    self.assertIn('damaged-job.json', result.stderr)
+
+    def test_empty_or_missing_quarantine_does_not_warn(self):
+        for quarantine in (None, []):
+            with self.subTest(quarantine=quarantine):
+                result, _, _ = self.run_deploy(self.job(), drain='complete', quarantine=quarantine)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('WARNING: runner quarantine', result.stderr)
 
     def test_timeout_recoverable_unit_proceeds_to_swap(self):
         result, log, admission = self.run_deploy(self.job(request={}, process=dict(unit="fake-unit", pid=42)))

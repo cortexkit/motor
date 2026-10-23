@@ -35,6 +35,17 @@ install -m 755 "$candidate" "$live.new"
 admission_held=false
 stopped=false
 rollback=
+warn_quarantine() {
+  local folder="$state_root/$instance/quarantine" contents
+  [ -d "$folder" ] || return 0
+  if contents=$(ls -A -- "$folder" 2>&1); then
+    if [ -n "$contents" ]; then
+      printf 'WARNING: runner quarantine is not empty: %s\n%s\n' "$folder" "$contents" >&2
+    fi
+  else
+    printf 'WARNING: could not inspect runner quarantine: %s\n%s\n' "$folder" "$contents" >&2
+  fi
+}
 cleanup() {
   result=$?
   trap - EXIT
@@ -49,6 +60,7 @@ cleanup() {
     else
       echo "Rollback failed; manually restore $rollback and start $unit" >&2
     fi
+    warn_quarantine
   fi
   if [ "$admission_held" = true ] && [ "$stopped" = false ]; then
     admin="$live.new"
@@ -114,5 +126,6 @@ else
 fi
 stopped=false
 admission_held=false
+warn_quarantine
 "$live" --version
 printf 'deployed %s; rollback executable: %s\n' "$unit" "$rollback"
