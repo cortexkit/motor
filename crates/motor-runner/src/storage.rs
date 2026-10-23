@@ -105,16 +105,16 @@ impl ReturnedFiles {
 
     /// The manifest a replay sends once the bytes are gone: at its original
     /// seq, each returned entry failed as `expired` with its size, other
-    /// failures unchanged, and no returned bytes.
+    /// failures unchanged, and no returned bytes. Original chunk counts remain
+    /// available to check the replay's sequence gap; legacy entries keep none.
     pub fn expired_manifest(&self) -> ReturnManifest {
         let mut manifest = self.manifest.clone();
         for entry in &mut manifest.files {
             if let ReturnManifestOutcome::Returned { size, .. } = entry.outcome {
-                *entry = ReturnManifestEntry::failed(
-                    entry.path.clone(),
-                    ReturnPathsFailureCause::Expired,
-                )
-                .with_size(size);
+                entry.outcome = ReturnManifestOutcome::Failed {
+                    cause: ReturnPathsFailureCause::Expired,
+                    size: Some(size),
+                };
             }
         }
         manifest.total_bytes = 0;

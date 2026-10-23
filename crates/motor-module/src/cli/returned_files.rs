@@ -82,7 +82,7 @@ impl Returns {
         }
     }
 
-    pub(super) fn manifest(&mut self, manifest: &shared::ReturnManifest) {
+    pub(super) fn manifest(&mut self, manifest: &shared::ReturnManifest, last_output_seq: u64) {
         self.requested(
             manifest
                 .files
@@ -97,7 +97,16 @@ impl Returns {
             .assembler
             .take()
             .unwrap_or_else(|| motor_protocol::ReturnAssembler::new(&self.requested, self.cap));
-        match assembler.finish(manifest) {
+        let verified = if manifest
+            .files
+            .iter()
+            .any(|entry| entry.cause() == Some(&shared::ReturnPathsFailureCause::Expired))
+        {
+            assembler.finish_expired_replay(manifest, last_output_seq)
+        } else {
+            assembler.finish(manifest)
+        };
+        match verified {
             Ok(verified) => {
                 self.result = Some(
                     verified

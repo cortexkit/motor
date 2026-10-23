@@ -153,6 +153,7 @@ fn assemble(frames: &[Frame], run: &Run) -> (Vec<Option<Vec<u8>>>, ReturnManifes
     let mut bytes = vec![Vec::new(); run.return_paths.len()];
     let mut seqs = Vec::new();
     let mut manifest = None;
+    let mut last_output_seq = 0;
     for frame in frames {
         match frame {
             Frame::ReturnChunk(chunk) => {
@@ -164,11 +165,22 @@ fn assemble(frames: &[Frame], run: &Run) -> (Vec<Option<Vec<u8>>>, ReturnManifes
             }
             Frame::ReturnManifest(record) => manifest = Some(record.clone()),
             Frame::ReturnResult(_) => panic!("a chunked request never gets return_result"),
+            Frame::Output(output) => last_output_seq = output.seq,
             _ => {}
         }
     }
     let manifest = manifest.expect("chunked request replays its manifest");
-    let verified = assembler.finish(&manifest).unwrap();
+    let verified = if manifest
+        .files
+        .iter()
+        .any(|entry| entry.cause() == Some(&ReturnPathsFailureCause::Expired))
+    {
+        assembler
+            .finish_expired_replay(&manifest, last_output_seq)
+            .unwrap()
+    } else {
+        assembler.finish(&manifest).unwrap()
+    };
     let files = verified
         .iter()
         .zip(bytes)
@@ -288,6 +300,14 @@ async fn return_chunked_replay_after_one_hour_skips_chunks_and_leaves_a_seq_gap(
             panic!("output precedes the manifest: {frames:?}")
         };
         assert_eq!(before.seq + 1, seqs[0], "the gap is exactly the chunks");
+        assert_eq!(manifest.files[0].chunks(), Some(2));
+        assert_eq!(manifest.files[1].chunks(), Some(0));
+        let count: u64 = manifest
+            .files
+            .iter()
+            .map(|entry| u64::from(entry.chunks().unwrap()))
+            .sum();
+        assert_eq!(manifest.seq - before.seq - 1, count);
         assert_eq!(
             manifest.files[0].cause(),
             Some(&ReturnPathsFailureCause::Expired)

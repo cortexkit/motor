@@ -120,11 +120,12 @@ fn caller_manifest_echoes_requested_paths_by_position() {
         Uuid::nil(),
         7,
         vec![
-            shared::ReturnManifestEntry::returned("/w/key/sub/./out", 1, "digest"),
+            shared::ReturnManifestEntry::returned("/w/key/sub/./out", 1, "digest").with_chunks(1),
             shared::ReturnManifestEntry::failed(
                 "/w/key/sub/missing",
                 shared::ReturnPathsFailureCause::Missing,
-            ),
+            )
+            .with_chunks(0),
         ],
         1,
         10,
@@ -134,6 +135,8 @@ fn caller_manifest_echoes_requested_paths_by_position() {
     assert_eq!(caller.files[0].path(), "./out");
     assert_eq!(caller.files[1].path(), "missing");
     assert_eq!(caller.files[0].sha256(), Some("digest"));
+    assert_eq!(caller.files[0].chunks(), Some(1));
+    assert_eq!(caller.files[1].chunks(), Some(0));
     assert_eq!(
         (caller.seq, caller.total_bytes, caller.cap_bytes),
         (7, 1, 10)

@@ -60,11 +60,10 @@ fn stream(id: Uuid, paths: &[String], chunked: bool, bytes: &[u8]) -> Vec<serde_
             shared::ReturnManifest::new(
                 id,
                 records.len() as u64,
-                vec![shared::ReturnManifestEntry::returned(
-                    &paths[0],
-                    bytes.len() as u64,
-                    digest
-                )],
+                vec![
+                    shared::ReturnManifestEntry::returned(&paths[0], bytes.len() as u64, digest)
+                        .with_chunks(records.len() as u32)
+                ],
                 bytes.len() as u64,
                 shared::RETURN_CHUNKED_MAX_BYTES_CAP
             )
@@ -124,15 +123,23 @@ async fn run(client: &FakeRunner, paths: Vec<String>, attach: bool) -> (u8, Stri
 
 #[tokio::test]
 async fn cli_return_v1_and_v2_write_files_and_reattach() {
-    for chunked in [false, true] {
+    for (chunked, counted) in [(false, false), (true, false), (true, true)] {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-return-stream");
         let root = fs::canonicalize(scratch.path()).unwrap();
         let path = root.join(".cortexkit/gate/return-probe.txt");
         let paths = vec![path.to_str().unwrap().to_owned()];
         let bytes = vec![b'x'; if chunked { 700_000 } else { 8 }];
+        let mut records = stream(Uuid::now_v7(), &paths, chunked, &bytes);
+        if chunked && !counted {
+            let manifest = records.len() - 2;
+            records[manifest]["files"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("chunks");
+        }
         let client = FakeRunner {
             root,
-            records: stream(Uuid::now_v7(), &paths, chunked, &bytes),
+            records,
             submissions: AtomicUsize::new(0),
         };
         for attach in [false, true] {
@@ -290,6 +297,110 @@ async fn cli_return_invalid_digest_never_installs_unverified_bytes() {
         "{err}"
     );
     assert!(!Path::new(&paths[0]).exists());
+}
+
+#[tokio::test]
+async fn cli_return_miscounted_or_partial_counts_never_install_bytes() {
+    for partial in [false, true] {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-return-counts");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        let mut paths = vec![root.join("out").to_str().unwrap().to_owned()];
+        let mut records = stream(Uuid::now_v7(), &paths, true, b"bytes");
+        if partial {
+            paths.push(root.join("missing").to_str().unwrap().to_owned());
+            records[1]["files"].as_array_mut().unwrap().push(json!(
+                shared::ReturnManifestEntry::failed(
+                    &paths[1],
+                    shared::ReturnPathsFailureCause::Missing
+                )
+            ));
+            records[0]["return_paths"] = json!(paths);
+        } else {
+            records[1]["files"][0]["chunks"] = json!(2);
+        }
+        let client = FakeRunner {
+            root,
+            records,
+            submissions: AtomicUsize::new(0),
+        };
+        let (code, err) = run(&client, paths.clone(), false).await;
+        assert_eq!(code, 23);
+        assert!(
+            err.contains(&format!("not returned {}: read_error", paths[0])),
+            "{err}"
+        );
+        assert!(!Path::new(&paths[0]).exists());
+    }
+}
+
+#[tokio::test]
+async fn cli_return_expired_replay_checks_counts_against_gap_with_or_without_output() {
+    for last_output in [None, Some(7)] {
+        for (gap, partial) in [(3, false), (4, false), (3, true)] {
+            let scratch = cortexkit_test_support::ScratchDir::new("cli-return-expired-counts");
+            let root = fs::canonicalize(scratch.path()).unwrap();
+            let paths = vec![
+                root.join("expired").to_str().unwrap().to_owned(),
+                root.join("read-error").to_str().unwrap().to_owned(),
+            ];
+            let id = Uuid::now_v7();
+            let mut records = Vec::new();
+            if let Some(seq) = last_output {
+                records.push(json!(StreamRecord::Output(motor_protocol::Output::new(
+                    seq,
+                    OutputStream::Stdout,
+                    motor_protocol::BytePayload(Vec::new())
+                ))));
+            }
+            let mut manifest = json!(StreamRecord::ReturnManifest(shared::ReturnManifest::new(
+                id,
+                last_output.unwrap_or(0) + 1 + gap,
+                vec![
+                    shared::ReturnManifestEntry::failed(
+                        &paths[0],
+                        shared::ReturnPathsFailureCause::Expired
+                    )
+                    .with_size(700_000)
+                    .with_chunks(2),
+                    shared::ReturnManifestEntry::failed(
+                        &paths[1],
+                        shared::ReturnPathsFailureCause::ReadError
+                    )
+                    .with_size(600_000)
+                    .with_chunks(1),
+                ],
+                0,
+                shared::RETURN_CHUNKED_MAX_BYTES_CAP,
+            )));
+            if partial {
+                manifest["files"][1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("chunks");
+            }
+            manifest["return_paths"] = json!(paths);
+            records.extend([manifest, terminal(id)]);
+            let client = FakeRunner {
+                root,
+                records,
+                submissions: AtomicUsize::new(0),
+            };
+            for attach in [false, true] {
+                let (code, err) = run(&client, paths.clone(), attach).await;
+                assert_eq!(code, 23);
+                let expected = if gap == 3 && !partial {
+                    "expired"
+                } else {
+                    "read_error"
+                };
+                assert!(
+                    err.contains(&format!("not returned {}: {expected}", paths[0])),
+                    "{err}"
+                );
+                assert!(paths.iter().all(|path| !Path::new(path).exists()));
+            }
+        }
+    }
 }
 
 #[test]
