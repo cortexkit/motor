@@ -1200,7 +1200,12 @@ async fn consume<C: ExecClient + ?Sized>(
             }
             StreamRecord::ReturnResult(result) => session.returns.legacy(&result),
             StreamRecord::ReturnChunk(chunk) => session.returns.chunk(&chunk),
-            StreamRecord::ReturnManifest(manifest) => session.returns.manifest(&manifest),
+            StreamRecord::ReturnManifest(manifest) => {
+                // Started occupies sequence zero even when the job emits no output.
+                session
+                    .returns
+                    .manifest(&manifest, last_output_seq.unwrap_or(0))
+            }
             _ => {}
         }
     }

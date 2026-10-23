@@ -257,14 +257,21 @@ impl ChunkedCollection {
     /// after the job's output and before its terminal record.
     pub(crate) fn commit(&self, job_id: Uuid, next_seq: &mut u64) -> ReturnedFiles {
         let mut chunks = self.chunks.clone();
+        let mut counts = vec![0u32; self.files.len()];
         for chunk in &mut chunks {
             chunk.seq = *next_seq;
             *next_seq += 1;
+            counts[chunk.path_index as usize] += 1;
         }
         let manifest = ReturnManifest::new(
             job_id,
             *next_seq,
-            self.files.clone(),
+            self.files
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, entry)| entry.with_chunks(counts[index]))
+                .collect(),
             self.total_bytes,
             self.cap_bytes,
         );
@@ -899,6 +906,7 @@ mod tests {
         );
         let (files, manifest) = verify(&run, &job, &collection);
         assert_eq!(files, vec![None]);
+        assert_eq!(manifest.files[0].chunks(), Some(0));
         assert_eq!(
             cause(&manifest, 0),
             Some((ReturnPathsFailureCause::OverCap, Some(cap + 1)))
@@ -923,6 +931,7 @@ mod tests {
         let (files, manifest) = verify(&run, &job, &collection);
         assert!(files[0].is_some() && files[1].is_some());
         assert_eq!(files[2], None);
+        assert_eq!(manifest.files[2].chunks(), Some(0));
         assert_eq!(
             cause(&manifest, 2),
             Some((ReturnPathsFailureCause::OverCap, Some(1)))
@@ -995,6 +1004,8 @@ mod tests {
             Some((ReturnPathsFailureCause::ReadError, Some(600 * 1024)))
         );
         assert_eq!(manifest.total_bytes, 4);
+        assert_eq!(manifest.files[0].chunks(), Some(0));
+        assert_eq!(manifest.files[1].chunks(), Some(1));
         // Only the kept file's chunk remains on disk.
         assert_eq!(
             fs::read_dir(job.join(&collection.directory))
@@ -1002,6 +1013,92 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn return_chunked_manifest_counts_only_committed_chunks_for_each_path() {
+        let dir = ScratchDir::new("return-chunked-counts");
+        let root = dir.join("workspace");
+        let job = dir.join("job");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&job).unwrap();
+        let empty = root.join("empty");
+        let kept = root.join("kept");
+        let growing = root.join("growing");
+        let content = pattern(RETURN_CHUNK_MAX_BYTES * 3 / 2, 5);
+        fs::write(&empty, b"").unwrap();
+        fs::write(&kept, &content).unwrap();
+        fs::write(&growing, &content).unwrap();
+        let run = chunked(
+            &root,
+            &[&empty, &kept, &growing],
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        );
+        let collection = collect_chunked_before_read(&run, &job, |index| {
+            if index == 2 {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&growing)
+                    .unwrap()
+                    .write_all(b"more")
+                    .unwrap();
+            }
+        });
+        let (files, manifest) = verify(&run, &job, &collection);
+        assert_eq!(files, vec![Some(Vec::new()), Some(content.clone()), None]);
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|entry| entry.chunks())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(2), Some(0)]
+        );
+        assert_eq!(
+            cause(&manifest, 2),
+            Some((
+                ReturnPathsFailureCause::ReadError,
+                Some(content.len() as u64)
+            ))
+        );
+        assert_eq!(collection.chunks.len(), 2);
+        assert!(collection.chunks.iter().all(|chunk| chunk.path_index == 1));
+        assert_eq!(manifest.total_bytes, content.len() as u64);
+    }
+
+    #[test]
+    fn return_chunked_legacy_expired_manifest_omits_all_counts() {
+        let stored = ReturnedFiles {
+            directory: "returned-legacy".into(),
+            chunks: Vec::new(),
+            manifest: ReturnManifest::new(
+                Uuid::nil(),
+                3,
+                vec![
+                    ReturnManifestEntry::returned("kept", 1, "digest"),
+                    ReturnManifestEntry::failed("missing", ReturnPathsFailureCause::Missing),
+                ],
+                1,
+                RETURN_CHUNKED_MAX_BYTES_CAP,
+            ),
+            expired: false,
+        };
+        let wire = serde_json::to_value(&stored).unwrap();
+        assert!(wire["manifest"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.get("chunks").is_none()));
+        let restored: ReturnedFiles = serde_json::from_value(wire).unwrap();
+        let expired = restored.expired_manifest();
+        assert!(expired.files.iter().all(|entry| entry.chunks().is_none()));
+        assert_eq!(
+            expired.files[0].cause(),
+            Some(&ReturnPathsFailureCause::Expired)
+        );
+        assert_eq!(expired.files[0].size(), Some(1));
+        assert_eq!(expired.files[1], stored.manifest.files[1]);
+        assert_eq!(expired.total_bytes, 0);
     }
 
     #[test]
