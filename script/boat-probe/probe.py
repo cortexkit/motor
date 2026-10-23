@@ -951,6 +951,8 @@ def main(report_stream=None):
     parser.add_argument('--cache-repositories', type=Path, help='private pinned bundle manifest for sequential repositories in one clone')
     parser.add_argument('--cache-profile', choices=('legacy', 'hourly', 'baseline'), default='legacy')
     parser.add_argument('--cache-baseline', action='store_true')
+    parser.add_argument('--cache-samples', type=int, choices=(2, 3),
+                        help='read-only samples per class for --cache-profile hourly (default 3)')
     parser.add_argument('--cache-bundle-sha256', help='independently recorded bundle digest from A')
     parser.add_argument('--cache-backends', type=Path, help='backend manifest with owner-only credential file paths')
     parser.add_argument('--cache-prefix', help='same cache-bench/UNIQUE-RUN/ prefix filled on A')
@@ -964,7 +966,7 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
-    if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or any((
+    if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or args.cache_samples or any((
             args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
             args.cache_backends, args.cache_prefix, args.cache_repositories)):
         from cache_bench import validate

@@ -447,7 +447,7 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaisesRegex(bench.BenchError, 'Boat is read-only'):
             bench.benchmark(argparse.Namespace(profile='fill', placement='B'), object())
 
-    def exercise(self, placement, profile='legacy', baseline=False):
+    def exercise(self, placement, profile='legacy', baseline=False, samples=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'fixed'
             root.mkdir()
@@ -483,7 +483,7 @@ class ScheduleTests(unittest.TestCase):
                         'p95_get_ms': 2, 'transfer': {'bytes_downloaded': 400}}) as latency, \
                     contextlib.redirect_stdout(io.StringIO()):
                 bench.benchmark(argparse.Namespace(placement=placement, output=output, prefix=PREFIX,
-                                                   profile=profile, baseline=baseline), S3())
+                                                   profile=profile, baseline=baseline, samples=samples), S3())
             result = json.loads((output / 'results.json').read_text())
             self.assertTrue(result['complete'])
             self.assertEqual(len(latency.call_args_list), 0 if profile in ('fill', 'baseline') else 2)
@@ -516,6 +516,16 @@ class ScheduleTests(unittest.TestCase):
         calls = self.exercise('B', profile='hourly', baseline=True)
         self.assertEqual(calls[0][0], 'no-cache')
         self.assertEqual(len(calls), 4)
+
+    def test_hourly_sample_count_bounds_read_only_rebuilds_and_requires_hourly(self):
+        calls = self.exercise('B', profile='hourly', baseline=True, samples=2)
+        self.assertEqual([c[0] for c in calls], ['no-cache', 'remote-read-only-1', 'remote-read-only-2'])
+        args = bench.parse_args(['--run', '--profile', 'hourly', '--samples', '2', '--placement', 'B',
+                                 '--backends', '/b.json', '--prefix', PREFIX, '--output', '/out'])
+        self.assertEqual(args.samples, 2)
+        for argv in (['--run', '--profile', 'baseline', '--samples', '2'], ['--run', '--profile', 'hourly', '--samples', '4']):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                bench.parse_args(argv + ['--placement', 'B', '--backends', '/b.json', '--prefix', PREFIX, '--output', '/out'])
 
     def test_fill_only_writes_once_and_calibration_only_builds_uncached(self):
         calls = self.exercise('A', profile='fill')

@@ -34,11 +34,14 @@ def validate(parser, args):
     options = (args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
                args.cache_backends, args.cache_prefix, repositories)
     if not args.cache_bench:
-        if any(options) or getattr(args, 'cache_profile', 'legacy') != 'legacy' or getattr(args, 'cache_baseline', False):
+        if (any(options) or getattr(args, 'cache_profile', 'legacy') != 'legacy' or getattr(args, 'cache_baseline', False)
+                or getattr(args, 'cache_samples', None)):
             parser.error('--cache-* options require --cache-bench')
         return
     if getattr(args, 'cache_baseline', False) and getattr(args, 'cache_profile', 'legacy') != 'hourly':
         parser.error('--cache-baseline requires --cache-profile hourly')
+    if getattr(args, 'cache_samples', None) and getattr(args, 'cache_profile', 'legacy') != 'hourly':
+        parser.error('--cache-samples requires --cache-profile hourly')
     if not (args.cache_image and args.cache_backends and (repositories or
             args.cache_bundle and args.cache_bundle_sha256 and args.cache_prefix)):
         parser.error('--cache-bench requires --cache-image, --cache-bundle, --cache-bundle-sha256, --cache-backends and --cache-prefix')
@@ -154,9 +157,10 @@ def run(runner, args):
                        'rm /srv/cache-bench/assets.tar.gz')
                 remote('rm -rf -- /dev/shm/motor-cache-results')
                 baseline = ' --baseline' if getattr(args, 'cache_baseline', False) else ''
+                samples = f" --samples {int(args.cache_samples)}" if getattr(args, 'cache_samples', None) else ''
                 result = remote('env ' + tools + 'python3 /dev/shm/motor-cache-bench.py --run --placement B '
                                 '--backends /dev/shm/motor-cache-backends.json '
-                                f"--prefix {shlex.quote(repository['prefix'])} --profile {profile}{baseline} "
+                                f"--prefix {shlex.quote(repository['prefix'])} --profile {profile}{samples}{baseline} "
                                 '--output /dev/shm/motor-cache-results > /dev/null', checked=False)
                 fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False, reserve=5)
                 if fetched.returncode == 0:
