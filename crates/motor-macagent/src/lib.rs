@@ -1,9 +1,10 @@
 //! Single-job guest execution using the shared macOS agent protocol.
 
+pub use motor_macvm::{BootConfig, Mount, read_boot_config};
 use std::io::{self, Read};
+#[cfg(unix)]
+pub mod mounts;
 
-pub const NONCE_MAGIC: &[u8] = b"MOTOR-NONCE-V1\n";
-pub const NONCE_BYTES: usize = 32;
 pub const VSOCK_PORT: u32 = 5000;
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 pub const BASH: &str = "/opt/motor/bin/bash";
@@ -11,36 +12,17 @@ pub const HOME: &str = "/Users/motorjob";
 pub const PATH: &str =
     "/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// The rest of the raw disk is padding, not part of the nonce.
-pub fn read_nonce(mut disk: impl Read) -> io::Result<String> {
-    let mut header = vec![0; NONCE_MAGIC.len() + NONCE_BYTES + 1];
-    disk.read_exact(&mut header)?;
-    let nonce = &header[NONCE_MAGIC.len()..header.len() - 1];
-    if !header.starts_with(NONCE_MAGIC)
-        || header.last() != Some(&b'\n')
-        || !nonce
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid nonce disk",
-        ));
-    }
-    Ok(String::from_utf8(nonce.to_vec()).expect("hex is UTF-8"))
-}
-
-/// Probe whole raw disks, accepting exactly one magic header. A matching header
-/// with corrupt nonce bytes is an error, not an unrelated disk to skip.
-pub fn find_nonce<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<String> {
+/// Probe whole raw disks, requiring exactly one v2 boot metadata disk.
+/// A matching header with corrupt metadata is an error, not a disk to skip.
+pub fn find_boot_config<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<BootConfig> {
     let mut found = None;
     for mut disk in disks {
-        let mut magic = vec![0; NONCE_MAGIC.len()];
-        if disk.read_exact(&mut magic).is_err() || magic != NONCE_MAGIC {
+        let mut magic = vec![0; motor_macvm::NONCE_HEADER.len()];
+        if disk.read_exact(&mut magic).is_err() || magic != motor_macvm::NONCE_HEADER.as_bytes() {
             continue;
         }
-        let nonce = read_nonce(io::Cursor::new(magic).chain(disk))?;
-        if found.replace(nonce).is_some() {
+        let config = read_boot_config(io::Cursor::new(magic).chain(disk))?;
+        if found.replace(config).is_some() {
             return Err(io::Error::other("multiple nonce disks"));
         }
     }
@@ -50,50 +32,50 @@ pub fn find_nonce<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<Str
 #[cfg(test)]
 mod nonce_tests {
     use super::*;
-
-    fn disk(nonce: &str) -> Vec<u8> {
-        [NONCE_MAGIC, nonce.as_bytes(), b"\n", &[0; 1024]].concat()
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    fn disk() -> Vec<u8> {
+        motor_macvm::nonce_bytes(NONCE, &[]).unwrap()
     }
-
     #[test]
-    fn nonce_header_and_hex_are_exact_and_padding_is_ignored() {
-        let nonce = "0123456789abcdef0123456789abcdef";
-        assert_eq!(read_nonce(&disk(nonce)[..]).unwrap(), nonce);
-        for invalid in [
-            "0123456789ABCDEF0123456789abcdef",
-            "short",
-            "g123456789abcdef0123456789abcdef",
-        ] {
-            assert!(read_nonce(&disk(invalid)[..]).is_err());
-        }
-        let mut wrong_magic = disk(nonce);
-        wrong_magic[0] = b'X';
-        assert!(read_nonce(&wrong_magic[..]).is_err());
-        assert!(read_nonce(&disk(nonce)[..20]).is_err());
+    fn v2_metadata_reader_is_shared_with_host_writer() {
+        let bytes = disk();
+        assert_eq!(read_boot_config(&bytes[..]).unwrap().nonce, NONCE);
+        let mut old = bytes.clone();
+        old[b"MOTOR-NONCE-V".len()] = b'1';
+        assert!(read_boot_config(&old[..]).is_err());
+        let mut corrupt = bytes;
+        *corrupt.last_mut().unwrap() = 1;
+        assert!(read_boot_config(&corrupt[..]).is_err());
     }
-
     #[test]
-    fn discovers_one_nonce_disk_independently_of_enumeration_order() {
-        let nonce = "0123456789abcdef0123456789abcdef";
+    fn discovers_exactly_one_v2_disk_and_rejects_corrupt_matching_disk() {
+        let valid = disk();
         for disks in [
-            vec![vec![0; 512], disk(nonce)],
-            vec![disk(nonce), vec![0; 512]],
+            vec![vec![0; 512], valid.clone()],
+            vec![valid.clone(), vec![0; 512]],
         ] {
-            assert_eq!(find_nonce(disks.iter().map(|d| &d[..])).unwrap(), nonce);
+            assert_eq!(
+                find_boot_config(disks.iter().map(|d| &d[..]))
+                    .unwrap()
+                    .nonce,
+                NONCE
+            );
         }
         assert!(
-            find_nonce([&[0; 512][..]])
+            find_boot_config([&[0; 512][..]])
                 .unwrap_err()
                 .to_string()
                 .contains("not found")
         );
         assert!(
-            find_nonce([&disk(nonce)[..], &disk(nonce)[..]])
+            find_boot_config([&valid[..], &valid[..]])
                 .unwrap_err()
                 .to_string()
                 .contains("multiple")
         );
-        assert!(find_nonce([&disk("corrupt")[..], &disk(nonce)[..]]).is_err());
+        let mut bad = valid.clone();
+        bad[motor_macvm::NONCE_HEADER.len()] = b'g';
+        assert!(find_boot_config([&bad[..], &valid[..]]).is_err());
     }
 }
 

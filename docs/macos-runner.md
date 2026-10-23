@@ -32,15 +32,19 @@ profile, version 1. The Windows profile remains version 4.
 ### Nonce disk and connection
 
 The host attaches exactly two disks: the boot disk and a read-only raw nonce
-disk. At byte zero the nonce disk contains these bytes, with no length prefix:
+disk. At byte zero the nonce disk contains this header, nonce and bounded map:
 
 ```text
-MOTOR-NONCE-V1\n
+MOTOR-NONCE-V2\n
 <32 lowercase ASCII hexadecimal characters>\n
+<4-byte big-endian length><JSON mount map>
 ```
 
 Here `\n` means one newline byte, not two literal characters. Remaining disk
-bytes are padding. The nonce is generated per job. The guest probes whole raw
+bytes are zero padding, to a fixed 69,632-byte disk. The JSON array has at most
+64 entries and is at most 64 KiB: `[{"tag":"workspace","destination":"/Users/motor/repo","read_only":false}, ...]`.
+The nonce is generated per job. There is no v1 reader or compatibility mode.
+The guest probes whole raw
 disk nodes named `/dev/rdiskN` (decimal N, no partition suffix) and requires
 exactly one matching magic header; it does not assume a disk number. A matching
 header with invalid nonce bytes is an error. The raw and corresponding block
@@ -60,8 +64,26 @@ The workspace is mounted read-write at its caller's absolute path. Each sibling
 is mounted read-only at its own caller path, preserving their relative layout.
 The per-job cargo-home share is mounted read-write at
 **`/opt/motor/job/cargo-home`**. No host state, prep tree or persistent cache is
-shared. The host/image setup mounts these before sending `TreeEnd`; the agent
-does not materialize or mount shares.
+shared. The VM helper writes the exact tag/destination/access map retained by
+its job configuration to the nonce disk. Before connecting or sending Hello,
+the root agent validates the complete map and creates missing parent directories
+as root, refusing symlinks in every existing component. Workspace and sibling
+destinations are normalized paths beneath `/Users/`; only the pinned cargo-home
+destination is permitted outside that root. Destinations and tags must be unique,
+destinations must not overlap, the workspace and cargo-home must be read-write,
+and every sibling must be read-only. The nonce disk remains an unmounted raw,
+read-only device, never a guest share.
+The runner emits tags `workspace`, `cargo-home` and `sibling-N` (decimal N),
+with at most 62 siblings so the complete map stays within its 64-entry bound.
+
+The agent runs `/sbin/mount_virtiofs` for each entry (with `-o ro` for siblings),
+then verifies the filesystem type, exact tag, destination and read-only flag
+against the kernel's mount table. Unexpected virtiofs mounts also fail bootstrap.
+Entry-specific failures identify the tag, destination and reason; map-wide
+inventory failures report a general reason. Either exits without connecting, so
+the host refuses the job on its pre-start Hello timeout. The agent never materializes
+source trees. `mounts` portable tests inject the mount system; actual mounts and
+kernel tag spelling still require VM qualification.
 
 The agent runs `/opt/motor/bin/bash -c <command>` as `motorjob`, with caller cwd.
 It clears the inherited daemon environment, applies the Linux caller-env
@@ -84,7 +106,6 @@ may override:
 
 - `--nonce-device /dev/rdiskN`: read this raw device instead of discovery;
 - `--port 5000`: set the host vsock port;
-- `--cargo-home /absolute/guest/mount`: set the cargo-home mount point.
 
 These are not caller-controlled job options. The shell, job account and pinned
 environment have no CLI override. The nonce reader/discovery and environment
@@ -92,6 +113,41 @@ tests, plus the Unix execution tests, run with `cargo test -p motor-macagent`.
 Execution tests substitute a private process group for the whole guest uid, so
 they cannot kill unrelated host processes. Real uid isolation, raw-device
 permissions and vsock authentication still require VM qualification.
+
+## Runner configuration and operator lane
+
+Run `motor-runner serve --backend macos-vm --vm-config <file>`. On macOS every
+other backend requires `--development-allow-host-backend`; production launchd
+configuration must never use that override. The TOML file names absolute `image`
+and `helper` paths, the sealed image's `toolchain_version`, and `[tools.cargo]`,
+`[tools.rustc]`, `[tools.bun]`, `[tools.git]` tables, each with `path` and `sha256`.
+Runner resource trees are beneath its state root, separate from its per-instance
+durable output log. Records in `macvm-records` are fsynced before staging;
+two `macvm-locks/slot-N.lock` files and one admission lock enforce capacity.
+An unproven stop or failed deletion retains both the record and slot, makes
+status unavailable (degraded), and is retried by maintenance without an operator.
+
+The four ignored `macos_qualification_*` integration tests run on the VM host
+against the **installed** launchd daemon through `ck motor run --platform macos`,
+not a test-owned runner or an SSH command shell. Set
+`MOTOR_MACOS_QUALIFICATION_WORKSPACE`, `MOTOR_MACOS_QUALIFICATION_STATE_ROOT`, and
+`MOTOR_MACOS_QUALIFICATION_CRATE` to the disposable qualification fixture and
+named Motor crate. `MOTOR_MACOS_QUALIFICATION_CK` optionally names the installed
+client. The isolation lane requires one sibling fixture named by
+`MOTOR_MACOS_QUALIFICATION_SIBLING`; that path is passed to every job as an explicit
+`--sibling` snapshot. The isolation lane checks the exact three virtiofs mounts,
+fails a sibling write and raw-disk reads as motorjob, and compiles a guest-only
+vsock connection probe using the sealed image's Command Line Tools. The env lane
+checks that tool version against `script/macos-runner/toolchain.json`. The isolation
+lane also observes a guest-written file in the live host job tree and checks its
+motor ownership.
+Keep the provider's existing SYNAPSE workload (its `synapse-work` checkout) active
+for the concurrent lane, and retain the provider operator's confirmation that it
+ran throughout the measurement. This deliberately measures memory and swap while
+the shared Mac also serves its other workload. Start with cold target/prep caches
+and retain the concurrent test's timing,
+minimum free memory, swap observations and service owners. The Bun fixture must have
+locked local sibling dependencies and a darwin-arm64-only package.
 
 ## Host helper and sealed-image layout
 
@@ -101,8 +157,8 @@ or graphics. `job_configuration_has_exact_devices_and_share_access` checks the
 portable plan, and `framework_job_devices_match_portable_plan_without_booting_vm`
 checks its actual framework device arrays on macOS without starting a VM.
 Workspace and cargo-home shares are read-write; siblings are read-only. Tags and
-guest destinations are retained in the plan. The image's root mount setup must
-consume that mapping before the host sends `TreeEnd`.
+guest destinations are retained in the plan and written to the boot metadata
+disk. The root guest agent mounts that mapping before its Hello.
 
 A sealed directory contains four regular read-only files: `disk.img`,
 `auxiliary-storage`, `hardware-model` (the framework's data representation), and
@@ -111,7 +167,7 @@ read-only. `clone_image` makes an APFS `clonefile` copy with no ordinary-copy
 fallback and makes only the clone's boot disk and auxiliary storage writable.
 The runner must record the clone and nonce paths durably **before** creating them;
 creation failures intentionally leave any partial resource for recorded cleanup.
-`create_nonce_disk` exclusively creates a 4096-byte, owner-readable, read-only
+`create_nonce_disk` exclusively creates a 69,632-byte, owner-readable, read-only
 raw image with the nonce format above, zero padding, and fsyncs it and its parent.
 
 `spawn_job_helper(executable, plan, slot_file)` starts one helper per VM, blocked

@@ -763,6 +763,10 @@ impl Runner {
     ) -> io::Result<Option<RunnerDiskFull>> {
         self.ensure_admission_ownership()?;
         let _pressure = self.core.disk.lock().unwrap();
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            return crate::macos::evict(&self.core.config, self.core.trees.mirrors.clone());
+        }
         let floor = self.core.config.free_space_floor_bytes;
         if floor == 0 {
             return Ok(None);

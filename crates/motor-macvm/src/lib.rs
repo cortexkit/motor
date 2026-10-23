@@ -6,7 +6,9 @@
 use motor_winagent::{Frame, MACOS_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const BOOT_DISK: &str = "disk.img";
@@ -14,8 +16,11 @@ pub const AUXILIARY_STORAGE: &str = "auxiliary-storage";
 pub const HARDWARE_MODEL: &str = "hardware-model";
 pub const MACHINE_IDENTIFIER: &str = "machine-identifier";
 pub const VSOCK_PORT: u32 = 5000;
-pub const NONCE_HEADER: &str = "MOTOR-NONCE-V1\n";
-pub const NONCE_DISK_SIZE: usize = 4096;
+mod nonce;
+pub use nonce::{
+    BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, nonce_bytes,
+    read_boot_config,
+};
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -152,6 +157,16 @@ impl JobVmConfig {
     pub fn shares(&self) -> &[Share] {
         &self.shares
     }
+    pub fn mounts(&self) -> Vec<Mount> {
+        self.shares
+            .iter()
+            .map(|share| Mount {
+                tag: share.location.tag.clone(),
+                destination: share.location.guest.clone(),
+                read_only: share.read_only,
+            })
+            .collect()
+    }
     pub fn vsock_devices(&self) -> usize {
         1
     }
@@ -172,56 +187,6 @@ impl JobVmConfig {
     }
 }
 
-pub fn nonce_bytes(nonce: &str) -> io::Result<Vec<u8>> {
-    if nonce.len() != 32
-        || !nonce
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(invalid(
-            "nonce must contain exactly 32 lowercase hexadecimal characters",
-        ));
-    }
-    let mut bytes = format!("{NONCE_HEADER}{nonce}\n").into_bytes();
-    bytes.resize(NONCE_DISK_SIZE, 0);
-    Ok(bytes)
-}
-
-pub fn read_nonce(mut input: impl Read) -> io::Result<String> {
-    let mut bytes = vec![0; NONCE_DISK_SIZE];
-    input.read_exact(&mut bytes)?;
-    let end = NONCE_HEADER.len() + 32;
-    let nonce = std::str::from_utf8(&bytes[NONCE_HEADER.len()..end])
-        .map_err(|_| invalid("invalid nonce disk"))?;
-    if bytes != nonce_bytes(nonce)? {
-        return Err(invalid("invalid nonce disk header or padding"));
-    }
-    Ok(nonce.to_owned())
-}
-
-/// Creates a new disk, never truncating an existing job's secret.
-pub fn create_nonce_disk(path: &Path, nonce: &str) -> io::Result<()> {
-    let bytes = nonce_bytes(nonce)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o400);
-    }
-    let mut disk = options.open(path)?;
-    disk.write_all(&bytes)?;
-    disk.sync_all()?;
-    let mut permissions = disk.metadata()?.permissions();
-    permissions.set_readonly(true);
-    disk.set_permissions(permissions)?;
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| invalid("nonce disk has no parent"))?,
-    )?
-    .sync_all()
-}
-
 /// Consumes the first connection even if its Hello is malformed. Authentication
 /// failure cannot be retried by another process in the same VM.
 pub struct SessionAcceptor {
@@ -232,7 +197,7 @@ pub struct SessionAcceptor {
 
 impl SessionAcceptor {
     pub fn new(nonce: String, image: String) -> io::Result<Self> {
-        nonce_bytes(&nonce)?;
+        nonce::validate_nonce(&nonce)?;
         Ok(Self {
             nonce,
             image,
@@ -726,14 +691,19 @@ mod tests {
             .join(format!("macvm-nonce-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("nonce.raw");
-        create_nonce_disk(&path, NONCE).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        create_nonce_disk(&path, NONCE, &[]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            NONCE_DISK_SIZE as u64
+        );
         assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
         assert_eq!(
-            read_nonce(std::fs::File::open(&path).unwrap()).unwrap(),
+            read_boot_config(std::fs::File::open(&path).unwrap())
+                .unwrap()
+                .nonce,
             NONCE
         );
-        assert!(create_nonce_disk(&path, NONCE).is_err());
+        assert!(create_nonce_disk(&path, NONCE, &[]).is_err());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
@@ -783,12 +753,12 @@ mod tests {
     #[test]
     fn nonce_parser_refuses_bad_header_padding_and_length() {
         for index in [0, NONCE_HEADER.len(), NONCE_DISK_SIZE - 1] {
-            let mut bytes = nonce_bytes(NONCE).unwrap();
+            let mut bytes = nonce_bytes(NONCE, &[]).unwrap();
             bytes[index] = b'X';
-            assert!(read_nonce(bytes.as_slice()).is_err());
+            assert!(read_boot_config(bytes.as_slice()).is_err());
         }
-        assert!(read_nonce(&b"short"[..]).is_err());
-        assert!(nonce_bytes("ABCDEF01234567890123456789012345").is_err());
+        assert!(read_boot_config(&b"short"[..]).is_err());
+        assert!(nonce_bytes("ABCDEF01234567890123456789012345", &[]).is_err());
     }
 }
 

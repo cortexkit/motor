@@ -974,6 +974,7 @@ version = "0.1.0"
 dependencies = [
  "cortexkit-test-support",
  "libc",
+ "motor-macvm",
  "motor-protocol",
  "motor-winagent",
  "tempfile",
@@ -1059,6 +1060,7 @@ dependencies = [
  "cortexkit-test-support",
  "fs2",
  "libc",
+ "motor-macvm",
  "motor-protocol",
  "motor-winagent",
  "rand 0.8.7",

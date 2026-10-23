@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 
 [target.'cfg(unix)'.dependencies]
 cortexkit-cow = "=0.1.1"
+motor-macvm = { path = "../motor-macvm" }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true, features = ["io-std"] }

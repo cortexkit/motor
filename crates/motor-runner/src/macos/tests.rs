@@ -839,3 +839,129 @@ fn binary_bun_lock_refusal_is_actionable_before_fetch() {
     assert!(!job.join("cargo-home").exists());
     assert!(!job.join("Users/motor/project/node_modules").exists());
 }
+
+#[test]
+fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
+    let f = Fixture::new();
+    let request = f.request();
+    let prepared = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    let mut config = crate::engine::Config::new(f.staging.state.clone(), "macos");
+    config.free_space_probe = Arc::new(|_| Ok(30 << 30));
+    config.macos = Some(Arc::new(VmConfig {
+        image: "/image".into(),
+        helper: "/helper".into(),
+        tools: f.staging.tools.clone(),
+        toolchain_version: "sealed".into(),
+    }));
+    let control = Control {
+        cancel: Cancellation::default(),
+        deadline: Instant::now() + PREP_TIMEOUT,
+    };
+    let path_lock = control
+        .lock(&f.staging.path_lock(&request.workspace_key))
+        .unwrap();
+    let prep_lock = control.lock(&config.state_root.join("prep.lock")).unwrap();
+    let entry = config
+        .macos_runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    config
+        .macos_runtime
+        .workspace(&config.state_root, &entry)
+        .unwrap();
+    let canonical = config
+        .state_root
+        .join("canonical")
+        .join(mapped(&request.workspace_key).unwrap());
+    let store = config
+        .state_root
+        .join("targets")
+        .join(lifecycle::key(&request.workspace_key));
+    host::create_dir_all(&store).unwrap();
+    host::write(store.join("cached"), "whole").unwrap();
+    assert!(evict(&config, f.staging.trees.mirrors.clone())
+        .unwrap()
+        .is_none());
+    assert!(canonical.exists());
+    assert!(store.exists());
+    assert!(config.state_root.join("prep-cargo").exists());
+    // Other tests fork children concurrently; explicitly unlock so inherited
+    // CLOEXEC descriptors cannot extend this fixture's deliberate lock hold.
+    fs2::FileExt::unlock(&path_lock).unwrap();
+    fs2::FileExt::unlock(&prep_lock).unwrap();
+    drop(path_lock);
+    drop(prep_lock);
+    let workspace_lock = entry.owned.lock().unwrap().workspace_lock.take().unwrap();
+    fs2::FileExt::unlock(&workspace_lock).unwrap();
+    assert!(canonical.join(".git").is_dir());
+    evict(&config, f.staging.trees.mirrors.clone()).unwrap();
+    assert!(!canonical.exists());
+    assert!(!store.exists());
+    assert!(!config.state_root.join("prep-cargo").exists());
+    assert!(prepared.workspace.exists());
+    config.free_space_probe = Arc::new(|_| Ok(19 << 30));
+    assert!(evict(&config, f.staging.trees.mirrors.clone())
+        .unwrap()
+        .is_some());
+}
+#[test]
+fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let mut request = f.request();
+    let config = crate::engine::Config::new(f.staging.state.clone(), "macos");
+    let runtime = Runtime::default();
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let first = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    let marker = f.scratch.join("marker");
+    let sentinel = f.scratch.join("sentinel");
+    host::create_dir(&sentinel).unwrap();
+    host::write(sentinel.join("whole"), "unchanged").unwrap();
+    let script = format!("#!/bin/sh\nprintf poisoned > '{}'\n", marker.display());
+    let hook = first.workspace.join(".git/hooks/post-checkout");
+    host::create_dir_all(hook.parent().unwrap()).unwrap();
+    tool(hook, &script);
+    host::write(
+        first.workspace.join(".git/config"),
+        format!(
+            "[core]\nfsmonitor = sh -c 'printf poisoned > {}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    host::create_dir(first.workspace.join("node_modules")).unwrap();
+    symlink(&config.state_root, first.workspace.join("node_modules/x")).unwrap();
+    symlink(&sentinel, first.workspace.join("target")).unwrap();
+    assert!(execution::target_out(&config, &entry, &first.workspace).is_err());
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    runtime.finish(&config.state_root, &entry);
+    request.job_id = uuid::Uuid::now_v7();
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let second = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    execution::target_in(&config, &entry, &second).unwrap();
+    host::create_dir(second.workspace.join("target")).unwrap();
+    host::write(second.workspace.join("target/whole"), "new job").unwrap();
+    execution::target_out(&config, &entry, &second.workspace).unwrap();
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    runtime.finish(&config.state_root, &entry);
+    assert!(!marker.exists());
+    assert_eq!(
+        host::read_to_string(sentinel.join("whole")).unwrap(),
+        "unchanged"
+    );
+    assert!(!second.workspace.exists());
+    assert!(!first.workspace.exists());
+}

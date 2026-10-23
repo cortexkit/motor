@@ -314,7 +314,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm] [--tenant-vm] [--vm-config FILE]",
+              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend]",
         )),
     }
 }
@@ -334,6 +334,10 @@ fn configure_options(
         if arg == "--boat-profile" {
             config.boat_profile = true;
             config.disk_reserve_bytes = motor_runner::BOAT_DISK_RESERVE_BYTES;
+            continue;
+        }
+        if arg == "--development-allow-host-backend" {
+            config.development_allow_host_backend = true;
             continue;
         }
         let value = args
@@ -616,7 +620,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("expected host, vm or windows-vm"));
+            .contains("expected host, vm, windows-vm or macos-vm"));
     }
 
     #[test]

@@ -440,14 +440,15 @@ async fn session(
     send(
         tx,
         Frame::Hello {
-            return_paths: !runner.config().windows_instance(),
-            return_chunked: !runner.config().windows_instance(),
+            return_paths: !runner.config().vm_instance(),
+            return_chunked: !runner.config().vm_instance(),
             protocol_version: PROTOCOL_VERSION,
             started: supports_started,
             default_branch_tip: supports_default_branch_tip,
             gate_jobs: supports_gate_jobs,
             platforms: match runner.config().served_platform() {
                 Platform::Windows => vec!["windows".into()],
+                Platform::Macos => vec!["macos".into()],
                 _ => Vec::new(),
             },
         },

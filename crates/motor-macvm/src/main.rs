@@ -331,7 +331,7 @@ mod native {
             }
             let _slot = File::from_raw_fd(4);
             let session = UnixStream::from_raw_fd(3);
-            let nonce = read_nonce(File::open(&plan.request().nonce_disk)?)?;
+            let nonce = read_boot_config(File::open(&plan.request().nonce_disk)?)?.nonce;
             let config = job_configuration(&plan)?;
             let vm = VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &config);
             let state = ListenerState {

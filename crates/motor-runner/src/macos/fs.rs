@@ -26,6 +26,59 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 impl Dir {
+    pub(super) fn sync_all(&self) -> io::Result<()> {
+        for name in self.names()? {
+            match self.kind(&name)? {
+                libc::S_IFDIR => self.child(&name, false)?.sync_all()?,
+                libc::S_IFREG => self.file(&name, false)?.sync_all()?,
+                _ => {}
+            }
+        }
+        self.0.sync_all()
+    }
+    pub(super) fn publish(
+        &self,
+        temporary: &std::ffi::OsStr,
+        store: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        let from = c(temporary)?;
+        let to = c(store)?;
+        if self.contains(store)? {
+            self.child(store, false)?;
+            #[cfg(target_os = "macos")]
+            cv(unsafe {
+                libc::renameatx_np(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    self.0.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_SWAP,
+                )
+            })?;
+            #[cfg(target_os = "linux")]
+            cv(unsafe {
+                libc::renameat2(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    self.0.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            })?;
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            return Err(invalid("atomic target exchange is unsupported"));
+        } else {
+            cv(unsafe {
+                libc::renameat(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    self.0.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            })?;
+        }
+        self.0.sync_all()
+    }
     pub(super) fn open(path: &Path, create: bool) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("host tree must be absolute"));

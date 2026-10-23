@@ -32,7 +32,7 @@ pub(crate) mod vm;
 #[cfg(windows)]
 #[path = "windows/hyperv.rs"]
 pub(crate) mod vm;
-pub(crate) use agent::{PreparedVm, Runtime};
+pub(crate) use agent::Runtime;
 pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
@@ -225,7 +225,7 @@ impl Backend for WindowsBackend {
         _weight: u32,
     ) -> io::Result<Launch> {
         let execution = prepared
-            .windows
+            .vm
             .as_ref()
             .ok_or_else(|| invalid("Windows VM was not prepared"))?
             .lock()
@@ -239,7 +239,7 @@ impl Backend for WindowsBackend {
                 unit: Some(setup.id),
             }),
             durable_output: false,
-            execution: Box::new(execution),
+            execution,
         })
     }
     fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {

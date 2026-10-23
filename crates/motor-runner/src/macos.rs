@@ -18,9 +18,14 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod execution;
 mod fs;
+mod lifecycle;
 mod preflight;
 mod process;
+pub(crate) use execution::MacosBackend;
+pub(crate) use lifecycle::evict;
+pub(crate) use lifecycle::{Runtime, VmConfig};
 #[cfg(test)]
 mod tests;
 use fs::Dir;
@@ -30,6 +35,11 @@ pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Validate identifiers without inspecting or touching the corresponding host paths.
 pub fn validate_paths(request: &Run) -> io::Result<()> {
+    if request.siblings.len() > 62 {
+        return Err(invalid(
+            "macos_path_invalid: at most 62 sibling shares are supported",
+        ));
+    }
     for path in [
         &request.repository_root,
         &request.workspace_key,
@@ -71,12 +81,12 @@ fn mapped(path: &str) -> io::Result<&Path> {
 }
 
 /// Path to a standalone tool binary and its expected SHA-256.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct Tool {
     pub path: PathBuf,
     pub sha256: String,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct Tools {
     pub cargo: Tool,
     pub rustc: Tool,
