@@ -725,10 +725,18 @@ filesystem-attribute setter ioctls (`FS_IOC_FSSETXATTR`, native and compat
 inheritance on a newly created directory and allocate uncharged project-0 files.
 The x86-64, x32 and i386 paths are covered; attribute getters and unrelated
 ioctls remain allowed. `chattr` **setting** flags may notice this restriction;
-normal builds do not need these setters. Non-Boat build-server and tenant units are
-unchanged. The filter interpreter exercises both sides of every jump, and a
-forked-child test checks actual setter/getter syscalls. The operator disk-quota
-probe also attempts to clear inheritance before filling the same directory.
+normal builds do not need these setters. `file_setattr` (native syscall 469 and
+its x32/i386 equivalents) returns ENOSYS so it cannot bypass the refused ioctls;
+`file_getattr` remains allowed. Non-Boat build-server and tenant units are
+unchanged. The filter interpreter exercises both sides of every jump. The
+forked-child ioctl test uses fd -1 and proves interception only, not refusal on
+a real inode. The file_setattr child test uses a distinct test errno, not a
+kernel's potentially unimplemented-syscall ENOSYS. Actual FSSETXATTR inode
+refusals are proved by the operator probe with successful unfiltered root
+FSSETXATTR controls;
+the job then fills the same directory whose inheritance it could not clear.
+When job-side refusal checks pass but the unfiltered root control reports
+ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS.
 
 ## Fast startup checks and failure evidence
 

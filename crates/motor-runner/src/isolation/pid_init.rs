@@ -189,7 +189,7 @@ fn check_runner_path(running: &Path, installed: &Path) -> io::Result<()> {
     }
     if running.canonicalize()? != installed {
         return Err(io::Error::other(format!(
-            "--boat-profile on systemd before 257 runs each job's PID namespace init from {}; this runner is {}. Run the installed runner",
+            "--boat-profile runs each job's PID namespace init from {}; this runner is {}. Run the installed runner",
             installed.display(), running.display()
         )));
     }
