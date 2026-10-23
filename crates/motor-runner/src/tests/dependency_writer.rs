@@ -261,7 +261,7 @@ async fn writer_lockfile_mutation_fails_and_scratch_is_removed() {
 }
 
 #[tokio::test]
-async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_hosts() {
+async fn writer_is_a_singleton_that_waits_for_free_permits_on_large_and_small_hosts() {
     for capacity in [16, 2] {
         let f = Fixture::new();
         let writer_release = f.scratch.join("writer-release");
@@ -290,7 +290,11 @@ async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_h
             ),
         );
         first.weight_hint = Some(capacity);
-        f.submit(&runner, &first, &bytes);
+        // Submitted as a branch tip, so that it queues no fill: a fill queued
+        // with it would take its permits first.
+        assert_run_accepted(&runner, &first);
+        let spool = f.spool(&runner, &first, &bytes);
+        runner.fetch_run(&first, &spool.directory, false).unwrap();
         until(|| {
             runner
                 .status()
@@ -902,37 +906,108 @@ fn failed_descriptor_request_queues_nothing() {
     );
 }
 
+/// Under steady load the foreground queue never empties, and the oldest
+/// queued job usually waits for more permits than are free. A cache fill
+/// must still get through: it is tried before that job and takes only free
+/// permits, the repository whose jobs arrived last fills first, and the
+/// single writer slot keeps the next fill waiting until this one ends.
 #[tokio::test]
-async fn queued_foreground_blocks_writer_even_when_writer_fits_idle_capacity() {
+async fn one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit() {
     let f = Fixture::new();
+    let release = f.scratch.join("fill-release");
     let mut config = f.config();
     config.max_weight = 16;
+    config.base_commands = vec![format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    )];
     let runner = Runner::open(config).unwrap();
-    let (r, bytes) = f.run("true");
-    let upload = f.spool(&runner, &r, &bytes);
-    let mut prepare = prepare_for(&r);
-    prepare.bundles = r.bundles.clone();
+    // Two repositories with mirrors: the fixture's main one, and commons.
+    let (main, bytes) = f.run("true");
+    let upload = f.spool(&runner, &main, &bytes);
+    let mut prepare = prepare_for(&main);
+    prepare.bundles = main.bundles.clone();
     runner.fetch_prepare(&prepare, &upload.directory).unwrap();
-    let id = {
+    let (mut commons, _) = job_at(&f, "commons-job", "true");
+    let (manifest, bundle) = f.bundle(&f.sibling, &f.canonical, 0);
+    let tip = git(&f.sibling, &["rev-parse", "HEAD"]);
+    commons.repository_root = f.canonical.clone();
+    commons.bundles = vec![manifest];
+    commons.siblings = vec![];
+    commons.snapshot_commit = tip.clone();
+    commons.integration_tip = tip.clone();
+    commons.base_commit = Some(tip.clone());
+    commons.tree_hash = git(&f.sibling, &["rev-parse", "HEAD^{tree}"]);
+    let upload = f.spool(&runner, &commons, &[bundle]);
+    let mut prepare = prepare_for(&commons);
+    prepare.bundles = commons.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    let (main_fill, commons_fill, aged) = {
         let mut inner = runner.core.inner.lock().unwrap();
-        let mut held = Job::new(Uuid::now_v7(), Some(r.clone()), runner.now(), 1, 12);
+        let now = runner.now();
+        // A main job holds 12 of 16 permits; a commons job, accepted later
+        // and past its backfill grace, waits for all 16.
+        inner.order += 1;
+        let mut held = Job::new(Uuid::now_v7(), Some(main.clone()), now, inner.order, 12);
         held.state = JobState::Running;
         inner.jobs.insert(held.id, held);
-        let mut foreground = Job::new(Uuid::now_v7(), Some(r.clone()), runner.now(), 2, 16);
-        foreground.state = JobState::Queued;
-        inner.jobs.insert(foreground.id, foreground);
-        runner
-            .queue_base(&mut inner, &f.root, &r.integration_tip, &f.key, &[], &[])
-            .unwrap();
-        inner.jobs.values().find(|j| j.base).unwrap().id
+        inner.order += 1;
+        let mut waiting = Job::new(Uuid::now_v7(), Some(commons.clone()), now, inner.order, 16);
+        waiting.state = JobState::Queued;
+        waiting.queued_ms = Some(now - BACKFILL_GRACE_MS - 1);
+        let aged = waiting.id;
+        inner.jobs.insert(aged, waiting);
+        // The main fill is queued first, so queue order alone would pick it.
+        let fill = |inner: &mut Inner, root: &str, tip: &str, key: &str| {
+            runner.queue_base(inner, root, tip, key, &[], &[]).unwrap();
+            inner
+                .jobs
+                .values()
+                .filter(|j| j.base && j.request.as_ref().unwrap().repository_root == root)
+                .map(|j| j.id)
+                .max()
+                .unwrap()
+        };
+        let main_fill = fill(&mut inner, &f.root, &main.integration_tip, &f.key);
+        let commons_fill = fill(&mut inner, &f.canonical, &tip, &commons.workspace_key);
+        (main_fill, commons_fill, aged)
     };
+    until_with_diagnostics(
+        || runner.core.inner.lock().unwrap().writer.is_some(),
+        || {
+            format!(
+                "no fill started past the queued job; {}",
+                runner_diagnostics(&runner)
+            )
+        },
+    )
+    .await;
     settle().await;
-    let started = runner.core.inner.lock().unwrap().jobs[&id].setup_ms;
-    runner.begin_drain(Duration::from_secs(1), false);
+    {
+        let inner = runner.core.inner.lock().unwrap();
+        assert_eq!(
+            inner.writer,
+            Some(commons_fill),
+            "the fill for the repository with the newest job must go first"
+        );
+        assert_eq!(inner.jobs[&commons_fill].weight, 4);
+        assert_eq!(
+            inner.jobs[&main_fill].setup_ms, None,
+            "a second fill started while the first was running"
+        );
+        assert_eq!(inner.jobs[&aged].setup_ms, None);
+    }
+    fs::write(&release, "").unwrap();
+    terminal(&runner, commons_fill).await;
+    // The queued job still waits, and the next fill starts all the same.
     assert_eq!(
-        started, None,
-        "writer used idle capacity while foreground work was queued"
+        terminal(&runner, main_fill).await.outcome,
+        Outcome::Exit { code: 0 }
     );
+    assert!(runner.core.inner.lock().unwrap().jobs[&aged]
+        .setup_ms
+        .is_none());
+    runner.begin_drain(Duration::from_secs(1), false);
 }
 
 async fn miss_reader(f: &Fixture, runner: &Runner, name: &str, approved_tip: Option<&str>) {

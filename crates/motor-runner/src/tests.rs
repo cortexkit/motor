@@ -2798,6 +2798,9 @@ fn launch_gate_child() {
     c.owned_workspace_roots = vec![path.clone()];
     c.free_space_floor_bytes = 0;
     c.base_commands = vec!["true".into()];
+    // The crash must come at this job's gate. A cache fill queued with it
+    // would start first and reach the gate hook instead.
+    c.disable_warm_builds = true;
     c.before_gate = Some(Arc::new(|| unsafe { libc::_exit(86) }));
     let runner = Runner::open(c).unwrap();
     runner.accept(r.clone()).unwrap();

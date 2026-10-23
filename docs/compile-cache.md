@@ -202,10 +202,18 @@ tests.
   reuses the previous fill. Tests:
   `descriptor_reuses_source_only_tips_and_refills_manifest_and_config_changes`,
   `descriptor_changes_for_toolchain_and_command_without_lockfile_changes`.
-- At most one fill runs per instance, and only when no foreground job is queued.
-  A fill never takes capacity from a waiting job. Tests:
-  `writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_hosts`,
-  `queued_foreground_blocks_writer_even_when_writer_fits_idle_capacity`.
+- At most one fill runs per instance (one writer slot), with a fixed 4 permits
+  (fewer on a smaller host). It does not wait for queued foreground jobs:
+  under steady load the queue never empties, and an emptied cache would never
+  be filled again. On a host so small that the fill would take over half of
+  the permits, it still waits until no foreground job is queued. A fill that
+  may start is tried before every queued foreground job except gates, takes
+  only permits that are free, and holds back later jobs while it waits for
+  them, as a job past its backfill grace does. It never takes permits from a
+  placed job. The next fill is for the repository whose jobs arrived most
+  recently. Tests:
+  `writer_is_a_singleton_that_waits_for_free_permits_on_large_and_small_hosts`,
+  `one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit`.
 - Reader misses can request one refill per repository, tip and descriptor, and
   only when the submitted snapshot's descriptor matches the tip's. The bound
   survives a runner restart. A branch that changes dependencies never triggers

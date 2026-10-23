@@ -25,6 +25,7 @@ pub(crate) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
     }
     let mut existing = path;
     let mut tail = Vec::new();
+    let mut looked_again = false;
     loop {
         match fs::canonicalize(existing) {
             Ok(mut canonical) => {
@@ -35,6 +36,13 @@ pub(crate) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match fs::symlink_metadata(existing) {
+                    // Created after canonicalize looked, by a setup running
+                    // alongside (a first workspace and a cache fill both
+                    // create the shared parent folder): look once more.
+                    Ok(metadata) if !metadata.file_type().is_symlink() && !looked_again => {
+                        looked_again = true;
+                        continue;
+                    }
                     Ok(_) => return Err(error),
                     Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
                     Err(other) => return Err(other),

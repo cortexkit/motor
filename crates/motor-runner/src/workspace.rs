@@ -234,8 +234,15 @@ pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(error);
+            match fs::symlink_metadata(path) {
+                // Created after canonicalize looked, by a setup running
+                // alongside (a first workspace and a cache fill both create
+                // the shared parent folder): look once more.
+                Ok(metadata) if !metadata.file_type().is_symlink() => {
+                    return fs::canonicalize(path);
+                }
+                Ok(_) => return Err(error),
+                Err(_) => {}
             }
             let parent = path
                 .parent()
