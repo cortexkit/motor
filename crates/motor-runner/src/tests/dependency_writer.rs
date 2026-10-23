@@ -983,20 +983,28 @@ async fn one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit() {
     )
     .await;
     settle().await;
-    {
+    // Read under the state lock, assert after releasing it: a failed
+    // assertion while holding it would poison it for the runner's threads.
+    let (writer, weight, main_setup, aged_setup) = {
         let inner = runner.core.inner.lock().unwrap();
-        assert_eq!(
+        (
             inner.writer,
-            Some(commons_fill),
-            "the fill for the repository with the newest job must go first"
-        );
-        assert_eq!(inner.jobs[&commons_fill].weight, 4);
-        assert_eq!(
-            inner.jobs[&main_fill].setup_ms, None,
-            "a second fill started while the first was running"
-        );
-        assert_eq!(inner.jobs[&aged].setup_ms, None);
-    }
+            inner.jobs[&commons_fill].weight,
+            inner.jobs[&main_fill].setup_ms,
+            inner.jobs[&aged].setup_ms,
+        )
+    };
+    assert_eq!(
+        writer,
+        Some(commons_fill),
+        "the fill for the repository with the newest job must go first"
+    );
+    assert_eq!(weight, 4);
+    assert_eq!(
+        main_setup, None,
+        "a second fill started while the first was running"
+    );
+    assert_eq!(aged_setup, None);
     fs::write(&release, "").unwrap();
     terminal(&runner, commons_fill).await;
     // The queued job still waits, and the next fill starts all the same.
@@ -1004,10 +1012,57 @@ async fn one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit() {
         terminal(&runner, main_fill).await.outcome,
         Outcome::Exit { code: 0 }
     );
-    assert!(runner.core.inner.lock().unwrap().jobs[&aged]
-        .setup_ms
-        .is_none());
+    let aged_setup = runner.core.inner.lock().unwrap().jobs[&aged].setup_ms;
+    assert!(aged_setup.is_none());
     runner.begin_drain(Duration::from_secs(1), false);
+}
+
+/// A fill that does not fit yet keeps the permits that come free for itself:
+/// otherwise small jobs arriving behind it would take each one, and under
+/// steady load the fill would never start.
+#[tokio::test]
+async fn a_waiting_fill_keeps_free_permits_from_later_jobs() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 16;
+    let runner = Runner::open(config).unwrap();
+    let (main, bytes) = f.run("true");
+    let upload = f.spool(&runner, &main, &bytes);
+    let mut prepare = prepare_for(&main);
+    prepare.bundles = main.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    let (small, _) = job_at(&f, "small", "true");
+    let (fill, small) = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let now = runner.now();
+        // 13 of 16 permits are held: the 4-permit fill does not fit, a
+        // 1-permit job would.
+        inner.order += 1;
+        let mut held = Job::new(Uuid::now_v7(), Some(main.clone()), now, inner.order, 13);
+        held.state = JobState::Running;
+        inner.jobs.insert(held.id, held);
+        runner
+            .queue_base(&mut inner, &f.root, &main.integration_tip, &f.key, &[], &[])
+            .unwrap();
+        let fill = inner.jobs.values().find(|j| j.base).unwrap().id;
+        inner.order += 1;
+        let mut waiting = Job::new(small.job_id, Some(small.clone()), now, inner.order, 1);
+        waiting.state = JobState::Queued;
+        waiting.queued_ms = Some(now);
+        inner.jobs.insert(waiting.id, waiting);
+        (fill, small.job_id)
+    };
+    settle().await;
+    let (writer, small_setup) = {
+        let inner = runner.core.inner.lock().unwrap();
+        (inner.writer, inner.jobs[&small].setup_ms)
+    };
+    runner.begin_drain(Duration::from_secs(1), false);
+    assert_eq!(writer, None);
+    assert_eq!(
+        small_setup, None,
+        "a later job took the permits fill {fill} is waiting for"
+    );
 }
 
 async fn miss_reader(f: &Fixture, runner: &Runner, name: &str, approved_tip: Option<&str>) {
