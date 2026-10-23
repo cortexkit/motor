@@ -1,5 +1,5 @@
 //! Durable VM ownership, serialized admission, and conservative restart recovery.
-use super::{fs::Dir, Cancellation, Control, Staging, Tools, PREP_TIMEOUT};
+use super::{fs::Dir, Cancellation, Control, ScopedLock, Staging, Tools, PREP_TIMEOUT};
 use crate::{
     engine::Config,
     storage::{atomic_json, invalid},
@@ -113,7 +113,7 @@ pub(super) struct Record {
 pub(super) struct Owned {
     pub record: Record,
     pub slot: Option<File>,
-    pub workspace_lock: Option<File>,
+    pub workspace_lock: Option<ScopedLock>,
     pub helper: Option<JobHelper>,
 }
 pub(super) struct Entry {
@@ -156,6 +156,21 @@ pub(super) trait Host: Send + Sync {
 }
 struct Native;
 const RELEASE_PROOF_VERSION: u8 = 2;
+fn release_slot(owned: &mut Owned) -> io::Result<()> {
+    if !owned.record.stop_proven
+        || owned.record.proof_version != RELEASE_PROOF_VERSION
+        || owned.record.slot.is_some()
+    {
+        return Err(invalid(
+            "slot release requires a persisted stop proof and cleared reservation",
+        ));
+    }
+    if let Some(slot) = &owned.slot {
+        super::unlock_file(slot)?;
+    }
+    owned.slot.take();
+    Ok(())
+}
 fn release_after_gate(
     record: &Record,
     scan: impl FnOnce() -> io::Result<bool>,
@@ -282,7 +297,7 @@ pub(crate) struct Runtime {
     pub(super) jobs: Mutex<BTreeMap<Uuid, Arc<Entry>>>,
     pub(super) host: Arc<dyn Host>,
     cancelled: Mutex<std::collections::BTreeSet<Uuid>>,
-    runner_lock: Mutex<Option<File>>,
+    runner_lock: Mutex<Option<ScopedLock>>,
     grace: Duration,
     stop_timeout: Duration,
 }
@@ -535,7 +550,7 @@ impl Runtime {
             let mut owned = entry.owned.lock().unwrap();
             owned.record.slot = None;
             Self::save(root, &owned.record)?;
-            owned.slot.take();
+            release_slot(&mut owned)?;
         }
         for path in record.paths.all() {
             self.host.delete(path)?;
@@ -544,7 +559,6 @@ impl Runtime {
         File::open(root.join("macvm-records"))?.sync_all()?;
         {
             let mut owned = entry.owned.lock().unwrap();
-            owned.slot.take();
             owned.workspace_lock.take();
         }
         self.jobs.lock().unwrap().remove(&record.id);
@@ -577,7 +591,7 @@ impl Runtime {
             owned.record.quarantined = true;
             owned.record.slot = None;
             Self::save(root, &owned.record)?;
-            owned.slot.take();
+            release_slot(&mut owned)?;
             owned.workspace_lock.take();
             owned.record.clone()
         };
@@ -615,9 +629,10 @@ impl Runtime {
         let mut runner_lock = self.runner_lock.lock().unwrap();
         if runner_lock.is_none() {
             let file = lock_file(&root.join("macvm-locks/runner.lock"))?;
-            fs2::FileExt::try_lock_exclusive(&file)
-                .map_err(|e| invalid(format!("macOS state root is already served: {e}")))?;
-            *runner_lock = Some(file);
+            *runner_lock = Some(
+                ScopedLock::try_exclusive(file)
+                    .map_err(|e| invalid(format!("macOS state root is already served: {e}")))?,
+            );
         }
         drop(runner_lock);
         let records = Dir::open(&root.join("macvm-records"), true)?;
@@ -754,7 +769,7 @@ pub(crate) fn evict(
                 break;
             }
             let lock = lock_file(&staging.path_lock(&logical))?;
-            if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+            if let Ok(_lock) = ScopedLock::try_exclusive(lock) {
                 remove(&path)?;
             }
         }
@@ -774,14 +789,14 @@ pub(crate) fn evict(
                         .join("macvm-locks")
                         .join(format!("workspace-{key}.lock")),
                 )?;
-                if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+                if let Ok(_lock) = ScopedLock::try_exclusive(lock) {
                     targets.remove(&name)?;
                 }
             }
         }
         if probe()? < 40 << 30 {
             let lock = lock_file(&root.join("prep.lock"))?;
-            if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+            if let Ok(_lock) = ScopedLock::try_exclusive(lock) {
                 let state = Dir::open(root, false)?;
                 state.remove("prep-cargo".as_ref())?;
                 state.remove("prep-bun".as_ref())?;

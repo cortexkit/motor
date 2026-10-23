@@ -925,14 +925,10 @@ fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
     assert!(canonical.exists());
     assert!(store.exists());
     assert!(config.state_root.join("prep-cargo").exists());
-    // Other tests fork children concurrently; explicitly unlock so inherited
-    // CLOEXEC descriptors cannot extend this fixture's deliberate lock hold.
-    fs2::FileExt::unlock(&path_lock).unwrap();
-    fs2::FileExt::unlock(&prep_lock).unwrap();
+    // Controller guards explicitly unlock when dropped.
     drop(path_lock);
     drop(prep_lock);
-    let workspace_lock = entry.owned.lock().unwrap().workspace_lock.take().unwrap();
-    fs2::FileExt::unlock(&workspace_lock).unwrap();
+    entry.owned.lock().unwrap().workspace_lock.take();
     assert!(canonical.join(".git").is_dir());
     evict(&config, f.staging.trees.mirrors.clone()).unwrap();
     assert!(!canonical.exists());

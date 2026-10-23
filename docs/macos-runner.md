@@ -132,6 +132,16 @@ and `helper` paths, the sealed image's `toolchain_version`, and `[tools.cargo]`,
 Runner resource trees are beneath its state root, separate from its per-instance
 durable output log. Records in `macvm-records` are fsynced before staging;
 two `macvm-locks/slot-N.lock` files and one admission lock enforce capacity.
+Controller descriptors (state-root, admission, workspace, canonical and prep)
+are close-on-exec and use explicit unlock-on-drop ownership. CLOEXEC alone is
+not a fork boundary: a child parked before exec retains the same flock open-file
+description. A controller unlock releases every such inherited reference; the
+guard only does that in its creating process. Slot fd 4 intentionally survives
+the helper exec and is not an unconditional unlock-on-drop controller guard.
+The runner explicitly unlocks its slot only after the durable stop/disk proof,
+and the helper marks fd 4 close-on-exec once adopted so it cannot leak through a
+later helper-side exec. The no-exec regression deliberately keeps a forked child
+parked while releasing ownership, rather than relying on that child to exec.
 An unproven stop retains both the record and VM slot. Once disk release is proven,
 the runner fsyncs `slot: null` before releasing that slot. Filesystem cleanup is
 separate: it restores owner rwx on owned directories through no-follow directory

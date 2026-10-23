@@ -676,6 +676,7 @@ fn deep_guest_tree_is_bounded_and_quarantined_without_slot_loss_after_restart() 
     assert!(record.paths.quarantine.is_dir());
     let next = begin(&runtime, &root, 1);
     assert!(runtime.admit(&root, &next).unwrap());
+    drop(next);
     drop(runtime);
     let runtime = new_runtime(host);
     runtime.recover(&root).unwrap();
@@ -883,4 +884,91 @@ fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
             assert!(marker.exists());
         }
     }
+}
+
+#[test]
+fn controller_and_proven_slot_locks_release_while_child_is_still_before_exec() {
+    use std::os::fd::AsRawFd;
+    let scratch = ScratchDir::new("macos-forked-locks");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    runtime.recover(&root).unwrap();
+    let entry = begin(&runtime, &root, 0);
+    runtime.workspace(&root, &entry).unwrap();
+    assert!(runtime.admit(&root, &entry).unwrap());
+    boot(&runtime, &host, &root, &entry, 100);
+    let control = control(Cancellation::default());
+    let admission_path = root.join("macvm-locks/admission.lock");
+    let prep_path = root.join("prep.lock");
+    let canonical_path = root.join("canonical-locks/test.lock");
+    let admission = control.lock(&admission_path).unwrap();
+    let prep = control.lock(&prep_path).unwrap();
+    let canonical = control.lock(&canonical_path).unwrap();
+    let (slot_path, workspace_path) = {
+        let owned = entry.owned.lock().unwrap();
+        let slot = owned.record.slot.unwrap();
+        for fd in [
+            owned.slot.as_ref().unwrap().as_raw_fd(),
+            owned.workspace_lock.as_ref().unwrap().as_raw_fd(),
+            runtime
+                .runner_lock
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_raw_fd(),
+            admission.as_raw_fd(),
+            prep.as_raw_fd(),
+            canonical.as_raw_fd(),
+        ] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "controller descriptor is not close-on-exec"
+            );
+        }
+        (
+            root.join("macvm-locks").join(format!("slot-{slot}.lock")),
+            root.join("macvm-locks")
+                .join(format!("workspace-{}.lock", key(&owned.record.workspace))),
+        )
+    };
+    // The child deliberately retains every descriptor without exec: CLOEXEC
+    // cannot rescue either controller ownership or the eventual slot release.
+    let forked = crate::test_helpers::fork_before_exec().unwrap();
+    host.stop_failure.store(true, Ordering::Release);
+    runtime.finish(&root, &entry);
+    let probe = lock_file(&slot_path).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&probe).is_err());
+    drop(probe);
+    host.stop_failure.store(false, Ordering::Release);
+    runtime.finish(&root, &entry);
+    assert!(!runtime.degraded());
+    drop(admission);
+    drop(prep);
+    drop(canonical);
+    drop(entry);
+    drop(runtime);
+    for path in [
+        root.join("macvm-locks/runner.lock"),
+        admission_path,
+        workspace_path,
+        prep_path,
+        canonical_path,
+        slot_path,
+    ] {
+        let probe = lock_file(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&probe).unwrap_or_else(|error| {
+            panic!(
+                "{} remained held through a forked copy: {error}",
+                path.display()
+            )
+        });
+        fs2::FileExt::unlock(&probe).unwrap();
+    }
+    let restarted = new_runtime(host);
+    restarted.recover(&root).unwrap();
+    drop(restarted);
+    drop(forked);
 }

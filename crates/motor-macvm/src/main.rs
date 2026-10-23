@@ -334,6 +334,11 @@ mod native {
                 ));
             }
             let _slot = File::from_raw_fd(4);
+            // fd 4 survives this exec intentionally, but must not leak through
+            // any later exec performed by framework code in the helper.
+            if libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
+                return Err(io::Error::last_os_error());
+            }
             let session = UnixStream::from_raw_fd(3);
             let nonce = read_boot_config(File::open(&plan.request().nonce_disk)?)?.nonce;
             let config = job_configuration(&plan)?;
