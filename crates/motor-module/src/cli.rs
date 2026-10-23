@@ -32,6 +32,10 @@ use tokio::{
     time::Instant,
 };
 
+#[cfg(test)]
+mod return_tests;
+mod returned_files;
+
 /// Nothing ran: the request was refused before the command started (by
 /// ck-motor, the runner or the daemon), or it could not be submitted.
 pub const EXIT_REFUSED: u8 = 200;
@@ -86,7 +90,8 @@ and stderr here as they arrive.
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
   --return-path PATH  return this absolute workspace file (repeatable, at most 64)
-  --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
+  --return-max-bytes N  cap total returned raw bytes (default/maximum 10485760;
+                       legacy runners are capped at 262144)
   --secret-file PATH  save the reattach secret in this new 0600 file (optional)
   --allow-spill       allow this gate job to spill to hosted capacity when configured
   --hosted            operator test of the hosted path: run this one job on a
@@ -155,6 +160,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             if parsed.hosted && parsed.allow_spill {
                 return Err("--hosted and --allow-spill cannot be combined".into());
             }
+            validate_return_args(&parsed)?;
             return Ok(Invocation::Run(parsed));
         }
         if word == "-h" || word == "--help" {
@@ -236,6 +242,67 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
     }
     Err("missing -- before the command".into())
+}
+
+fn workspace_root(cwd: Option<&Path>) -> Result<PathBuf, String> {
+    let cwd = cwd.map(Path::to_path_buf).map_or_else(
+        || std::env::current_dir().map_err(|error| format!("current directory: {error}")),
+        Ok,
+    )?;
+    let root = crate::snapshot::git(
+        &cwd,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .map_err(|error| format!("{} is not in a git checkout: {error}", cwd.display()))?;
+    canonical(Path::new(&root), "workspace")
+}
+
+fn validate_return_args(args: &RunArgs) -> Result<(), String> {
+    for path in &args.return_paths {
+        if path.len() > 4096 {
+            return Err(format!("--return-path {path:?} exceeds 4096 bytes"));
+        }
+        if !Path::new(path).is_absolute() {
+            let hint = if path.starts_with('$') {
+                "; a shell variable inside single quotes isn't expanded"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "--return-path {path:?} must be an absolute workspace file{hint}"
+            ));
+        }
+    }
+    if !args.return_paths.is_empty() {
+        let root = workspace_root(args.cwd.as_deref())?;
+        for path in &args.return_paths {
+            returned_files::relative_path(&root, Path::new(path)).map_err(|_| {
+                format!(
+                    "--return-path {path:?} must be inside workspace {}",
+                    root.display()
+                )
+            })?;
+        }
+    }
+    if args.return_paths.len() > 64 {
+        return Err("--return-path accepts at most 64 paths".into());
+    }
+    if args
+        .return_max_bytes
+        .is_some_and(|cap| cap > cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP)
+    {
+        return Err("--return-max-bytes exceeds the 10485760 byte cap".into());
+    }
+    Ok(())
+}
+
+fn return_cap(args: &RunArgs) -> u64 {
+    args.return_max_bytes
+        .unwrap_or(if args.return_paths.is_empty() {
+            motor_protocol::RETURN_MAX_BYTES
+        } else {
+            cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP
+        })
 }
 
 pub const ATTACH_HELP: &str = "\
@@ -471,6 +538,7 @@ pub fn command_line(words: &[String]) -> String {
 /// contains the working directory and the repository root is that checkout's
 /// main checkout, as AFT keys them; ck-motor validates both again.
 pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
+    validate_return_args(args)?;
     let cwd = match &args.cwd {
         Some(cwd) => cwd.clone(),
         None => std::env::current_dir().map_err(|e| format!("current directory: {e}"))?,
@@ -501,6 +569,11 @@ pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
     )
     .with_env(args.env.clone())
     .with_timeout(args.timeout)
+    .with_return_paths(args.return_paths.clone())
+    .with_return_chunked(
+        !args.return_paths.is_empty() || return_cap(args) > motor_protocol::RETURN_MAX_BYTES,
+    )
+    .with_return_max_bytes(return_cap(args))
     .with_siblings(
         args.siblings
             .iter()
@@ -600,6 +673,10 @@ where
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ExecClient: Send + Sync {
+    /// Fallback checkout for an attachment without saved workspace metadata.
+    fn local_workspace(&self) -> Option<&Path> {
+        None
+    }
     /// Start `exec.run`. Records arrive as the serialized `StreamRecord`
     /// bodies ck-motor emits.
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError>;
@@ -701,6 +778,13 @@ async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
         client,
         stream,
         Session {
+            returns: returned_files::Returns::new(
+                Some(PathBuf::from(&request.workspace_key)),
+                Some(request.return_paths.clone()),
+                request
+                    .return_max_bytes
+                    .unwrap_or(cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP),
+            ),
             job_id: None,
             secret: None,
             secret_file,
@@ -715,6 +799,7 @@ async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
 }
 
 struct Session {
+    returns: returned_files::Returns,
     job_id: Option<Uuid>,
     secret: Option<String>,
     secret_file: Option<SecretFile>,
@@ -768,6 +853,14 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
         client,
         stream,
         Session {
+            returns: returned_files::Returns::new(
+                client
+                    .local_workspace()
+                    .map(Path::to_path_buf)
+                    .or_else(|| workspace_root(None).ok()),
+                None,
+                cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+            ),
             job_id: Some(args.job_id),
             secret: Some(secret.into()),
             secret_file: None,
@@ -904,6 +997,7 @@ async fn consume<C: ExecClient + ?Sized>(
                         {
                             Ok(replacement) => {
                                 stream = replacement;
+                                session.returns.restart();
                                 received = false;
                                 continue;
                             }
@@ -983,6 +1077,34 @@ async fn consume<C: ExecClient + ?Sized>(
             .as_object_mut()
             .and_then(|record| record.remove("hosted"))
             .and_then(|v| serde_json::from_value::<crate::HostedJobState>(v).ok());
+        if let Some(paths) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_paths"))
+        {
+            if let Ok(paths) = serde_json::from_value::<Vec<String>>(paths) {
+                session.returns.requested(paths);
+            }
+        }
+        if let Some(workspace) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_workspace"))
+        {
+            if let Some(workspace) = workspace.as_str() {
+                session.returns.job_workspace(workspace);
+            }
+        }
+        // The direct v1 interface attaches the runner's stored result as
+        // metadata. Newer streams also support standalone shared records.
+        if let Some(result) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_result"))
+        {
+            if let Ok(result) = serde_json::from_value::<motor_protocol::ReturnResult>(result) {
+                if let Some(result) = crate::agent_route::return_record(result, "") {
+                    session.returns.legacy(&result);
+                }
+            }
+        }
         let record: StreamRecord = match serde_json::from_value(value) {
             Ok(record) => record,
             Err(error) => {
@@ -1045,6 +1167,7 @@ async fn consume<C: ExecClient + ?Sized>(
                 };
             }
             StreamRecord::Terminal(terminal) => {
+                session.returns.finish(err);
                 if let Some(state) = &hosted {
                     let _ = writeln!(
                         err,
@@ -1065,6 +1188,9 @@ async fn consume<C: ExecClient + ?Sized>(
                 }
                 return settle_named(&terminal, name, err);
             }
+            StreamRecord::ReturnResult(result) => session.returns.legacy(&result),
+            StreamRecord::ReturnChunk(chunk) => session.returns.chunk(&chunk),
+            StreamRecord::ReturnManifest(manifest) => session.returns.manifest(&manifest),
             _ => {}
         }
     }
@@ -1176,7 +1302,7 @@ pub struct SubcClient {
     consumer: SubcConsumer,
     route: Mutex<Option<ClientRoute>>,
     workspace: PathBuf,
-    returns: crate::ReturnOptions,
+    return_workspace: Option<PathBuf>,
     allow_spill: bool,
     hosted: bool,
 }
@@ -1211,7 +1337,7 @@ impl SubcClient {
             consumer,
             route: Mutex::new(None),
             workspace: workspace.to_owned(),
-            returns: crate::ReturnOptions::default(),
+            return_workspace: workspace_root(Some(workspace)).ok(),
             allow_spill: false,
             hosted: false,
         })
@@ -1323,8 +1449,11 @@ fn connection_error(error: CallError) -> SubmitError {
 
 #[async_trait]
 impl ExecClient for SubcClient {
+    fn local_workspace(&self) -> Option<&Path> {
+        self.return_workspace.as_deref()
+    }
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
-        let mut params = self.returns.params(request);
+        let mut params = serde_json::to_value(request).expect("serializable request");
         if self.allow_spill {
             params["allow_spill"] = json!(true);
         }
@@ -1445,13 +1574,6 @@ pub async fn main(args: &[String]) -> u8 {
             eprintln!("ck motor run: refused before start: {message}");
             return EXIT_REFUSED;
         }
-    };
-    client.returns = crate::ReturnOptions {
-        return_paths: args.return_paths.clone(),
-        return_max_bytes: args
-            .return_max_bytes
-            .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
-        return_chunked: false,
     };
     client.allow_spill = args.allow_spill;
     client.hosted = args.hosted;
@@ -1909,21 +2031,37 @@ mod tests {
 
     #[test]
     fn return_paths_cli_options_are_repeatable_and_merge_into_direct_request() {
-        let Ok(Invocation::Run(args)) = parse_args(&words(
-            "--return-path /w/one --return-path=/w/two --return-max-bytes 1 -- true",
-        )) else {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-repeatable-returns");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        crate::snapshot::git(&root, &["init", "-q"]).unwrap();
+        let paths = vec![
+            root.join("one").display().to_string(),
+            root.join("two").display().to_string(),
+        ];
+        let Ok(Invocation::Run(args)) = parse_args(&[
+            "--cwd".into(),
+            root.display().to_string(),
+            "--return-path".into(),
+            paths[0].clone(),
+            format!("--return-path={}", paths[1]),
+            "--return-max-bytes".into(),
+            "1".into(),
+            "--".into(),
+            "true".into(),
+        ]) else {
             panic!("expected run")
         };
-        assert_eq!(args.return_paths, vec!["/w/one", "/w/two"]);
+        assert_eq!(args.return_paths, paths);
         assert_eq!(args.return_max_bytes, Some(1));
-        let request = RunRequest::new("/w", "/w", "/w", "true");
+        let key = root.to_str().unwrap();
+        let request = RunRequest::new(key, key, key, "true");
         let params = crate::ReturnOptions {
             return_paths: args.return_paths,
             return_max_bytes: args.return_max_bytes.unwrap(),
             return_chunked: false,
         }
         .params(&request);
-        assert_eq!(params["return_paths"], json!(["/w/one", "/w/two"]));
+        assert_eq!(params["return_paths"], json!(paths));
         assert_eq!(params["return_max_bytes"], 1);
         assert_eq!(params["command"], "true");
         let empty = crate::ReturnOptions::default().params(&request);
@@ -2237,6 +2375,11 @@ mod hosted_cli_tests {
                 &UnusedClient,
                 Box::new(records),
                 Session {
+                    returns: returned_files::Returns::new(
+                        None,
+                        None,
+                        cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+                    ),
                     job_id: Some(id),
                     secret: None,
                     secret_file: None,

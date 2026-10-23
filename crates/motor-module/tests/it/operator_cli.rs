@@ -1542,6 +1542,131 @@ async fn cli_streams_both_outputs_in_order_and_exits_with_the_commands_code() {
     }
 }
 
+struct ReturnClient {
+    wire: WireClient,
+    workspace: std::path::PathBuf,
+}
+
+#[subc_client_rs::async_trait]
+impl ExecClient for ReturnClient {
+    fn local_workspace(&self) -> Option<&std::path::Path> {
+        Some(&self.workspace)
+    }
+    async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.wire.run(request).await
+    }
+    async fn attach(&self, id: Uuid, secret: &str) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.wire.attach(id, secret).await
+    }
+    async fn status(
+        &self,
+        id: Uuid,
+        secret: &str,
+    ) -> Result<motor_protocol::JobStatusReply, SubmitError> {
+        self.wire.status(id, secret).await
+    }
+    async fn cancel(&self, id: Uuid, secret: Option<&str>) -> Result<(), String> {
+        self.wire.cancel(id, secret).await
+    }
+}
+
+#[tokio::test]
+async fn cli_returns_absolute_git_ignored_job_created_file_and_reattaches_with_v1_fallback() {
+    for legacy in [false, true] {
+        let f = Fixture::new(Cut::None, 28).await;
+        f.proxy.strip_return_chunked.store(legacy, Ordering::SeqCst);
+        fs::write(f.key.join(".gitignore"), ".cortexkit/\n").unwrap();
+        let path = f.key.join(".cortexkit/gate/return-probe.txt");
+        let ignored =
+            crate::snapshot::git(&f.key, &["check-ignore", path.to_str().unwrap()]).unwrap();
+        assert_eq!(ignored, path.to_str().unwrap());
+        assert!(!path.exists());
+        let daemon = Daemon::start(&f, direct_config(&f)).await;
+        assert_eq!(
+            daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+            FrameType::Response
+        );
+        let mut client = ReturnClient {
+            wire: WireClient {
+                daemon,
+                channel: DIRECT_CHANNEL,
+                hosted: false,
+            },
+            workspace: f.key.clone(),
+        };
+        let request = timed(
+            &f,
+            "mkdir -p .cortexkit/gate; echo returned > .cortexkit/gate/return-probe.txt; exit 23",
+            300,
+        )
+        .with_return_paths(vec![path.to_str().unwrap().into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP);
+        let secret_path = f.scratch.join("return-secret");
+        let secret_file = cli::SecretFile::create(&secret_path).unwrap();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = cli::drive_run(
+            &client,
+            &request,
+            Some(secret_file),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 23, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(fs::read(&path).unwrap(), b"returned\n");
+        let line = format!("ck motor run: returned {} (9 bytes)", path.display());
+        assert_eq!(String::from_utf8_lossy(&err).matches(&line).count(), 1);
+        let run = f
+            .proxy
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|frame| match frame {
+                motor_protocol::Frame::Run(run) => Some(run.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(run.return_chunked, !legacy);
+        assert_eq!(
+            run.return_max_bytes,
+            if legacy {
+                motor_protocol::RETURN_MAX_BYTES
+            } else {
+                cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP
+            }
+        );
+        fs::remove_file(&path).unwrap();
+        err.clear();
+        let args = cli::AttachArgs {
+            job_id: run.job_id,
+            secret_file: Some(secret_path.clone()),
+            status: false,
+        };
+        let secret = fs::read_to_string(&secret_path).unwrap();
+        client.workspace = f.scratch.join("different-attach-directory");
+        fs::create_dir(&client.workspace).unwrap();
+        assert_eq!(
+            cli::drive_attach(
+                &client,
+                &args,
+                secret.trim(),
+                &mut out,
+                &mut err,
+                &mut interrupts
+            )
+            .await,
+            23
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"returned\n");
+        assert_eq!(String::from_utf8_lossy(&err).matches(&line).count(), 1);
+    }
+}
+
 #[tokio::test]
 async fn cli_returns_the_refused_code_with_the_reason_and_detail() {
     let f = Fixture::new(Cut::None, 28).await;
