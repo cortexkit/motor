@@ -56,6 +56,10 @@ enum Fault {
     DismountOnce,
     CacheGrantMissingOnce,
     CacheGrantMissingAlways,
+    // The guest's RAW-disk initialization fails part-way on the first boot
+    // only, leaving a disk that is no longer RAW but holds no NTFS volume.
+    CacheInitFailedOnce,
+    CacheInitFailed,
     UnitExit,
     Silent,
     FloodOutput,
@@ -240,12 +244,15 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
     let captured = agent.clone();
     c.windows_vm = Some(Arc::new(move |args, nonce, path| {
         captured.units.lock().unwrap().push(args.to_vec());
-        let fault = if matches!(fault, Fault::DismountOnce | Fault::CacheGrantMissingOnce) {
+        let fault = if matches!(
+            fault,
+            Fault::DismountOnce | Fault::CacheGrantMissingOnce | Fault::CacheInitFailedOnce
+        ) {
             if captured.units.lock().unwrap().len() == 1 {
-                if fault == Fault::DismountOnce {
-                    Fault::Dismount
-                } else {
-                    Fault::CacheGrantMissingAlways
+                match fault {
+                    Fault::DismountOnce => Fault::Dismount,
+                    Fault::CacheInitFailedOnce => Fault::CacheInitFailed,
+                    _ => Fault::CacheGrantMissingAlways,
                 }
             } else {
                 Fault::None
@@ -323,6 +330,21 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                                 step: motor_winagent::cache_steps::CacheStep::VolumeAcl,
                                 elapsed_ms: 1,
                                 message: "VolumeAcl: cache_grant_missing".into(),
+                                completed: Vec::new(),
+                            },
+                        },
+                    )?;
+                    stall(&a, &s, 2);
+                    return Ok(());
+                }
+                if fault == Fault::CacheInitFailed {
+                    session.send(
+                        &mut port,
+                        &AgentFrame::CacheFailed {
+                            failure: motor_winagent::cache_steps::CacheFailure {
+                                step: motor_winagent::cache_steps::CacheStep::InitializeRaw,
+                                elapsed_ms: 36_494,
+                                message: "native storage step timed out".into(),
                                 completed: Vec::new(),
                             },
                         },
@@ -1205,6 +1227,55 @@ async fn windows_backend_missing_cache_grant_on_retry_refuses_without_third_boot
         .caches()
         .disk(&request.workspace_key)
         .exists());
+}
+
+#[tokio::test]
+async fn windows_backend_interrupted_cache_initialization_discards_disk_and_next_job_recreates_it()
+{
+    // A guest can lose its 30 s initialization budget after the disk got a GPT
+    // but before the NTFS volume exists. The guest only initializes RAW disks,
+    // so such a disk can never be completed later; it must not stay at the
+    // workspace's cache path.
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::CacheInitFailedOnce, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (first, bytes) = request(&f);
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&first.workspace_key);
+    fs::write(&disk, b"GPT without an NTFS volume").unwrap();
+    f.submit(&runner, &first, &bytes);
+    assert!(matches!(
+        terminal(&runner, first.job_id).await.outcome,
+        Outcome::RefusedBeforeStart { .. }
+    ));
+    assert!(!disk.exists(), "interrupted cache disk was kept");
+    assert_eq!(
+        a.units.lock().unwrap().len(),
+        1,
+        "no retry for this failure"
+    );
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+    for path in job_artifacts(runner.config(), first.job_id) {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+
+    let (second, bytes) = request(&f);
+    assert_eq!(first.workspace_key, second.workspace_key);
+    f.submit(&runner, &second, &bytes);
+    assert_eq!(
+        terminal(&runner, second.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    // The fake qemu-img writes this content only when it creates a new disk.
+    assert_eq!(fs::read(&disk).unwrap(), b"fake qcow2");
+    assert_eq!(a.units.lock().unwrap().len(), 2);
+    assert_eq!(a.starts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

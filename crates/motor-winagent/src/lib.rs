@@ -53,6 +53,9 @@ pub enum Stream {
 pub struct CacheTimings {
     pub elapsed_ms: u64,
     pub disk_selection_ms: u64,
+    /// Time spent initializing a RAW cache disk (native GPT layout plus
+    /// format.com). The name is kept from the PowerShell formatter it replaced
+    /// because it is part of the wire format.
     pub powershell_ms: u64,
     /// PowerShell Set-Disk time, zero when the native path is used.
     pub set_disk_ms: u64,
