@@ -52,9 +52,41 @@ pub fn nonce_bytes(nonce: &str, mounts: &[Mount]) -> io::Result<Vec<u8>> {
     bytes.resize(NONCE_DISK_SIZE, 0);
     Ok(bytes)
 }
-pub fn read_boot_config(mut input: impl Read) -> io::Result<BootConfig> {
-    let mut prefix = vec![0; NONCE_HEADER.len() + 33 + 4];
-    input.read_exact(&mut prefix)?;
+#[repr(align(4096))]
+struct RawImage([u8; NONCE_DISK_SIZE]);
+
+/// Raw devices require an aligned buffer, length and offset. Never probe their
+/// header with a short read or retry a partial read at an unaligned offset.
+pub fn read_boot_candidate(mut input: impl Read) -> io::Result<Option<BootConfig>> {
+    let mut image = Box::new(RawImage([0; NONCE_DISK_SIZE]));
+    let count = loop {
+        match input.read(&mut image.0) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => break result?,
+        }
+    };
+    if !image.0[..count].starts_with(NONCE_HEADER.as_bytes()) {
+        return Ok(None);
+    }
+    if count != NONCE_DISK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short nonce disk",
+        ));
+    }
+    decode_boot_config(&image.0).map(Some)
+}
+
+pub fn read_boot_config(input: impl Read) -> io::Result<BootConfig> {
+    read_boot_candidate(input)?.ok_or_else(|| invalid("invalid nonce disk header"))
+}
+
+/// Parse the complete fixed-size image, including every byte of zero padding.
+pub fn decode_boot_config(bytes: &[u8]) -> io::Result<BootConfig> {
+    if bytes.len() != NONCE_DISK_SIZE {
+        return Err(invalid("invalid nonce disk extent"));
+    }
+    let prefix = &bytes[..NONCE_HEADER.len() + 33 + 4];
     if !prefix.starts_with(NONCE_HEADER.as_bytes()) || prefix[NONCE_HEADER.len() + 32] != b'\n' {
         return Err(invalid("invalid nonce disk header"));
     }
@@ -66,15 +98,12 @@ pub fn read_boot_config(mut input: impl Read) -> io::Result<BootConfig> {
     if length == 0 || length > MAX_MAP_BYTES {
         return Err(invalid("invalid nonce mount map length"));
     }
-    let mut map = vec![0; length];
-    input.read_exact(&mut map)?;
-    let mounts: Vec<Mount> = serde_json::from_slice(&map).map_err(invalid)?;
+    let end = prefix.len() + length;
+    let mounts: Vec<Mount> = serde_json::from_slice(&bytes[prefix.len()..end]).map_err(invalid)?;
     if mounts.len() > MAX_MOUNTS {
         return Err(invalid("nonce mount map exceeds 64 entries"));
     }
-    let mut padding = vec![0; NONCE_DISK_SIZE - prefix.len() - length];
-    input.read_exact(&mut padding)?;
-    if padding.iter().any(|b| *b != 0) {
+    if bytes[end..].iter().any(|b| *b != 0) {
         return Err(invalid("invalid nonce disk padding"));
     }
     Ok(BootConfig { nonce, mounts })
@@ -106,6 +135,41 @@ pub fn create_nonce_disk(path: &Path, nonce: &str, mounts: &[Mount]) -> io::Resu
 mod tests {
     use super::*;
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    struct SectorDevice {
+        image: Vec<u8>,
+        reads: usize,
+    }
+    impl Read for SectorDevice {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads != 1
+                || out.len() != NONCE_DISK_SIZE
+                || !(out.as_ptr() as usize).is_multiple_of(4096)
+            {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+            out.copy_from_slice(&self.image);
+            Ok(out.len())
+        }
+    }
+    #[test]
+    fn raw_nonce_device_is_read_once_with_sector_aligned_io() {
+        let mut disk = SectorDevice {
+            image: nonce_bytes(NONCE, &[]).unwrap(),
+            reads: 0,
+        };
+        assert_eq!(read_boot_config(&mut disk).unwrap().nonce, NONCE);
+        assert_eq!(disk.reads, 1);
+    }
+    #[test]
+    fn complete_image_rejects_nonzero_tail_and_extra_extent() {
+        let mut bytes = nonce_bytes(NONCE, &[]).unwrap();
+        bytes[NONCE_DISK_SIZE - 1] = 1;
+        assert!(decode_boot_config(&bytes).is_err());
+        bytes[NONCE_DISK_SIZE - 1] = 0;
+        bytes.push(1);
+        assert!(decode_boot_config(&bytes).is_err());
+    }
     #[test]
     fn v2_mount_map_roundtrips_and_rejects_v1() {
         let mounts = [Mount {

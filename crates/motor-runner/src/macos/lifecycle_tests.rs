@@ -9,6 +9,9 @@ struct Fake {
     killed: Mutex<Vec<ProcessIdentity>>,
     stop_failure: AtomicBool,
     delete_failure: AtomicBool,
+    disk_held: AtomicBool,
+    scans: std::sync::atomic::AtomicUsize,
+    orphan: Mutex<Option<ProcessIdentity>>,
 }
 fn identity(pid: i32) -> ProcessIdentity {
     ProcessIdentity {
@@ -38,8 +41,18 @@ impl Host for Fake {
         }
         Ok(())
     }
-    fn release_proven(&self, _: &Record) -> io::Result<bool> {
-        Ok(true)
+    fn release_proven(&self, record: &Record) -> io::Result<bool> {
+        release_after_gate(record, || {
+            self.scans.fetch_add(1, Ordering::AcqRel);
+            Ok(!self.disk_held.load(Ordering::Acquire))
+        })
+    }
+    fn stop_unrecorded(&self, _: &Record) -> io::Result<()> {
+        let process = self.orphan.lock().unwrap().take();
+        if let Some(process) = process {
+            self.kill(process)?;
+        }
+        Ok(())
     }
     fn delete(&self, path: &Path) -> io::Result<()> {
         if self.delete_failure.load(Ordering::Acquire) {
@@ -54,6 +67,8 @@ fn new_runtime(host: Arc<Fake>) -> Arc<Runtime> {
         jobs: Mutex::default(),
         cancelled: Mutex::default(),
         runner_lock: Mutex::default(),
+        grace: Duration::from_millis(30),
+        stop_timeout: Duration::from_millis(120),
     })
 }
 fn begin(runtime: &Runtime, root: &Path, index: usize) -> Arc<Entry> {
@@ -249,8 +264,8 @@ fn record_precedes_first_resource_and_recovery_removes_only_derived_paths() {
     }
 }
 #[test]
-fn stop_and_delete_failures_retain_records_slots_and_degraded_across_restart() {
-    for stop in [true, false] {
+fn stop_failure_retains_record_slot_and_degraded_across_restart() {
+    {
         let scratch = ScratchDir::new("macos-cleanup-failure");
         let root = scratch.join("state");
         let sentinel = scratch.join("sentinel");
@@ -261,8 +276,7 @@ fn stop_and_delete_failures_retain_records_slots_and_degraded_across_restart() {
         assert!(runtime.admit(&root, &entry).unwrap());
         make_paths(&entry);
         boot(&runtime, &host, &root, &entry, 100);
-        host.stop_failure.store(stop, Ordering::Release);
-        host.delete_failure.store(!stop, Ordering::Release);
+        host.stop_failure.store(true, Ordering::Release);
         runtime.finish(&root, &entry);
         assert!(runtime.degraded());
         let record = entry.owned.lock().unwrap().record.clone();
@@ -528,5 +542,345 @@ fn runner_sigkill_crash_windows_recover_resources_and_whole_target() {
             );
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+    }
+}
+
+#[test]
+fn permanent_delete_failure_quarantines_without_holding_vm_capacity_across_restart() {
+    let scratch = ScratchDir::new("macos-quarantine");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    runtime.workspace(&root, &entry).unwrap();
+    assert!(runtime.admit(&root, &entry).unwrap());
+    make_paths(&entry);
+    boot(&runtime, &host, &root, &entry, 100);
+    host.delete_failure.store(true, Ordering::Release);
+    runtime.finish(&root, &entry);
+    let record = entry.owned.lock().unwrap().record.clone();
+    assert!(record.quarantined && record.stop_proven);
+    assert!(record.slot.is_none());
+    assert!(record.paths.quarantine.is_dir());
+    assert!(!record.paths.tree.exists());
+    assert!(!runtime.workspace_busy(&record.workspace, Uuid::now_v7()));
+    drop(entry);
+    drop(runtime);
+    let runtime = new_runtime(host.clone());
+    runtime.recover(&root).unwrap();
+    let entry = runtime.entry(record.id).unwrap();
+    assert!(entry.owned.lock().unwrap().record.slot.is_none());
+    assert!(!runtime.cleanup_pending(record.id));
+    assert_eq!(
+        runtime
+            .begin(&root, record.id, &record.workspace)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    let next = begin(&runtime, &root, 1);
+    assert!(runtime.admit(&root, &next).unwrap());
+    host.delete_failure.store(false, Ordering::Release);
+    runtime.retry_cleanups(&Config::new(&root, "macos"));
+    assert!(runtime.entry(record.id).is_none());
+    assert_gone(&entry);
+}
+#[test]
+fn nonroot_cleanup_repairs_guest_modes_without_following_links_across_restart() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "permission regression must run as the real non-root host account"
+    );
+    let scratch = ScratchDir::new("macos-permission-cleanup");
+    let root = scratch.join("state");
+    let sentinel = scratch.join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("whole"), "safe").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    assert!(runtime.admit(&root, &entry).unwrap());
+    make_paths(&entry);
+    boot(&runtime, &host, &root, &entry, 100);
+    let paths = entry.owned.lock().unwrap().record.paths.clone();
+    let empty = paths.tree.join("empty");
+    let locked = paths.tree.join("locked");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::create_dir_all(locked.join("nonempty")).unwrap();
+    std::fs::write(locked.join("nonempty/file"), "owned").unwrap();
+    symlink(&sentinel, paths.tree.join("outside-link")).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert_eq!(
+        std::fs::read_dir(&empty).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        std::fs::remove_dir(locked.join("nonempty"))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    drop(entry);
+    drop(runtime);
+    let runtime = new_runtime(host);
+    runtime.recover(&root).unwrap();
+    assert!(!runtime.degraded());
+    assert!(!paths.tree.exists());
+    assert_eq!(
+        std::fs::read_to_string(sentinel.join("whole")).unwrap(),
+        "safe"
+    );
+    assert_eq!(
+        std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+#[test]
+fn deep_guest_tree_is_bounded_and_quarantined_without_slot_loss_after_restart() {
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    let scratch = ScratchDir::new("macos-deep-cleanup");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    assert!(runtime.admit(&root, &entry).unwrap());
+    make_paths(&entry);
+    let record = entry.owned.lock().unwrap().record.clone();
+    let mut dir = Dir::open(&record.paths.tree, false).unwrap();
+    for _ in 0..(super::super::fs::MAX_TREE_DEPTH + 64) {
+        dir = dir.child("d".as_ref(), true).unwrap();
+    }
+    drop(dir);
+    drop(entry);
+    drop(runtime);
+    let runtime = new_runtime(host.clone());
+    let now = Instant::now();
+    runtime.recover(&root).unwrap();
+    assert!(now.elapsed() < Duration::from_secs(2));
+    let record = runtime
+        .entry(record.id)
+        .unwrap()
+        .owned
+        .lock()
+        .unwrap()
+        .record
+        .clone();
+    assert!(record.quarantined);
+    assert!(record.slot.is_none());
+    assert!(record.paths.quarantine.is_dir());
+    let next = begin(&runtime, &root, 1);
+    assert!(runtime.admit(&root, &next).unwrap());
+    drop(runtime);
+    let runtime = new_runtime(host);
+    runtime.recover(&root).unwrap();
+    assert!(runtime
+        .entry(record.id)
+        .unwrap()
+        .owned
+        .lock()
+        .unwrap()
+        .record
+        .slot
+        .is_none());
+}
+#[test]
+fn opened_gate_without_service_identity_still_requires_disk_holder_scan() {
+    let scratch = ScratchDir::new("macos-no-service-proof");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    assert!(runtime.admit(&root, &entry).unwrap());
+    make_paths(&entry);
+    {
+        let mut owned = entry.owned.lock().unwrap();
+        owned.record.gate_open = true;
+        owned.record.stop_proven = true;
+        owned.record.proof_version = 0;
+        Runtime::save(&root, &owned.record).unwrap();
+    }
+    host.disk_held.store(true, Ordering::Release);
+    drop(entry);
+    drop(runtime);
+    let runtime = new_runtime(host.clone());
+    runtime.recover(&root).unwrap();
+    assert!(host.scans.load(Ordering::Acquire) > 0);
+    assert!(runtime.degraded());
+    let entry = runtime
+        .jobs
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(entry.owned.lock().unwrap().record.slot.is_some());
+    host.disk_held.store(false, Ordering::Release);
+    runtime.retry_cleanups(&Config::new(&root, "macos"));
+    assert!(runtime.jobs.lock().unwrap().is_empty());
+}
+#[test]
+fn helper_orphan_is_stopped_by_disk_association_without_killing_foreign_service() {
+    let scratch = ScratchDir::new("macos-orphan-stop");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    assert!(runtime.admit(&root, &entry).unwrap());
+    make_paths(&entry);
+    {
+        let mut owned = entry.owned.lock().unwrap();
+        owned.record.gate_open = true;
+        Runtime::save(&root, &owned.record).unwrap();
+    }
+    host.processes.lock().unwrap().insert(700, identity(700));
+    host.services.lock().unwrap().push(Service {
+        identity: identity(700),
+        owned: true,
+    });
+    *host.orphan.lock().unwrap() = Some(identity(700));
+    host.processes.lock().unwrap().insert(800, identity(800));
+    host.services.lock().unwrap().push(Service {
+        identity: identity(800),
+        owned: false,
+    });
+    runtime.finish(&root, &entry);
+    assert!(!runtime.degraded());
+    assert_eq!(*host.killed.lock().unwrap(), vec![identity(700)]);
+    assert!(host.alive(identity(800)).unwrap());
+}
+#[test]
+fn pid_replacement_between_observations_is_not_signalled() {
+    let mut checks = 0;
+    let signalled = AtomicBool::new(false);
+    signal_if_current(
+        identity(42),
+        || {
+            checks += 1;
+            Ok(checks == 1)
+        },
+        || {
+            signalled.store(true, Ordering::Release);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(checks, 2);
+    assert!(!signalled.load(Ordering::Acquire));
+}
+#[test]
+fn recovery_skips_temporary_and_stray_record_files() {
+    let scratch = ScratchDir::new("macos-record-strays");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    let id = entry.owned.lock().unwrap().record.id;
+    for name in ["record.tmp", "README", "not-a-uuid.json", ".hidden.json"] {
+        std::fs::write(root.join("macvm-records").join(name), "not a record").unwrap();
+    }
+    let copy = entry.owned.lock().unwrap().record.clone();
+    std::fs::write(
+        root.join("macvm-records")
+            .join(format!("{}.json", Uuid::now_v7())),
+        serde_json::to_vec(&copy).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("macvm-records")
+            .join(format!("{}.json", Uuid::now_v7())),
+        "malformed stray",
+    )
+    .unwrap();
+    drop(entry);
+    drop(runtime);
+    let runtime = new_runtime(host);
+    runtime.recover(&root).unwrap();
+    assert!(runtime.entry(id).is_none());
+    assert!(root.join("macvm-records/record.tmp").exists());
+}
+
+#[test]
+fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+    for ignore_eof in [false, true] {
+        let scratch = ScratchDir::new("macos-helper-grace");
+        let root = scratch.join("state");
+        let host = Arc::new(Fake::default());
+        let mut value = Runtime {
+            host,
+            jobs: Mutex::default(),
+            cancelled: Mutex::default(),
+            runner_lock: Mutex::default(),
+            grace: Duration::from_millis(100),
+            stop_timeout: Duration::from_secs(1),
+        };
+        let runtime = &mut value;
+        let entry = begin(runtime, &root, 0);
+        assert!(runtime.admit(&root, &entry).unwrap());
+        make_paths(&entry);
+        let script = scratch.join("helper");
+        let marker = scratch.join("graceful");
+        std::fs::write(
+            &script,
+            if ignore_eof {
+                "#!/bin/sh\nwhile :; do :; done\n".to_string()
+            } else {
+                format!(
+                    "#!/bin/sh\nIFS= read -r gate\nprintf stopped > '{}'\nexit 0\n",
+                    marker.display()
+                )
+            },
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let share = |tag: &str, guest: &str| motor_macvm::ShareLocation {
+            host: scratch.join(tag),
+            tag: tag.into(),
+            guest: guest.into(),
+        };
+        let paths = entry.owned.lock().unwrap().record.paths.clone();
+        let plan = motor_macvm::JobVmConfig::new(motor_macvm::JobVmRequest {
+            clone: paths.clone,
+            nonce_disk: paths.nonce,
+            workspace: share("workspace", "/Users/test/repo"),
+            siblings: vec![],
+            cargo_home: share("cargo-home", motor_macvm::CARGO_HOME),
+        })
+        .unwrap();
+        {
+            let mut owned = entry.owned.lock().unwrap();
+            owned.helper = Some(
+                motor_macvm::spawn_job_helper(&script, &plan, owned.slot.as_ref().unwrap())
+                    .unwrap(),
+            );
+        }
+        let now = Instant::now();
+        runtime.finish(&root, &entry);
+        assert!(!runtime.degraded());
+        let status = entry
+            .owned
+            .lock()
+            .unwrap()
+            .helper
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .unwrap();
+        if ignore_eof {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert!(now.elapsed() >= Duration::from_millis(100));
+        } else {
+            assert!(status.success());
+            assert!(marker.exists());
+        }
     }
 }

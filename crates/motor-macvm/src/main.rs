@@ -304,7 +304,11 @@ mod native {
             }
             match lifecycle.next_action() {
                 Some(HelperAction::Start) => break,
-                Some(HelperAction::Exit) => return report(HelperReport::Stopped),
+                Some(HelperAction::Exit) => {
+                    return report(HelperReport::Stopped {
+                        reason: lifecycle.stop_reason(true, false, false),
+                    });
+                }
                 _ => {}
             }
         }
@@ -368,10 +372,15 @@ mod native {
             let mut service_reported = false;
             let mut started_at = Instant::now();
             let mut failed = false;
+            let mut gate_eof = false;
+            let mut stop_called = false;
             loop {
                 for event in rx.try_iter() {
                     match event {
-                        Event::Gate(e) => lifecycle.gate(e),
+                        Event::Gate(e) => {
+                            gate_eof |= e == GateEvent::Eof;
+                            lifecycle.gate(e);
+                        }
                         Event::Started(Ok(())) => {
                             started = true;
                             start_completed = true;
@@ -384,6 +393,9 @@ mod native {
                         }
                         Event::Stopped => lifecycle.vm_stopped(),
                         Event::Failed(detail) => {
+                            if gate_eof && stop_called {
+                                continue;
+                            }
                             failed = true;
                             let _ = report(HelperReport::Failed { detail });
                             lifecycle.gate(GateEvent::Eof);
@@ -424,7 +436,9 @@ mod native {
                 }
                 match lifecycle.next_action() {
                     Some(HelperAction::Exit) => {
-                        report(HelperReport::Stopped)?;
+                        report(HelperReport::Stopped {
+                            reason: lifecycle.stop_reason(gate_eof, stop_called, failed),
+                        })?;
                         return if failed {
                             Err(error("VM job helper failed"))
                         } else {
@@ -432,6 +446,7 @@ mod native {
                         };
                     }
                     Some(HelperAction::Stop) if vm.canStop() => {
+                        stop_called = true;
                         let stop_tx = tx.clone();
                         vm.stopWithCompletionHandler(&block2::RcBlock::new(
                             move |e: *mut NSError| {

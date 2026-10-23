@@ -965,3 +965,60 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
     assert!(!second.workspace.exists());
     assert!(!first.workspace.exists());
 }
+
+#[test]
+fn apfs_case_aliases_share_locks_and_cannot_overlap() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    assert_eq!(
+        f.staging.path_lock("/Users/Motor/Project"),
+        f.staging.path_lock("/Users/motor/project")
+    );
+    assert_eq!(
+        lifecycle::key("/Users/Motor/Project"),
+        lifecycle::key("/Users/motor/project")
+    );
+    request.siblings.push(motor_protocol::SiblingSnapshot {
+        canonical_path: "/Users/MOTOR/PROJECT/sub".into(),
+        commit: request.snapshot_commit.clone(),
+        base_commit: None,
+        tree_hash: String::new(),
+    });
+    assert!(validate_paths(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping"));
+}
+
+#[test]
+fn guest_copy_and_sync_reject_excessive_depth_before_stack_or_fd_exhaustion() {
+    let scratch = ScratchDir::new("macos-copy-depth");
+    let source = scratch.join("source");
+    let destination = scratch.join("destination");
+    let mut dir = Dir::open(&source, true).unwrap();
+    for _ in 0..(fs::MAX_TREE_DEPTH + 16) {
+        dir = dir.child("d".as_ref(), true).unwrap();
+    }
+    drop(dir);
+    let source = Dir::open(&source, false).unwrap();
+    let destination = Dir::open(&destination, true).unwrap();
+    let control = Control {
+        cancel: Cancellation::default(),
+        deadline: Instant::now() + PREP_TIMEOUT,
+    };
+    assert!(source
+        .clone_into(&destination, &control)
+        .unwrap_err()
+        .to_string()
+        .contains("depth limit"));
+    assert!(source
+        .sync_all()
+        .unwrap_err()
+        .to_string()
+        .contains("depth limit"));
+    assert!(source
+        .copy_inputs(&destination, &control)
+        .unwrap_err()
+        .to_string()
+        .contains("depth limit"));
+}

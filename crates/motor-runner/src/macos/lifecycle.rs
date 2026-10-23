@@ -64,6 +64,8 @@ pub(super) struct Paths {
     pub cargo: PathBuf,
     pub prep: PathBuf,
     pub target_tmp: PathBuf,
+    #[serde(default)]
+    pub quarantine: PathBuf,
 }
 impl Paths {
     fn new(root: &Path, id: Uuid) -> Self {
@@ -75,9 +77,10 @@ impl Paths {
             tree,
             prep: root.join("prep").join(id.to_string()),
             target_tmp: root.join("targets").join(format!(".{id}.tmp")),
+            quarantine: root.join("quarantine").join(id.to_string()),
         }
     }
-    fn all(&self) -> [&Path; 6] {
+    fn primary(&self) -> [&Path; 6] {
         [
             &self.clone,
             &self.nonce,
@@ -86,6 +89,10 @@ impl Paths {
             &self.prep,
             &self.target_tmp,
         ]
+    }
+    fn all(&self) -> [&Path; 7] {
+        let p = self.primary();
+        [p[0], p[1], p[2], p[3], p[4], p[5], &self.quarantine]
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,6 +105,10 @@ pub(super) struct Record {
     pub gate_open: bool,
     pub service: Option<ProcessIdentity>,
     pub stop_proven: bool,
+    #[serde(default)]
+    pub proof_version: u8,
+    #[serde(default)]
+    pub quarantined: bool,
 }
 pub(super) struct Owned {
     pub record: Record,
@@ -129,17 +140,51 @@ pub(super) struct Service {
     pub identity: ProcessIdentity,
     pub owned: bool,
 }
-/// Process observations are injectable, but every real kill still requires an exact start timestamp.
+/// Process observations are injectable. Numeric-PID signals are timestamp-checked,
+/// not identity-atomic; retained child handles provide the stronger helper path.
 pub(super) trait Host: Send + Sync {
     fn services(&self) -> io::Result<Vec<Service>>;
     fn alive(&self, process: ProcessIdentity) -> io::Result<bool>;
     fn kill(&self, process: ProcessIdentity) -> io::Result<()>;
     fn release_proven(&self, record: &Record) -> io::Result<bool>;
+    fn stop_unrecorded(&self, _record: &Record) -> io::Result<()> {
+        Ok(())
+    }
     fn delete(&self, path: &Path) -> io::Result<()> {
         remove(path)
     }
 }
 struct Native;
+const RELEASE_PROOF_VERSION: u8 = 2;
+fn release_after_gate(
+    record: &Record,
+    scan: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    if !record.gate_open {
+        return Ok(true);
+    }
+    scan()
+}
+/// Darwin has no pidfd signal API. Recheck immediately before the numeric-PID
+/// signal, but an exit/reuse between that check and kill remains possible.
+/// Only retained, unreaped direct children have identity-bound termination.
+fn signal_if_current(
+    process: ProcessIdentity,
+    mut current: impl FnMut() -> io::Result<bool>,
+    signal: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if !current()? {
+        return Ok(());
+    }
+    if !current()? {
+        tracing::debug!(
+            pid = process.pid,
+            "process changed before signal; not signalling"
+        );
+        return Ok(());
+    }
+    signal()
+}
 impl Host for Native {
     fn services(&self) -> io::Result<Vec<Service>> {
         #[cfg(target_os = "macos")]
@@ -193,25 +238,43 @@ impl Host for Native {
         }
     }
     fn kill(&self, process: ProcessIdentity) -> io::Result<()> {
-        if self.alive(process)? && unsafe { libc::kill(process.pid, libc::SIGKILL) } != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::ESRCH) {
-                return Err(e);
-            }
-        }
-        Ok(())
+        signal_if_current(
+            process,
+            || self.alive(process),
+            || {
+                if unsafe { libc::kill(process.pid, libc::SIGKILL) } != 0 {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            },
+        )
     }
     fn release_proven(&self, record: &Record) -> io::Result<bool> {
+        release_after_gate(record, || {
+            #[cfg(target_os = "macos")]
+            {
+                motor_macvm::process::release_proven(
+                    record.service,
+                    &record.paths.clone,
+                    &record.paths.nonce,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(invalid("VM disk-holder inspection requires macOS"))
+            }
+        })
+    }
+    fn stop_unrecorded(&self, record: &Record) -> io::Result<()> {
         #[cfg(target_os = "macos")]
-        if let Some(service) = record.service {
-            return motor_macvm::process::release_proven(
-                service,
-                &record.paths.clone,
-                &record.paths.nonce,
-            );
+        for process in motor_macvm::process::disk_services(&record.paths.clone)? {
+            self.kill(process)?;
         }
         let _ = record;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -220,6 +283,8 @@ pub(crate) struct Runtime {
     pub(super) host: Arc<dyn Host>,
     cancelled: Mutex<std::collections::BTreeSet<Uuid>>,
     runner_lock: Mutex<Option<File>>,
+    grace: Duration,
+    stop_timeout: Duration,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -228,6 +293,8 @@ impl Default for Runtime {
             host: Arc::new(Native),
             cancelled: Mutex::default(),
             runner_lock: Mutex::default(),
+            grace: Duration::from_millis(600),
+            stop_timeout: Duration::from_millis(1400),
         }
     }
 }
@@ -249,8 +316,11 @@ impl Runtime {
             Dir::open(&root.join(name), true)?;
         }
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(entry) = jobs.get(&id) {
-            return Ok(entry.clone());
+        if jobs.contains_key(&id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "job identifier still owns resources; never reuse a quarantined inventory",
+            ));
         }
         let record = Record {
             id,
@@ -261,6 +331,8 @@ impl Runtime {
             gate_open: false,
             service: None,
             stop_proven: false,
+            proof_version: RELEASE_PROOF_VERSION,
+            quarantined: false,
         };
         // This durable inventory precedes staging, including the first job directory.
         Self::save(root, &record)?;
@@ -309,15 +381,17 @@ impl Runtime {
             .retain(|id| live.contains(id));
     }
     pub fn cleanup_pending(&self, id: Uuid) -> bool {
-        self.entry(id)
-            .is_some_and(|e| !e.active.load(Ordering::Acquire))
+        self.entry(id).is_some_and(|e| {
+            !e.active.load(Ordering::Acquire) && !e.owned.lock().unwrap().record.quarantined
+        })
     }
     pub fn workspace_busy(&self, workspace: &str, except: Uuid) -> bool {
-        self.jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, e)| *id != except && e.owned.lock().unwrap().record.workspace == workspace)
+        self.jobs.lock().unwrap().iter().any(|(id, e)| {
+            let owned = e.owned.lock().unwrap();
+            *id != except
+                && !owned.record.quarantined
+                && owned.record.workspace.eq_ignore_ascii_case(workspace)
+        })
     }
     pub fn degraded(&self) -> bool {
         self.jobs
@@ -386,50 +460,69 @@ impl Runtime {
             .any(|s| s.owned && !recorded.contains(&s.identity)))
     }
     pub(super) fn stop(&self, root: &Path, entry: &Entry) -> io::Result<()> {
+        let started = Instant::now();
         let record = {
             let mut owned = entry.owned.lock().unwrap();
-            if owned.record.stop_proven {
+            if owned.record.stop_proven && owned.record.proof_version == RELEASE_PROOF_VERSION {
                 return Ok(());
             }
+            owned.record.stop_proven = false;
             if let Some(helper) = owned.helper.as_mut() {
                 helper.close_gate();
-                if helper.child.try_wait()?.is_none() {
-                    helper.child.kill()?;
-                }
             }
             owned.record.clone()
         };
-        for process in [record.helper, record.service].into_iter().flatten() {
-            self.host.kill(process)?;
+        let helper_alive = || -> io::Result<bool> {
+            let mut owned = entry.owned.lock().unwrap();
+            if let Some(helper) = owned.helper.as_mut() {
+                return Ok(helper.child.try_wait()?.is_none());
+            }
+            record
+                .helper
+                .map(|process| self.host.alive(process))
+                .transpose()
+                .map(|alive| alive.unwrap_or(false))
+        };
+        while helper_alive()? && started.elapsed() < self.grace {
+            std::thread::park_timeout(Duration::from_millis(5));
         }
-        let deadline = Instant::now() + Duration::from_millis(1400);
+        if helper_alive()? {
+            let mut owned = entry.owned.lock().unwrap();
+            if let Some(helper) = owned.helper.as_mut() {
+                helper.child.kill()?;
+            } else if let Some(process) = record.helper {
+                self.host.kill(process)?;
+            }
+        }
+        if let Some(service) = record.service {
+            self.host.kill(service)?;
+        }
         loop {
-            // Reap our child before testing its identity: a zombie still has a PID.
-            let mut alive = match entry.owned.lock().unwrap().helper.as_mut() {
-                Some(helper) => helper.child.try_wait()?.is_none(),
-                None => false,
-            };
-            for process in [record.helper, record.service].into_iter().flatten() {
-                alive |= self.host.alive(process)?;
+            if !helper_alive()? {
+                if record.gate_open {
+                    self.host.stop_unrecorded(&record)?;
+                }
+                let mut service_alive = false;
+                if let Some(service) = record.service {
+                    service_alive = self.host.alive(service)?;
+                }
+                // The scan is mandatory even when no service identity was ever
+                // reported. A process with another name can still hold the disks.
+                let released = self.host.release_proven(&record)?;
+                let unrecorded =
+                    record.gate_open && record.service.is_none() && self.unrecorded_owned()?;
+                if !service_alive && released && !unrecorded {
+                    break;
+                }
             }
-            if !alive {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(invalid("macOS VM stop is not proven"));
+            if started.elapsed() >= self.stop_timeout {
+                return Err(invalid("macOS VM stop or disk release is unproven"));
             }
             std::thread::park_timeout(Duration::from_millis(5));
         }
-        if record.gate_open && record.service.is_none() && self.unrecorded_owned()? {
-            return Err(invalid(
-                "unrecorded motor-owned VirtualMachine service; stop unproven",
-            ));
-        }
-        if !self.host.release_proven(&record)? {
-            return Err(invalid("VM resources are still open; stop unproven"));
-        }
         let mut owned = entry.owned.lock().unwrap();
         owned.record.stop_proven = true;
+        owned.record.proof_version = RELEASE_PROOF_VERSION;
         Self::save(root, &owned.record)
     }
     pub(super) fn cleanup(&self, root: &Path, entry: &Entry) -> io::Result<()> {
@@ -438,6 +531,12 @@ impl Runtime {
             return Err(invalid("macOS record paths do not match job identity"));
         }
         self.stop(root, entry)?;
+        {
+            let mut owned = entry.owned.lock().unwrap();
+            owned.record.slot = None;
+            Self::save(root, &owned.record)?;
+            owned.slot.take();
+        }
         for path in record.paths.all() {
             self.host.delete(path)?;
         }
@@ -457,9 +556,47 @@ impl Runtime {
         };
         entry.active.store(false, Ordering::Release);
         if let Err(error) = self.cleanup(root, entry) {
+            let stopped = {
+                let owned = entry.owned.lock().unwrap();
+                owned.record.stop_proven
+                    && owned.record.proof_version == RELEASE_PROOF_VERSION
+                    && owned.record.paths == Paths::new(root, owned.record.id)
+            };
+            if stopped {
+                if let Err(quarantine_error) = self.quarantine(root, entry) {
+                    tracing::warn!(%quarantine_error,"stopped job quarantine relocation incomplete; inventory retained");
+                }
+            }
             entry.failed.store(true, Ordering::Release);
-            tracing::warn!(%error, "macOS cleanup failed; degraded, retaining record and slot");
+            tracing::warn!(%error, stopped, "macOS cleanup failed; record retained, VM slots retained only for unproven stops");
         }
+    }
+    fn quarantine(&self, root: &Path, entry: &Entry) -> io::Result<()> {
+        let record = {
+            let mut owned = entry.owned.lock().unwrap();
+            owned.record.quarantined = true;
+            owned.record.slot = None;
+            Self::save(root, &owned.record)?;
+            owned.slot.take();
+            owned.workspace_lock.take();
+            owned.record.clone()
+        };
+        let destination = Dir::open(&record.paths.quarantine, true)?;
+        for (index, path) in record.paths.primary().iter().enumerate() {
+            let parent = match Dir::open(path.parent().unwrap(), false) {
+                Ok(parent) => parent,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if parent.contains(path.file_name().unwrap())? {
+                parent.move_to(
+                    path.file_name().unwrap(),
+                    &destination,
+                    index.to_string().as_ref(),
+                )?;
+            }
+        }
+        Ok(())
     }
     pub fn retry_cleanups(&self, config: &Config) {
         let entries: Vec<_> = self
@@ -486,18 +623,39 @@ impl Runtime {
         let records = Dir::open(&root.join("macvm-records"), true)?;
         Dir::open(&root.join("macvm-locks"), true)?;
         for name in records.names()? {
-            if !name.to_string_lossy().ends_with(".json") {
-                return Err(invalid("unexpected macOS job record"));
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if Uuid::parse_str(stem).is_err() {
+                continue;
             }
-            let record: Record =
-                serde_json::from_reader(records.file(&name, false)?).map_err(invalid)?;
-            if name != format!("{}.json", record.id).as_str()
-                || record.paths != Paths::new(root, record.id)
-                || record.slot.is_some_and(|s| s > 1)
+            let mut record: Record = match records
+                .file(&name, false)
+                .and_then(|file| serde_json::from_reader(file).map_err(invalid))
             {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(?name,%error,"ignoring unreadable stray macOS record file");
+                    continue;
+                }
+            };
+            if record.paths.quarantine.as_os_str().is_empty() {
+                record.paths.quarantine = Paths::new(root, record.id).quarantine;
+            }
+            if name != format!("{}.json", record.id).as_str() {
+                tracing::warn!(?name, "ignoring misnamed stray macOS ownership record");
+                continue;
+            }
+            if record.paths != Paths::new(root, record.id) || record.slot.is_some_and(|s| s > 1) {
                 return Err(invalid("invalid macOS ownership record"));
             }
             super::mapped(&record.workspace)?;
+            if record.stop_proven && record.proof_version == RELEASE_PROOF_VERSION {
+                record.slot = None;
+                Self::save(root, &record)?;
+            } else if record.gate_open && record.slot.is_none() {
+                return Err(invalid("unproven opened gate has no recorded VM slot"));
+            }
             let slot = record
                 .slot
                 .map(|s| lock_file(&root.join("macvm-locks").join(format!("slot-{s}.lock"))))
@@ -534,7 +692,10 @@ impl Runtime {
     }
 }
 pub(super) fn key(workspace: &str) -> String {
-    format!("{:x}", Sha256::digest(workspace.as_bytes()))
+    format!(
+        "{:x}",
+        Sha256::digest(workspace.to_ascii_lowercase().as_bytes())
+    )
 }
 pub(super) fn control(cancel: Cancellation) -> Control {
     Control {

@@ -8,13 +8,97 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Component, Path},
 };
 
 pub(super) struct Dir(File);
+pub(super) const MAX_TREE_DEPTH: usize = 64;
+
+struct DirectoryStream(*mut libc::DIR);
+impl DirectoryStream {
+    fn owned_child(parent: libc::c_int, name: &std::ffi::OsStr) -> io::Result<Self> {
+        let name = c(name)?;
+        // Restore only a directory reached through its retained parent. Never
+        // chmod a link or resolve a guest-controlled pathname from the cwd.
+        #[cfg(target_os = "linux")]
+        {
+            let fd = cv(unsafe {
+                libc::openat(
+                    parent,
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            })?;
+            let capability = unsafe { File::from_raw_fd(fd) };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_fchmodat2,
+                    capability.as_raw_fd(),
+                    c"".as_ptr(),
+                    0o700,
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        cv(unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) })?;
+        let fd = cv(unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })?;
+        let file = unsafe { File::from_raw_fd(fd) };
+        cv(unsafe { libc::fchmod(file.as_raw_fd(), 0o700) })?;
+        let fd = file.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(stream))
+    }
+    fn fd(&self) -> libc::c_int {
+        unsafe { libc::dirfd(self.0) }
+    }
+    fn next(&mut self) -> io::Result<Option<OsString>> {
+        loop {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            #[cfg(not(target_os = "linux"))]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(0) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                return Ok(Some(OsString::from_vec(name.to_vec())));
+            }
+        }
+    }
+}
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
 fn c(value: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(value.as_bytes()).map_err(invalid)
 }
@@ -27,9 +111,15 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
 }
 impl Dir {
     pub(super) fn sync_all(&self) -> io::Result<()> {
+        self.sync_all_depth(0)
+    }
+    fn sync_all_depth(&self, depth: usize) -> io::Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(invalid("guest tree depth limit exceeded"));
+        }
         for name in self.names()? {
             match self.kind(&name)? {
-                libc::S_IFDIR => self.child(&name, false)?.sync_all()?,
+                libc::S_IFDIR => self.child(&name, false)?.sync_all_depth(depth + 1)?,
                 libc::S_IFREG => self.file(&name, false)?.sync_all()?,
                 _ => {}
             }
@@ -219,24 +309,68 @@ impl Dir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
-        if kind == libc::S_IFDIR {
-            let child = self.child(name, false)?;
-            for entry in child.names()? {
-                child.remove(&entry)?;
+        if kind != libc::S_IFDIR {
+            cv(unsafe { libc::unlinkat(self.0.as_raw_fd(), c(name)?.as_ptr(), 0) })?;
+            return Ok(());
+        }
+        let mut stack = vec![(
+            name.to_os_string(),
+            DirectoryStream::owned_child(self.0.as_raw_fd(), name)?,
+        )];
+        while let Some((_, stream)) = stack.last_mut() {
+            if let Some(name) = stream.next()? {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                cv(unsafe {
+                    libc::fstatat(
+                        stream.fd(),
+                        c(&name)?.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                })?;
+                if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    if stack.len() >= MAX_TREE_DEPTH {
+                        return Err(invalid("guest tree depth limit exceeded"));
+                    }
+                    let parent = stack.last().unwrap().1.fd();
+                    stack.push((name.clone(), DirectoryStream::owned_child(parent, &name)?));
+                } else {
+                    cv(unsafe { libc::unlinkat(stream.fd(), c(&name)?.as_ptr(), 0) })?;
+                }
+            } else {
+                let (name, stream) = stack.pop().unwrap();
+                drop(stream);
+                let parent = stack
+                    .last()
+                    .map(|(_, stream)| stream.fd())
+                    .unwrap_or(self.0.as_raw_fd());
+                cv(unsafe { libc::unlinkat(parent, c(&name)?.as_ptr(), libc::AT_REMOVEDIR) })?;
             }
         }
+        Ok(())
+    }
+    pub(super) fn move_to(
+        &self,
+        name: &std::ffi::OsStr,
+        to: &Dir,
+        destination: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        if to.contains(destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "quarantine destination already exists",
+            ));
+        }
         cv(unsafe {
-            libc::unlinkat(
+            libc::renameat(
                 self.0.as_raw_fd(),
                 c(name)?.as_ptr(),
-                if kind == libc::S_IFDIR {
-                    libc::AT_REMOVEDIR
-                } else {
-                    0
-                },
+                to.0.as_raw_fd(),
+                c(destination)?.as_ptr(),
             )
         })?;
-        Ok(())
+        self.0.sync_all()?;
+        to.0.sync_all()
     }
     pub(super) fn text(&self, name: &std::ffi::OsStr) -> io::Result<String> {
         let mut text = String::new();
@@ -244,6 +378,12 @@ impl Dir {
         Ok(text)
     }
     pub(super) fn copy_inputs(&self, to: &Dir, control: &Control) -> io::Result<()> {
+        self.copy_inputs_depth(to, control, 0)
+    }
+    fn copy_inputs_depth(&self, to: &Dir, control: &Control, depth: usize) -> io::Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(invalid("guest tree depth limit exceeded"));
+        }
         for name in self.names()? {
             control.check()?;
             let text = name
@@ -264,8 +404,11 @@ impl Dir {
             }
             let kind = self.kind(&name)?;
             if kind == libc::S_IFDIR {
-                self.child(&name, false)?
-                    .copy_inputs(&to.child(&name, true)?, control)?;
+                self.child(&name, false)?.copy_inputs_depth(
+                    &to.child(&name, true)?,
+                    control,
+                    depth + 1,
+                )?;
             } else if matches!(
                 text,
                 "Cargo.toml" | "Cargo.lock" | "package.json" | "bun.lock" | "bun.lockb"
@@ -293,12 +436,20 @@ impl Dir {
         Ok(())
     }
     pub(super) fn clone_into(&self, to: &Dir, control: &Control) -> io::Result<()> {
+        self.clone_into_depth(to, control, 0)
+    }
+    fn clone_into_depth(&self, to: &Dir, control: &Control, depth: usize) -> io::Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(invalid("guest tree depth limit exceeded"));
+        }
         for name in self.names()? {
             control.check()?;
             match self.kind(&name)? {
-                libc::S_IFDIR => self
-                    .child(&name, false)?
-                    .clone_into(&to.child(&name, true)?, control)?,
+                libc::S_IFDIR => self.child(&name, false)?.clone_into_depth(
+                    &to.child(&name, true)?,
+                    control,
+                    depth + 1,
+                )?,
                 libc::S_IFREG => {
                     let source = self.file(&name, false)?;
                     #[cfg(target_os = "macos")]

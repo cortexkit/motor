@@ -18,8 +18,8 @@ pub const MACHINE_IDENTIFIER: &str = "machine-identifier";
 pub const VSOCK_PORT: u32 = 5000;
 mod nonce;
 pub use nonce::{
-    BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, nonce_bytes,
-    read_boot_config,
+    BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, decode_boot_config,
+    nonce_bytes, read_boot_candidate, read_boot_config,
 };
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 
@@ -108,10 +108,11 @@ impl JobVmConfig {
                     "virtio-fs tags must be unique, 1-36 ASCII name characters",
                 ));
             }
-            if guests
-                .iter()
-                .any(|p| p.starts_with(&location.guest) || location.guest.starts_with(p))
-            {
+            if guests.iter().any(|p| {
+                let left = p.to_string_lossy().to_ascii_lowercase();
+                let right = location.guest.to_string_lossy().to_ascii_lowercase();
+                Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left)
+            }) {
                 return Err(invalid("guest share destinations must not overlap"));
             }
             if location.host.starts_with(&request.clone)
@@ -270,7 +271,16 @@ pub enum HelperReport {
     Failed {
         detail: String,
     },
-    Stopped,
+    Stopped {
+        reason: HelperStopReason,
+    },
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum HelperStopReason {
+    GateEofBeforeStart,
+    GateEof,
+    VmStopped,
+    Failure,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,6 +338,20 @@ pub struct HelperLifecycle {
 }
 
 impl HelperLifecycle {
+    pub fn stop_reason(&self, gate_eof: bool, stop_called: bool, failed: bool) -> HelperStopReason {
+        if failed {
+            return HelperStopReason::Failure;
+        }
+        if gate_eof && self.closed {
+            if !self.start_requested {
+                return HelperStopReason::GateEofBeforeStart;
+            }
+            if stop_called && self.stopped {
+                return HelperStopReason::GateEof;
+            }
+        }
+        HelperStopReason::VmStopped
+    }
     pub fn gate(&mut self, event: GateEvent) {
         match event {
             GateEvent::Open if !self.closed => self.opened = true,
@@ -597,6 +621,18 @@ mod tests {
         json["network"] = serde_json::json!(true);
         assert!(serde_json::from_value::<JobVmRequest>(json).is_err());
     }
+    #[test]
+    fn rejects_case_aliased_guest_share_overlap() {
+        let mut value = request();
+        value.siblings[0].guest = value
+            .workspace
+            .guest
+            .join("nested")
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .into();
+        assert!(JobVmConfig::new(value).is_err());
+    }
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     #[test]
     fn single_session_accepts_only_correct_first_hello() {
@@ -649,6 +685,32 @@ mod tests {
             watch_gate(input, |e| lifecycle.gate(e)).unwrap();
             assert_eq!(lifecycle.next_action(), Some(HelperAction::Exit));
         }
+    }
+    #[test]
+    fn helper_exit_reason_distinguishes_eof_from_unrelated_stop() {
+        let mut lifecycle = HelperLifecycle::default();
+        lifecycle.gate(GateEvent::Eof);
+        assert_eq!(
+            lifecycle.stop_reason(true, false, false),
+            HelperStopReason::GateEofBeforeStart
+        );
+        let mut lifecycle = HelperLifecycle::default();
+        lifecycle.gate(GateEvent::Open);
+        assert_eq!(lifecycle.next_action(), Some(HelperAction::Start));
+        lifecycle.gate(GateEvent::Eof);
+        lifecycle.vm_stopped();
+        assert_eq!(
+            lifecycle.stop_reason(true, true, false),
+            HelperStopReason::GateEof
+        );
+        assert_eq!(
+            lifecycle.stop_reason(true, false, false),
+            HelperStopReason::VmStopped
+        );
+        assert_eq!(
+            lifecycle.stop_reason(true, true, true),
+            HelperStopReason::Failure
+        );
     }
     #[test]
     fn gate_eof_after_open_waits_for_vm_stopped() {
@@ -1027,11 +1089,11 @@ pub mod process {
     /// Failure means cleanup and slot reuse must remain blocked. Qualification
     /// must establish that VM disk holders use the motor UID.
     pub fn release_proven(
-        service: ProcessIdentity,
+        service: Option<ProcessIdentity>,
         clone: &Path,
         nonce_disk: &Path,
     ) -> io::Result<bool> {
-        if identity_alive(service)? {
+        if service.map(identity_alive).transpose()?.unwrap_or(false) {
             return Ok(false);
         }
         let keys = [
@@ -1048,6 +1110,34 @@ pub mod process {
             }
         }
         Ok(true)
+    }
+    /// A stopped helper may not have reported its service. Match only services
+    /// that actually hold this job's private boot-disk vnode, never by PID/name alone.
+    pub fn disk_services(clone: &Path) -> io::Result<Vec<ProcessIdentity>> {
+        let boot = file_key(&clone.join(BOOT_DISK))?;
+        let mut services = Vec::new();
+        for pid in same_uid_pids()? {
+            let path = match executable(pid) {
+                Ok(path) => path,
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(e) => return Err(e),
+            };
+            if path.file_name() != Some(std::ffi::OsStr::new(SERVICE))
+                || !path
+                    .components()
+                    .any(|c| c.as_os_str() == "Virtualization.framework")
+            {
+                continue;
+            }
+            let identity = process_identity(pid)?;
+            if open_files(pid)?.contains(&boot) {
+                if process_identity(pid)? != identity {
+                    return Err(io::Error::other("VM service identity changed"));
+                }
+                services.push(identity);
+            }
+        }
+        Ok(services)
     }
 
     #[cfg(test)]
@@ -1138,12 +1228,28 @@ mod native_tests {
         let identity = process_identity(std::process::id() as i32).unwrap();
         assert!(
             !process::release_proven(
-                identity,
+                Some(identity),
                 Path::new("/nonexistent-clone"),
                 Path::new("/nonexistent-nonce")
             )
             .unwrap()
         );
+    }
+    #[test]
+    #[ignore = "operator: same-UID libproc descriptor visibility on the rented Mac"]
+    fn disk_holder_blocks_release_without_reported_service() {
+        let scratch = cortexkit_test_support::ScratchDir::new("macvm-unreported-holder");
+        let clone = scratch.join("clone");
+        std::fs::create_dir(&clone).unwrap();
+        for name in [BOOT_DISK, AUXILIARY_STORAGE] {
+            std::fs::write(clone.join(name), "disk").unwrap();
+        }
+        let nonce = scratch.join("nonce");
+        std::fs::write(&nonce, "nonce").unwrap();
+        let holder = std::fs::File::open(clone.join(BOOT_DISK)).unwrap();
+        assert!(!process::release_proven(None, &clone, &nonce).unwrap());
+        drop(holder);
+        assert!(process::release_proven(None, &clone, &nonce).unwrap());
     }
 }
 

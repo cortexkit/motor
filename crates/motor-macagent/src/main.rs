@@ -89,7 +89,7 @@ mod guest {
         }
         let job_gid = unsafe {
             let job = libc::getpwnam(c"motorjob".as_ptr());
-            if job.is_null() || (*job).pw_uid == 0 {
+            if job.is_null() || (*job).pw_uid == 0 || (*job).pw_gid == 0 {
                 return Err(io::Error::other("unprivileged motorjob account missing"));
             }
             (*job).pw_gid

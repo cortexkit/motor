@@ -50,18 +50,20 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
     {
         mapped(path)?;
     }
-    if !Path::new(&request.cwd).starts_with(&request.workspace_key) {
+    if !Path::new(&request.cwd.to_ascii_lowercase())
+        .starts_with(request.workspace_key.to_ascii_lowercase())
+    {
         return Err(invalid("macos_path_invalid: cwd outside workspace"));
     }
     let roots: Vec<_> = std::iter::once(&request.workspace_key)
         .chain(request.siblings.iter().map(|s| &s.canonical_path))
         .collect();
     for (i, root) in roots.iter().enumerate() {
-        if roots
-            .iter()
-            .skip(i + 1)
-            .any(|other| Path::new(root).starts_with(other) || Path::new(other).starts_with(root))
-        {
+        if roots.iter().skip(i + 1).any(|other| {
+            let root = root.to_ascii_lowercase();
+            let other = other.to_ascii_lowercase();
+            Path::new(&root).starts_with(&other) || Path::new(&other).starts_with(&root)
+        }) {
             return Err(invalid("macos_path_invalid: overlapping snapshots"));
         }
     }
@@ -209,9 +211,10 @@ impl Staging {
         })
     }
     fn path_lock(&self, logical: &str) -> PathBuf {
-        self.state
-            .join("canonical-locks")
-            .join(format!("{:x}.lock", Sha256::digest(logical.as_bytes())))
+        self.state.join("canonical-locks").join(format!(
+            "{:x}.lock",
+            Sha256::digest(logical.to_ascii_lowercase().as_bytes())
+        ))
     }
     /// Eviction uses the same lock as materialization and cloning; active jobs use independent copies.
     pub fn evict_canonical(&self, logical: &str, cancel: Cancellation) -> io::Result<()> {

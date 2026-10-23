@@ -79,8 +79,9 @@ pub fn validate(entries: &[Mount]) -> io::Result<()> {
             }
         }
         if entries[..i].iter().any(|other| {
-            entry.destination.starts_with(&other.destination)
-                || other.destination.starts_with(&entry.destination)
+            let left = entry.destination.to_string_lossy().to_ascii_lowercase();
+            let right = other.destination.to_string_lossy().to_ascii_lowercase();
+            Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left)
         }) {
             return Err(entry_error(entry, "overlapping destinations"));
         }
@@ -95,6 +96,8 @@ pub struct Observation {
     pub tag: String,
     pub destination: std::path::PathBuf,
     pub read_only: bool,
+    pub nosuid: bool,
+    pub nodev: bool,
     pub filesystem: String,
 }
 pub trait System {
@@ -122,6 +125,8 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
             || matches[0].tag != entry.tag
             || matches[0].filesystem != "virtiofs"
             || matches[0].read_only != entry.read_only
+            || !matches[0].nosuid
+            || !matches[0].nodev
         {
             return Err(entry_error(
                 entry,
@@ -204,9 +209,14 @@ pub fn mount_native(entries: &[Mount]) -> io::Result<()> {
         fn mount(&mut self, entry: &Mount) -> io::Result<()> {
             let mut command = std::process::Command::new("/sbin/mount_virtiofs");
             command.env_clear();
-            if entry.read_only {
-                command.args(["-o", "ro"]);
-            }
+            command.args([
+                "-o",
+                if entry.read_only {
+                    "ro,nosuid,nodev"
+                } else {
+                    "nosuid,nodev"
+                },
+            ]);
             let output = command.arg(&entry.tag).arg(&entry.destination).output()?;
             if !output.status.success() {
                 return Err(invalid(format!(
@@ -235,6 +245,8 @@ pub fn mount_native(entries: &[Mount]) -> io::Result<()> {
                     tag: string(&mount.f_mntfromname)?,
                     destination: string(&mount.f_mntonname)?.into(),
                     read_only: mount.f_flags & libc::MNT_RDONLY as u32 != 0,
+                    nosuid: mount.f_flags & libc::MNT_NOSUID as u32 != 0,
+                    nodev: mount.f_flags & libc::MNT_NODEV as u32 != 0,
                     filesystem: string(&mount.f_fstypename)?,
                 });
             }
@@ -286,7 +298,12 @@ mod tests {
             entries[0].destination = path.into();
             assert!(validate(&entries).is_err(), "{path}");
         }
-        for path in ["/Users/test/repo", "/Users/test/repo/sub", "/Users/test"] {
+        for path in [
+            "/Users/test/repo",
+            "/Users/test/repo/sub",
+            "/Users/test",
+            "/Users/TEST/REPO/sub",
+        ] {
             let mut entries = map();
             entries[1].destination = path.into();
             assert!(validate(&entries).is_err());
@@ -359,6 +376,8 @@ mod tests {
                     tag: e.tag.clone(),
                     destination: e.destination.clone(),
                     read_only: e.read_only,
+                    nosuid: true,
+                    nodev: true,
                     filesystem: "virtiofs".into(),
                 })
                 .collect();
@@ -373,8 +392,12 @@ mod tests {
                     tag: "unexpected".into(),
                     destination: "/Users/other".into(),
                     read_only: false,
+                    nosuid: true,
+                    nodev: true,
                     filesystem: "virtiofs".into(),
                 }),
+                6 => out[0].nosuid = false,
+                7 => out[0].nodev = false,
                 _ => {}
             }
             Ok(out)
@@ -385,7 +408,7 @@ mod tests {
         let mut fake = Fake::default();
         mount_all(&map(), &mut fake).unwrap();
         assert_eq!(fake.prepared, 3);
-        for corrupt in 1..=5 {
+        for corrupt in 1..=7 {
             let mut fake = Fake {
                 corrupt,
                 ..Fake::default()

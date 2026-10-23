@@ -16,12 +16,10 @@ pub const PATH: &str =
 /// A matching header with corrupt metadata is an error, not a disk to skip.
 pub fn find_boot_config<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<BootConfig> {
     let mut found = None;
-    for mut disk in disks {
-        let mut magic = vec![0; motor_macvm::NONCE_HEADER.len()];
-        if disk.read_exact(&mut magic).is_err() || magic != motor_macvm::NONCE_HEADER.as_bytes() {
+    for disk in disks {
+        let Some(config) = motor_macvm::read_boot_candidate(disk)? else {
             continue;
-        }
-        let config = read_boot_config(io::Cursor::new(magic).chain(disk))?;
+        };
         if found.replace(config).is_some() {
             return Err(io::Error::other("multiple nonce disks"));
         }
@@ -35,6 +33,19 @@ mod nonce_tests {
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     fn disk() -> Vec<u8> {
         motor_macvm::nonce_bytes(NONCE, &[]).unwrap()
+    }
+    #[test]
+    fn discovery_uses_one_aligned_full_device_read() {
+        struct Device(Vec<u8>);
+        impl Read for Device {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert_eq!(out.len(), motor_macvm::NONCE_DISK_SIZE);
+                assert_eq!(out.as_ptr() as usize % 4096, 0);
+                out.copy_from_slice(&self.0);
+                Ok(out.len())
+            }
+        }
+        assert_eq!(find_boot_config([Device(disk())]).unwrap().nonce, NONCE);
     }
     #[test]
     fn v2_metadata_reader_is_shared_with_host_writer() {
@@ -84,7 +95,6 @@ mod execution {
     use super::*;
     use motor_winagent::{Frame, Peer, Profile, Protocol, Stream};
     use std::collections::BTreeMap;
-    #[cfg(test)]
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
@@ -127,6 +137,33 @@ mod execution {
         uid: libc::uid_t,
         gid: libc::gid_t,
     }
+    fn validate_user(user: User) -> io::Result<User> {
+        if user.uid == 0 || user.gid == 0 {
+            return Err(io::Error::other(
+                "motorjob must have a non-root uid and gid",
+            ));
+        }
+        Ok(user)
+    }
+    fn set_credentials(process: &mut tokio::process::Command, user: User) -> io::Result<()> {
+        let user = validate_user(user)?;
+        // std applies gid/uid and clears supplementary groups before resolving
+        // current_dir; a pre_exec credential drop runs too late for that lookup.
+        process.as_std_mut().gid(user.gid).uid(user.uid);
+        Ok(())
+    }
+    fn require_empty_groups(
+        clear: impl FnOnce() -> io::Result<()>,
+        count: impl FnOnce() -> io::Result<i32>,
+    ) -> io::Result<()> {
+        clear()?;
+        if count()? != 0 {
+            return Err(io::Error::other(
+                "guest supplementary groups were not cleared",
+            ));
+        }
+        Ok(())
+    }
 
     enum KillScope {
         User(User),
@@ -142,6 +179,7 @@ mod execution {
         fn kill(&self) -> io::Result<()> {
             match self {
                 Self::User(user) => {
+                    let user = validate_user(*user)?;
                     // A non-root kill(-1) reaches all processes of the job uid,
                     // including descendants that escaped the shell's process group.
                     // The root agent must never issue that syscall as root.
@@ -151,8 +189,7 @@ mod execution {
                             return Err(io::Error::last_os_error());
                         }
                         if pid == 0 {
-                            if user.uid == 0
-                                || libc::setgroups(0, std::ptr::null()) != 0
+                            if libc::setgroups(0, std::ptr::null()) != 0
                                 || libc::setgid(user.gid) != 0
                                 || libc::setuid(user.uid) != 0
                             {
@@ -235,16 +272,36 @@ mod execution {
                 "agent must run as root",
             ));
         }
+        // uid() clears groups in the child before chdir, but std tolerates
+        // EPERM from that clearing. Empty the daemon's groups first and fail
+        // closed here so no child can inherit a privileged supplementary group.
+        require_empty_groups(
+            || {
+                if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+                if count < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(count)
+                }
+            },
+        )?;
         // Copy the passwd fields before another libc lookup can reuse its storage.
         let user = unsafe {
             let entry = libc::getpwnam(c"motorjob".as_ptr());
             if entry.is_null() || (*entry).pw_uid == 0 {
                 return Err(io::Error::other("unprivileged motorjob account missing"));
             }
-            User {
+            validate_user(User {
                 uid: (*entry).pw_uid,
                 gid: (*entry).pw_gid,
-            }
+            })?
         };
         serve(
             stream,
@@ -407,22 +464,12 @@ mod execution {
             .kill_on_drop(true);
         match &*settings.scope {
             KillScope::User(user) => {
-                let user = *user;
+                let user = validate_user(*user)?;
                 let path = std::ffi::CString::new(tmpdir.path().as_os_str().as_encoded_bytes())?;
                 if unsafe { libc::chown(path.as_ptr(), user.uid, user.gid) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                unsafe {
-                    process.pre_exec(move || {
-                        if libc::setgroups(0, std::ptr::null()) != 0
-                            || libc::setgid(user.gid) != 0
-                            || libc::setuid(user.uid) != 0
-                        {
-                            return Err(io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
+                set_credentials(&mut process, user)?;
             }
             #[cfg(test)]
             KillScope::ProcessGroup { .. } => {
@@ -514,6 +561,51 @@ mod execution {
         use tokio::io::DuplexStream;
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        #[test]
+        fn root_uid_or_primary_gid_is_rejected() {
+            for user in [User { uid: 0, gid: 20 }, User { uid: 501, gid: 0 }] {
+                assert!(validate_user(user).is_err());
+            }
+            assert!(validate_user(User { uid: 501, gid: 20 }).is_ok());
+        }
+        #[test]
+        fn supplementary_group_clear_failure_is_fatal() {
+            assert!(
+                require_empty_groups(|| Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(0))
+                    .is_err()
+            );
+            assert!(require_empty_groups(|| Ok(()), || Ok(1)).is_err());
+            assert!(require_empty_groups(|| Ok(()), || Ok(0)).is_ok());
+        }
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        #[ignore = "operator: root inside disposable guest with motorjob; never on the host"]
+        async fn macos_qualification_drop_precedes_cwd_resolution() {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::env::var("MOTOR_MACOS_GUEST_QUALIFICATION").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let entry = unsafe { libc::getpwnam(c"motorjob".as_ptr()) };
+            assert!(!entry.is_null());
+            let user = validate_user(unsafe {
+                User {
+                    uid: (*entry).pw_uid,
+                    gid: (*entry).pw_gid,
+                }
+            })
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut command = tokio::process::Command::new(BASH);
+            command.args(["-c", "exit 0"]).current_dir(root.path());
+            set_credentials(&mut command, user).unwrap();
+            assert_eq!(
+                command.spawn().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
 
         struct Fixture {
             host: DuplexStream,

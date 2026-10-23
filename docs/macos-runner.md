@@ -44,6 +44,9 @@ Here `\n` means one newline byte, not two literal characters. Remaining disk
 bytes are zero padding, to a fixed 69,632-byte disk. The JSON array has at most
 64 entries and is at most 64 KiB: `[{"tag":"workspace","destination":"/Users/motor/repo","read_only":false}, ...]`.
 The nonce is generated per job. There is no v1 reader or compatibility mode.
+The guest reads the entire image into a 4096-byte-aligned buffer with one
+sector-aligned read before parsing it; neither discovery nor the explicit-device
+path probes a short header on a raw device. Every padding byte is checked.
 The guest probes whole raw
 disk nodes named `/dev/rdiskN` (decimal N, no partition suffix) and requires
 exactly one matching magic header; it does not assume a disk number. A matching
@@ -76,8 +79,9 @@ read-only device, never a guest share.
 The runner emits tags `workspace`, `cargo-home` and `sibling-N` (decimal N),
 with at most 62 siblings so the complete map stays within its 64-entry bound.
 
-The agent runs `/sbin/mount_virtiofs` for each entry (with `-o ro` for siblings),
-then verifies the filesystem type, exact tag, destination and read-only flag
+The agent runs `/sbin/mount_virtiofs` with `nosuid,nodev` for every entry and `ro`
+for siblings, then verifies the filesystem type, exact tag, destination and
+read-only, nosuid and nodev flags
 against the kernel's mount table. Unexpected virtiofs mounts also fail bootstrap.
 Entry-specific failures identify the tag, destination and reason; map-wide
 inventory failures report a general reason. Either exits without connecting, so
@@ -86,6 +90,10 @@ source trees. `mounts` portable tests inject the mount system; actual mounts and
 kernel tag spelling still require VM qualification.
 
 The agent runs `/opt/motor/bin/bash -c <command>` as `motorjob`, with caller cwd.
+Before accepting a command, the root daemon clears and verifies its own
+supplementary groups, treating failure as fatal. The child uses Command's gid/uid
+settings before chdir, not a late pre_exec credential drop; no privileged
+supplementary group can survive std's tolerated EPERM on group clearing.
 It clears the inherited daemon environment, applies the Linux caller-env
 allow-list, then pins `HOME=/Users/motorjob`, a fresh writable job `TMPDIR`,
 `RUSTUP_HOME=/opt/motor/rustup`, `CARGO_HOME=/opt/motor/job/cargo-home`, and
@@ -124,10 +132,19 @@ and `helper` paths, the sealed image's `toolchain_version`, and `[tools.cargo]`,
 Runner resource trees are beneath its state root, separate from its per-instance
 durable output log. Records in `macvm-records` are fsynced before staging;
 two `macvm-locks/slot-N.lock` files and one admission lock enforce capacity.
-An unproven stop or failed deletion retains both the record and slot, makes
-status unavailable (degraded), and is retried by maintenance without an operator.
+An unproven stop retains both the record and VM slot. Once disk release is proven,
+the runner fsyncs `slot: null` before releasing that slot. Filesystem cleanup is
+separate: it restores owner rwx on owned directories through no-follow directory
+capabilities, streams an iterative deletion walk, and caps depth at 64. Copy-back
+and sync walks have the same depth limit. Unremovable/deep trees are moved under
+the job's recorded `quarantine/<job_id>` path (or remain at the recorded original
+path if relocation fails). Their inventory remains for retry/operator attention,
+but they hold neither a VM slot nor the workspace lock. Quarantine remains visible
+as degraded status and a warning; direct runner admission can still use free slots.
+Recovery ignores unrelated/temp record-directory entries, while valid ownership
+records with invalid resource paths still fail closed.
 
-The four ignored `macos_qualification_*` integration tests run on the VM host
+The four job-level ignored `macos_qualification_*` integration tests run on the VM host
 against the **installed** launchd daemon through `ck motor run --platform macos`,
 not a test-owned runner or an SSH command shell. Set
 `MOTOR_MACOS_QUALIFICATION_WORKSPACE`, `MOTOR_MACOS_QUALIFICATION_STATE_ROOT`, and
@@ -146,7 +163,9 @@ for the concurrent lane, and retain the provider operator's confirmation that it
 ran throughout the measurement. This deliberately measures memory and swap while
 the shared Mac also serves its other workload. Start with cold target/prep caches
 and retain the concurrent test's timing,
-minimum free memory, swap observations and service owners. The Bun fixture must have
+minimum free memory, swap observations and service owners. The nonce permission
+probe uses an aligned 4096-byte read and accepts only EACCES or EPERM, never an
+alignment failure such as EINVAL. The Bun fixture must have
 locked local sibling dependencies and a darwin-arm64-only package.
 
 ## Host helper and sealed-image layout
@@ -205,15 +224,27 @@ failed lookup is an error, not permission to guess. With no symbol, the public
 vnode match remains mandatory. `service_identity_requires_exactly_one_inspectable_disk_owner`
 and `incomplete_and_denied_libproc_lists_fail_closed` check the fail-closed rules.
 
-Cleanup must close the gate, wait for the helper to exit (SIGKILL it on the
-runner's stop timeout), and then call `process::release_proven` until the stop
+Cleanup closes the gate and allows the helper 600 ms to stop gracefully before
+SIGKILL escalation; the overall stop/proof polling budget is 1.4 s. It then calls
+`process::release_proven` until the stop
 bound expires. It requires both that the recorded service PID/start identity is
 no longer alive and that no inspectable same-UID process holds the clone boot
 disk, auxiliary storage or nonce disk by descriptor or fileport. Query errors,
 partial scans and missing disk paths are **not** proof. Do not delete the paths
 or reuse the slot if proof fails; retain the record and report degraded for
-operator attention. A helper lost before reporting a service identity also
-remains unproven; the runner's recovery logic must retain its resources.
+operator attention. With no reported service, the same descriptor/fileport scan
+is still mandatory. After helper loss, a same-UID framework service that holds
+this job's exact boot-disk vnode can be stopped without guessing from its name or
+PID alone. Unrelated services are never killed. Unrecorded motor services and
+unknown disk holders keep the stop unproven until they disappear. Persisted proof
+is versioned; legacy proofs are revalidated before deletion or slot reuse.
+
+Direct unreaped helpers are terminated through their retained child handles.
+Darwin has no pidfd-style public signal operation in use here for services or
+restart recovery. PID/start observations are checked twice, including immediately
+before numeric-PID SIGKILL, but they are not an identity-atomic signal: exit and
+PID reuse between the last observation and kill remains a residual race. The
+timestamp check must not be described as proof against that interval.
 
 A global `proc_listpidspath` scan is deliberately not used: it silently skips
 processes it cannot inspect. Exclusive file locks are advisory and cannot prove
@@ -255,3 +286,50 @@ they are not portable tests and are not run by ordinary crate tests:
   refusal of a second connection, and that a bad first Hello fails the job.
   Verify the guest mount setup honors every plan tag,
   guest destination and access mode before any job starts.
+
+### Audit limits retained deliberately
+
+There are no quotas on the read-write shares, boot-clone growth, quarantine or
+root guest output spools. The 20/40 GiB admission/eviction floors are host-wide
+pressure policy, not per-job byte limits; a hostile job can still consume state
+volume space. Operators must monitor the volume and quarantined inventories.
+
+The target store is untrusted guest output and is published after non-cancelled
+failed jobs as well as successful ones, including signals or an incomplete agent
+session once VM disk release is proven. This deliberately matches Linux, where a
+workspace retains its target between jobs. The case-insensitive workspace key is
+not a branch/principal integrity boundary: later jobs may consume earlier build
+artifacts. The host only clones, swaps and removes that data; it never executes
+or parses it. Neither cache integrity partitioning nor quotas are provided here.
+
+### Additional rented-Mac/guest audit qualification
+
+Run `macos_qualification_helper_identity` and `macos_qualification_helper_sigkill`
+as the motor account against the installed daemon, with the existing workspace,
+state-root and client variables plus `MOTOR_MACOS_QUALIFICATION_INSTANCE`. They
+observe the daemon's real helper/service record and disk-vnode association; the
+SIGKILL lane requires both processes gone within two seconds. Run
+`macos_qualification_helper_gate` with `MOTOR_MACOS_QUALIFICATION_HELPER` and
+`MOTOR_MACOS_QUALIFICATION_VM_CONFIG`. It first derives the configuration from a
+live daemon helper's parent argv, checks the live executable matches that exact
+helper path, rejects build-tree paths, and verifies its signature and virtualization
+entitlement. The direct signed-helper primitive then tests both EOF-before-G and
+EOF-after-Started, using the sealed image named by that daemon configuration.
+The latter is the proof of the after-open gate promise: the helper must exit
+successfully with `Stopped { reason: GateEof }`, and its VM/service/disk references
+must be gone within two seconds of EOF, before any escalation exists. Cleanup
+fallback runs only after the proof passed or failed and retains the inventory if
+release cannot be established. It never turns a failed EOF proof into a pass.
+All seven host qualification tests serialize their lanes, except the concurrent
+lane's deliberate two-job pair. Real job qualification remains daemon-based;
+this separately authorized primitive directly drives the installed helper so
+that daemon cancellation escalation cannot mask an EOF failure. The native macvm
+`disk_holder_blocks_release_without_reported_service` test checks the real
+same-UID libproc scan with no reported service identity.
+
+Inside a disposable guest, as root with `MOTOR_MACOS_GUEST_QUALIFICATION=1`, run
+`macos_qualification_drop_precedes_cwd_resolution`. It verifies that the standard
+Command uid/gid transition (which clears supplementary groups before chdir)
+rejects a root-only cwd rather than resolving it while privileged. Both uid 0 and
+primary gid 0 are refused for motorjob. These native paths must be compiled/linted
+and exercised on the rented Mac/guest; Linux does not cross-lint Apple-only code.
