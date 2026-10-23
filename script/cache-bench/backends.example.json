@@ -1,0 +1,6 @@
+[
+  {"name": "ovh-standard", "bucket": "motor-cache-test", "credentials": "~/.config/cache-bench/ovh", "region": "de", "addressing": "path", "storage_class": "STANDARD"},
+  {"name": "ovh-high-performance", "bucket": "motor-cache-test", "credentials": "~/.config/cache-bench/ovh", "region": "de", "addressing": "path", "storage_class": "EXPRESS_ONEZONE"},
+  {"name": "r2", "bucket": "motor-cache-test", "credentials": "~/.config/cache-bench/r2", "region": "auto", "addressing": "path"},
+  {"name": "hetzner-fsn1", "bucket": "cortexkitmotor", "credentials": "~/.config/cache-bench/hetzner", "region": "fsn1", "addressing": "path"}
+]
