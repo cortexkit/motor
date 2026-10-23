@@ -20,6 +20,10 @@ use uuid::Uuid;
 
 mod cargo_fetch;
 mod hosts;
+mod javascript_tools;
+#[cfg(test)]
+pub(crate) use javascript_tools::ToolchainRole;
+pub(crate) use javascript_tools::{JavascriptTools, JOB_BUN_DIR};
 pub(crate) mod pid_init;
 mod readable;
 
@@ -264,23 +268,22 @@ pub(crate) fn retire_writer_cache(fleet: &Path, retired: &Path) -> io::Result<()
 /// access ACLs once at daemon startup; recursive default ACLs on every Cargo
 /// cache directory let trusted Cargo fetches add readable content between jobs
 /// without rescanning the shared trees before each launch.
-pub(crate) fn prepare_shared_read_access() -> io::Result<()> {
-    prepare_shared_read_access_as(USER)
+pub(crate) fn prepare_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
+    prepare_shared_read_access_as(USER, javascript)
 }
 
-pub(crate) fn prepare_writer_shared_read_access() -> io::Result<()> {
-    prepare_shared_read_access_as(WRITER_USER)
+pub(crate) fn prepare_writer_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
+    prepare_shared_read_access_as(WRITER_USER, javascript)
 }
 
-fn prepare_shared_read_access_as(user: &str) -> io::Result<()> {
+fn prepare_shared_read_access_as(user: &str, javascript: &JavascriptTools) -> io::Result<()> {
     let cargo_home = PathBuf::from(
         std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
     );
     let rustup_home = PathBuf::from(
         std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
     );
-    let bun_bin = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bun/bin"));
-    prepare_shared_read_access_from_as(&cargo_home, &rustup_home, bun_bin.as_deref(), user)
+    prepare_shared_read_access_from_as(&cargo_home, &rustup_home, Some(javascript.bun_dir()), user)
 }
 
 #[cfg(test)]
@@ -587,11 +590,136 @@ fn prepare_javascript_dependencies(
     repository: &str,
     workspace: &Path,
     tree: &str,
+    tools: &JavascriptTools,
 ) -> io::Result<()> {
     let tracked = javascript_tracked_tree(workspace, tree)?;
-    prepare_javascript_with(workspace, &tracked.paths, |install, command| {
-        cache_javascript_install(state, repository, workspace, &tracked, install, command)
+    prepare_javascript_with(workspace, &tracked.paths, tools, |install, command| {
+        cache_javascript_install(
+            state, repository, workspace, &tracked, install, command, tools,
+        )
     })
+}
+
+/// Expands to one embedded file of a committed JavaScript fixture:
+/// `(path below the check workspace, contents, executable)`.
+macro_rules! javascript_fixture_file {
+    ($manager:literal, $path:literal, $executable:literal) => {
+        (
+            concat!($manager, "/", $path),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test-fixtures/javascript/",
+                $manager,
+                "/",
+                $path
+            )),
+            $executable,
+        )
+    };
+}
+
+/// One offline locked install per supported lockfile kind (bun.lock,
+/// package-lock.json, pnpm-lock.yaml), each with a local dependency and a
+/// preinstall script that must not run. These are the committed fixtures the
+/// real-manager tests install; they are embedded so an image can run the
+/// check with nothing staged beside the runner.
+const JAVASCRIPT_SETUP_FIXTURE: &[(&str, &str, bool)] = &[
+    javascript_fixture_file!("bun", "package.json", false),
+    javascript_fixture_file!("bun", "bun.lock", false),
+    javascript_fixture_file!("bun", "vendor/fixture-dep/package.json", false),
+    javascript_fixture_file!("bun", "vendor/fixture-dep/index.js", false),
+    javascript_fixture_file!("bun", "vendor/fixture-dep/cli.js", true),
+    javascript_fixture_file!("npm", "package.json", false),
+    javascript_fixture_file!("npm", "package-lock.json", false),
+    javascript_fixture_file!("npm", "vendor/fixture-dep/package.json", false),
+    javascript_fixture_file!("npm", "vendor/fixture-dep/index.js", false),
+    javascript_fixture_file!("npm", "vendor/fixture-dep/cli.js", true),
+    javascript_fixture_file!("pnpm", "package.json", false),
+    javascript_fixture_file!("pnpm", "pnpm-lock.yaml", false),
+    javascript_fixture_file!("pnpm", "pnpm-workspace.yaml", false),
+    javascript_fixture_file!("pnpm", "vendor/fixture-dep/package.json", false),
+    javascript_fixture_file!("pnpm", "vendor/fixture-dep/index.js", false),
+    javascript_fixture_file!("pnpm", "vendor/fixture-dep/cli.js", true),
+];
+
+/// Runs the runner's trusted JavaScript dependency setup with `tools` on the
+/// embedded fixture, in a new directory `scratch`: the same discovery, tool
+/// lookup, version probes, manager cache environment and locked install that
+/// prepare a job's checkout. Only the install cache, which needs a reflink
+/// filesystem, is left out. Returns one line per install naming the tool that
+/// ran; any missing tool or failed install is an error naming it.
+pub(crate) fn check_javascript_setup(
+    tools: &JavascriptTools,
+    scratch: &Path,
+) -> io::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir(scratch).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("create new check directory {}: {error}", scratch.display()),
+        )
+    })?;
+    let workspace = scratch.join("workspace");
+    for (path, contents, executable) in JAVASCRIPT_SETUP_FIXTURE {
+        let file = workspace.join(path);
+        fs::create_dir_all(file.parent().expect("fixture files are in directories"))?;
+        fs::write(&file, contents)?;
+        if *executable {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    checked(Command::new("git").args(["init", "-q"]).arg(&workspace))?;
+    checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["add", "-f", "."]),
+    )?;
+    let tree = workspace::git(&workspace, &["write-tree"])?;
+    let tracked = javascript_tracked_tree(&workspace, &tree)?;
+    let caches = scratch.join("manager-caches");
+    let mut report = Vec::new();
+    prepare_javascript_with(&workspace, &tracked.paths, tools, |install, command| {
+        let (manager_version, _) = javascript_install_versions(command, install, tools)?;
+        let manager = javascript_manager(install.lockfile);
+        let cache = caches.join(manager);
+        fs::create_dir_all(cache.join("home"))?;
+        javascript_manager_cache_command(command, manager, &cache);
+        let directory = workspace.join(&install.directory);
+        let lockfile = install.directory.join(install.lockfile);
+        run_javascript_install_via(
+            &directory,
+            manager,
+            &lockfile.to_string_lossy(),
+            command,
+            checked,
+        )?;
+        if !directory
+            .join("node_modules/fixture-dep/index.js")
+            .is_file()
+        {
+            return Err(io::Error::other(
+                "the locked install did not install the fixture's local dependency",
+            ));
+        }
+        if directory.join("lifecycle-ran").exists() {
+            return Err(io::Error::other("the fixture's preinstall script ran"));
+        }
+        report.push(format!(
+            "{}: {} {}",
+            lockfile.display(),
+            Path::new(command.get_program()).display(),
+            String::from_utf8_lossy(&manager_version).trim()
+        ));
+        Ok(())
+    })?;
+    if report.len() != 3 {
+        return Err(io::Error::other(format!(
+            "expected 3 locked installs, ran {}",
+            report.len()
+        )));
+    }
+    Ok(report.join("\n"))
 }
 
 /// Installs the JavaScript dependencies of a sibling snapshot being built
@@ -615,7 +743,8 @@ pub(crate) fn prepare_snapshot_javascript(
     let mut tracked = javascript_tracked_tree(snapshot, tree)?;
     tracked.logical_root = Some(path.to_path_buf());
     let view = View::javascript(snapshot, path);
-    prepare_javascript_with(snapshot, &tracked.paths, |install, command| {
+    let tools = JavascriptTools::for_config(config);
+    prepare_javascript_with(snapshot, &tracked.paths, &tools, |install, command| {
         cache_javascript_install_via(
             &state,
             repository,
@@ -623,6 +752,7 @@ pub(crate) fn prepare_snapshot_javascript(
             &tracked,
             install,
             command,
+            &tools,
             |command| {
                 helper::run(
                     config,
@@ -657,10 +787,11 @@ fn prepare_javascript_checkouts(
 fn prepare_javascript_with(
     workspace: &Path,
     paths: &[PathBuf],
+    tools: &JavascriptTools,
     mut install: impl FnMut(&JavascriptInstall, &mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
     for entry in discover_javascript_installs(paths)? {
-        let result = javascript_install_command(workspace, &entry)
+        let result = javascript_install_command(workspace, &entry, tools)
             .and_then(|mut command| install(&entry, &mut command));
         result.map_err(|error| {
             io::Error::other(format!(
@@ -690,6 +821,7 @@ fn javascript_manager(lockfile: &str) -> &'static str {
 fn javascript_install_command(
     workspace: &Path,
     install: &JavascriptInstall,
+    tools: &JavascriptTools,
 ) -> io::Result<Command> {
     let directory = workspace.join(&install.directory);
     for name in ["package.json", install.lockfile] {
@@ -713,37 +845,36 @@ fn javascript_install_command(
         Err(error) => return Err(error),
     }
     let manager = javascript_manager(install.lockfile);
-    let mut command = Command::new(javascript_executable(manager));
+    let mut command = Command::new(tools.require(manager)?);
+    // npm and pnpm run on Node: refuse here, naming Node's configured path,
+    // rather than let `env node` fail inside the manager.
+    if manager != "bun" {
+        tools.require("node")?;
+    }
     if manager == "npm" {
         command.args(["ci", "--ignore-scripts"]);
     } else {
         command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
     }
-    command.current_dir(directory);
+    command
+        .current_dir(directory)
+        .env("PATH", tools.search_path());
     Ok(command)
 }
 
-fn javascript_executable(manager: &str) -> PathBuf {
-    if manager == "bun" {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".bun/bin/bun"))
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("bun"))
-    } else {
-        PathBuf::from(manager)
-    }
-}
-
 /// For the sibling snapshot key: the `--version` output of each JavaScript
-/// package manager (bun, npm, pnpm) that runs here, by manager name, and of
-/// Node. A manager that is missing or fails is left out and a missing Node
-/// gives empty output, so installing one changes the key without making
-/// snapshot setup fail here; an install that needs it still fails as it does
-/// today.
-pub(crate) fn javascript_runner_versions() -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
+/// package manager (bun, npm, pnpm) at its configured location, by manager
+/// name, and of Node. A manager that is missing or fails is left out and a
+/// missing Node gives empty output, so installing one changes the key without
+/// making snapshot setup fail here; an install that needs it still fails as it
+/// does today.
+pub(crate) fn javascript_runner_versions(
+    tools: &JavascriptTools,
+) -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
     let version = |executable: PathBuf| {
         Command::new(executable)
             .arg("--version")
+            .env("PATH", tools.search_path())
             .stdin(Stdio::null())
             .output()
             .ok()
@@ -753,10 +884,10 @@ pub(crate) fn javascript_runner_versions() -> (BTreeMap<String, Vec<u8>>, Vec<u8
     let managers = ["bun", "npm", "pnpm"]
         .into_iter()
         .filter_map(|manager| {
-            version(javascript_executable(manager)).map(|output| (manager.to_string(), output))
+            version(tools.executable(manager)).map(|output| (manager.to_string(), output))
         })
         .collect();
-    let node = version(PathBuf::from("node")).unwrap_or_default();
+    let node = version(tools.executable("node")).unwrap_or_default();
     (managers, node)
 }
 
@@ -779,7 +910,7 @@ fn javascript_version(command: &Command, executable: &std::ffi::OsStr) -> io::Re
     let output = version.output().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::other(format!(
-                "{} not installed on the build server: {error}",
+                "{} not installed: {error}",
                 executable.to_string_lossy()
             ))
         } else {
@@ -1170,15 +1301,33 @@ fn cache_javascript_install(
     tracked: &JavascriptTree,
     install: &JavascriptInstall,
     command: &mut Command,
+    tools: &JavascriptTools,
 ) -> io::Result<()> {
     cache_javascript_install_via(
-        state, repository, workspace, tracked, install, command, checked,
+        state, repository, workspace, tracked, install, command, tools, checked,
     )
+}
+
+/// The manager's and Node's `--version` output that key an install's cache
+/// entry. Bun installs do not run Node, so their Node version is empty.
+fn javascript_install_versions(
+    command: &Command,
+    install: &JavascriptInstall,
+    tools: &JavascriptTools,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let manager_version = javascript_version(command, command.get_program())?;
+    let node_version = if javascript_manager(install.lockfile) == "bun" {
+        Vec::new()
+    } else {
+        javascript_version(command, tools.require("node")?.as_os_str())?
+    };
+    Ok((manager_version, node_version))
 }
 
 /// Like `cache_javascript_install`, with `run` running the package manager
 /// when the cache has no entry, for example in a sibling snapshot helper
 /// unit.
+#[allow(clippy::too_many_arguments)]
 fn cache_javascript_install_via(
     state: &Path,
     repository: &str,
@@ -1186,14 +1335,10 @@ fn cache_javascript_install_via(
     tracked: &JavascriptTree,
     install: &JavascriptInstall,
     command: &mut Command,
+    tools: &JavascriptTools,
     run: impl FnOnce(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
-    let manager_version = javascript_version(command, command.get_program())?;
-    let node_version = if javascript_manager(install.lockfile) == "bun" {
-        Vec::new()
-    } else {
-        javascript_version(command, "node".as_ref())?
-    };
+    let (manager_version, node_version) = javascript_install_versions(command, install, tools)?;
     let key = javascript_cache_key(
         workspace,
         repository,
@@ -1315,9 +1460,10 @@ fn run_javascript_install_via(
     command: &mut Command,
     run: impl FnOnce(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
+    let program = PathBuf::from(command.get_program());
     run(command).map_err(|error| {
         let detail = if error.kind() == io::ErrorKind::NotFound {
-            format!("{manager} not installed on the build server: {error}")
+            format!("{manager} not installed at {}: {error}", program.display())
         } else {
             error.to_string()
         };
@@ -1438,6 +1584,25 @@ fn word(path: &Path) -> io::Result<String> {
 
 fn bind(source: &Path, destination: &Path) -> io::Result<String> {
     Ok(format!("{}:{}", word(source)?, word(destination)?))
+}
+
+/// The read-only mount that shows the runner's Bun directory to jobs at
+/// [`JOB_BUN_DIR`], where every role's job PATH expects Bun, together with
+/// that destination. On the build server and Boat the two paths are the same;
+/// a tenant VM keeps Bun outside its /home. Without a Bun directory there is
+/// no mount, and a job that runs `bun` fails to find it.
+fn job_bun_mount(javascript: &JavascriptTools) -> io::Result<Option<(String, PathBuf)>> {
+    let source = javascript.bun_dir();
+    if !source.is_dir() {
+        return Ok(None);
+    }
+    let destination = PathBuf::from(JOB_BUN_DIR);
+    let mount = if source == destination {
+        word(source)?
+    } else {
+        bind(source, &destination)?
+    };
+    Ok(Some((mount, destination)))
 }
 
 fn grant(path: &Path) -> io::Result<()> {
@@ -2259,6 +2424,7 @@ impl Sandbox {
             false,
             true,
             None,
+            &JavascriptTools::for_role(ToolchainRole::BuildServer),
         )
     }
 
@@ -2281,6 +2447,7 @@ impl Sandbox {
         tenant_vm: bool,
         shared_compile_cache: bool,
         snapshots: Option<&SnapshotSiblings<'_>>,
+        javascript: &JavascriptTools,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2298,6 +2465,7 @@ impl Sandbox {
             tenant_vm,
             shared_compile_cache,
             snapshots,
+            javascript,
         )
     }
 
@@ -2312,6 +2480,7 @@ impl Sandbox {
         limit: u32,
         dependency_routes: &BTreeMap<String, PathBuf>,
         tree: &str,
+        javascript: &JavascriptTools,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2329,6 +2498,7 @@ impl Sandbox {
             false,
             true,
             None,
+            javascript,
         )
     }
 
@@ -2349,6 +2519,7 @@ impl Sandbox {
         tenant_vm: bool,
         shared_compile_cache: bool,
         snapshots: Option<&SnapshotSiblings<'_>>,
+        javascript: &JavascriptTools,
     ) -> io::Result<Self> {
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
@@ -2400,7 +2571,13 @@ impl Sandbox {
                     tree,
                     in_place_siblings,
                     |checkout, repository, checkout_tree| {
-                        prepare_javascript_dependencies(state, repository, checkout, checkout_tree)
+                        prepare_javascript_dependencies(
+                            state,
+                            repository,
+                            checkout,
+                            checkout_tree,
+                            javascript,
+                        )
                     },
                 )
             })?;
@@ -2508,13 +2685,10 @@ impl Sandbox {
             "{}:/usr/local/bin:/usr/bin:/bin",
             shared_cargo.join("bin").display()
         );
-        if let Some(home) = std::env::var_os("HOME") {
-            let bun = PathBuf::from(home).join(".bun/bin");
-            if bun.is_dir() {
-                read_only.push(word(&bun)?);
-                mount_destinations.push(bun.clone());
-                path = format!("{}:{path}", bun.display());
-            }
+        if let Some((mount, destination)) = job_bun_mount(javascript)? {
+            read_only.push(mount);
+            path = format!("{}:{path}", destination.display());
+            mount_destinations.push(destination);
         }
         // The shared source/index trees are immutable. Cargo's locks and cache
         // bookkeeping live in the job's private CARGO_HOME, not the shared one.

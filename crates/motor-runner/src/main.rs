@@ -65,6 +65,13 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         return motor_runner::check_permissions_helper();
     }
     #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "check-javascript-setup")
+    {
+        return check_javascript_setup(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
     if args.first().is_some_and(|arg| arg == "tenant-agent") {
         if args.len() != 1 {
             return Err(io::Error::other("tenant-agent takes no arguments"));
@@ -317,6 +324,39 @@ async fn run(args: Vec<String>) -> io::Result<()> {
               "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend]",
         )),
     }
+}
+
+/// `check-javascript-setup --scratch DIR [--tenant-vm] [--boat-profile]`:
+/// the role flags are the ones `serve` takes, so the check looks for the
+/// JavaScript tools exactly where that serving runner will.
+#[cfg(target_os = "linux")]
+fn check_javascript_setup(args: &[String]) -> io::Result<()> {
+    let mut config = Config::new("/nonexistent", "javascript-setup-check");
+    let mut scratch = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tenant-vm" => config.tenant_vm = true,
+            "--boat-profile" => config.boat_profile = true,
+            "--scratch" => {
+                scratch =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        io::Error::other("--scratch needs a directory")
+                    })?))
+            }
+            _ => return Err(io::Error::other(format!("unknown option {arg}"))),
+        }
+    }
+    let scratch =
+        scratch.ok_or_else(|| io::Error::other("check-javascript-setup requires --scratch DIR"))?;
+    println!(
+        "{}",
+        motor_runner::check_javascript_setup(&config, &scratch)?
+    );
+    println!(
+        "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
+    );
+    Ok(())
 }
 
 fn configure_options(

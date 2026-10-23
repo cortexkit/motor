@@ -166,7 +166,12 @@ and namespace prerequisites, Python 3 and `motor-runner`. The existing tools
 installer's build-only directories live inside the disposable chroot; only
 `/usr/local/lib/motor/cargo/bin`, `/usr/local/lib/motor/rustup`, the parity
 checker/manifest and sccache build receipts enter the image. Bun lives at
-`/home/ubuntu/.bun/bin` as on the build server. Required packages and Git build
+`/usr/local/lib/motor/bun/bin` (the manifest's `tools.bun.path_by_role.tenant`),
+not at the build server's `/home/ubuntu/.bun/bin`: in a tenant VM `/home` is the
+tenant's own workspace root, bound over the image's `/home` at attach, so
+anything the image put there disappears before the runner starts. The recipe
+removes `/home/ubuntu` after moving the Rust toolchain out and refuses the image
+if anything remains under `/home` or `/Users`. Required packages and Git build
 dependencies come from the shared manifest in addition to the tenant OS packages.
 Both images create `motor-job` with the manifest's exact UID and primary GID;
 numeric collisions refuse the build and name the existing owner. `motor-cache`
@@ -212,9 +217,13 @@ are not accepted as immutable tool inputs, even when a version probe runs fine.
 The checked path list is recorded in tools.json before the image can complete.
 
 The agent receives `CARGO_HOME=/usr/local/lib/motor/cargo` as the **immutable
-bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/home/ubuntu`.
-The latter makes the runner mount the immutable Bun directory into jobs; each
-job still gets its own `/motor-home` as HOME. The agent
+bind source**, plus the image's `RUSTUP_HOME`, `PATH`, and `HOME=/tenant`. The
+runner does not use HOME or PATH to find its JavaScript tools: `--tenant-vm`
+selects the tenant layout, so its trusted dependency setup runs Bun from
+`/usr/local/lib/motor/bun/bin` and Node, npm and pnpm from `/usr/local/bin`,
+refusing by path if one is missing, and it mounts the Bun directory into jobs at
+`/home/ubuntu/.bun/bin`, the tenant job PATH's first entry. Each job still gets
+its own `/motor-home` as HOME. The agent
 mounts the provisioned XFS `/dev/vdb`, binds its tool `bin` read-only onto
 `/tenant/cargo-home/bin`, binds `/tenant/roots/{Users,home}`, and runs the
 FICLONE probes. It starts the transient `motor-tenant-runner` unit using
@@ -306,6 +315,19 @@ sshd availability and the inotify instance floor. The versionless `gnutest`
 is bound to its package-qualified image hash, rechecked in the booted guest.
 Tenant dependency caches live on its private data disk; unlike Boat's fleet
 seed, their contents are not part of this immutable toolchain contract.
+
+A passing parity check alone does not show that the runner can prepare a
+job: the parity checker finds tools on its own PATH, the runner at its role's
+fixed paths. So image creation also runs `motor-runner check-javascript-setup
+--tenant-vm`, the runner's own trusted dependency setup with the tenant
+runner's tool lookup, on embedded fixtures locked with `bun.lock`,
+`package-lock.json` and `pnpm-lock.yaml` (recorded as `javascript_setup` in
+`tools.json`); a setup tool missing from where the runner looks fails the
+build. Qualification repeats that check in the booted guest after attachment,
+when the tenant's `/home` and `/Users` are bound over the image's (`PASS guest
+runner JavaScript setup`), and every leased job's repository carries the same
+three fixtures, so each job's real workspace setup installs them and the job
+fails unless it did.
 
 On a host with a registered tenant, `qualify.py` deliberately refuses. Do not
 remove a registration or stop a live helper to bypass this fence. After the

@@ -653,7 +653,15 @@ def storage_checks(data):
                                      for name in (r'var-lib-motor\x2dboat.mount', 'Users.mount'))}
 
 
-NODE_CHECK = "node -e \"if (require('boat-dep') !== 'boat-node-modules') process.exit(1); console.log(require('boat-dep'))\""
+# Committed offline fixtures locked with bun.lock and pnpm-lock.yaml; the root
+# package-lock.json covers npm. Each job's workspace setup installs all three
+# with the runner's own tool lookup, and the check fails the job unless it did.
+JAVASCRIPT_FIXTURES = ROOT / 'crates/motor-runner/test-fixtures/javascript'
+JAVASCRIPT_FIXTURE_MANAGERS = ('bun', 'pnpm')
+NODE_CHECK = ("for m in " + " ".join(JAVASCRIPT_FIXTURE_MANAGERS) + "; do "
+              "test -f \"$m/node_modules/fixture-dep/index.js\" && test ! -e \"$m/lifecycle-ran\" "
+              "|| { echo \"runner setup did not install the $m fixture\" >&2; exit 1; }; done; "
+              "node -e \"if (require('boat-dep') !== 'boat-node-modules') process.exit(1); console.log(require('boat-dep'))\"")
 
 
 def job_repository(repository, cargo_seed_manifest=None):
@@ -686,6 +694,8 @@ def job_repository(repository, cargo_seed_manifest=None):
             'packages':{'':manifest, 'node_modules/boat-dep':{'version':'1.0.0',
                         'resolved':'file:vendor/boat-dep.tgz', 'integrity':integrity}}}
     (repository / 'package-lock.json').write_text(json.dumps(lock) + '\n')
+    for name in JAVASCRIPT_FIXTURE_MANAGERS:
+        shutil.copytree(JAVASCRIPT_FIXTURES / name, repository / name, ignore=shutil.ignore_patterns('node_modules'))
     for command in (['git','init','-q'], ['git','add','.'],
                     ['git','-c','user.name=Boat probe','-c','user.email=probe@invalid','commit','-qm','probe input']):
         subprocess.run(command, cwd=repository, check=True, stdout=sys.stderr)

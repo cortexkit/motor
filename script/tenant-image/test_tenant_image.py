@@ -102,7 +102,7 @@ class ImageTests(unittest.TestCase):
         with mock.patch.object(guest, "run", return_value="git version 2.53.0") as run:
             self.assertEqual("git version 2.53.0", guest.verify_git(manifest, unit, which))
         run.assert_called_once_with("/usr/local/bin/git", "--version", capture=True)
-        self.assertEqual(["/home/ubuntu/.bun/bin:/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"], searched)
+        self.assertEqual(["/usr/local/lib/motor/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"], searched)
         with mock.patch.object(guest, "run", return_value="git version 2.47.3"):
             with self.assertRaisesRegex(ValueError, "git version differs"):
                 guest.verify_git(manifest, unit, which)
@@ -465,11 +465,52 @@ class ImageTests(unittest.TestCase):
         with mock.patch.object(guest.subprocess, "run", return_value=result):
             guest.refuse_probe(["tenant-agent", "extra"], "tenant-agent takes no arguments")
 
+    def test_image_build_runs_the_tenant_runners_own_javascript_setup(self):
+        scratch = self.root / "javascript-setup-check"
+        calls = []
+
+        def run(*args, capture=False):
+            calls.append(args)
+            scratch.mkdir()
+            return "bun/bun.lock: /usr/local/lib/motor/bun/bin/bun 1.4.2\n" + guest.JAVASCRIPT_SETUP_PASS
+        with mock.patch.object(guest, "run", side_effect=run):
+            lines = guest.verify_javascript_setup(scratch)
+        # --tenant-vm selects the same tool locations the serving tenant runner uses.
+        self.assertEqual([("motor-runner", "check-javascript-setup", "--tenant-vm", "--scratch", str(scratch))], calls)
+        self.assertEqual(guest.JAVASCRIPT_SETUP_PASS, lines[-1])
+        self.assertFalse(scratch.exists())
+        with mock.patch.object(guest, "run", side_effect=lambda *a, **k: scratch.mkdir() or "no pass line"):
+            with self.assertRaisesRegex(ValueError, "did not pass"):
+                guest.verify_javascript_setup(scratch)
+        import inspect
+        self.assertIn("verify_javascript_setup()", inspect.getsource(guest.verify))
+
+    def test_nothing_the_image_installs_stays_under_the_bound_workspace_roots(self):
+        home = self.root / "home/ubuntu"
+        (home / ".bun/bin").mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, r"hides at boot: \[.*\.bun"):
+            guest.retire_tool_home(home)
+        (home / ".bun/bin").rmdir()
+        (home / ".bun").rmdir()
+        guest.retire_tool_home(home)
+        self.assertFalse(home.exists())
+        users = self.root / "Users"
+        users.mkdir()
+        self.assertEqual([str(self.root / "home"), str(users)],
+                         guest.verify_workspace_roots_empty((self.root / "home", users)))
+        (users / "leftover").write_text("")
+        with self.assertRaisesRegex(ValueError, "binds over at attach"):
+            guest.verify_workspace_roots_empty((self.root / "home", users))
+
     def test_agent_uses_immutable_tools_and_carries_runner_environment(self):
         unit = (HERE / "guest/motor-tenant-agent.service").read_text()
         self.assertIn("Environment=CARGO_HOME=/usr/local/lib/motor/cargo\n", unit)
         self.assertIn("Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup\n", unit)
-        self.assertIn("Environment=HOME=/home/ubuntu\n", unit)
+        # The runner finds its JavaScript tools at its role's fixed paths, not
+        # through HOME, and must not read configuration from beneath /home:
+        # in a tenant VM that is the tenant's own bound directory.
+        self.assertIn("Environment=HOME=/tenant\n", unit)
+        self.assertNotIn("/home", unit)
         self.assertIn("ExecStart=/usr/local/bin/motor-runner tenant-agent\n", unit)
 
     def test_capture_resolves_stable_alias_to_release_and_captures_all_targets(self):
@@ -737,7 +778,7 @@ class RootPathTests(unittest.TestCase):
 
     def test_missing_roots_are_listed_and_escaping_links_fail(self):
         report = self.check()
-        self.assertEqual((report["offenders"], report["missing"]), ([], ["/home/ubuntu/.bun/bin"]))
+        self.assertEqual((report["offenders"], report["missing"]), ([], []))
         (self.image / "usr/local/sbin").symlink_to("/")
         report = self.check(("/usr/local/sbin",))
         self.assertEqual(report["offenders"],
@@ -765,6 +806,17 @@ class RootPathTests(unittest.TestCase):
             for path in paths:
                 with self.subTest(image=name, path=path):
                     self.assertTrue(covered(path, roots))
+
+    def test_tenant_units_run_nothing_from_the_bound_workspace_roots(self):
+        # The tenant agent binds the tenant's /home and /Users over the image's
+        # before the runner starts; a tool the image placed there vanishes.
+        for name in ("motor-tenant-agent.service", "motor-qualification.service"):
+            for path in unit_paths(HERE / "guest" / name):
+                with self.subTest(unit=name, path=path):
+                    self.assertFalse(any(path == root or path.startswith(root + "/")
+                                         for root in ("/home", "/Users")))
+        for root in root_paths.TENANT_ROOTS:
+            self.assertFalse(root.startswith(("/home", "/Users")), root)
 
     def test_recipes_enforce_the_invariant_after_installation(self):
         import inspect

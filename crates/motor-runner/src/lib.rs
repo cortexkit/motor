@@ -75,6 +75,19 @@ pub fn permission_helper_digest() -> String {
 pub fn check_permissions_helper() -> std::io::Result<()> {
     permissions::check_install()
 }
+/// Runs the trusted JavaScript dependency setup with the tools of the role
+/// `config` selects (`--tenant-vm`, `--boat-profile`) on an embedded fixture
+/// locked with bun.lock, package-lock.json and pnpm-lock.yaml, in the new
+/// directory `scratch`. Image builds and qualification run it so that a setup
+/// tool missing from where the runner looks fails there, not in a job.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn check_javascript_setup(
+    config: &Config,
+    scratch: &std::path::Path,
+) -> std::io::Result<String> {
+    isolation::check_javascript_setup(&isolation::JavascriptTools::for_config(config), scratch)
+}
 /// PID 1 of a Boat job's PID namespace on systemd before 257; the job unit
 /// execs the installed runner in this mode. Never returns.
 #[cfg(target_os = "linux")]

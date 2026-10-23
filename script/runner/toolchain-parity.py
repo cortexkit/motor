@@ -16,6 +16,9 @@ import subprocess
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "toolchain.json"
 LOCAL_BIN = Path("/usr/local/bin")
+# A tenant VM binds the tenant's own directories over these image paths before
+# its runner starts, so no tool the tenant runner executes may live beneath them.
+TENANT_WORKSPACE_ROOTS = ("/home", "/Users")
 HOST_ONLY_LOCAL_BIN_PATTERNS = ("motor-host*", "firecracker-*", "jailer-*")
 if 'seed' not in globals():
     seed_spec = importlib.util.spec_from_file_location('cargo_seed', HERE / 'cargo-seed.py')
@@ -152,7 +155,9 @@ def capture(manifest=None, job=False, role="build-server"):
     env = dict(os.environ, CARGO_HOME=str(cargo_home), RUSTUP_HOME=str(rustup_home),
                RUSTUP_AUTO_INSTALL="0", RUSTUP_NO_UPDATE_CHECK="1")
     if not job:
-        env["PATH"] = str(cargo_home / "bin") + ":/home/ubuntu/.bun/bin:" + os.environ.get("PATH", os.defpath)
+        bun_dir = Path(tool_path(paths.get("tools", {}).get("bun", {}), role, job)
+                       or "/home/ubuntu/.bun/bin/bun").parent
+        env["PATH"] = str(cargo_home / "bin") + f":{bun_dir}:" + os.environ.get("PATH", os.defpath)
     rustup = str(cargo_home / "bin/rustup")
     toolchains = {}
     target_payloads = {}
@@ -252,6 +257,15 @@ def capture(manifest=None, job=False, role="build-server"):
     }
 
 
+def tool_path(spec, role, job=False):
+    """Where `role` puts a manifest tool: jobs see `job_path` when the tool has
+    one (Bun, which the runner mounts there), otherwise both hosts and jobs use
+    the role's `path_by_role` entry or the measured build-server `path`."""
+    if job and "job_path" in spec:
+        return spec["job_path"]
+    return spec.get("path_by_role", {}).get(role, spec.get("path"))
+
+
 def first_line(text):
     return text.splitlines()[0] if text else ""
 
@@ -334,6 +348,9 @@ def validate(manifest, role="build-server"):
     git = manifest["tools"].get("git")
     if git is not None:
         validate_git(git)
+    bun = manifest["tools"].get("bun")
+    if bun is not None:
+        validate_bun(bun, manifest)
     for name, spec in manifest["tools"].items():
         source = spec.get("version_from")
         if source and (source not in manifest["tools"]
@@ -380,6 +397,21 @@ def validate_git(spec):
     packages = source.get("build_packages")
     if not packages or not all(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) for name in packages):
         raise ValueError("invalid git build packages")
+
+
+def validate_bun(spec, manifest):
+    """The runner runs Bun from its role's manifest path and mounts that
+    directory into jobs at job_path, which every role's job PATH searches.
+    The tenant's path must avoid the directories the tenant agent binds over."""
+    job_dir = str(Path(spec.get("job_path", "")).parent)
+    for role, environment in manifest["job_environment_by_role"].items():
+        if job_dir not in environment["PATH"].split(":"):
+            raise ValueError(f"Bun's job directory {job_dir} is not on the {role} job PATH")
+    if spec["path"] != spec.get("job_path") or set(spec.get("path_by_role", {})) - {"boat", "tenant"}:
+        raise ValueError("invalid Bun install layout")
+    tenant = tool_path(spec, "tenant")
+    if any(tenant == root or tenant.startswith(root + "/") for root in TENANT_WORKSPACE_ROOTS):
+        raise ValueError(f"tenant Bun at {tenant} would be hidden by the tenant's bound workspace roots")
 
 
 def readonly_mount(path, mountinfo):
@@ -437,7 +469,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         observed = tools.get(name) or {}
         # A tool the image installs beside a distribution copy, like git,
         # resolves from another directory there; its version is still exact.
-        equal(name + " path", expected.get("path_by_role", {}).get(role, expected["path"]), observed.get("path"))
+        equal(name + " path", tool_path(expected, role, job), observed.get("path"))
         equal(name + " --version exit", 0, observed.get("exit_code"))
         version = first_line(observed.get("version"))
         if name == "wasm-opt":
@@ -528,7 +560,7 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_
         return {"passed": not errors, "errors": errors, "role": role, "job": job,
                 "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual}
     validate(manifest)
-    actual = capture(role_manifest(manifest, role, job), job=job)
+    actual = capture(role_manifest(manifest, role, job), job=job, role=role)
     if role in ("boat", "tenant") and not job:
         state = Path('/usr/local/lib/motor' if role == 'tenant' else '/srv/build')
         marker = state / "sccache-inputs.sha256"
@@ -632,7 +664,7 @@ def main():
         if args.role == "macos":
             result = capture(manifest, job=args.job, role=args.role)
         else:
-            result = capture(role_manifest(manifest, args.role, args.job), job=args.job)
+            result = capture(role_manifest(manifest, args.role, args.job), job=args.job, role=args.role)
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(

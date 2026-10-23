@@ -158,7 +158,9 @@ impl JavascriptEnvironment {
         let _ = config;
         #[cfg(target_os = "linux")]
         {
-            let (managers, node_version) = crate::isolation::javascript_runner_versions();
+            let (managers, node_version) = crate::isolation::javascript_runner_versions(
+                &crate::isolation::JavascriptTools::for_config(config),
+            );
             Ok(Self::of_runner(&managers, &node_version))
         }
         #[cfg(not(target_os = "linux"))]

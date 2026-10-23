@@ -5,6 +5,7 @@ import io
 import errno
 from unittest.mock import patch, Mock
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import tarfile
@@ -826,9 +827,10 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.storage_checks(late)['storage_verified_before_services'])
 
     def test_job_repository_lockfile_installs_regular_bytes_not_symlink_only_modules(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(host.subprocess, 'run'):
+        with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            host.job_repository(repo)
+            with patch.object(host.subprocess, 'run'):
+                host.job_repository(repo)
             manifest = json.loads((repo / 'package.json').read_text())
             self.assertEqual(manifest['dependencies'], {'boat-dep':'file:vendor/boat-dep.tgz'})
             lock = json.loads((repo / 'package-lock.json').read_text())
@@ -840,6 +842,19 @@ class RunnerHostTests(unittest.TestCase):
             with tarfile.open(repo / 'vendor/boat-dep.tgz', 'r:gz') as tar:
                 self.assertTrue(all(member.isfile() and member.size > 0 for member in tar.getmembers()))
                 self.assertEqual(tar.extractfile('package/index.js').read(), b"module.exports = 'boat-node-modules';\n")
+            # Bun and pnpm lockfiles too, so a setup tool the runner cannot
+            # find in the Boat image fails the node_modules jobs.
+            for manager, lockfile in (('bun', 'bun.lock'), ('pnpm', 'pnpm-lock.yaml')):
+                self.assertTrue((repo / manager / lockfile).is_file())
+                self.assertFalse((repo / manager / 'node_modules').exists())
+            command = host.NODE_CHECK.split('; node -e')[0] + '; echo installed'
+            missing = subprocess.run(['sh', '-c', command], cwd=repo, capture_output=True, text=True)
+            self.assertEqual('runner setup did not install the bun fixture\n', missing.stderr)
+            for manager in host.JAVASCRIPT_FIXTURE_MANAGERS:
+                (repo / manager / 'node_modules/fixture-dep').mkdir(parents=True)
+                (repo / manager / 'node_modules/fixture-dep/index.js').write_text('')
+            self.assertEqual('installed\n', subprocess.run(['sh', '-c', command], cwd=repo,
+                                                           capture_output=True, text=True).stdout)
 
     def test_verify_prepared_hydrates_before_identity_phase_without_recipe_or_restart(self):
         probe = Mock()
