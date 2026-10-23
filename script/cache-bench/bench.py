@@ -946,7 +946,7 @@ def measured_records(result):
 
 
 def scheduled_reports(hour):
-    """Yield (placement, leg) for each report of one schedule slot.
+    """Yield (placement, leg) for each recorded leg of one schedule slot, with or without a report.
 
     Every slot runs one Boat sandbox per repository (plus, for a repository whose
     baseline does not fit beside its samples, a separate baseline-only sandbox),
@@ -1175,7 +1175,7 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.summarize:
         if any((args.credentials, args.backends, args.prefix, args.placement, args.output, args.source,
-                args.commit, args.cargo_home, args.toolchain, args.bundle)):
+                args.commit, args.cargo_home, args.toolchain, args.bundle, args.samples)):
             p.error('--summarize accepts only the scheduler directory')
         return args
     if (args.profile != 'legacy' or args.baseline or args.samples) and not args.run:

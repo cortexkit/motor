@@ -65,7 +65,9 @@ The second command reuses the first command's target *within* a sample, not
 across samples. `CARGO_NET_OFFLINE=true`, incremental compilation is off, and
 parallelism is fixed in the bundle. “Cold” means cold Cargo target, **not**
 dropped OS page caches. No tests execute. The legacy commands fetch motor only;
-the hourly protocol below prepares separately pinned private fleet bundles.
+the hourly protocol below prepares separately pinned private fleet bundles, and
+its `--profile hourly` runs three read-only samples per class unless `--samples 2`
+is given for a repository whose cold build is too long for three.
 Use otherwise-idle hosts with comparable CPU/memory limits. Linking, uncacheable
 work, disk/page caches and sandbox overhead remain placement differences.
 
@@ -104,7 +106,7 @@ denied requests, zero-hit warm reads and RTT errors invalidate success but remai
 visible. Missing-key backends alone do not invalidate an otherwise successful
 subset. All-skipped runs fail rather than claiming useful measurements.
 
-`results.md` is one table with **placement × backend** rows: no-cache/fill/three
+`results.md` is one table with **placement × backend** rows: no-cache/fill/RO
 RO/local-warm wall times, RO hit/miss/error and byte/request counters, direct and
 gateway full-GET p50/p95, and both routes' TCP/tiny-GET p50/p95. Combine A and B
 JSON as shown below for a single cross-placement table. Full per-backend JSON,
@@ -188,44 +190,71 @@ and rejects ambiguous matches. It parses the pinned Cargo version's HTML
 `UNIT_DATA` (not a stable machine API); absent/changed timing data fails admission.
 
 Selection admits only a candidate with more measured dependency unit-seconds than
-motor. It picks the smallest estimated hourly budget that fits 1,800 seconds:
-`7 × (motor cold seconds + candidate cold seconds) + 360s non-build allowance + 180s margin`.
-Seven is six RO samples (three per class) plus the sixth-hour baseline. The 360s
-allowance covers uploads/hydration, probes and cleanup; it is an estimate, **not a
-guarantee**. A bad network/hour or large upload can exceed it. Runtime SSH steps
-use the remaining TTL with a 30s cleanup reserve and fail rather than extending
-the sandbox. If neither candidate fits, calibration fails and scheduling refuses
-to start: inspect the evidence, do not hand-edit admission or invent a choice.
+motor, and prefers the one with the most. Each repository is sized **for its own
+sandbox**: it gets R read-only samples per class, the largest of 3 and 2 for which
+its busiest hour fits the 1,800-second TTL:
+`(2R + 1) × cold seconds + 360s non-build allowance + 180s margin ≤ 1,800`,
+where the 1 is the sixth-hour uncached baseline. If even R=2 cannot also hold the
+baseline but `4 × cold + 540 ≤ 1,800`, that repository keeps R=2 and its
+sixth-hour baseline runs in a separate baseline-only sandbox in the same slot
+(never skipped). A candidate that does not fit at R=2 with a separate baseline is
+passed over for the other; if neither fits (or motor itself does not), calibration
+fails. With the OVH Boat-large measurements (motor 45.0 s, prefrontal 197.2 s,
+broca 203.7 s cold) this selects broca at R=2 with an inline baseline, and motor
+at R=3. `calibration.json` records each repository's `sizing` (R, whether the
+baseline needs its own sandbox, and the budgets) and the chosen plan; the
+scheduler refuses a calibration whose recorded plan differs from what its
+measurements give. R is the same in every hour, so samples stay comparable within
+a repository; rebuild statistics are not comparable across repositories with
+different R. The 360s allowance covers uploads/hydration, probes and cleanup; it
+is an estimate, **not a guarantee**. A bad network/hour or large upload can exceed
+it. Runtime SSH steps use the remaining TTL with a 30s cleanup reserve and fail
+rather than extending the sandbox. If calibration fails, scheduling refuses to
+start: inspect the evidence, do not hand-edit admission or invent a choice.
 
-Each iteration uses **one new Boat large sandbox for both classes and both
-repositories**, swapping bundles sequentially at the same absolute paths used
-during fill. `/srv/cache-bench/motor` is deliberately the fixed checkout path even
-for prefrontal/broca; `manifest.repository` identifies the real source. Three
-cold-target RO rebuilds per class/repository, 200 full GETs per direct/gateway
-route, and the existing TCP/tiny-GET probes run there. A single uncached baseline
-per repository runs only at hours 6, 12, …, 72, before that hour's first class.
+Each slot runs **one new Boat large sandbox per repository**, one after another:
+motor first, then the selected repository. A sandbox holds only its repository's
+samples for both classes, at the fixed absolute paths used during fill.
+`/srv/cache-bench/motor` is deliberately the fixed checkout path even for
+prefrontal/broca; `manifest.repository` identifies the real source. R cold-target
+RO rebuilds per class, 200 full GETs per direct/gateway route, and the existing
+TCP/tiny-GET probes run there. A single uncached baseline per repository runs
+only at hours 6, 12, …, 72, before that repository's first class (inline, or in
+its own baseline-only sandbox just before the repository's sandbox). Each sandbox
+reads the Boat key afresh, and a failed sandbox does not suppress the other
+repository's sandbox or the server leg. With the OVH numbers a sixth hour's Boat
+work is budgeted at about 855 s (motor) + 1,559 s (broca), followed by at most
+900 s of server leg; a slot that overruns its hour delays the next slot's start
+but never skips it unless its whole hour has elapsed.
 The server leg performs **only** direct TCP, tiny GET and 200 full GET probes per
 class/repository, via pinned operator SSH. It does not extract sources or invoke
-Cargo. Class order alternates for both legs; motor runs before the selected repo.
-Within an iteration Boat precedes server, so the two placements are not simultaneous.
+Cargo. Class order alternates each hour for every sandbox and the server leg.
+Within a slot the Boat sandboxes precede the server leg, so the two placements
+are not simultaneous.
 
 The scheduler fixes 72 slots, at start + 0h through start + 71h, not 72 hours of
-continuous load. `state.json` is atomically checkpointed before/after each leg.
+continuous load. `state.json` records each repository's R and planned sandboxes
+in every slot, and is atomically checkpointed before/after each sandbox and leg.
 An exclusive output-folder lock prevents two schedulers sharing state. Restart
 with **the identical command, script revision and inputs**: finished slots are
-never rerun; an interrupted slot becomes failed; slots whose whole hour elapsed
-offline become `missed` instead of being backfilled in a burst. The remaining
-slots keep their original timestamps and class/baseline ordering. Failed Boat
-legs do not suppress server legs or the next hour. Unresolved sandbox cleanup is
-retried before another Boat clone; it can fail that Boat leg, not silently leak
-additional clones. Keep the probe checkpoints for operator cleanup, even after
-an interruption. Exit 1 at the end means at least one failed/missed slot, not that
-the later hours were abandoned.
+never rerun; an interrupted slot becomes failed (keeping the sandboxes it
+finished); slots whose whole hour elapsed offline become `missed` instead of
+being backfilled in a burst. The remaining slots keep their original timestamps,
+class/baseline ordering and sample counts. Unresolved cleanup of any earlier
+sandbox is retried before each new clone; it can fail that sandbox, not silently
+leak additional clones. Keep the probe checkpoints for operator cleanup, even
+after an interruption. Exit 1 at the end means at least one failed/missed slot,
+not that the later hours were abandoned.
 
 ### 1. Prepare private inputs (direct Linux SSH host, never a runner job)
 
-Use the **delivered script revision** throughout preparation, calibration, fill
-and scheduling. Do not upgrade it midway. Start with empty reserved
+The operator sequence is: prepare (1), calibrate (2), fill (3), schedule (4),
+purge (5). Use the **delivered script revision** throughout preparation,
+calibration, fill and scheduling. Do not upgrade it midway. Each bundle pins the
+SHA-256 of `bench.py` that prepared it, and every measurement refuses a different
+driver, so bundles prepared with an earlier revision cannot be reused: after an
+upgrade, prepare new bundles under a new `EXPERIMENT` (new prefixes) and
+calibrate them afresh in a new output folder. Start with empty reserved
 `/srv/cache-bench`; this protocol replaces that directory between repositories.
 Run the following in a direct operator SSH shell on the build server. Set the
 three checkout paths and the exact toolchain installed in the prepared image.
@@ -327,9 +356,15 @@ import json, sys
 data = json.load(open(sys.argv[1]))
 print('Selected:', data['selected'], '\nReason:', data['reason'])
 for name, result in data['records'].items():
-    print(name, result['cold_seconds'], 'cold s;', result['dependency_unit_seconds'], 'dependency unit-s')
+    print(name, result['cold_seconds'], 'cold s;', result['dependency_unit_seconds'], 'dependency unit-s;',
+          'sizing:', result['sizing'])
+print('Scheduled sizing (R per repository):', data['sizing'])
 PY
 ```
+
+Use a fresh `$OUT` (and `$INPUT`) for each experiment: calibration refuses an
+output folder that already holds `calibration.json`, and the scheduler refuses a
+calibration recorded by an earlier revision (schema 1, without sizing).
 
 Retain the complete calibration folder, not just its final JSON. A successful
 calibration and matching raw results are mandatory before fill or scheduling.
@@ -380,9 +415,12 @@ python3 - "$OUT/schedule/state.json" <<'PY'
 import collections, json, sys
 data = json.load(open(sys.argv[1]))
 print(collections.Counter(h['status'] for h in data['iterations']))
+print('R per repository:', {name: s['samples'] for name, s in data['sizing'].items()})
 for h in data['iterations']:
     if h['status'] != 'pending':
-        print(h['hour'], h['status'], h.get('order'), 'baseline:', h['baseline'])
+        sandboxes = {name: leg.get('complete') for name, leg in (h.get('boat') or {}).items()}
+        print(h['hour'], h['status'], h.get('order'), 'baseline:', h['baseline'], 'boat:', sandboxes,
+              'server:', (h.get('server') or {}).get('complete'))
 PY
 tail -n 20 "$OUT/schedule.log"
 # Safe during the run: the state snapshot points only at completed report files.
@@ -396,12 +434,16 @@ calibration, fill evidence, or change credential paths while resuming. Keys can
 be rotated in their existing files. The scheduler fingerprints scripts/options,
 not credential values.
 
-`summary.{json,md}` pools raw successful full-fetch/TCP/tiny-GET latency samples
-per class × placement × repository × route, reporting nearest-rank p50/p95/p99,
-error/timeout denominators, rebuild/baseline distributions and hit/miss/cache
-error counts. It includes all schedule slots (including failed/missed ones),
-hourly measurements and HP-minus-Standard paired differences for each measured
-hour/metric. Missing observations are never imputed. Errors/timeouts are logical
+`summary.{json,md}` has one section per repository, stating its R (read-only
+samples per class per hour) and whether its baseline ran in a separate sandbox.
+Each section pools raw successful full-fetch/TCP/tiny-GET latency samples per
+class × placement × route, reporting nearest-rank p50/p95/p99, error/timeout
+denominators, rebuild/baseline distributions and hit/miss/cache error counts,
+then that repository's class comparison. Baselines from a baseline-only sandbox
+join the repository's baseline distribution and nothing else. The summary also
+includes all schedule slots with each sandbox's outcome (including failed/missed
+slots), hourly measurements and HP-minus-Standard paired differences for each
+measured hour/metric. Missing observations are never imputed. Errors/timeouts are logical
 probe outcomes; a stale-connection retry that succeeds is included in the
 end-to-end latency, not counted as a failed logical fetch. A deterministic
 descriptive comparison states whether the absolute median paired difference
@@ -412,9 +454,10 @@ no rebuild distribution, not artificial zero-second builds.
 ### 5. Cleanup/purge (after schedule stops and evidence is retained)
 
 ```sh
-# For any checkpoint reporting incomplete cleanup (also after an interrupted hour):
+# For any checkpoint reporting incomplete cleanup (also after an interrupted hour);
+# SANDBOX is the repository name, or <repository>-baseline for a baseline-only sandbox:
 # YOUR_BOAT_KEY_READER | python3 "$REPO/script/boat-probe/probe.py" --key-stdin \
-#   --cleanup "$OUT/schedule/hour-NNN/boat/probe/results.json"
+#   --cleanup "$OUT/schedule/hour-NNN/boat-SANDBOX/probe/results.json"
 python3 - "$OUT/calibration/calibration.json" > "$OUT/purge-prefixes.txt" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
