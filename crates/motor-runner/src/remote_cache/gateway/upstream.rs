@@ -141,8 +141,9 @@ pub(super) enum Framing {
     Empty,
     /// Exactly this many bytes.
     Length(u64),
-    /// Chunked, or no length at all: the body runs to the end of the
-    /// connection, which therefore cannot be reused.
+    /// No length at all, so the body runs to the end of the connection; a
+    /// chunked body is treated the same way, since the gateway does not
+    /// decode chunks. Either way the connection cannot be reused.
     UntilClose,
 }
 
