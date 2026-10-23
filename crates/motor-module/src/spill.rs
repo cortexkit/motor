@@ -139,6 +139,8 @@ mod tests {
             (Some(9), None, false),
             (Some(7201), None, false),
             (Some(10_800), None, false),
+            // A 4-hour timeout, as in a production spill the broker refused.
+            (Some(14_400), None, false),
             (Some(30), Some(0), false),
             (Some(30), Some(1), true),
         ] {
