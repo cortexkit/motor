@@ -650,12 +650,60 @@ A re-request must repeat it. Any other value is 400 `bad_request`.
   root -g root /tmp/ck-motor-tenant-id /etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id &&
   cat /etc/motor/tenant/id` and requires the printed id back. The runner reads it, refuses all
   connections while it is missing, and checks the token's `aud` equals `boat:<id>`.
+- **Compile-cache provisioning.** The broker installs the sandbox's compile-cache provisioning
+  after every create or resume, once Boat reports the sandbox hydrated. A guest reboot the broker
+  does not see clears `/run`; the cache is then unavailable until the next create or resume.
+  - **Paths and modes.** `/run/motor/cache/` is a root-owned (`root:root`) `0700` directory on
+    tmpfs. It holds two root-owned files: `/run/motor/cache/read-key`, mode `0400`, and
+    `/run/motor/cache/config.json`, mode `0444` (plus, only during a write, its temporary file).
+    Neither file, nor any staging copy of one, is ever placed in `/etc` or anywhere Boat saves in
+    a snapshot: Boat archives `/etc` in snapshots and swaps it late after a restore. The broker
+    stages content through Boat's files API in a private `0700` directory with a random name
+    under `/tmp`, which Boat never saves in snapshots, and removes the staging copy right after
+    the install.
+  - **`read-key`** is one UTF-8 JSON object with exactly the members `generation` (string),
+    `access_key_id` (string) and `secret_access_key` (string): the read-only OVH credential of the
+    sandbox tenant's cache tenant. The bucket policy confines that credential to exactly the
+    tenant's store prefix and grants it no write. A read-write key is never written to a Boat
+    sandbox. A raw key, or any other shape, is invalid and leaves the cache unavailable.
+  - **`config.json`** is one UTF-8 JSON object with exactly the members `generation` (string),
+    `tenant` (string, the cache tenant's subject, e.g. `acct:<ULID>`), `endpoint` (string),
+    `region` (string), `bucket` (string), `prefix` (string), `storage_class` (string) and
+    `enabled` (boolean). `prefix` equals `"tenant/" + tenant.replace(":", "-") + "/"`, e.g.
+    `tenant/acct-01KXJJHK4V6DB42W1YAN2XD9QN/`. The broker installs a cache tenant's files only
+    into that tenant's own sandboxes.
+  - **Generations.** `read-key` and `config.json` carry the same `generation` value, an opaque
+    string the runner only compares for equality and never orders. A generation is immutable
+    except for `enabled`: a new key or any other changed config member is installed under a new
+    `generation`, and `enabled` alone may be flipped in place. The runner activates a set only
+    when both files parse and share one `generation`. A mixed set leaves the previous complete
+    generation active, and a reused `generation` with changed contents makes the cache
+    unavailable.
+  - **Atomic writes, key first.** Each file is written to a temporary file in
+    `/run/motor/cache/` with its final owner and mode, then renamed over its final name. The
+    broker renames `read-key` before `config.json`.
+  - **Read-back.** After both renames, the broker runs
+    `sudo sha256sum /run/motor/cache/read-key /run/motor/cache/config.json` through Boat's exec
+    API and requires each printed digest to equal the SHA-256 of the bytes it wrote. Otherwise it
+    repeats the whole write, at most 3 attempts per start; after that it logs
+    `boat_cache_key_install_failed` and the cache stays unavailable.
+  - **Cache tenant versus sandbox.** The runner takes the cache-tenant id only from `tenant` in
+    `/run/motor/cache/config.json`, never from `/etc/motor/tenant/id`, which keeps holding the
+    sandbox id for the admission audience `boat:<id>`. Two sandboxes with different ids can share
+    one cache tenant and read the same prefix.
+  - **Never gates readiness.** Missing, invalid or unverified cache files make the runner report
+    `cache_unavailable` and build uncached. They don't delay `/run/motor/endpoint-ready`, don't
+    hold back booking, and aren't a `sandbox_lost`.
 - The runner listens only on `127.0.0.1:9443`.
 - Once the runner listens with its signing keys loaded, the image writes `/run/motor/endpoint-ready`
   holding the sandbox id (the content of `/etc/motor/tenant/id`, a trailing newline allowed). The
   broker reads it with the fixed command `cat /run/motor/endpoint-ready` through Boat's exec API
   after every start, create or resume, and books no lease onto the sandbox until it names this
-  sandbox. `/run` is cleared at boot, so the marker always belongs to the current start.
+  sandbox. `/run` is cleared at boot, so the marker always belongs to the current start. The
+  endpoint removes the marker whenever it cannot admit jobs (its runner disk full, say) and writes
+  it again once it can: before booking a sandbox that is already running from an earlier lease,
+  the broker reads it once more and books only if it still names the sandbox; otherwise the
+  sandbox is stopped and deleted.
 - sshd sets `AllowTcpForwarding local`, `PermitTTY no`, `AllowAgentForwarding no`,
   `X11Forwarding no` and `PermitTunnel no`, and the boot unit empties `authorized_keys` on every
   resume.
