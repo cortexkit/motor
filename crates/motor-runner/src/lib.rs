@@ -22,6 +22,11 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
+// Only the provisioning layer exists yet and nothing in a production build
+// reads it, so only tests reach this module for now.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod remote_cache;
 mod server;
 mod setup_log;
 // Nothing in a production build uses sibling snapshots yet: production builds
