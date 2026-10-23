@@ -158,9 +158,14 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
     let state = root
         .parent()
         .ok_or_else(|| io::Error::other("cache has no state directory"))?;
+    // sccache 0.18 in READ_ONLY mode tries to create `preprocessor/` inside the
+    // cache and fails every C compile (cc-rs exit 254) on the read-only job
+    // mount when it is missing, so a new or freshly evicted cache needs it from
+    // the start rather than after the writer's first fill.
+    let preprocessor = fleet.join("preprocessor");
     // Do not repair a symlink into somebody else's tree. Storage is fixed under
     // the instance state directory, never supplied by a job or a repository.
-    for directory in [root, fleet] {
+    for directory in [root, fleet, preprocessor.as_path()] {
         match fs::symlink_metadata(directory) {
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
                 return Err(io::Error::other(

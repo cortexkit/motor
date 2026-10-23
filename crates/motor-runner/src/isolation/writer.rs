@@ -302,7 +302,17 @@ fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
         .join(new_entries[0].strip_prefix(&fleet).unwrap())
         .exists());
     prepare_writer_cache(&fleet, account).unwrap();
-    for directory in [container, fleet.as_path(), retired.as_path()] {
+    // A freshly emptied cache must already hold sccache's preprocessor folder:
+    // read-only sccache fails every C compile without it.
+    let preprocessor = fleet.join("preprocessor");
+    assert!(preprocessor.is_dir());
+    assert_eq!(fs::metadata(&preprocessor).unwrap().uid(), account.uid);
+    for directory in [
+        container,
+        fleet.as_path(),
+        retired.as_path(),
+        preprocessor.as_path(),
+    ] {
         assert_job_cannot_write(directory);
     }
 }
