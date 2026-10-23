@@ -6,10 +6,39 @@ const GIB: u64 = 1 << 30;
 
 // Exercise scheduling with native fixture processes, without requiring a root
 // XFS quota mount. The production host backend has no such quota bypass.
-struct SchedulerFixtureBackend;
+#[derive(Default)]
+struct SchedulerFixtureBackend {
+    #[cfg(target_os = "linux")]
+    policy: Option<Arc<FixtureCachePolicy>>,
+}
+#[cfg(target_os = "linux")]
+struct FixtureCachePolicy {
+    cap: u64,
+    initial: u64,
+    attempts: AtomicU64,
+}
 impl backend::Backend for SchedulerFixtureBackend {
     fn materialize(&self, config: &Config, trees: &Trees, setup: &Setup) -> io::Result<Prepared> {
-        backend::HostBackend.materialize(config, trees, setup)
+        let prepared = backend::HostBackend.materialize(config, trees, setup)?;
+        #[cfg(target_os = "linux")]
+        if let Some(policy) = &self.policy {
+            policy.attempts.fetch_add(1, Ordering::SeqCst);
+            let initial = if prepared.target.join("warm-marker").exists() {
+                policy.initial
+            } else {
+                0
+            };
+            backend::setup_step(
+                "fixture quota capacity",
+                crate::boat_quota::capacity(
+                    initial / 512,
+                    policy.cap,
+                    config.boat_cold_materialization,
+                    crate::boat_quota::MIN_COLD_CAP_BYTES,
+                ),
+            )?;
+        }
+        Ok(prepared)
     }
     fn launch(
         &self,
@@ -50,7 +79,8 @@ async fn boat_queues_a_second_small_job_through_setup_and_execution() {
     let mut config = boat_config(&f, |_| Ok(63 * GIB));
     config.manual_tick = false;
     config.long_work = Some(hold.hook());
-    let runner = Runner::open_with_backend(config, Box::new(SchedulerFixtureBackend)).unwrap();
+    let runner =
+        Runner::open_with_backend(config, Box::new(SchedulerFixtureBackend::default())).unwrap();
     let marker = f.scratch.join("release-first");
     hold.arm();
     let (mut first, mut first_bytes) = job_at(
@@ -96,6 +126,119 @@ async fn boat_queues_a_second_small_job_through_setup_and_execution() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn over_cap_baseline_is_evicted_and_the_job_runs_cold() {
+    let f = Fixture::new();
+    let mut config = boat_config(&f, |_| Ok(63 * GIB));
+    config.manual_tick = false;
+    let policy = Arc::new(FixtureCachePolicy {
+        cap: 16 * GIB,
+        initial: 24 * GIB,
+        attempts: AtomicU64::new(0),
+    });
+    let runner = Runner::open_with_backend(
+        config,
+        Box::new(SchedulerFixtureBackend {
+            policy: Some(policy.clone()),
+        }),
+    )
+    .unwrap();
+    let (mut warm, mut warm_bytes) = f.run("true");
+    warm.siblings.clear();
+    warm.bundles.truncate(1);
+    warm_bytes.truncate(1);
+    f.submit(&runner, &warm, &warm_bytes);
+    assert_eq!(
+        terminal(&runner, warm.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    policy.attempts.store(0, Ordering::SeqCst);
+    let path = PathBuf::from(&f.key);
+    fs::write(path.join("target/warm-marker"), b"reused cache").unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .get_mut(&f.key)
+            .unwrap()
+            .sibling_freshness
+            .insert("old-cache".into(), Default::default());
+    }
+    let (mut request, mut bytes) =
+        f.run("if test -e target/warm-marker; then exit 31; fi; printf cold-after-eviction");
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    bytes.truncate(1);
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(
+        result.outcome,
+        Outcome::Exit { code: 0 },
+        "{result:?}; {}",
+        runner_diagnostics(&runner)
+    );
+    assert_eq!(policy.attempts.load(Ordering::SeqCst), 2);
+    assert!(!path.join("target/warm-marker").exists());
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(inner.catalog.workspaces[&f.key]
+        .sibling_freshness
+        .is_empty());
+    assert_eq!(inner.last_eviction.as_ref().unwrap().path, f.key);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cold_quota_shortage_refuses_before_start_and_withdraws_ready_marker() {
+    let f = Fixture::new();
+    let marker = f.scratch.join("endpoint-ready");
+    fs::write(&marker, b"sandbox").unwrap();
+    let withdrawals = Arc::new(AtomicU64::new(0));
+    let mut config = boat_config(&f, |_| Ok(63 * GIB));
+    config.manual_tick = false;
+    config.boat_readiness_withdraw = {
+        let (marker, withdrawals) = (marker.clone(), withdrawals.clone());
+        Arc::new(move || {
+            withdrawals.fetch_add(1, Ordering::SeqCst);
+            fs::remove_file(&marker)
+        })
+    };
+    let policy = Arc::new(FixtureCachePolicy {
+        cap: 4 * GIB,
+        initial: 0,
+        attempts: AtomicU64::new(0),
+    });
+    let runner = Runner::open_with_backend(
+        config,
+        Box::new(SchedulerFixtureBackend {
+            policy: Some(policy.clone()),
+        }),
+    )
+    .unwrap();
+    let (mut request, mut bytes) = f.run("touch should-not-run");
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    bytes.truncate(1);
+    f.submit(&runner, &request, &bytes);
+    let terminal = terminal(&runner, request.job_id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDiskFull
+        }
+    );
+    assert_eq!(policy.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(withdrawals.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    assert!(!Path::new(&request.workspace_key)
+        .join("should-not-run")
+        .exists());
+    assert!(runner.core.inner.lock().unwrap().jobs[&request.job_id]
+        .started_ms
+        .is_none());
+}
+
 fn workspace(runner: &Runner, path: &Path, used_ms: u64) {
     fs::create_dir_all(path.join("target")).unwrap();
     fs::write(path.join("target/artifact"), vec![1; 8192]).unwrap();
@@ -110,7 +253,7 @@ fn workspace(runner: &Runner, path: &Path, used_ms: u64) {
     runner.catalog(&inner).unwrap();
 }
 
-/// The Boat image's thresholds (24 GiB floor, 32 GiB soft goal) with a free
+/// The Boat image's cold-cap thresholds with a free
 /// space probe the test controls.
 fn boat_config(
     f: &Fixture,
@@ -119,8 +262,8 @@ fn boat_config(
     let mut c = f.config();
     c.boat_profile = true;
     c.boat_memory_max_bytes = Some(2 << 30);
-    c.free_space_floor_bytes = 24 * GIB;
-    c.free_space_eviction_bytes = Some(32 * GIB);
+    c.free_space_floor_bytes = (32 * GIB) + (64 << 20);
+    c.free_space_eviction_bytes = Some(40 * GIB);
     c.disk_reserve_bytes = 4096;
     c.free_space_probe = Arc::new(probe);
     c.manual_tick = true;
@@ -193,7 +336,7 @@ fn boat_admission_refuses_typed_when_eviction_leaves_free_space_under_the_floor(
         Admission::DiskFull(RunnerDiskFull {
             free_bytes,
             floor_bytes,
-        }) if free_bytes == 10 * GIB && floor_bytes == 24 * GIB
+        }) if free_bytes == 10 * GIB && floor_bytes == (32 * GIB) + (64 << 20)
     ));
     assert!(!other.exists());
     assert!(

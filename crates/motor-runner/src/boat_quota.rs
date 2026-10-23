@@ -22,6 +22,87 @@ const PROVISIONAL_RESERVE: u64 = 24 * 1024 * 1024 * 1024;
 const BLOCK_CAP: u64 = 32 * 1024 * 1024 * 1024;
 const INODE_CAP: u64 = 65_536;
 const INODE_RESERVE: u64 = 8192;
+pub(crate) const MIN_COLD_CAP_BYTES: u64 = 8 << 30;
+pub(crate) const READY_FREE_BYTES: u64 =
+    PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES + MIN_COLD_CAP_BYTES;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColdCache {
+    pub initial_bytes: Option<u64>,
+    pub cap_bytes: u64,
+    pub minimum_growth: u64,
+    pub cause: Option<String>,
+}
+impl std::fmt::Display for ColdCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Boat cache needs a cold retry: initial_bytes={:?} cap_bytes={} minimum_growth_bytes={} cause={}", self.initial_bytes, self.cap_bytes, self.minimum_growth, self.cause.as_deref().unwrap_or("insufficient reusable growth"))
+    }
+}
+impl std::error::Error for ColdCache {}
+
+pub(crate) fn cold_cache(error: &io::Error) -> Option<ColdCache> {
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    for _ in 0..32 {
+        if let Some(request) = current.downcast_ref::<ColdCache>() {
+            return Some(request.clone());
+        }
+        current = if let Some(error) = current.downcast_ref::<io::Error>() {
+            error
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))?
+        } else {
+            current.source()?
+        };
+    }
+    None
+}
+
+pub(crate) fn cache_walk_error(error: io::Error, cold: bool) -> io::Error {
+    if !cold && walk::is_limit(&error) {
+        io::Error::other(ColdCache {
+            initial_bytes: None,
+            cap_bytes: 0,
+            minimum_growth: MIN_COLD_CAP_BYTES,
+            cause: Some(error.to_string()),
+        })
+    } else {
+        error
+    }
+}
+
+pub(crate) fn capacity(
+    initial_blocks: u64,
+    cap_bytes: u64,
+    cold: bool,
+    minimum_growth: u64,
+) -> io::Result<(u64, u64)> {
+    let (hard, remaining) = block_limits(initial_blocks, cap_bytes / 512);
+    if cap_bytes < minimum_growth || (!cold && remaining * 512 < minimum_growth) {
+        return Err(io::Error::other(ColdCache {
+            initial_bytes: Some(initial_blocks * 512),
+            cap_bytes,
+            minimum_growth,
+            cause: None,
+        }));
+    }
+    if initial_blocks > hard {
+        return Err(io::Error::other(
+            "cold Boat checkout exceeds the total per-job quota cap",
+        ));
+    }
+    Ok((hard, remaining * 512))
+}
+
+pub(crate) fn withdraw_ready() -> io::Result<()> {
+    let output = crate::systemd::output(crate::privilege::command("/usr/bin/python3").args([
+        "/usr/local/libexec/motor-boat-start.py",
+        "--withdraw-storage",
+    ]))?;
+    if !output.status.success() {
+        return Err(io::Error::other("cannot withdraw Boat endpoint readiness"));
+    }
+    Ok(())
+}
 
 pub(crate) fn job_roots(
     workspace: &Path,
@@ -243,6 +324,13 @@ fn budget(xfs: u64, root: u64, reserved: u64, cap: u64, floor: u64) -> io::Resul
     }
 }
 
+fn block_limits(initial: u64, physical_allowance: u64) -> (u64, u64) {
+    // No initial-usage credit: shared baseline charges can become physical CoW
+    // allocations. They must consume, rather than increase, this total cap.
+    let hard = physical_allowance;
+    (hard, hard.saturating_sub(initial))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
@@ -260,6 +348,8 @@ struct Lease {
     blocks: u64,
     inodes: u64,
     growth_bytes: u64,
+    #[serde(default)]
+    initial_blocks: u64,
     #[serde(default)]
     phase: Phase,
 }
@@ -351,8 +441,8 @@ fn quarantine_runtime(runtime: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare(state: &Path, id: Uuid, roots: Vec<PathBuf>) -> io::Result<()> {
-    prepare_with(&System, state, id, roots)
+pub(crate) fn prepare(state: &Path, id: Uuid, roots: Vec<PathBuf>, cold: bool) -> io::Result<()> {
+    prepare_with(&System, state, id, roots, cold, MIN_COLD_CAP_BYTES)
 }
 
 pub(crate) fn preflight_cached_tree(path: &Path) -> io::Result<()> {
@@ -360,6 +450,31 @@ pub(crate) fn preflight_cached_tree(path: &Path) -> io::Result<()> {
     let root = walk::physical_root(path, &budget)?;
     let device = root.metadata()?.dev();
     walk::visit(root, device, &mut budget, &mut |_, _| Ok(true))
+}
+
+pub(crate) fn cached_bytes(path: &Path) -> io::Result<u64> {
+    let mut budget = walk::Budget::default();
+    let root = walk::physical_root(path, &budget)?;
+    let device = root.metadata()?.dev();
+    let mut bytes = 0u64;
+    walk::visit(root, device, &mut budget, &mut |_, metadata| {
+        bytes = bytes.saturating_add(metadata.blocks() * 512);
+        Ok(true)
+    })?;
+    Ok(bytes)
+}
+
+pub(crate) fn remove_retired_tree(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing retired-tree container"))?;
+    walk::remove_private(path, parent).map_err(|error| {
+        if walk::is_limit(&error) {
+            io::Error::new(io::ErrorKind::TimedOut, error)
+        } else {
+            error
+        }
+    })
 }
 
 pub(crate) fn validate_for_launch(state: &Path, id: Uuid, roots: &[PathBuf]) -> io::Result<()> {
@@ -414,6 +529,8 @@ fn prepare_with(
     state: &Path,
     id: Uuid,
     roots: Vec<PathBuf>,
+    cold: bool,
+    minimum_growth: u64,
 ) -> io::Result<()> {
     let (_lock, directory) = lock(state)?;
     let manifest = directory.join(format!("{id}.json"));
@@ -421,24 +538,18 @@ fn prepare_with(
         return Err(io::Error::other("Boat job already has a quota lease"));
     }
     let mut used_ids = std::collections::BTreeSet::new();
-    let (mut reserved_blocks, mut reserved_inodes) = (0u64, 0u64);
     for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            let lease: Lease = serde_json::from_slice(&fs::read(path)?)?;
+            let mut lease: Lease = serde_json::from_slice(&fs::read(&path)?)?;
             used_ids.insert(lease.project);
-            // Pending or releasing leases cannot launch a job. Missing quota records
-            // are also normal before assignment and after limits were cleared.
-            if !lease.active() {
-                continue;
+            // The dispatcher gives this setup the only Boat job slot. Older
+            // leases can retain inodes for delayed cleanup, but no command can
+            // spend their unused allowance. Keep their limits until cleanup.
+            if lease.active() {
+                lease.phase = Phase::Releasing;
+                crate::storage::atomic_json_private(&path, &lease)?;
             }
-            let Some(usage) = usage(system, lease.project)? else {
-                continue;
-            };
-            reserved_blocks =
-                reserved_blocks.saturating_add(lease.blocks.saturating_sub(usage.blocks));
-            reserved_inodes =
-                reserved_inodes.saturating_add(lease.inodes.saturating_sub(usage.inodes));
         }
     }
     let project = next_project(system, &directory, &used_ids)?;
@@ -449,14 +560,27 @@ fn prepare_with(
     let bytes = budget(
         xfs,
         root,
-        reserved_blocks.saturating_mul(512),
+        0,
         BLOCK_CAP,
         PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES,
-    )? / 512
+    )
+    .map_err(|_| {
+        io::Error::other(ColdCache {
+            initial_bytes: None,
+            cap_bytes: 0,
+            minimum_growth,
+            cause: None,
+        })
+    })? / 512
         * 512;
-    let inode_budget = budget(inodes, inodes, reserved_inodes, INODE_CAP, INODE_RESERVE)?;
+    let inode_budget = budget(inodes, inodes, 0, INODE_CAP, INODE_RESERVE)?;
     if bytes == 0 {
-        return Err(io::Error::other("Boat quota smaller than one block"));
+        return Err(io::Error::other(ColdCache {
+            initial_bytes: None,
+            cap_bytes: 0,
+            minimum_growth,
+            cause: None,
+        }));
     }
     let device = fs::metadata(system.mount())?.dev();
     // Persist before touching inodes: runtime cleanup can undo partial assignment.
@@ -466,19 +590,24 @@ fn prepare_with(
         blocks: 0,
         inodes: 0,
         growth_bytes: bytes,
+        initial_blocks: 0,
         phase: Phase::Pending,
     };
     crate::storage::atomic_json_private(&manifest, &lease)?;
     system.monitor(&manifest, project, device)?;
-    assign_roots(system, &lease.roots, project, None, device)?;
+    assign_roots(system, &lease.roots, project, None, device)
+        .map_err(|error| cache_walk_error(error, cold))?;
     let initial = system.quota(project, None)?;
-    lease.blocks = initial.blocks + bytes / 512;
+    let (hard, remaining) = capacity(initial.blocks, bytes, cold, minimum_growth)?;
+    lease.blocks = hard;
+    lease.growth_bytes = remaining;
+    lease.initial_blocks = initial.blocks;
     lease.inodes = initial.inodes + inode_budget;
     crate::storage::atomic_json_private(&manifest, &lease)?;
     system.quota(project, Some((lease.blocks, lease.inodes)))?;
     lease.phase = Phase::Active;
     crate::storage::atomic_json_private(&manifest, &lease)?;
-    tracing::info!(job_id = %id, project, writable_bytes = bytes, inode_budget, block_limit = lease.blocks, inode_limit = lease.inodes, xfs_free = xfs, root_free = root, provisional_reserve = PROVISIONAL_RESERVE, "Boat job disk quota installed");
+    tracing::info!(job_id = %id, project, initial_bytes = initial.blocks * 512, physical_cap_bytes = bytes, writable_bytes = lease.growth_bytes, cold, inode_budget, block_limit = lease.blocks, inode_limit = lease.inodes, xfs_free = xfs, root_free = root, provisional_reserve = PROVISIONAL_RESERVE, "Boat job disk quota installed");
     Ok(())
 }
 

@@ -214,3 +214,113 @@ pub(super) fn visit(
     }
     Ok(())
 }
+
+fn unlink_at(parent: RawFd, name: &OsStr, directory: bool) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())?;
+    // SAFETY: the parent is pinned and the name is one NUL-terminated component.
+    let result = unsafe {
+        libc::unlinkat(
+            parent,
+            name.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+struct RemovalFrame {
+    pin: File,
+    entries: fs::ReadDir,
+    name: std::ffi::OsString,
+}
+
+// Only private retired trees are accepted. Partial progress is safe to retry;
+// deep subtrees are lifted into the same private container instead of requiring
+// unbounded descriptors, recursion, or reconstructed descendant pathnames.
+pub(super) fn remove_private(path: &Path, container: &Path) -> io::Result<()> {
+    if path.parent() != Some(container) {
+        return Err(io::Error::other(
+            "retired tree is not a direct child of its private container",
+        ));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing retired tree name"))?;
+    let mut budget = Budget::default();
+    let parent = physical_root(container, &budget)?;
+    let root = match open_at(parent.as_raw_fd(), name, false) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let device = parent.metadata()?.dev();
+    let metadata = root.metadata()?;
+    if metadata.dev() != device {
+        return Err(io::Error::other("retired tree crosses a filesystem"));
+    }
+    if !metadata.is_dir() {
+        return unlink_at(parent.as_raw_fd(), name, false);
+    }
+    let entries = fs::read_dir(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
+    let mut stack = vec![RemovalFrame {
+        pin: root,
+        entries,
+        name: name.to_owned(),
+    }];
+    while let Some(frame) = stack.last_mut() {
+        budget.check_time()?;
+        let Some(entry) = frame.entries.next() else {
+            let finished = stack.pop().unwrap();
+            let owner = stack
+                .last()
+                .map_or(parent.as_raw_fd(), |frame| frame.pin.as_raw_fd());
+            unlink_at(owner, &finished.name, true)?;
+            continue;
+        };
+        budget.entry()?;
+        let name = entry?.file_name();
+        let child = match open_at(frame.pin.as_raw_fd(), &name, false) {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let metadata = child.metadata()?;
+        if metadata.dev() != device {
+            return Err(io::Error::other("retired tree crosses a filesystem"));
+        }
+        if !metadata.is_dir() {
+            unlink_at(frame.pin.as_raw_fd(), &name, false)?;
+            continue;
+        }
+        if stack.len() >= budget.limits.depth {
+            let target = CString::new(format!("boat-deep-{}", uuid::Uuid::now_v7())).unwrap();
+            let source = CString::new(name.as_bytes())?;
+            // SAFETY: both parents are pinned directories on the same filesystem.
+            if unsafe {
+                libc::renameat(
+                    stack.last().unwrap().pin.as_raw_fd(),
+                    source.as_ptr(),
+                    parent.as_raw_fd(),
+                    target.as_ptr(),
+                )
+            } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            continue;
+        }
+        let entries = fs::read_dir(format!("/proc/self/fd/{}", child.as_raw_fd()))?;
+        stack.push(RemovalFrame {
+            pin: child,
+            entries,
+            name,
+        });
+    }
+    Ok(())
+}

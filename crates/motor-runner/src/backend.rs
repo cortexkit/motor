@@ -19,7 +19,28 @@ use std::{
 };
 
 pub(crate) fn setup_step<T>(step: &str, result: io::Result<T>) -> io::Result<T> {
-    result.map_err(|error| io::Error::other(format!("{step}: {error}")))
+    result.map_err(|error| {
+        io::Error::other(SetupError {
+            step: step.to_owned(),
+            error,
+        })
+    })
+}
+
+#[derive(Debug)]
+struct SetupError {
+    step: String,
+    error: io::Error,
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.error)
+    }
+}
+impl std::error::Error for SetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// How this runner instance runs jobs; each instance serves one platform.
@@ -449,7 +470,9 @@ impl Backend for HostBackend {
             // starts a separate, potentially much larger traversal.
             setup_step(
                 "preflight Boat cached tree",
-                crate::boat_quota::preflight_cached_tree(&path),
+                crate::boat_quota::preflight_cached_tree(&path).map_err(|error| {
+                    crate::boat_quota::cache_walk_error(error, config.boat_cold_materialization)
+                }),
             )?;
         }
         #[cfg(target_os = "linux")]
@@ -741,6 +764,7 @@ impl Backend for HostBackend {
                         &trees.state,
                         s.id,
                         crate::boat_quota::job_roots(&path, &target, &runtime, &spool),
+                        config.boat_cold_materialization,
                     ),
                 )?;
                 sandbox

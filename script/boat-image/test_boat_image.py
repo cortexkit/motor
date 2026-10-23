@@ -231,8 +231,8 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
         self.assertIn('--reserve-daemon-core false', unit)
-        self.assertIn('--free-space-floor-bytes 25769803776', unit)
-        self.assertIn('--free-space-eviction-bytes 34359738368', unit)
+        self.assertIn('--free-space-floor-bytes 34426847232', unit)
+        self.assertIn('--free-space-eviction-bytes 42949672960', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
@@ -518,8 +518,30 @@ class RecipeTests(unittest.TestCase):
             with patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'ENDPOINT_READY', marker), \
                  patch.object(start, 'STORAGE_HEALTH', health), patch.object(start, 'STORAGE_LOCK', lock), \
                  patch.object(start, 'storage_identity', return_value=(1792, 128, 131)), \
-                 patch.object(start, 'notify_systemd'):
+                 patch.object(start, 'notify_systemd'), \
+                 patch.object(start.os, 'statvfs', return_value=Mock(f_bavail=64 << 30, f_frsize=1, f_favail=10000)):
                 yield evidence, marker, health
+
+    def test_cold_quota_shortage_withdraws_until_both_filesystems_recover(self):
+        required = (32 << 30) + (64 << 20)
+        available = {'root': required - 4096, 'xfs': 64 << 30}
+        def stats(path):
+            return Mock(f_bavail=available['root' if str(path) == '/' else 'xfs'], f_frsize=1, f_favail=10000)
+        with self.storage_watch_paths() as (_, marker, health):
+            polls = []
+            def pause(_):
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 1:
+                    available['root'] = 64 << 30
+                    available['xfs'] = required - 1
+                elif len(polls) == 2:
+                    available['xfs'] = required
+                else:
+                    raise InterruptedError('stop after recovery')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy', 'unhealthy', 'healthy'])
 
     def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
         with self.storage_watch_paths() as (_, marker, health):
