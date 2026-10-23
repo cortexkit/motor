@@ -70,6 +70,33 @@ async fn nested_workspace_is_refused_before_any_workspace_is_created() {
     assert!(!nested.exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_nested_request_does_not_block_its_outer_workspace() {
+    let f = Fixture::new();
+    let (config, _) = super::sibling_snapshots::snapshot_config(&f);
+    let runner = Runner::open(config).unwrap();
+    let outer = f.scratch.join("remote/worktrees/outer");
+    prepare_workspace(&f, &runner, &outer).await;
+
+    let (mut nested, _) = f.run("true");
+    nested.workspace_key = text(&outer.join("nested")).to_owned();
+    nested.cwd = nested.workspace_key.clone();
+    refusal_detail(&runner, &nested).await;
+
+    // The refused record is retained; it must not make the outer checkout overlap.
+    let (mut again, bytes) = f.run("true");
+    again.workspace_key = text(&outer).to_owned();
+    again.cwd = again.workspace_key.clone();
+    f.submit(&runner, &again, &bytes);
+    let result = terminal(&runner, again.job_id).await;
+    assert!(
+        matches!(result.outcome, Outcome::Exit { code: 0 }),
+        "{}",
+        serde_json::to_string(&result).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn workspace_with_only_a_string_prefix_of_a_known_workspace_is_admitted() {
     let f = Fixture::new();

@@ -731,6 +731,11 @@ fn nested_workspace_detail(
             // Cache-fill jobs use base:<root> as a scheduling key, not a filesystem
             // path. Writer-path validation checks each fill job's actual checkout cwd.
             .filter(|job| !job.base)
+            // A finished or refused job holds no path: its workspace, if one was
+            // created, is in the catalog. Counting retained terminal records
+            // would let one refused nested request block its outer checkout for
+            // the whole retention period.
+            .filter(|job| job.terminal.is_none())
             .filter_map(|j| j.request.as_ref())
             .chain(inner.admitting.values())
         {
