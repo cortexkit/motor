@@ -2490,6 +2490,7 @@ impl Sandbox {
         dependency_routes: &BTreeMap<String, PathBuf>,
         tree: &str,
         javascript: &JavascriptTools,
+        boat_profile: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2509,6 +2510,7 @@ impl Sandbox {
             None,
             javascript,
         )
+        .map(|sandbox| sandbox.with_boat_profile(boat_profile, true, None))
     }
 
     #[allow(clippy::too_many_arguments)]

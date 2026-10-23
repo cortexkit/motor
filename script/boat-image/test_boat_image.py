@@ -566,6 +566,35 @@ class RecipeTests(unittest.TestCase):
             with patch.object(start, 'storage_lock', ordered_lock), patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
                 start.watch_storage(pause=pause)
 
+    def test_healthy_publication_rechecks_capacity_under_a_nonrecursive_lock(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            held = False
+            samples = []
+            @contextlib.contextmanager
+            def lock():
+                nonlocal held
+                self.assertFalse(held, 'storage lock was acquired recursively')
+                held = True
+                try:
+                    yield
+                finally:
+                    held = False
+            def capacity():
+                samples.append(held)
+                return True
+            def pause(_):
+                self.assertEqual(samples, [False, True])
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                raise InterruptedError('publication checked')
+            with patch.object(start, 'storage_lock', lock), patch.object(start, 'quota_capacity_ready', capacity), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_capacity_check_is_lock_free_and_samples_only_two_filesystems(self):
+        stats = Mock(f_bavail=64 << 30, f_frsize=1)
+        with patch.object(start, 'storage_lock', side_effect=AssertionError('caller already holds this lock')), patch.object(start.os, 'statvfs', return_value=stats) as probe:
+            self.assertTrue(start.quota_capacity_ready())
+        self.assertEqual(probe.call_args_list, [unittest.mock.call(start.STATE), unittest.mock.call('/')])
+
     def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
         with self.storage_watch_paths() as (_, marker, health):
             def read_evidence():

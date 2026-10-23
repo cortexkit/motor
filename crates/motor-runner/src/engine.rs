@@ -706,6 +706,9 @@ impl QueueProgress {
 }
 
 struct Inner {
+    /// Reserve-file allocation claims the idle interval, then releases the state
+    /// lock while writing and syncing the file.
+    restoring_reserve: bool,
     writer: Option<Uuid>,
     #[cfg(target_os = "linux")]
     cache_fills: BTreeMap<Uuid, crate::writer::CacheFill>,
@@ -1121,6 +1124,8 @@ struct QuarantineCleanup {
 }
 
 struct Core {
+    /// Admission/prepare take this before claiming state, never while holding inner.
+    reserve_restore: Mutex<()>,
     tenant_events: Option<Arc<crate::tenant::EventLog>>,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
@@ -1935,6 +1940,7 @@ impl Runner {
         let sibling_fences = config.sibling_fences();
         let runner = Self {
             core: Arc::new(Core {
+                reserve_restore: Mutex::new(()),
                 tenant_events,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
@@ -1944,6 +1950,7 @@ impl Runner {
                 trees,
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
+                    restoring_reserve: false,
                     writer: None,
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
@@ -2722,6 +2729,7 @@ impl Runner {
             request.weight_hint = Some(4);
         }
         let (_admission, initial_refusal) = {
+            let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs.contains_key(&request.job_id)
                 || inner.pending_replays.contains(&request.job_id)
@@ -3382,6 +3390,7 @@ impl Runner {
         self.validate_writer_paths(&r.workspace_key, None, &r.siblings)?;
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let (recorded, prior) = {
+            let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
             if Self::deleting(&inner, &r.workspace_key, &r.siblings)
                 || Self::occupied(&inner, &r.workspace_key)
@@ -5617,6 +5626,9 @@ impl Runner {
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+        if inner.restoring_reserve {
+            return Ok(());
+        }
         if self.ensure_admission_ownership().is_err() {
             return Ok(());
         }
@@ -5719,6 +5731,9 @@ impl Runner {
         id: Uuid,
         claims: &BTreeMap<Uuid, Vec<u32>>,
     ) -> io::Result<()> {
+        if inner.restoring_reserve {
+            return Ok(());
+        }
         let job = inner.jobs[&id].clone();
         let r = job.request.clone().unwrap();
         // Recovered warm builds bypass external admission. Boat must never run

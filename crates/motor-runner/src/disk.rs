@@ -106,6 +106,13 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
 }
 
 impl Runner {
+    // Only profiles with a disk reserve need this barrier. It is taken before
+    // inner so waiting for allocation never prevents status or cancel reads.
+    pub(super) fn reserve_restore_barrier(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        (self.core.config.disk_reserve_bytes != 0)
+            .then(|| self.core.reserve_restore.lock().unwrap())
+    }
+
     pub(super) fn protect_admission(&self, inner: &mut Inner, request: &Run) -> AdmissionGuard {
         let token = Uuid::now_v7();
         inner.admitting.insert(token, request.clone());
@@ -116,6 +123,7 @@ impl Runner {
     }
 
     pub(crate) fn transfer(&self, id: Uuid) -> TransferGuard {
+        let _restore = self.reserve_restore_barrier();
         self.core.inner.lock().unwrap().transfers.insert(id);
         TransferGuard {
             runner: self.clone(),
@@ -190,6 +198,7 @@ impl Runner {
                 "runner_draining".into(),
             )));
         }
+        let _restore = self.reserve_restore_barrier();
         if let Some(full) = self.ensure_disk_space()? {
             return Ok(Err(refusal(
                 RefusalReason::RunnerDiskFull,
@@ -907,7 +916,7 @@ impl Runner {
             .as_ref()
             .map(|_| ())
             .map_err(|error| io::Error::new(error.kind(), error.to_string()));
-        self.record_disk_removal(&candidate, deleted);
+        self.record_disk_removal(&candidate, deleted, false);
         result
     }
 
@@ -1263,12 +1272,17 @@ impl Runner {
         if self.core.config.disk_reserve_bytes == 0 || floor == 0 {
             return Ok(());
         }
+        let Ok(_restore) = self.core.reserve_restore.try_lock() else {
+            return Ok(());
+        };
         let idle = |inner: &Inner| {
-            inner.jobs.values().all(|job| job.terminal.is_some())
+            !inner.restoring_reserve
+                && inner.jobs.values().all(|job| job.terminal.is_some())
                 && inner.starting.is_empty()
                 && inner.admitting.is_empty()
                 && inner.preparing.is_empty()
                 && inner.transfers.is_empty()
+                && inner.reserved.is_empty()
         };
         if !idle(&self.core.inner.lock().unwrap()) {
             return Ok(());
@@ -1280,26 +1294,36 @@ impl Runner {
                 return Ok(());
             }
         }
-        // Setup samples free space for the job's cap. Keep admission/setup
-        // excluded until this uncharged allocation has finished, including when
-        // the disk was already above its floor and no eviction was needed.
-        let inner = self.core.inner.lock().unwrap();
+        // Claim the idle interval, not the global lock: writing the reserve can
+        // stall on a stressed disk, but status/cancel/record work must proceed.
+        let mut inner = self.core.inner.lock().unwrap();
         if !idle(&inner) {
             return Ok(());
         }
-        self.restore_disk_reserve()
+        inner.restoring_reserve = true;
+        drop(inner);
+        let claim = Marker::new(self, |inner: &mut Inner| inner.restoring_reserve = false);
+        let temporary = self.write_disk_reserve()?;
+        let mut inner = self.core.inner.lock().unwrap();
+        let published = temporary.map_or(Ok(()), |temporary| {
+            fs::rename(&temporary, self.disk_reserve_path()).inspect_err(|_| {
+                let _ = fs::remove_file(temporary);
+            })
+        });
+        claim.clear(&mut inner);
+        published
     }
 
-    /// Writes the reserve file out in full, so its blocks are really
-    /// allocated, and moves it into place only once complete.
-    fn restore_disk_reserve(&self) -> io::Result<()> {
+    /// Returns a fully allocated, synced temporary file. The caller publishes it
+    /// under the idle claim without keeping the state lock across this I/O.
+    fn write_disk_reserve(&self) -> io::Result<Option<PathBuf>> {
         let bytes = self.core.config.disk_reserve_bytes;
         let path = self.disk_reserve_path();
         match fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_file() => {
                 return Err(invalid("runner disk reserve is not a regular file"))
             }
-            Ok(metadata) if metadata.len() == bytes => return Ok(()),
+            Ok(metadata) if metadata.len() == bytes => return Ok(None),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -1311,6 +1335,7 @@ impl Runner {
                 .create(true)
                 .truncate(true)
                 .open(&temporary)?;
+            self.long_work("disk_reserve_write");
             let chunk = vec![0; 1 << 20];
             let mut left = bytes;
             while left > 0 {
@@ -1318,15 +1343,14 @@ impl Runner {
                 file.write_all(&chunk[..n])?;
                 left -= n as u64;
             }
-            file.sync_all()?;
-            fs::rename(&temporary, &path)
+            file.sync_all()
         })();
         if written.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         written?;
-        tracing::info!(bytes, "runner disk reserve restored");
-        Ok(())
+        tracing::info!(bytes, "runner disk reserve allocated");
+        Ok(Some(temporary))
     }
 
     /// Frees the reserve after a write ran out of space, so the records that

@@ -695,6 +695,7 @@ impl Backend for HostBackend {
                             &routes,
                             &r.tree_hash,
                             &crate::isolation::JavascriptTools::for_config(config),
+                            config.boat_profile,
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(

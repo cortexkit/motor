@@ -736,8 +736,10 @@ existing storage. The separate runner reserve file is outside the project and
 remains available for terminal bookkeeping. After the cgroup is gone, runtime
 cleanup clears tree assignments, limits, hit markers and the lease. Workspace
 contents remain reusable and subject to normal idle/pressure eviction.
-Reserve-file restoration runs only while idle, with admission and setup excluded
-through the allocation, so it cannot spend headroom after a job samples its cap.
+Reserve-file restoration claims an idle interval under the scheduler lock, then
+writes and syncs outside it. A separate admission/prepare barrier and the setup
+marker exclude new work through publication, without blocking status or cancel
+on the large write. The marker is released on errors as well as success.
 Storage-health publication rechecks both filesystems under the readiness lock;
 an older healthy sample cannot overwrite a newer setup withdrawal.
 

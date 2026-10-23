@@ -297,33 +297,28 @@ fn boat_var_tmp_bind_uses_the_same_quota_covered_runtime_as_tmp() {
 
 #[test]
 fn boat_writer_unit_is_structurally_refused_even_if_cache_is_requested() {
-    let f = Fixture::new();
-    let mut sandbox = f
-        .command_sandbox()
-        .with_boat_profile(true, false, Some(14 << 30))
-        .with_pid_init(Some(test_identity()));
-    sandbox.writer = true;
-    sandbox.user = WRITER_USER;
-    let env = [("SCCACHE_DIR".into(), "/motor-cache".into())];
-    let error = sandbox
-        .command(
-            "touch /motor-cache/unlimited",
-            &f.workspace,
-            &env,
-            true,
-            &[1],
-            1,
-        )
-        .err();
-    assert!(
-        error.is_some(),
-        "Boat emitted a writer unit with a possible unlabelled cache mount"
-    );
+    with_prepared_boat_sandbox(true, |f, sandbox| {
+        let env = [("SCCACHE_DIR".into(), "/motor-cache".into())];
+        let error = sandbox
+            .command(
+                "touch /motor-cache/unlimited",
+                &f.workspace,
+                &env,
+                true,
+                &[1],
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "Boat jobs cannot use dependency writer units"
+        );
+    });
 }
 
-#[test]
-fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
-    use std::os::unix::{ffi::OsStringExt, process::ExitStatusExt};
+fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandbox)) {
+    use std::os::unix::process::ExitStatusExt;
     let f = Fixture::new();
     fs::create_dir_all(f.workspace.join("src")).unwrap();
     fs::write(f.workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
@@ -351,9 +346,13 @@ fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
             if program.ends_with("/id") {
                 let args: Vec<_> = command.get_args().collect();
                 let stdout = if args[0] == "-u" {
-                    format!("{}\n", unsafe { libc::geteuid() } + 10001)
+                    format!(
+                        "{}\n",
+                        unsafe { libc::geteuid() }
+                            + if args[1] == WRITER_USER { 10002 } else { 10001 }
+                    )
                 } else {
-                    format!("{USER}\n")
+                    format!("{}\n", args[1].to_string_lossy())
                 };
                 return Ok(std::process::Output {
                     status: std::process::ExitStatus::from_raw(0),
@@ -375,39 +374,74 @@ fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
             command.output()
         }),
         || {
-            let mut sandbox = Sandbox::prepare_role(
-                id,
-                &f.state,
-                &f.workspace,
-                &target,
-                &[],
-                None,
-                &f.state.join("slots"),
-                1,
-                &BTreeMap::new(),
-                &tree,
-                f.workspace.to_str().unwrap(),
-                false,
-                false,
-                false,
-                None,
-            )
+            let javascript = JavascriptTools::for_role(ToolchainRole::Boat);
+            let sandbox = if writer {
+                Sandbox::prepare_writer(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    &javascript,
+                    true,
+                )
+            } else {
+                Sandbox::prepare_role(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    &[],
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    f.workspace.to_str().unwrap(),
+                    false,
+                    false,
+                    false,
+                    None,
+                    &javascript,
+                )
+                .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
+            }
             .unwrap()
-            .with_boat_profile(true, true, Some(14 << 30))
             .with_boat_temporary_paths()
             .unwrap()
             .with_pid_init(Some(test_identity()));
+            inspect(&f, sandbox);
+        },
+    );
+}
+
+#[test]
+fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
+    use std::os::unix::ffi::OsStringExt;
+    for writer in [false, true] {
+        with_prepared_boat_sandbox(writer, |f, mut sandbox| {
+            let target = f.scratch.join("target");
             let roots = crate::boat_quota::job_roots(
                 &f.workspace,
                 &target,
                 &sandbox.runtime.0,
-                &f.state.join("spools").join(id.to_string()),
+                &f.state.join("spools").join("fixture"),
             );
             for private_pids in [true, false] {
                 sandbox.private_pids = private_pids;
-                let command = sandbox
-                    .command("true", &f.workspace, &[], true, &[1], 1)
-                    .unwrap();
+                let command = sandbox.command("true", &f.workspace, &[], true, &[1], 1);
+                if writer {
+                    assert_eq!(
+                        command.unwrap_err().to_string(),
+                        "Boat jobs cannot use dependency writer units"
+                    );
+                    continue;
+                }
+                let command = command.unwrap();
                 let args: Vec<_> = command
                     .get_args()
                     .map(|arg| arg.to_str().unwrap())
@@ -449,8 +483,8 @@ fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
                     );
                 }
             }
-        },
-    );
+        });
+    }
 }
 
 #[test]

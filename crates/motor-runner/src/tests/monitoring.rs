@@ -2023,6 +2023,7 @@ fn boat_oom_killed_init_without_exit_is_definite_and_explained() {
     let f = Fixture::new();
     let mut config = f.config();
     config.boat_profile = true;
+    config.free_space_probe = Arc::new(|_| Ok(63 << 30));
     config.boat_memory_max_bytes = Some(12_500_000_000);
     config.systemd_command = Some(Arc::new(|args| {
         use std::os::unix::process::ExitStatusExt;

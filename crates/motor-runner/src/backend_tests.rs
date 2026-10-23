@@ -67,7 +67,7 @@ fn boat_launch_without_a_quota_lease_never_starts_even_without_isolation() {
         target: scratch.join("target"),
         sandbox: None,
         wrapper: None,
-        windows: None,
+        vm: None,
     };
     match HostBackend.launch(&config, &trees(&config), &setup, &prepared, 1) {
         Ok(mut launch) => {

@@ -270,6 +270,89 @@ fn boat_reserve_restore_never_allocates_beside_live_or_starting_work() {
     }
 }
 
+#[test]
+fn boat_reserve_write_does_not_hold_the_state_lock_or_block_status() {
+    let f = Fixture::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let mut config = boat_config(&f, |_| Ok(63 * GIB));
+    config.long_work = Some(Arc::new(move |label| {
+        if label == "disk_reserve_write" {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    std::thread::scope(|scope| {
+        let writing = scope.spawn(|| runner.disk_upkeep());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let status_runner = &runner;
+        scope.spawn(move || {
+            status_tx.send(status_runner.status()).unwrap();
+        });
+        let status = status_rx.recv_timeout(Duration::from_secs(2));
+        // Release the writer before asserting, so a regression that blocks
+        // status can finish instead of stranding either thread during unwinding.
+        release_tx.send(()).unwrap();
+        writing.join().unwrap().unwrap();
+        assert!(
+            status.is_ok(),
+            "status waited behind the reserve-file write"
+        );
+    });
+    assert!(!runner.core.inner.lock().unwrap().restoring_reserve);
+}
+
+#[test]
+fn boat_reserve_restore_claim_blocks_setup_and_clears_on_write_error() {
+    let f = Fixture::new();
+    let runner = Runner::open(boat_config(&f, |_| Ok(63 * GIB))).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request.clone()).unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.restoring_reserve = true;
+        runner
+            .start(&mut inner, request.job_id, &BTreeMap::new())
+            .unwrap();
+        runner.dispatch(&mut inner, runner.now()).unwrap();
+        assert!(
+            inner.starting.is_empty(),
+            "reserve allocation admitted setup"
+        );
+        inner.restoring_reserve = false;
+        inner
+            .jobs
+            .get_mut(&request.job_id)
+            .unwrap()
+            .terminal(Outcome::Exit { code: 0 }, runner.now());
+    }
+    fs::create_dir_all(runner.core.trees.state.join("disk-reserve.tmp")).unwrap();
+    assert!(runner.disk_upkeep().is_err());
+    assert!(
+        !runner.core.inner.lock().unwrap().restoring_reserve,
+        "failed write leaked its idle claim"
+    );
+}
+
+#[test]
+fn boat_reserve_restore_claim_clears_after_failed_publication() {
+    let f = Fixture::new();
+    let mut config = boat_config(&f, |_| Ok(63 * GIB));
+    let reserve = config.state_dir().join("disk-reserve");
+    config.long_work = Some(Arc::new(move |label| {
+        if label == "disk_reserve_write" {
+            fs::create_dir(&reserve).unwrap();
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    assert!(runner.disk_upkeep().is_err());
+    assert!(!runner.core.inner.lock().unwrap().restoring_reserve);
+    assert!(!runner.core.trees.state.join("disk-reserve.tmp").exists());
+}
+
 #[tokio::test]
 async fn boat_persisted_fill_is_refused_before_claiming_writer_or_setup() {
     let f = Fixture::new();
