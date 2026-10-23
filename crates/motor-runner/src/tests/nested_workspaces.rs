@@ -71,30 +71,168 @@ async fn nested_workspace_is_refused_before_any_workspace_is_created() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn refused_nested_request_does_not_block_its_outer_workspace() {
-    let f = Fixture::new();
-    let (config, _) = super::sibling_snapshots::snapshot_config(&f);
-    let runner = Runner::open(config).unwrap();
-    let outer = f.scratch.join("remote/worktrees/outer");
-    prepare_workspace(&f, &runner, &outer).await;
-
+async fn refuse_nested_checkout(f: &Fixture, runner: &Runner, outer: &Path) -> Run {
+    assert_eq!(
+        runner.core.inner.lock().unwrap().sibling_fences,
+        crate::sibling_snapshots::SiblingFences::Legacy
+    );
+    prepare_workspace(f, runner, outer).await;
     let (mut nested, _) = f.run("true");
-    nested.workspace_key = text(&outer.join("nested")).to_owned();
+    nested.workspace_key = text(&outer.join(".git/remote-gate")).to_owned();
     nested.cwd = nested.workspace_key.clone();
-    refusal_detail(&runner, &nested).await;
+    git(
+        &f.main,
+        &[
+            "clone",
+            "--no-hardlinks",
+            text(&f.main),
+            &nested.workspace_key,
+        ],
+    );
+    let detail = refusal_detail(runner, &nested).await;
+    let expected = runner.safe_refusal_detail(
+        format!(
+            "path {} overlaps runner workspace or sibling {}; nested workspaces aren't supported",
+            nested.workspace_key,
+            outer.display()
+        ),
+        std::iter::empty::<String>(),
+    );
+    assert!(detail.contains(&expected), "{detail}");
 
-    // The refused record is retained; it must not make the outer checkout overlap.
+    // Deleting the caller's checkout does not delete the refused job's record.
+    fs::remove_dir_all(&nested.workspace_key).unwrap();
+    assert_retained_nested_refusal(runner, &nested);
+    nested
+}
+
+#[cfg(unix)]
+fn assert_retained_nested_refusal(runner: &Runner, nested: &Run) {
+    let disk: Job = read_json(&runner.record_path(nested.job_id)).unwrap();
+    let catalog: Catalog = read_json(&runner.config().state_dir().join("catalog.json")).unwrap();
+    assert!(!catalog.workspaces.contains_key(&nested.workspace_key));
+    let inner = runner.core.inner.lock().unwrap();
+    for job in [&disk, &inner.jobs[&nested.job_id]] {
+        assert_eq!(job.request.as_ref(), Some(nested));
+        assert_eq!(job.state, JobState::Tombstone);
+        assert!(job.started_ms.is_none());
+        assert_eq!(
+            job.terminal.as_ref().unwrap().outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::WorkspaceSetupFailed
+            }
+        );
+    }
+    assert!(!inner.catalog.workspaces.contains_key(&nested.workspace_key));
+    assert!(!Path::new(&nested.workspace_key).exists());
+}
+
+#[cfg(unix)]
+async fn run_outer_checkout(f: &Fixture, runner: &Runner, outer: &Path) {
     let (mut again, bytes) = f.run("true");
-    again.workspace_key = text(&outer).to_owned();
+    again.workspace_key = text(outer).to_owned();
     again.cwd = again.workspace_key.clone();
-    f.submit(&runner, &again, &bytes);
-    let result = terminal(&runner, again.job_id).await;
+    f.submit(runner, &again, &bytes);
+    let result = terminal(runner, again.job_id).await;
     assert!(
         matches!(result.outcome, Outcome::Exit { code: 0 }),
         "{}",
         serde_json::to_string(&result).unwrap()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_nested_request_does_not_block_its_outer_workspace() {
+    let f = Fixture::new();
+    let (mut config, _) = super::sibling_snapshots::snapshot_config(&f);
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let outer = f.scratch.join("remote/worktrees/outer");
+    refuse_nested_checkout(&f, &runner, &outer).await;
+    run_outer_checkout(&f, &runner, &outer).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reloaded_refused_nested_request_does_not_block_its_outer_workspace() {
+    let f = Fixture::new();
+    let (mut config, _) = super::sibling_snapshots::snapshot_config(&f);
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config.clone()).unwrap();
+    let outer = f.scratch.join("remote/worktrees/outer");
+    let nested = refuse_nested_checkout(&f, &runner, &outer).await;
+    drop(runner);
+
+    let runner = reopen(config);
+    assert_retained_nested_refusal(&runner, &nested);
+    run_outer_checkout(&f, &runner, &outer).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_setup_still_fences_overlapping_run_and_prepare() {
+    let f = Fixture::new();
+    let (mut config, _) = super::sibling_snapshots::snapshot_config(&f);
+    config.disable_warm_builds = true;
+    let hold = Hold::new("materialize");
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let (mut nested, bytes) = f.run("true");
+    let outer = f.scratch.join("remote/worktrees/outer");
+    nested.workspace_key = text(&outer.join("nested")).to_owned();
+    nested.cwd = nested.workspace_key.clone();
+    hold.arm();
+    let _release = Release(hold.clone());
+    f.submit(&runner, &nested, &bytes);
+    reached(&hold).await;
+    runner.cancel(nested.job_id).unwrap();
+    assert_eq!(
+        terminal(&runner, nested.job_id).await.outcome,
+        Outcome::Cancelled
+    );
+    {
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(inner.starting.contains(&nested.job_id));
+        assert!(inner.reserved.contains_key(&nested.workspace_key));
+        assert!(!inner.catalog.workspaces.contains_key(&nested.workspace_key));
+    }
+    let (mut enclosing, _) = f.run("true");
+    enclosing.workspace_key = text(&outer).to_owned();
+    enclosing.cwd = enclosing.workspace_key.clone();
+    let prepare = prepare_for(&enclosing);
+    let refusal = match runner.admit_prepare(&prepare).unwrap() {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("a cancelled job's unfinished setup still owns its checkout"),
+    };
+    assert_eq!(refusal.reason, RefusalReason::WorkspaceSetupFailed);
+    let detail = refusal_detail(&runner, &enclosing).await;
+    assert!(
+        detail.contains("overlaps runner workspace or sibling"),
+        "{detail}"
+    );
+
+    hold.release();
+    until(|| {
+        !runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .starting
+            .contains(&nested.job_id)
+    })
+    .await;
+    // Successful materialization transfers ownership from setup to the catalog,
+    // even though cancellation prevented the command from starting.
+    assert!(runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .workspaces
+        .contains_key(&nested.workspace_key));
 }
 
 #[tokio::test]
