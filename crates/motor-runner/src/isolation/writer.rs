@@ -31,8 +31,8 @@ fn writer_cache_policy_removes_job_write_access_and_inherits_reads() {
         writer_cache_owner(WriterAccount { uid: 50123 }),
         "50123:motor-cache"
     );
-    let directory = writer_cache_acl(true);
-    let file = writer_cache_acl(false);
+    let directory = writer_cache_acl(true, false);
+    let file = writer_cache_acl(false, false);
     assert!(directory.split(',').any(|entry| entry == "u:motor-job:r-x"));
     assert!(directory
         .split(',')
@@ -50,6 +50,119 @@ fn writer_cache_policy_removes_job_write_access_and_inherits_reads() {
 }
 
 #[test]
+fn writer_cache_eviction_policy_grants_only_runner_write_without_inheriting_it() {
+    let acl = writer_cache_acl(true, true);
+    let entries: Vec<_> = acl.split(',').collect();
+    let runner = unsafe { libc::geteuid() };
+    assert!(entries.contains(&format!("u:{runner}:rwx").as_str()));
+    for entry in [
+        "u:motor-job:r-x",
+        "m::rwx",
+        "g::---",
+        "o::---",
+        "d:u:motor-job:r-x",
+        "d:m::r-x",
+        "d:g::---",
+        "d:o::---",
+    ] {
+        assert!(entries.contains(&entry), "missing {entry}: {acl}");
+    }
+    assert!(entries.contains(&format!("d:u:{runner}:r-x").as_str()));
+}
+
+struct ReclaimWriterCache(PathBuf);
+
+impl Drop for ReclaimWriterCache {
+    fn drop(&mut self) {
+        reclaim_runtime(&self.0).expect("reclaim writer test scratch");
+    }
+}
+
+#[test]
+#[ignore = "requires operator sudo, ACLs and provisioned motor-cache and motor-job accounts"]
+fn isolated_writer_cache_eviction_repairs_cross_parent_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "probe must run as the runner, not root"
+    );
+    let f = Fixture::new();
+    let _reclaim = ReclaimWriterCache(f.scratch.clone());
+    let account = validate_writer_account().unwrap();
+    let config = crate::engine::Config::new(&f.scratch, "runner-state");
+    let fleet = config.sccache_dir();
+    let root = fleet.parent().unwrap();
+    prepare_writer_cache(&fleet, account).unwrap();
+    let trash = config.state_dir().join("trash");
+    fs::create_dir(&trash).unwrap();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(fs::metadata(&trash).unwrap().uid(), unsafe {
+        libc::geteuid()
+    });
+
+    for scenario in ["fleet-read-only", "legacy-parent", "chmod-mask"] {
+        prepare_writer_cache(&fleet, account).unwrap();
+        if scenario == "legacy-parent" {
+            // Older setup granted only reads to the runner on the source parent.
+            repair_writer_cache_path(root, true).unwrap();
+        } else if scenario == "chmod-mask" {
+            // chmod removes effective write access through the ACL mask but
+            // leaves named job-write entries that eviction repair must not revive.
+            for directory in [root, fleet.as_path()] {
+                checked(
+                    crate::privilege::command("/usr/bin/setfacl")
+                        .args([
+                            "-m",
+                            &format!("u:{}:rwx,u:{USER}:rwx,m::rwx", unsafe { libc::geteuid() }),
+                            "--",
+                        ])
+                        .arg(directory),
+                )
+                .unwrap();
+                checked(
+                    crate::privilege::command("/usr/bin/chmod")
+                        .args(["0750", "--"])
+                        .arg(directory),
+                )
+                .unwrap();
+            }
+        } else {
+            // Source parent and destination are writable, yet fleet is not.
+            // With no sticky bits, EACCES isolates Linux's moved-directory check.
+            checked(
+                Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "test -w \"$1\" && ! test -w \"$2\" && test -w \"$3\"",
+                        "probe",
+                    ])
+                    .arg(root)
+                    .arg(&fleet)
+                    .arg(&trash),
+            )
+            .unwrap();
+        }
+        for directory in [root, fleet.as_path(), trash.as_path()] {
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o1000, 0);
+            assert_job_cannot_write(directory);
+        }
+        let retired = trash.join(scenario);
+        assert_eq!(
+            fs::rename(&fleet, &retired).unwrap_err().raw_os_error(),
+            Some(libc::EACCES),
+            "{scenario}"
+        );
+        retire_writer_cache(&fleet, &retired).unwrap();
+        assert!(!fleet.exists(), "{scenario}");
+        assert!(retired.is_dir(), "{scenario}");
+        assert_job_cannot_write(root);
+        assert_job_cannot_write(&retired);
+    }
+}
+
+#[test]
 #[ignore = "requires provisioned motor-cache, motor-job, sccache 0.18.0, sudo, ACLs and a real system manager"]
 fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
     use crate::writer::CacheFill;
@@ -57,13 +170,7 @@ fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
     use std::os::unix::fs::MetadataExt;
 
     let f = Fixture::new();
-    struct Reclaim(PathBuf);
-    impl Drop for Reclaim {
-        fn drop(&mut self) {
-            reclaim_runtime(&self.0).expect("reclaim writer test scratch");
-        }
-    }
-    let _reclaim = Reclaim(f.scratch.clone());
+    let _reclaim = ReclaimWriterCache(f.scratch.clone());
     let account = validate_writer_account().unwrap();
     prepare_writer_shared_read_access().unwrap();
     let config = crate::engine::Config::new(&f.scratch, "runner-state");
@@ -185,13 +292,36 @@ fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
             .arg(container),
     )
     .unwrap();
-    // Exercise the runner's own rename, without sudo: recursive fleet repair
-    // alone cannot grant permission to remove an entry from its parent.
+    // Use the same repair and unprivileged rename as production eviction.
     let trash = config.state_dir().join("trash");
     fs::create_dir_all(&trash).unwrap();
     let retired = trash.join("fleet-eviction-test");
-    fs::rename(&fleet, &retired).unwrap();
-    fs::rename(&retired, &fleet).unwrap();
+    retire_writer_cache(&fleet, &retired).unwrap();
+    assert!(!fleet.exists());
+    assert!(retired
+        .join(new_entries[0].strip_prefix(&fleet).unwrap())
+        .exists());
+    prepare_writer_cache(&fleet, account).unwrap();
+    for directory in [container, fleet.as_path(), retired.as_path()] {
+        assert_job_cannot_write(directory);
+    }
+}
+
+fn assert_job_cannot_write(path: &Path) {
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "-u",
+                USER,
+                "/bin/sh",
+                "-c",
+                "! test -w \"$1\" && ! touch \"$1/host-job-entry\" 2>/dev/null",
+                "reader",
+            ])
+            .arg(path),
+    )
+    .unwrap();
 }
 
 fn assert_job_cannot_read(path: &Path) {

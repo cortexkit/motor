@@ -119,11 +119,14 @@ fn validate_identity(
 
 /// Both access and default ACLs are replaced, not merged: a legacy permissive
 /// group or named-user ACL must never give a foreground job cache-write access.
-fn writer_cache_acl(directory: bool) -> String {
+fn writer_cache_acl(directory: bool, runner_write: bool) -> String {
     let access = if directory { "r-x" } else { "r--" };
     let owner = if directory { "rwx" } else { "rw-" };
+    let runner_access = if runner_write { owner } else { access };
     let runner = unsafe { libc::geteuid() };
-    let acl = format!("u::{owner},u:{USER}:{access},u:{runner}:{access},g::---,m::{access},o::---");
+    let acl = format!(
+        "u::{owner},u:{USER}:{access},u:{runner}:{runner_access},g::---,m::{runner_access},o::---"
+    );
     if directory {
         format!("{acl},d:u::rwx,d:u:{USER}:r-x,d:u:{runner}:r-x,d:g::---,d:m::r-x,d:o::---")
     } else {
@@ -191,8 +194,8 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
         )?;
         repair_writer_cache_path(directory, true)?;
     }
-    // Eviction renames fleet into trash, which needs write access on its
-    // parent, not just on fleet. Jobs retain read-only cache access.
+    // Allow the runner to remove entries from the cache parent. Cross-parent
+    // eviction also repairs fleet itself immediately before the rename.
     checked(
         crate::privilege::command("/usr/bin/setfacl")
             .args([
@@ -222,9 +225,34 @@ fn writer_cache_owner(account: WriterAccount) -> String {
 pub(crate) fn repair_writer_cache_path(path: &Path, directory: bool) -> io::Result<()> {
     checked(
         crate::privilege::command("/usr/bin/setfacl")
-            .args(["-P", "--set", &writer_cache_acl(directory), "--"])
+            .args(["-P", "--set", &writer_cache_acl(directory, false), "--"])
             .arg(path),
     )
+}
+
+pub(crate) fn retire_writer_cache(fleet: &Path, retired: &Path) -> io::Result<()> {
+    let root = fleet
+        .parent()
+        .ok_or_else(|| io::Error::other("cache has no parent"))?;
+    // Linux requires write/search on the source parent and write on a directory
+    // moved across parents, to update its '..' entry. Repair both at eviction:
+    // older caches lack the parent grant, and chmod can close an ACL's mask.
+    // Replace ACLs rather than widening a mask over latent job-write grants;
+    // only the runner gains write access, without walking the cache contents.
+    for directory in [root, fleet] {
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "compiler cache must be a physical directory",
+            ));
+        }
+        checked(
+            crate::privilege::command("/usr/bin/setfacl")
+                .args(["-P", "--set", &writer_cache_acl(true, true), "--"])
+                .arg(directory),
+        )?;
+    }
+    fs::rename(fleet, retired)
 }
 
 /// Prepare the immutable host trees mounted into jobs. Existing entries get
