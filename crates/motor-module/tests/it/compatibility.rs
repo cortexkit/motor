@@ -12,6 +12,82 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio::{net::TcpListener, process::Command};
 
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production runner"]
+async fn pinned_old_runner_refuses_macos_platform_before_start() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    async fn next_message(stream: &mut tokio::net::UnixStream) -> Option<Frame> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame = read_frame_async(stream).await.unwrap();
+                if !matches!(frame, Some(Frame::Heartbeat { .. })) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    let binary = std::env::var_os("MOTOR_COMPAT_RUNNER")
+        .expect("run python3 scripts/mixed-version.py to build the unchanged pinned runner");
+    let f = Fixture::new(Cut::None, 28).await;
+    let state = f.scratch.join("old-macos-refusal");
+    let socket = cortexkit_test_support::scratch_root()
+        .parent()
+        .unwrap()
+        .join(format!(
+            "old-macos-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+    let mut helper = Command::new(binary)
+        .args([&state, &socket, f.remote_key.parent().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        BufReader::new(helper.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n");
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    write_frame_async(&mut stream, &legacy_hello())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut stream).await,
+        Some(Frame::Hello { .. })
+    ));
+    let id = Uuid::now_v7();
+    let run: Frame = serde_json::from_value(serde_json::json!({
+        "type": "run", "job_id": id, "platform": "macos", "workspace_key": f.key,
+        "repository_root": f.main, "cwd": f.key, "command": "touch must-not-start",
+        "env": {}, "queue_wait_limit_s": 300, "snapshot_commit": "commit",
+        "tree_hash": "tree", "integration_tip": "", "siblings": [], "bundles": []
+    }))
+    .unwrap();
+    write_frame_async(&mut stream, &run).await.unwrap();
+    let reply = next_message(&mut stream).await;
+    assert!(
+        matches!(
+            reply,
+            Some(Frame::Refusal(Refusal {
+                reason: RefusalReason::PlatformUnsupported,
+                ..
+            }))
+        ),
+        "old runner must refuse macos before starting: {reply:?}"
+    );
+    assert!(!f.remote_key.join("must-not-start").exists());
+    helper.kill().await.unwrap();
+    helper.wait().await.unwrap();
+}
+
 struct RunnerHello {
     proxy: Arc<Proxy>,
     frame: Arc<Mutex<Option<Frame>>>,

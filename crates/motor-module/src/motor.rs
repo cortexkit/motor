@@ -252,6 +252,7 @@ impl Motor {
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
+        let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
         let mut env_not_forwarded: Vec<_> = request
             .env
             .keys()
@@ -273,7 +274,7 @@ impl Motor {
         // repository_root is resolved by the caller from Git's common directory,
         // not the workspace key, which changes for each linked worktree.
         let repository_routed = !hosted_test
-            && request.platform != Some(Platform::Windows)
+            && matches!(request.platform, None | Some(Platform::Linux))
             && std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
                 self.config
                     .hosted_repositories
@@ -296,7 +297,7 @@ impl Motor {
                 self.storage.bind_windows(id, runner.clone())?;
             }
         }
-        if hosted_test {
+        if hosted_test && !macos_not_hosted {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
             self.storage.hosted_route(id, route)?;
@@ -307,7 +308,9 @@ impl Motor {
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
-        } else if self.config.hosted_runners && request.platform != Some(Platform::Windows) {
+        } else if self.config.hosted_runners
+            && matches!(request.platform, None | Some(Platform::Linux))
+        {
             self.storage
                 .hosted_route(id, crate::HostedJobState::new(&self.config))?;
         }
@@ -320,6 +323,21 @@ impl Motor {
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
+            if macos_not_hosted {
+                let result = motor
+                    .refused(
+                        id,
+                        RefusalReason::RequestRejected,
+                        None,
+                        Some("macos_not_hosted".into()),
+                        &tx,
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.send(Err(error)).await;
+                }
+                return;
+            }
             if let Err(e) = motor
                 .run_job(
                     id,
@@ -589,7 +607,9 @@ impl Motor {
         } else {
             Some(self.connector_for_job(id)?)
         };
-        if request.network.is_some() && !self.config.network_routing {
+        if request.network.is_some()
+            && (!self.config.network_routing || request.platform == Some(Platform::Macos))
+        {
             return self
                 .refused(
                     id,
@@ -723,6 +743,7 @@ impl Motor {
         .then(|| request.clone());
         let hosted = self.hosted_state(id).is_some();
         let windows = request.platform == Some(Platform::Windows);
+        let macos = request.platform == Some(Platform::Macos);
         let build_server_id = self.build_server_id(id);
         // A resubmitted spill gets one spill attempt only, and its queue-wait
         // budget starts again: the first wait only proved the build server full.
@@ -987,11 +1008,12 @@ impl Motor {
                     .await
                     .map(|_| false);
             }
-            if windows
+            let required_platform = if macos { "macos" } else { "windows" };
+            if (windows || macos)
                 && !channel
                     .platforms
                     .iter()
-                    .any(|platform| platform == "windows")
+                    .any(|platform| platform == required_platform)
             {
                 if explicit_windows && self.next_windows_runner(id)? {
                     return Ok(true);
@@ -1007,7 +1029,7 @@ impl Motor {
                         id,
                         RefusalReason::PlatformUnsupported,
                         Some(snapshots.main.tree_hash.clone()),
-                        Some("requested platform windows is not listed in the runner hello".into()),
+                        Some(format!("requested platform {required_platform} is not listed in the runner hello")),
                         tx,
                     )
                     .await
@@ -1122,6 +1144,8 @@ impl Motor {
             network: request.network.clone(),
             platform: if windows {
                 Some(Platform::Windows)
+            } else if macos {
+                Some(Platform::Macos)
             } else {
                 None
             },
@@ -1204,7 +1228,7 @@ impl Motor {
                         .await
                         .map(|_| false);
                 }
-                let wrong_platform = windows && accepted.platform != Some(Platform::Windows);
+                let wrong_platform = (windows || macos) && accepted.platform != request.platform;
                 if !wrong_platform && !resubmitted {
                     if let Some((request, run)) = shadow_run {
                         self.start_shadow(id, request, run, snapshots.clone());
@@ -2103,7 +2127,7 @@ impl Motor {
         &self,
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
-        if self.config.hosted_runners && platform != Some(&Platform::Windows) {
+        if self.config.hosted_runners && matches!(platform, None | Some(Platform::Linux)) {
             return Ok(RunnerStatusReply {
                 status: StatusReply::new(0, Vec::new(), false, Vec::new(), "hosted"),
                 disk: None,

@@ -112,6 +112,7 @@ fn is_health_flow(scope: Option<&ScopeStamp>) -> bool {
 /// `runon: "windows"` only to a module that lists it. The daemon refuses a
 /// module's HELLO unless every capability is spelled `<name>/v<N>`.
 pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
+pub(crate) const MACOS_CAPABILITY: &str = "exec-remote-macos/v1";
 pub(crate) const NETWORK_CAPABILITY: &str = "exec-remote-net/v1";
 /// Always advertised: an `exec.run` request may carry `return_paths`, and the
 /// job's stream then has a `return_result` record before its terminal record.
@@ -143,6 +144,9 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
     }
     if config.network_routing {
         provides.push(NETWORK_CAPABILITY.into());
+    }
+    if config.macos_runner.is_some() {
+        provides.push(MACOS_CAPABILITY.into());
     }
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
