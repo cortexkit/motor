@@ -582,6 +582,8 @@ def verdict(data):
         reasons.append("measurements incomplete")
     if data.get("error"):
         reasons.append("error recorded")
+    if 'cache_bench' in data and data['cache_bench'].get('complete') is not True:
+        reasons.append('cache benchmark incomplete')
     for mode in ("ssh_reach", "runner_host"):
         if mode in data:
             checks = data[mode].get('checks', [])
@@ -694,7 +696,11 @@ def cleanup_section(data):
 
 
 def render(data, path):
-    text = render_runner_host(data) if "runner_host" in data else render_environment(data)
+    if 'cache_bench' in data:
+        from cache_bench import render as render_cache_bench
+        text = render_cache_bench(data)
+    else:
+        text = render_runner_host(data) if "runner_host" in data else render_environment(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
 
@@ -939,6 +945,12 @@ def main(report_stream=None):
     mode.add_argument("--ssh-reach", action="store_true", help="one fresh sandbox of --size; pinned SSH, loopback TLS forwarding and key restrictions")
     mode.add_argument("--runner-prerequisites", action="store_true", help="one fresh sandbox of --size; inspect OS, PrivatePIDs, SSH configuration and KVM without installing tools")
     mode.add_argument("--runner-host", action="store_true", help="install Boat recipe, real motor jobs, snapshot timing; at most 30 minutes")
+    mode.add_argument('--cache-bench', action='store_true', help='operator-only remote sccache measurements in a prepared-image clone')
+    parser.add_argument('--cache-image', help='borrow this prepared named snapshot unchanged')
+    parser.add_argument('--cache-bundle', type=Path, help='offline source and CARGO_HOME bundle produced on A')
+    parser.add_argument('--cache-bundle-sha256', help='independently recorded bundle digest from A')
+    parser.add_argument('--cache-backends', type=Path, help='backend manifest with owner-only credential file paths')
+    parser.add_argument('--cache-prefix', help='same cache-bench/UNIQUE-RUN/ prefix filled on A')
     parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
     parser.add_argument('--verify-prepared-image', help='qualify an existing snapshot unchanged: hydrate, install broker identity, real jobs, resume; no recipe reapply or service restart')
@@ -949,6 +961,10 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
+    if args.cache_bench or any((args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
+                                args.cache_backends, args.cache_prefix)):
+        from cache_bench import validate
+        validate(parser, args)
     if (args.prepared_image or args.from_prepared_image or args.verify_prepared_image) and not args.runner_host:
         parser.error('prepared image options require --runner-host')
     if args.from_prepared_image and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.from_prepared_image):
@@ -1000,7 +1016,10 @@ def main(report_stream=None):
             runner.cargo_seed_manifest = args.cargo_seed_manifest
             runner.cargo_seed_sha256 = args.cargo_seed_sha256
             runner.cargo_seed_archive = args.cargo_seed_archive
-            if args.runner_host:
+            if args.cache_bench:
+                from cache_bench import run
+                run(runner, args)
+            elif args.runner_host:
                 from runner_host import RunnerHost
                 RunnerHost(runner).run()
             elif args.runner_prerequisites:
