@@ -4,6 +4,60 @@ use super::*;
 
 const GIB: u64 = 1 << 30;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boat_queues_a_second_small_job_through_setup_and_execution() {
+    let f = Fixture::new();
+    let hold = Hold::new("materialize");
+    let _release = Release(hold.clone());
+    let mut config = boat_config(&f, |_| Ok(63 * GIB));
+    config.manual_tick = false;
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let marker = f.scratch.join("release-first");
+    hold.arm();
+    let (mut first, mut first_bytes) = job_at(
+        &f,
+        "singleton-a",
+        &format!("while test ! -e '{}'; do sleep .02; done", marker.display()),
+    );
+    first.weight_hint = Some(1);
+    first.siblings.clear();
+    first.bundles.truncate(1);
+    first_bytes.truncate(1);
+    f.submit(&runner, &first, &first_bytes);
+    reached(&hold).await;
+    let (mut second, mut second_bytes) = job_at(&f, "singleton-b", "true");
+    second.weight_hint = Some(1);
+    second.siblings.clear();
+    second.bundles.truncate(1);
+    second_bytes.truncate(1);
+    f.submit(&runner, &second, &second_bytes);
+    settle().await;
+    assert!(
+        !begun(&runner, second.job_id),
+        "Boat started a second setup even though a job already owns the sandbox"
+    );
+    hold.release();
+    wait_for(|| {
+        runner.core.inner.lock().unwrap().jobs[&first.job_id]
+            .started_ms
+            .is_some()
+    })
+    .await;
+    settle().await;
+    assert!(
+        !begun(&runner, second.job_id),
+        "Boat ran two small jobs concurrently on different workspaces"
+    );
+    fs::write(marker, b"release").unwrap();
+    for id in [first.job_id, second.job_id] {
+        assert_eq!(
+            terminal(&runner, id).await.outcome,
+            Outcome::Exit { code: 0 }
+        );
+    }
+}
+
 fn workspace(runner: &Runner, path: &Path, used_ms: u64) {
     fs::create_dir_all(path.join("target")).unwrap();
     fs::write(path.join("target/artifact"), vec![1; 8192]).unwrap();

@@ -5604,6 +5604,11 @@ impl Runner {
         let mut index = DispatchIndex::build(inner);
         self.update_queue_wait_clocks(inner, now, &index);
         loop {
+            // A Boat lease owns the entire sandbox, regardless of CPU weight
+            // or checkout. Count setup reservations as well as running jobs.
+            if self.core.config.boat_profile && !index.workspace_owners.is_empty() {
+                break;
+            }
             let mut next = None;
             for id in index.heads(inner, now) {
                 if inner.terminal_saves.contains(&id) {
