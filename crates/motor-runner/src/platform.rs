@@ -248,8 +248,9 @@ unsafe fn close_inherited_descriptors(ranges: &[(u32, u32)], fallback_end: u32) 
     }
 }
 
-// The portable backend exists for protocol/in-process tests on the Mac. The
-// production crash-safe process-group launch backend is Linux-only.
+// The portable backend exists for protocol/in-process tests on non-Linux Unix
+// development hosts such as macOS. The production crash-safe process-group
+// launch backend is Linux-only.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io::Result<Launch> {
     use std::os::fd::{FromRawFd, IntoRawFd};

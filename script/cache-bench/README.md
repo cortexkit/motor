@@ -307,6 +307,6 @@ python3 -m unittest discover -s script/boat-probe -p 'test_*.py' -v
 python3 scripts/run-script-tests.py
 ```
 
-Workers run these with `runon: linux,8c`, never on the Mac. Fixtures do not compile
+Workers run these with `runon: linux,8c`, never locally on the operator machine. Fixtures do not compile
 the workspace, contact providers, or assert live performance. Operator gates
 above require direct host access, not the remote job runner.

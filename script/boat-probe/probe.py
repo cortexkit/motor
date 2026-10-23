@@ -858,7 +858,7 @@ def render_runner_host(data):
         lines += ["## Failed check reasons", "", *[
             f"- `{check['name']}`: {display(check.get('reason', 'not recorded in this report'))}"
             for check in failures], ""]
-    lines += ["## Timing (seconds, measured from the operator's Mac)", "",
+    lines += ["## Timing (seconds, measured from the operator machine)", "",
               "| Measurement | Seconds |", "| --- | --- |"]
     prepared, snapshot = runner.get("prepared_image") or {}, runner.get("snapshot") or {}
     for label, value in (("Create to Boat-ready (first sandbox)", runner.get("create", {}).get("seconds_to_ready")),

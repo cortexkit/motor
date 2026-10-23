@@ -10,7 +10,7 @@ them. Each part's details live in the linked documents.
 
 | Part | Where | Runs on | Role |
 | --- | --- | --- | --- |
-| `ck-motor` | `crates/motor-module` | Caller's Mac | CortexKit daemon module: admits callers, captures snapshots, holds the SSH connection, follows job streams. [module.md](module.md) |
+| `ck-motor` | `crates/motor-module` | Caller's machine | CortexKit daemon module: admits callers, captures snapshots, holds the SSH connection, follows job streams. [module.md](module.md) |
 | Protocol | `crates/motor-protocol` | Both | Framed client-runner protocol and codec; re-exports the caller types. [wire-protocol.md](wire-protocol.md) |
 | `motor-runner` | `crates/motor-runner` | Build server | Admission, queueing, Git mirrors, workspaces, execution, retained output. |
 | Linux sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` | Build server | Runs each Linux job as `motor-job` in a transient systemd service. [job-isolation.md](job-isolation.md) |

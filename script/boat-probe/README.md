@@ -134,7 +134,7 @@ audit. This is a bounded detection check, not proof that arbitrary hidden secret
 cannot exist. The ordinary cleanup/recovery contract below applies. Prerequisite success means
 evidence was collected, not that all runner capabilities passed.
 
-### SSH reachability from an IPv4-only Mac
+### SSH reachability from an IPv4-only operator machine
 
 `--ssh-reach` is a separate focused mode; it also requires local `ssh` and
 `ssh-keygen`, and the Boat key's `ssh` action:

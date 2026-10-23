@@ -161,7 +161,7 @@ impl Connector for Arc<Proxy> {
                             _ => false,
                         };
                         let mut value = serde_json::to_value(frame).unwrap();
-                        // In one process the Mac and server cannot own the same
+                        // In one process the client and server cannot own the same
                         // absolute directory. Only the fixture remaps roots;
                         // production transports send the original paths intact.
                         proxy.rewrite(&mut value, false);

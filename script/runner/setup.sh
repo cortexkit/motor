@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Operator tool: bootstrap a builder and populate a source copy by hand.
 # Normal jobs use the ck-motor execution service; this script does not deploy it.
-# Bootstrap the dedicated Ubuntu builder from a Mac; no private Git fetches.
+# Bootstrap the dedicated Ubuntu builder from the operator machine; no private Git fetches.
 set -euo pipefail
 host=${RUNNER_HOST:-alfonso-runner}
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -40,8 +40,9 @@ sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   ca-certificates unzip xz-utils binaryen unattended-upgrades ufw nodejs npm
 sudo -n install -d -o ubuntu -g ubuntu /srv/build /srv/build/src /srv/build/target /srv/build/cargo-home /srv/build/tools-target /srv/build/mirrors /srv/build/bundles
 
-# Mac paths must share the generations' XFS device: FICLONE cannot cross from
-# /srv/build to the root filesystem. Refuse to hide pre-existing /Users data;
+# Caller paths under /Users (where macOS clients keep checkouts) must share the
+# generations' XFS device: FICLONE cannot cross from /srv/build to the root
+# filesystem. Refuse to hide pre-existing /Users data;
 # moving an existing installation onto the array requires an operator first.
 sudo -n install -d -o ubuntu -g ubuntu -m 0755 /srv/build/Users /Users
 if ! mountpoint -q /Users && [ -n "$(sudo -n find /Users -mindepth 1 -maxdepth 1 -print -quit)" ]; then

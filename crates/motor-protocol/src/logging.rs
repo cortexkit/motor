@@ -1,7 +1,7 @@
-//! The log sink shared by both ends of exec-remote/v1: ck-motor on the Mac and
-//! motor-runner on the Linux runner. Both report through `tracing`, which
-//! discards every event until a subscriber is installed, so each binary's
-//! `main` installs this one. It formats INFO and above as one
+//! The log sink shared by both ends of exec-remote/v1: ck-motor on the client
+//! machine and motor-runner on the Linux runner. Both report through
+//! `tracing`, which discards every event until a subscriber is installed, so
+//! each binary's `main` installs this one. It formats INFO and above as one
 //! `<prefix> LEVEL target: message field=value ...` line per event and writes
 //! it to stderr. Whoever captures that stderr adds the timestamp: the subc
 //! daemon for ck-motor (`ck module logs ck-motor`), and the systemd user unit

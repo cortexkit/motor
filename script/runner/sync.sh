@@ -43,8 +43,8 @@ REMOTE
 }
 trap cleanup EXIT
 
-# Bun supplies a TOML parser on the Mac, including Macs whose Python predates
-# tomllib. Inspect every Cargo.toml in each discovered repository, not just the
+# Bun supplies a TOML parser on the operator machine, including machines whose
+# Python predates tomllib. Inspect every Cargo.toml in each discovered repository, not just the
 # current workspace members: target, patch, dev and workspace deps all matter.
 bun - "$scratch" "$@" <<'JS'
 const fs = require("node:fs");
@@ -212,7 +212,7 @@ git --git-dir="$mirror" update-ref refs/runner/head "$head"
 mkdir -p "$workspace"
 if [ ! -d "$workspace/.git" ]; then git init "$workspace"; fi
 # The working repository borrows objects from our credential-free mirror. Its
-# config and hooks are created on the runner, never copied from the Mac.
+# config and hooks are created on the runner, never copied from the operator machine.
 printf '%s\n' "$mirror/objects" > "$workspace/.git/objects/info/alternates"
 git -C "$workspace" -c core.hooksPath=/dev/null checkout --force --detach "$head"
 REMOTE
