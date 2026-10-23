@@ -934,6 +934,7 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
         let mut config = f.config();
         config.boat_profile = true;
         config.boat_memory_max_bytes = Some(2 << 30);
+        config.free_space_probe = Arc::new(|_| Ok(63 << 30));
         config.private_pids = !boat_init;
         let supervisor_failed = case == "supervisor wait failed";
         config.systemd_command = Some(Arc::new(move |args| {

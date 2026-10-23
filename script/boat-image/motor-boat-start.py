@@ -233,6 +233,11 @@ def empty_mountpoint(path):
 def check_storage():
     rows = mounts()
     state, users = state_mount(rows), users_mount(rows)
+    options = subprocess.check_output(['/usr/bin/findmnt', '-n', '-o', 'OPTIONS', '--target', str(STATE)], text=True)
+    if not ({'prjquota', 'pquota'} & set(options.strip().split(','))):
+        raise RuntimeError('Boat state disk requires enforced XFS project quotas')
+    if 'discard' not in options.strip().split(','):
+        raise RuntimeError('Boat state disk requires discard to reclaim sparse backing space')
     geometry = subprocess.check_output(['/usr/sbin/xfs_info', str(STATE)], text=True)
     if not re.search(r'\breflink=1\b', geometry):
         raise RuntimeError(f'{STATE} does not have XFS reflink enabled')
@@ -344,6 +349,16 @@ def notify_systemd(message):
             connection.sendall(message.encode())
 
 
+QUOTA_READY_FREE_BYTES = (24 << 30) + (64 << 20) + (8 << 30)
+
+
+def quota_capacity_ready():
+    def free(path):
+        value = os.statvfs(path)
+        return value.f_bavail * value.f_frsize
+    return min(free(STATE), free('/')) >= QUOTA_READY_FREE_BYTES
+
+
 def watch_storage(pause=time.sleep, notify=None):
     notify = notify or notify_systemd
     try:
@@ -354,11 +369,28 @@ def watch_storage(pause=time.sleep, notify=None):
         expected = tuple(json.loads(STORAGE_EVIDENCE.read_text())['identity'])
         if len(expected) != 3 or any(type(value) is not int or value < 0 for value in expected):
             raise ValueError('invalid Boat storage identity evidence')
+        capacity_withdrawn = False
         while True:
             if storage_identity() != expected:
                 raise RuntimeError('Boat runner state disk identity changed')
-            with storage_lock():
-                write_storage_health('healthy', expected)
+            if not quota_capacity_ready():
+                if not capacity_withdrawn:
+                    withdraw_storage('cold_quota_capacity_below_floor')
+                else:
+                    with storage_lock():
+                        ENDPOINT_READY.unlink(missing_ok=True)
+                        write_storage_health('unhealthy', reason='cold_quota_capacity_below_floor')
+                capacity_withdrawn = True
+            else:
+                with storage_lock():
+                    # A setup can withdraw readiness after the first sample.
+                    # Never publish that older sample over its locked withdrawal.
+                    capacity_withdrawn = not quota_capacity_ready()
+                    if capacity_withdrawn:
+                        ENDPOINT_READY.unlink(missing_ok=True)
+                        write_storage_health('unhealthy', reason='cold_quota_capacity_below_floor')
+                    else:
+                        write_storage_health('healthy', expected)
             pause(1)
             notify('WATCHDOG=1')
     except BaseException as error:

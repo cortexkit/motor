@@ -45,7 +45,8 @@ BUILD = Path("/srv/build")
 STATE = Path("/var/lib/motor-boat")
 # The runner's admission floor, the --free-space-floor-bytes value in
 # motor-boat.service. The endpoint withholds readiness below it.
-FREE_SPACE_FLOOR_BYTES = 24 << 30
+# Leave the provisional 24-GiB reserve, 64-MiB replay tail and an 8-GiB cold cap.
+FREE_SPACE_FLOOR_BYTES = (32 << 30) + (64 << 20)
 APT_LISTS = Path('/var/lib/apt/lists/motor-boat')
 APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourceparts=/etc/apt/motor-boat.sources.d',
                '-o', 'Dir::State::lists=' + str(APT_LISTS), '-o', 'Acquire::AllowInsecureRepositories=false',
@@ -411,7 +412,7 @@ def state(pins):
                      "DefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=motor-boat-restored.service\n"
                      "After=motor-boat-restored.service\nConditionPathExists=!/run/motor-boat-storage.json\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"
-                     "Type=xfs\nOptions=loop,noatime\n")
+                     "Type=xfs\nOptions=loop,noatime,prjquota,discard\n")
     Path("/Users").mkdir(exist_ok=True)
     Path("/etc/systemd/system/Users.mount").write_text(
         "[Unit]\nDefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=var-lib-motor\\x2dboat.mount\n"

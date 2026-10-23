@@ -262,6 +262,232 @@ fn boat_pid_init_unit_changes_only_what_the_init_needs() {
 }
 
 #[test]
+fn boat_var_tmp_bind_uses_the_same_quota_covered_runtime_as_tmp() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let sandbox = f
+        .command_sandbox()
+        .with_boat_profile(true, false, Some(14 << 30));
+    fs::create_dir_all(&sandbox.root).unwrap();
+    crate::systemd::with_process_hook(
+        Box::new(|_| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }),
+        || {
+            let sandbox = sandbox.with_boat_temporary_paths().unwrap();
+            assert_eq!(
+                sandbox.read_write,
+                [format!(
+                    "{}:/var/tmp",
+                    f.scratch.join("unprepared/tmp").display()
+                )]
+            );
+            assert!(sandbox.root.join("var").is_dir());
+            assert!(!fs::symlink_metadata(sandbox.root.join("var"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        },
+    );
+}
+
+#[test]
+fn boat_writer_unit_is_structurally_refused_even_if_cache_is_requested() {
+    with_prepared_boat_sandbox(true, |f, sandbox| {
+        let env = [("SCCACHE_DIR".into(), "/motor-cache".into())];
+        let error = sandbox
+            .command(
+                "touch /motor-cache/unlimited",
+                &f.workspace,
+                &env,
+                true,
+                &[1],
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "Boat jobs cannot use dependency writer units"
+        );
+    });
+}
+
+fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandbox)) {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    fs::create_dir_all(f.workspace.join("src")).unwrap();
+    fs::write(f.workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        f.workspace.join("Cargo.toml"),
+        "[package]\nname = 'quota-mount-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        f.workspace.join("Cargo.lock"),
+        "version = 3\n[[package]]\nname = 'quota-mount-fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    workspace::git(&f.workspace, &["init", "-q"]).unwrap();
+    workspace::git(&f.workspace, &["add", "."]).unwrap();
+    let tree = workspace::git(&f.workspace, &["write-tree"]).unwrap();
+    let target = f.scratch.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let id = Uuid::now_v7();
+    // Exercise the real mount construction. Only account/privileged operations
+    // are substituted; Git, Cargo fetch and the filesystem layout remain real.
+    crate::systemd::with_process_hook(
+        Box::new(|command| {
+            let program = command.get_program().to_string_lossy();
+            if program.ends_with("/id") {
+                let args: Vec<_> = command.get_args().collect();
+                let stdout = if args[0] == "-u" {
+                    format!(
+                        "{}\n",
+                        unsafe { libc::geteuid() }
+                            + if args[1] == WRITER_USER { 10002 } else { 10001 }
+                    )
+                } else {
+                    format!("{}\n", args[1].to_string_lossy())
+                };
+                return Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: stdout.into_bytes(),
+                    stderr: Vec::new(),
+                });
+            }
+            if ["sudo", "setfacl", "chown", "chmod"].iter().any(|name| {
+                Path::new(command.get_program())
+                    .file_name()
+                    .is_some_and(|actual| actual == *name)
+            }) {
+                return Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            command.output()
+        }),
+        || {
+            let javascript = JavascriptTools::for_role(ToolchainRole::Boat);
+            let sandbox = if writer {
+                Sandbox::prepare_writer(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    &javascript,
+                    true,
+                )
+            } else {
+                Sandbox::prepare_role(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    &[],
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    f.workspace.to_str().unwrap(),
+                    false,
+                    false,
+                    false,
+                    None,
+                    &javascript,
+                )
+                .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
+            }
+            .unwrap()
+            .with_boat_temporary_paths()
+            .unwrap()
+            .with_pid_init(Some(test_identity()));
+            inspect(&f, sandbox);
+        },
+    );
+}
+
+#[test]
+fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
+    use std::os::unix::ffi::OsStringExt;
+    for writer in [false, true] {
+        with_prepared_boat_sandbox(writer, |f, mut sandbox| {
+            let target = f.scratch.join("target");
+            let roots = crate::boat_quota::job_roots(
+                &f.workspace,
+                &target,
+                &sandbox.runtime.0,
+                &f.state.join("spools").join("fixture"),
+            );
+            for private_pids in [true, false] {
+                sandbox.private_pids = private_pids;
+                let command = sandbox.command("true", &f.workspace, &[], true, &[1], 1);
+                if writer {
+                    assert_eq!(
+                        command.unwrap_err().to_string(),
+                        "Boat jobs cannot use dependency writer units"
+                    );
+                    continue;
+                }
+                let command = command.unwrap();
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert!(args.contains(&"--property=ProtectSystem=strict"));
+                assert!(args.contains(&"--property=ProtectHome=tmpfs"));
+                assert!(!args
+                    .iter()
+                    .any(|arg| arg.starts_with("--property=ReadWritePaths=")));
+                let binds = args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("--property=BindPaths="))
+                    .unwrap();
+                assert!(!binds.is_empty(), "empty mount plan cannot prove coverage");
+                for bind in binds.split_whitespace() {
+                    let source = bind.split(':').next().unwrap();
+                    let mut bytes = Vec::new();
+                    let mut encoded = source.bytes();
+                    while let Some(byte) = encoded.next() {
+                        match byte {
+                            b'\\' => {
+                                assert_eq!(encoded.next(), Some(b'x'));
+                                let hex: String =
+                                    encoded.by_ref().take(2).map(char::from).collect();
+                                bytes.push(u8::from_str_radix(&hex, 16).unwrap());
+                            }
+                            b'%' => {
+                                assert_eq!(encoded.next(), Some(b'%'));
+                                bytes.push(b'%');
+                            }
+                            byte => bytes.push(byte),
+                        }
+                    }
+                    let source = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                    assert!(
+                        roots.iter().any(|root| source.starts_with(root)),
+                        "unquota'd writable source in Boat unit: {}",
+                        source.display()
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[test]
 fn boat_pid_init_unit_refuses_loader_variables_and_a_missing_identity() {
     let f = Fixture::new();
     let sandbox = || {

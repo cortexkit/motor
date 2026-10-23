@@ -1847,6 +1847,12 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
 
 pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
     let _access = crate::tree_access::lock(path);
+    // Boat uses bounded, descriptor-relative private GC even after a crash has
+    // removed its lease. Recursive permission helpers cannot handle every legal
+    // job-created path and must not strand its private data during recovery.
+    if crate::boat_quota::reclaim_runtime(path)? || !path.exists() {
+        return Ok(());
+    }
     // ACLs alone cannot override sticky-directory unlink rules. Once the job's
     // cgroup is gone, reclaim the entire private tree (including nested sticky
     // directories and root-owned mount ancestors), without following symlinks.
@@ -1946,7 +1952,7 @@ pub(crate) struct Sandbox {
     private_pids: bool,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
-    /// Set for Boat jobs on systemd before 257: the identity the PID namespace
+    /// Set for Boat jobs: the identity the PID namespace
     /// init drops to (see `pid_init`).
     pid_init: Option<pid_init::JobIdentity>,
     provider_unset_env: Vec<String>,
@@ -1989,6 +1995,9 @@ impl Drop for RuntimeDir {
             return;
         }
         if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return;
+            }
             tracing::warn!(%error, path = %self.0.display(), "could not remove private job home");
         }
     }
@@ -2481,6 +2490,7 @@ impl Sandbox {
         dependency_routes: &BTreeMap<String, PathBuf>,
         tree: &str,
         javascript: &JavascriptTools,
+        boat_profile: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2500,6 +2510,7 @@ impl Sandbox {
             None,
             javascript,
         )
+        .map(|sandbox| sandbox.with_boat_profile(boat_profile, true, None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2908,13 +2919,25 @@ impl Sandbox {
         self.boat_memory_max = if enabled { memory_max } else { None };
         self
     }
+    pub(crate) fn with_boat_temporary_paths(mut self) -> io::Result<Self> {
+        // Do not depend on systemd's version-specific PrivateTmp /var/tmp
+        // backing. Bind /var/tmp to runtime/tmp, the same quota-covered XFS
+        // scratch already mounted at /tmp.
+        let destination = Path::new("/var/tmp");
+        prepare_root_owned_mount_ancestors(&self.root, destination)?;
+        let ancestors = root_owned_mount_ancestors(&self.root, destination)?;
+        set_sandbox_directory_owner_modes(&[(&ancestors, "0755")])?;
+        self.read_write
+            .push(bind(&self.runtime.0.join("tmp"), destination)?);
+        Ok(self)
+    }
     /// The job identity for Boat units that cannot use PrivatePIDs. Only those
     /// units use it; see [`Sandbox::uses_pid_init`].
     pub(crate) fn with_pid_init(mut self, identity: Option<pid_init::JobIdentity>) -> Self {
         self.pid_init = identity;
         self
     }
-    /// Boat sandboxes on systemd before 257 start the unit as root and run
+    /// Boat sandboxes start the unit as root and run
     /// the runner's PID namespace init in front of the wrapper.
     fn uses_pid_init(&self) -> bool {
         self.boat_profile && !self.private_pids
@@ -2957,6 +2980,11 @@ impl Sandbox {
         cpus: &[u32],
         requested_vcpus: u32,
     ) -> io::Result<Command> {
+        if self.boat_profile && self.writer {
+            return Err(io::Error::other(
+                "Boat jobs cannot use dependency writer units",
+            ));
+        }
         let user = self.user;
         let pid_init = if self.uses_pid_init() {
             Some(self.pid_init.as_ref().ok_or_else(|| {

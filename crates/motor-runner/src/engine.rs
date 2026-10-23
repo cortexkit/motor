@@ -80,6 +80,10 @@ pub struct Config {
     /// Explicit single-tenant Boat compatibility: systemd before 257 cannot
     /// create private PID namespaces. All other job isolation remains enabled.
     pub boat_profile: bool,
+    /// Set only on a per-attempt config clone after Boat evicts a reused cache.
+    pub(crate) boat_cold_materialization: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) boat_readiness_withdraw: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
     /// One-job Boat budget measured at boot, after idle overhead and headroom.
     /// Never used for the fleet profile's per-vCPU memory rule.
     pub boat_memory_max_bytes: Option<u64>,
@@ -87,8 +91,7 @@ pub struct Config {
     pub(crate) private_pids: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_unset_environment: Vec<String>,
-    /// The job account's ids, set when Boat jobs run the runner's PID
-    /// namespace init because systemd lacks PrivatePIDs.
+    /// The job account's ids for Boat's PID namespace init and quota filter.
     #[cfg(target_os = "linux")]
     pub(crate) pid_init: Option<crate::isolation::pid_init::JobIdentity>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.
@@ -353,6 +356,9 @@ impl Config {
         Self {
             tenant_vm: false,
             boat_profile: false,
+            boat_cold_materialization: false,
+            #[cfg(target_os = "linux")]
+            boat_readiness_withdraw: Arc::new(crate::boat_quota::withdraw_ready),
             boat_memory_max_bytes: None,
             #[cfg(target_os = "linux")]
             private_pids: true,
@@ -700,6 +706,9 @@ impl QueueProgress {
 }
 
 struct Inner {
+    /// Reserve-file allocation claims the idle interval, then releases the state
+    /// lock while writing and syncing the file.
+    restoring_reserve: bool,
     writer: Option<Uuid>,
     #[cfg(target_os = "linux")]
     cache_fills: BTreeMap<Uuid, crate::writer::CacheFill>,
@@ -1115,6 +1124,8 @@ struct QuarantineCleanup {
 }
 
 struct Core {
+    /// Admission/prepare take this before claiming state, never while holding inner.
+    reserve_restore: Mutex<()>,
     tenant_events: Option<Arc<crate::tenant::EventLog>>,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
@@ -1404,6 +1415,18 @@ impl Runner {
         Self::open_with_backend(config, backend)
     }
     fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        if config.boat_profile {
+            config.free_space_floor_bytes = config
+                .free_space_floor_bytes
+                .max(crate::boat_quota::READY_FREE_BYTES);
+            if let Some(goal) = &mut config.free_space_eviction_bytes {
+                *goal = (*goal).max(40 << 30);
+            }
+            let probe = config.free_space_probe.clone();
+            config.free_space_probe =
+                Arc::new(move |path| Ok(probe(path)?.min(probe(Path::new("/"))?)));
+        }
         config.configure_backend()?;
         if config.instance.is_empty()
             || !config
@@ -1917,6 +1940,7 @@ impl Runner {
         let sibling_fences = config.sibling_fences();
         let runner = Self {
             core: Arc::new(Core {
+                reserve_restore: Mutex::new(()),
                 tenant_events,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
@@ -1926,6 +1950,7 @@ impl Runner {
                 trees,
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
+                    restoring_reserve: false,
                     writer: None,
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
@@ -2704,6 +2729,7 @@ impl Runner {
             request.weight_hint = Some(4);
         }
         let (_admission, initial_refusal) = {
+            let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
             if inner.jobs.contains_key(&request.job_id)
                 || inner.pending_replays.contains(&request.job_id)
@@ -3364,6 +3390,7 @@ impl Runner {
         self.validate_writer_paths(&r.workspace_key, None, &r.siblings)?;
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let (recorded, prior) = {
+            let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
             if Self::deleting(&inner, &r.workspace_key, &r.siblings)
                 || Self::occupied(&inner, &r.workspace_key)
@@ -5599,12 +5626,20 @@ impl Runner {
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+        if inner.restoring_reserve {
+            return Ok(());
+        }
         if self.ensure_admission_ownership().is_err() {
             return Ok(());
         }
         let mut index = DispatchIndex::build(inner);
         self.update_queue_wait_clocks(inner, now, &index);
         loop {
+            // A Boat lease owns the entire sandbox, regardless of CPU weight
+            // or checkout. Count setup reservations as well as running jobs.
+            if self.core.config.boat_profile && !index.workspace_owners.is_empty() {
+                break;
+            }
             let mut next = None;
             for id in index.heads(inner, now) {
                 if inner.terminal_saves.contains(&id) {
@@ -5696,10 +5731,22 @@ impl Runner {
         id: Uuid,
         claims: &BTreeMap<Uuid, Vec<u32>>,
     ) -> io::Result<()> {
+        if inner.restoring_reserve {
+            return Ok(());
+        }
         let job = inner.jobs[&id].clone();
         let r = job.request.clone().unwrap();
-        // Internal warm builds bypass external admission, but share its CPU limit.
-        if let Some((reason, detail)) = self.cpu_refusal(job.weight) {
+        // Recovered warm builds bypass external admission. Boat must never run
+        // them: writer units expose a shared cache outside the job project.
+        let refusal = if self.core.config.boat_profile && job.base {
+            Some((
+                RefusalReason::WorkspaceSetupFailed,
+                "Boat jobs cannot use dependency writer units".to_owned(),
+            ))
+        } else {
+            self.cpu_refusal(job.weight)
+        };
+        if let Some((reason, detail)) = refusal {
             let safe_detail = self.safe_refusal_detail(&detail, r.env.values().cloned());
             let mut refused = job.clone();
             refuse_before_start(
@@ -5909,6 +5956,12 @@ impl Runner {
             if let Some(full) =
                 crate::setup_log::phase("disk admission", || self.ensure_disk_space())?
             {
+                #[cfg(target_os = "linux")]
+                if self.core.config.boat_profile {
+                    if let Err(error) = (self.core.config.boat_readiness_withdraw)() {
+                        tracing::error!(%error, "failed to withdraw Boat readiness after setup disk shortage");
+                    }
+                }
                 return Err(io::Error::other(format!(
                     "runner_disk_full: free_bytes={} floor_bytes={}",
                     full.free_bytes, full.floor_bytes
@@ -5939,11 +5992,36 @@ impl Runner {
                 self.cap_sibling_snapshots(&r.siblings);
                 resolved?;
             }
+            #[cfg(target_os = "linux")]
+            if self.core.config.boat_profile {
+                match self.materialize(s) {
+                    Ok(prepared) => return Ok(prepared),
+                    Err(error) if crate::boat_quota::cold_cache(&error).is_some() => {
+                        let request = crate::boat_quota::cold_cache(&error).unwrap();
+                        tracing::info!(job_id = %s.id, workspace = %s.request.workspace_key, initial_bytes = ?request.initial_bytes, cap_bytes = request.cap_bytes, minimum_growth_bytes = request.minimum_growth, "evicting Boat cache before one cold materialization retry");
+                        self.evict_boat_setup_workspace(s)?;
+                        let mut cold = self.core.config.clone();
+                        cold.boat_cold_materialization = true;
+                        return self.materialize_config(s, &cold).map_err(|error| {
+                            if let Some(request) = crate::boat_quota::cold_cache(&error) {
+                                if let Err(withdraw) = (self.core.config.boat_readiness_withdraw)() {
+                                    tracing::error!(%withdraw, "failed to withdraw Boat readiness after cold quota shortage");
+                                }
+                                io::Error::other(format!("runner_disk_full: cold_quota_cap_bytes={} minimum_growth_bytes={}; command was not started", request.cap_bytes, request.minimum_growth))
+                            } else { error }
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             self.materialize(s)
         })
     }
 
     fn materialize(&self, s: &Setup) -> io::Result<Prepared> {
+        self.materialize_config(s, &self.core.config)
+    }
+    fn materialize_config(&self, s: &Setup, config: &Config) -> io::Result<Prepared> {
         #[cfg(test)]
         if self.core.config.fail_materialize {
             return Err(io::Error::other(
@@ -5951,9 +6029,7 @@ impl Runner {
             ));
         }
         self.long_work("materialize");
-        self.core
-            .backend
-            .materialize(&self.core.config, &self.core.trees, s)
+        self.core.backend.materialize(config, &self.core.trees, s)
     }
 
     /// `launch` for a job that tests set up by hand, with no dispatch to undo.

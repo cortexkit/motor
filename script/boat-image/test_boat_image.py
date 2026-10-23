@@ -231,8 +231,8 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
         self.assertIn('--reserve-daemon-core false', unit)
-        self.assertIn('--free-space-floor-bytes 25769803776', unit)
-        self.assertIn('--free-space-eviction-bytes 34359738368', unit)
+        self.assertIn('--free-space-floor-bytes 34426847232', unit)
+        self.assertIn('--free-space-eviction-bytes 42949672960', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
@@ -345,6 +345,7 @@ class RecipeTests(unittest.TestCase):
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
+        self.assertIn('Options=loop,noatime,prjquota,discard', mount)
         for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
@@ -398,14 +399,26 @@ class RecipeTests(unittest.TestCase):
 
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
-             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=0']), \
              self.assertRaisesRegex(RuntimeError, 'reflink enabled'):
             start.check_storage()
         with tempfile.TemporaryDirectory() as tmp, patch.object(start, 'STATE', Path(tmp)), \
              patch.object(start, 'USERS', Path(tmp)), patch.object(start, 'mounts', return_value=[]), \
              patch.object(start, 'state_mount'), patch.object(start, 'users_mount'), \
-             patch.object(start.subprocess, 'check_output', return_value='reflink=1'), \
+             patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=1']), \
              patch.object(start.fcntl, 'ioctl', side_effect=OSError(95, 'unsupported')), self.assertRaises(OSError):
+             start.check_storage()
+
+    def test_storage_requires_enforced_project_quota(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,noquota'), \
+             self.assertRaisesRegex(RuntimeError, 'requires enforced XFS project quotas'):
+            start.check_storage()
+
+    def test_storage_requires_discard_for_outer_disk_reclamation(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,prjquota'), \
+             self.assertRaisesRegex(RuntimeError, 'requires discard'):
             start.check_storage()
 
     def test_prepare_storage_never_mounts_over_nonempty_views(self):
@@ -505,8 +518,82 @@ class RecipeTests(unittest.TestCase):
             with patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'ENDPOINT_READY', marker), \
                  patch.object(start, 'STORAGE_HEALTH', health), patch.object(start, 'STORAGE_LOCK', lock), \
                  patch.object(start, 'storage_identity', return_value=(1792, 128, 131)), \
-                 patch.object(start, 'notify_systemd'):
+                 patch.object(start, 'notify_systemd'), \
+                 patch.object(start.os, 'statvfs', return_value=Mock(f_bavail=64 << 30, f_frsize=1, f_favail=10000)):
                 yield evidence, marker, health
+
+    def test_cold_quota_shortage_withdraws_until_both_filesystems_recover(self):
+        required = (32 << 30) + (64 << 20)
+        available = {'root': required - 4096, 'xfs': 64 << 30}
+        def stats(path):
+            return Mock(f_bavail=available['root' if str(path) == '/' else 'xfs'], f_frsize=1, f_favail=10000)
+        with self.storage_watch_paths() as (_, marker, health):
+            polls = []
+            def pause(_):
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 1:
+                    available['root'] = 64 << 30
+                    available['xfs'] = required - 1
+                elif len(polls) == 2:
+                    available['xfs'] = required
+                else:
+                    raise InterruptedError('stop after recovery')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy', 'unhealthy', 'healthy'])
+
+    def test_capacity_sample_cannot_overwrite_a_newer_locked_withdrawal(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            available = {'root': 64 << 30}
+            locks = []
+            @contextlib.contextmanager
+            def ordered_lock():
+                locks.append(True)
+                if len(locks) == 2:
+                    # A setup acquired the lock after an old healthy sample,
+                    # withdrew readiness, and released it before publication.
+                    available['root'] = (32 << 30) - 1
+                    marker.unlink(missing_ok=True)
+                    start.write_storage_health('unhealthy', reason='newer setup withdrawal')
+                yield
+            def stats(path):
+                return Mock(f_bavail=available['root'] if str(path) == '/' else 64 << 30, f_frsize=1, f_favail=10000)
+            def pause(_):
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy', 'stale healthy sample replaced the newer withdrawal')
+                raise InterruptedError('publication observed')
+            with patch.object(start, 'storage_lock', ordered_lock), patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_healthy_publication_rechecks_capacity_under_a_nonrecursive_lock(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            held = False
+            samples = []
+            @contextlib.contextmanager
+            def lock():
+                nonlocal held
+                self.assertFalse(held, 'storage lock was acquired recursively')
+                held = True
+                try:
+                    yield
+                finally:
+                    held = False
+            def capacity():
+                samples.append(held)
+                return True
+            def pause(_):
+                self.assertEqual(samples, [False, True])
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                raise InterruptedError('publication checked')
+            with patch.object(start, 'storage_lock', lock), patch.object(start, 'quota_capacity_ready', capacity), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_capacity_check_is_lock_free_and_samples_only_two_filesystems(self):
+        stats = Mock(f_bavail=64 << 30, f_frsize=1)
+        with patch.object(start, 'storage_lock', side_effect=AssertionError('caller already holds this lock')), patch.object(start.os, 'statvfs', return_value=stats) as probe:
+            self.assertTrue(start.quota_capacity_ready())
+        self.assertEqual(probe.call_args_list, [unittest.mock.call(start.STATE), unittest.mock.call('/')])
 
     def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
         with self.storage_watch_paths() as (_, marker, health):

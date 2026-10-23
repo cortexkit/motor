@@ -19,7 +19,28 @@ use std::{
 };
 
 pub(crate) fn setup_step<T>(step: &str, result: io::Result<T>) -> io::Result<T> {
-    result.map_err(|error| io::Error::other(format!("{step}: {error}")))
+    result.map_err(|error| {
+        io::Error::other(SetupError {
+            step: step.to_owned(),
+            error,
+        })
+    })
+}
+
+#[derive(Debug)]
+struct SetupError {
+    step: String,
+    error: io::Error,
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.error)
+    }
+}
+impl std::error::Error for SetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// How this runner instance runs jobs; each instance serves one platform.
@@ -444,6 +465,17 @@ impl Backend for HostBackend {
         }
         let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
         #[cfg(target_os = "linux")]
+        if config.boat_profile && path.exists() {
+            // Bound hostile cached trees before permission repair or checkout
+            // starts a separate, potentially much larger traversal.
+            setup_step(
+                "preflight Boat cached tree",
+                crate::boat_quota::preflight_cached_tree(&path).map_err(|error| {
+                    crate::boat_quota::cache_walk_error(error, config.boat_cold_materialization)
+                }),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
         if config.isolate_jobs && path.exists() {
             crate::setup_log::phase("restore workspace access", || {
                 crate::isolation::restore_runner_access(&path)
@@ -663,6 +695,7 @@ impl Backend for HostBackend {
                             &routes,
                             &r.tree_hash,
                             &crate::isolation::JavascriptTools::for_config(config),
+                            config.boat_profile,
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(
@@ -721,6 +754,24 @@ impl Backend for HostBackend {
                 }),
             )?;
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
+            let sandbox = if config.boat_profile {
+                let sandbox = sandbox.with_boat_temporary_paths()?;
+                let runtime = trees.state.join("sandboxes").join(s.id.to_string());
+                let spool = trees.state.join("spools").join(s.id.to_string());
+                fs::create_dir_all(&spool)?;
+                setup_step(
+                    "install Boat job disk quota",
+                    crate::boat_quota::prepare(
+                        &trees.state,
+                        s.id,
+                        crate::boat_quota::job_roots(&path, &target, &runtime, &spool),
+                        config.boat_cold_materialization,
+                    ),
+                )?;
+                sandbox
+            } else {
+                sandbox
+            };
             wrapper = sandbox.wrapper.clone();
             Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
         } else {
@@ -753,6 +804,23 @@ impl Backend for HostBackend {
             setup_step(
                 "verify Boat storage",
                 verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.cwd),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        if config.boat_profile {
+            let workspace = Path::new(if s.base { &r.cwd } else { &r.workspace_key });
+            setup_step(
+                "verify Boat quota lease",
+                crate::boat_quota::validate_for_launch(
+                    &trees.state,
+                    s.id,
+                    &crate::boat_quota::job_roots(
+                        workspace,
+                        &prepared.target,
+                        &trees.state.join("sandboxes").join(s.id.to_string()),
+                        &trees.state.join("spools").join(s.id.to_string()),
+                    ),
+                ),
             )?;
         }
         let mut env = BTreeMap::new();

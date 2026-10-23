@@ -79,7 +79,9 @@ pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::
     if major < 257 && !boat_profile {
         return Err(io::Error::other("systemd >=257 is required for PrivatePIDs; only an explicitly configured single-tenant --boat-profile may run without it"));
     }
-    Ok(major >= 257)
+    // Boat always uses the runner init, including on newer managers, so its
+    // namespace and project-quota ioctl filter runs before any job code.
+    Ok(major >= 257 && !boat_profile)
 }
 
 #[cfg(target_os = "linux")]
@@ -92,7 +94,7 @@ pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
     }
     let enabled = private_pids_capability(&String::from_utf8_lossy(&output.stdout), boat_profile)?;
     if !enabled {
-        tracing::info!("Boat profile: systemd lacks PrivatePIDs; jobs use the runner's PID namespace bootstrap");
+        tracing::info!("Boat profile: jobs use the runner's PID namespace bootstrap and quota-attribute filter");
     }
     Ok(enabled)
 }
@@ -163,7 +165,7 @@ fn boat_provider_environment_names_include_unknown_prefixes_without_values() {
 fn boat_pid_compatibility_is_explicit_and_version_checked() {
     assert!(private_pids_capability("255.4-1ubuntu8.16", false).is_err());
     assert!(!private_pids_capability("255.4-1ubuntu8.16", true).unwrap());
-    assert!(private_pids_capability("257.9", true).unwrap());
+    assert!(!private_pids_capability("257.9", true).unwrap());
     assert!(private_pids_capability("259.5", false).unwrap());
     assert!(private_pids_capability("unknown", true).is_err());
 }

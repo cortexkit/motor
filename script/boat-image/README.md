@@ -382,11 +382,11 @@ The operator's prerequisite pass measured systemd **255.4**, which rejects
 `PrivatePIDs=yes`. `--boat-profile` is an explicit, **one-job-per-sandbox**
 compatibility choice approved for this provider. The runner queries the actual
 system manager's version. Without the flag, systemd <257 refuses startup; the
-build server never silently loses PID isolation. On newer systemd even the Boat
-profile retains PrivatePIDs. The flag requires the Linux host backend; tenant
+build server never silently loses PID isolation. Boat uses the runner init on
+newer systemd too, to enforce its quota-inheritance filter. The flag requires the Linux host backend; tenant
 mode additionally requires root-private local sockets rather than vsock.
 
-On systemd 255, the unit runs the installed, root-owned
+In Boat mode, the unit runs the installed, root-owned
 `/usr/local/bin/motor-runner job-pid-init <uid> <gid> <groups> <proc-reference-json> -- <wrapper argv>`.
 The runner refuses startup if that installed executable is missing, unsafe or
 different from the running executable. The init starts as root with only
@@ -395,7 +395,8 @@ creates a PID namespace, then forks its PID 1. That child mounts a fresh
 `nosuid,nodev,noexec,hidepid=invisible` proc and moves systemd's protected proc
 submounts into it. It drops to the exact `motor-job` UID, GID and supplementary
 groups, empties all capability sets, joins a fresh session keyring as that user,
-and stacks a filter restoring `RestrictNamespaces=yes` equivalence. Only then
+and stacks a filter restoring `RestrictNamespaces=yes` namespace restrictions
+and protecting quota inheritance. Only then
 does it exec the unchanged bash wrapper as PID 1; the command is PID 2.
 `NoNewPrivileges=yes` and all other filesystem/network restrictions apply
 throughout. Loader/allocator environment controls (`LD_*`, `GLIBC_TUNABLES`,
@@ -414,9 +415,8 @@ outcome is unknown, never an assumed retry-safe refusal or job exit 226. A
 wrapper-recorded exit 226 remains a normal exit. A supervisor wait failure uses
 status 227 and cannot write a setup-failure record; without a wrapper exit file
 it is an unknown outcome, never a retry-safe refusal. These changes apply only
-when Boat mode is enabled and systemd lacks PrivatePIDs, including Boat-plus-
-tenant deployments on older systemd. Ordinary build-server, non-Boat tenant
-and systemd >=257 units are unchanged.
+when Boat mode is enabled, including Boat-plus-tenant deployments. Ordinary
+build-server and non-Boat tenant units are unchanged.
 
 The init starts a separate session/process group, re-arms its parent-death
 SIGKILL after dropping credentials, and checks both PPid and an inherited
@@ -427,7 +427,7 @@ JSON telemetry recording credentials, post-drop PDEATHSIG, SID/PGID, descriptors
 that survive exec and proc protections. The live root observer checks it and
 the actual host-view session separation while a job runs.
 
-Before serving Boat fallback jobs, the runner measures protected proc mounts
+Before serving Boat jobs, the runner measures protected proc mounts
 in an independent systemd reference unit using the probe's protection policy.
 The measured path/read-only set is passed in the init argv; after moving the
 mounts, the init requires exact equality or refuses before start. No guessed
@@ -650,18 +650,128 @@ code digest and both exact command forms are valid. Boat runs the trusted unit
 as root and installs that same fixed helper, without granting jobs sudo. No
 setuid helper or shell command is delegated.
 
-The Boat unit explicitly sets a **24 GiB admission floor** and **32 GiB soft
-eviction goal**; neither is inferred from the provider label or filesystem size.
-An operator-reported cold Cargo build used about 20 GiB, so 24 GiB reserves that
-footprint plus 4 GiB of working headroom rather than admitting a cold build with
-only 4 GiB free. The 32 GiB goal starts reclaiming inactive caches earlier. Both
-fit the roughly 63 GiB free measured inside this 64 GiB XFS volume. These are
-admission/reclamation thresholds, not a disk quota or a guarantee for arbitrary
-artifact sizes; active workspaces and cache-ownership protections are unchanged.
+The Boat unit sets a **32 GiB + 64 MiB admission/readiness floor** and a **40 GiB
+soft eviction goal**. The floor leaves the provisional 24-GiB snapshot/cleanup
+reserve, the existing 64-MiB replay bound, and an 8-GiB minimum cold cap. Boat
+probes the lesser of XFS and outer-root available space; the endpoint remains
+withdrawn while either filesystem cannot leave that cold cap. Active streams
+continue while readiness is withdrawn. Idle pressure cleanup restores capacity
+without waiting for a new booking. These thresholds are not a measured upper
+bound on snapshot scratch or a promise that arbitrary builds fit.
 The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
 `--free-space-floor-bytes` flag sets the floor; new
 `--free-space-eviction-bytes` optionally overrides the soft goal and must exceed
 the floor, otherwise the original twice-floor rule applies.
+
+### Per-job disk quota
+
+The Boat state mount uses XFS `prjquota,discard`; startup refuses a mount without
+project enforcement. `discard` returns freed loop-image extents to the outer
+filesystem, rather than leaving an ever-growing sparse file after eviction.
+Existing images must be rebuilt/remounted while services are stopped; a live
+remount cannot safely enable XFS project quotas.
+
+For **Boat only**, after trusted checkout/dependency preparation and before job
+code, the runner assigns the workspace (including its target bind), private
+runtime (HOME, temporary directories, raw stdout/stderr and the preallocated
+exit inode), and incoming spool to one project. Shared Cargo registry/Git,
+rustup and tool binaries are read-only job mounts. Private Cargo/Bun cache writes
+are under HOME. `/dev/shm` is a separate, memory-cgroup-bounded tmpfs: it cannot
+be charged to XFS and remains memory-limited instead. Boat explicitly binds
+`/var/tmp` to the same XFS scratch as `/tmp`, avoiding any dependency on the
+systemd version's private-temporary backing. The live probe verifies project IDs
+on both spellings. Binds of an unexpected
+filesystem fail setup, rather than silently escaping the quota.
+
+The **total** hard block cap is at most 32 GiB, calculated from
+`min(XFS available bytes, / available bytes) - provisional reserve - replay tail
+allowance`, rounded down to 512 bytes. The **24-GiB reserve is provisional**,
+not an empirically established snapshot requirement. Initial logical usage
+consumes the cap; it never increases it. Reflinked baseline extents can become
+physical CoW allocations or release logical charge without freeing physical
+space, so initial-plus-growth accounting is unsafe even for sequential jobs.
+
+A reused baseline leaving under 8 GiB of growth is evicted through the same
+owned cache-removal/catalog path as idle eviction, then materialized cold once.
+The setup reservation stays held. A cold physical cap below 8 GiB produces the
+existing safe refused-before-start `RunnerDiskFull`, withdraws the ready marker,
+and cannot run the command. Automatic placement elsewhere is not implemented.
+A cold checkout that itself exceeds the total cap is a no-start
+setup failure. Inodes retain an additional cap of 65,536 and an 8,192-inode
+bookkeeping reserve. Boat dispatch enforces one job, including setup, regardless
+of weight or workspace. Older leases retain their inode ownership until cleanup
+but cannot spend unused allowance after the singleton successor starts.
+
+A flock serializes lease changes. Cleanup clears only inodes still carrying
+that lease's project, so delayed A cleanup cannot unquota successor B. Durable
+pending/active/releasing phases and missing-record recovery make interrupted
+setup and double release idempotent. Launch independently requires the active
+lease, matching kernel limits, and owned writable roots.
+Boat refuses dependency-writer jobs before setup, including recovered fills,
+and independently refuses writer-unit construction. Shared writer-cache mounts
+must never bypass the job project. The unit mount test enumerates every writable
+bind's host source against the quota roots rather than accepting known destinations.
+
+Quota walking is iterative and descriptor-relative, validates all physical
+roots first, deduplicates `(dev, ino)`, and is limited to 262,144 entries, depth
+128 and five seconds. Cached-tree preflight precedes permission repair and
+requests cold eviction for cached pathnames beyond PATH_MAX, before whole-path
+checkout or permission tools encounter them. Every retired runtime is detached
+into private quarantine before its lease is removed; failed detachment keeps the
+retirement durable. Manifest-free crash recovery also uses bounded deletion,
+never recursive permission helpers. IDs are not recycled into quarantined usage.
+Private GC is bounded and can lift deep subtrees within private storage so later
+passes make progress without recursion.
+
+Block/inode hard-limit failures stay inside the job as EDQUOT (or ENOSPC).
+Start logs include both filesystems' available bytes and the job allowance.
+The kernel's `VFS_DQUOT` project hard-limit notifications produce a warning and
+a private hit marker even if the job subsequently unlinks its fill file;
+cleanup logs whether a warning was observed. This requires the provider kernel's
+`CONFIG_QUOTA_NETLINK_INTERFACE`; quota setup fails closed if its events group
+is unavailable. Multicast notifications are observational, not a lossless audit
+log across runner crashes. The exit file's data block is allocated before job
+code and charged as initial project usage, so recording an exit overwrites
+existing storage. The separate runner reserve file is outside the project and
+remains available for terminal bookkeeping. After the cgroup is gone, runtime
+cleanup clears tree assignments, limits, hit markers and the lease. Workspace
+contents remain reusable and subject to normal idle/pressure eviction.
+Reserve-file restoration claims an idle interval under the scheduler lock, then
+writes and syncs outside it. A separate admission/prepare barrier and the setup
+marker exclude new work through publication, without blocking status or cancel
+on the large write. The marker is released on errors as well as success.
+Storage-health publication rechecks both filesystems under the readiness lock;
+an older healthy sample cannot overwrite a newer setup withdrawal.
+
+Runner-written replay chunks/records and returned-file copies are not job
+writable mounts and retain their existing bounds; the fixed reserve protects
+them. Trusted dependency fetching and shared package-manager cache preparation
+precede quota installation and are **not** bounded by this job-code quota. A
+future writable bind from another filesystem must move onto this XFS volume or
+have an independently enforced filesystem quota deducted from the same budget;
+there is no unbounded writable-bind fallback.
+
+### Project-inheritance protection
+
+Boat jobs always enter through the runner's PID namespace init, even when the
+system manager supports `PrivatePIDs`. Its existing seccomp filter also rejects
+filesystem-attribute setter ioctls (`FS_IOC_FSSETXATTR`, native and compat
+`FS_IOC_SETFLAGS`) with `EPERM`. An inode owner can otherwise clear XFS project
+inheritance on a newly created directory and allocate uncharged project-0 files.
+The x86-64, x32 and i386 paths are covered; attribute getters and unrelated
+ioctls remain allowed. `chattr` **setting** flags may notice this restriction;
+normal builds do not need these setters. `file_setattr` (native syscall 469 and
+its x32/i386 equivalents) returns ENOSYS so it cannot bypass the refused ioctls;
+`file_getattr` remains allowed. Non-Boat build-server and tenant units are
+unchanged. The filter interpreter exercises both sides of every jump. The
+forked-child ioctl test uses fd -1 and proves interception only, not refusal on
+a real inode. The file_setattr child test uses a distinct test errno, not a
+kernel's potentially unimplemented-syscall ENOSYS. Actual FSSETXATTR inode
+refusals are proved by the operator probe with successful unfiltered root
+FSSETXATTR controls;
+the job then fills the same directory whose inheritance it could not clear.
+When job-side refusal checks pass but the unfiltered root control reports
+ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS.
 
 ## Fast startup checks and failure evidence
 

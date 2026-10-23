@@ -106,6 +106,13 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
 }
 
 impl Runner {
+    // Only profiles with a disk reserve need this barrier. It is taken before
+    // inner so waiting for allocation never prevents status or cancel reads.
+    pub(super) fn reserve_restore_barrier(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        (self.core.config.disk_reserve_bytes != 0)
+            .then(|| self.core.reserve_restore.lock().unwrap())
+    }
+
     pub(super) fn protect_admission(&self, inner: &mut Inner, request: &Run) -> AdmissionGuard {
         let token = Uuid::now_v7();
         inner.admitting.insert(token, request.clone());
@@ -116,6 +123,7 @@ impl Runner {
     }
 
     pub(crate) fn transfer(&self, id: Uuid) -> TransferGuard {
+        let _restore = self.reserve_restore_barrier();
         self.core.inner.lock().unwrap().transfers.insert(id);
         TransferGuard {
             runner: self.clone(),
@@ -190,6 +198,7 @@ impl Runner {
                 "runner_draining".into(),
             )));
         }
+        let _restore = self.reserve_restore_barrier();
         if let Some(full) = self.ensure_disk_space()? {
             return Ok(Err(refusal(
                 RefusalReason::RunnerDiskFull,
@@ -449,10 +458,14 @@ impl Runner {
             "spools",
             "trash",
             "sandboxes",
+            "boat-quarantine",
             "git-deps",
             "js-installs",
             "js-manager-caches",
         ] {
+            if kind == "boat-quarantine" && !self.core.config.boat_profile {
+                continue;
+            }
             let root = self.core.trees.state.join(kind);
             let Ok(entries) = fs::read_dir(&root) else {
                 continue;
@@ -482,7 +495,7 @@ impl Runner {
                     javascript_entry_lock(&self.core.trees.state, &path)?.is_none()
                 } else if kind == "git-deps" {
                     dependency_roots.contains(&path) || inner.evicting_dependencies.contains(&path)
-                } else if kind == "trash" {
+                } else if matches!(kind, "trash" | "boat-quarantine") {
                     false
                 } else {
                     name.parse::<Uuid>().ok().is_some_and(|id| {
@@ -662,7 +675,13 @@ impl Runner {
             Err(error) => {
                 // Permission and filesystem failures rarely change between
                 // admissions. Retry later rather than hammering the same tree.
-                let retry_after_ms = self.now().saturating_add(5 * 60 * 1000);
+                let delay =
+                    if self.core.config.boat_profile && error.kind() == io::ErrorKind::TimedOut {
+                        10_000
+                    } else {
+                        5 * 60 * 1000
+                    };
+                let retry_after_ms = self.now().saturating_add(delay);
                 self.core
                     .health
                     .lock()
@@ -826,6 +845,81 @@ impl Runner {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    fn boat_private_candidate(&self, candidate: &Candidate) -> bool {
+        self.core.config.boat_profile
+            && (candidate.workspace.is_some()
+                || candidate.path.parent() == Some(self.trash().as_path())
+                || candidate.path.parent()
+                    == Some(self.core.trees.state.join("boat-quarantine").as_path()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_boat_candidate(&self, candidate: &Candidate) -> io::Result<u64> {
+        if let Some(key) = &candidate.workspace {
+            self.validate_destinations(key, None, &[])?;
+        }
+        let bytes = crate::boat_quota::cached_bytes(&candidate.path).unwrap_or_else(|error| {
+            tracing::warn!(path = %candidate.path.display(), %error, "Boat eviction size unknown; deletion must not depend on a complete walk");
+            0
+        });
+        let retired = if candidate.workspace.is_some() {
+            fs::create_dir_all(self.trash())?;
+            let retired = self.trash().join(format!("boat-cache-{}", Uuid::now_v7()));
+            fs::rename(&candidate.path, &retired)?;
+            retired
+        } else {
+            candidate.path.clone()
+        };
+        if let Err(error) = crate::boat_quota::remove_retired_tree(&retired) {
+            if candidate.workspace.is_none() {
+                return Err(error);
+            }
+            tracing::warn!(path = %retired.display(), %error, "Boat cache detached; bounded private garbage collection will continue later");
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn evict_boat_setup_workspace(&self, setup: &Setup) -> io::Result<()> {
+        let key = &setup.request.workspace_key;
+        let _pressure = self.core.disk.lock().unwrap();
+        let used = {
+            let mut inner = self.core.inner.lock().unwrap();
+            if !self.core.config.boat_profile
+                || setup.base
+                || !inner.starting.contains(&setup.id)
+                || !inner.reserved.contains_key(key)
+                || inner.jobs[&setup.id].key() != key.as_str()
+            {
+                return Err(io::Error::other(
+                    "cold eviction does not own the active Boat setup reservation",
+                ));
+            }
+            inner.dropping.insert(key.clone());
+            inner
+                .catalog
+                .workspaces
+                .get(key)
+                .map_or(self.now(), |workspace| workspace.used_ms)
+        };
+        let candidate = Candidate {
+            path: PathBuf::from(key),
+            workspace: Some(key.clone()),
+            last_used_ms: used,
+            cache_disk: false,
+            snapshot: false,
+        };
+        let _tree = crate::tree_access::lock(&candidate.path);
+        let deleted = self.remove_boat_candidate(&candidate);
+        let result = deleted
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+        self.record_disk_removal(&candidate, deleted, false);
+        result
+    }
+
     /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
     /// deleted regardless of age or free space before the ordinary rules apply
     /// to everything else.
@@ -927,7 +1021,11 @@ impl Runner {
                     // Only caches are worth keeping for reuse. A dead job's private
                     // tree and pending deletions are garbage at any age.
                     let garbage = c.path.parent().is_some_and(|parent| {
-                        parent == sandboxes || parent == trash || staging.as_deref() == Some(parent)
+                        parent == sandboxes
+                            || parent == trash
+                            || (self.core.config.boat_profile
+                                && parent == self.core.trees.state.join("boat-quarantine"))
+                            || staging.as_deref() == Some(parent)
                     });
                     if (c.cache_disk
                         && now.saturating_sub(c.last_used_ms) <= SOFT_PRESSURE_MIN_AGE_MS)
@@ -1052,6 +1150,9 @@ impl Runner {
                 .map_or(Ok(()), |key| self.validate_destinations(key, None, &[]));
             #[cfg(target_os = "linux")]
             let access = authorization.and_then(|()| {
+                if self.boat_private_candidate(&candidate) {
+                    return Ok(());
+                }
                 if self.core.config.isolate_jobs {
                     if candidate.path.parent()
                         == Some(self.core.trees.state.join("sandboxes").as_path())
@@ -1068,6 +1169,10 @@ impl Runner {
             let access: io::Result<()> = authorization;
             let mut cache_cleared = false;
             let deleted = access.and_then(|()| {
+                #[cfg(target_os = "linux")]
+                if self.boat_private_candidate(&candidate) {
+                    return self.remove_boat_candidate(&candidate);
+                }
                 let bytes = allocated_bytes(&candidate.path, device)?;
                 if candidate.cache_disk {
                     caches.as_ref().unwrap().remove(&candidate.path)?;
@@ -1167,37 +1272,58 @@ impl Runner {
         if self.core.config.disk_reserve_bytes == 0 || floor == 0 {
             return Ok(());
         }
+        let Ok(_restore) = self.core.reserve_restore.try_lock() else {
+            return Ok(());
+        };
+        let idle = |inner: &Inner| {
+            !inner.restoring_reserve
+                && inner.jobs.values().all(|job| job.terminal.is_some())
+                && inner.starting.is_empty()
+                && inner.admitting.is_empty()
+                && inner.preparing.is_empty()
+                && inner.transfers.is_empty()
+                && inner.reserved.is_empty()
+        };
+        if !idle(&self.core.inner.lock().unwrap()) {
+            return Ok(());
+        }
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         if probe()? < floor {
-            let idle = {
-                let inner = self.core.inner.lock().unwrap();
-                inner.jobs.values().all(|job| job.terminal.is_some())
-                    && inner.starting.is_empty()
-                    && inner.admitting.is_empty()
-                    && inner.preparing.is_empty()
-                    && inner.transfers.is_empty()
-            };
-            if !idle {
-                return Ok(());
-            }
             self.ensure_disk_space()?;
             if probe()? < floor {
                 return Ok(());
             }
         }
-        self.restore_disk_reserve()
+        // Claim the idle interval, not the global lock: writing the reserve can
+        // stall on a stressed disk, but status/cancel/record work must proceed.
+        let mut inner = self.core.inner.lock().unwrap();
+        if !idle(&inner) {
+            return Ok(());
+        }
+        inner.restoring_reserve = true;
+        drop(inner);
+        let claim = Marker::new(self, |inner: &mut Inner| inner.restoring_reserve = false);
+        let temporary = self.write_disk_reserve()?;
+        let mut inner = self.core.inner.lock().unwrap();
+        let published = temporary.map_or(Ok(()), |temporary| {
+            fs::rename(&temporary, self.disk_reserve_path()).inspect_err(|_| {
+                let _ = fs::remove_file(temporary);
+            })
+        });
+        claim.clear(&mut inner);
+        published
     }
 
-    /// Writes the reserve file out in full, so its blocks are really
-    /// allocated, and moves it into place only once complete.
-    fn restore_disk_reserve(&self) -> io::Result<()> {
+    /// Returns a fully allocated, synced temporary file. The caller publishes it
+    /// under the idle claim without keeping the state lock across this I/O.
+    fn write_disk_reserve(&self) -> io::Result<Option<PathBuf>> {
         let bytes = self.core.config.disk_reserve_bytes;
         let path = self.disk_reserve_path();
         match fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_file() => {
                 return Err(invalid("runner disk reserve is not a regular file"))
             }
-            Ok(metadata) if metadata.len() == bytes => return Ok(()),
+            Ok(metadata) if metadata.len() == bytes => return Ok(None),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -1209,6 +1335,7 @@ impl Runner {
                 .create(true)
                 .truncate(true)
                 .open(&temporary)?;
+            self.long_work("disk_reserve_write");
             let chunk = vec![0; 1 << 20];
             let mut left = bytes;
             while left > 0 {
@@ -1216,15 +1343,14 @@ impl Runner {
                 file.write_all(&chunk[..n])?;
                 left -= n as u64;
             }
-            file.sync_all()?;
-            fs::rename(&temporary, &path)
+            file.sync_all()
         })();
         if written.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         written?;
-        tracing::info!(bytes, "runner disk reserve restored");
-        Ok(())
+        tracing::info!(bytes, "runner disk reserve allocated");
+        Ok(Some(temporary))
     }
 
     /// Frees the reserve after a write ran out of space, so the records that

@@ -320,3 +320,84 @@ networking follows [Public URLs / raw TCP](https://docs.boat.dev/hosting) and
 [Firewall](https://docs.boat.dev/hosting/firewall): guest root rules, not an
 invented provider firewall API. No live provider assertion follows from these
 portable tests.
+## Disk-quota qualification
+
+The runner-host probe fills the real total quota (up to 32 GiB, with nonzero
+random data and fsync) before its stop/resume cycle. It
+first tries native and compat attribute setters, requires EPERM, checks that a
+new file still inherits the job project, then fills that same directory. A
+preallocated barrier lets the root observer measure **both** root and XFS free
+space while the failed write's data is still present. A pre-fill handshake
+captures physical headroom before writes begin. Ordinary lanes require the
+root-read kernel hard limit and near-limit charge, EDQUOT/ENOSPC, a normal failed
+terminal, cleanup/readiness, and a normal next job. Netlink warnings are recorded
+but are not a substitute for those checks: multicast loss must not fake either
+success or failure. Probe results retain `runner_host.disk_quota`,
+including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes`, so the
+provisional 24-GiB reserve can be tuned empirically. `reserve_at_limit` proves
+only enforcement of that floor, **not its sufficiency**; `reserve_assurance`
+explicitly leaves `sufficiency_proven` false.
+
+Separate jobs exhaust workspace, target, scratch, HOME and `/var/tmp`, and allocate past the same
+limit on the existing root-created `/motor-output/stdout` inode. The stdout lane
+uses `fallocate(KEEP_SIZE)`: it must allocate nearly the entire allowance before
+EDQUOT/ENOSPC and a matching near-full kernel quota, while preserving the root-disk
+reserve. It verifies `st_blocks` as well as project ID, so a refused no-op is not
+a pass. Keeping the file size at zero avoids streaming tens of GiB into the
+operator client; the lane punches its unwritten extents before reporting. Every
+lane checks project IDs for workspace, target, HOME, `/tmp`, `/var/tmp`, stdout,
+stderr, exit and cache-stats. Only quota jobs request the operator example's
+optional bounded 900-second deadline; existing probe invocations still default
+to 120 seconds. `phases[].kernel_release` records `uname -r`.
+
+A 64-MiB retained-target baseline must be relabelled and reduce the successor's
+remaining growth. Another job leaves actual FICLONE copies; its successor
+deletes copies while retaining their source, then fills with unique data. The
+probe checks initial logical charge, reduced growth, per-file allocation and
+physical free-space deltas against an independently sampled cap, rather than
+allowing initial-plus-growth credit. A 2,200-level private tree must finish
+without stranding a lease and leave capacity for the next job. Stale cleanup
+ordering is covered deterministically through the real Rust lease/lock code
+with kernel calls seamed, in both orders and across restart. No privileged
+release-only probe entry point is shipped; live forced stale cleanup is skipped.
+
+Finally a quota-sized **target file stays on disk**. The job remains at its
+barrier so idle eviction cannot remove it before the provider stops/snapshots
+the sandbox. The client is intentionally interrupted for this final snapshot
+case, not reported as a normal quota terminal; preceding lanes prove those
+terminals. Stop must archive successfully, resume must hydrate, and the resumed
+phase must run a normal job. This is not merely a stop after unlinking the fill.
+Failure cleanup stops writers and removes only the disposable probe's fills,
+so a failed reserve qualification does not deliberately leave the sandbox full.
+
+Before the jobs, an unfiltered root control on the same XFS mount sets and clears
+project inheritance with FSSETXATTR and verifies the actual flag transition. The
+job must get EPERM for that same ioctl. Root also invokes native syscall 469
+(`file_setattr`) with a 24-byte `file_attr`, an empty pathname and `AT_EMPTY_PATH`
+to clear the flag; the real job requires ENOSYS from the
+filter before filling its inherited directory. If root can use the syscall, the
+job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
+kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
+returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
+syscall filter. The result records the
+root control, errno and kernel release. The probe still collects quota and
+stop/resume evidence, but does not claim every required check passed when the
+path-setter case is inconclusive.
+
+Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
+image. Use the existing credential reader and seed arguments:
+
+```sh
+set -o pipefail
+<key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
+  --size xlarge --verify-prepared-image <new-prepared-image> \
+  --cargo-seed-manifest <seed.json> --cargo-seed-archive <seed.tar.gz> \
+  --cargo-seed-sha256 <manifest-sha256> --acknowledge-tenant-one-private-cache \
+  --max-minutes 30 --output .cortexkit/internal-docs/research/boat-disk-quota
+```
+
+This is a real disk workload, not a portable unit test. A root-space emergency
+watchdog kills the probe job if containment fails and either filesystem falls more
+than 64 MiB below the provisional reserve. Such a run is a qualification failure,
+not a successful quota result. Do not qualify an older image without the new
+quota and syscall filter. No live qualification is implied by green unit tests.

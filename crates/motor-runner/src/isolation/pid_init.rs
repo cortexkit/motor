@@ -2,9 +2,10 @@
 //!
 //! Build-server job units set `PrivatePIDs=yes`, so each job has its own PID
 //! namespace: PID 1 is the runner's bash wrapper, the job is PID 2, and `/proc`
-//! shows only that namespace. Boat sandboxes run systemd 255, which rejects
-//! PrivatePIDs. There the job unit starts as root and execs the installed
-//! runner in this mode instead of the wrapper. It
+//! shows only that namespace. Boat jobs use this init on every systemd version
+//! (including 255, which rejects PrivatePIDs), so the namespace and quota
+//! inheritance filter share one bootstrap. The unit execs the installed runner
+//! as root instead of the wrapper. It
 //!
 //! 1. creates the PID namespace and forks its PID 1;
 //! 2. in PID 1, mounts a `/proc` for the new namespace, carrying over the
@@ -12,8 +13,8 @@
 //!    `ProtectKernelTunables=yes`;
 //! 3. drops to the job account with no capabilities, joins a fresh session
 //!    keyring and installs a seccomp filter that blocks new PID namespaces
-//!    again, so the job ends up exactly as `RestrictNamespaces=yes` leaves a
-//!    build-server job;
+//!    again, matching `RestrictNamespaces=yes`, and prevents clearing quota
+//!    inheritance through filesystem-attribute setters;
 //! 4. execs the unchanged wrapper as PID 1.
 //!
 //! The first process stays outside the namespace as the unit's main process
@@ -188,7 +189,7 @@ fn check_runner_path(running: &Path, installed: &Path) -> io::Result<()> {
     }
     if running.canonicalize()? != installed {
         return Err(io::Error::other(format!(
-            "--boat-profile on systemd before 257 runs each job's PID namespace init from {}; this runner is {}. Run the installed runner",
+            "--boat-profile runs each job's PID namespace init from {}; this runner is {}. Run the installed runner",
             installed.display(), running.display()
         )));
     }
@@ -906,6 +907,9 @@ const I386_CLONE: u32 = 120;
 const I386_UNSHARE: u32 = 310;
 const I386_SETNS: u32 = 346;
 const CLONE3: u32 = 435;
+// Linux UAPI include/uapi/asm-generic/unistd.h and x86 syscall_{64,32}.tbl:
+// file_setattr is common syscall 469; x32 adds X32_SYSCALL_BIT.
+const FILE_SETATTR: u32 = 469;
 
 /// A step of the filter, with jumps to named labels.
 enum Step {
@@ -924,7 +928,10 @@ enum Step {
 /// refuses too). It covers x86_64, x32 and i386 system call numbers and allows
 /// other supported-ABI calls, which systemd's filter still governs. clone3's
 /// pointed-to arguments cannot be inspected by classic BPF, so return ENOSYS
-/// explicitly and let libc fall back to clone. Unknown architectures are killed
+/// explicitly and let libc fall back to clone. file_setattr also returns ENOSYS:
+/// its path-based attribute setters must fall back to the refused ioctls rather
+/// than bypassing project inheritance protection. file_getattr remains allowed.
+/// Unknown architectures are killed
 /// rather than trusting an inherited filter to cover an unrecognized ABI.
 /// The engine passes EPERM, the errno systemd's filter uses; tests pass a
 /// distinct value to see which refusals come from this filter.
@@ -932,8 +939,17 @@ enum Step {
 /// seccompiler's high-level filter targets one architecture and kills on an
 /// architecture mismatch; it has no i386 target. This small multi-ABI filter
 /// handles i386 and x32 namespace calls explicitly, failing closed otherwise.
+/// Filesystem-attribute setters are also denied: an inode owner can otherwise
+/// clear project inheritance and create files outside the Boat job's quota.
+/// Attribute getters and unrelated ioctl requests remain available.
 /// Tests exercise both arms of every BPF jump.
 fn namespace_filter(errno: u16) -> Vec<SockFilter> {
+    namespace_filter_with_setattr_errno(errno, libc::ENOSYS as u16)
+}
+
+// A distinct setter errno lets tests prove interception even on kernels that
+// predate file_setattr and would return ENOSYS without any filter.
+fn namespace_filter_with_setattr_errno(errno: u16, setter_errno: u16) -> Vec<SockFilter> {
     use Step::*;
     let steps = [
         Load(DATA_ARCH),
@@ -943,22 +959,39 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         Label("x86_64"),
         Load(DATA_NR),
         And(!X32_SYSCALL_BIT),
-        JumpIfEqual(CLONE3, "clone3", "x86_64_calls"),
+        JumpIfEqual(CLONE3, "enosys", "x86_64_file_attr"),
+        Label("x86_64_file_attr"),
+        JumpIfEqual(FILE_SETATTR, "file_setattr_denied", "x86_64_calls"),
         Label("x86_64_calls"),
         JumpIfEqual(X86_64_UNSHARE, "flags", "x86_64_not_unshare"),
         Label("x86_64_not_unshare"),
         JumpIfEqual(X86_64_CLONE, "flags", "x86_64_not_clone"),
         Label("x86_64_not_clone"),
-        JumpIfEqual(X86_64_SETNS, "nstype", "allow"),
+        JumpIfEqual(X86_64_SETNS, "nstype", "x86_64_not_setns"),
+        Label("x86_64_not_setns"),
+        JumpIfEqual(16, "ioctl", "x32_ioctl"),
+        Label("x32_ioctl"),
+        JumpIfEqual(514, "ioctl", "allow"),
         Label("i386"),
         Load(DATA_NR),
-        JumpIfEqual(CLONE3, "clone3", "i386_calls"),
+        JumpIfEqual(CLONE3, "enosys", "i386_file_attr"),
+        Label("i386_file_attr"),
+        JumpIfEqual(FILE_SETATTR, "file_setattr_denied", "i386_calls"),
         Label("i386_calls"),
         JumpIfEqual(I386_UNSHARE, "flags", "i386_not_unshare"),
         Label("i386_not_unshare"),
         JumpIfEqual(I386_CLONE, "flags", "i386_not_clone"),
         Label("i386_not_clone"),
-        JumpIfEqual(I386_SETNS, "nstype", "allow"),
+        JumpIfEqual(I386_SETNS, "nstype", "i386_not_setns"),
+        Label("i386_not_setns"),
+        JumpIfEqual(54, "ioctl", "allow"),
+        Label("ioctl"),
+        Load(DATA_ARG1_LOW),
+        JumpIfEqual(0x401c_5820, "deny", "not_fssetxattr"),
+        Label("not_fssetxattr"),
+        JumpIfEqual(0x4008_6602, "deny", "not_setflags64"),
+        Label("not_setflags64"),
+        JumpIfEqual(0x4004_6602, "deny", "allow"),
         Label("flags"),
         Load(DATA_ARG0_LOW),
         JumpIfAnyBit(CLONE_NEWPID, "deny", "allow"),
@@ -969,8 +1002,10 @@ fn namespace_filter(errno: u16) -> Vec<SockFilter> {
         JumpIfAnyBit(CLONE_NEWPID, "deny", "allow"),
         Label("deny"),
         Return(SECCOMP_RET_ERRNO | u32::from(errno)),
-        Label("clone3"),
+        Label("enosys"),
         Return(SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+        Label("file_setattr_denied"),
+        Return(SECCOMP_RET_ERRNO | u32::from(setter_errno)),
         Label("kill"),
         Return(SECCOMP_RET_KILL_PROCESS),
         Label("allow"),
