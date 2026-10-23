@@ -78,6 +78,47 @@ class CachePins(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads((self.root / "output.json").read_text())["file_count"], 1)
 
+    def test_done_line_order_does_not_change_tree_hash(self):
+        done = self.sdk / "DONE"
+        done.write_bytes(b"x86_64\nheaders.vsix\nlibraries.msi")
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        done.write_bytes(b"libraries.msi\nx86_64\nheaders.vsix")
+        self.assertEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
+    def test_changed_done_line_changes_tree_hash(self):
+        done = self.sdk / "DONE"
+        done.write_bytes(b"x86_64\nheaders.vsix\nlibraries.msi")
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        done.write_bytes(b"x86_64\nheaders.vsix\nchanged.msi")
+        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
+    def test_missing_done_line_changes_tree_hash(self):
+        done = self.sdk / "DONE"
+        done.write_bytes(b"x86_64\nheaders.vsix\nlibraries.msi")
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        done.write_bytes(b"x86_64\nheaders.vsix")
+        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
+    def test_duplicate_done_line_changes_tree_hash(self):
+        done = self.sdk / "DONE"
+        done.write_bytes(b"x86_64\nheaders.vsix")
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        done.write_bytes(b"x86_64\nheaders.vsix\nheaders.vsix")
+        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
+    def test_other_done_files_remain_byte_exact(self):
+        done = self.sdk / "sdk" / "DONE"
+        done.parent.mkdir()
+        done.write_bytes(b"first\nsecond")
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        done.write_bytes(b"second\nfirst")
+        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
+    def test_one_byte_payload_change_changes_tree_hash(self):
+        original = cache_manifest.manifest(self.cache)["tree_sha256"]
+        (self.sdk / "sdk.lib").write_bytes(b"First")
+        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

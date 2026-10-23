@@ -411,17 +411,16 @@
     "gnuwhoami": "/usr/bin/gnuwhoami",
     "gnuyes": "/usr/bin/gnuyes"
   },
-  "job_identity": {
-    "uid": 999,
-    "gid": 986
+  "inotify_minimum": {
+    "max_user_instances": 8192
   },
   "job_environment": {
     "CARGO_HOME": "/motor-home/cargo",
     "ESBUILD_BIN": null,
     "RUSTUP_HOME": "/home/ubuntu/.rustup",
-    "TMPDIR": "/motor-home/tmp",
-    "TMP": "/motor-home/tmp",
     "TEMP": "/motor-home/tmp",
+    "TMP": "/motor-home/tmp",
+    "TMPDIR": "/motor-home/tmp",
     "WASM_BINDGEN_BIN": null,
     "WASM_OPT_BIN": null
   },
@@ -438,10 +437,14 @@
     },
     "tenant": {
       "PATH": "/home/ubuntu/.bun/bin:/tenant/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
-      "RUSTUP_HOME": "/usr/local/lib/motor/rustup",
       "RUSTC_WRAPPER": null,
+      "RUSTUP_HOME": "/usr/local/lib/motor/rustup",
       "SCCACHE_DIR": null
     }
+  },
+  "job_identity": {
+    "gid": 986,
+    "uid": 999
   },
   "layout_by_role": {
     "tenant": {
@@ -454,9 +457,6 @@
         "rustup_home": "/usr/local/lib/motor/rustup"
       }
     }
-  },
-  "inotify_minimum": {
-    "max_user_instances": 8192
   },
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
   "rust_profile": "minimal",
@@ -583,8 +583,8 @@
       },
       "realpath_suffix_by_role": {
         "boat": "/usr/local/lib/git/2.53.0/bin/git",
-        "tenant": "/usr/local/lib/git/2.53.0/bin/git",
-        "build-server": "/usr/bin/git"
+        "build-server": "/usr/bin/git",
+        "tenant": "/usr/local/lib/git/2.53.0/bin/git"
       },
       "source": {
         "build_packages": [
@@ -659,13 +659,13 @@
         "boat": "/usr/local/lib/binaryen/120/bin/wasm-opt",
         "tenant": "/usr/local/lib/binaryen/120/bin/wasm-opt"
       },
-      "version": "wasm-opt version 120",
       "source": {
         "archive_root": "binaryen-version_120",
         "install_dir": "/usr/local/lib/binaryen/120",
         "sha256": "ddb097af51d1bdb17300d986b0de7d97422f1933dedb4c9eda3510e0bf4076cc",
         "url": "https://github.com/WebAssembly/binaryen/releases/download/version_120/binaryen-version_120-x86_64-linux.tar.gz"
-      }
+      },
+      "version": "wasm-opt version 120"
     },
     "x86_64-w64-mingw32-g++": {
       "observed_build_server_version": "x86_64-w64-mingw32-g++ (GCC) 13-win32",
@@ -683,8 +683,8 @@
   "windows_cross": {
     "arch": "x86_64",
     "cache": "target/windows-cross/cache",
-    "cache_scope_note": "The unchanged tree hash covers Microsoft's xwin/ payload subtree, with xwin/ in each relative path. cargo-xwin creates a host clang-cl symlink and cmake/ wrappers outside it while building; those are generated tool configuration, not SDK/CRT inputs.",
-    "cache_tree_sha256": "3c8ae4a1113c0d056b443311753a5d4fcaab0baf4d208bc9885ef5cd324d406f",
+    "cache_scope_note": "The tree hash covers the xwin/ subtree with relative paths and explicit file/symlink types. Only generated xwin/DONE hashes sorted LF-separated lines; content and multiplicity remain significant. Every other file byte and symlink target is exact. cargo-xwin creates host clang-cl and cmake/ wrappers outside this subtree; those are generated tool configuration, not SDK/CRT inputs.",
+    "cache_tree_sha256": "7463ca5bdb3be96b45a3a4a4ee5304d9b92d19e72930acc1d806e1eb3e8bf7cb",
     "cargo_xwin": "0.23.1",
     "crt": "14.44.17.14",
     "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation.",
