@@ -3,20 +3,20 @@ use motor_protocol::StreamRecord;
 use std::{
     fs::File,
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
 pub(super) struct Capture(File);
 impl Capture {
+    /// Creates a new file only, so an existing file or a planted link is never
+    /// written through. On Unix it is owner-only; on Windows it inherits the
+    /// folder's access rules, as the caller's own files do.
     pub(super) fn create(path: &Path) -> io::Result<Self> {
-        Ok(Self(
-            File::options()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?,
-        ))
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        Ok(Self(options.open(path)?))
     }
 
     pub(super) fn record(&mut self, record: &StreamRecord) -> io::Result<()> {
@@ -37,7 +37,7 @@ impl Capture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
