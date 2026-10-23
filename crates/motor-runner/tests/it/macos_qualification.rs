@@ -691,7 +691,10 @@ fn helper_records() -> Vec<HelperRecord> {
                         for share in std::iter::once(&request.workspace).chain(&request.siblings) {
                             assert_eq!(
                                 share.host,
-                                record.paths.tree.join(share.guest.trim_start_matches('/'))
+                                record
+                                    .paths
+                                    .tree
+                                    .join(share.guest.strip_prefix("/").unwrap_or(&share.guest))
                             );
                         }
                         let path = PathBuf::from(required("MOTOR_MACOS_QUALIFICATION_EVIDENCE"))
