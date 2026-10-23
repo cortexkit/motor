@@ -123,14 +123,15 @@ fn token(root: &Path, restrict: bool) -> io::Result<Handle> {
 
 /// No inherited handles, no profile, no repository working directory, no shell.
 /// Suspending before Job Object assignment closes the child escape race.
-pub(super) fn fetch(config: &Config, command: &mut Command, cwd: &Path) -> io::Result<()> {
-    run_as_batch(config, command, cwd, true)
+fn fetch(config: &Config, command: &mut Command, cwd: &Path, timeout: Duration) -> io::Result<()> {
+    run_as_batch(config, command, cwd, true, timeout)
 }
 fn run_as_batch(
     config: &Config,
     command: &mut Command,
     cwd: &Path,
     restrict: bool,
+    timeout: Duration,
 ) -> io::Result<()> {
     let root = &config.windows.as_ref().unwrap().layout_root;
     let token = token(root, restrict)?;
@@ -198,10 +199,13 @@ fn run_as_batch(
         if ResumeThread(thread.0) == u32::MAX {
             return Err(io::Error::last_os_error());
         }
-        let deadline = Instant::now() + Duration::from_secs(600);
+        let deadline = Instant::now() + timeout;
         while WaitForSingleObject(process.0, 50) != WAIT_OBJECT_0 {
             if Instant::now() >= deadline {
-                return Err(invalid("Windows trusted preparation exceeded 600 seconds"));
+                return Err(invalid(format!(
+                    "Windows trusted preparation exceeded {} seconds",
+                    timeout.as_secs()
+                )));
             }
         }
         let mut code = 0;
@@ -222,22 +226,6 @@ pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
     }
 }
 
-fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
-    crate::filesystem::identity(source)?;
-    if metadata.is_dir() {
-        fs::create_dir_all(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &target.join(entry.file_name()))?;
-        }
-    } else if metadata.is_file() {
-        fs::copy(source, target)?;
-    } else {
-        return Err(invalid("special file in trusted preparation input"));
-    }
-    Ok(())
-}
 pub(super) fn copy_routes(
     staging: &Path,
     routes: &BTreeMap<String, PathBuf>,
@@ -245,23 +233,33 @@ pub(super) fn copy_routes(
     let mut result = BTreeMap::new();
     for (index, (url, mirror)) in routes.iter().enumerate() {
         let copy = staging.join("fetch-git-deps").join(index.to_string());
-        copy_tree(mirror, &copy)?;
+        super::staging::copy_tree(mirror, &copy, staging)?;
         result.insert(url.clone(), copy);
     }
     Ok(result)
 }
-fn copy_manifests(source: &Path, target: &Path) -> io::Result<()> {
+fn copy_manifests(source: &Path, target: &Path, staging: &Path) -> io::Result<()> {
     fs::create_dir_all(target)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_symlink() {
+            fs::write(
+                target.join(entry.file_name()),
+                super::staging::link_text(&entry.path())?,
+            )?;
+            continue;
+        }
+        crate::filesystem::identity(&entry.path())?;
         if metadata.is_dir() {
-            copy_manifests(&entry.path(), &target.join(entry.file_name()))?;
+            copy_manifests(&entry.path(), &target.join(entry.file_name()), staging)?;
+        } else if !metadata.is_file() {
+            return Err(invalid("special file in preparation manifests"));
         } else if matches!(
             entry.file_name().to_str(),
             Some("Cargo.toml" | "Cargo.lock")
         ) {
-            fs::copy(entry.path(), target.join(entry.file_name()))?;
+            super::staging::copy_tree(&entry.path(), &target.join(entry.file_name()), staging)?;
         } else if entry.path().extension().is_some_and(|s| s == "rs") {
             // Cargo discovers targets while fetching; empty placeholders retain
             // that layout without exposing source code to the prep account.
@@ -274,6 +272,7 @@ pub(super) fn prepare_fetch(
     config: &Config,
     staging: &Path,
     command: &mut Command,
+    timeout: Duration,
 ) -> io::Result<()> {
     use fs2::FileExt;
     use sha2::{Digest, Sha256};
@@ -293,7 +292,9 @@ pub(super) fn prepare_fetch(
         return Err(invalid("standalone prep cargo SHA-256 mismatch"));
     }
     let manifests = staging.join("fetch-manifests");
-    copy_manifests(&staging.join("m"), &manifests.join("m"))?;
+    if !manifests.exists() {
+        copy_manifests(&staging.join("m"), &manifests.join("m"), staging)?;
+    }
     let cache = config.state_dir().join("prep-cargo");
     fs::create_dir_all(&cache)?;
     let mut fetch_command = Command::new(&cargo);
@@ -329,21 +330,7 @@ pub(super) fn prepare_fetch(
         None,
         &["-Staging".into(), staging.to_string_lossy().into()],
     )?)?;
-    let fetched = (|| {
-        fetch(config, &mut fetch_command, staging)?;
-        for name in [
-            "registry/index",
-            "registry/cache",
-            "git/db",
-            "git/checkouts",
-        ] {
-            let source = cache.join(name);
-            if source.exists() {
-                copy_tree(&source, &staging.join("cargo-home").join(name))?;
-            }
-        }
-        Ok(())
-    })();
+    let fetched = fetch(config, &mut fetch_command, staging, timeout);
     super::vm::checked(super::vm::control(
         config,
         "RevokePrep",
@@ -351,6 +338,39 @@ pub(super) fn prepare_fetch(
         &["-Staging".into(), staging.to_string_lossy().into()],
     )?)?;
     fetched
+}
+
+pub(super) fn stage_cache(config: &Config, staging: &Path) -> io::Result<()> {
+    use fs2::FileExt;
+    // Copy once after all workspace fetches, with no batch process able to
+    // change the shared cache while it is being staged.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(
+            config
+                .windows
+                .as_ref()
+                .unwrap()
+                .layout_root
+                .join("prep.lock"),
+        )?;
+    lock.lock_exclusive()?;
+    let cache = config.state_dir().join("prep-cargo");
+    for name in [
+        "registry/index",
+        "registry/cache",
+        "git/db",
+        "git/checkouts",
+    ] {
+        let source = cache.join(name);
+        if source.exists() {
+            super::staging::copy_tree(&source, &staging.join("cargo-home").join(name), staging)?;
+        }
+    }
+    Ok(())
 }
 
 /// Executes the same restricted batch launch used for Cargo. An unrestricted
@@ -386,7 +406,13 @@ pub(super) fn qualify(config: &Config) -> io::Result<()> {
                 .arg(&output)
                 .env_clear()
                 .env("SYSTEMROOT", r"C:\Windows");
-            run_as_batch(config, &mut command, &stage, restricted)?;
+            run_as_batch(
+                config,
+                &mut command,
+                &stage,
+                restricted,
+                Duration::from_secs(600),
+            )?;
             let bytes = fs::read(&output)?;
             fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
             let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;

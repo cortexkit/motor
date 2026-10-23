@@ -25,6 +25,8 @@ mod host;
 #[cfg(windows)]
 mod hvsock;
 pub(crate) mod prep;
+pub(crate) mod prep_error;
+mod staging;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -56,7 +58,7 @@ pub(crate) fn prepare_and_drop_resources(
 }
 
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
-    prep::execute(path)
+    prep::execute(path).inspect_err(|error| eprintln!("{}", prep_error::error_line(error)))
 }
 #[cfg(windows)]
 pub(crate) fn probe_peers() -> io::Result<()> {
