@@ -527,7 +527,10 @@ def tools(manifest, role="boat"):
     run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts", str(pnpm))
     bun = published(f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/", "bun-linux-x64.zip")
     run("unzip", "-qo", str(bun), "-d", str(BUILD / "downloads"))
-    bun_path = Path(manifest["tools"]["bun"]["path"])
+    # The tenant image keeps Bun out of /home, which a tenant VM covers with the
+    # tenant's own directory; the runner looks for it at this same per-role path.
+    bun = manifest["tools"]["bun"]
+    bun_path = Path(bun.get("path_by_role", {}).get(role, bun["path"]))
     bun_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(BUILD / "downloads/bun-linux-x64/bun", bun_path)
     bun_path.chmod(0o755)

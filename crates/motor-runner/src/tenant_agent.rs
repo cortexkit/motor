@@ -20,7 +20,10 @@ mod runner_socket;
 mod snapshot;
 
 const ARGS: &str = "/tenant/runner-args";
-const ROOTS: [&str; 2] = ["/Users", "/home"];
+/// The tenant's workspace roots, each bound from the tenant disk over the
+/// image's own directory before the runner starts. Nothing the runner runs
+/// may live beneath them in the image.
+pub(crate) const ROOTS: [&str; 2] = ["/Users", "/home"];
 
 pub async fn serve_agent() -> io::Result<()> {
     let listener = crate::vsock::Listener::bind(54)?;

@@ -22,6 +22,40 @@ fn write_lock_mismatch_probe(workspace: &Path) {
     fs::write(package.join("index.js"), "module.exports = 'probe';\n").unwrap();
 }
 
+/// Tools whose bun, node, npm and pnpm are inert stubs, for tests that inspect
+/// or replace the install command rather than run a package manager.
+fn stub_tools(f: &Fixture) -> JavascriptTools {
+    let bin = f.scratch.join("stub-tools");
+    if !bin.exists() {
+        fs::create_dir(&bin).unwrap();
+        for name in ["bun", "node", "npm", "pnpm"] {
+            crate::test_helpers::write_test_executable(&bin.join(name), b"#!/bin/sh\nexit 0\n")
+                .unwrap();
+        }
+    }
+    JavascriptTools::at(ToolchainRole::BuildServer, &bin, &bin)
+}
+
+/// The build server's real tools, at the toolchain manifest's locations.
+fn installed_tools() -> JavascriptTools {
+    JavascriptTools::for_role(ToolchainRole::BuildServer)
+}
+
+/// Refuses the root install of `f.workspace` with tools whose directories
+/// exist but hold nothing, and returns the error.
+fn refuse_with_empty_tools(f: &Fixture) -> String {
+    let empty = f.scratch.join("empty-tools");
+    fs::create_dir(&empty).unwrap();
+    let tools = JavascriptTools::at(ToolchainRole::Tenant, &empty, &empty);
+    let tree = tracked_tree(&f.workspace);
+    let paths = javascript_tracked_paths(&f.workspace, &tree).unwrap();
+    prepare_javascript_with(&f.workspace, &paths, &tools, |_, _| {
+        panic!("no install may start without its manager")
+    })
+    .unwrap_err()
+    .to_string()
+}
+
 #[test]
 fn javascript_prepare_refuses_missing_npm_by_name() {
     let f = Fixture::new();
@@ -35,33 +69,25 @@ fn javascript_prepare_refuses_missing_npm_by_name() {
         r#"{"name":"runner-missing-npm-fixture","lockfileVersion":3,"packages":{}}"#,
     )
     .unwrap();
-    let (manager, lockfile, mut command) = root_install_command(&f.workspace)
+    let tools = stub_tools(&f);
+    let (manager, lockfile, command) = root_install_command(&f.workspace, &tools)
         .unwrap()
         .expect("a package-lock.json workspace must require a locked install");
     assert_eq!(manager, "npm");
     assert_eq!(lockfile, "package-lock.json");
-    assert_eq!(command.get_program(), "npm");
+    assert_eq!(command.get_program(), tools.executable("npm"));
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
         ["ci", "--ignore-scripts"]
     );
-    // Hide npm for this child only; changing the process-wide PATH would race
-    // other tests and would make this regression depend on host provisioning.
-    let empty_path = f.scratch.join("empty-path");
-    fs::create_dir(&empty_path).unwrap();
-    command.env("PATH", &empty_path);
-    let error = run_javascript_install(&f.workspace, manager, lockfile, &mut command)
-        .unwrap_err()
-        .to_string();
+    // The refusal names the one place the runner looked, not a PATH search.
+    let error = refuse_with_empty_tools(&f);
+    let tried = f.scratch.join("empty-tools/npm");
     assert!(
-        error.contains("npm not installed on the build server"),
+        error.contains(&format!("npm not installed at {}", tried.display())),
         "{error}"
     );
     assert!(error.contains("package-lock.json"), "{error}");
-    assert!(
-        error.contains(&f.workspace.display().to_string()),
-        "{error}"
-    );
     assert!(!f.workspace.join("node_modules").exists());
 }
 
@@ -108,33 +134,25 @@ fn javascript_prepare_requires_locked_pnpm_install_and_refuses_missing_pnpm_by_n
         "lockfileVersion: '9.0'\n",
     )
     .unwrap();
-    let (manager, lockfile, mut command) = root_install_command(&f.workspace)
+    let tools = stub_tools(&f);
+    let (manager, lockfile, command) = root_install_command(&f.workspace, &tools)
         .unwrap()
         .expect("a pnpm-lock.yaml workspace must require a locked install");
     assert_eq!(manager, "pnpm");
     assert_eq!(lockfile, "pnpm-lock.yaml");
-    assert_eq!(command.get_program(), "pnpm");
+    assert_eq!(command.get_program(), tools.executable("pnpm"));
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
         ["install", "--frozen-lockfile", "--ignore-scripts"]
     );
     assert_eq!(command.get_current_dir(), Some(f.workspace.as_path()));
-    // Hide pnpm for this child only so the refusal is independent of host tools.
-    let empty_path = f.scratch.join("empty-path");
-    fs::create_dir(&empty_path).unwrap();
-    command.env("PATH", &empty_path);
-    let error = run_javascript_install(&f.workspace, manager, lockfile, &mut command)
-        .unwrap_err()
-        .to_string();
+    let error = refuse_with_empty_tools(&f);
+    let tried = f.scratch.join("empty-tools/pnpm");
     assert!(
-        error.contains("pnpm not installed on the build server"),
+        error.contains(&format!("pnpm not installed at {}", tried.display())),
         "{error}"
     );
     assert!(error.contains("pnpm-lock.yaml"), "{error}");
-    assert!(
-        error.contains(&f.workspace.display().to_string()),
-        "{error}"
-    );
     assert!(!f.workspace.join("node_modules").exists());
 }
 
@@ -159,7 +177,7 @@ fn javascript_lockfile_precedence_keeps_bun_then_npm_then_pnpm() {
         ("npm", "package-lock.json"),
         ("pnpm", "pnpm-lock.yaml"),
     ] {
-        let (manager, lockfile, _) = root_install_command(&f.workspace)
+        let (manager, lockfile, _) = root_install_command(&f.workspace, &stub_tools(&f))
             .unwrap()
             .expect("remaining lockfiles require an install");
         assert_eq!(manager, expected_manager);
@@ -229,11 +247,7 @@ fn isolated_prepare_installs_bun_lock_without_lifecycle_scripts() {
         r#"{"name":"runner-bun-fixture","version":"1.0.0","private":true,"scripts":{"preinstall":"echo ran > lifecycle-ran"},"dependencies":{"fixture-dep":"file:vendor/fixture-dep"}}"#,
     )
     .unwrap();
-    let bun = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".bun/bin/bun"))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("bun"));
-    let lock = Command::new(bun)
+    let lock = Command::new(installed_tools().executable("bun"))
         .args(["install", "--lockfile-only", "--ignore-scripts"])
         .current_dir(&f.workspace)
         .output()
@@ -490,6 +504,7 @@ fn javascript_discovery_order_is_shallowest_then_path_with_one_lock_per_director
 
 fn root_install_command(
     workspace: &Path,
+    tools: &JavascriptTools,
 ) -> io::Result<Option<(&'static str, &'static str, Command)>> {
     let tree = tracked_tree(workspace);
     let installs = discover_javascript_installs(&javascript_tracked_paths(workspace, &tree)?)?;
@@ -499,7 +514,7 @@ fn root_install_command(
     else {
         return Ok(None);
     };
-    let command = javascript_install_command(workspace, &install)?;
+    let command = javascript_install_command(workspace, &install, tools)?;
     Ok(Some((
         javascript_manager(install.lockfile),
         install.lockfile,
@@ -516,23 +531,24 @@ fn javascript_nested_install_failure_refuses_and_does_not_install_later_director
     let tree = tracked_tree(&f.workspace);
     let mut called = Vec::new();
     let paths = javascript_tracked_paths(&f.workspace, &tree).unwrap();
-    let error = prepare_javascript_with(&f.workspace, &paths, |install, command| {
-        called.push(install.directory.clone());
-        assert_eq!(
-            command.get_current_dir(),
-            Some(f.workspace.join(&install.directory).as_path())
-        );
-        *command = Command::new("sh");
-        command.args(["-c", "echo stale-lock >&2; exit 1"]);
-        run_javascript_install(
-            &f.workspace.join(&install.directory),
-            javascript_manager(install.lockfile),
-            &install.directory.join(install.lockfile).to_string_lossy(),
-            command,
-        )
-    })
-    .unwrap_err()
-    .to_string();
+    let error =
+        prepare_javascript_with(&f.workspace, &paths, &stub_tools(&f), |install, command| {
+            called.push(install.directory.clone());
+            assert_eq!(
+                command.get_current_dir(),
+                Some(f.workspace.join(&install.directory).as_path())
+            );
+            *command = Command::new("sh");
+            command.args(["-c", "echo stale-lock >&2; exit 1"]);
+            run_javascript_install(
+                &f.workspace.join(&install.directory),
+                javascript_manager(install.lockfile),
+                &install.directory.join(install.lockfile).to_string_lossy(),
+                command,
+            )
+        })
+        .unwrap_err()
+        .to_string();
     assert!(
         error.contains("locked npm install using a/package-lock.json failed"),
         "{error}"
@@ -549,7 +565,7 @@ fn javascript_install_order_matches_discovery_order() {
     let tree = tracked_tree(&f.workspace);
     let mut called = Vec::new();
     let paths = javascript_tracked_paths(&f.workspace, &tree).unwrap();
-    prepare_javascript_with(&f.workspace, &paths, |install, _| {
+    prepare_javascript_with(&f.workspace, &paths, &stub_tools(&f), |install, _| {
         called.push(install.directory.clone());
         Ok(())
     })
@@ -602,6 +618,7 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
         &f.workspace.to_string_lossy(),
         &f.workspace,
         &tree,
+        &installed_tools(),
     )
     .unwrap();
     for manager in ["npm", "bun", "pnpm"] {
@@ -634,6 +651,7 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
         &f.workspace.to_string_lossy(),
         &f.workspace,
         &tree,
+        &installed_tools(),
     )
     .unwrap_err()
     .to_string();
@@ -658,9 +676,7 @@ impl FakeJavascriptManager {
         let bin = f.scratch.join("fake-bin");
         fs::create_dir(&bin).unwrap();
         let executable = bin.join("npm");
-        crate::test_helpers::write_test_executable(
-            &executable,
-            r#"#!/bin/sh
+        let script = r#"#!/bin/sh
 if [ "$1" = --version ]; then /bin/cat "$JS_VERSION"; exit; fi
 printf 'install\n' >> "$JS_CALLS"
 if [ -f "$JS_INTERRUPTED" ]; then kill -TERM $$; fi
@@ -671,10 +687,12 @@ printf '#!/bin/sh\nprintf fixture' > "$temporary"
 /bin/chmod +x "$temporary"
 /bin/mv -f "$temporary" node_modules/.bin/fixture-tool
 if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir -p "$m/node_modules/member-dep"; done; fi
-"#
-        .as_bytes(),
-        )
-        .unwrap();
+"#;
+        // The same fake answers for every manager, so each lockfile kind
+        // finds its manager at the fake tool location.
+        for name in ["npm", "bun", "pnpm"] {
+            crate::test_helpers::write_test_executable(&bin.join(name), script.as_bytes()).unwrap();
+        }
         crate::test_helpers::write_test_executable(
             &bin.join("node"),
             b"#!/bin/sh\nprintf 'node-fixture-v1\\n'\n",
@@ -690,6 +708,10 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
             members: f.scratch.join("member-dirs"),
             bin,
         }
+    }
+    /// The fake manager and Node as the runner's configured tools.
+    fn tools(&self) -> JavascriptTools {
+        JavascriptTools::at(ToolchainRole::BuildServer, &self.bin, &self.bin)
     }
     fn prepare(&self, f: &Fixture, tree: &str) -> io::Result<()> {
         self.prepare_checkout(f, &f.workspace, tree)
@@ -707,7 +729,8 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
         checkout: &Path,
         tracked: &JavascriptTree,
     ) -> io::Result<()> {
-        prepare_javascript_with(checkout, &tracked.paths, |install, command| {
+        let tools = self.tools();
+        prepare_javascript_with(checkout, &tracked.paths, &tools, |install, command| {
             let mut fake = Command::new(&self.executable);
             fake.args(command.get_args())
                 .current_dir(command.get_current_dir().unwrap())
@@ -723,6 +746,7 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
                 tracked,
                 install,
                 &mut fake,
+                &tools,
             )
         })
     }
@@ -1056,6 +1080,7 @@ fn javascript_real_npm_cache_clones_bin_into_second_workspace_and_times_hit() {
         &f.workspace.to_string_lossy(),
         &f.workspace,
         &tree,
+        &installed_tools(),
     )
     .unwrap();
     let cold = cold_start.elapsed();
@@ -1070,6 +1095,7 @@ fn javascript_real_npm_cache_clones_bin_into_second_workspace_and_times_hit() {
         &f.workspace.to_string_lossy(),
         &second,
         &second_tree,
+        &installed_tools(),
     )
     .unwrap();
     let hit = hit_start.elapsed();
@@ -1566,6 +1592,7 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
             &f.workspace.to_string_lossy(),
             &f.workspace,
             &tree,
+            &installed_tools(),
         )
         .unwrap();
         let directory = f.workspace.join(manager);
@@ -1581,6 +1608,7 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
             &f.workspace.to_string_lossy(),
             &f.workspace,
             &tree,
+            &installed_tools(),
         )
         .unwrap_err()
         .to_string();
@@ -1633,7 +1661,7 @@ fn javascript_manager_caches_ignore_inherited_locations() {
         let mut command = Command::new(&manager.executable);
         command
             .args(
-                javascript_install_command(&checkout, install)
+                javascript_install_command(&checkout, install, &manager.tools())
                     .unwrap()
                     .get_args(),
             )
@@ -1662,6 +1690,7 @@ fn javascript_manager_caches_ignore_inherited_locations() {
             &tracked,
             install,
             &mut command,
+            &manager.tools(),
         )
         .unwrap();
         let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
@@ -1743,7 +1772,8 @@ fn javascript_bun_same_path_changed_tarball_installs_changed_bytes() {
         let tree = tracked_tree(&f.workspace);
         let tracked = javascript_tracked_tree(&f.workspace, &tree).unwrap();
         let install = &discover_javascript_installs(&tracked.paths).unwrap()[0];
-        let mut command = javascript_install_command(&f.workspace, install).unwrap();
+        let mut command =
+            javascript_install_command(&f.workspace, install, &installed_tools()).unwrap();
         // Reuse one scratch Bun cache for both tarball versions to reproduce
         // path-keyed stale hits without writing to the operator's personal cache.
         command.env("BUN_INSTALL_CACHE_DIR", f.scratch.join("shared-bun-cache"));
@@ -1755,6 +1785,7 @@ fn javascript_bun_same_path_changed_tarball_installs_changed_bytes() {
             &tracked,
             install,
             &mut command,
+            &installed_tools(),
         )
         .unwrap();
         let installed: serde_json::Value = serde_json::from_slice(
@@ -1907,4 +1938,113 @@ fn javascript_snapshot_local_dependency_links_cannot_escape() {
             .to_string();
         assert!(error.contains("outside the repository"), "{link}: {error}");
     }
+}
+
+/// The tenant image keeps Bun in /usr/local/lib/motor/bun/bin, because the
+/// tenant agent binds the tenant's own /home over the image's before the
+/// runner starts. Setup must run that Bun however the daemon's HOME and PATH
+/// are set: here they name neither the fixture's Bun nor its directory.
+#[test]
+fn javascript_setup_runs_the_tenant_layouts_bun_without_home_or_path() {
+    let f = Fixture::new();
+    let image = f.scratch.join("tenant-image");
+    let bun_dir = image.join("usr/local/lib/motor/bun/bin");
+    let node_dir = image.join("usr/local/bin");
+    fs::create_dir_all(&bun_dir).unwrap();
+    fs::create_dir_all(&node_dir).unwrap();
+    let record = f.scratch.join("tenant-bun-ran");
+    crate::test_helpers::write_test_executable(
+        &bun_dir.join("bun"),
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 1.0.0-tenant-fixture; exit; fi
+printf '%s\n%s\n' "$*" "$PATH" > '{}'
+/bin/mkdir -p node_modules/fixture-dep
+echo "module.exports = 'fixture';" > node_modules/fixture-dep/index.js
+"#,
+            record.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(!std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d == bun_dir)));
+    assert!(
+        !std::env::var_os("HOME").is_some_and(|home| Path::new(&home).join(".bun/bin") == bun_dir)
+    );
+    write_js_pair(&f.workspace, "", "bun.lock");
+    let tree = tracked_tree(&f.workspace);
+    let tools = JavascriptTools::at(ToolchainRole::Tenant, &bun_dir, &node_dir);
+    prepare_javascript_dependencies(
+        &f.state,
+        &f.workspace.to_string_lossy(),
+        &f.workspace,
+        &tree,
+        &tools,
+    )
+    .unwrap();
+    let ran = fs::read_to_string(&record).expect("the tenant layout's bun did not run");
+    let mut lines = ran.lines();
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("install --frozen-lockfile --ignore-scripts"),
+        "{ran}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(tools.search_path().to_str().unwrap()),
+        "the manager's PATH is the configured one, not the daemon's"
+    );
+    assert!(f
+        .workspace
+        .join("node_modules/fixture-dep/index.js")
+        .is_file());
+}
+
+#[test]
+fn tenant_bun_is_mounted_where_jobs_look_for_it() {
+    let f = Fixture::new();
+    let bun_dir = f.scratch.join("usr/local/lib/motor/bun/bin");
+    let tools = JavascriptTools::at(ToolchainRole::Tenant, &bun_dir, &f.scratch);
+    assert_eq!(job_bun_mount(&tools).unwrap(), None, "no Bun, no mount");
+    fs::create_dir_all(&bun_dir).unwrap();
+    let (mount, destination) = job_bun_mount(&tools).unwrap().unwrap();
+    assert_eq!(destination, Path::new(JOB_BUN_DIR));
+    assert_eq!(
+        mount,
+        bind(&bun_dir, Path::new("/home/ubuntu/.bun/bin")).unwrap()
+    );
+}
+
+/// The image check runs every supported lockfile kind through the real
+/// setup with the configured tools, and refuses by name when one is missing.
+#[test]
+fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools() {
+    let f = Fixture::new();
+    let report = check_javascript_setup(&installed_tools(), &f.scratch.join("check")).unwrap();
+    for lockfile in [
+        "bun/bun.lock",
+        "npm/package-lock.json",
+        "pnpm/pnpm-lock.yaml",
+    ] {
+        assert!(report.contains(lockfile), "{report}");
+    }
+    assert!(report.contains("/home/ubuntu/.bun/bin/bun"), "{report}");
+    let empty = f.scratch.join("no-tools");
+    fs::create_dir(&empty).unwrap();
+    let error = check_javascript_setup(
+        &JavascriptTools::at(ToolchainRole::Tenant, &empty, &empty),
+        &f.scratch.join("second-check"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(&format!(
+            "bun not installed at {}",
+            empty.join("bun").display()
+        )),
+        "{error}"
+    );
 }

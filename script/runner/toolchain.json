@@ -3,7 +3,7 @@
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
     "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
-    "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
+    "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed at /home/ubuntu/.bun/bin on the build server and Boat. The tenant image installs it at /usr/local/lib/motor/bun/bin, because a tenant VM's /home is the tenant's own workspace root, bound over the image's /home before the runner starts. The runner takes Bun, Node, npm and pnpm only from these per-role paths, never from HOME or PATH, and every role's jobs see Bun mounted at /home/ubuntu/.bun/bin (tools.bun.job_path).",
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
     "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
@@ -550,7 +550,11 @@
   "source": "Read-only build-server capture; refresh with toolchain-parity.py --capture and --from-capture",
   "tools": {
     "bun": {
+      "job_path": "/home/ubuntu/.bun/bin/bun",
       "path": "/home/ubuntu/.bun/bin/bun",
+      "path_by_role": {
+        "tenant": "/usr/local/lib/motor/bun/bin/bun"
+      },
       "version": "1.4.2"
     },
     "bun-1.3.14": {

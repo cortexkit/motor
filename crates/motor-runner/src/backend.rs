@@ -662,6 +662,7 @@ impl Backend for HostBackend {
                             config.rustc_slots,
                             &routes,
                             &r.tree_hash,
+                            &crate::isolation::JavascriptTools::for_config(config),
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(
@@ -679,6 +680,7 @@ impl Backend for HostBackend {
                             config.tenant_vm,
                             config.shared_compile_cache(),
                             snapshots.as_ref(),
+                            &crate::isolation::JavascriptTools::for_config(config),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its

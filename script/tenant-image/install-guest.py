@@ -23,7 +23,11 @@ AGENT_VALIDATED_PATHS = (Path("/tenant"), Path("/Users"), Path("/home"), PREFIX 
 # they ship root-owned and readable by every account. The tenant runner then
 # finds them readable and skips its startup ACL grant, which on the VM's RAM
 # overlay would copy the whole toolchain up into memory on every boot.
-TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo")
+TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo", PREFIX / "bun")
+# The tenant agent binds the tenant's own directories over these before the
+# runner starts, so anything the image put beneath them would vanish at boot.
+TENANT_WORKSPACE_ROOTS = (Path("/home"), Path("/Users"))
+JAVASCRIPT_SETUP_PASS = "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
 
 
 def load_root_paths():
@@ -94,10 +98,13 @@ def install_tools(pins):
     run("apt-get", "purge", "-y", "binaryen")
     shared.tools(manifest, role="tenant")
 
-    PREFIX.mkdir(parents=True)
+    # The shared installer has already put Bun under PREFIX (toolchain.json's
+    # tenant path), outside /home.
+    PREFIX.mkdir(parents=True, exist_ok=True)
     (PREFIX / "cargo").mkdir()
     shutil.copytree(BUILD / "cargo-home/bin", PREFIX / "cargo/bin", symlinks=True)
     shutil.move("/home/ubuntu/.rustup", PREFIX / "rustup")
+    retire_tool_home()
     # Root runs these files, so they get a fixed root-only-writable mode rather
     # than whatever mode the build checkout's umask left on the source copy.
     def install_file(source, destination):
@@ -112,7 +119,37 @@ def install_tools(pins):
         install_file(BUILD / "script/runner" / name, parity_dir / name)
     # Only immutable binaries and toolchains enter the image, not install caches.
     os.environ.update(CARGO_HOME=str(PREFIX / "cargo"), RUSTUP_HOME=str(PREFIX / "rustup"),
-                      PATH=f"/home/ubuntu/.bun/bin:{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+                      PATH=f"{PREFIX}/bun/bin:{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+
+
+def retire_tool_home(home=Path("/home/ubuntu")):
+    """The shared installer builds the Rust toolchain under /home/ubuntu, as on
+    Boat. In a tenant VM /home is the tenant's own directory, bound over the
+    image's, so nothing may stay there; refuse, naming it, if anything did."""
+    left = sorted(str(path) for path in home.iterdir())
+    if left:
+        raise ValueError(f"image tools left under {home}, which a tenant's /home hides at boot: {left}")
+    home.rmdir()
+
+
+def verify_workspace_roots_empty(roots=TENANT_WORKSPACE_ROOTS):
+    for root in roots:
+        left = sorted(str(path) for path in root.iterdir())
+        if left:
+            raise ValueError(f"image files under {root}, which the tenant agent binds over at attach: {left}")
+    return [str(root) for root in roots]
+
+
+def verify_javascript_setup(scratch=BUILD / "javascript-setup-check", runner="motor-runner"):
+    """Run the tenant runner's own trusted JavaScript dependency setup, with
+    the tool locations its --tenant-vm role uses, on bun.lock,
+    package-lock.json and pnpm-lock.yaml fixtures, so a setup tool missing from
+    where the runner looks fails the image build rather than every job."""
+    output = run(runner, "check-javascript-setup", "--tenant-vm", "--scratch", str(scratch), capture=True)
+    shutil.rmtree(scratch)
+    if output.splitlines()[-1:] != [JAVASCRIPT_SETUP_PASS]:
+        raise ValueError(f"runner JavaScript setup check did not pass: {output}")
+    return output.splitlines()
 
 
 def install_services(source, destination):
@@ -328,6 +365,8 @@ def verify(pins):
     manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
     inventory["git"] = verify_git(manifest)
     inventory["wasm_opt"] = verify_wasm_opt(manifest)
+    inventory["empty_workspace_roots"] = verify_workspace_roots_empty()
+    inventory["javascript_setup"] = verify_javascript_setup()
     # Both errors occur during parsing, before a listener or runner can be opened.
     refuse_probe(["tenant-agent", "image-capability-probe"], "tenant-agent takes no arguments")
     refuse_probe(["image-capability-probe", "--tenant-vm", "--backend", "vm"],
@@ -348,7 +387,7 @@ def verify(pins):
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
     print(f"guest inventory: {len(pins['packages'])} base packages; {len(inventory['rust_toolchains'])} Rust toolchains; "
-          "4 JS tools; runner tenant-agent, git, sccache, nextest and Python executed")
+          "4 JS tools; runner tenant-agent and JavaScript setup, git, sccache, nextest and Python executed")
 
 
 def main():

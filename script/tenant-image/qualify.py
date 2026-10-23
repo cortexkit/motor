@@ -45,10 +45,17 @@ NAME_SERVICE = ("PASS guest name service: no VM nameserver, host name from files
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
 ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
 PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
+JAVASCRIPT_SETUP = ("PASS guest runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml "
+                    "installed with the tenant runner's tools after attach")
+# Committed offline fixtures, one per lockfile kind the runner installs from.
+# Every qualification job's repository carries them, so each job's real
+# workspace setup runs Bun, npm and pnpm inside the booted image.
+JAVASCRIPT_FIXTURES = REPO / "crates/motor-runner/test-fixtures/javascript"
+JAVASCRIPT_MANAGERS = ("bun", "npm", "pnpm")
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-          "tool trees", "root paths", "toolchain parity", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+          "tool trees", "root paths", "toolchain parity", "javascript setup", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
          "guest units", "teardown")
 
 
@@ -241,6 +248,21 @@ def parity_job_command(gnu_test_sha256, number):
     return ("python3 toolchain-parity.py --check --role tenant --job "
             f"--gnu-test-sha256 {gnu_test_sha256} > \"$d/parity-job-{number}.json\" "
             f'|| {{ cat "$d/parity-job-{number}.json" >&2; exit 1; }}; ')
+
+
+def javascript_job_command():
+    """Fails the job unless the runner's workspace setup installed each
+    fixture's locked local dependency without running its preinstall script."""
+    return (f'for m in {" ".join(JAVASCRIPT_MANAGERS)}; do '
+            'test -f "$m/node_modules/fixture-dep/index.js" '
+            '|| { echo "runner setup did not install the $m fixture" >&2; exit 1; }; '
+            'test ! -e "$m/lifecycle-ran" '
+            '|| { echo "the $m fixture lifecycle script ran" >&2; exit 1; }; done; ')
+
+
+def stage_javascript_fixtures(fixture, source=JAVASCRIPT_FIXTURES):
+    for manager in JAVASCRIPT_MANAGERS:
+        shutil.copytree(source / manager, fixture / manager, ignore=shutil.ignore_patterns("node_modules"))
 
 
 def parity_inputs(image, repo=REPO):
@@ -607,6 +629,7 @@ class Harness:
             (fixture / "input").write_text("tenant image qualification\n")
             for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py", "syscall-surface.py"):
                 shutil.copyfile(REPO / "script/runner" / name, fixture / name)
+            stage_javascript_fixtures(fixture)
             self.run("git", "-C", fixture, "add", ".")
             self.run("git", "-C", fixture, "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid",
                      "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
@@ -632,6 +655,7 @@ class Harness:
         self.record("lease", job_id=identifier, placement=lease["placement"], max_s=lease["max_s"])
         command = 'set -eu; d="${CARGO_TARGET_DIR:?}"; mkdir -p "$d"; '
         command += parity_job_command(self.gnu_test_sha256, number)
+        command += javascript_job_command()
         if number == 1:
             command += f'printf "%s" {self.name} > "$d/qualification-sentinel"; '
         else:
@@ -831,6 +855,7 @@ class Harness:
             self.step("tool trees", lambda: self.expect_console(TOOL_TREES))
             self.step("root paths", lambda: self.expect_console(ROOT_PATHS))
             self.step("toolchain parity", lambda: self.expect_console(PARITY))
+            self.step("javascript setup", lambda: self.expect_console(JAVASCRIPT_SETUP))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,

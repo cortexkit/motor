@@ -2,6 +2,7 @@
 """Root qualification payload, staged only on a disposable tenant disk."""
 import os
 import importlib.util
+import shutil
 import json
 from pathlib import Path
 import socket
@@ -27,6 +28,9 @@ TOOL_ROOTS = (Path("/usr/local/lib/motor/rustup"), Path("/usr/local/lib/motor/ca
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
 ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
 PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
+JAVASCRIPT_SETUP = ("PASS guest runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml "
+                    "installed with the tenant runner's tools after attach")
+RUNNER_JAVASCRIPT_PASS = "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
 SAMPLE_BYTES = 32 * 1024 * 1024
 
 
@@ -294,6 +298,22 @@ def toolchain_probe(root):
     print(PARITY, flush=True)
 
 
+def javascript_setup_probe(scratch):
+    """The runner's own trusted JavaScript dependency setup, with the tool
+    locations of its --tenant-vm role, run after attach: the tenant's /home and
+    /Users are bound over the image's by now, so a setup tool the image left
+    beneath them is missing here exactly as it would be for a job."""
+    target = scratch / "javascript-setup"
+    if target.exists():
+        shutil.rmtree(target)
+    output = run("/usr/local/bin/motor-runner", "check-javascript-setup", "--tenant-vm",
+                 "--scratch", str(target))
+    if RUNNER_JAVASCRIPT_PASS not in output.splitlines():
+        raise RuntimeError("the runner's JavaScript setup check did not pass")
+    shutil.rmtree(target)
+    print(JAVASCRIPT_SETUP, flush=True)
+
+
 def main():
     deadline = time.monotonic() + 120
     while subprocess.run(["systemctl", "is-active", "--quiet", "motor-tenant-runner.service"]).returncode:
@@ -308,6 +328,7 @@ def main():
     toolchain_probe(root)
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)
+    javascript_setup_probe(scratch)
     env = dict(os.environ, TMPDIR=str(scratch), RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="")
     for key in list(env):
         if key.startswith("GIT_CONFIG_"):

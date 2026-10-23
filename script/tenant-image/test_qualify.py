@@ -64,6 +64,47 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'package-qualified'):
             q.parity_job_command('', 1)
 
+    def test_javascript_setup_runs_in_the_booted_guest_and_in_every_job(self):
+        guest = q.module('javascript_guest', q.HERE / 'guest/hosted_qualify.py')
+        self.assertEqual(q.JAVASCRIPT_SETUP, guest.JAVASCRIPT_SETUP)
+        self.assertLess(q.STEPS.index("toolchain parity"), q.STEPS.index("javascript setup"))
+        self.assertLess(q.STEPS.index("javascript setup"), q.STEPS.index("first job"))
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+
+            def runner(*args):
+                Path(args[-1]).mkdir()
+                return guest.RUNNER_JAVASCRIPT_PASS + '\n'
+            with mock.patch.object(guest, 'run', side_effect=runner) as run, \
+                 mock.patch('builtins.print') as printed:
+                guest.javascript_setup_probe(scratch)
+            self.assertEqual(('/usr/local/bin/motor-runner', 'check-javascript-setup', '--tenant-vm',
+                              '--scratch', str(scratch / 'javascript-setup')), run.call_args.args)
+            printed.assert_called_once_with(q.JAVASCRIPT_SETUP, flush=True)
+            with mock.patch.object(guest, 'run', side_effect=lambda *a: Path(a[-1]).mkdir() or 'FAIL\n'), \
+                 self.assertRaisesRegex(RuntimeError, 'did not pass'):
+                guest.javascript_setup_probe(scratch)
+            # Each job's repository carries all three lockfile kinds, and the
+            # job fails unless setup installed them without lifecycle scripts.
+            fixture = scratch / 'fixture'
+            fixture.mkdir()
+            q.stage_javascript_fixtures(fixture)
+            for manager, lockfile in (('bun', 'bun.lock'), ('npm', 'package-lock.json'), ('pnpm', 'pnpm-lock.yaml')):
+                self.assertTrue((fixture / manager / lockfile).is_file())
+                self.assertFalse((fixture / manager / 'node_modules').exists())
+            command = 'set -eu; ' + q.javascript_job_command() + 'echo installed'
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual('runner setup did not install the bun fixture\n', result.stderr)
+            for manager in q.JAVASCRIPT_MANAGERS:
+                (fixture / manager / 'node_modules/fixture-dep').mkdir(parents=True)
+                (fixture / manager / 'node_modules/fixture-dep/index.js').write_text('')
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual('installed\n', result.stdout)
+            (fixture / 'pnpm/lifecycle-ran').write_text('ran')
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual('the pnpm fixture lifecycle script ran\n', result.stderr)
+
     def test_guest_host_parity_must_match_image_gnutest_inventory(self):
         guest = q.module('parity_guest', q.HERE / 'guest/hosted_qualify.py')
         with tempfile.TemporaryDirectory() as tmp:

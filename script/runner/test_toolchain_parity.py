@@ -196,7 +196,7 @@ class ParityTests(unittest.TestCase):
                             'version': '0.1.0', 'checksum': checksum, 'bytes': 7}],
                 'files': {path: {'sha256': checksum, 'bytes': 7}}}
 
-    def observed(self, role='build-server'):
+    def observed(self, role='build-server', job=False):
         manifest = parity.role_manifest(self.manifest, role, job=True)
         bins = {}
         for name, expected in manifest['cargo_binaries'].items():
@@ -206,7 +206,7 @@ class ParityTests(unittest.TestCase):
         for name, expected in manifest['cargo_binaries'].items():
             if 'matches' in expected:
                 bins[name]['sha256'] = bins[expected['matches']]['sha256']
-        tools = {name: {'path': spec.get('path_by_role', {}).get(role, spec['path']),
+        tools = {name: {'path': parity.tool_path(spec, role, job),
                         'realpath': spec['path'] + spec.get('realpath_suffix',
                                                              spec.get('realpath_suffix_by_role', {}).get(role, '')),
                         'version': spec.get('version', spec.get('observed_build_server_version')), 'exit_code': 0}
@@ -293,7 +293,7 @@ class ParityTests(unittest.TestCase):
         self.assertTrue(self.report(self.observed(), job=True)['passed'])
 
     def test_tenant_role_checks_the_job_layout_without_compile_cache(self):
-        actual = self.observed('tenant')
+        actual = self.observed('tenant', job=True)
         actual['compile_wrapper'] = {}
         self.assertEqual([], self.report(actual, job=True, role='tenant')['errors'])
         for name, value in (('PATH', '/tenant/cargo-home/bin:/usr/local/bin:/usr/bin:/bin'),
@@ -306,11 +306,11 @@ class ParityTests(unittest.TestCase):
     def test_tenant_job_requires_sshd_and_runtime_capabilities(self):
         for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):
             with self.subTest(name=name):
-                actual = self.observed('tenant')
+                actual = self.observed('tenant', job=True)
                 actual['runtime'][name] = False
                 self.assertEqual([f'job {name}: expected True, observed False'],
                                  self.report(actual, job=True, role='tenant')['errors'])
-        actual = self.observed('tenant')
+        actual = self.observed('tenant', job=True)
         actual['runtime']['proc']['meminfo'] = False
         actual['runtime']['inotify']['max_user_instances'] = 128
         self.assertEqual(['/proc/meminfo readable: expected True, observed False',
@@ -330,11 +330,55 @@ class ParityTests(unittest.TestCase):
         actual['cargo_binaries']['sccache']['sha256'] = 'replaced'
         self.assertIn('sccache built artifact hash', '\n'.join(parity.differences(self.manifest, actual, role='tenant')))
 
+    def test_tenant_host_runs_bun_outside_home_and_jobs_see_it_at_the_shared_path(self):
+        # A tenant VM's /home is the tenant's own workspace root, bound over the
+        # image's /home before the runner starts, so the image's Bun lives in
+        # /usr/local/lib/motor and the runner mounts it at job_path for jobs.
+        host = self.observed('tenant')
+        host.update(self.manifest['layout_by_role']['tenant']['host'])
+        host['sccache_artifacts'] = {'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
+                                     'binaries': {name: host['cargo_binaries'][name]['sha256']
+                                                  for name in self.manifest['sccache']['build_server_sha256']}}
+        self.assertEqual('/usr/local/lib/motor/bun/bin/bun', host['tools']['bun']['path'])
+        self.assertEqual([], parity.differences(self.manifest, host, role='tenant'))
+        host['tools']['bun']['path'] = '/home/ubuntu/.bun/bin/bun'
+        self.assertEqual(["bun path: expected '/usr/local/lib/motor/bun/bin/bun', observed '/home/ubuntu/.bun/bin/bun'"],
+                         parity.differences(self.manifest, host, role='tenant'))
+        job = self.observed('tenant', job=True)
+        job['compile_wrapper'] = {}
+        self.assertEqual('/home/ubuntu/.bun/bin/bun', job['tools']['bun']['path'])
+        self.assertEqual([], self.report(job, job=True, role='tenant')['errors'])
+        for role in ('build-server', 'boat'):
+            self.assertEqual('/home/ubuntu/.bun/bin/bun', self.observed(role)['tools']['bun']['path'])
+
+    def test_tenant_bun_under_a_bound_workspace_root_is_refused(self):
+        for path in ('/home/ubuntu/.bun/bin/bun', '/Users/shared/bun'):
+            with self.subTest(path=path):
+                manifest = copy.deepcopy(self.manifest)
+                manifest['tools']['bun']['path_by_role']['tenant'] = path
+                with self.assertRaisesRegex(ValueError, 'hidden by the tenant'):
+                    parity.validate(manifest)
+
+    def test_host_capture_searches_the_roles_bun_directory(self):
+        searched = []
+        class Searched(Exception):
+            pass
+        def which(name, path=None):
+            searched.append(path)
+            raise Searched
+        with patch.object(parity, 'output', return_value='stub'), \
+             patch.object(Path, 'iterdir', return_value=iter(())), \
+             patch.object(Path, 'glob', return_value=iter(())), \
+             patch.object(parity.shutil, 'which', side_effect=which), \
+             self.assertRaises(Searched):
+            parity.capture(parity.role_manifest(self.manifest, 'tenant'), role='tenant')
+        self.assertEqual('/usr/local/lib/motor/bun/bin', searched[0].split(':')[1])
+
     def test_every_role_checks_exact_job_uid_and_gid(self):
         for role in ('build-server', 'boat', 'tenant'):
             for field in ('uid', 'gid'):
                 with self.subTest(role=role, field=field):
-                    actual = self.observed(role)
+                    actual = self.observed(role, job=True)
                     actual['job_identity'][field] = 997
                     errors = self.report(actual, job=True, role=role)['errors']
                     self.assertEqual(1, len(errors))
@@ -496,7 +540,7 @@ class ParityTests(unittest.TestCase):
     def test_capture_cli_measures_the_tools_the_manifest_names(self):
         seen = []
         with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture']), \
-             patch.object(parity, 'capture', side_effect=lambda manifest=None, job=False: seen.append(manifest) or {}), \
+             patch.object(parity, 'capture', side_effect=lambda manifest=None, job=False, role=None: seen.append(manifest) or {}), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(parity.main(), 0)
         self.assertEqual(1, len(seen))
@@ -508,7 +552,7 @@ class ParityTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, parity.main())
         self.assertEqual('/tenant/cargo-home', capture.call_args.args[0]['cargo_home'])
-        self.assertEqual({'job': True}, capture.call_args.kwargs)
+        self.assertEqual({'job': True, 'role': 'tenant'}, capture.call_args.kwargs)
 
     def test_check_cli_fails_when_git_version_differs_from_the_server(self):
         actual = self.observed()

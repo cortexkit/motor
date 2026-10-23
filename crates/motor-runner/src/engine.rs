@@ -1502,10 +1502,14 @@ impl Runner {
                     bun_bin.as_deref(),
                 )?;
             } else {
-                crate::isolation::prepare_shared_read_access()?;
+                crate::isolation::prepare_shared_read_access(
+                    &crate::isolation::JavascriptTools::for_config(&config),
+                )?;
             }
             #[cfg(not(test))]
-            crate::isolation::prepare_shared_read_access()?;
+            crate::isolation::prepare_shared_read_access(
+                &crate::isolation::JavascriptTools::for_config(&config),
+            )?;
         }
         // The operator's state root may be reached through symlinks (for example
         // when storage lives on another volume). Resolve only that trusted root
@@ -1575,9 +1579,10 @@ impl Runner {
         if config.isolate_jobs && !config.windows_instance() {
             // A bad cache account must not take the foreground runner down.
             // Keep the validated identity only after its storage is also safe.
+            let javascript = crate::isolation::JavascriptTools::for_config(&config);
             config.writer_account =
                 match crate::isolation::validate_writer_account().and_then(|account| {
-                    crate::isolation::prepare_writer_shared_read_access()?;
+                    crate::isolation::prepare_writer_shared_read_access(&javascript)?;
                     Ok(account)
                 }) {
                     Ok(account) => Some(account),
