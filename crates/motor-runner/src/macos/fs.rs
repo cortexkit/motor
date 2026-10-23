@@ -16,9 +16,44 @@ use std::{
 
 pub(super) struct Dir(File);
 pub(super) const MAX_TREE_DEPTH: usize = 64;
+struct ReadFrame {
+    dir: Dir,
+    entries: DirectoryStream,
+}
+impl ReadFrame {
+    fn new(dir: Dir) -> io::Result<Self> {
+        let entries = DirectoryStream::from_dir(dir.child(".".as_ref(), false)?)?;
+        Ok(Self { dir, entries })
+    }
+}
+struct CopyFrame {
+    source: Dir,
+    destination: Dir,
+    entries: DirectoryStream,
+}
+impl CopyFrame {
+    fn new(source: Dir, destination: Dir) -> io::Result<Self> {
+        let entries = DirectoryStream::from_dir(source.child(".".as_ref(), false)?)?;
+        Ok(Self {
+            source,
+            destination,
+            entries,
+        })
+    }
+}
 
 struct DirectoryStream(*mut libc::DIR);
 impl DirectoryStream {
+    fn from_dir(dir: Dir) -> io::Result<Self> {
+        let fd = dir.0.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        Ok(Self(stream))
+    }
     fn owned_child(parent: libc::c_int, name: &std::ffi::OsStr) -> io::Result<Self> {
         let name = c(name)?;
         // Restore only a directory reached through its retained parent. Never
@@ -57,13 +92,7 @@ impl DirectoryStream {
         })?;
         let file = unsafe { File::from_raw_fd(fd) };
         cv(unsafe { libc::fchmod(file.as_raw_fd(), 0o700) })?;
-        let fd = file.into_raw_fd();
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(stream))
+        Self::from_dir(Dir(file))
     }
     fn fd(&self) -> libc::c_int {
         unsafe { libc::dirfd(self.0) }
@@ -111,20 +140,27 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
 }
 impl Dir {
     pub(super) fn sync_all(&self) -> io::Result<()> {
-        self.sync_all_depth(0)
-    }
-    fn sync_all_depth(&self, depth: usize) -> io::Result<()> {
-        if depth >= MAX_TREE_DEPTH {
-            return Err(invalid("guest tree depth limit exceeded"));
-        }
-        for name in self.names()? {
-            match self.kind(&name)? {
-                libc::S_IFDIR => self.child(&name, false)?.sync_all_depth(depth + 1)?,
-                libc::S_IFREG => self.file(&name, false)?.sync_all()?,
+        let mut stack = vec![ReadFrame::new(self.child(".".as_ref(), false)?)?];
+        while !stack.is_empty() {
+            let Some(name) = stack.last_mut().unwrap().entries.next()? else {
+                stack.last().unwrap().dir.0.sync_all()?;
+                stack.pop();
+                continue;
+            };
+            let frame = stack.last().unwrap();
+            match frame.dir.kind(&name)? {
+                libc::S_IFDIR => {
+                    if stack.len() >= MAX_TREE_DEPTH {
+                        return Err(invalid("guest tree depth limit exceeded"));
+                    }
+                    let child = frame.dir.child(&name, false)?;
+                    stack.push(ReadFrame::new(child)?);
+                }
+                libc::S_IFREG => frame.dir.file(&name, false)?.sync_all()?,
                 _ => {}
             }
         }
-        self.0.sync_all()
+        Ok(())
     }
     pub(super) fn publish(
         &self,
@@ -378,14 +414,19 @@ impl Dir {
         Ok(text)
     }
     pub(super) fn copy_inputs(&self, to: &Dir, control: &Control) -> io::Result<()> {
-        self.copy_inputs_depth(to, control, 0)
-    }
-    fn copy_inputs_depth(&self, to: &Dir, control: &Control, depth: usize) -> io::Result<()> {
-        if depth >= MAX_TREE_DEPTH {
-            return Err(invalid("guest tree depth limit exceeded"));
-        }
-        for name in self.names()? {
+        let mut stack = vec![CopyFrame::new(
+            self.child(".".as_ref(), false)?,
+            to.child(".".as_ref(), false)?,
+        )?];
+        // A single heap buffer is shared by the iterative walk. A buffer in a
+        // recursive frame can overflow a 2 MiB test/worker stack before depth 64.
+        let mut buffer = Box::new([0; 65536]);
+        while !stack.is_empty() {
             control.check()?;
+            let Some(name) = stack.last_mut().unwrap().entries.next()? else {
+                stack.pop();
+                continue;
+            };
             let text = name
                 .to_str()
                 .ok_or_else(|| invalid("non-UTF8 prep input"))?;
@@ -402,13 +443,15 @@ impl Dir {
             ) {
                 continue;
             }
-            let kind = self.kind(&name)?;
+            let frame = stack.last().unwrap();
+            let kind = frame.source.kind(&name)?;
             if kind == libc::S_IFDIR {
-                self.child(&name, false)?.copy_inputs_depth(
-                    &to.child(&name, true)?,
-                    control,
-                    depth + 1,
-                )?;
+                if stack.len() >= MAX_TREE_DEPTH {
+                    return Err(invalid("guest tree depth limit exceeded"));
+                }
+                let source = frame.source.child(&name, false)?;
+                let destination = frame.destination.child(&name, true)?;
+                stack.push(CopyFrame::new(source, destination)?);
             } else if matches!(
                 text,
                 "Cargo.toml" | "Cargo.lock" | "package.json" | "bun.lock" | "bun.lockb"
@@ -417,13 +460,12 @@ impl Dir {
                 if kind != libc::S_IFREG {
                     return Err(invalid(format!("symlink or special prep input: {text}")));
                 }
-                let mut output = to.file(&name, true)?;
+                let mut output = frame.destination.file(&name, true)?;
                 if !text.ends_with(".rs") {
-                    let mut source = self.file(&name, false)?;
-                    let mut buffer = [0; 65536];
+                    let mut source = frame.source.file(&name, false)?;
                     loop {
                         control.check()?;
-                        let n = source.read(&mut buffer)?;
+                        let n = source.read(&mut buffer[..])?;
                         if n == 0 {
                             break;
                         }
@@ -436,80 +478,84 @@ impl Dir {
         Ok(())
     }
     pub(super) fn clone_into(&self, to: &Dir, control: &Control) -> io::Result<()> {
-        self.clone_into_depth(to, control, 0)
-    }
-    fn clone_into_depth(&self, to: &Dir, control: &Control, depth: usize) -> io::Result<()> {
-        if depth >= MAX_TREE_DEPTH {
-            return Err(invalid("guest tree depth limit exceeded"));
-        }
-        for name in self.names()? {
+        let mut stack = vec![CopyFrame::new(
+            self.child(".".as_ref(), false)?,
+            to.child(".".as_ref(), false)?,
+        )?];
+        while !stack.is_empty() {
             control.check()?;
-            match self.kind(&name)? {
-                libc::S_IFDIR => self.child(&name, false)?.clone_into_depth(
-                    &to.child(&name, true)?,
-                    control,
-                    depth + 1,
-                )?,
-                libc::S_IFREG => {
-                    let source = self.file(&name, false)?;
-                    #[cfg(target_os = "macos")]
-                    {
-                        unsafe extern "C" {
-                            fn fclonefileat(
-                                src: libc::c_int,
-                                dst: libc::c_int,
-                                name: *const libc::c_char,
-                                flags: u32,
-                            ) -> libc::c_int;
-                        }
-                        cv(unsafe {
-                            fclonefileat(
-                                source.as_raw_fd(),
-                                to.0.as_raw_fd(),
-                                c(&name)?.as_ptr(),
-                                0,
-                            )
-                        })?;
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        let output = to.file(&name, true)?;
-                        #[cfg(target_os = "linux")]
-                        cv(unsafe {
-                            libc::ioctl(
-                                output.as_raw_fd(),
-                                0x40049409 as libc::c_ulong,
-                                source.as_raw_fd(),
-                            )
-                        })?;
-                        cv(unsafe {
-                            libc::fchmod(
-                                output.as_raw_fd(),
-                                source.metadata()?.permissions().mode(),
-                            )
-                        })?;
-                        #[cfg(not(target_os = "linux"))]
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "clonefile requires macOS or Linux reflinks",
-                        ));
-                    }
+            let Some(name) = stack.last_mut().unwrap().entries.next()? else {
+                stack.pop();
+                continue;
+            };
+            let frame = stack.last().unwrap();
+            let kind = frame.source.kind(&name)?;
+            if kind == libc::S_IFDIR {
+                if stack.len() >= MAX_TREE_DEPTH {
+                    return Err(invalid("guest tree depth limit exceeded"));
                 }
-                libc::S_IFLNK => {
+                let source = frame.source.child(&name, false)?;
+                let destination = frame.destination.child(&name, true)?;
+                stack.push(CopyFrame::new(source, destination)?);
+            } else {
+                frame.source.clone_leaf(&frame.destination, &name, kind)?;
+            }
+        }
+        Ok(())
+    }
+    fn clone_leaf(&self, to: &Dir, name: &std::ffi::OsStr, kind: libc::mode_t) -> io::Result<()> {
+        match kind {
+            libc::S_IFREG => {
+                let source = self.file(name, false)?;
+                #[cfg(target_os = "macos")]
+                {
+                    unsafe extern "C" {
+                        fn fclonefileat(
+                            src: libc::c_int,
+                            dst: libc::c_int,
+                            name: *const libc::c_char,
+                            flags: u32,
+                        ) -> libc::c_int;
+                    }
                     cv(unsafe {
-                        libc::symlinkat(
-                            c(&self.link(&name)?)?.as_ptr(),
-                            to.0.as_raw_fd(),
-                            c(&name)?.as_ptr(),
-                        )
+                        fclonefileat(source.as_raw_fd(), to.0.as_raw_fd(), c(name)?.as_ptr(), 0)
                     })?;
                 }
-                _ => {
-                    return Err(invalid(format!(
-                        "special file in clone: {}",
-                        name.to_string_lossy()
-                    )))
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let output = to.file(name, true)?;
+                    #[cfg(target_os = "linux")]
+                    cv(unsafe {
+                        libc::ioctl(
+                            output.as_raw_fd(),
+                            0x40049409 as libc::c_ulong,
+                            source.as_raw_fd(),
+                        )
+                    })?;
+                    cv(unsafe {
+                        libc::fchmod(output.as_raw_fd(), source.metadata()?.permissions().mode())
+                    })?;
+                    #[cfg(not(target_os = "linux"))]
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "clonefile requires macOS or Linux reflinks",
+                    ));
                 }
+            }
+            libc::S_IFLNK => {
+                cv(unsafe {
+                    libc::symlinkat(
+                        c(&self.link(name)?)?.as_ptr(),
+                        to.0.as_raw_fd(),
+                        c(name)?.as_ptr(),
+                    )
+                })?;
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "special file in clone: {}",
+                    name.to_string_lossy()
+                )))
             }
         }
         Ok(())

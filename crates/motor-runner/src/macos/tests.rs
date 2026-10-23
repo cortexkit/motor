@@ -364,58 +364,76 @@ fn pinned_tools_are_checked_on_every_prep_and_fetch_errors_name_package() {
 #[test]
 fn prep_timeout_and_cancel_kill_the_entire_process_group() {
     for cancelled in [false, true] {
-        let mut f = Fixture::new();
-        write(&f.source.join("package.json"), "{}");
-        let pids = f.scratch.join("pids");
-        f.staging.tools.bun = tool(
-            f.scratch.join("tools/bun"),
+        let scratch = ScratchDir::new("prep-group-ready");
+        let pids = scratch.join("pids");
+        let helper = tool(
+            scratch.join("helper"),
             &format!(
-                "#!/bin/sh\nsleep 1000 &\necho $$ $! > '{}'\nwait\n",
+                "#!/bin/sh\nsleep 1000 &\necho $$ $! > '{}.tmp'\nmv '{}.tmp' '{}'\nwait\n",
+                pids.display(),
+                pids.display(),
                 pids.display()
             ),
         );
-        let r = f.request();
+        let mut command = Command::new(&helper.path);
         let cancellation = Cancellation::default();
-        std::thread::scope(|scope| {
-            let token = cancellation.clone();
-            if cancelled {
-                let pids = &pids;
-                scope.spawn(move || {
-                    let until = Instant::now() + Duration::from_secs(10);
-                    while !pids.exists() {
-                        assert!(Instant::now() < until);
-                        std::thread::park_timeout(Duration::from_millis(10));
+        let mut recorded = None;
+        let error = process::wait_after_ready(&mut command, || {
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                match host::read_to_string(&pids) {
+                    Ok(text) => {
+                        let ids = text
+                            .split_whitespace()
+                            .map(str::parse::<libc::pid_t>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(invalid)?;
+                        if ids.len() != 2 {
+                            return Err(invalid("prep child published an incomplete PID marker"));
+                        }
+                        if !ids
+                            .iter()
+                            .all(|pid| *pid > 1 && unsafe { libc::kill(*pid, 0) } == 0)
+                        {
+                            return Err(invalid(
+                                "prep ready barrier did not identify live processes",
+                            ));
+                        }
+                        recorded = Some(ids);
+                        break;
                     }
-                    token.cancel();
-                });
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                if Instant::now() >= until {
+                    return Err(invalid("prep child never reached its ready barrier"));
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
             }
-            let error = f
-                .staging
-                .prepare_with_timeout(
-                    &r,
-                    cancellation,
-                    if cancelled {
+            // This tests the shared production monitor/Group drop, not whether
+            // git/materialization happened to finish inside a two-second budget.
+            if cancelled {
+                cancellation.cancel();
+            }
+            Ok(Control {
+                cancel: cancellation,
+                deadline: Instant::now()
+                    + if cancelled {
                         Duration::from_secs(10)
                     } else {
-                        Duration::from_secs(2)
+                        Duration::from_millis(100)
                     },
-                )
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(
-                error.contains(if cancelled { "cancelled" } else { "timed out" }),
-                "{error}"
-            );
-        });
-        let pids = host::read_to_string(&pids).unwrap();
-        for pid in pids
-            .split_whitespace()
-            .map(|s| s.parse::<libc::pid_t>().unwrap())
-        {
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(if cancelled { "cancelled" } else { "timed out" }),
+            "{error}"
+        );
+        for pid in recorded.expect("the process must be running before its monitor is tested") {
             let until = Instant::now() + Duration::from_secs(2);
             loop {
-                // A killed, reparented Linux child may remain as an inert zombie until init reaps it.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 #[cfg(target_os = "linux")]
                 let alive = alive
@@ -429,6 +447,25 @@ fn prep_timeout_and_cancel_kill_the_entire_process_group() {
             }
         }
     }
+}
+
+#[test]
+fn whole_prep_deadline_can_expire_before_fetch_process_starts() {
+    let mut f = Fixture::new();
+    write(&f.source.join("package.json"), "{}");
+    let marker = f.scratch.join("fetch-started");
+    f.staging.tools.bun = tool(
+        f.scratch.join("tools/bun"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let request = f.request();
+    let error = f
+        .staging
+        .prepare_with_timeout(&request, Cancellation::default(), Duration::ZERO)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("timed out"));
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -1000,25 +1037,33 @@ fn guest_copy_and_sync_reject_excessive_depth_before_stack_or_fd_exhaustion() {
         dir = dir.child("d".as_ref(), true).unwrap();
     }
     drop(dir);
-    let source = Dir::open(&source, false).unwrap();
-    let destination = Dir::open(&destination, true).unwrap();
-    let control = Control {
-        cancel: Cancellation::default(),
-        deadline: Instant::now() + PREP_TIMEOUT,
-    };
-    assert!(source
-        .clone_into(&destination, &control)
-        .unwrap_err()
-        .to_string()
-        .contains("depth limit"));
-    assert!(source
-        .sync_all()
-        .unwrap_err()
-        .to_string()
-        .contains("depth limit"));
-    assert!(source
-        .copy_inputs(&destination, &control)
-        .unwrap_err()
-        .to_string()
-        .contains("depth limit"));
+    std::thread::Builder::new()
+        .name("bounded-tree-walks".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let source = Dir::open(&source, false).unwrap();
+            let destination = Dir::open(&destination, true).unwrap();
+            let control = Control {
+                cancel: Cancellation::default(),
+                deadline: Instant::now() + PREP_TIMEOUT,
+            };
+            assert!(source
+                .clone_into(&destination, &control)
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+            assert!(source
+                .sync_all()
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+            assert!(source
+                .copy_inputs(&destination, &control)
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

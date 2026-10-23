@@ -135,8 +135,10 @@ two `macvm-locks/slot-N.lock` files and one admission lock enforce capacity.
 An unproven stop retains both the record and VM slot. Once disk release is proven,
 the runner fsyncs `slot: null` before releasing that slot. Filesystem cleanup is
 separate: it restores owner rwx on owned directories through no-follow directory
-capabilities, streams an iterative deletion walk, and caps depth at 64. Copy-back
-and sync walks have the same depth limit. Unremovable/deep trees are moved under
+capabilities, streams an iterative deletion walk, and caps depth at 64. Input
+projection, copy-back and sync also use explicit heap stacks with that depth
+limit; the input-copy buffer is one heap allocation, never a recursive frame.
+Unremovable/deep trees are moved under
 the job's recorded `quarantine/<job_id>` path (or remain at the recorded original
 path if relocation fails). Their inventory remains for retry/operator attention,
 but they hold neither a VM slot nor the workspace lock. Quarantine remains visible
