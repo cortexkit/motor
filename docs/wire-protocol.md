@@ -358,6 +358,21 @@ changes it. Tests:
 `a_client_that_never_closes_is_released_at_the_drain_deadline_without_delivery`
 (`crates/motor-host/tests/it/transport.rs`).
 
+7.7. The tenant runner closes a job stream as soon as it has written the
+terminal, without reading the client's later heartbeats. A slow client can
+still be far behind at that point, with the job's last output and the terminal
+queued between the runner and `motor-host`. When forwarding client bytes to the
+runner fails because the runner closed its end (broken pipe, reset or not
+connected), `motor-host` logs `guest_input_closed`, stops forwarding and
+discards further client input, and keeps relaying the runner's frames until
+the runner's stream ends. The relay ends there, not at the failed write, so
+the client still receives everything the runner wrote. Tests:
+`slow_client_receives_every_frame_after_the_runner_closes_its_job_stream`
+(`crates/motor-host/tests/it/transport.rs`) and, end to end through ck-motor's
+hosted channel and the real tenant runner,
+`a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_closes_its_job_stream`
+(`crates/motor-module/src/hosted/relay_close_tests.rs`).
+
 ## 8. Queue wait and withdrawal
 
 8.1. `heartbeat.queue_wait_ms` is present only while the job is queued,

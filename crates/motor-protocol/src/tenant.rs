@@ -118,6 +118,16 @@ pub enum TenantAgentRequest {
     Diagnostics {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         https: bool,
+        /// Return the runner's journal from this Unix time on, rather than its
+        /// last 64 entries. Older runners ignore this and the fields below.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_unix_s: Option<u64>,
+        /// End of the journal window, in Unix seconds; only with `since_unix_s`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_unix_s: Option<u64>,
+        /// Keep only journal entries that name this job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jti: Option<Uuid>,
     },
     ArgsStatus,
     PrepareSnapshot {

@@ -3,7 +3,11 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import socket
+import struct
 import subprocess
+import tempfile
+import threading
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -148,6 +152,61 @@ class HostedHostConfigTests(unittest.TestCase):
             with self.subTest(args=args):
                 refused = subprocess.run(["python3", str(HERE / "hosted_host.py"), *args], capture_output=True, text=True)
                 self.assertEqual(refused.returncode, 2)
+
+
+class RunnerLogTests(unittest.TestCase):
+    def test_request_uses_the_diagnostics_fields_motor_protocol_decodes(self):
+        source = (REPO / "crates/motor-protocol/src/tenant.rs").read_text()
+        variant = re.search(r"\n    Diagnostics \{(.*?)\n    \},", source, re.S)
+        self.assertIsNotNone(variant)
+        fields = {m[1] for m in re.finditer(r"^\s*(\w+):", variant[1], re.M)}
+        request = hosted.runner_log_request("tenant-1", 1800000000, 1800000600, "00000000-0000-7000-8000-000000000001")
+        self.assertEqual(request["op"], "diagnostics")
+        self.assertLessEqual(set(request) - {"tenant", "op"}, fields)
+        self.assertEqual(hosted.runner_log_request("tenant-1", 5, None, None),
+                         {"tenant": "tenant-1", "op": "diagnostics", "since_unix_s": 5})
+        with self.assertRaises(ValueError):
+            hosted.runner_log_request("tenant-1", 10, 9, None)
+
+    def test_times_are_unix_seconds_or_iso_and_default_to_utc(self):
+        self.assertEqual(hosted.unix_seconds("1800000000"), 1800000000)
+        self.assertEqual(hosted.unix_seconds("2026-10-23T14:00:00Z"), hosted.unix_seconds("2026-10-23T14:00:00"))
+        self.assertEqual(hosted.unix_seconds("2026-10-23T16:00:00+02:00"), hosted.unix_seconds("2026-10-23T14:00:00"))
+
+    def test_reply_lines_are_utc_stamped_and_refusals_are_errors(self):
+        reply = {"ok": True, "journal": {"entries": [{"unix_us": 1800000000123456, "message": "runner_channel_closed reason=eof"}],
+                                         "truncated": True}}
+        self.assertEqual(hosted.runner_log_lines(reply), ["2027-01-15T08:00:00.123456+00:00 runner_channel_closed reason=eof",
+                                                          "# truncated: narrow --since/--until or add --job"])
+        for refused in ({"ok": False, "error": "admin_refused"}, {"ok": True, "journal": {"unavailable": True}}):
+            with self.subTest(reply=refused), self.assertRaises(ValueError):
+                hosted.runner_log_lines(refused)
+
+    def test_admin_exchange_frames_one_request_and_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "admin.sock"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            server.listen(1)
+            received = {}
+
+            def answer():
+                connection, _ = server.accept()
+                with connection:
+                    (length,) = struct.unpack(">I", connection.recv(4, socket.MSG_WAITALL))
+                    received.update(json.loads(connection.recv(length, socket.MSG_WAITALL)))
+                    body = json.dumps({"ok": True, "journal": {"entries": []}}).encode()
+                    connection.sendall(struct.pack(">I", len(body)) + body)
+
+            thread = threading.Thread(target=answer)
+            thread.start()
+            try:
+                reply = hosted.admin_exchange({"tenant": "tenant-1", "op": "diagnostics", "since_unix_s": 1}, path)
+            finally:
+                thread.join(10)
+                server.close()
+        self.assertEqual(received, {"tenant": "tenant-1", "op": "diagnostics", "since_unix_s": 1})
+        self.assertEqual(reply, {"ok": True, "journal": {"entries": []}})
 
 
 class InstallScriptTests(unittest.TestCase):

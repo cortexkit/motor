@@ -1205,6 +1205,10 @@ where
         // selecting host-settled final frames; ownership is not client delivery.
         let draining_terminal = AtomicBool::new(false);
         let relay_trace = crate::relay::RelayTrace::new(&claims.jti);
+        // Set once writing to the guest has failed because the guest closed
+        // its end. Client input is then read and discarded, and the guest's
+        // output keeps flowing to the client until the guest's stream ends.
+        let guest_input_closed = AtomicBool::new(false);
         // Copy by hand rather than with tokio::io::copy, so a failure says
         // whether reading the client or writing the guest failed.
         let to_guest = async {
@@ -1215,7 +1219,7 @@ where
                     tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
                     return Ok::<(), anyhow::Error>(());
                 }
-                if draining_terminal.load(Ordering::Acquire) {
+                if draining_terminal.load(Ordering::Acquire) || guest_input_closed.load(Ordering::Acquire) {
                     continue;
                 }
                 if let Err(error) = relay_trace.guest_input(&mut gw, &buffer[..n]).await {
@@ -1223,6 +1227,18 @@ where
                         && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected)
                     {
                         tracing::debug!(jti = claims.jti, side = "guest", step = "relay", cause = %error, "guest_input_closed_during_terminal_drain");
+                        continue;
+                    }
+                    if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected) {
+                        // The tenant runner closes a job stream as soon as it
+                        // has written the terminal, without reading what the
+                        // client sent since (its one-per-second heartbeats).
+                        // Frames it wrote before closing are still queued for
+                        // this relay, so a failed write here must not end the
+                        // relay: the guest's output side decides when it ends.
+                        tracing::warn!(jti = claims.jti, operation = "write_guest_uds", cause = %error, "guest_input_closed");
+                        relay_trace.guest_input_closed();
+                        guest_input_closed.store(true, Ordering::Release);
                         continue;
                     }
                     tracing::warn!(jti = claims.jti, operation = "write_guest_uds", cause = %error, "relay_io_failed");

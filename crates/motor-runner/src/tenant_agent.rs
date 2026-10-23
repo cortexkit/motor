@@ -131,7 +131,19 @@ async fn dispatch(
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
         TenantAgentRequest::Status => forward(Frame::Status).await,
-        TenantAgentRequest::Diagnostics { https } => diagnostics::collect(https).await,
+        TenantAgentRequest::Diagnostics {
+            https,
+            since_unix_s,
+            until_unix_s,
+            jti,
+        } => {
+            let query = diagnostics::JournalQuery {
+                since_unix_s,
+                until_unix_s,
+                jti,
+            };
+            diagnostics::collect(https, query).await
+        }
         TenantAgentRequest::PrepareSnapshot { kind } => {
             let _guard = attach.lock().await;
             snapshot::prepare(kind).await

@@ -1431,6 +1431,21 @@ async fn assert_clean_eof(client: &mut (impl AsyncRead + Unpin)) {
 /// real end, not when the drain finishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_client_heartbeating_past_job_end_receives_every_frame_through_the_terminal() {
+    slow_client_through_job_end(false).await;
+}
+
+/// The tenant runner closes its job stream right after writing the terminal,
+/// without reading the heartbeats the client sent meanwhile. The host's next
+/// heartbeat write to the guest then fails with a broken pipe while most of
+/// the job's output is still queued for a slow client. That failed write must
+/// not end the relay: the client still receives every output frame, the
+/// terminal and the hosted terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_client_receives_every_frame_after_the_runner_closes_its_job_stream() {
+    slow_client_through_job_end(true).await;
+}
+
+async fn slow_client_through_job_end(runner_closes_after_terminal: bool) {
     const FRAMES: u64 = 400;
     let (runtime, fake, broker, requester, c) = fixture();
     let (mut client, server) = small_buffer_tcp_pair().await;
@@ -1462,7 +1477,11 @@ async fn slow_client_heartbeating_past_job_end_receives_every_frame_through_the_
             .unwrap();
         }
         write_json(&mut guest, &exit_terminal()).unwrap();
-        guest
+        if runner_closes_after_terminal {
+            drop(guest);
+            return None;
+        }
+        Some(guest)
     });
     // The job ends now, while nearly all of its output is still unread.
     runtime

@@ -1001,6 +1001,7 @@ dependencies = [
 name = "motor-module"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "cortexkit-claustrum-client",
  "cortexkit-exec-remote-types",

@@ -1047,6 +1047,8 @@ pub(crate) async fn wait_after_iat(iat: u64) {
 
 #[cfg(test)]
 pub(crate) mod boat_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod relay_close_tests;
 #[cfg(test)]
 mod sandbox_tests;
 #[cfg(all(test, target_os = "linux"))]

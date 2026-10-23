@@ -8,6 +8,7 @@ struct Progress {
     client_read: u64,
     guest_written: u64,
     input_pending: usize,
+    input_closed: bool,
     client_written: u64,
     frame_type: &'static str,
     frame_seq: Option<u64>,
@@ -51,6 +52,12 @@ impl RelayTrace {
             p.input_pending = remaining.len();
         }
         Ok(())
+    }
+
+    /// Records that the guest closed its input: the bytes still pending from
+    /// the failed write stay in the trace, and later client bytes are dropped.
+    pub fn guest_input_closed(&self) {
+        self.progress.lock().expect("relay progress").input_closed = true;
     }
 
     pub async fn client_frame(
@@ -110,6 +117,7 @@ impl Drop for RelayTrace {
             client_read_bytes = p.client_read,
             guest_written_bytes = p.guest_written,
             guest_input_pending_bytes = p.input_pending,
+            guest_input_closed = p.input_closed,
             client_written_bytes = p.client_written,
             client_frame = p.frame_type,
             client_frame_seq = p.frame_seq,

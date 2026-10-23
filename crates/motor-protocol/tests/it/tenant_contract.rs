@@ -53,6 +53,8 @@ fn pinned_agent_operations_roundtrip_and_preserve_exit_after() {
         json!({"op":"status"}),
         json!({"op":"diagnostics"}),
         json!({"op":"diagnostics","https":true}),
+        json!({"op":"diagnostics","since_unix_s":1800000000,"until_unix_s":1800000600,
+            "jti":"00000000-0000-7000-8000-000000000001"}),
         json!({"op":"args_status"}),
     ] {
         let request: TenantAgentRequest = serde_json::from_value(value.clone()).unwrap();
