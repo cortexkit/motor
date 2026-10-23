@@ -332,3 +332,28 @@ fn cli_return_parse_refuses_relative_literal_variable_and_outside_paths() {
     );
     assert_eq!(request.return_paths, [good.to_str().unwrap()]);
 }
+
+#[test]
+fn cli_return_install_keeps_an_existing_mode_and_gives_new_files_the_umask_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = cortexkit_test_support::ScratchDir::new("cli-return-mode");
+    let root = fs::canonicalize(scratch.path()).unwrap();
+    let script = root.join("run.sh");
+    fs::write(&script, b"old").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    super::returned_files::install(&root, &script, b"new").unwrap();
+    assert_eq!(fs::read(&script).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o7777,
+        0o750
+    );
+
+    let umask = unsafe { libc::umask(0o022) };
+    unsafe { libc::umask(umask) };
+    let fresh = root.join("fresh.txt");
+    super::returned_files::install(&root, &fresh, b"x").unwrap();
+    assert_eq!(
+        fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o666 & !(umask as u32)
+    );
+}

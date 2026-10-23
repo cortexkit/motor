@@ -257,6 +257,9 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
+        // Keep an existing file's permission bits; a new file gets the usual
+        // 0666 minus the umask, as if the user had written it themselves.
+        let mut existing_mode = None;
         if result == 0 {
             let stat = unsafe { stat.assume_init() };
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
@@ -264,6 +267,7 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
                     "destination is not a regular file (symlinks are refused)",
                 ));
             }
+            existing_mode = Some(stat.st_mode & 0o7777);
         } else if io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
             return Err(io::Error::last_os_error());
         }
@@ -277,7 +281,7 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
                 directory.as_raw_fd(),
                 temporary.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
+                0o666 as libc::c_uint,
             )
         };
         if fd < 0 {
@@ -285,6 +289,11 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
         }
         let mut file = unsafe { File::from_raw_fd(fd) };
         let result = (|| {
+            if let Some(mode) = existing_mode {
+                if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             file.write_all(data)?;
             file.sync_all()?;
             // renameat replaces the directory entry, never the target of a
