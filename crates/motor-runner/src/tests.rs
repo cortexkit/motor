@@ -3979,7 +3979,7 @@ async fn cache_fence_protects_writer_setup_and_queues_writers_during_eviction() 
     assert!(!entry.exists());
 }
 
-/// Exercises the real daemon over its wire protocol without modifying the Mac
+/// Exercises the real daemon over its wire protocol without modifying the
 /// client or using an in-process Runner. The operator supplies the daemon socket
 /// and an existing host-only file whose absence inside the job proves isolation.
 #[cfg(target_os = "linux")]

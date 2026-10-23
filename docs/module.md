@@ -1,6 +1,6 @@
 # The ck-motor module
 
-`ck-motor` is motor's client. It runs on the caller's Mac as a reserved module
+`ck-motor` is motor's client. It runs on the caller's machine as a reserved module
 of the CortexKit daemon (SubC). It receives `exec-remote/v1` requests, captures a
 snapshot of the caller's checkout, and sends it with the command to
 `motor-runner` over SSH. This document covers how it is placed, who may call it,

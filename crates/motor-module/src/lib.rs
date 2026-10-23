@@ -1,4 +1,4 @@
-//! Mac-side executor. Submitted commands only ever reach the remote runner;
+//! Client-side executor. Submitted commands only ever reach the remote runner;
 //! transport loss after submission is recovered by attach, never by rerunning.
 mod agent;
 mod agent_route;

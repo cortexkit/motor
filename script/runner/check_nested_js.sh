@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Run before deploying a runner change to nested JavaScript installs, to show
 # every fleet repository's nested lockfiles still install under the new runner.
-# Run on the Mac. For every git checkout directly under the CortexKit projects
-# directory, ship its default branch to the build server and run motor-runner's
-# own install command in each tracked nested directory that holds package.json
-# plus a supported lockfile, shallowest first. The root is skipped: the runner
-# already installs it today. Prints one PASS or FAIL line per directory.
-# Nothing on the Mac changes; the server copies are deleted at the end.
+# Run on the operator machine. For every git checkout directly under the
+# CortexKit projects directory, ship its default branch to the build server and
+# run motor-runner's own install command in each tracked nested directory that
+# holds package.json plus a supported lockfile, shallowest first. The root is
+# skipped: the runner already installs it today. Prints one PASS or FAIL line per
+# directory. Nothing on the operator machine changes; the server copies are
+# deleted at the end.
 set -euo pipefail
 
 projects=${1:-$HOME/Work/Projects/CortexKit}

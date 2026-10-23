@@ -107,7 +107,7 @@ pub struct Config {
     pub(crate) writer_account: Option<crate::isolation::WriterAccount>,
     pub backend: BackendKind,
     pub vm_config: Option<PathBuf>,
-    /// Allow an explicitly selected host backend on a developer's Mac only.
+    /// Allow an explicitly selected host backend on a macOS development host only.
     pub development_allow_host_backend: bool,
     #[cfg(unix)]
     pub(crate) macos: Option<Arc<crate::macos::VmConfig>>,

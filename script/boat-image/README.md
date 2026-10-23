@@ -682,7 +682,7 @@ preflight prints the same per-unit evidence before stopping a failed service.
 
 ## Operator probe
 
-From the operator's Mac, use the same stdin credential reader as `boat-probe`:
+From the operator machine, use the same stdin credential reader as `boat-probe`:
 
 ```sh
 set -o pipefail
@@ -726,8 +726,8 @@ is no copy fallback.
 
 Expect about **10 minutes** of sandbox time when starting from a prepared image
 (the measured run below took 9 minutes plus asynchronous purge), and longer for a
-cold first build of every tool; the cold path was not timed in that run. The Mac
-first builds the small `boat_probe` example;
+cold first build of every tool; the cold path was not timed in that run. The
+operator machine first builds the small `boat_probe` example;
 no paid sandbox exists during that local build. It uses `Motor::with_connector`
 and `Motor::run`, so snapshot capture, bundle transfer, admission, streamed output
 and terminal handling are production client code, not a Python wire imitation.
@@ -870,7 +870,7 @@ the operator must rebuild and rerun the expanded probe for that evidence.
 - **Real jobs, through the production client** over the API-pinned SSH forward:
   the exit job returned code 23 with its output, the offline Rust 1.99.0 build
   printed `boat-hello`, in every phase. Each job took 1.0–1.4 s end to end from
-  the Mac, 2.5–4.1 s right after resume.
+  the operator machine, 2.5–4.1 s right after resume.
 - **Isolation, read by the job itself:** user `motor-job`, interfaces `["lo"]`, a
   network and mount namespace different from the host's, private writable
   `/dev/shm`, NoNewPrivs with zero effective and bounding capabilities, `/proc`
@@ -896,7 +896,7 @@ the operator must rebuild and rerun the expanded probe for that evidence.
   first start of a clone measured the runner at 48.7 MB idle instead of about
   15 MB, giving the lowest budget, 13391 MiB. Anything that advertises a fixed
   job memory for Boat must use the lowest observed value, not 13444.
-- **Timing** (from the Mac): create from the prepared image to Boat-ready 2.7 s;
+- **Timing** (from the operator machine): create from the prepared image to Boat-ready 2.7 s;
   source upload plus recipe reapply 63.6 s; prepared image save 12.0 s;
   measurement snapshot save 19.1 s; create from snapshot to Boat-ready 5.4 s and
   **to first finished job 68.1 s**. About 50 s of the 68.1 s is waiting for

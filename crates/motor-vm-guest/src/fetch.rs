@@ -34,7 +34,7 @@ fn plain(s: &str) -> bool {
 }
 impl Policy {
     /// git_directories maps exact locked git sources (including #revision) to Cargo's
-    /// directory name. These inputs come from the Mac client's locked git bundles,
+    /// directory name. These inputs come from the client's locked git bundles,
     /// prepared as bare repositories for this guest, not a runner git_sources table.
     pub fn from_lock(
         lock: &str,

@@ -88,7 +88,7 @@ optional fleet audit (alongside `script/runner/check_nested_js.sh`):
 bash script/runner/check_nested_cargo.sh /path/to/fleet/checkouts
 ```
 
-Run it on the operator Mac or a host holding those checkouts. It clones each
+Run it on the operator machine or a host holding those checkouts. It clones each
 locally recorded default-branch snapshot into temporary storage (falling back
 to HEAD when that ref is unset), excludes the root graph, and
 runs a separately bounded `cargo fetch --locked --offline` from a neutral

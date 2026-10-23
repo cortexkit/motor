@@ -2,9 +2,9 @@
 
 Motor runs build and test commands for coding agents on a remote Linux build
 server, or in a fresh Windows virtual machine per job. A client module on the
-caller's Mac captures a snapshot of the checkout, including uncommitted work,
-sends only the Git history the server lacks, and the server checks it out at
-the same absolute path and runs the command in an isolated sandbox. Output
+caller's own machine captures a snapshot of the checkout, including uncommitted
+work, sends only the Git history the server lacks, and the server checks it out
+at the same absolute path and runs the command in an isolated sandbox. Output
 streams back as it is produced, jobs survive dropped connections, and a command
 is never run twice: a job either ran, provably did not start, or is reported as
 unknown. Motor is the `exec-remote/v1` provider for the

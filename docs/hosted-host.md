@@ -116,7 +116,7 @@ extra rule.
 
 ## Procedure
 
-1. From the Mac, sync the checkout: `script/runner/sync.sh`.
+1. From the operator machine, sync the checkout: `script/runner/sync.sh`.
 2. On the server, check the prerequisites: the private `/var/lib/motor-vm`
    storage view ([linux-microvm.md](linux-microvm.md#install)), Firecracker and
    jailer 1.17.0 in `/usr/local/lib/firecracker/1.17.0/`, the qualified tenant

@@ -1,4 +1,4 @@
-"""Pinned SSH and loopback TLS measurements, controlled from the operator's Mac."""
+"""Pinned SSH and loopback TLS measurements, controlled from the operator machine."""
 from __future__ import annotations
 
 import base64

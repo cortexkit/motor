@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 # Host-isolation and root-helper lanes need dedicated trusted infrastructure
-# and privileges; Mac tests need a real Mac. They are not hosted CI lanes.
-# See AGENTS.md for operator build-server and local Mac instructions.
+# and privileges; macOS tests need a real macOS host. They are not hosted CI lanes.
+# See AGENTS.md for operator build-server and local macOS instructions.
 jobs:
   linux-ordinary:
     name: Linux ordinary

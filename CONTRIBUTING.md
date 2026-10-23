@@ -93,7 +93,7 @@ passing portable suite does not establish the boundaries they check.
 | `motor-vm-helper --features linux-root-tests` and `linux-service-tests` | Root, systemd 254 or newer, cgroup v2, the Firecracker jailer | By hand; see [docs/linux-microvm.md](docs/linux-microvm.md) |
 | `motor-vm-guest --features linux-root-tests` and `trusted-cargo-tests` | Root and namespaces; network access and a trusted Cargo | By hand; see [docs/linux-microvm.md](docs/linux-microvm.md) |
 | `motor-vm-loader --features linux-uffd-tests` and `linux-root-tests` | `userfaultfd` permission; root and a static loader binary | By hand; see [docs/linux-microvm.md](docs/linux-microvm.md) |
-| `motor-module` `motor_e2e` binary (macOS only) | A real runner reachable over SSH; its inputs are the `CK_MOTOR_E2E_*` variables named at the top of `crates/motor-module/tests/motor_e2e.rs` | By hand on a Mac, with the command in that file's header |
+| `motor-module` `motor_e2e` binary (macOS only) | A real runner reachable over SSH; its inputs are the `CK_MOTOR_E2E_*` variables named at the top of `crates/motor-module/tests/motor_e2e.rs` | By hand on a macOS client, with the command in that file's header |
 | Real macOS daemon and vault integration | An installed CortexKit daemon and credential vault | Not in this repository |
 
 Operator lanes fail on a missing prerequisite instead of counting a skip as a
