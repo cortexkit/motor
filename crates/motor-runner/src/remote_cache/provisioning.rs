@@ -300,21 +300,16 @@ fn read_file(path: &Path, mode: u32, owner: u32) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The `generation` every file of one set carries: a non-empty string or an
-/// unsigned integer, compared exactly (the number 1 differs from "1").
+/// The `generation` every file of one set carries: an opaque non-empty JSON
+/// string, compared only for equality. A number or any other JSON type makes
+/// the file invalid, so a file holding 1 never meets one holding "1".
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Generation {
-    Number(u64),
-    Text(String),
-}
+#[serde(transparent)]
+pub(crate) struct Generation(pub(crate) String);
 
 impl fmt::Display for Generation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Number(number) => write!(f, "{number}"),
-            Self::Text(text) => write!(f, "{text:?}"),
-        }
+        write!(f, "{:?}", self.0)
     }
 }
 
@@ -372,7 +367,7 @@ fn visible_token(value: &str) -> bool {
 fn parse_config(bytes: &[u8]) -> Result<ConfigFile, String> {
     let config: ConfigFile =
         serde_json::from_slice(bytes).map_err(|e| format!("{CONFIG_FILE}: {e}"))?;
-    if config.generation == Generation::Text(String::new()) {
+    if config.generation.0.is_empty() {
         return Err(format!("{CONFIG_FILE}: generation is empty"));
     }
     // The tenant id becomes part of an object-store key prefix, so it is held
@@ -431,7 +426,7 @@ fn parse_key(bytes: &[u8]) -> Result<KeyMaterial, String> {
         };
         format!("{category} at line {} column {}", e.line(), e.column())
     })?;
-    if key.generation == Generation::Text(String::new()) {
+    if key.generation.0.is_empty() {
         return Err("generation is empty".to_string());
     }
     if !visible_token(&key.access_key_id) || !visible_token(&key.secret_access_key) {

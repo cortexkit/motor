@@ -62,7 +62,7 @@ impl Host {
 
 fn config_json(generation: u64) -> Value {
     json!({
-        "generation": generation,
+        "generation": generation.to_string(),
         "tenant": TENANT,
         "endpoint": "https://s3.gra.io.cloud.ovh.net",
         "region": "gra",
@@ -77,7 +77,7 @@ fn config_json(generation: u64) -> Value {
 /// file a credential came from.
 fn key_json(role: KeyRole, generation: u64, serial: u64) -> Value {
     json!({
-        "generation": generation,
+        "generation": generation.to_string(),
         "access_key_id": format!("{}-id-{serial}", role.file_name()),
         "secret_access_key": secret(role, serial),
     })
@@ -85,6 +85,12 @@ fn key_json(role: KeyRole, generation: u64, serial: u64) -> Value {
 
 fn secret(role: KeyRole, serial: u64) -> String {
     format!("{}-secret-{serial}", role.file_name())
+}
+
+/// The generation the helpers above write for serial `n`: the string form of
+/// the number, since a generation is always a JSON string.
+fn numbered(n: u64) -> Generation {
+    Generation(n.to_string())
 }
 
 fn unavailable(status: &Status) -> &Unavailable {
@@ -172,7 +178,7 @@ fn build_server_generation_parses_with_both_keys() {
     assert_eq!(reread.previous_enabled, None);
     assert_eq!(reread.enabled, Some(true));
     let active = provisioning.admit().expect("available and enabled");
-    assert_eq!(active.generation, Generation::Number(1));
+    assert_eq!(active.generation, numbered(1));
     assert_eq!(active.tenant, TENANT);
     assert_eq!(active.region, "gra");
     assert_eq!(active.storage_class, "STANDARD");
@@ -391,8 +397,12 @@ fn raw_key_or_unknown_fields_leave_no_complete_generation() {
     assert_eq!(provisioning.reread().status, Status::Available);
 }
 
+/// `generation` is an opaque string compared for equality. A file whose
+/// generation is a number (or any other non-string JSON value) is invalid, so
+/// a broker writing 1 and an operator writing "1" never form a set, and a set
+/// that agrees only on the number 1 never activates.
 #[test]
-fn string_generations_compare_exactly() {
+fn generation_must_be_a_string() {
     let host = Host::new(HostRole::TenantVm);
     let mut config = config_json(0);
     config["generation"] = json!("2026-10-24");
@@ -404,19 +414,64 @@ fn string_generations_compare_exactly() {
     assert_eq!(provisioning.reread().status, Status::Available);
     assert_eq!(
         provisioning.admit().unwrap().generation,
-        Generation::Text("2026-10-24".into())
+        Generation("2026-10-24".into())
     );
-    // The number 1 and the string "1" are different generations.
-    config["generation"] = json!(1);
-    host.config_value(&config);
-    key["generation"] = json!("1");
-    host.key_value(KeyRole::Read, &key);
-    let reread = provisioning.reread();
-    assert!(!reread.activated);
-    assert_eq!(
-        provisioning.admit().unwrap().generation,
-        Generation::Text("2026-10-24".into())
-    );
+
+    for value in [
+        json!(1),
+        json!(1.5),
+        json!(true),
+        json!(null),
+        json!(["1"]),
+        json!({"id": "1"}),
+    ] {
+        // A non-string generation in config.json, with a key that matches it
+        // as a string.
+        config["generation"] = value.clone();
+        host.config_value(&config);
+        key["generation"] = json!("1");
+        host.key_value(KeyRole::Read, &key);
+        let mut fresh = host.provisioning();
+        let status = fresh.reread().status;
+        let Unavailable::NoCompleteGeneration { detail } = unavailable(&status) else {
+            panic!("config generation {value}: {status:?}");
+        };
+        assert!(detail.starts_with("config.json: "), "{value}: {detail}");
+        assert!(!detail.contains("read-key"), "{value}: {detail}");
+
+        // A non-string generation in the key file, with a config that
+        // matches it as a string.
+        config["generation"] = json!("1");
+        host.config_value(&config);
+        key["generation"] = value.clone();
+        host.key_value(KeyRole::Read, &key);
+        let mut fresh = host.provisioning();
+        let status = fresh.reread().status;
+        let Unavailable::NoCompleteGeneration { detail } = unavailable(&status) else {
+            panic!("key generation {value}: {status:?}");
+        };
+        assert!(
+            detail.starts_with("read-key: not an object of generation"),
+            "{value}: {detail}"
+        );
+        assert!(
+            !detail.contains(&secret(KeyRole::Read, 1)),
+            "{value}: {detail}"
+        );
+
+        // Both files agreeing on the same non-string value is still no set,
+        // and the generation already active stays active.
+        config["generation"] = value.clone();
+        host.config_value(&config);
+        let reread = provisioning.reread();
+        assert!(!reread.activated, "{value}");
+        assert_eq!(reread.status, Status::Available, "{value}");
+        assert_eq!(
+            provisioning.admit().unwrap().generation,
+            Generation("2026-10-24".into()),
+            "{value}"
+        );
+    }
 }
 
 /// Config, read key and write key updated one at a time in every order: no
@@ -449,7 +504,7 @@ fn staggered_updates_activate_only_complete_generations() {
             let admitted = provisioning.admit().unwrap();
             if step < 2 {
                 assert!(!reread.activated, "{order:?} step {step}");
-                assert_eq!(admitted.generation, Generation::Number(1));
+                assert_eq!(admitted.generation, numbered(1));
                 assert_eq!(read_id(&admitted), "read-key-id-1");
                 assert_eq!(
                     admitted.write_key.as_ref().unwrap().access_key_id,
@@ -457,7 +512,7 @@ fn staggered_updates_activate_only_complete_generations() {
                 );
             } else {
                 assert!(reread.activated, "{order:?}");
-                assert_eq!(admitted.generation, Generation::Number(2));
+                assert_eq!(admitted.generation, numbered(2));
                 assert_eq!(read_id(&admitted), "read-key-id-2");
                 assert_eq!(
                     admitted.write_key.as_ref().unwrap().access_key_id,
@@ -466,7 +521,7 @@ fn staggered_updates_activate_only_complete_generations() {
             }
         }
         // A request admitted before activation finishes with its own key.
-        assert_eq!(admitted_first.generation, Generation::Number(1));
+        assert_eq!(admitted_first.generation, numbered(1));
         assert_eq!(read_id(&admitted_first), "read-key-id-1");
     }
 }
@@ -529,10 +584,7 @@ fn enabled_flips_within_one_reread_without_a_new_generation() {
     assert!(!reread.activated);
     assert_eq!(reread.enabled, Some(false));
     assert!(provisioning.admit().is_none());
-    assert_eq!(
-        provisioning.active().unwrap().generation,
-        Generation::Number(1)
-    );
+    assert_eq!(provisioning.active().unwrap().generation, numbered(1));
 }
 
 /// One unparsable config between good reads changes neither the active
@@ -576,7 +628,7 @@ fn generation_reused_with_changes_is_unavailable() {
     assert_eq!(
         reason,
         Unavailable::GenerationReused {
-            generation: Generation::Number(1)
+            generation: numbered(1)
         }
     );
     assert_eq!(reason.to_string(), "generation reused");
@@ -646,10 +698,7 @@ fn prefix_not_matching_the_derivation_is_unavailable() {
 
     host.config(2);
     assert!(provisioning.reread().activated);
-    assert_eq!(
-        provisioning.admit().unwrap().generation,
-        Generation::Number(2)
-    );
+    assert_eq!(provisioning.admit().unwrap().generation, numbered(2));
 }
 
 #[test]
