@@ -74,13 +74,14 @@ See `ck motor run --help` for the options and exit statuses.";
 pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
                     [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
-                    [--allow-spill | --hosted] -- COMMAND...
+                    [--net] [--allow-spill | --hosted] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
 that contains --cwd (default: the current directory), and streams its stdout
 and stderr here as they arrive.
 
   --vcpus N           vCPUs to reserve (the runner's default when omitted)
+  --net  allow outbound IPv4 internet (package and tool fetches); jobs are offline without it
   --sibling PATH      also send this sibling repository (repeatable)
   --env NAME=VALUE    set an environment variable for the job (repeatable).
                       Nothing is inherited from this shell; ck-motor forwards
@@ -131,6 +132,7 @@ pub enum Invocation {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RunArgs {
     pub vcpus: Option<u32>,
+    pub net: bool,
     pub siblings: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub timeout: u64,
@@ -165,6 +167,10 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
         if word == "-h" || word == "--help" {
             return Ok(Invocation::Help);
+        }
+        if word == "--net" {
+            parsed.net = true;
+            continue;
         }
         if word == "--allow-spill" {
             parsed.allow_spill = true;
@@ -582,6 +588,9 @@ pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
     );
     if let Some(vcpus) = args.vcpus {
         request = request.with_weight_hint(vcpus);
+    }
+    if args.net {
+        request = request.with_network(motor_protocol::Network::Outbound);
     }
     Ok(request)
 }
@@ -1982,6 +1991,7 @@ mod tests {
             args,
             RunArgs {
                 vcpus: Some(4),
+                net: false,
                 siblings: vec!["/a".into(), "/b".into()],
                 env: [("CI", "1"), ("RUSTFLAGS", "-D=warnings")]
                     .into_iter()
@@ -2007,6 +2017,7 @@ mod tests {
         };
         assert_eq!(args.timeout, DEFAULT_TIMEOUT_SECS);
         assert_eq!(args.vcpus, None);
+        assert!(!args.net);
         assert!(!args.allow_spill);
         let Ok(Invocation::Run(args)) = parse_args(&words("--allow-spill -- true")) else {
             panic!("expected a run")
@@ -2027,6 +2038,32 @@ mod tests {
             panic!("expected a run")
         };
         assert_eq!(command_line(&args.command), "ls --help");
+    }
+
+    #[test]
+    fn net_flag_sends_outbound_network_and_default_omits_it() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-net");
+        crate::snapshot::git(scratch.path(), &["init", "--quiet"]).unwrap();
+        for net in [false, true] {
+            let mut words = vec!["--cwd".to_owned(), scratch.path().display().to_string()];
+            if net {
+                words.push("--net".into());
+            }
+            words.extend(["--".into(), "true".into()]);
+            let Ok(Invocation::Run(args)) = parse_args(&words) else {
+                panic!("expected a run")
+            };
+            assert_eq!(args.net, net);
+            let request = build_request(&args).unwrap();
+            let params = serde_json::to_value(&request).unwrap();
+            if net {
+                assert_eq!(request.network, Some(motor_protocol::Network::Outbound));
+                assert_eq!(params["network"], "outbound");
+            } else {
+                assert_eq!(request.network, None);
+                assert!(params.get("network").is_none(), "{params}");
+            }
+        }
     }
 
     #[test]
@@ -2080,6 +2117,7 @@ mod tests {
             "--env NOEQUALS -- true",
             "--env =v -- true",
             "--bogus -- true",
+            "--net=true -- true",
             "--",
             "--timeout",
         ] {
