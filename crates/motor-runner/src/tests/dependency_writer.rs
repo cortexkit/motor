@@ -1330,3 +1330,116 @@ async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
     );
     assert_private();
 }
+
+/// Eviction moves the compiler cache aside, puts an empty one in its place
+/// and then deletes the old one. If that deletion fails, the cache jobs see
+/// is still empty, so the fill records must go and the repository refill.
+#[tokio::test]
+async fn compiler_cache_emptied_by_a_failed_eviction_is_filled_again() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "an undeletable entry requires a non-root runner"
+    );
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.free_space_floor_bytes = 100;
+    let fleet = config.sccache_dir();
+    let shard = fleet.join("0");
+    let pressure = Arc::new(AtomicBool::new(false));
+    let pressured = pressure.clone();
+    let cached = shard.clone();
+    // Below the hard floor for as long as the cache holds its entry.
+    config.free_space_probe = Arc::new(move |_| {
+        Ok(if pressured.load(Ordering::SeqCst) && cached.exists() {
+            10
+        } else {
+            300
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let filled = repository(&f, &runner).filled_descriptor;
+    assert!(filled.is_some());
+    let fills = writer_count(&runner);
+    // An entry in a read-only shard cannot be deleted by the runner.
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join("entry"), "cached").unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o500)).unwrap();
+    pressure.store(true, Ordering::SeqCst);
+    let _ = runner.ensure_disk_space().unwrap();
+    pressure.store(false, Ordering::SeqCst);
+    // Let the fixture clean up the copy that could not be deleted.
+    let trash = runner.config().state_dir().join("trash");
+    let mut stranded = false;
+    for entry in fs::read_dir(&trash).unwrap() {
+        let retired = entry.unwrap().path().join("0");
+        if retired.is_dir() {
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).unwrap();
+            stranded = true;
+        }
+    }
+    assert!(stranded, "the eviction did not fail after moving the cache");
+    assert!(
+        fleet.is_dir() && !shard.exists(),
+        "the cache was not emptied"
+    );
+    assert_eq!(
+        repository(&f, &runner).filled_descriptor,
+        None,
+        "a fill is still recorded for an empty compiler cache"
+    );
+    runner.tick().unwrap();
+    base_done(&runner).await;
+    assert_eq!(
+        writer_count(&runner),
+        fills + 1,
+        "the cache was not refilled"
+    );
+    assert_eq!(repository(&f, &runner).filled_descriptor, filled);
+}
+
+/// A compiler cache emptied while the runner was down (by hand, or by an
+/// eviction that moved it aside and did not live to save the catalog) holds
+/// none of the recorded fills; one that still holds entries keeps them.
+#[tokio::test]
+async fn restart_forgets_fills_of_an_emptied_compiler_cache() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    let fleet = config.sccache_dir();
+    let runner = Runner::open(config.clone()).unwrap();
+    warm(&f, &runner).await;
+    let filled = repository(&f, &runner).filled_descriptor.unwrap();
+    let fills = writer_count(&runner);
+    fs::create_dir_all(fleet.join("0/1")).unwrap();
+    drop(runner);
+    // Ticks are driven by hand, so a refill cannot replace the records the
+    // assertions read before it runs.
+    config.manual_tick = true;
+    let runner = reopen(config.clone());
+    assert!(
+        repository(&f, &runner)
+            .filled_descriptors
+            .contains_key(&filled),
+        "a restart forgot the fills of a cache that still holds entries"
+    );
+    drop(runner);
+    fs::remove_dir_all(fleet.join("0")).unwrap();
+    let runner = reopen(config);
+    assert!(
+        repository(&f, &runner).filled_descriptors.is_empty(),
+        "a fill is still recorded for an empty compiler cache"
+    );
+    runner.tick().unwrap();
+    base_done(&runner).await;
+    assert_eq!(
+        writer_count(&runner),
+        fills + 1,
+        "the cache was not refilled"
+    );
+    assert_eq!(
+        repository(&f, &runner).filled_descriptor.as_ref(),
+        Some(&filled)
+    );
+}

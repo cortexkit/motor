@@ -1767,6 +1767,31 @@ impl Runner {
                 });
             }
         }
+        // The fill records describe the shared compiler cache's contents. A
+        // cache found empty here was emptied while the runner was down: by
+        // hand, or by an eviction that moved it aside but did not live to
+        // save the catalog. Its fills are gone, so each repository's next
+        // pass must fill it again rather than reuse its record. A runner with
+        // no cache directory has never filled one.
+        let fleet = config.sccache_dir();
+        if !config.windows_instance() && fleet.is_dir() {
+            match crate::compile_cache::holds_entries(&fleet) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if catalog
+                        .repositories
+                        .values()
+                        .any(|repository| !repository.filled_descriptors.is_empty())
+                    {
+                        tracing::info!("compiler cache is empty; forgetting recorded fills");
+                    }
+                    catalog.forget_compiler_cache_fills();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot inspect the compiler cache; keeping recorded fills")
+                }
+            }
+        }
         for repository in catalog.repositories.values_mut() {
             // Descriptors are recorded only for clients advertising a trusted
             // default-branch tip; older clients' arbitrary HEAD tips cannot be
@@ -7102,6 +7127,12 @@ impl Runner {
             // with the job still being finalized; repeating the update only
             // moves the last-use time forward. Both saves run without the
             // state lock.
+            //
+            // Every job also counts as a use of the shared compiler cache,
+            // which jobs mount read-only so nothing on disk shows their reads;
+            // disk eviction ages the cache by this time. A warm build's catalog
+            // is saved with its result, below.
+            inner.catalog.compile_cache_used_ms = Some(self.now());
             let catalog = if job.base {
                 Ok(None)
             } else {
@@ -7109,9 +7140,8 @@ impl Runner {
                     &mut inner,
                     job.request.as_ref().unwrap(),
                     reader_descriptor.as_ref(),
-                )
-                .then(|| self.catalog_snapshot(&inner))
-                .transpose()
+                );
+                self.catalog_snapshot(&inner).map(Some)
             };
             drop(inner);
             let saved = catalog
@@ -7222,16 +7252,16 @@ impl Runner {
     }
 
     /// Note in the catalog that a finished job (not a warm build) last used
-    /// its workspace now, and handle a warm-cache miss it reported. Returns
-    /// whether the catalog knows the workspace, and so whether it changed.
+    /// its workspace now, and handle a warm-cache miss it reported. A
+    /// workspace the catalog does not know is left alone.
     fn note_finished_workspace(
         &self,
         inner: &mut Inner,
         request: &Run,
         reader_descriptor: Option<&String>,
-    ) -> bool {
+    ) {
         let Some(w) = inner.catalog.workspaces.get_mut(&request.workspace_key) else {
-            return false;
+            return;
         };
         w.used_ms = self.now();
         if let Some(descriptor) = reader_descriptor {
@@ -7250,7 +7280,6 @@ impl Runner {
                 }
             }
         }
-        true
     }
 
     /// Log one step of finishing a job, with the time since finishing began.
