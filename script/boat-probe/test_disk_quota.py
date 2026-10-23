@@ -10,7 +10,7 @@ class DiskQuotaChecks(unittest.TestCase):
         result = dict(code=73, stdout=json.dumps(dict(lane='tmp', errno=errno.EDQUOT,
                       projects={name: 1 for name in ('workspace', 'target', 'home', 'tmp', 'var_tmp', 'stdout', 'stderr', 'exit', 'cache-stats')},
                       inheritance=dict(project=1, child_project=1,
-                      setters_refused=[0x401c5820, 0x40086602, 0x40046602]))))
+                      setters_refused=[0x401c5820, 0x40086602, 0x40046602], file_setattr_errno=errno.ENOSYS))))
         at_limit = dict(errno=errno.EDQUOT, bytes_written=2**30, lease=dict(blocks=2**21, project=1, growth_bytes=2**30),
                         kernel_hard_limit_warning=True,
                         root_free_bytes=disk_quota.RESERVE_BYTES, xfs_free_bytes=disk_quota.RESERVE_BYTES)
@@ -67,6 +67,32 @@ class DiskQuotaChecks(unittest.TestCase):
             compile(disk_quota.job(lane), '<quota-job>', 'exec')
         with self.assertRaises(ValueError):
             disk_quota.job('outside-quota')
+        compile(disk_quota.POSITIVE_CONTROL, '<root-attribute-control>', 'exec')
+
+    def control(self, supported=True):
+        return dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,
+                    before_project=0, after_project=0, file_setattr_supported=supported,
+                    file_setattr_errno=0 if supported else errno.ENOSYS, kernel_release='6.17.0')
+
+    def test_positive_control_requires_a_real_inheritance_transition(self):
+        control = self.control()
+        self.assertTrue(disk_quota.positive_control_passed(control))
+        for change in ({'clear_succeeded': False}, {'before_flags': 0}, {'after_flags': 0x200}, {'after_project': 1}):
+            self.assertFalse(disk_quota.positive_control_passed(dict(control, **change)))
+
+    def test_file_setattr_requires_supported_unfiltered_control_for_pass(self):
+        result, _, _ = self.evidence()
+        self.assertEqual(disk_quota.file_setattr_status(result, self.control()), 'PASS')
+        self.assertEqual(disk_quota.file_setattr_status(result, self.control(False)), 'INCONCLUSIVE')
+        self.assertEqual(disk_quota.file_setattr_status(result, {}), 'FAIL')
+
+    def test_file_setattr_wrong_refusal_or_missing_job_is_not_inconclusive(self):
+        result, _, _ = self.evidence()
+        report = json.loads(result['stdout'])
+        report['inheritance']['file_setattr_errno'] = errno.EPERM
+        result['stdout'] = json.dumps(report)
+        self.assertEqual(disk_quota.file_setattr_status(result, self.control(False)), 'FAIL')
+        self.assertEqual(disk_quota.file_setattr_status({}, self.control(False)), 'FAIL')
 
 
 if __name__ == '__main__':

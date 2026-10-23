@@ -1,7 +1,7 @@
 """Destructive-to-job, not destructive-to-sandbox, disk exhaustion qualification."""
 import errno
 import json
-from quota_inheritance import SOURCE as INHERITANCE
+from quota_inheritance import SOURCE as INHERITANCE, POSITIVE_CONTROL
 
 RESERVE_BYTES = 24 * 1024**3  # Provisional until stop/resume headroom is measured.
 LANES = ('tmp', 'home', 'var_tmp', 'output_stdout')
@@ -168,3 +168,25 @@ def checks(result, observation, cleanup):
         'cleanup_ready': cleanup.get('ready') is True and cleanup.get('leases') == [],
         'reserve_after_cleanup': all(cleanup.get(key, -1) >= RESERVE_BYTES for key in ('root_free_bytes', 'xfs_free_bytes')),
     }
+
+
+def positive_control_passed(report):
+    return (report.get('request') == 0x401c5820 and report.get('clear_succeeded') is True
+            and bool(report.get('before_flags', 0) & 0x200) and not (report.get('after_flags', 0) & 0x200)
+            and isinstance(report.get('before_project'), int)
+            and report.get('before_project') == report.get('after_project'))
+
+
+def file_setattr_status(result, control):
+    try:
+        report = json.loads(result.get('stdout', ''))
+    except (ValueError, TypeError):
+        return 'FAIL'
+    refused = result.get('code') == 73 and report.get('inheritance', {}).get('file_setattr_errno') == errno.ENOSYS
+    if not refused or not positive_control_passed(control):
+        return 'FAIL'
+    if control.get('file_setattr_supported') is True and control.get('file_setattr_errno') == 0:
+        return 'PASS'
+    if control.get('file_setattr_supported') is False and control.get('file_setattr_errno') == errno.ENOSYS:
+        return 'INCONCLUSIVE'
+    return 'FAIL'

@@ -346,6 +346,20 @@ stderr, exit and cache-stats. Only quota jobs request the operator example's
 optional bounded 900-second deadline; existing probe invocations still default
 to 120 seconds. `phases[].kernel_release` records `uname -r`.
 
+Before the jobs, an unfiltered root control on the same XFS mount sets and clears
+project inheritance with FSSETXATTR and verifies the actual flag transition. The
+job must get EPERM for that same ioctl. Root also invokes native syscall 469
+(`file_setattr`) with a 24-byte `file_attr`, an empty pathname and `AT_EMPTY_PATH`
+to clear the flag; the real job requires ENOSYS from the
+filter before filling its inherited directory. If root can use the syscall, the
+job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
+kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
+returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
+syscall filter. The result records the
+root control, errno and kernel release. The probe still collects quota and
+stop/resume evidence, but does not claim every required check passed when the
+path-setter case is inconclusive.
+
 Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
 image. Use the existing credential reader and seed arguments:
 

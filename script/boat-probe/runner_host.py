@@ -1457,6 +1457,11 @@ class RunnerHost:
         from concurrent.futures import ThreadPoolExecutor
         import disk_quota
         record = self.data['disk_quota'] = {}
+        control = record['setter_positive_control'] = json.loads(self.execute(
+            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
+        self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)
+        if not disk_quota.positive_control_passed(control):
+            raise ValueError('unfiltered XFS attribute positive control failed')
         argv = self.route(sid, directory, public)
         with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
             with tempfile.TemporaryDirectory(prefix='boat-quota-client-') as storage:
@@ -1472,6 +1477,11 @@ class RunnerHost:
                     row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
                     for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup']).items():
                         self.check('disk_quota.' + lane + '.' + name, passed, row)
+                    status = disk_quota.file_setattr_status(row['result'], control)
+                    reason = ('unfiltered root file_setattr returned ENOSYS; kernel/inherited policy cannot distinguish the job filter; uname -r: '
+                              + control.get('kernel_release', 'unknown')) if status == 'INCONCLUSIVE' else None
+                    self.check('disk_quota.' + lane + '.file_setattr_refusal', status == 'PASS',
+                               {'control': control, 'job': row['result'], 'observation_gap': reason}, status=status, reason=reason)
                     if lane == 'tmp':
                         record['at_limit'] = row['at_limit']
                     if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
