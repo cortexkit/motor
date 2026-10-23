@@ -663,6 +663,56 @@ The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
 `--free-space-eviction-bytes` optionally overrides the soft goal and must exceed
 the floor, otherwise the original twice-floor rule applies.
 
+### Per-job disk quota
+
+The Boat state mount uses XFS `prjquota,discard`; startup refuses a mount without
+project enforcement. `discard` returns freed loop-image extents to the outer
+filesystem, rather than leaving an ever-growing sparse file after eviction.
+Existing images must be rebuilt/remounted while services are stopped; a live
+remount cannot safely enable XFS project quotas.
+
+For **Boat only**, after trusted checkout/dependency preparation and before job
+code, the runner assigns the workspace (including its target bind), private
+runtime (HOME, both temporary directories, raw stdout/stderr and the preallocated
+exit inode), and incoming spool to one project. Shared Cargo registry/Git,
+rustup and tool binaries are read-only job mounts. Private Cargo/Bun cache writes
+are under HOME. `/dev/shm` is a separate, memory-cgroup-bounded tmpfs: it cannot
+be charged to XFS and remains memory-limited instead. Binds of an unexpected
+filesystem fail setup, rather than silently escaping the quota.
+
+Additional growth is capped at 32 GiB and calculated from
+`min(XFS available bytes, / available bytes) - provisional reserve - replay tail
+allowance - outstanding job reservations`, rounded down to 512 bytes. The **24
+GiB snapshot/cleanup reserve is provisional**, reusing the existing admission
+floor; it is **not** a measured upper bound on Boat's snapshot staging. The
+runner also withholds the existing 64-MiB replay-tail maximum from growth.
+Already-present workspace blocks are charged as initial usage, not mistakenly
+treated as free growth. Inodes have a hard additional cap of 65,536, leaving
+8,192 available for runner bookkeeping. A flock serializes allocation and
+cleanup, and durable leases retain outstanding reservations across restart.
+
+Block/inode hard-limit failures stay inside the job as EDQUOT (or ENOSPC).
+Start logs include both filesystems' available bytes and the job allowance.
+The kernel's `VFS_DQUOT` project hard-limit notifications produce a warning and
+a private hit marker even if the job subsequently unlinks its fill file;
+cleanup logs whether a warning was observed. This requires the provider kernel's
+`CONFIG_QUOTA_NETLINK_INTERFACE`; quota setup fails closed if its events group
+is unavailable. Multicast notifications are observational, not a lossless audit
+log across runner crashes. The exit file's data block is allocated before job
+code and charged as initial project usage, so recording an exit overwrites
+existing storage. The separate runner reserve file is outside the project and
+remains available for terminal bookkeeping. After the cgroup is gone, runtime
+cleanup clears tree assignments, limits, hit markers and the lease. Workspace
+contents remain reusable and subject to normal idle/pressure eviction.
+
+Runner-written replay chunks/records and returned-file copies are not job
+writable mounts and retain their existing bounds; the fixed reserve protects
+them. Trusted dependency fetching and shared package-manager cache preparation
+precede quota installation and are **not** bounded by this job-code quota. A
+future writable bind from another filesystem must move onto this XFS volume or
+have an independently enforced filesystem quota deducted from the same budget;
+there is no unbounded writable-bind fallback.
+
 ### Project-inheritance protection
 
 Boat jobs always enter through the runner's PID namespace init, even when the

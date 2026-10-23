@@ -320,3 +320,34 @@ networking follows [Public URLs / raw TCP](https://docs.boat.dev/hosting) and
 [Firewall](https://docs.boat.dev/hosting/firewall): guest root rules, not an
 invented provider firewall API. No live provider assertion follows from these
 portable tests.
+## Disk-quota qualification
+
+The runner-host probe now fills the real dynamic quota (up to 32 GiB, with
+nonzero random data and fsync) immediately before its stop/resume cycle. It
+first tries native and compat attribute setters, requires EPERM, checks that a
+new file still inherits the job project, then fills that same directory. A
+preallocated barrier lets the root observer measure **both** root and XFS free
+space while the failed write's data is still present. It requires an actual
+kernel project-hard-limit warning, EDQUOT/ENOSPC and a normal failed terminal;
+then verifies lease cleanup, readiness, a normal next job, successful stop and
+resume, and a normal resumed job. Probe results retain `runner_host.disk_quota`,
+including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes`, so the
+provisional 24-GiB reserve can be tuned empirically rather than called measured.
+
+Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
+image. Use the existing credential reader and seed arguments:
+
+```sh
+set -o pipefail
+<key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
+  --size xlarge --verify-prepared-image <new-prepared-image> \
+  --cargo-seed-manifest <seed.json> --cargo-seed-archive <seed.tar.gz> \
+  --cargo-seed-sha256 <manifest-sha256> --acknowledge-tenant-one-private-cache \
+  --max-minutes 30 --output .cortexkit/internal-docs/research/boat-disk-quota
+```
+
+This is a real disk workload, not a portable unit test. A root-space emergency
+watchdog kills the probe job if containment fails and root headroom falls more
+than 64 MiB below the provisional reserve. Such a run is a qualification failure,
+not a successful quota result. Do not qualify an older image without the new
+quota and syscall filter. No live qualification is implied by green unit tests.

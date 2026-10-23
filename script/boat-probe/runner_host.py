@@ -1433,13 +1433,15 @@ class RunnerHost:
             # Do not restart, reconfigure or mount anything in the guest: that
             # would repair the startup order this mode is meant to observe.
             self.phase(sid, 'prepared_clone', directory, public, repository, client, first_started=started)
-            self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+            self.disk_quota(sid, directory, public, repository, client)
+            self.data['disk_quota']['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
             self.probe.wait_sandbox(sid, {'archived'})
-            self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
+            self.data['disk_quota']['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
             from probe import READY, required_checks_passed
             self.probe.wait_sandbox(sid, READY)
             self.probe.wait_hydrated(sid)
-            self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
+            resumed = self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
+            self.check_job('disk_quota.normal_job_after_stop_resume', resumed['node_modules_first']['result'], 0, marker='boat-node-modules')
             self.replay_cleanup(sid)
         self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
         self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
@@ -1449,6 +1451,29 @@ class RunnerHost:
         result = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout'])
         self.data['deferred_cleanup_replay'] = result
         self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
+
+    def disk_quota(self, sid, directory, public, repository, client):
+        from concurrent.futures import ThreadPoolExecutor
+        import disk_quota
+        record = self.data['disk_quota'] = {}
+        argv = self.route(sid, directory, public)
+        with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
+            with tempfile.TemporaryDirectory(prefix='boat-quota-client-') as storage:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    command = 'python3 -c ' + shlex.quote(disk_quota.JOB)
+                    pending = executor.submit(process, [str(client), address, str(repository), storage, command, '1'], timeout=1000)
+                    record['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.OBSERVER), timeout=950)['stdout'])
+                    result = pending.result()
+                record['client'] = result
+                record['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
+                record['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                for name, passed in disk_quota.checks(record['result'], record['at_limit'], record['cleanup']).items():
+                    self.check('disk_quota.' + name, passed, record)
+                normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
+                record['next_job'] = normal
+                self.check_job('disk_quota.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')
+        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.')):
+            raise ValueError('disk quota qualification failed; refusing stop/resume qualification')
 
     def _run(self):
         from probe import READY, cleanup, required_checks_passed
@@ -1543,12 +1568,14 @@ class RunnerHost:
                 self.data['create_from_snapshot']['seconds_to_hydrated'] = hydrated_at - start
                 self.phase(sid, "snapshot_clone", directory, public, repository, client, first_started=start,
                            pre_swap_install=pre_swap, hydrated_at=hydrated_at)
-                self.probe.request("POST", f"/sandboxes/{sid}/stop", {})
+                self.disk_quota(sid, directory, public, repository, client)
+                self.data['disk_quota']['stop'] = self.probe.request("POST", f"/sandboxes/{sid}/stop", {})
                 self.probe.wait_sandbox(sid, {"archived"})
-                self.probe.request("POST", f"/sandboxes/{sid}/resume", {})
+                self.data['disk_quota']['resume'] = self.probe.request("POST", f"/sandboxes/{sid}/resume", {})
                 self.probe.wait_sandbox(sid, READY)
                 self.probe.wait_hydrated(sid)
-                self.phase(sid, "resumed", directory, public, repository, client, hydrated_at=time.monotonic())
+                resumed = self.phase(sid, "resumed", directory, public, repository, client, hydrated_at=time.monotonic())
+                self.check_job('disk_quota.normal_job_after_stop_resume', resumed['node_modules_first']['result'], 0, marker='boat-node-modules')
                 self.replay_cleanup(sid)
                 before = self.data["phases"][1]["host"]["ssh_config"]
                 after = self.data["phases"][2]["host"]["ssh_config"]

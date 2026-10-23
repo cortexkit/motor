@@ -345,6 +345,7 @@ class RecipeTests(unittest.TestCase):
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
+        self.assertIn('Options=loop,noatime,prjquota,discard', mount)
         for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
@@ -398,14 +399,26 @@ class RecipeTests(unittest.TestCase):
 
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
-             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=0']), \
              self.assertRaisesRegex(RuntimeError, 'reflink enabled'):
             start.check_storage()
         with tempfile.TemporaryDirectory() as tmp, patch.object(start, 'STATE', Path(tmp)), \
              patch.object(start, 'USERS', Path(tmp)), patch.object(start, 'mounts', return_value=[]), \
              patch.object(start, 'state_mount'), patch.object(start, 'users_mount'), \
-             patch.object(start.subprocess, 'check_output', return_value='reflink=1'), \
+             patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=1']), \
              patch.object(start.fcntl, 'ioctl', side_effect=OSError(95, 'unsupported')), self.assertRaises(OSError):
+             start.check_storage()
+
+    def test_storage_requires_enforced_project_quota(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,noquota'), \
+             self.assertRaisesRegex(RuntimeError, 'requires enforced XFS project quotas'):
+            start.check_storage()
+
+    def test_storage_requires_discard_for_outer_disk_reclamation(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,prjquota'), \
+             self.assertRaisesRegex(RuntimeError, 'requires discard'):
             start.check_storage()
 
     def test_prepare_storage_never_mounts_over_nonempty_views(self):

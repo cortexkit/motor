@@ -233,6 +233,11 @@ def empty_mountpoint(path):
 def check_storage():
     rows = mounts()
     state, users = state_mount(rows), users_mount(rows)
+    options = subprocess.check_output(['/usr/bin/findmnt', '-n', '-o', 'OPTIONS', '--target', str(STATE)], text=True)
+    if not ({'prjquota', 'pquota'} & set(options.strip().split(','))):
+        raise RuntimeError('Boat state disk requires enforced XFS project quotas')
+    if 'discard' not in options.strip().split(','):
+        raise RuntimeError('Boat state disk requires discard to reclaim sparse backing space')
     geometry = subprocess.check_output(['/usr/sbin/xfs_info', str(STATE)], text=True)
     if not re.search(r'\breflink=1\b', geometry):
         raise RuntimeError(f'{STATE} does not have XFS reflink enabled')

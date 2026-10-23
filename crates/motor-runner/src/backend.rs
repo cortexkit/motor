@@ -721,6 +721,19 @@ impl Backend for HostBackend {
                 }),
             )?;
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
+            if config.boat_profile {
+                let runtime = trees.state.join("sandboxes").join(s.id.to_string());
+                let spool = trees.state.join("spools").join(s.id.to_string());
+                fs::create_dir_all(&spool)?;
+                setup_step(
+                    "install Boat job disk quota",
+                    crate::boat_quota::prepare(
+                        &trees.state,
+                        s.id,
+                        vec![path.clone(), target.clone(), runtime, spool],
+                    ),
+                )?;
+            }
             wrapper = sandbox.wrapper.clone();
             Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
         } else {

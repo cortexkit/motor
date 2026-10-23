@@ -1847,6 +1847,7 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
 
 pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
     let _access = crate::tree_access::lock(path);
+    crate::boat_quota::release_runtime(path)?;
     // ACLs alone cannot override sticky-directory unlink rules. Once the job's
     // cgroup is gone, reclaim the entire private tree (including nested sticky
     // directories and root-owned mount ancestors), without following symlinks.
@@ -1946,7 +1947,7 @@ pub(crate) struct Sandbox {
     private_pids: bool,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
-    /// Set for Boat jobs on systemd before 257: the identity the PID namespace
+    /// Set for Boat jobs: the identity the PID namespace
     /// init drops to (see `pid_init`).
     pid_init: Option<pid_init::JobIdentity>,
     provider_unset_env: Vec<String>,
@@ -2914,7 +2915,7 @@ impl Sandbox {
         self.pid_init = identity;
         self
     }
-    /// Boat sandboxes on systemd before 257 start the unit as root and run
+    /// Boat sandboxes start the unit as root and run
     /// the runner's PID namespace init in front of the wrapper.
     fn uses_pid_init(&self) -> bool {
         self.boat_profile && !self.private_pids

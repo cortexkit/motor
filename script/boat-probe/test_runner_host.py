@@ -865,14 +865,21 @@ class RunnerHostTests(unittest.TestCase):
         runner = host.RunnerHost(probe)
         order = []
         probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
-        runner.phase = Mock(side_effect=lambda sid, label, *args, **kwargs: order.append(label))
+        def phase(sid, label, *args, **kwargs):
+            order.append(label)
+            return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules'}}}
+        runner.phase = Mock(side_effect=phase)
+        def disk_quota(*args):
+            order.append('disk_quota')
+            runner.data['disk_quota'] = {}
+        runner.disk_quota = Mock(side_effect=disk_quota)
         runner.replay_cleanup = Mock(side_effect=lambda sid: order.append('cleanup_replay'))
         runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
         with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
              patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe':Mock(READY={'running'})}):
             Path(tmp, '.cortexkit').mkdir()
             runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
-        self.assertEqual(order, ['hydrated', 'prepared_clone', 'hydrated', 'resumed', 'cleanup_replay'])
+        self.assertEqual(order, ['hydrated', 'prepared_clone', 'disk_quota', 'hydrated', 'resumed', 'cleanup_replay'])
         runner.execute.assert_not_called()
         probe.create.assert_called_once_with('prepared')
 

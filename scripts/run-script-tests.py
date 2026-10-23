@@ -25,6 +25,7 @@ TEST_FILES = [
     "script/boat-probe/test_runner_prerequisites.py",
     "script/boat-probe/test_runner_host.py",
     "script/boat-probe/test_resources.py",
+    "script/boat-probe/test_disk_quota.py",
     "script/boat-image/test_boat_image.py",
     "script/cache-bench/test_bench.py",
     "script/cache-bench/test_schedule.py",

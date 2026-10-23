@@ -87,8 +87,7 @@ pub struct Config {
     pub(crate) private_pids: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_unset_environment: Vec<String>,
-    /// The job account's ids, set when Boat jobs run the runner's PID
-    /// namespace init because systemd lacks PrivatePIDs.
+    /// The job account's ids for Boat's PID namespace init and quota filter.
     #[cfg(target_os = "linux")]
     pub(crate) pid_init: Option<crate::isolation::pid_init::JobIdentity>,
     /// Root-private tenant channels instead of vsock, only when explicitly set.

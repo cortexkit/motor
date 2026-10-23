@@ -1,6 +1,10 @@
 //! Durable, instance-scoped remote execution. The Unix transport is also usable
 //! in-process: bind a scratch socket and pass a cloned [`Runner`] to [`serve`].
 mod backend;
+#[cfg(target_os = "linux")]
+mod boat_quota;
+#[cfg(target_os = "linux")]
+mod boat_quota_events;
 mod cleanup;
 #[cfg(any(target_os = "linux", test))]
 mod compile_cache;
@@ -93,7 +97,7 @@ pub fn check_javascript_setup(
 ) -> std::io::Result<String> {
     isolation::check_javascript_setup(&isolation::JavascriptTools::for_config(config), scratch)
 }
-/// PID 1 of a Boat job's PID namespace on systemd before 257; the job unit
+/// PID 1 of a Boat job's PID namespace; the job unit
 /// execs the installed runner in this mode. Never returns.
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
