@@ -80,8 +80,13 @@ with tempfile.TemporaryDirectory(prefix='cache-bench-driver-',dir='/dev/shm') as
   raise RuntimeError('reserved benchmark root must be an operator-owned directory')
  report={'fills':{},'complete':True}
  for repo in payload['repositories']:
-  shutil.rmtree(root)
-  root.mkdir(mode=0o700)
+  # Empty the reserved root rather than replacing it: it sits in a root-owned
+  # parent the operator account can't write, so it must never be removed.
+  for child in root.iterdir():
+   if child.is_dir() and not child.is_symlink():
+    shutil.rmtree(child)
+   else:
+    child.unlink()
   bundle=pathlib.Path(payload['server_assets'])/(repo['name']+'.tar.gz')
   subprocess.run(['tar','-xzf',str(bundle),'-C',str(root)],check=True)
   output=pathlib.Path(payload['server_assets'])/'fills'/repo['name']
@@ -200,7 +205,10 @@ def fill(args, repositories, configs):
                              'python3 -c ' + shlex.quote(REMOTE_FILL)], input=json.dumps(payload).encode(),
                             capture_output=True, timeout=4 * TTL, env=transport_env())
     if result.returncode:
-        raise bench.BenchError('server fill failed; inspect private server evidence, never retry into a nonempty prefix')
+        # The last stderr line is the remote exception; bench errors never carry credentials.
+        lines = result.stderr.decode(errors='replace').strip().splitlines()
+        cause = lines[-1][:300] if lines else 'no error output'
+        raise bench.BenchError(f'server fill failed: {cause}; inspect private server evidence, never retry into a nonempty prefix')
     report = json.loads(result.stdout)
     for name, data in report['fills'].items():
         output = args.output / name
