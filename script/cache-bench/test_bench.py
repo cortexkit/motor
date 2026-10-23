@@ -34,6 +34,7 @@ class _Connection:
     """Fails the first request sent on each instance that the test marks stale."""
     made = []
     stale = set()
+    sock = None
     def __init__(self, host, timeout):
         self.number = len(_Connection.made)
         _Connection.made.append(self)
@@ -182,21 +183,42 @@ class ParsingTests(unittest.TestCase):
             bench.parse_stats('{"stats":{}}')
 
     def test_latency_counts_exactly_200_real_gets_and_nearest_rank_percentiles(self):
+        clock = [0.0]
         class Fake:
             events = []
             bucket = 'motor-cache-test'
             def objects(self, prefix):
                 return [prefix + 'a', prefix + 'b']
-            def request(self, method, path):
+            def request(self, method, path, timeout):
+                clock[0] += (len(self.events) + 1) / 1000
                 self.events.append({'method': method, 'status': 200, 'bytes_downloaded': 11,
                                     'seconds': (len(self.events) + 1) / 1000})
                 return 200, {}, b'cache entry'
-        result = bench.latency_probe(Fake(), PREFIX)
+        with patch.object(bench.time, 'perf_counter', side_effect=lambda: clock[0]):
+            result = bench.latency_probe(Fake(), PREFIX)
         self.assertEqual((result['samples'], result['distinct_objects']), (200, 2))
-        self.assertEqual(result['p50_get_ms'], 100)
-        self.assertEqual(result['p95_get_ms'], 190)
+        self.assertAlmostEqual(result['p50_get_ms'], 100)
+        self.assertAlmostEqual(result['p95_get_ms'], 190)
         self.assertEqual(result['transfer']['bytes_downloaded'], 2200)
         self.assertEqual(result['transfer']['request_count'], 200)
+
+    def test_fetch_errors_and_timeouts_survive_and_later_fetches_proceed(self):
+        class Fake:
+            events = []
+            bucket = 'motor-cache-test'
+            count = 0
+            def objects(self, prefix):
+                return [prefix + 'a']
+            def request(self, *args, **kwargs):
+                self.count += 1
+                if self.count == 1:
+                    raise bench.BenchTimeout('withheld')
+                return (503 if self.count == 2 else 200), {}, b'entry'
+        result = bench.latency_probe(Fake(), PREFIX)
+        self.assertEqual(len(result['records']), 200)
+        self.assertEqual(result['failures'], 2)
+        self.assertEqual(sum(r['timeout'] for r in result['records']), 1)
+        self.assertEqual(len(result['get_seconds']), 198)
 
     def test_sigv4_uses_selected_region_and_signs_storage_class(self):
         headers = bench.signed_headers('PUT', '/motor-cache-test/a', '', b'', 'id', 'secret',
@@ -327,6 +349,19 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(s3.calls[0][3]['extra'], {'range': 'bytes=0-0'})
         self.assertEqual(len(client.events), 1)
 
+    def test_gateway_upstream_timeout_is_preserved_in_tiny_get_records(self):
+        s3 = self.S3()
+        with patch.object(s3, 'request', side_effect=bench.BenchTimeout('withheld')), \
+                bench.Gateway(s3, PREFIX, False) as gateway:
+            client = bench.GatewayClient(gateway)
+            try:
+                result = bench.rtt_probe(client, PREFIX + 'hash', seconds=.05)
+            finally:
+                client.close()
+        records = result['tiny_get']['records']
+        self.assertGreater(len(records), 0)
+        self.assertTrue(all(not r['ok'] and r['timeout'] and r['status'] == 504 for r in records))
+
     def test_authentication_error_body_cannot_leak_access_id_to_sccache(self):
         s3 = self.S3()
         with patch.object(s3, 'request', return_value=(403, {}, b'<AccessKeyId>PRIVATE-ID</AccessKeyId>')), \
@@ -386,8 +421,8 @@ class WorkloadTests(unittest.TestCase):
             result = bench.workload('sample', {'X': 'same'}, Path(tmp), True)
         clean.assert_called_once_with(bench.TARGET, ignore_errors=True)
         self.assertEqual([call.args[0] for call in run.call_args_list],
-                         [['cargo', 'build', '--locked', '--workspace'],
-                          ['cargo', 'test', '--no-run', '--locked', '--workspace']])
+                          [['cargo', 'build', '--locked', '--workspace', '--timings'],
+                           ['cargo', 'test', '--no-run', '--locked', '--workspace', '--timings']])
         self.assertEqual(command.call_args_list[-1].args[0], ['sccache', '--stop-server'])
         self.assertEqual(result['sccache']['requests'], 2)
 
@@ -408,7 +443,11 @@ class WorkloadTests(unittest.TestCase):
 
 
 class ScheduleTests(unittest.TestCase):
-    def exercise(self, placement):
+    def test_fill_profile_refuses_boat_before_any_measurement(self):
+        with self.assertRaisesRegex(bench.BenchError, 'Boat is read-only'):
+            bench.benchmark(argparse.Namespace(profile='fill', placement='B'), object())
+
+    def exercise(self, placement, profile='legacy', baseline=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'fixed'
             root.mkdir()
@@ -443,11 +482,12 @@ class ScheduleTests(unittest.TestCase):
                     patch.object(bench, 'latency_probe', return_value={'samples': 200, 'p50_get_ms': 1,
                         'p95_get_ms': 2, 'transfer': {'bytes_downloaded': 400}}) as latency, \
                     contextlib.redirect_stdout(io.StringIO()):
-                bench.benchmark(argparse.Namespace(placement=placement, output=output, prefix=PREFIX), S3())
+                bench.benchmark(argparse.Namespace(placement=placement, output=output, prefix=PREFIX,
+                                                   profile=profile, baseline=baseline), S3())
             result = json.loads((output / 'results.json').read_text())
             self.assertTrue(result['complete'])
-            self.assertEqual(len(latency.call_args_list), 2)
-            self.assertEqual(rtt.call_count, 2)
+            self.assertEqual(len(latency.call_args_list), 0 if profile in ('fill', 'baseline') else 2)
+            self.assertEqual(rtt.call_count, 0 if profile in ('fill', 'baseline') else 2)
             return calls
 
     def test_a_fills_its_own_backend_and_reads_three_times_plus_local_floor(self):
@@ -469,8 +509,43 @@ class ScheduleTests(unittest.TestCase):
         prefixes = [call[1]['SCCACHE_S3_KEY_PREFIX'] for call in calls[1:]]
         self.assertEqual(prefixes.count(PREFIX), 3)
 
+    def test_hourly_only_reads_and_optional_baseline_never_fills(self):
+        calls = self.exercise('B', profile='hourly')
+        self.assertEqual([c[0] for c in calls], [f'remote-read-only-{i}' for i in range(1, 4)])
+        self.assertTrue(all(c[1]['SCCACHE_S3_RW_MODE'] == 'READ_ONLY' for c in calls))
+        calls = self.exercise('B', profile='hourly', baseline=True)
+        self.assertEqual(calls[0][0], 'no-cache')
+        self.assertEqual(len(calls), 4)
+
+    def test_fill_only_writes_once_and_calibration_only_builds_uncached(self):
+        calls = self.exercise('A', profile='fill')
+        self.assertEqual([c[0] for c in calls], ['remote-fill'])
+        calls = self.exercise('B', profile='baseline')
+        self.assertEqual([c[0] for c in calls], ['no-cache'])
+
+    def test_network_profile_never_checks_toolchain_or_runs_builds(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bench, 'workload') as workload, \
+                patch.object(bench, 'versions') as versions, \
+                patch.object(bench, 'network_probes', return_value={'runs': [], 'complete': True}) as probes:
+            bench.benchmark(argparse.Namespace(profile='network', prefix=PREFIX, placement='A',
+                                               output=Path(tmp) / 'output'), object())
+        workload.assert_not_called()
+        versions.assert_not_called()
+        self.assertFalse(probes.call_args.kwargs['gateway'])
+
 
 class MatrixTests(unittest.TestCase):
+    def test_nonempty_second_class_refuses_before_any_fill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configs = [{'name': name, 'credentials': '/fake'} for name in ('standard', 'hp')]
+            args = argparse.Namespace(profile='fill', placement='A', prefix=PREFIX, output=Path(tmp) / 'out')
+            with patch.object(bench, 'credentials', return_value=('endpoint', 'id', 'secret')), \
+                    patch.object(bench, 'S3') as s3, patch.object(bench, 'benchmark') as benchmark:
+                s3.return_value.objects.side_effect = [[], ['existing-object']]
+                with self.assertRaisesRegex(bench.BenchError, 'no fills started'):
+                    bench.matrix(args, configs)
+            benchmark.assert_not_called()
+
     def test_available_subset_fills_independently_and_missing_keys_are_explicitly_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

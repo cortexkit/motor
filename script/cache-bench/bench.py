@@ -37,6 +37,10 @@ class BenchError(Exception):
     pass
 
 
+class BenchTimeout(BenchError):
+    pass
+
+
 def credentials(path, config=None):
     """Never include file contents or parser exceptions in errors."""
     mode = path.stat().st_mode
@@ -100,6 +104,39 @@ def load_backends(args):
             path = args.backends.resolve().parent / path
         value['credentials'] = str(path.absolute())
     return configs
+
+
+def bundle_manifest(path):
+    with tarfile.open(path) as archive:
+        stream = archive.extractfile('manifest.json')
+        if stream is None:
+            raise BenchError('bundle has no manifest')
+        return json.load(stream)
+
+
+def load_repositories(path):
+    values = json.loads(path.read_text())
+    if not isinstance(values, list) or not values:
+        raise BenchError('repositories must be a nonempty JSON array')
+    result = []
+    for item in values:
+        if (not isinstance(item, dict) or set(item) != {'name', 'bundle', 'bundle_sha256', 'prefix'} or
+                item['name'] not in ('motor', 'prefrontal', 'broca') or
+                not re.fullmatch('[0-9a-f]{64}', item['bundle_sha256'])):
+            raise BenchError('repository requires name, bundle, bundle_sha256 and prefix')
+        prefix_arg(item['prefix'])
+        bundle = Path(item['bundle']).expanduser()
+        if not bundle.is_absolute():
+            bundle = path.resolve().parent / bundle
+        if sha(bundle) != item['bundle_sha256']:
+            raise BenchError('repository bundle digest differs from independently recorded digest')
+        manifest = bundle_manifest(bundle)
+        if manifest.get('repository', 'motor') != item['name']:
+            raise BenchError('bundle repository differs from repository manifest')
+        result.append(dict(item, bundle=str(bundle)))
+    if len({r['name'] for r in result}) != len(result) or len({r['prefix'] for r in result}) != len(result):
+        raise BenchError('repository names and prefixes must be unique')
+    return result
 
 
 def prefix_arg(value):
@@ -182,7 +219,7 @@ def prepare(args):
         source = args.cargo_home / relative
         if source.exists():
             shutil.copytree(source, CARGO_HOME / relative, symlinks=False)
-    manifest = {'schema': 1, 'commit': args.commit, 'toolchain': args.toolchain,
+    manifest = {'schema': 1, 'repository': args.repository, 'commit': args.commit, 'toolchain': args.toolchain,
                 'jobs': args.jobs, 'versions': info, 'checkout': str(CHECKOUT),
                 'cargo_home': str(CARGO_HOME), 'lock_sha256': sha(CHECKOUT / 'Cargo.lock'),
                 'source_sha256': source_sha(), 'driver_sha256': sha(Path(__file__))}
@@ -221,9 +258,10 @@ def signed_headers(method, path, query, body, access, secret, now=None, extra=No
 
 class _Transport(Exception):
     """A request that failed below HTTP, before or while reading the response."""
-    def __init__(self, message, reused):
+    def __init__(self, message, reused, timed_out=False):
         super().__init__(message)
         self.message, self.reused = message, reused
+        self.timed_out = timed_out
 
 
 class S3:
@@ -251,11 +289,11 @@ class S3:
             # idempotent, so a reused connection that fails is retried once on
             # a new one; a failure on a new connection is real.
             if not first.reused:
-                raise BenchError(first.message) from None
+                raise (BenchTimeout if first.timed_out else BenchError)(first.message) from None
             try:
                 return self._send(method, path, query, body, extra, True, timeout)
             except _Transport as second:
-                raise BenchError(second.message) from None
+                raise (BenchTimeout if second.timed_out else BenchError)(second.message) from None
 
     def _send(self, method, path, query, body, extra, fresh, timeout):
         if fresh and getattr(self.local, 'connection', None):
@@ -267,6 +305,9 @@ class S3:
         connection = self.local.connection
         if connection is None:
             raise BenchError('object-storage connection was not initialized')
+        connection.timeout = timeout
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
         start = time.perf_counter()
         status, data = 0, b''
         try:
@@ -285,7 +326,7 @@ class S3:
             # may carry the signed URL, so it stays withheld.
             raise _Transport(f'object-storage transport failure: {method} {type(error).__name__}'
                              f' on a {"reused" if reused else "new"} connection (details withheld)',
-                             reused) from None
+                              reused, isinstance(error, TimeoutError)) from None
         finally:
             with self.lock:
                 self.events.append({'method': method, 'status': status, 'bytes_downloaded': len(data),
@@ -389,8 +430,9 @@ class Gateway:
                     if self.headers.get('Range'):
                         extra['range'] = self.headers['Range']
                     fresh = self.headers.get('X-Cache-Bench-Fresh') == '1'
+                    probe = self.headers.get('X-Cache-Bench-Probe') == '1'
                     status, headers, data = gateway.s3.request(self.command, parsed.path, body=body, extra=extra,
-                                                              fresh=fresh, timeout=5 if fresh else 120)
+                                                              fresh=fresh, timeout=5 if fresh or probe else 120)
                     if status >= 300:
                         # S3 authentication error XML can echo the access ID; never forward it to logs.
                         data = b''
@@ -404,6 +446,8 @@ class Gateway:
                     self.end_headers()
                     if self.command != 'HEAD':
                         self.wfile.write(data)
+                except BenchTimeout:
+                    self.send_error(504, 'object-storage timeout')
                 except (ValueError, BenchError, OSError):
                     self.send_error(502, 'object-storage request failed')
 
@@ -475,20 +519,24 @@ class GatewayClient:
             self.connection = None
         if self.connection is None:
             self.connection = http.client.HTTPConnection(*self.connect_address, timeout=timeout)
+        self.connection.timeout = timeout
+        if self.connection.sock is not None:
+            self.connection.sock.settimeout(timeout)
         start = time.perf_counter()
         status, data = 0, b''
         try:
             headers = dict(extra or {})
+            headers['X-Cache-Bench-Probe'] = '1'
             if fresh:
                 headers['X-Cache-Bench-Fresh'] = '1'
             self.connection.request(method, path, body, headers)
             response = self.connection.getresponse()
             status, data = response.status, response.read()
             return status, dict(response.getheaders()), data
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException) as error:
             self.connection.close()
             self.connection = None
-            raise BenchError('gateway probe transport failure') from None
+            raise (BenchTimeout if isinstance(error, TimeoutError) else BenchError)('gateway probe transport failure') from None
         finally:
             self.events.append({'method': method, 'status': status, 'bytes_downloaded': len(data),
                                 'seconds': time.perf_counter() - start})
@@ -499,29 +547,39 @@ class GatewayClient:
 
 
 def rtt_probe(client, key, seconds=30):
-    tcp, tiny, failures = [], [], 0
+    tcp, tiny = [], []
     before_events = len(client.events)
     start = time.perf_counter()
     until = start + seconds
     while time.perf_counter() < until:
         timeout = max(.01, min(5, until - time.perf_counter()))
-        try:
+        for kind, records in (('tcp', tcp), ('tiny', tiny)):
             before = time.perf_counter()
-            with socket.create_connection(client.connect_address, timeout=timeout):
-                tcp.append(time.perf_counter() - before)
-            before = time.perf_counter()
-            status, _, body = client.request('GET', object_path(key, client.bucket), extra={'range': 'bytes=0-0'},
-                                             fresh=True, timeout=timeout)
-            if status != 206 or len(body) != 1:
-                raise BenchError('tiny GET did not return one ranged byte')
-            tiny.append(time.perf_counter() - before)
-        except (OSError, BenchError):
-            failures += 1
+            record: dict = {'ok': False, 'timeout': False}
+            try:
+                if kind == 'tcp':
+                    with socket.create_connection(client.connect_address, timeout=timeout):
+                        pass
+                else:
+                    status, _, body = client.request('GET', object_path(key, client.bucket), extra={'range': 'bytes=0-0'},
+                                                     fresh=True, timeout=timeout)
+                    record['status'] = status
+                    record['timeout'] = status in (408, 504)
+                    if status != 206 or len(body) != 1:
+                        raise BenchError('tiny GET did not return one ranged byte')
+                record['ok'] = True
+            except (OSError, BenchError) as error:
+                record['timeout'] = record['timeout'] or isinstance(error, (TimeoutError, BenchTimeout))
+                record['error_kind'] = type(error).__name__
+            record['seconds'] = time.perf_counter() - before
+            records.append(record)
         time.sleep(min(.1, max(0, until - time.perf_counter())))
     def summary(values):
-        return {'samples': len(values), 'p50_ms': percentile(values, .5) * 1000 if values else None,
-                'p95_ms': percentile(values, .95) * 1000 if values else None}
-    return {'seconds': time.perf_counter() - start, 'failures': failures,
+        good = [r['seconds'] for r in values if r['ok']]
+        return {'samples': len(good), 'records': values,
+                'p50_ms': percentile(good, .5) * 1000 if good else None,
+                'p95_ms': percentile(good, .95) * 1000 if good else None}
+    return {'seconds': time.perf_counter() - start, 'failures': sum(not r['ok'] for r in tcp + tiny),
             'tcp_connect': summary(tcp), 'tiny_get': summary(tiny),
             'transfer': transfer_summary(client.events[before_events:])}
 
@@ -531,16 +589,50 @@ def latency_probe(s3, prefix, samples=200):
     if not keys:
         raise BenchError('no real cache objects for latency probe; fill must succeed first')
     before = len(s3.events)
-    timings = []
+    timings, records = [], []
     for index in range(samples):
-        status, _, _ = s3.request('GET', object_path(keys[index % len(keys)], s3.bucket))
-        if status != 200:
-            raise BenchError(f'latency GET returned HTTP {status}')
-        timings.append(s3.events[-1]['seconds'])
+        start = time.perf_counter()
+        record: dict = {'ok': False, 'timeout': False}
+        try:
+            status, _, _ = s3.request('GET', object_path(keys[index % len(keys)], s3.bucket), timeout=5)
+            record['status'] = status
+            record['ok'] = status == 200
+            record['timeout'] = status in (408, 504)
+        except (OSError, BenchError) as error:
+            record['timeout'] = isinstance(error, (TimeoutError, BenchTimeout))
+            record['error_kind'] = type(error).__name__
+        record['seconds'] = time.perf_counter() - start
+        records.append(record)
+        if record['ok']:
+            timings.append(record['seconds'])
     return {'samples': samples, 'distinct_objects': min(samples, len(keys)),
-            'p50_get_ms': percentile(timings, .50) * 1000,
-            'p95_get_ms': percentile(timings, .95) * 1000,
+            'p50_get_ms': percentile(timings, .50) * 1000 if timings else None,
+            'p95_get_ms': percentile(timings, .95) * 1000 if timings else None,
+            'failures': sum(not r['ok'] for r in records), 'records': records,
             'transfer': transfer_summary(s3.events[before:]), 'get_seconds': timings}
+
+
+def dependency_timings(env):
+    """Sum Cargo unit durations, not wall time: parallel dependency units overlap."""
+    path = TARGET / 'cargo-timings/cargo-timing.html'
+    if not path.exists():
+        return None
+    parts = path.read_text().split('const UNIT_DATA =')
+    if len(parts) != 2:
+        raise BenchError('Cargo timing HTML has no recognized UNIT_DATA; calibration cannot infer dependency time')
+    units, _ = json.JSONDecoder().raw_decode(parts[1].lstrip())
+    metadata = json.loads(command(['cargo', 'metadata', '--offline', '--locked', '--format-version', '1'], env, CHECKOUT))
+    membership = {}
+    for package in metadata['packages']:
+        membership.setdefault((package['name'], package['version']), []).append(package['id'] in metadata['workspace_members'])
+    dependencies = []
+    for unit in units:
+        matches = membership.get((unit['name'], unit['version']), [])
+        if len(matches) != 1 or not isinstance(unit['duration'], (float, int)) or unit['duration'] < 0:
+            raise BenchError('Cargo timing unit is ambiguous or invalid; cannot classify dependency work')
+        if not matches[0]:
+            dependencies.append(unit)
+    return dependencies
 
 
 def workload(name, env, output, use_cache):
@@ -553,17 +645,20 @@ def workload(name, env, output, use_cache):
         if use_cache:
             command(['sccache', '--start-server'], env)
             command(['sccache', '--zero-stats'], env)
-        start = time.perf_counter()
-        for label, argv in (('build', ['cargo', 'build', '--locked', '--workspace']),
-                            ('test-no-run', ['cargo', 'test', '--no-run', '--locked', '--workspace'])):
+        for label, argv in (('build', ['cargo', 'build', '--locked', '--workspace', '--timings']),
+                             ('test-no-run', ['cargo', 'test', '--no-run', '--locked', '--workspace', '--timings'])):
             step_start = time.perf_counter()
             with (output / f'{name}-{label}.log').open('wb') as log:
                 result = subprocess.run(argv, cwd=CHECKOUT, env=env, stdout=log, stderr=subprocess.STDOUT)
             steps.append({'command': argv, 'seconds': time.perf_counter() - step_start,
-                          'exit_code': result.returncode})
+                           'exit_code': result.returncode})
             if result.returncode:
                 raise BenchError(f'{name} {label} failed; see workload log')
-        wall = time.perf_counter() - start
+            if name == 'no-cache':
+                units = dependency_timings(env)
+                steps[-1]['dependency_units'] = units
+                steps[-1]['dependency_unit_seconds'] = sum(u['duration'] for u in units) if units is not None else None
+        wall = sum(step['seconds'] for step in steps)
         if use_cache:
             stats = parse_stats(command(['sccache', '--show-stats', '--stats-format', 'json'], env))
     finally:
@@ -640,7 +735,51 @@ def save(output, data):
     (output / 'results.md').write_text(render(data))
 
 
+def network_probes(s3, prefix, gateway=True, checkpoint=lambda result: None):
+    audit = verify_class(s3, prefix)
+    key = audit['sampled_objects'][0]['key']
+    result = {'runs': [], 'warnings': [], 'class_audit': audit, 'latency': {}, 'rtt': {}, 'complete': False}
+    checkpoint(result)
+    result['latency']['direct'] = latency_probe(s3, prefix)
+    checkpoint(result)
+    result['rtt']['direct'] = rtt_probe(s3, key)
+    checkpoint(result)
+    if gateway:
+        with Gateway(s3, prefix, False) as proxy:
+            client = GatewayClient(proxy)
+            try:
+                result['latency']['gateway'] = latency_probe(client, prefix)
+                checkpoint(result)
+                result['rtt']['gateway'] = rtt_probe(client, key)
+                checkpoint(result)
+            finally:
+                client.close()
+    result['complete'] = True
+    checkpoint(result)
+    return result
+
+
+def result_status(result):
+    if result.get('class_audit', {}).get('matches_requested') is False:
+        return 'class-mismatch'
+    if result.get('warnings'):
+        return 'cache-warnings'
+    if any(p.get('failures', 0) for group in ('latency', 'rtt') for p in result.get(group, {}).values()):
+        return 'probe-errors'
+    return 'passed'
+
+
 def benchmark(args, s3):
+    profile = getattr(args, 'profile', 'legacy')
+    if profile == 'fill' and args.placement != 'A':
+        raise BenchError('fill profile requires server placement A; Boat is read-only')
+    if profile == 'network':
+        args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
+        data = dict(network_probes(s3, args.prefix, gateway=False,
+                                  checkpoint=lambda partial: save(args.output, dict(partial, placement=args.placement))),
+                    placement=args.placement)
+        save(args.output, data)
+        return data
     if ROOT.is_symlink() or ROOT.resolve() != ROOT or CHECKOUT.resolve() != CHECKOUT or CARGO_HOME.resolve() != CARGO_HOME:
         raise BenchError('fixed checkout/CARGO_HOME paths must not be symlinks')
     manifest = json.loads((ROOT / 'manifest.json').read_text())
@@ -703,29 +842,32 @@ def benchmark(args, s3):
             data['warnings'].append(name + ': no cache hits; check path/toolchain parity')
 
     try:
-        existing = list(s3.objects(args.prefix))
-        if args.placement == 'A' and existing:
+        existing = [] if profile == 'baseline' else list(s3.objects(args.prefix))
+        filling = profile == 'fill' or profile == 'legacy' and args.placement == 'A'
+        if filling and existing:
             raise BenchError('fill prefix is not empty; choose a new prefix or explicitly --purge it')
-        if args.placement == 'B' and not existing:
+        if profile != 'baseline' and not filling and not existing:
             raise BenchError('A must fill this prefix before B runs')
-        run('no-cache', 'none')
-        if args.placement == 'A':
+        if profile in ('legacy', 'baseline') or getattr(args, 'baseline', False):
+            run('no-cache', 'none')
+        if profile == 'baseline':
+            data['complete'] = True
+            return data
+        if filling:
             run('remote-fill', 'remote', fill=True)
         data['class_audit'] = verify_class(s3, args.prefix)
+        if profile == 'fill':
+            data['complete'] = True
+            return data
         for number in range(1, 4):
             run(f'remote-read-only-{number}', 'remote')
-        data['latency'] = {'direct': latency_probe(s3, args.prefix)}
-        key = data['class_audit']['sampled_objects'][0]['key']
-        data['rtt'] = {'direct': rtt_probe(s3, key)}
-        with Gateway(s3, args.prefix, False) as gateway:
-            client = GatewayClient(gateway)
-            try:
-                data['latency']['gateway'] = latency_probe(client, args.prefix)
-                data['rtt']['gateway'] = rtt_probe(client, key)
-            finally:
-                client.close()
+        def record_probes(partial):
+            data.update({key: partial[key] for key in ('class_audit', 'latency', 'rtt')})
+            save(output, data)
+        probes = network_probes(s3, args.prefix, checkpoint=record_probes)
+        data.update({key: probes[key] for key in ('class_audit', 'latency', 'rtt')})
         save(output, data)
-        if args.placement == 'A':
+        if profile == 'legacy' and args.placement == 'A':
             shutil.rmtree(ROOT / 'local-cache', ignore_errors=True)
             run('local-fill', 'local')
             run('local-warm', 'local')
@@ -739,30 +881,36 @@ def benchmark(args, s3):
     return data
 
 
-def matrix(args, configs):
+def matrix(args, configs, clients=None):
     if args.output.resolve() == ROOT or ROOT in args.output.resolve().parents:
         raise BenchError('output must be outside /srv/cache-bench')
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {'schema': 1, 'placement': args.placement, 'backends': [], 'complete': False}
     save(args.output, report)
+    if getattr(args, 'profile', 'legacy') == 'fill':
+        # Check every class before any PUT, so a stale second prefix cannot cause a partial refill.
+        for config in configs:
+            s3 = clients[config['name']] if clients is not None else S3(*credentials(Path(config['credentials']), config), config)
+            if list(s3.objects(args.prefix + config['name'] + '/')):
+                raise BenchError('fill prefix is not empty; no fills started')
     for config in configs:
         entry = {key: config.get(key) for key in ('name', 'bucket', 'region', 'addressing', 'storage_class')}
         entry['placement'] = args.placement
         report['backends'].append(entry)
         path = Path(config['credentials'])
-        if not path.exists():
+        if clients is None and not path.exists():
             entry.update(status='skipped', reason='credential file unavailable')
             save(args.output, report)
             continue
         try:
-            s3 = S3(*credentials(path, config), config)
+            s3 = clients[config['name']] if clients is not None else S3(*credentials(path, config), config)
             backend_args = argparse.Namespace(placement=args.placement, output=args.output / config['name'],
-                                              prefix=args.prefix + config['name'] + '/')
+                                              prefix=args.prefix + config['name'] + '/',
+                                              profile=getattr(args, 'profile', 'legacy'),
+                                              baseline=getattr(args, 'baseline', False) and not report['backends'][:-1])
             entry['result'] = benchmark(backend_args, s3)
             result = entry['result']
-            entry['status'] = ('class-mismatch' if result['class_audit']['matches_requested'] is False else
-                               'cache-warnings' if result['warnings'] else
-                               'probe-errors' if any(probe['failures'] for probe in result['rtt'].values()) else 'passed')
+            entry['status'] = result_status(result)
         except (Exception, KeyboardInterrupt) as error:
             entry.update(status='failed', error=str(error) if isinstance(error, BenchError) else type(error).__name__)
             partial = args.output / config['name'] / 'results.json'
@@ -779,6 +927,164 @@ def matrix(args, configs):
     return report['complete']
 
 
+def distribution(values):
+    return {'n': len(values), **{label: percentile(values, fraction) if values else None
+                               for label, fraction in (('p50', .5), ('p95', .95), ('p99', .99))}}
+
+
+def measured_records(result):
+    for route, probe in result.get('latency', {}).items():
+        yield route, 'full-get', probe.get('records', [])
+    for route, probes in result.get('rtt', {}).items():
+        for kind in ('tcp_connect', 'tiny_get'):
+            yield route, kind, probes[kind].get('records', [])
+
+
+def summarize_data(directory):
+    state = json.loads((directory / 'state.json').read_text())
+    groups, hourly = {}, []
+    for hour in state['iterations']:
+        for leg, placement in (('boat', 'B'), ('server', 'A')):
+            path = hour.get(leg, {}).get('report')
+            if not path:
+                continue
+            report = json.loads((directory / path).read_text())
+            for entry in report['backends']:
+                repo = entry.get('repository', 'motor')
+                storage = entry.get('storage_class')
+                key = (storage, placement, repo)
+                group = groups.setdefault(key, {'storage_class': storage, 'placement': placement, 'repository': repo,
+                                                'rebuild_seconds': [], 'baseline_seconds': [], 'hits': 0, 'misses': 0,
+                                                'cache_errors': 0, 'probes': {}, 'hours': 0, 'failed_hours': 0})
+                group['hours'] += 1
+                group['failed_hours'] += entry['status'] != 'passed'
+                result = entry.get('result', {})
+                row = {'hour': hour['hour'], 'due_at': hour['due_at'], 'iteration_status': hour['status'],
+                       'storage_class': storage, 'placement': placement, 'repository': repo, 'status': entry['status'],
+                       'class_valid': result.get('class_audit', {}).get('matches_requested') is True,
+                       'returned_classes': result.get('class_audit', {}).get('returned', []),
+                       'probes': {}, 'rebuild_seconds': [], 'hits': 0, 'misses': 0, 'cache_errors': 0}
+                for run in result.get('runs', []):
+                    if run['name'] == 'no-cache':
+                        group['baseline_seconds'].append(run['wall_seconds'])
+                    if run['name'].startswith('remote-read-only-'):
+                        group['rebuild_seconds'].append(run['wall_seconds'])
+                        row['rebuild_seconds'].append(run['wall_seconds'])
+                        for field in ('hits', 'misses'):
+                            value = (run.get('sccache') or {}).get(field, 0)
+                            group[field] += value
+                            row[field] += value
+                        errors = sum((run.get('sccache') or {}).get(f, 0) for f in ('errors', 'read_errors', 'write_errors'))
+                        group['cache_errors'] += errors
+                        row['cache_errors'] += errors
+                for route, kind, records in measured_records(result):
+                    label = route + '/' + kind
+                    group['probes'].setdefault(label, []).extend(records)
+                    row['probes'][label] = probe_distribution(records)
+                row['rebuild_seconds'] = distribution(row['rebuild_seconds'])
+                hourly.append(row)
+    paired = []
+    by_hour = {}
+    for row in hourly:
+        if not row['class_valid']:
+            continue
+        by_hour.setdefault((row['hour'], row['placement'], row['repository']), {})[row['storage_class']] = row
+    for (hour, placement, repo), classes in sorted(by_hour.items()):
+        if not {'STANDARD', 'EXPRESS_ONEZONE'} <= classes.keys():
+            continue
+        a, b = classes['STANDARD'], classes['EXPRESS_ONEZONE']
+        metrics = {}
+        for label in a['probes'].keys() & b['probes'].keys():
+            for quantile in ('p50', 'p95', 'p99', 'error_rate', 'timeout_rate'):
+                left, right = a['probes'][label].get(quantile), b['probes'][label].get(quantile)
+                if left is not None and right is not None:
+                    metrics[label + '/' + quantile] = right - left
+        if a['rebuild_seconds']['n'] and b['rebuild_seconds']['n']:
+            metrics['rebuild/p50_seconds'] = b['rebuild_seconds']['p50'] - a['rebuild_seconds']['p50']
+        paired.append(dict(hour=hour, placement=placement, repository=repo, difference=metrics))
+    comparisons = {}
+    for row in paired:
+        for metric, delta in row['difference'].items():
+            comparisons.setdefault((row['placement'], row['repository'], metric), []).append(delta)
+    variation = []
+    for (placement, repo, metric), values in sorted(comparisons.items()):
+        median = percentile(values, .5)
+        iqr = percentile(values, .75) - percentile(values, .25)
+        statement = ('insufficient paired hours (need at least 6)' if len(values) < 6 else
+                     'median difference exceeds observed paired-hour IQR' if abs(median) > iqr else
+                     'median difference does not exceed observed paired-hour IQR')
+        variation.append(dict(placement=placement, repository=repo, metric=metric, paired_hours=len(values),
+                              median_difference=median, paired_hour_iqr=iqr, statement=statement))
+    baselines = {}
+    for group in groups.values():
+        group['hours_without_report'] = len(state['iterations']) - group['hours']
+        baselines.setdefault((group['placement'], group['repository']), []).extend(group['baseline_seconds'])
+    for group in groups.values():
+        group['rebuild_seconds'] = distribution(group['rebuild_seconds'])
+        group['baseline_seconds'] = distribution(baselines[(group['placement'], group['repository'])])
+        group['probes'] = {key: probe_distribution(value) for key, value in group['probes'].items()}
+    return {'schema': 1, 'groups': list(groups.values()), 'hourly': hourly, 'paired': paired,
+            'variation': variation, 'schedule': state['iterations']}
+
+
+def probe_distribution(records):
+    count = len(records)
+    return {**distribution([r['seconds'] * 1000 for r in records if r['ok']]),
+            'attempts': count, 'errors': sum(not r['ok'] for r in records),
+            'timeouts': sum(r['timeout'] for r in records),
+            'error_rate': sum(not r['ok'] for r in records) / count if count else None,
+            'timeout_rate': sum(r['timeout'] for r in records) / count if count else None}
+
+
+def summarize(directory):
+    report = summarize_data(directory)
+    def fmt(value):
+        return 'n/a' if value is None else f'{value:.3f}'
+    def dist(value):
+        return '/'.join(fmt(value[q]) for q in ('p50', 'p95', 'p99'))
+    lines = ['# Hourly cache comparison', '',
+             'Nearest-rank p50/p95/p99. Latency milliseconds include body read and any retry; successful requests only.',
+             'Error/timeout rates divide logical failed/timed-out probes by all attempted probes; timeouts are a subset of errors.',
+             'Unobserved hours are not successes or network errors. Rebuilds are cold-target Cargo seconds.',
+             'Baselines are class-independent; their distribution is repeated across the two class rows, not two builds.',
+             'Classes label requested tiers; raw hourly JSON retains audit validity/returned classes. Invalid/absent audits are excluded from pairing.',
+             'Paired difference = EXPRESS_ONEZONE minus STANDARD; negative latency/time favors EXPRESS_ONEZONE.',
+             'Variation rule: absolute median paired difference > paired-hour IQR, with at least 6 pairs.',
+             'This descriptive rule is not a significance test or a production-readiness claim.', '',
+             '| Class | Placement | Repository | Observed hours/failed | Slots without report (including pending) | Rebuild p50/p95/p99 s (n) | Baseline p50/p95/p99 s (n) | Hits/misses/cache errors |',
+             '|---|---|---|---|---|---|---|---|']
+    for g in report['groups']:
+        lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {g['hours']}/{g['failed_hours']} | {g['hours_without_report']} | "
+                     f"{dist(g['rebuild_seconds'])} ({g['rebuild_seconds']['n']}) | "
+                     f"{dist(g['baseline_seconds'])} ({g['baseline_seconds']['n']}) | {g['hits']}/{g['misses']}/{g['cache_errors']} |")
+    lines += ['', '| Class | Placement | Repository | Route/probe | p50/p95/p99 ms | Errors/attempts | Timeouts/attempts | Error/timeout rate |', '|---|---|---|---|---|---|---|---|']
+    for g in report['groups']:
+        for label, p in sorted(g['probes'].items()):
+            lines.append(f"| {g['storage_class']} | {g['placement']} | {g['repository']} | {label} | {dist(p)} | "
+                         f"{p['errors']}/{p['attempts']} | {p['timeouts']}/{p['attempts']} | {fmt(p['error_rate'])}/{fmt(p['timeout_rate'])} |")
+    lines += ['', '## Schedule (including missing/failed hours)', '', '| Hour | Due UTC | Status | Boat | Server |', '|---|---|---|---|---|']
+    for h in report['schedule']:
+        due = datetime.fromtimestamp(h['due_at'], timezone.utc).isoformat()
+        lines.append(f"| {h['hour']} | {due} | {h['status']} | {h.get('boat', {}).get('complete', 'n/a')} | {h.get('server', {}).get('complete', 'n/a')} |")
+    lines += ['', '## Hour-by-hour measurements', '', '| Hour | Class | Placement | Repository | Status | Rebuild p50/p95/p99 s | Hits/misses/errors | Route/probe | p50/p95/p99 ms | Errors/attempts (timeouts) |', '|---|---|---|---|---|---|---|---|---|---|']
+    for h in report['hourly']:
+        for label, p in h['probes'].items():
+            lines.append(f"| {h['hour']} | {h['storage_class']} | {h['placement']} | {h['repository']} | {h['status']} | "
+                         f"{dist(h['rebuild_seconds'])} | {h['hits']}/{h['misses']}/{h['cache_errors']} | {label} | {dist(p)} | "
+                         f"{p['errors']}/{p['attempts']} ({p['timeouts']}) |")
+    lines += ['', '## Paired differences each hour', '', '| Hour | Placement | Repository | Metric (ms unless seconds/rate named) | HP minus Standard |', '|---|---|---|---|---|']
+    for row in report['paired']:
+        for metric, delta in sorted(row['difference'].items()):
+            lines.append(f"| {row['hour']} | {row['placement']} | {row['repository']} | {metric} | {fmt(delta)} |")
+    lines += ['', '## Difference versus variation', '']
+    for row in report['variation']:
+        lines.append(f"- {row['placement']}/{row['repository']}/{row['metric']}: median {fmt(row['median_difference'])}, "
+                     f"paired-hour IQR {fmt(row['paired_hour_iqr'])}, {row['paired_hours']} pairs: {row['statement']}.")
+    (directory / 'summary.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+    (directory / 'summary.md').write_text('\n'.join(lines) + '\n')
+    print(str(directory / 'summary.md'))
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     mode = result.add_mutually_exclusive_group(required=True)
@@ -786,6 +1092,10 @@ def parser():
     mode.add_argument('--run', action='store_true')
     mode.add_argument('--purge', action='store_true', help='delete all objects under the explicit benchmark prefix')
     mode.add_argument('--combine', nargs='+', type=Path, help='combine A/B result files offline into one table')
+    mode.add_argument('--summarize', type=Path, help='summarize a scheduler output directory offline')
+    result.add_argument('--profile', choices=('legacy', 'fill', 'hourly', 'network', 'baseline'), default='legacy')
+    result.add_argument('--baseline', action='store_true', help='include one uncached sample in an hourly matrix')
+    result.add_argument('--repository', default='motor', choices=('motor', 'prefrontal', 'broca'))
     result.add_argument('--credentials', type=Path)
     result.add_argument('--backends', type=Path, help='JSON backend manifest; unavailable credential files are skipped')
     result.add_argument('--backend-name')
@@ -808,6 +1118,15 @@ def parser():
 def parse_args(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    if args.summarize:
+        if any((args.credentials, args.backends, args.prefix, args.placement, args.output, args.source,
+                args.commit, args.cargo_home, args.toolchain, args.bundle)):
+            p.error('--summarize accepts only the scheduler directory')
+        return args
+    if (args.profile != 'legacy' or args.baseline) and not args.run:
+        p.error('--profile/--baseline require --run')
+    if args.baseline and args.profile != 'hourly':
+        p.error('--baseline requires --profile hourly')
     if args.combine:
         if not args.output or any((args.credentials, args.backends, args.prefix, args.placement, args.bucket,
                                    args.backend_name, args.region, args.addressing, args.storage_class,
@@ -832,6 +1151,8 @@ def parse_args(argv=None):
             p.error('preparation options require --prepare')
         if args.run and not (args.output and args.placement):
             p.error('--run requires --placement A|B and --output NEW_DIR')
+        if args.run and args.profile == 'fill' and args.placement != 'A':
+            p.error('--profile fill requires --placement A')
         if args.purge and (args.output or args.placement):
             p.error('--purge does not accept --output or --placement')
     return args
@@ -840,6 +1161,9 @@ def parse_args(argv=None):
 def main(argv=None):
     os.umask(0o077)
     args = parse_args(argv)
+    if args.summarize:
+        summarize(args.summarize)
+        return True
     if args.combine:
         report = {'schema': 1, 'backends': [], 'complete': True}
         for path in args.combine:

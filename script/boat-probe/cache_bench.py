@@ -30,21 +30,28 @@ class Authorization(SSHReach):
 
 
 def validate(parser, args):
+    repositories = getattr(args, 'cache_repositories', None)
     options = (args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
-               args.cache_backends, args.cache_prefix)
+               args.cache_backends, args.cache_prefix, repositories)
     if not args.cache_bench:
-        if any(options):
+        if any(options) or getattr(args, 'cache_profile', 'legacy') != 'legacy' or getattr(args, 'cache_baseline', False):
             parser.error('--cache-* options require --cache-bench')
         return
-    if not all(options):
+    if getattr(args, 'cache_baseline', False) and getattr(args, 'cache_profile', 'legacy') != 'hourly':
+        parser.error('--cache-baseline requires --cache-profile hourly')
+    if not (args.cache_image and args.cache_backends and (repositories or
+            args.cache_bundle and args.cache_bundle_sha256 and args.cache_prefix)):
         parser.error('--cache-bench requires --cache-image, --cache-bundle, --cache-bundle-sha256, --cache-backends and --cache-prefix')
     import re
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.cache_image):
         parser.error('invalid --cache-image named snapshot')
-    if not re.fullmatch('[0-9a-f]{64}', args.cache_bundle_sha256):
+    if repositories and any((args.cache_bundle, args.cache_bundle_sha256, args.cache_prefix)):
+        parser.error('--cache-repositories replaces --cache-bundle/--cache-bundle-sha256/--cache-prefix')
+    if not repositories and not re.fullmatch('[0-9a-f]{64}', args.cache_bundle_sha256):
         parser.error('--cache-bundle-sha256 requires the digest recorded on A')
     try:
-        bench.prefix_arg(args.cache_prefix)
+        if not repositories:
+            bench.prefix_arg(args.cache_prefix)
     except argparse.ArgumentTypeError:
         parser.error('invalid cache prefix')
     if args.max_minutes > 30:
@@ -57,8 +64,14 @@ def run(runner, args):
     for config in configs:
         if Path(config['credentials']).exists():
             bench.credentials(Path(config['credentials']), config)
-    if bench.sha(args.cache_bundle) != args.cache_bundle_sha256:
-        raise ProbeError('cache bundle digest differs from independently recorded A digest')
+    multi = getattr(args, 'cache_repositories', None)
+    if multi:
+        repositories = bench.load_repositories(multi)
+    else:
+        if bench.sha(args.cache_bundle) != args.cache_bundle_sha256:
+            raise ProbeError('cache bundle digest differs from independently recorded A digest')
+        repositories = [dict(name='motor', bundle=str(args.cache_bundle),
+                             bundle_sha256=args.cache_bundle_sha256, prefix=args.cache_prefix)]
     data = runner.data['cache_bench'] = {'source_image': args.cache_image,
                                         'bundle_sha256': args.cache_bundle_sha256, 'complete': False}
     item, runner.data['create'] = runner.create(args.cache_image)
@@ -69,7 +82,7 @@ def run(runner, args):
     with tempfile.TemporaryDirectory(prefix='.cache-ssh-', dir=runner.results_path.parent) as temporary:
         directory = Path(temporary)
         private = directory / 'identity'
-        environment = {k: v for k, v in os.environ.items() if k != 'BOAT_API_KEY'}
+        environment = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'USER', 'LOGNAME', 'SSH_AUTH_SOCK')}
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(private)],
                        check=True, capture_output=True, env=environment)
         response = Authorization(runner).authorize(item['id'], private.with_suffix('.pub').read_text().strip())
@@ -78,10 +91,17 @@ def run(runner, args):
         pin_host(known_hosts, alias, response)
         ssh = ssh_argv(endpoint(response), private, known_hosts, alias)
 
-        def remote(text, source=None, checked=True):
-            budget = max(1, int(runner.deadline - time.monotonic()) - 30)
-            result = subprocess.run(ssh + [text], stdin=source or subprocess.DEVNULL,
-                                    capture_output=True, env=environment, timeout=budget)
+        def remote(text, source=None, checked=True, reserve=30):
+            budget = int(runner.deadline - time.monotonic()) - reserve
+            if budget <= 0:
+                raise ProbeError('cache benchmark exhausted the sandbox TTL (30s cleanup reserve)')
+            try:
+                result = subprocess.run(ssh + [text], stdin=source or subprocess.DEVNULL,
+                                        capture_output=True, env=environment, timeout=budget)
+            except subprocess.TimeoutExpired:
+                if checked:
+                    raise ProbeError('cache-bench SSH step exceeded the sandbox budget') from None
+                result = subprocess.CompletedProcess(ssh, 124, b'', b'')
             if checked and result.returncode:
                 # Do not persist stdin, command stdout or exception bodies on failures.
                 raise ProbeError(f'cache-bench SSH step failed (exit {result.returncode})')
@@ -91,12 +111,6 @@ def run(runner, args):
         try:
             remote('test ! -e /srv/cache-bench && sudo -n mkdir -m700 /srv/cache-bench && '
                    'sudo -n chown "$(id -u):$(id -g)" /srv/cache-bench')
-            with args.cache_bundle.open('rb') as stream:
-                remote('umask 077; cat > /srv/cache-bench/assets.tar.gz', stream)
-            digest = shlex.quote(args.cache_bundle_sha256 + '  /srv/cache-bench/assets.tar.gz')
-            remote(f"printf '%s\\n' {digest} | sha256sum --check --status && "
-                   'tar -xzf /srv/cache-bench/assets.tar.gz -C /srv/cache-bench && '
-                   'rm /srv/cache-bench/assets.tar.gz')
             with SOURCE.open('rb') as stream:
                 remote('umask 077; cat > /dev/shm/motor-cache-bench.py', stream)
             remote('rm -f ' + paths + ' && rm -rf -- /dev/shm/motor-cache-results')
@@ -113,7 +127,6 @@ def run(runner, args):
             manifest.write_text(json.dumps(remote_configs))
             with manifest.open('rb') as stream:
                 remote('umask 077; cat > /dev/shm/motor-cache-backends.json', stream)
-            prefix = shlex.quote(args.cache_prefix)
             # The operator SSH session is not a job: its PATH lacks the image's Cargo
             # bin and its default RUSTUP_HOME is the session user's own. Run A's
             # operator script exports both the same way, from the build server's
@@ -129,21 +142,42 @@ def run(runner, args):
             missing = found.stdout.decode(errors='replace').split()
             if missing or found.returncode:
                 raise ProbeError('cache-bench tools missing in the sandbox: ' + (' '.join(missing) or 'check failed'))
-            result = remote('env ' + tools + 'python3 /dev/shm/motor-cache-bench.py --run --placement B '
-                            '--backends /dev/shm/motor-cache-backends.json '
-                            f'--prefix {prefix} --output /dev/shm/motor-cache-results > /dev/null', checked=False)
-            fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False)
-            if fetched.returncode == 0:
-                data['result'] = json.loads(fetched.stdout)
-                destination = runner.results_path.parent / 'cache-results'
-                destination.mkdir(mode=0o700)
-                bench.save(destination, data['result'])
-            if result.returncode or not data.get('result', {}).get('complete'):
-                raise ProbeError('cache benchmark failed; inspect cache-results/results.json if available')
+            combined = {'schema': 1, 'backends': [], 'complete': True}
+            profile = getattr(args, 'cache_profile', 'legacy')
+            for repository in repositories:
+                remote('find /srv/cache-bench -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +')
+                with Path(repository['bundle']).open('rb') as stream:
+                    remote('umask 077; cat > /srv/cache-bench/assets.tar.gz', stream)
+                digest = shlex.quote(repository['bundle_sha256'] + '  /srv/cache-bench/assets.tar.gz')
+                remote(f"printf '%s\\n' {digest} | sha256sum --check --status && "
+                       'tar -xzf /srv/cache-bench/assets.tar.gz -C /srv/cache-bench && '
+                       'rm /srv/cache-bench/assets.tar.gz')
+                remote('rm -rf -- /dev/shm/motor-cache-results')
+                baseline = ' --baseline' if getattr(args, 'cache_baseline', False) else ''
+                result = remote('env ' + tools + 'python3 /dev/shm/motor-cache-bench.py --run --placement B '
+                                '--backends /dev/shm/motor-cache-backends.json '
+                                f"--prefix {shlex.quote(repository['prefix'])} --profile {profile}{baseline} "
+                                '--output /dev/shm/motor-cache-results > /dev/null', checked=False)
+                fetched = remote('cat /dev/shm/motor-cache-results/results.json', checked=False, reserve=5)
+                if fetched.returncode == 0:
+                    report = json.loads(fetched.stdout)
+                    if multi:
+                        for entry in report['backends']:
+                            entry['repository'] = repository['name']
+                        combined['backends'].extend(report['backends'])
+                        combined['complete'] &= report['complete']
+                        data['result'] = combined
+                    else:
+                        data['result'] = report
+                    destination = runner.results_path.parent / 'cache-results'
+                    destination.mkdir(mode=0o700, exist_ok=True)
+                    bench.save(destination, data['result'])
+                if result.returncode or not data.get('result', {}).get('complete'):
+                    raise ProbeError('cache benchmark failed; inspect cache-results/results.json if available')
             data['complete'] = True
         finally:
             try:
-                removed = remote('rm -f ' + paths, checked=False)
+                removed = remote('rm -f ' + paths, checked=False, reserve=0)
                 data['credential_file_removed'] = removed.returncode == 0
                 if not data['credential_file_removed']:
                     data['complete'] = False

@@ -27,6 +27,7 @@ TEST_FILES = [
     "script/boat-probe/test_resources.py",
     "script/boat-image/test_boat_image.py",
     "script/cache-bench/test_bench.py",
+    "script/cache-bench/test_schedule.py",
     "script/hosted-host/test_hosted_host.py",
     "script/macos-runner/test_macos_runner.py",
     "script/runner/network-check-tests.py",

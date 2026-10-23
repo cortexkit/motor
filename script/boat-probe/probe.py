@@ -948,6 +948,9 @@ def main(report_stream=None):
     mode.add_argument('--cache-bench', action='store_true', help='operator-only remote sccache measurements in a prepared-image clone')
     parser.add_argument('--cache-image', help='borrow this prepared named snapshot unchanged')
     parser.add_argument('--cache-bundle', type=Path, help='offline source and CARGO_HOME bundle produced on A')
+    parser.add_argument('--cache-repositories', type=Path, help='private pinned bundle manifest for sequential repositories in one clone')
+    parser.add_argument('--cache-profile', choices=('legacy', 'hourly', 'baseline'), default='legacy')
+    parser.add_argument('--cache-baseline', action='store_true')
     parser.add_argument('--cache-bundle-sha256', help='independently recorded bundle digest from A')
     parser.add_argument('--cache-backends', type=Path, help='backend manifest with owner-only credential file paths')
     parser.add_argument('--cache-prefix', help='same cache-bench/UNIQUE-RUN/ prefix filled on A')
@@ -961,8 +964,9 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
-    if args.cache_bench or any((args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
-                                args.cache_backends, args.cache_prefix)):
+    if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or any((
+            args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
+            args.cache_backends, args.cache_prefix, args.cache_repositories)):
         from cache_bench import validate
         validate(parser, args)
     if (args.prepared_image or args.from_prepared_image or args.verify_prepared_image) and not args.runner_host:
