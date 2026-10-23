@@ -197,6 +197,11 @@ pub struct RunnerHealth {
     pub running: Vec<HealthRunningJob>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_job_units: Option<u64>,
+    /// IDs blocking disk cleanup at its latest evaluation, initially all
+    /// quarantines. Ownerless markers with no sandbox are omitted only after
+    /// a fresh complete inventory accounts for every live execution unit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_blocked_by_quarantine: Vec<Uuid>,
     pub counts: HealthCounts,
     /// Retained completed jobs over ten minutes at under 25% of reserved CPUs.
     /// Persisted job measurements survive restarts, unlike the in-memory counts.

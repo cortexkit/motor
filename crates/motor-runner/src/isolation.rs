@@ -191,6 +191,17 @@ pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::
         )?;
         repair_writer_cache_path(directory, true)?;
     }
+    // Eviction renames fleet into trash, which needs write access on its
+    // parent, not just on fleet. Jobs retain read-only cache access.
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args([
+                "-m",
+                &format!("u:{}:rwx,m::rwx", unsafe { libc::geteuid() }),
+                "--",
+            ])
+            .arg(root),
+    )?;
     // State ancestors need traversal, not list or write access. ACLs on the
     // cache directories themselves give reads, including future writer entries.
     prepare_private_state(state)?;

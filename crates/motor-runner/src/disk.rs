@@ -303,6 +303,13 @@ impl Runner {
                 queue_depth,
                 running,
                 failed_job_units,
+                cleanup_blocked_by_quarantine: self
+                    .core
+                    .quarantine_cleanup
+                    .lock()
+                    .unwrap()
+                    .blocked
+                    .clone(),
                 counts: counters.counts(now),
                 underused_reservations,
                 repository_usage,
@@ -759,6 +766,46 @@ impl Runner {
         self.reclaim_disk_space(self.core.config.boat_profile)
     }
 
+    fn quarantine_cleanup_blockers(&self) -> Vec<Uuid> {
+        let all = || self.core.quarantined.keys().copied().collect();
+        if self.core.quarantined.is_empty() {
+            return Vec::new();
+        }
+        // A cached admission decision is not proof for a destructive pass.
+        // Do not race another inventory or accept an incomplete backend list.
+        let Ok(_probe) = self.core.quarantine_probe.try_lock() else {
+            return all();
+        };
+        let Ok(Some(units)) = self.core.backend.live_units(&self.core.config) else {
+            return all();
+        };
+        {
+            let inner = self.core.inner.lock().unwrap();
+            if !inner.launching.is_empty() || !inner.starting.is_empty() {
+                return all();
+            }
+            let accounted: BTreeSet<_> = inner
+                .jobs
+                .values()
+                .filter(|job| job.terminal.is_none())
+                .filter_map(|job| job.process.and_then(|process| process.unit))
+                .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
+                .collect();
+            if !units.is_subset(&accounted) {
+                return all();
+            }
+        }
+        self.core
+            .quarantined
+            .iter()
+            .filter_map(|(id, job)| {
+                let sandbox = self.core.trees.state.join("sandboxes").join(id.to_string());
+                let absent = matches!(fs::symlink_metadata(sandbox), Err(error) if error.kind() == io::ErrorKind::NotFound);
+                (job.request.is_some() || job.process.is_some() || !absent).then_some(*id)
+            })
+            .collect()
+    }
+
     /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
     /// deleted regardless of age or free space before the ordinary rules apply
     /// to everything else.
@@ -766,10 +813,10 @@ impl Runner {
         &self,
         sweep_idle_workspaces: bool,
     ) -> io::Result<Option<RunnerDiskFull>> {
-        self.ensure_admission_ownership()?;
         let _pressure = self.core.disk.lock().unwrap();
         let floor = self.core.config.free_space_floor_bytes;
         if floor == 0 {
+            self.ensure_admission_ownership()?;
             return Ok(None);
         }
         // Reclaim cache before admission becomes unsafe. Missing the soft goal
@@ -781,16 +828,35 @@ impl Runner {
             .unwrap_or_else(|| floor.saturating_mul(2));
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         let mut free = probe()?;
-        if !self.core.quarantined.is_empty() {
-            // Admission can proceed after every live unit is accounted for, but
-            // damaged historical records still cannot authorize destructive GC.
+        if free >= soft && !sweep_idle_workspaces {
+            self.ensure_admission_ownership()?;
+            return Ok(None);
+        }
+        let blocked = self.quarantine_cleanup_blockers();
+        {
+            let mut cleanup = self.core.quarantine_cleanup.lock().unwrap();
+            cleanup.blocked = blocked.clone();
+            let now = self.now();
+            if !blocked.is_empty()
+                && cleanup
+                    .last_error_ms
+                    .is_none_or(|last| now.saturating_sub(last) >= 300_000)
+            {
+                tracing::error!(quarantined_ids = ?blocked, "runner disk cleanup blocked by quarantine");
+                cleanup.last_error_ms = Some(now);
+            }
+        }
+        if !blocked.is_empty() {
+            self.ensure_admission_ownership()?;
             return Ok((free < floor).then_some(RunnerDiskFull {
                 free_bytes: free,
                 floor_bytes: floor,
             }));
         }
-        if free >= soft && !sweep_idle_workspaces {
-            return Ok(None);
+        for id in self.core.quarantined.keys() {
+            // Null sidecar fields do not prove that a job never ran. The fresh
+            // inventory and absent sandbox only authorize GC, not replay/retry.
+            tracing::warn!(quarantined_id = %id, "disk cleanup proceeding past ownerless quarantine; duplicate fence retained");
         }
         let device = crate::filesystem::device(&self.core.trees.state)?;
         let mut attempted = BTreeSet::new();

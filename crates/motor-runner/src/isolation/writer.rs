@@ -170,6 +170,28 @@ fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
     // The host DAC check is independent of the sandbox's read-only mount.
     // It catches an ACL that would let a job write through another mount.
     checked(Command::new("/usr/bin/sudo").args(["-n", "-u", USER, "/bin/bash", "-c", "test -r \"$2\" && ! test -w \"$1\" && ! test -w \"$2\" && ! touch \"$1/host-job-entry\" 2>/dev/null && ! (printf poison > \"$2\") 2>/dev/null", "reader"]).arg(&fleet).arg(&new_entries[0])).unwrap();
+    let container = fleet.parent().unwrap();
+    checked(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "-u",
+                USER,
+                "/bin/sh",
+                "-c",
+                "test -r \"$1\" && ! test -w \"$1\"",
+                "reader",
+            ])
+            .arg(container),
+    )
+    .unwrap();
+    // Exercise the runner's own rename, without sudo: recursive fleet repair
+    // alone cannot grant permission to remove an entry from its parent.
+    let trash = config.state_dir().join("trash");
+    fs::create_dir_all(&trash).unwrap();
+    let retired = trash.join("fleet-eviction-test");
+    fs::rename(&fleet, &retired).unwrap();
+    fs::rename(&retired, &fleet).unwrap();
 }
 
 fn assert_job_cannot_read(path: &Path) {

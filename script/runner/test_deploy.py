@@ -6,7 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import socket
+import select
 import threading
+import time
 import base64
 import hashlib
 import tempfile
@@ -46,7 +48,7 @@ class PermissionsPolicyTests(unittest.TestCase):
 class DeployTests(unittest.TestCase):
     def run_deploy(self, job, *, resume=True, drain="timeout", fail_start=False,
                     instance="main", default_state_root=False, decoys=False, drain_timeout=None,
-                    helper_valid=True, canary='pass', canary_timeout=None):
+                    helper_valid=True, canary='pass', canary_timeout=None, quarantine=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
@@ -57,6 +59,11 @@ class DeployTests(unittest.TestCase):
             state.mkdir(parents=True)
             (root / 'admission').write_text('open')
             (state / "record.json").write_text(json.dumps(job))
+            if quarantine is not None:
+                folder = state_root / instance / 'quarantine'
+                folder.mkdir()
+                for name in quarantine:
+                    (folder / name).write_text('{}')
             if decoys:
                 for decoy in (root / "state/windows/jobs/wrong-root",
                               state_root / "main/jobs/wrong-instance"):
@@ -142,6 +149,24 @@ fi
 
     def job(self, **extra):
         return dict(dict(id="survivor-job", state="Running", terminal=None, started_ms=1), **extra)
+
+    def test_swap_and_rollback_warn_with_quarantine_folder_listing(self):
+        for canary in ('pass', 'exit-1'):
+            for instance in ('main', 'e2e'):
+                with self.subTest(canary=canary, instance=instance):
+                    result, _, _ = self.run_deploy(self.job(), drain='complete', canary=canary,
+                                                  instance=instance, quarantine=['damaged-job.json'])
+                    self.assertEqual(result.returncode, 0 if canary == 'pass' else 1)
+                    self.assertIn('WARNING: runner quarantine is not empty:', result.stderr)
+                    self.assertIn(f'/{instance}/quarantine', result.stderr)
+                    self.assertIn('damaged-job.json', result.stderr)
+
+    def test_empty_or_missing_quarantine_does_not_warn(self):
+        for quarantine in (None, []):
+            with self.subTest(quarantine=quarantine):
+                result, _, _ = self.run_deploy(self.job(), drain='complete', quarantine=quarantine)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('WARNING: runner quarantine', result.stderr)
 
     def test_timeout_recoverable_unit_proceeds_to_swap(self):
         result, log, admission = self.run_deploy(self.job(request={}, process=dict(unit="fake-unit", pid=42)))
@@ -301,7 +326,7 @@ fi
 
 class CanaryTests(unittest.TestCase):
     def exercise(self, outcome: 'str | list[str]' = 'pass', instance='main', *,
-                 timeout_s: 'int | None' = None, invocations=1):
+                 timeout_s: 'int | None' = None, invocations=1, gate_jobs=True):
         outcomes = outcome if isinstance(outcome, list) else [outcome]
         timeout_s = timeout_s or (1 if outcomes[-1] in (
             'timeout', 'no-terminal', 'runner_full', 'runner_draining', 'queue_wait_exceeded') else 5)
@@ -320,11 +345,16 @@ class CanaryTests(unittest.TestCase):
             def handle(peer, outcome):
                 hello = canary.receive(peer)
                 self.assertTrue(hello['started'])
+                self.assertTrue(hello['gate_jobs'])
                 self.assertNotIn('default_branch_tip', hello)
-                canary.send(peer, dict(type='hello', protocol_version=1))
+                canary.send(peer, dict(type='hello', protocol_version=1, gate_jobs=gate_jobs))
                 request = canary.receive(peer)
                 requests.append(request)
                 self.assertEqual(request['weight_hint'], 1)
+                if gate_jobs:
+                    self.assertTrue(request['gate_job'])
+                else:
+                    self.assertNotIn('gate_job', request)
                 self.assertEqual(request['timeout'], 5)
                 self.assertGreaterEqual(request['queue_wait_limit_s'], 1)
                 self.assertLessEqual(request['queue_wait_limit_s'], min(10, timeout_s))
@@ -354,13 +384,59 @@ class CanaryTests(unittest.TestCase):
                 refs = subprocess.check_output(['git', 'bundle', 'list-heads', str(bundle_path)], text=True)
                 self.assertIn(request['snapshot_commit'], refs)
                 self.assertEqual(request['integration_tip'], request['snapshot_commit'])
+                if outcome in ('withdraw', 'withdraw-delayed', 'withdraw-race'):
+                    before = time.monotonic()
+                    canary.send(peer, dict(type='heartbeat',
+                                           queue_wait_ms=request['queue_wait_limit_s'] * 1000 -
+                                           (200 if outcome == 'withdraw-delayed' else 0)))
+                    peer.settimeout(2)
+                    self.assertEqual(canary.next_record(peer),
+                                     dict(type='withdraw', job_id=job))
+                    if outcome == 'withdraw-delayed':
+                        self.assertGreater(time.monotonic() - before, 0.1)
+                    if outcome == 'withdraw-race':
+                        canary.send(peer, dict(type='withdraw_reply', outcome='started'))
+                    else:
+                        canary.send(peer, dict(type='withdraw_reply', outcome='withdrawn'))
+                        canary.send(peer, dict(type='terminal', job_id=job,
+                                              outcome=dict(type='refused_before_start',
+                                                           reason='queue_wait_exceeded')))
+                        return
+                if outcome == 'untimed':
+                    canary.send(peer, dict(type='heartbeat',
+                                           queue_wait_ms=request['queue_wait_limit_s'] * 1000 - 200))
+                    canary.send(peer, dict(type='heartbeat'))
+                    until = time.monotonic() + 0.4
+                    while select.select([peer], [], [], max(0, until - time.monotonic()))[0]:
+                        self.assertEqual(canary.receive(peer)['type'], 'heartbeat',
+                                         'untimed stream must not withdraw')
+                        if time.monotonic() >= until:
+                            break
                 if outcome in ('queue_wait_exceeded', 'setup-failed'):
                     reason = ('workspace_setup_failed' if outcome == 'setup-failed'
                               else outcome)
                     canary.send(peer, dict(type='terminal', job_id=job,
                                           outcome=dict(type='refused_before_start', reason=reason)))
                     return
-                if outcome != 'no-start':
+                if outcome == 'heartbeats':
+                    for started in (False, True):
+                        if started:
+                            canary.send(peer, dict(type='started', job_id=job))
+                        received = []
+                        limit = time.monotonic() + 3
+                        while len(received) < 2 and time.monotonic() < limit:
+                            canary.send(peer, dict(type='heartbeat'))
+                            if select.select([peer], [], [], 0.1)[0]:
+                                self.assertEqual(canary.receive(peer)['type'], 'heartbeat')
+                                received.append(time.monotonic())
+                        self.assertEqual(len(received), 2)
+                        self.assertGreater(received[1] - received[0], 0.5)
+                        self.assertLess(received[1] - received[0], 2)
+                if outcome == 'queued':
+                    while peer.recv(4096):
+                        pass
+                    return
+                if outcome not in ('no-start', 'heartbeats'):
                     canary.send(peer, dict(type='started', job_id=job))
                 if outcome == 'no-terminal':
                     while peer.recv(4096):
@@ -424,6 +500,35 @@ class CanaryTests(unittest.TestCase):
         result, _ = self.exercise('timeout')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('deployment canary deadline exceeded', result.stderr)
+
+    def test_canary_sends_heartbeats_while_queued_and_started_despite_runner_heartbeats(self):
+        result, _ = self.exercise('heartbeats', timeout_s=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_canary_omits_gate_mark_without_runner_capability(self):
+        result, _ = self.exercise(gate_jobs=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepted_but_queued_at_deadline_is_inconclusive(self):
+        result, _ = self.exercise('queued', timeout_s=2)
+        self.assertEqual(result.returncode, canary.INCONCLUSIVE, result.stderr)
+        self.assertIn('isolation not verified', result.stderr)
+
+    def test_queue_wait_budget_sends_withdraw_and_retries_capacity(self):
+        for outcome in ('withdraw', 'withdraw-delayed'):
+            with self.subTest(outcome=outcome):
+                result, requests = self.exercise([outcome, 'pass'], timeout_s=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(requests), 2)
+                self.assertIn('queue_wait_exceeded', result.stderr)
+
+    def test_missing_queue_duration_clears_withdrawal_deadline(self):
+        result, _ = self.exercise('untimed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_withdrawal_that_races_start_still_requires_successful_execution(self):
+        result, _ = self.exercise('withdraw-race')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_capacity_and_draining_refusals_are_inconclusive_not_fatal(self):
         for reason in ('runner_full', 'runner_draining', 'queue_wait_exceeded'):
