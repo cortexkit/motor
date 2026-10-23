@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Restore, provision, measure and seal a macOS image using our VM helper."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+from download import fetch
+import parity
+import pinlock
+
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parent.parent
+REMOTE = "/Users/motorbuild/motor-image-build"
+IMAGE_FILES = ("disk.img", "auxiliary-storage", "hardware-model", "machine-identifier")
+
+
+def run(*args, **kwargs):
+    return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def verify_ipsw(path, pin):
+    if path.stat().st_size != pin["size"] or parity.digest(path) != pin["sha256"]:
+        raise ValueError("IPSW build " + pin["build"] + " size/SHA-256 differs")
+
+
+def require_committed(path):
+    relative = path.resolve().relative_to(REPOSITORY)
+    run("git", "ls-files", "--error-unmatch", "--", relative, cwd=REPOSITORY, stdout=subprocess.DEVNULL)
+    run("git", "diff", "--exit-code", "HEAD", "--", relative, cwd=REPOSITORY)
+
+
+def ssh_options(args):
+    if not re.fullmatch(r"motorbuild@[A-Za-z0-9][A-Za-z0-9.-]*", args.guest):
+        raise ValueError("--guest must be motorbuild@<guest-ip-or-host>")
+    return ["-F", "/dev/null", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "UserKnownHostsFile=" + str(args.known_hosts.resolve()), "-i", str(args.work / "build_key")]
+
+
+def prepare_inputs(args, manifest):
+    inputs = args.work / "inputs"
+    inputs.mkdir(exist_ok=True)
+    for name, spec in manifest["sources"].items():
+        fetch(spec["url"], inputs / name, spec["sha256"], args.measure)
+    for tool in manifest["cargo_installs"]:
+        if "git" in tool:
+            fetch(tool["source"]["url"], inputs / ("cargo-" + tool["rev"]), tool["source"]["sha256"], args.measure)
+    commit = manifest["agent"]["commit"]
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise ValueError("agent source needs a full pinned commit")
+    with (inputs / "agent.tar").open("wb") as stream:
+        run("git", "archive", "--format=tar", commit, cwd=REPOSITORY, stdout=stream)
+    (inputs / "agent.commit").write_text(commit + "\n")
+    return inputs
+
+
+def provision(args, manifest):
+    if not args.measure:
+        pinlock.require_ready(manifest)
+        require_committed(args.manifest)
+    if args.clt_label:
+        if not args.measure and args.clt_label != manifest["clt"]["softwareupdate_label"]:
+            raise ValueError("CLT update label differs from reviewed pin")
+        manifest["clt"]["softwareupdate_label"] = args.clt_label
+    if manifest["clt"]["softwareupdate_label"] == pinlock.PENDING:
+        raise ValueError("measure with --clt-label from softwareupdate --list in the guest")
+    options = ssh_options(args)
+    inputs = prepare_inputs(args, manifest)
+    recipe = args.work / "recipe"
+    recipe.mkdir(exist_ok=False)
+    for name in ("guest.py", "parity.py", "pinlock.py", "bootstrap.sh"):
+        shutil.copyfile(HERE / name, recipe / name)
+    (recipe / "toolchain.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    run("/usr/bin/ssh", *options, args.guest, "test ! -e " + REMOTE + " && mkdir -m 700 " + REMOTE)
+    run("/usr/bin/scp", *options, "-r", recipe, inputs, args.guest + ":" + REMOTE + "/")
+    # shlex quotes the softwareupdate label, which includes spaces on some releases.
+    import shlex
+    command = "/bin/sh " + REMOTE + "/recipe/bootstrap.sh " + REMOTE + " " + shlex.quote(manifest["clt"]["softwareupdate_label"]) + (" measure" if args.measure else " reviewed")
+    run("/usr/bin/ssh", *options, args.guest, command)
+    with (args.work / "candidate.json").open("wb") as stream:
+        run("/usr/bin/ssh", *options, args.guest, "sudo -n cat " + REMOTE + "/candidate.json", stdout=stream)
+    with (args.work / "tools.tar").open("wb") as stream:
+        run("/usr/bin/ssh", *options, args.guest, "sudo -n tar -cf - -C " + REMOTE + " tools", stdout=stream)
+    print("Measured candidate: " + str(args.work / "candidate.json"))
+    print("NOT DEPLOYABLE: review candidate, mark release_status reviewed, commit lock; then seal this stopped image.")
+
+
+def seal(args, manifest):
+    pinlock.require_ready(manifest)
+    parity.validate(manifest, json.loads((HERE.parent / "runner/toolchain.json").read_text()))
+    require_committed(args.manifest)
+    options = ssh_options(args)
+    # Sealing the measured VM avoids rebuilding native binaries into different bytes.
+    candidate = json.loads((args.work / "candidate.json").read_text())
+    reviewed = dict(manifest, release_status="pending review")
+    if candidate != reviewed:
+        raise ValueError("reviewed lock does not match this VM's measured candidate")
+    run("/usr/bin/scp", *options, args.manifest, args.guest + ":" + REMOTE + "/recipe/toolchain.json")
+    result = subprocess.run(["/usr/bin/ssh", *options, args.guest,
+                             "sudo -n /usr/bin/python3 " + REMOTE + "/recipe/guest.py seal --scratch " + REMOTE],
+                            text=True, capture_output=True)
+    marker = "MOTOR_SEALED " + parity.digest(args.manifest)
+    if marker not in result.stdout.splitlines() or result.returncode not in (0, 255):
+        raise ValueError("guest did not acknowledge Remote Login/key sealing: " + result.stderr)
+    (args.work / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"}) + "\n")
+    (args.work / "build_key").unlink()
+    (args.work / "build_key.pub").unlink(missing_ok=True)
+    print("Guest acknowledged seal and shutdown. Wait for the image-build helper to exit, then run finalize.")
+
+
+def finalize(args, manifest):
+    pinlock.require_ready(manifest)
+    require_committed(args.manifest)
+    receipt = json.loads((args.work / "guest-sealed.json").read_text())
+    if receipt != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"} or (args.work / "build_key").exists():
+        raise ValueError("missing guest seal acknowledgement or build key still exists")
+    for name in IMAGE_FILES:
+        path = args.image / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("image must contain four regular files")
+        result = subprocess.run(["/usr/sbin/lsof", "-t", "--", str(path)], capture_output=True)
+        if result.returncode != 1 or result.stdout or result.stderr:
+            raise ValueError("image still open, or lsof could not prove it stopped")
+    (args.image / "agent.sha256").write_text(manifest["agent"]["sha256"] + "\n")
+    files = {name: parity.digest(args.image / name) for name in (*IMAGE_FILES, "agent.sha256")}
+    (args.image / "image.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest),
+                                                       "ipsw": manifest["ipsw"], "agent": manifest["agent"],
+                                                       "files": files}, indent=2) + "\n")
+    for path in args.image.iterdir():
+        path.chmod(0o444)
+    args.image.chmod(0o555)
+    print("Sealed read-only image; installed-daemon qualification is still required.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=("key", "restore", "boot", "provision", "seal", "finalize"))
+    parser.add_argument("--manifest", type=Path, default=HERE / "toolchain.json")
+    parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--image", type=Path)
+    parser.add_argument("--ipsw", type=Path)
+    parser.add_argument("--vm-helper", type=Path)
+    parser.add_argument("--guest")
+    parser.add_argument("--known-hosts", type=Path)
+    parser.add_argument("--clt-label")
+    parser.add_argument("--measure", action="store_true")
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        parser.error("image operations require a dedicated macOS VM host")
+    args.work = args.work.resolve()
+    args.work.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(args.manifest.read_text())
+    if args.operation == "key":
+        run("/usr/bin/ssh-keygen", "-t", "ed25519", "-N", "", "-f", args.work / "build_key", "-C", "motor-image-build-only")
+        print("Authorize only build_key.pub in the disposable guest; never authorize it on the host.")
+    elif args.operation in ("restore", "boot"):
+        if not args.vm_helper or not args.image or (args.operation == "restore" and not args.ipsw):
+            parser.error("restore/boot need --vm-helper --image; restore also needs --ipsw")
+        run("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", HERE / "virtualization.entitlements", args.vm_helper)
+        if args.operation == "restore":
+            verify_ipsw(args.ipsw, manifest["ipsw"])
+            run("/usr/bin/swift", HERE / "prepare-image.swift", args.ipsw, args.image)
+        run(args.vm_helper, "image-build", args.image, *([args.ipsw] if args.operation == "restore" else []))
+    elif args.operation == "finalize":
+        if not args.image:
+            parser.error("finalize needs --image")
+        finalize(args, manifest)
+    else:
+        if not args.guest or not args.known_hosts:
+            parser.error("provision/seal need --guest and --known-hosts")
+        provision(args, manifest) if args.operation == "provision" else seal(args, manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print("image build refused: " + str(error), file=sys.stderr)
+        sys.exit(1)

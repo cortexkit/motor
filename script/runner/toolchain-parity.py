@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only inventory of the Linux runner's job-visible toolchain."""
+"""Read-only inventory of a runner's job-visible toolchain."""
 
 import argparse
 import fnmatch
@@ -128,7 +128,18 @@ def job_identity(job):
         return None
 
 
-def capture(manifest=None, job=False):
+def macos_parity():
+    spec = importlib.util.spec_from_file_location('macos_parity', HERE.parent / 'macos-runner/parity.py')
+    if spec is None or spec.loader is None:
+        raise ImportError('cannot load macOS toolchain inventory')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def capture(manifest=None, job=False, role="build-server"):
+    if role == "macos":
+        return macos_parity().capture(manifest, job)
     paths = manifest or {}
     cargo_home = Path(paths.get("cargo_home", os.environ.get("CARGO_HOME", "/srv/build/cargo-home")))
     rustup_home = Path(paths.get("rustup_home", os.environ.get("RUSTUP_HOME", "/home/ubuntu/.rustup")))
@@ -238,7 +249,10 @@ def first_line(text):
     return text.splitlines()[0] if text else ""
 
 
-def validate(manifest):
+def validate(manifest, role="build-server"):
+    if role == "macos":
+        macos_parity().validate(manifest, json.loads(MANIFEST.read_text()))
+        return
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
     if (set(manifest.get('job_identity', {})) != {'uid', 'gid'}
@@ -368,6 +382,8 @@ def readonly_mount(path, mountinfo):
 
 
 def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None):
+    if role == "macos":
+        return macos_parity().differences(manifest, actual, job)
     manifest = role_manifest(manifest, role, job)
     errors = []
 
@@ -496,6 +512,13 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
 
 
 def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None):
+    if role == "macos":
+        validate(manifest, role)
+        actual = capture(manifest, job=job, role=role)
+        errors = differences(manifest, actual, role, job)
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        return {"passed": not errors, "errors": errors, "role": role, "job": job,
+                "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual}
     validate(manifest)
     actual = capture(role_manifest(manifest, role, job), job=job)
     if role in ("boat", "tenant") and not job:
@@ -583,19 +606,25 @@ def main():
     modes.add_argument("--check", action="store_true", help="compare live state with the manifest; exit nonzero on drift")
     modes.add_argument("--from-capture", type=Path, help="refresh measured manifest fields from captured JSON to stdout")
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
-    parser.add_argument("--role", choices=("build-server", "boat", "tenant"), default="build-server")
+    parser.add_argument("--role", choices=("build-server", "boat", "tenant", "macos"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
     parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='trusted server seed inventory; required for Boat parity')
     parser.add_argument('--cargo-seed-sha256', help='independently recorded server seed manifest digest')
     args = parser.parse_args()
+    if args.role == "macos" and args.from_capture:
+        parser.error('macOS pins must be reviewed against the build-server manifest, not refreshed from capture')
     if bool(args.cargo_seed_manifest) != bool(args.cargo_seed_sha256):
         parser.error('--cargo-seed-manifest and --cargo-seed-sha256 must be supplied together')
     if args.capture:
         # The manifest names tools beyond the built-in list (pinned variants such
         # as bun-1.3.14) and the GNU coreutils locations; without it the capture
         # omits them and --from-capture refuses it as unmeasured.
-        result = capture(role_manifest(json.loads(args.manifest.read_text()), args.role, args.job), job=args.job)
+        manifest = json.loads(args.manifest.read_text())
+        if args.role == "macos":
+            result = capture(manifest, job=args.job, role=args.role)
+        else:
+            result = capture(role_manifest(manifest, args.role, args.job), job=args.job)
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(

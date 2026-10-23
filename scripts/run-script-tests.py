@@ -28,6 +28,7 @@ TEST_FILES = [
     "script/boat-image/test_boat_image.py",
     "script/cache-bench/test_bench.py",
     "script/hosted-host/test_hosted_host.py",
+    "script/macos-runner/test_macos_runner.py",
     "script/runner/network-check-tests.py",
     "script/runner/test_check_nested_js.py",
     "script/runner/test_check_nested_cargo.py",
