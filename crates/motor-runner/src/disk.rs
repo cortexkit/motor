@@ -1049,6 +1049,13 @@ impl Runner {
                 } else if candidate.path == self.core.config.sccache_dir() {
                     let trash = self.trash().join(format!("sccache-{}", Uuid::now_v7()));
                     fs::create_dir_all(self.trash())?;
+                    #[cfg(target_os = "linux")]
+                    if self.core.config.writer_account.is_some() {
+                        crate::isolation::retire_writer_cache(&candidate.path, &trash)?;
+                    } else {
+                        fs::rename(&candidate.path, &trash)?;
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     fs::rename(&candidate.path, &trash)?;
                     #[cfg(target_os = "linux")]
                     if let Some(account) = self.core.config.writer_account {
