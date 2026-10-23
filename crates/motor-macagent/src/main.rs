@@ -31,7 +31,6 @@ mod guest {
         }
         let mut nonce_device = None;
         let mut port = motor_macagent::VSOCK_PORT;
-        let mut cargo_home = PathBuf::from(motor_macagent::CARGO_HOME);
         let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
             let value = args
@@ -46,15 +45,11 @@ mod guest {
                         .filter(|p| *p != 0)
                         .ok_or_else(|| io::Error::other("invalid vsock port"))?;
                 }
-                Some("--cargo-home") => cargo_home = PathBuf::from(value),
                 _ => return Err(io::Error::other("unknown option")),
             }
         }
-        if !cargo_home.is_absolute() {
-            return Err(io::Error::other("cargo-home must be absolute"));
-        }
-        let nonce = if let Some(path) = nonce_device {
-            motor_macagent::read_nonce(open_disk(&path)?)?
+        let boot = if let Some(path) = nonce_device {
+            motor_macagent::read_boot_config(open_disk(&path)?)?
         } else {
             let mut disks = Vec::new();
             for entry in std::fs::read_dir("/dev")? {
@@ -71,10 +66,16 @@ mod guest {
                 };
                 disks.push(disk);
             }
-            motor_macagent::find_nonce(disks)?
+            motor_macagent::find_boot_config(disks)?
         };
+        motor_macagent::mounts::mount_native(&boot.mounts)?;
         let stream = Vsock::connect(port).await?;
-        motor_macagent::serve_guest(stream, nonce, cargo_home).await
+        motor_macagent::serve_guest(
+            stream,
+            boot.nonce,
+            PathBuf::from(motor_macagent::CARGO_HOME),
+        )
+        .await
     }
 
     fn open_disk(path: &Path) -> io::Result<std::fs::File> {
@@ -88,7 +89,7 @@ mod guest {
         }
         let job_gid = unsafe {
             let job = libc::getpwnam(c"motorjob".as_ptr());
-            if job.is_null() || (*job).pw_uid == 0 {
+            if job.is_null() || (*job).pw_uid == 0 || (*job).pw_gid == 0 {
                 return Err(io::Error::other("unprivileged motorjob account missing"));
             }
             (*job).pw_gid

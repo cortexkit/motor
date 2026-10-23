@@ -107,6 +107,12 @@ pub struct Config {
     pub(crate) writer_account: Option<crate::isolation::WriterAccount>,
     pub backend: BackendKind,
     pub vm_config: Option<PathBuf>,
+    /// Allow an explicitly selected host backend on a developer's Mac only.
+    pub development_allow_host_backend: bool,
+    #[cfg(unix)]
+    pub(crate) macos: Option<Arc<crate::macos::VmConfig>>,
+    #[cfg(unix)]
+    pub(crate) macos_runtime: Arc<crate::macos::Runtime>,
     /// Host CPUs used by the Windows job VM, in CPU-list syntax. Linux placements
     /// also avoid their SMT siblings while the shared slot lock is held.
     pub windows_cpus: Option<String>,
@@ -367,6 +373,11 @@ impl Config {
             writer_account: None,
             backend: BackendKind::Host,
             vm_config: None,
+            development_allow_host_backend: false,
+            #[cfg(unix)]
+            macos: None,
+            #[cfg(unix)]
+            macos_runtime: Arc::default(),
             windows_cpus: None,
             windows_slot_lock: None,
             windows: None,
@@ -508,6 +519,9 @@ impl Config {
         self.state_dir().join("writer-scratch")
     }
     pub(crate) fn writer_enabled(&self) -> bool {
+        if self.macos_instance() {
+            return false;
+        }
         #[cfg(windows)]
         if self.windows_instance() {
             return false;
@@ -535,12 +549,51 @@ impl Config {
         match self.backend {
             BackendKind::Host | BackendKind::Vm => Platform::Linux,
             BackendKind::WindowsVm => Platform::Windows,
+            BackendKind::MacosVm => Platform::Macos,
         }
     }
     pub(crate) fn windows_instance(&self) -> bool {
         self.backend == BackendKind::WindowsVm
     }
+    pub(crate) fn macos_instance(&self) -> bool {
+        self.backend == BackendKind::MacosVm
+    }
+    pub(crate) fn vm_instance(&self) -> bool {
+        self.windows_instance() || self.macos_instance()
+    }
+    fn cleanup_pending(&self, id: Uuid) -> bool {
+        #[cfg(unix)]
+        if self.macos_instance() {
+            return self.macos_runtime.cleanup_pending(id);
+        }
+        self.windows_runtime.cleanup_pending(id)
+    }
+    fn backend_degraded(&self) -> bool {
+        #[cfg(unix)]
+        if self.macos_instance() {
+            return self.macos_runtime.degraded();
+        }
+        false
+    }
     fn configure_backend(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if !self.macos_instance() && !self.development_allow_host_backend {
+            return Err(invalid("macOS hosts require --backend macos-vm; development only: --development-allow-host-backend"));
+        }
+        #[cfg(unix)]
+        if self.macos_instance() {
+            self.macos = Some(Arc::new(crate::macos::VmConfig::load(
+                self.vm_config
+                    .as_deref()
+                    .ok_or_else(|| invalid("--backend macos-vm requires --vm-config <file>"))?,
+            )?));
+            self.max_weight = 8;
+            self.free_space_floor_bytes = 20 << 30;
+            self.free_space_eviction_bytes = Some(40 << 30);
+            self.workspace_roots = vec![self.state_root.clone()];
+            self.owned_workspace_roots = vec![self.state_root.clone()];
+            self.isolate_jobs = false;
+        }
         #[cfg(windows)]
         if !self.windows_instance() || self.tenant_vm || self.boat_profile {
             return Err(invalid(
@@ -1470,6 +1523,10 @@ impl Runner {
         #[cfg(unix)]
         {
             config.state_root = fs::canonicalize(&config.state_root)?;
+            if config.macos_instance() {
+                config.workspace_roots = vec![config.state_root.clone()];
+                config.owned_workspace_roots = vec![config.state_root.clone()];
+            }
         }
         let state = config.state_dir();
         #[cfg(unix)]
@@ -1712,7 +1769,7 @@ impl Runner {
                 .join("jobs")
                 .join(job.id.to_string())
                 .join("record.json");
-            if (config.windows_instance() && job.started_ms.is_none())
+            if (config.vm_instance() && job.started_ms.is_none())
                 || (job.pending() && job.started_ms.is_none() && job.process.is_none())
             {
                 refuse_before_start(
@@ -1736,7 +1793,7 @@ impl Runner {
             }
             jobs.insert(job.id, job);
         }
-        if config.windows_instance() {
+        if config.vm_instance() {
             // Catalog entries are caller checkout paths on the build server, and
             // those checkouts belong to the Linux instance. The Windows instance
             // works only in its own staging, so it must never touch them, not
@@ -1745,7 +1802,7 @@ impl Runner {
             catalog.sibling_commits.clear();
             catalog.repositories.clear();
         }
-        if !config.windows_instance() {
+        if !config.vm_instance() {
             migration::identify_legacy_checkouts(&mut catalog, &jobs, &config.instance);
         }
         // A saved dependency-writer job also preserves an approved tip if the
@@ -1800,7 +1857,13 @@ impl Runner {
             atomic_json(&state.join("catalog.json"), &catalog)?;
         }
         let order = jobs.values().map(|j| j.order).max().unwrap_or(0);
-        let rustc_version = if let Some(vm) = &config.windows {
+        #[cfg(unix)]
+        let macos_version = config.macos.as_ref().map(|vm| vm.toolchain_version.clone());
+        #[cfg(not(unix))]
+        let macos_version: Option<String> = None;
+        let rustc_version = if let Some(version) = macos_version {
+            version
+        } else if let Some(vm) = &config.windows {
             vm.toolchain_version.clone()
         } else {
             std::process::Command::new("rustc")
@@ -2212,7 +2275,7 @@ impl Runner {
         // monitor. Only a persisted Started proves launch progressed far enough;
         // setup, portable processes and Windows executions cannot reattach.
         cfg!(target_os = "linux")
-            && !self.core.config.windows_instance()
+            && !self.core.config.vm_instance()
             && job.started_ms.is_some()
             && job.started.is_some()
             && job.process.is_some_and(|process| process.unit.is_some())
@@ -2568,7 +2631,7 @@ impl Runner {
         sibling_checkouts: bool,
         kind: Option<WorkspaceKind>,
     ) {
-        if self.core.config.windows_instance() {
+        if self.core.config.vm_instance() {
             return;
         }
         if populated && sibling_checkouts {
@@ -2645,7 +2708,11 @@ impl Runner {
             Some(request.clone()),
             self.now(),
             inner.order,
-            request.weight_hint.unwrap_or(2),
+            if self.core.config.macos_instance() {
+                4
+            } else {
+                request.weight_hint.unwrap_or(2)
+            },
         );
         // If another pressure pass had already chosen this request's workspace
         // for deletion before admission began, the guard could not stop it, so
@@ -2740,6 +2807,29 @@ impl Runner {
                 return Some((RefusalReason::RequestRejected, error.to_string()));
             }
         }
+        if self.core.config.macos_instance() {
+            if request.weight_hint.is_some_and(|hint| hint > 4) {
+                return Some((RefusalReason::RequestRejected, "macos_vcpu_limit".into()));
+            }
+            if !request.return_paths.is_empty() {
+                return Some((
+                    RefusalReason::RequestRejected,
+                    "return_paths_unsupported".into(),
+                ));
+            }
+            if request.return_chunked {
+                return Some((
+                    RefusalReason::RequestRejected,
+                    "return_chunked_unsupported".into(),
+                ));
+            }
+            if request.network.is_some() {
+                return Some((
+                    RefusalReason::NetworkUnsupported,
+                    "network_unsupported".into(),
+                ));
+            }
+        }
         if let Err(code) = validate_return_request(
             &request.workspace_key,
             &request.return_paths,
@@ -2748,7 +2838,7 @@ impl Runner {
         ) {
             return Some((RefusalReason::RequestRejected, code.into()));
         }
-        if self.core.config.windows_instance() && !request.return_paths.is_empty() {
+        if self.core.config.vm_instance() && !request.return_paths.is_empty() {
             return Some((
                 RefusalReason::RequestRejected,
                 "return_paths_unsupported".into(),
@@ -2779,7 +2869,7 @@ impl Runner {
                     String::from(served),
                 ),
             ))
-        } else if let Some(refusal) = self.cpu_refusal(if self.core.config.windows_instance() {
+        } else if let Some(refusal) = self.cpu_refusal(if self.core.config.vm_instance() {
             4
         } else {
             request.weight_hint.unwrap_or(2)
@@ -2866,7 +2956,7 @@ impl Runner {
         cwd: Option<&str>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
-        if self.core.config.windows_instance() {
+        if self.core.config.vm_instance() {
             return Ok(());
         }
         if self.core.config.sibling_snapshot_mode() {
@@ -2890,7 +2980,7 @@ impl Runner {
         cwd: Option<&str>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
-        if self.core.config.windows_instance() {
+        if self.core.config.vm_instance() {
             return Ok(());
         }
         let mut known = Vec::new();
@@ -3422,6 +3512,8 @@ impl Runner {
         self.ensure_admission_ownership()?;
         if self.core.config.windows_instance() {
             Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"))
+        } else if self.core.config.macos_instance() {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the macOS VM instance; caller workspaces are never materialized on the host"))
         } else {
             Ok(())
         }
@@ -3456,7 +3548,7 @@ impl Runner {
             return false;
         }
         !tip.is_empty()
-            && !self.core.config.windows_instance()
+            && !self.core.config.vm_instance()
             && self.core.config.writer_enabled()
             && self.core.quarantined.is_empty()
     }
@@ -3934,7 +4026,7 @@ impl Runner {
         StatusReply::new(
             queue_depth,
             running,
-            true,
+            !self.core.config.backend_degraded(),
             inner
                 .catalog
                 .repositories
@@ -4018,12 +4110,16 @@ impl Runner {
         let elapsed_ms = || started.elapsed().as_millis() as u64;
         tracing::info!(job_id = %id, "cancel received");
         self.ensure_job_readable(id)?;
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            self.core.config.macos_runtime.interrupt(id);
+        }
         let log = self.job_log(id);
         let write = log.write_ahead_of_output();
         tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel acquired job log lock");
         let mut inner = self.core.inner.lock().unwrap();
         tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel acquired state lock");
-        if self.core.config.windows_instance() && inner.starting.contains(&id) {
+        if self.core.config.vm_instance() && inner.starting.contains(&id) {
             self.core
                 .backend
                 .cancel(&self.core.config, &inner.jobs[&id], true)?;
@@ -4119,20 +4215,19 @@ impl Runner {
         self.update_queue_wait_clocks(&inner, now, &index);
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
-            (!inner.starting.contains(&id) || self.core.config.windows_instance())
+            (!inner.starting.contains(&id) || self.core.config.vm_instance())
                 && job.pending()
                 && if stalled {
                     job.state == JobState::AwaitingBundles
                 } else {
                     // Windows VM boot stays withdrawable after setup reserves the job.
                     // Keep that setup interval separate from paused workspace-owner time.
-                    let setup_wait = if self.core.config.windows_instance()
-                        && inner.starting.contains(&job.id)
-                    {
-                        now.saturating_sub(job.setup_ms.unwrap_or(now))
-                    } else {
-                        0
-                    };
+                    let setup_wait =
+                        if self.core.config.vm_instance() && inner.starting.contains(&job.id) {
+                            now.saturating_sub(job.setup_ms.unwrap_or(now))
+                        } else {
+                            0
+                        };
                     job.state == JobState::Queued
                         && job.queued_ms.is_some()
                         && job.queue_wait_ms(now).saturating_add(setup_wait)
@@ -4149,7 +4244,7 @@ impl Runner {
         } else {
             self.queue_wait_detail_with_index(&inner, &index, id)
         };
-        if eligible && self.core.config.windows_instance() && inner.starting.contains(&id) {
+        if eligible && self.core.config.vm_instance() && inner.starting.contains(&id) {
             self.core
                 .backend
                 .cancel(&self.core.config, &inner.jobs[&id], true)?;
@@ -4266,7 +4361,7 @@ impl Runner {
         if inner.terminal_saves.contains(&head.id) {
             return true;
         }
-        if self.core.config.windows_runtime.cleanup_pending(head.id) {
+        if self.core.config.cleanup_pending(head.id) {
             return false;
         }
         let aged = !head.base
@@ -4298,7 +4393,7 @@ impl Runner {
             return None;
         }
         // An earlier attempt to start the job is still being cleaned up.
-        if inner.starting.contains(&id) || self.core.config.windows_runtime.cleanup_pending(id) {
+        if inner.starting.contains(&id) || self.core.config.cleanup_pending(id) {
             return Some("workspace setup");
         }
         Some(if inner.dropping.contains(job.key()) {
@@ -4715,6 +4810,23 @@ impl Runner {
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            self.core
+                .config
+                .macos_runtime
+                .retry_cleanups(&self.core.config);
+            let live = {
+                let inner = self.core.inner.lock().unwrap();
+                inner
+                    .jobs
+                    .values()
+                    .filter(|job| job.terminal.is_none() || inner.starting.contains(&job.id))
+                    .map(|job| job.id)
+                    .collect()
+            };
+            self.core.config.macos_runtime.prune_cancelled(&live);
+        }
         if self.core.config.windows_instance() {
             self.core.config.windows_runtime.retry_cleanups();
         }
@@ -5473,7 +5585,13 @@ impl Runner {
                 // paths named by the job's ID, which a new attempt would
                 // reuse. Like a checkout conflict, this holds back no one
                 // else: it can last until the VM is confirmed stopped.
-                if self.core.config.windows_runtime.cleanup_pending(id) {
+                #[cfg(unix)]
+                if self.core.config.macos_instance()
+                    && self.core.config.macos_runtime.workspace_busy(job.key(), id)
+                {
+                    continue;
+                }
+                if self.core.config.cleanup_pending(id) {
                     continue;
                 }
                 if job.weight > self.core.config.max_weight {
@@ -5797,9 +5915,9 @@ impl Runner {
     /// waiting for the VM's I/O thread, then drop the rest. Dropping a
     /// `PreparedVm` alone only signals that thread to stop.
     fn release_prepared(&self, prepared: Prepared) {
-        if let Some(vm) = &prepared.windows {
+        if let Some(vm) = &prepared.vm {
             if let Some(vm) = vm.lock().unwrap().take() {
-                backend::Execution::reap(&vm);
+                vm.reap();
             }
         }
         drop(prepared);
@@ -5969,7 +6087,7 @@ impl Runner {
             }
         };
         #[cfg(test)]
-        if !self.core.config.windows_instance() {
+        if !self.core.config.vm_instance() {
             if let Some(processes) = &self.core.config.test_processes {
                 if let Some(identity) = launch.process {
                     processes.lock().unwrap().register(identity);
@@ -6158,12 +6276,12 @@ impl Runner {
         }
         // Windows reap abandons the pre-Start I/O thread and joins VM cleanup.
         // Host executions must be waited before their process is reaped.
-        if !self.core.config.windows_instance() {
+        if !self.core.config.vm_instance() {
             let _ = execution.wait();
         }
         execution.reap();
         drop(execution);
-        if !self.core.config.windows_instance()
+        if !self.core.config.vm_instance()
             && finished
                 .process
                 .is_some_and(|process| process.unit.is_some())
@@ -6182,8 +6300,7 @@ impl Runner {
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
         }
-        let no_start =
-            unreleased && (cfg!(target_os = "linux") || self.core.config.windows_instance());
+        let no_start = unreleased && (cfg!(target_os = "linux") || self.core.config.vm_instance());
         if no_start {
             finished.process = None;
             finished.started_ms = None;
@@ -6220,7 +6337,7 @@ impl Runner {
         let mut delay = Duration::from_millis(50);
         loop {
             let saved = self.save(&finished);
-            if saved.is_ok() || self.core.config.windows_instance() {
+            if saved.is_ok() || self.core.config.vm_instance() {
                 let mut inner = self.core.inner.lock().unwrap();
                 if saved.is_err() {
                     inner.pending_start_refusals.insert(id);
@@ -7019,11 +7136,24 @@ impl Runner {
                 && writer_stats.is_ok()
                 && status.as_ref().is_ok_and(|s| s.success());
             let monitoring_error = status.as_ref().err().map(ToString::to_string);
+            #[cfg(unix)]
+            let macos_cancelled =
+                self.core.config.macos_instance() && self.core.config.macos_runtime.cancelled(id);
+            #[cfg(not(unix))]
+            let macos_cancelled = false;
             let outcome = match &status {
                 Ok(s) => s.wire(),
+                Err(_) if macos_cancelled => Outcome::Cancelled,
                 Err(_) => Outcome::OutcomeUnknown,
             };
             let mut finished = inner.jobs[&id].clone();
+            #[cfg(unix)]
+            if self.core.config.macos_instance()
+                && finished.kill.is_none()
+                && self.core.config.macos_runtime.cancelled(id)
+            {
+                finished.kill = Some((Killed::Cancel, self.now()));
+            }
             if let Some(mut result) = return_result.clone() {
                 // Save the bounded collection result with the command's finished
                 // state so replay cannot expose one without the other after restart.

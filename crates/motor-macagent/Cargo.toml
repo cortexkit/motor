@@ -7,6 +7,7 @@ description = "Motor's single-job macOS VM guest agent"
 
 [dependencies]
 motor-winagent = { path = "../motor-winagent" }
+motor-macvm = { path = "../motor-macvm", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

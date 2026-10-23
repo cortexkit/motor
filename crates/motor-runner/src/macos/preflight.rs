@@ -39,6 +39,16 @@ fn local(source: &str, base: &Path, roots: &[PathBuf]) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 fn cargo(value: &toml::Value, base: &Path, roots: &[PathBuf]) -> io::Result<()> {
+    if let Some(workspace) = value
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        local(workspace, base, roots)?;
+    }
+    cargo_values(value, base, roots)
+}
+fn cargo_values(value: &toml::Value, base: &Path, roots: &[PathBuf]) -> io::Result<()> {
     if let Some(table) = value.as_table() {
         if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
             for key in ["members", "default-members", "exclude"] {
@@ -81,11 +91,11 @@ fn cargo(value: &toml::Value, base: &Path, roots: &[PathBuf]) -> io::Result<()> 
             }
         }
         for child in table.values() {
-            cargo(child, base, roots)?;
+            cargo_values(child, base, roots)?;
         }
     } else if let Some(array) = value.as_array() {
         for child in array {
-            cargo(child, base, roots)?;
+            cargo_values(child, base, roots)?;
         }
     }
     Ok(())
@@ -258,7 +268,7 @@ fn bun_json(text: &str) -> io::Result<serde_json::Value> {
                 bytes[i] = b' ';
                 i += 1;
             }
-            if i + 1 == bytes.len() {
+            if i + 1 >= bytes.len() {
                 return Err(invalid("unterminated bun lock comment"));
             }
             bytes[i] = b' ';
@@ -409,12 +419,21 @@ pub(super) fn validate(
 }
 
 pub(super) fn validate_links(root: &Path, roots: &[PathBuf], control: &Control) -> io::Result<()> {
-    fn walk(dir: &Dir, base: &Path, roots: &[PathBuf], control: &Control) -> io::Result<()> {
+    fn walk(
+        dir: &Dir,
+        base: &Path,
+        roots: &[PathBuf],
+        control: &Control,
+        depth: usize,
+    ) -> io::Result<()> {
+        if depth >= super::fs::MAX_TREE_DEPTH {
+            return Err(invalid("node_modules tree depth limit exceeded"));
+        }
         for name in dir.names()? {
             control.check()?;
             let path = base.join(&name);
             match dir.kind(&name)? {
-                libc::S_IFDIR => walk(&dir.child(&name, false)?, &path, roots, control)?,
+                libc::S_IFDIR => walk(&dir.child(&name, false)?, &path, roots, control, depth + 1)?,
                 libc::S_IFLNK => {
                     let target = dir.link(&name)?;
                     let text = target.to_str().ok_or_else(|| {
@@ -439,12 +458,22 @@ pub(super) fn validate_links(root: &Path, roots: &[PathBuf], control: &Control) 
             &installation,
             roots,
             control,
+            0,
         )?;
     }
     Ok(())
 }
 pub(super) fn installations(root: &Path, control: &Control) -> io::Result<Vec<PathBuf>> {
-    fn walk(dir: &Dir, base: &Path, found: &mut Vec<PathBuf>, control: &Control) -> io::Result<()> {
+    fn walk(
+        dir: &Dir,
+        base: &Path,
+        found: &mut Vec<PathBuf>,
+        control: &Control,
+        depth: usize,
+    ) -> io::Result<()> {
+        if depth >= super::fs::MAX_TREE_DEPTH {
+            return Err(invalid("installation tree depth limit exceeded"));
+        }
         for name in dir.names()? {
             control.check()?;
             let path = base.join(&name);
@@ -454,13 +483,13 @@ pub(super) fn installations(root: &Path, control: &Control) -> io::Result<Vec<Pa
                 })?;
                 found.push(path);
             } else if dir.kind(&name)? == libc::S_IFDIR {
-                walk(&dir.child(&name, false)?, &path, found, control)?;
+                walk(&dir.child(&name, false)?, &path, found, control, depth + 1)?;
             }
         }
         Ok(())
     }
     let mut found = Vec::new();
-    walk(&Dir::open(root, false)?, root, &mut found, control)?;
+    walk(&Dir::open(root, false)?, root, &mut found, control, 0)?;
     Ok(found)
 }
 fn lexical_link(text: &str, base: &Path, roots: &[PathBuf], link: &Path) -> io::Result<PathBuf> {
@@ -536,4 +565,59 @@ fn resolve_link(mut target: PathBuf, roots: &[PathBuf], link: &Path) -> io::Resu
         "cyclic node_modules link: {}",
         link.display()
     )))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn deep_node_modules_are_refused_before_unbounded_walk() {
+        let scratch = cortexkit_test_support::ScratchDir::new("deep-module-validation");
+        let root = scratch.join("tree");
+        let modules = root.join("node_modules");
+        let mut dir = Dir::open(&modules, true).unwrap();
+        for _ in 0..(super::super::fs::MAX_TREE_DEPTH + 16) {
+            dir = dir.child("d".as_ref(), true).unwrap();
+        }
+        drop(dir);
+        let control = super::super::Control {
+            cancel: super::super::Cancellation::default(),
+            deadline: std::time::Instant::now() + super::super::PREP_TIMEOUT,
+        };
+        assert!(validate_links(&root, std::slice::from_ref(&root), &control)
+            .unwrap_err()
+            .to_string()
+            .contains("depth limit"));
+    }
+    #[test]
+    fn unterminated_bun_block_comments_are_refusals_not_panics() {
+        for text in ["/*", "{} /*", "/*x", "{\"packages\":{}} /*"] {
+            let result = std::panic::catch_unwind(|| bun_json(text));
+            let error = result
+                .expect("untrusted lockfile must not panic")
+                .unwrap_err();
+            assert!(error.to_string().contains("unterminated"), "{error}");
+        }
+        assert!(bun_json("{} /* closed */").is_ok());
+    }
+    #[test]
+    fn package_workspace_string_cannot_leave_validated_prep_roots() {
+        let scratch = cortexkit_test_support::ScratchDir::new("package-workspace-preflight");
+        let root = scratch.join("tree");
+        std::fs::create_dir(&root).unwrap();
+        for workspace in ["/outside", "../../outside", "../outside"] {
+            let value: toml::Value = toml::from_str(&format!(
+                "[package]\nname='test'\nworkspace={workspace:?}\n"
+            ))
+            .unwrap();
+            let error = cargo(&value, &root, std::slice::from_ref(&root))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(workspace), "{error}");
+        }
+        let value: toml::Value = toml::from_str("[package]\nname='test'\nworkspace='.'\n").unwrap();
+        cargo(&value, &root, std::slice::from_ref(&root)).unwrap();
+        let metadata:toml::Value=toml::from_str("[package]\nname='test'\n[package.metadata]\nworkspace='/not-a-cargo-workspace-pointer'\n").unwrap();
+        cargo(&metadata, &root, std::slice::from_ref(&root)).unwrap();
+    }
 }

@@ -364,7 +364,9 @@ impl Job {
         if let Some(tree_hash) = self.request.as_ref().map(|r| &r.tree_hash) {
             terminal = terminal.with_tree_hash(tree_hash.clone());
         }
-        if remote {
+        if remote
+            && self.request.as_ref().and_then(|r| r.platform.as_ref()) != Some(&Platform::Macos)
+        {
             terminal = terminal.with_workspace_changes(Vec::new());
         }
         self.terminal = Some(terminal);

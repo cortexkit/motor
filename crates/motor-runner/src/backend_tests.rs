@@ -43,7 +43,7 @@ fn boat_backend_refuses_storage_before_dispatch() {
         target: scratch.join("target"),
         sandbox: None,
         wrapper: None,
-        windows: None,
+        vm: None,
     };
     let error = HostBackend
         .launch(&config, &trees(&config), &setup, &prepared, 1)
@@ -164,7 +164,7 @@ fn host_backend_launch_uses_isolation_launcher() {
         target: scratch.join("target"),
         wrapper: Some("/motor-tools/prefrontal-build-slot".into()),
         sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
-        windows: None,
+        vm: None,
     };
     let error = launch_error(HostBackend.launch(&config, &trees(&config), &setup, &prepared, 8));
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -198,7 +198,7 @@ fn host_backend_refuses_isolated_launch_without_prepared_sandbox() {
         target: scratch.join("target"),
         wrapper: None,
         sandbox: None,
-        windows: None,
+        vm: None,
     };
     let error = launch_error(HostBackend.launch(
         &config,
@@ -241,7 +241,7 @@ fn isolated_host_backend_launch_runs_in_motor_job_service_with_022_umask() {
         target,
         wrapper: None,
         sandbox: Some(Box::new(sandbox)),
-        windows: None,
+        vm: None,
     };
     let mut launch = HostBackend
         .launch(&config, &trees(&config), &setup, &prepared, 8)
@@ -306,7 +306,7 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
         target: scratch.join("target"),
         wrapper: None,
         sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
-        windows: None,
+        vm: None,
     };
     let error = launch_error(HostBackend.launch(&config, &trees(&config), &setup, &prepared, 2));
     assert_eq!(error.to_string(), "isolation launcher observed");
@@ -342,7 +342,7 @@ fn hosted_cache_case(
         target: scratch.join("target"),
         wrapper: supervisor.then(|| "/motor-tools/prefrontal-build-slot".into()),
         sandbox: None,
-        windows: None,
+        vm: None,
     };
     let mut env = BTreeMap::from([(
         "CARGO_TARGET_DIR".into(),
@@ -472,7 +472,7 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
                     target: scratch.join("target"),
                     wrapper: supervisor.then(|| "/motor-tools/prefrontal-build-slot".into()),
                     sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
-                    windows: None,
+                    vm: None,
                 };
                 let error = launch_error(HostBackend.launch(
                     &config,

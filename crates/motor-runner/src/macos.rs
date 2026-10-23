@@ -18,9 +18,14 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod execution;
 mod fs;
+mod lifecycle;
 mod preflight;
 mod process;
+pub(crate) use execution::MacosBackend;
+pub(crate) use lifecycle::evict;
+pub(crate) use lifecycle::{Runtime, VmConfig};
 #[cfg(test)]
 mod tests;
 use fs::Dir;
@@ -30,6 +35,11 @@ pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Validate identifiers without inspecting or touching the corresponding host paths.
 pub fn validate_paths(request: &Run) -> io::Result<()> {
+    if request.siblings.len() > 62 {
+        return Err(invalid(
+            "macos_path_invalid: at most 62 sibling shares are supported",
+        ));
+    }
     for path in [
         &request.repository_root,
         &request.workspace_key,
@@ -40,18 +50,20 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
     {
         mapped(path)?;
     }
-    if !Path::new(&request.cwd).starts_with(&request.workspace_key) {
+    if !Path::new(&request.cwd.to_ascii_lowercase())
+        .starts_with(request.workspace_key.to_ascii_lowercase())
+    {
         return Err(invalid("macos_path_invalid: cwd outside workspace"));
     }
     let roots: Vec<_> = std::iter::once(&request.workspace_key)
         .chain(request.siblings.iter().map(|s| &s.canonical_path))
         .collect();
     for (i, root) in roots.iter().enumerate() {
-        if roots
-            .iter()
-            .skip(i + 1)
-            .any(|other| Path::new(root).starts_with(other) || Path::new(other).starts_with(root))
-        {
+        if roots.iter().skip(i + 1).any(|other| {
+            let root = root.to_ascii_lowercase();
+            let other = other.to_ascii_lowercase();
+            Path::new(&root).starts_with(&other) || Path::new(&other).starts_with(&root)
+        }) {
             return Err(invalid("macos_path_invalid: overlapping snapshots"));
         }
     }
@@ -71,12 +83,12 @@ fn mapped(path: &str) -> io::Result<&Path> {
 }
 
 /// Path to a standalone tool binary and its expected SHA-256.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct Tool {
     pub path: PathBuf,
     pub sha256: String,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct Tools {
     pub cargo: Tool,
     pub rustc: Tool,
@@ -127,6 +139,46 @@ struct Control {
     cancel: Cancellation,
     deadline: Instant,
 }
+/// Controller-only flock ownership ends here, not when the last forked copy
+/// happens to exec. Slot leases are different: helpers intentionally share them.
+struct ScopedLock {
+    file: File,
+    owner: libc::pid_t,
+}
+impl ScopedLock {
+    fn new_locked(file: File) -> Self {
+        Self {
+            file,
+            owner: unsafe { libc::getpid() },
+        }
+    }
+    fn try_exclusive(file: File) -> io::Result<Self> {
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self::new_locked(file))
+    }
+}
+fn unlock_file(file: &File) -> io::Result<()> {
+    loop {
+        match fs2::FileExt::unlock(file) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+impl Drop for ScopedLock {
+    fn drop(&mut self) {
+        // A fork-without-exec child must not unlock its still-live parent's
+        // ownership if it happens to drop inherited Rust values.
+        if self.owner == unsafe { libc::getpid() } {
+            let _ = unlock_file(&self.file);
+        }
+    }
+}
+impl std::os::fd::AsRawFd for ScopedLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+}
 impl Control {
     fn check(&self) -> io::Result<()> {
         if self.cancel.0.load(Ordering::Acquire) {
@@ -137,7 +189,7 @@ impl Control {
         }
         Ok(())
     }
-    fn lock(&self, path: &Path) -> io::Result<File> {
+    fn lock(&self, path: &Path) -> io::Result<ScopedLock> {
         let dir = Dir::open(path.parent().ok_or_else(|| invalid("lock parent"))?, true)?;
         let name = path.file_name().ok_or_else(|| invalid("lock name"))?;
         let file = match dir.file(name, true) {
@@ -148,7 +200,7 @@ impl Control {
         loop {
             self.check()?;
             match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(file),
+                Ok(()) => return Ok(ScopedLock::new_locked(file)),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::park_timeout(Duration::from_millis(10))
                 }
@@ -199,9 +251,10 @@ impl Staging {
         })
     }
     fn path_lock(&self, logical: &str) -> PathBuf {
-        self.state
-            .join("canonical-locks")
-            .join(format!("{:x}.lock", Sha256::digest(logical.as_bytes())))
+        self.state.join("canonical-locks").join(format!(
+            "{:x}.lock",
+            Sha256::digest(logical.to_ascii_lowercase().as_bytes())
+        ))
     }
     /// Eviction uses the same lock as materialization and cloning; active jobs use independent copies.
     pub fn evict_canonical(&self, logical: &str, cancel: Cancellation) -> io::Result<()> {

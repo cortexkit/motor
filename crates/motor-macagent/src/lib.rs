@@ -1,9 +1,10 @@
 //! Single-job guest execution using the shared macOS agent protocol.
 
+pub use motor_macvm::{BootConfig, Mount, read_boot_config};
 use std::io::{self, Read};
+#[cfg(unix)]
+pub mod mounts;
 
-pub const NONCE_MAGIC: &[u8] = b"MOTOR-NONCE-V1\n";
-pub const NONCE_BYTES: usize = 32;
 pub const VSOCK_PORT: u32 = 5000;
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 pub const BASH: &str = "/opt/motor/bin/bash";
@@ -11,36 +12,15 @@ pub const HOME: &str = "/Users/motorjob";
 pub const PATH: &str =
     "/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// The rest of the raw disk is padding, not part of the nonce.
-pub fn read_nonce(mut disk: impl Read) -> io::Result<String> {
-    let mut header = vec![0; NONCE_MAGIC.len() + NONCE_BYTES + 1];
-    disk.read_exact(&mut header)?;
-    let nonce = &header[NONCE_MAGIC.len()..header.len() - 1];
-    if !header.starts_with(NONCE_MAGIC)
-        || header.last() != Some(&b'\n')
-        || !nonce
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid nonce disk",
-        ));
-    }
-    Ok(String::from_utf8(nonce.to_vec()).expect("hex is UTF-8"))
-}
-
-/// Probe whole raw disks, accepting exactly one magic header. A matching header
-/// with corrupt nonce bytes is an error, not an unrelated disk to skip.
-pub fn find_nonce<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<String> {
+/// Probe whole raw disks, requiring exactly one v2 boot metadata disk.
+/// A matching header with corrupt metadata is an error, not a disk to skip.
+pub fn find_boot_config<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<BootConfig> {
     let mut found = None;
-    for mut disk in disks {
-        let mut magic = vec![0; NONCE_MAGIC.len()];
-        if disk.read_exact(&mut magic).is_err() || magic != NONCE_MAGIC {
+    for disk in disks {
+        let Some(config) = motor_macvm::read_boot_candidate(disk)? else {
             continue;
-        }
-        let nonce = read_nonce(io::Cursor::new(magic).chain(disk))?;
-        if found.replace(nonce).is_some() {
+        };
+        if found.replace(config).is_some() {
             return Err(io::Error::other("multiple nonce disks"));
         }
     }
@@ -50,50 +30,63 @@ pub fn find_nonce<R: Read>(disks: impl IntoIterator<Item = R>) -> io::Result<Str
 #[cfg(test)]
 mod nonce_tests {
     use super::*;
-
-    fn disk(nonce: &str) -> Vec<u8> {
-        [NONCE_MAGIC, nonce.as_bytes(), b"\n", &[0; 1024]].concat()
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    fn disk() -> Vec<u8> {
+        motor_macvm::nonce_bytes(NONCE, &[]).unwrap()
     }
-
     #[test]
-    fn nonce_header_and_hex_are_exact_and_padding_is_ignored() {
-        let nonce = "0123456789abcdef0123456789abcdef";
-        assert_eq!(read_nonce(&disk(nonce)[..]).unwrap(), nonce);
-        for invalid in [
-            "0123456789ABCDEF0123456789abcdef",
-            "short",
-            "g123456789abcdef0123456789abcdef",
-        ] {
-            assert!(read_nonce(&disk(invalid)[..]).is_err());
+    fn discovery_uses_one_aligned_full_device_read() {
+        struct Device(Vec<u8>);
+        impl Read for Device {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert_eq!(out.len(), motor_macvm::NONCE_DISK_SIZE);
+                assert_eq!(out.as_ptr() as usize % 4096, 0);
+                out.copy_from_slice(&self.0);
+                Ok(out.len())
+            }
         }
-        let mut wrong_magic = disk(nonce);
-        wrong_magic[0] = b'X';
-        assert!(read_nonce(&wrong_magic[..]).is_err());
-        assert!(read_nonce(&disk(nonce)[..20]).is_err());
+        assert_eq!(find_boot_config([Device(disk())]).unwrap().nonce, NONCE);
     }
-
     #[test]
-    fn discovers_one_nonce_disk_independently_of_enumeration_order() {
-        let nonce = "0123456789abcdef0123456789abcdef";
+    fn v2_metadata_reader_is_shared_with_host_writer() {
+        let bytes = disk();
+        assert_eq!(read_boot_config(&bytes[..]).unwrap().nonce, NONCE);
+        let mut old = bytes.clone();
+        old[b"MOTOR-NONCE-V".len()] = b'1';
+        assert!(read_boot_config(&old[..]).is_err());
+        let mut corrupt = bytes;
+        *corrupt.last_mut().unwrap() = 1;
+        assert!(read_boot_config(&corrupt[..]).is_err());
+    }
+    #[test]
+    fn discovers_exactly_one_v2_disk_and_rejects_corrupt_matching_disk() {
+        let valid = disk();
         for disks in [
-            vec![vec![0; 512], disk(nonce)],
-            vec![disk(nonce), vec![0; 512]],
+            vec![vec![0; 512], valid.clone()],
+            vec![valid.clone(), vec![0; 512]],
         ] {
-            assert_eq!(find_nonce(disks.iter().map(|d| &d[..])).unwrap(), nonce);
+            assert_eq!(
+                find_boot_config(disks.iter().map(|d| &d[..]))
+                    .unwrap()
+                    .nonce,
+                NONCE
+            );
         }
         assert!(
-            find_nonce([&[0; 512][..]])
+            find_boot_config([&[0; 512][..]])
                 .unwrap_err()
                 .to_string()
                 .contains("not found")
         );
         assert!(
-            find_nonce([&disk(nonce)[..], &disk(nonce)[..]])
+            find_boot_config([&valid[..], &valid[..]])
                 .unwrap_err()
                 .to_string()
                 .contains("multiple")
         );
-        assert!(find_nonce([&disk("corrupt")[..], &disk(nonce)[..]]).is_err());
+        let mut bad = valid.clone();
+        bad[motor_macvm::NONCE_HEADER.len()] = b'g';
+        assert!(find_boot_config([&bad[..], &valid[..]]).is_err());
     }
 }
 
@@ -102,7 +95,6 @@ mod execution {
     use super::*;
     use motor_winagent::{Frame, Peer, Profile, Protocol, Stream};
     use std::collections::BTreeMap;
-    #[cfg(test)]
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
@@ -145,6 +137,33 @@ mod execution {
         uid: libc::uid_t,
         gid: libc::gid_t,
     }
+    fn validate_user(user: User) -> io::Result<User> {
+        if user.uid == 0 || user.gid == 0 {
+            return Err(io::Error::other(
+                "motorjob must have a non-root uid and gid",
+            ));
+        }
+        Ok(user)
+    }
+    fn set_credentials(process: &mut tokio::process::Command, user: User) -> io::Result<()> {
+        let user = validate_user(user)?;
+        // std applies gid/uid and clears supplementary groups before resolving
+        // current_dir; a pre_exec credential drop runs too late for that lookup.
+        process.as_std_mut().gid(user.gid).uid(user.uid);
+        Ok(())
+    }
+    fn require_empty_groups(
+        clear: impl FnOnce() -> io::Result<()>,
+        count: impl FnOnce() -> io::Result<i32>,
+    ) -> io::Result<()> {
+        clear()?;
+        if count()? != 0 {
+            return Err(io::Error::other(
+                "guest supplementary groups were not cleared",
+            ));
+        }
+        Ok(())
+    }
 
     enum KillScope {
         User(User),
@@ -160,6 +179,7 @@ mod execution {
         fn kill(&self) -> io::Result<()> {
             match self {
                 Self::User(user) => {
+                    let user = validate_user(*user)?;
                     // A non-root kill(-1) reaches all processes of the job uid,
                     // including descendants that escaped the shell's process group.
                     // The root agent must never issue that syscall as root.
@@ -169,8 +189,7 @@ mod execution {
                             return Err(io::Error::last_os_error());
                         }
                         if pid == 0 {
-                            if user.uid == 0
-                                || libc::setgroups(0, std::ptr::null()) != 0
+                            if libc::setgroups(0, std::ptr::null()) != 0
                                 || libc::setgid(user.gid) != 0
                                 || libc::setuid(user.uid) != 0
                             {
@@ -253,16 +272,36 @@ mod execution {
                 "agent must run as root",
             ));
         }
+        // uid() clears groups in the child before chdir, but std tolerates
+        // EPERM from that clearing. Empty the daemon's groups first and fail
+        // closed here so no child can inherit a privileged supplementary group.
+        require_empty_groups(
+            || {
+                if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+                if count < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(count)
+                }
+            },
+        )?;
         // Copy the passwd fields before another libc lookup can reuse its storage.
         let user = unsafe {
             let entry = libc::getpwnam(c"motorjob".as_ptr());
             if entry.is_null() || (*entry).pw_uid == 0 {
                 return Err(io::Error::other("unprivileged motorjob account missing"));
             }
-            User {
+            validate_user(User {
                 uid: (*entry).pw_uid,
                 gid: (*entry).pw_gid,
-            }
+            })?
         };
         serve(
             stream,
@@ -425,22 +464,12 @@ mod execution {
             .kill_on_drop(true);
         match &*settings.scope {
             KillScope::User(user) => {
-                let user = *user;
+                let user = validate_user(*user)?;
                 let path = std::ffi::CString::new(tmpdir.path().as_os_str().as_encoded_bytes())?;
                 if unsafe { libc::chown(path.as_ptr(), user.uid, user.gid) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                unsafe {
-                    process.pre_exec(move || {
-                        if libc::setgroups(0, std::ptr::null()) != 0
-                            || libc::setgid(user.gid) != 0
-                            || libc::setuid(user.uid) != 0
-                        {
-                            return Err(io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
+                set_credentials(&mut process, user)?;
             }
             #[cfg(test)]
             KillScope::ProcessGroup { .. } => {
@@ -532,6 +561,53 @@ mod execution {
         use tokio::io::DuplexStream;
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        #[test]
+        fn root_uid_or_primary_gid_is_rejected() {
+            for user in [User { uid: 0, gid: 20 }, User { uid: 501, gid: 0 }] {
+                assert!(validate_user(user).is_err());
+            }
+            assert!(validate_user(User { uid: 501, gid: 20 }).is_ok());
+        }
+        #[test]
+        fn supplementary_group_clear_failure_is_fatal() {
+            assert!(
+                require_empty_groups(|| Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(0))
+                    .is_err()
+            );
+            assert!(require_empty_groups(|| Ok(()), || Ok(1)).is_err());
+            assert!(require_empty_groups(|| Ok(()), || Ok(0)).is_ok());
+        }
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        #[ignore = "operator: root inside disposable guest with motorjob; never on the host"]
+        async fn macos_qualification_drop_precedes_cwd_resolution() {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::env::var("MOTOR_MACOS_GUEST_QUALIFICATION").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let entry = unsafe { libc::getpwnam(c"motorjob".as_ptr()) };
+            assert!(!entry.is_null());
+            let user = validate_user(unsafe {
+                User {
+                    uid: (*entry).pw_uid,
+                    gid: (*entry).pw_gid,
+                }
+            })
+            .unwrap();
+            let scratch = cortexkit_test_support::scratch_root();
+            std::fs::create_dir_all(&scratch).unwrap();
+            let root = tempfile::tempdir_in(scratch).unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut command = tokio::process::Command::new(BASH);
+            command.args(["-c", "exit 0"]).current_dir(root.path());
+            set_credentials(&mut command, user).unwrap();
+            assert_eq!(
+                command.spawn().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
 
         struct Fixture {
             host: DuplexStream,

@@ -4,17 +4,26 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["framework"]
+framework = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-virtualization", "dep:block2", "dep:objc2-app-kit"]
+
+[[bin]]
+name = "motor-macvm"
+path = "src/main.rs"
+required-features = ["framework"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 motor-winagent = { path = "../motor-winagent" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-virtualization = "0.3"
-block2 = "0.6"
-objc2-app-kit = "0.3"
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-virtualization = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

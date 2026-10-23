@@ -32,6 +32,7 @@ pub enum BackendKind {
     Host,
     Vm,
     WindowsVm,
+    MacosVm,
 }
 
 impl FromStr for BackendKind {
@@ -42,7 +43,10 @@ impl FromStr for BackendKind {
             "host" => Ok(Self::Host),
             "vm" => Ok(Self::Vm),
             "windows-vm" => Ok(Self::WindowsVm),
-            _ => Err(invalid("unknown backend; expected host, vm or windows-vm")),
+            "macos-vm" => Ok(Self::MacosVm),
+            _ => Err(invalid(
+                "unknown backend; expected host, vm, windows-vm or macos-vm",
+            )),
         }
     }
 }
@@ -61,6 +65,10 @@ pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
             Err(invalid("--backend windows-vm requires --vm-config <file>"))
         }
         BackendKind::WindowsVm => Ok(Box::new(crate::windows::WindowsBackend)),
+        #[cfg(unix)]
+        BackendKind::MacosVm => Ok(Box::new(crate::macos::MacosBackend)),
+        #[cfg(not(unix))]
+        BackendKind::MacosVm => Err(invalid("macos-vm requires macOS")),
     }
 }
 
@@ -86,7 +94,7 @@ pub(crate) struct Prepared {
     pub target: PathBuf,
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
-    pub windows: Option<std::sync::Mutex<Option<crate::windows::PreparedVm>>>,
+    pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
 }
 
 /// Owns the prepared service and mount configuration. Tests can substitute a
@@ -144,13 +152,21 @@ pub(crate) trait Execution: Send {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ExecutionOutcome {
     Unix(ExitStatus),
-    WindowsExit { code: u32 },
+    WindowsExit {
+        code: u32,
+    },
+    #[cfg(unix)]
+    Signal {
+        signal: i32,
+    },
 }
 impl ExecutionOutcome {
     pub(crate) fn success(&self) -> bool {
         match self {
             Self::Unix(status) => status.success(),
             Self::WindowsExit { code } => *code == 0,
+            #[cfg(unix)]
+            Self::Signal { .. } => false,
         }
     }
     pub(crate) fn wire(self) -> motor_protocol::Outcome {
@@ -173,6 +189,8 @@ impl ExecutionOutcome {
                     },
                 }),
             Self::WindowsExit { code } => windows_outcome(code),
+            #[cfg(unix)]
+            Self::Signal { signal } => motor_protocol::Outcome::Signal { signal },
         }
     }
 }
@@ -716,7 +734,7 @@ impl Backend for HostBackend {
             target,
             wrapper,
             sandbox,
-            windows: None,
+            vm: None,
         })
     }
     fn launch(

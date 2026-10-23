@@ -241,7 +241,7 @@ impl Backend for InProcessWindows {
             cwd,
             wrapper: None,
             sandbox: None,
-            windows: None,
+            vm: None,
         })
     }
     fn launch(

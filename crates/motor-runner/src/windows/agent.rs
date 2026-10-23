@@ -533,7 +533,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
         target: PathBuf::from(&setup.request.workspace_key).join("target"),
         wrapper: None,
         sandbox: None,
-        windows: Some(Mutex::new(Some(handle))),
+        vm: Some(Mutex::new(Some(Box::new(handle)))),
     })
 }
 

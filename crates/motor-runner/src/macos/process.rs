@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Seek},
     os::unix::process::CommandExt,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -17,6 +17,28 @@ impl Drop for Group {
         }
         let _ = self.0.wait();
     }
+}
+fn wait(group: &mut Group, control: &Control) -> io::Result<ExitStatus> {
+    loop {
+        control.check()?;
+        if let Some(status) = group.0.try_wait()? {
+            return Ok(status);
+        }
+        std::thread::park_timeout(Duration::from_millis(10));
+    }
+}
+#[cfg(test)]
+pub(super) fn wait_after_ready(
+    cmd: &mut Command,
+    ready: impl FnOnce() -> io::Result<Control>,
+) -> io::Result<()> {
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut group = Group(cmd.spawn()?);
+    let control = ready()?;
+    wait(&mut group, &control).map(|_| ())
 }
 pub(super) fn run(cmd: &mut Command, logs: &Path, control: &Control) -> io::Result<()> {
     output(cmd, logs, control).map(|_| ())
@@ -32,21 +54,16 @@ pub(super) fn output(cmd: &mut Command, logs: &Path, control: &Control) -> io::R
         .stderr(Stdio::from(log.try_clone()?));
     let result = (|| {
         let mut group = Group(cmd.spawn()?);
-        loop {
-            control.check()?;
-            if let Some(status) = group.0.try_wait()? {
-                log.rewind()?;
-                let mut output = String::new();
-                log.take(65536).read_to_string(&mut output)?;
-                if status.success() {
-                    return Ok(output);
-                }
-                return Err(invalid(format!(
-                    "dependency preparation failed ({status}): {output}"
-                )));
-            }
-            std::thread::park_timeout(Duration::from_millis(10));
+        let status = wait(&mut group, control)?;
+        log.rewind()?;
+        let mut output = String::new();
+        log.take(65536).read_to_string(&mut output)?;
+        if status.success() {
+            return Ok(output);
         }
+        Err(invalid(format!(
+            "dependency preparation failed ({status}): {output}"
+        )))
     })();
     dir.remove(name.as_ref())?;
     result

@@ -364,58 +364,76 @@ fn pinned_tools_are_checked_on_every_prep_and_fetch_errors_name_package() {
 #[test]
 fn prep_timeout_and_cancel_kill_the_entire_process_group() {
     for cancelled in [false, true] {
-        let mut f = Fixture::new();
-        write(&f.source.join("package.json"), "{}");
-        let pids = f.scratch.join("pids");
-        f.staging.tools.bun = tool(
-            f.scratch.join("tools/bun"),
+        let scratch = ScratchDir::new("prep-group-ready");
+        let pids = scratch.join("pids");
+        let helper = tool(
+            scratch.join("helper"),
             &format!(
-                "#!/bin/sh\nsleep 1000 &\necho $$ $! > '{}'\nwait\n",
+                "#!/bin/sh\nsleep 1000 &\necho $$ $! > '{}.tmp'\nmv '{}.tmp' '{}'\nwait\n",
+                pids.display(),
+                pids.display(),
                 pids.display()
             ),
         );
-        let r = f.request();
+        let mut command = Command::new(&helper.path);
         let cancellation = Cancellation::default();
-        std::thread::scope(|scope| {
-            let token = cancellation.clone();
-            if cancelled {
-                let pids = &pids;
-                scope.spawn(move || {
-                    let until = Instant::now() + Duration::from_secs(10);
-                    while !pids.exists() {
-                        assert!(Instant::now() < until);
-                        std::thread::park_timeout(Duration::from_millis(10));
+        let mut recorded = None;
+        let error = process::wait_after_ready(&mut command, || {
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                match host::read_to_string(&pids) {
+                    Ok(text) => {
+                        let ids = text
+                            .split_whitespace()
+                            .map(str::parse::<libc::pid_t>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(invalid)?;
+                        if ids.len() != 2 {
+                            return Err(invalid("prep child published an incomplete PID marker"));
+                        }
+                        if !ids
+                            .iter()
+                            .all(|pid| *pid > 1 && unsafe { libc::kill(*pid, 0) } == 0)
+                        {
+                            return Err(invalid(
+                                "prep ready barrier did not identify live processes",
+                            ));
+                        }
+                        recorded = Some(ids);
+                        break;
                     }
-                    token.cancel();
-                });
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                if Instant::now() >= until {
+                    return Err(invalid("prep child never reached its ready barrier"));
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
             }
-            let error = f
-                .staging
-                .prepare_with_timeout(
-                    &r,
-                    cancellation,
-                    if cancelled {
+            // This tests the shared production monitor/Group drop, not whether
+            // git/materialization happened to finish inside a two-second budget.
+            if cancelled {
+                cancellation.cancel();
+            }
+            Ok(Control {
+                cancel: cancellation,
+                deadline: Instant::now()
+                    + if cancelled {
                         Duration::from_secs(10)
                     } else {
-                        Duration::from_secs(2)
+                        Duration::from_millis(100)
                     },
-                )
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(
-                error.contains(if cancelled { "cancelled" } else { "timed out" }),
-                "{error}"
-            );
-        });
-        let pids = host::read_to_string(&pids).unwrap();
-        for pid in pids
-            .split_whitespace()
-            .map(|s| s.parse::<libc::pid_t>().unwrap())
-        {
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(if cancelled { "cancelled" } else { "timed out" }),
+            "{error}"
+        );
+        for pid in recorded.expect("the process must be running before its monitor is tested") {
             let until = Instant::now() + Duration::from_secs(2);
             loop {
-                // A killed, reparented Linux child may remain as an inert zombie until init reaps it.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 #[cfg(target_os = "linux")]
                 let alive = alive
@@ -429,6 +447,25 @@ fn prep_timeout_and_cancel_kill_the_entire_process_group() {
             }
         }
     }
+}
+
+#[test]
+fn whole_prep_deadline_can_expire_before_fetch_process_starts() {
+    let mut f = Fixture::new();
+    write(&f.source.join("package.json"), "{}");
+    let marker = f.scratch.join("fetch-started");
+    f.staging.tools.bun = tool(
+        f.scratch.join("tools/bun"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let request = f.request();
+    let error = f
+        .staging
+        .prepare_with_timeout(&request, Cancellation::default(), Duration::ZERO)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("timed out"));
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -838,4 +875,191 @@ fn binary_bun_lock_refusal_is_actionable_before_fetch() {
         .join(request.job_id.to_string());
     assert!(!job.join("cargo-home").exists());
     assert!(!job.join("Users/motor/project/node_modules").exists());
+}
+
+#[test]
+fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
+    let f = Fixture::new();
+    let request = f.request();
+    let prepared = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    let mut config = crate::engine::Config::new(f.staging.state.clone(), "macos");
+    config.free_space_probe = Arc::new(|_| Ok(30 << 30));
+    config.macos = Some(Arc::new(VmConfig {
+        image: "/image".into(),
+        helper: "/helper".into(),
+        tools: f.staging.tools.clone(),
+        toolchain_version: "sealed".into(),
+    }));
+    let control = Control {
+        cancel: Cancellation::default(),
+        deadline: Instant::now() + PREP_TIMEOUT,
+    };
+    let path_lock = control
+        .lock(&f.staging.path_lock(&request.workspace_key))
+        .unwrap();
+    let prep_lock = control.lock(&config.state_root.join("prep.lock")).unwrap();
+    let entry = config
+        .macos_runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    config
+        .macos_runtime
+        .workspace(&config.state_root, &entry)
+        .unwrap();
+    let canonical = config
+        .state_root
+        .join("canonical")
+        .join(mapped(&request.workspace_key).unwrap());
+    let store = config
+        .state_root
+        .join("targets")
+        .join(lifecycle::key(&request.workspace_key));
+    host::create_dir_all(&store).unwrap();
+    host::write(store.join("cached"), "whole").unwrap();
+    assert!(evict(&config, f.staging.trees.mirrors.clone())
+        .unwrap()
+        .is_none());
+    assert!(canonical.exists());
+    assert!(store.exists());
+    assert!(config.state_root.join("prep-cargo").exists());
+    // Controller guards explicitly unlock when dropped.
+    drop(path_lock);
+    drop(prep_lock);
+    entry.owned.lock().unwrap().workspace_lock.take();
+    assert!(canonical.join(".git").is_dir());
+    evict(&config, f.staging.trees.mirrors.clone()).unwrap();
+    assert!(!canonical.exists());
+    assert!(!store.exists());
+    assert!(!config.state_root.join("prep-cargo").exists());
+    assert!(prepared.workspace.exists());
+    config.free_space_probe = Arc::new(|_| Ok(19 << 30));
+    assert!(evict(&config, f.staging.trees.mirrors.clone())
+        .unwrap()
+        .is_some());
+}
+#[test]
+fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let mut request = f.request();
+    let config = crate::engine::Config::new(f.staging.state.clone(), "macos");
+    let runtime = Runtime::default();
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let first = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    let marker = f.scratch.join("marker");
+    let sentinel = f.scratch.join("sentinel");
+    host::create_dir(&sentinel).unwrap();
+    host::write(sentinel.join("whole"), "unchanged").unwrap();
+    let script = format!("#!/bin/sh\nprintf poisoned > '{}'\n", marker.display());
+    let hook = first.workspace.join(".git/hooks/post-checkout");
+    host::create_dir_all(hook.parent().unwrap()).unwrap();
+    tool(hook, &script);
+    host::write(
+        first.workspace.join(".git/config"),
+        format!(
+            "[core]\nfsmonitor = sh -c 'printf poisoned > {}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    host::create_dir(first.workspace.join("node_modules")).unwrap();
+    symlink(&config.state_root, first.workspace.join("node_modules/x")).unwrap();
+    symlink(&sentinel, first.workspace.join("target")).unwrap();
+    assert!(execution::target_out(&config, &entry, &first.workspace).is_err());
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    runtime.finish(&config.state_root, &entry);
+    request.job_id = uuid::Uuid::now_v7();
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let second = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    execution::target_in(&config, &entry, &second).unwrap();
+    host::create_dir(second.workspace.join("target")).unwrap();
+    host::write(second.workspace.join("target/whole"), "new job").unwrap();
+    execution::target_out(&config, &entry, &second.workspace).unwrap();
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    runtime.finish(&config.state_root, &entry);
+    assert!(!marker.exists());
+    assert_eq!(
+        host::read_to_string(sentinel.join("whole")).unwrap(),
+        "unchanged"
+    );
+    assert!(!second.workspace.exists());
+    assert!(!first.workspace.exists());
+}
+
+#[test]
+fn apfs_case_aliases_share_locks_and_cannot_overlap() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    assert_eq!(
+        f.staging.path_lock("/Users/Motor/Project"),
+        f.staging.path_lock("/Users/motor/project")
+    );
+    assert_eq!(
+        lifecycle::key("/Users/Motor/Project"),
+        lifecycle::key("/Users/motor/project")
+    );
+    request.siblings.push(motor_protocol::SiblingSnapshot {
+        canonical_path: "/Users/MOTOR/PROJECT/sub".into(),
+        commit: request.snapshot_commit.clone(),
+        base_commit: None,
+        tree_hash: String::new(),
+    });
+    assert!(validate_paths(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping"));
+}
+
+#[test]
+fn guest_copy_and_sync_reject_excessive_depth_before_stack_or_fd_exhaustion() {
+    let scratch = ScratchDir::new("macos-copy-depth");
+    let source = scratch.join("source");
+    let destination = scratch.join("destination");
+    let mut dir = Dir::open(&source, true).unwrap();
+    for _ in 0..(fs::MAX_TREE_DEPTH + 16) {
+        dir = dir.child("d".as_ref(), true).unwrap();
+    }
+    drop(dir);
+    std::thread::Builder::new()
+        .name("bounded-tree-walks".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let source = Dir::open(&source, false).unwrap();
+            let destination = Dir::open(&destination, true).unwrap();
+            let control = Control {
+                cancel: Cancellation::default(),
+                deadline: Instant::now() + PREP_TIMEOUT,
+            };
+            assert!(source
+                .clone_into(&destination, &control)
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+            assert!(source
+                .sync_all()
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+            assert!(source
+                .copy_inputs(&destination, &control)
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit"));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

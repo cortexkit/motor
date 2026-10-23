@@ -5,6 +5,22 @@ fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
     if kind == BackendKind::WindowsVm {
         config = windows_instance::config(f);
     }
+    #[cfg(unix)]
+    if kind == BackendKind::MacosVm {
+        let path = f.scratch.join("macos.toml");
+        let mut text = String::from(
+            "image = '/image'\nhelper = '/helper'\ntoolchain_version = 'sealed rustc'\n",
+        );
+        for tool in ["cargo", "rustc", "bun", "git"] {
+            text.push_str(&format!(
+                "[tools.{tool}]\npath = '/tools/{tool}'\nsha256 = '{}'\n",
+                "0".repeat(64)
+            ));
+        }
+        fs::write(&path, text).unwrap();
+        config.vm_config = Some(path);
+        config.free_space_probe = Arc::new(|_| Ok(100 << 30));
+    }
     config.backend = kind;
     // Inject only the portable backend: these tests stop at admission, before
     // any Windows command could be handed to the host executor.
@@ -41,6 +57,12 @@ fn served_platform_is_derived_from_backend_kind() {
     assert_eq!(config.served_platform(), Platform::Windows);
     config.backend = BackendKind::Host;
     assert_eq!(config.served_platform(), Platform::Linux);
+    config.backend = BackendKind::MacosVm;
+    assert_eq!(config.served_platform(), Platform::Macos);
+    assert_eq!(
+        "macos-vm".parse::<BackendKind>().unwrap(),
+        BackendKind::MacosVm
+    );
     assert_eq!(
         "windows-vm".parse::<BackendKind>().unwrap(),
         BackendKind::WindowsVm
@@ -199,6 +221,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
             br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["windows"]}"#
                 .as_slice()
         }
+        (BackendKind::MacosVm, true) => br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["macos"]}"#.as_slice(),
         _ => unreachable!(),
     };
     // The session's writer sends a heartbeat on its first tick, which can land
@@ -341,4 +364,143 @@ fn macos_path_refusal_is_durable_before_platform_or_workspace_setup() {
             .unwrap()
             .contains("macos_path_invalid"));
     }
+}
+
+#[cfg(unix)]
+fn macos_request(f: &Fixture) -> Run {
+    let (mut request, _) = f.run("true");
+    request.platform = Some(Platform::Macos);
+    request.repository_root = "/Users/motor/project".into();
+    request.workspace_key = request.repository_root.clone();
+    request.cwd = request.workspace_key.clone();
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    request.bundles[0].repository = request.repository_root.clone();
+    request
+}
+#[cfg(unix)]
+#[test]
+fn macos_capacity_roots_and_feature_refusals_are_backend_specific() {
+    let f = Fixture::new();
+    let runner = platform_runner(&f, BackendKind::MacosVm);
+    assert_eq!(runner.config().max_weight, 8);
+    assert_eq!(
+        runner.config().workspace_roots,
+        vec![runner.config().state_root.clone()]
+    );
+    assert_eq!(
+        runner.config().owned_workspace_roots,
+        runner.config().workspace_roots
+    );
+    assert_eq!(runner.config().free_space_floor_bytes, 20 << 30);
+    assert_eq!(runner.config().free_space_eviction_bytes, Some(40 << 30));
+    assert!(!runner.warm_builds_enabled("arbitrary untrusted integration tip"));
+    assert!(!runner.config().writer_enabled());
+    for hint in 1..=4 {
+        let mut request = macos_request(&f);
+        request.weight_hint = Some(hint);
+        assert!(matches!(
+            runner.accept(request.clone()).unwrap(),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(
+            read_json::<Job>(&runner.record_path(request.job_id))
+                .unwrap()
+                .weight,
+            4
+        );
+    }
+    for (feature, detail, reason) in [
+        ("weight", "macos_vcpu_limit", RefusalReason::RequestRejected),
+        (
+            "paths",
+            "return_paths_unsupported",
+            RefusalReason::RequestRejected,
+        ),
+        (
+            "chunks",
+            "return_chunked_unsupported",
+            RefusalReason::RequestRejected,
+        ),
+        (
+            "network",
+            "network_unsupported",
+            RefusalReason::NetworkUnsupported,
+        ),
+    ] {
+        let mut request = macos_request(&f);
+        match feature {
+            "weight" => request.weight_hint = Some(5),
+            "paths" => request.return_paths = vec![format!("{}/file", request.workspace_key)],
+            "chunks" => request.return_chunked = true,
+            _ => request.network = Some(Network::Outbound),
+        }
+        assert!(
+            matches!(runner.accept(request.clone()).unwrap(),Admission::Refused(r) if r==reason)
+        );
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        assert_eq!(job.terminal.unwrap().refusal_detail(), Some(detail));
+        assert!(job.started_ms.is_none());
+    }
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn macos_hello_advertises_only_macos_and_accepted_echoes_it() {
+    let f = Fixture::new();
+    let runner = platform_runner(&f, BackendKind::MacosVm);
+    let (socket, server) = listener(&f, &runner);
+    let mut stream = platform_connect(&socket, BackendKind::MacosVm, true).await;
+    let request = macos_request(&f);
+    write_frame_async(&mut stream, &Frame::Run(request.clone()))
+        .await
+        .unwrap();
+    let Frame::Accepted(accepted) = read_next(&mut stream).await else {
+        panic!("expected macOS acceptance")
+    };
+    assert_eq!(accepted.platform(), Some(&Platform::Macos));
+    assert_eq!(accepted.job_id, request.job_id);
+    server.abort();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_backend_guard_requires_explicit_development_override() {
+    for kind in [BackendKind::Host, BackendKind::Vm, BackendKind::WindowsVm] {
+        let mut config = Config::new("unused", "guard");
+        config.backend = kind;
+        assert!(config
+            .configure_backend()
+            .unwrap_err()
+            .to_string()
+            .contains("macOS hosts require --backend macos-vm"));
+    }
+    let mut config = Config::new("unused", "guard");
+    config.development_allow_host_backend = true;
+    config.configure_backend().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_terminal_never_claims_workspace_changes_and_queued_cancel_is_prompt() {
+    let f = Fixture::new();
+    let runner = platform_runner(&f, BackendKind::MacosVm);
+    let request = macos_request(&f);
+    let mut job = Job::new(request.job_id, Some(request.clone()), 1, 1, 4);
+    job.started_ms = Some(2);
+    job.terminal(Outcome::Exit { code: 7 }, 3);
+    let terminal = job.terminal.unwrap();
+    assert!(terminal.workspace_changes.is_none());
+    assert_eq!(
+        serde_json::to_value(&terminal)
+            .unwrap()
+            .get("workspace_changes"),
+        Some(&serde_json::Value::Null)
+    );
+    runner.accept(request.clone()).unwrap();
+    let now = std::time::Instant::now();
+    runner.cancel(request.job_id).unwrap();
+    assert!(now.elapsed() < Duration::from_secs(2));
+    let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    assert_eq!(job.terminal.unwrap().outcome, Outcome::Cancelled);
+    assert!(job.started_ms.is_none());
 }

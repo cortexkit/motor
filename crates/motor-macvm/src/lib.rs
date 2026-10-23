@@ -6,7 +6,9 @@
 use motor_winagent::{Frame, MACOS_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const BOOT_DISK: &str = "disk.img";
@@ -14,8 +16,11 @@ pub const AUXILIARY_STORAGE: &str = "auxiliary-storage";
 pub const HARDWARE_MODEL: &str = "hardware-model";
 pub const MACHINE_IDENTIFIER: &str = "machine-identifier";
 pub const VSOCK_PORT: u32 = 5000;
-pub const NONCE_HEADER: &str = "MOTOR-NONCE-V1\n";
-pub const NONCE_DISK_SIZE: usize = 4096;
+mod nonce;
+pub use nonce::{
+    BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, decode_boot_config,
+    nonce_bytes, read_boot_candidate, read_boot_config,
+};
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -103,10 +108,11 @@ impl JobVmConfig {
                     "virtio-fs tags must be unique, 1-36 ASCII name characters",
                 ));
             }
-            if guests
-                .iter()
-                .any(|p| p.starts_with(&location.guest) || location.guest.starts_with(p))
-            {
+            if guests.iter().any(|p| {
+                let left = p.to_string_lossy().to_ascii_lowercase();
+                let right = location.guest.to_string_lossy().to_ascii_lowercase();
+                Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left)
+            }) {
                 return Err(invalid("guest share destinations must not overlap"));
             }
             if location.host.starts_with(&request.clone)
@@ -152,6 +158,16 @@ impl JobVmConfig {
     pub fn shares(&self) -> &[Share] {
         &self.shares
     }
+    pub fn mounts(&self) -> Vec<Mount> {
+        self.shares
+            .iter()
+            .map(|share| Mount {
+                tag: share.location.tag.clone(),
+                destination: share.location.guest.clone(),
+                read_only: share.read_only,
+            })
+            .collect()
+    }
     pub fn vsock_devices(&self) -> usize {
         1
     }
@@ -172,56 +188,6 @@ impl JobVmConfig {
     }
 }
 
-pub fn nonce_bytes(nonce: &str) -> io::Result<Vec<u8>> {
-    if nonce.len() != 32
-        || !nonce
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(invalid(
-            "nonce must contain exactly 32 lowercase hexadecimal characters",
-        ));
-    }
-    let mut bytes = format!("{NONCE_HEADER}{nonce}\n").into_bytes();
-    bytes.resize(NONCE_DISK_SIZE, 0);
-    Ok(bytes)
-}
-
-pub fn read_nonce(mut input: impl Read) -> io::Result<String> {
-    let mut bytes = vec![0; NONCE_DISK_SIZE];
-    input.read_exact(&mut bytes)?;
-    let end = NONCE_HEADER.len() + 32;
-    let nonce = std::str::from_utf8(&bytes[NONCE_HEADER.len()..end])
-        .map_err(|_| invalid("invalid nonce disk"))?;
-    if bytes != nonce_bytes(nonce)? {
-        return Err(invalid("invalid nonce disk header or padding"));
-    }
-    Ok(nonce.to_owned())
-}
-
-/// Creates a new disk, never truncating an existing job's secret.
-pub fn create_nonce_disk(path: &Path, nonce: &str) -> io::Result<()> {
-    let bytes = nonce_bytes(nonce)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o400);
-    }
-    let mut disk = options.open(path)?;
-    disk.write_all(&bytes)?;
-    disk.sync_all()?;
-    let mut permissions = disk.metadata()?.permissions();
-    permissions.set_readonly(true);
-    disk.set_permissions(permissions)?;
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| invalid("nonce disk has no parent"))?,
-    )?
-    .sync_all()
-}
-
 /// Consumes the first connection even if its Hello is malformed. Authentication
 /// failure cannot be retried by another process in the same VM.
 pub struct SessionAcceptor {
@@ -232,7 +198,7 @@ pub struct SessionAcceptor {
 
 impl SessionAcceptor {
     pub fn new(nonce: String, image: String) -> io::Result<Self> {
-        nonce_bytes(&nonce)?;
+        nonce::validate_nonce(&nonce)?;
         Ok(Self {
             nonce,
             image,
@@ -305,7 +271,16 @@ pub enum HelperReport {
     Failed {
         detail: String,
     },
-    Stopped,
+    Stopped {
+        reason: HelperStopReason,
+    },
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum HelperStopReason {
+    GateEofBeforeStart,
+    GateEof,
+    VmStopped,
+    Failure,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,6 +338,20 @@ pub struct HelperLifecycle {
 }
 
 impl HelperLifecycle {
+    pub fn stop_reason(&self, gate_eof: bool, stop_called: bool, failed: bool) -> HelperStopReason {
+        if failed {
+            return HelperStopReason::Failure;
+        }
+        if gate_eof && self.closed {
+            if !self.start_requested {
+                return HelperStopReason::GateEofBeforeStart;
+            }
+            if stop_called && self.stopped {
+                return HelperStopReason::GateEof;
+            }
+        }
+        HelperStopReason::VmStopped
+    }
     pub fn gate(&mut self, event: GateEvent) {
         match event {
             GateEvent::Open if !self.closed => self.opened = true,
@@ -632,6 +621,18 @@ mod tests {
         json["network"] = serde_json::json!(true);
         assert!(serde_json::from_value::<JobVmRequest>(json).is_err());
     }
+    #[test]
+    fn rejects_case_aliased_guest_share_overlap() {
+        let mut value = request();
+        value.siblings[0].guest = value
+            .workspace
+            .guest
+            .join("nested")
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .into();
+        assert!(JobVmConfig::new(value).is_err());
+    }
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     #[test]
     fn single_session_accepts_only_correct_first_hello() {
@@ -686,6 +687,32 @@ mod tests {
         }
     }
     #[test]
+    fn helper_exit_reason_distinguishes_eof_from_unrelated_stop() {
+        let mut lifecycle = HelperLifecycle::default();
+        lifecycle.gate(GateEvent::Eof);
+        assert_eq!(
+            lifecycle.stop_reason(true, false, false),
+            HelperStopReason::GateEofBeforeStart
+        );
+        let mut lifecycle = HelperLifecycle::default();
+        lifecycle.gate(GateEvent::Open);
+        assert_eq!(lifecycle.next_action(), Some(HelperAction::Start));
+        lifecycle.gate(GateEvent::Eof);
+        lifecycle.vm_stopped();
+        assert_eq!(
+            lifecycle.stop_reason(true, true, false),
+            HelperStopReason::GateEof
+        );
+        assert_eq!(
+            lifecycle.stop_reason(true, false, false),
+            HelperStopReason::VmStopped
+        );
+        assert_eq!(
+            lifecycle.stop_reason(true, true, true),
+            HelperStopReason::Failure
+        );
+    }
+    #[test]
     fn gate_eof_after_open_waits_for_vm_stopped() {
         let mut lifecycle = HelperLifecycle::default();
         assert_eq!(lifecycle.next_action(), None);
@@ -726,14 +753,19 @@ mod tests {
             .join(format!("macvm-nonce-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("nonce.raw");
-        create_nonce_disk(&path, NONCE).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        create_nonce_disk(&path, NONCE, &[]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            NONCE_DISK_SIZE as u64
+        );
         assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
         assert_eq!(
-            read_nonce(std::fs::File::open(&path).unwrap()).unwrap(),
+            read_boot_config(std::fs::File::open(&path).unwrap())
+                .unwrap()
+                .nonce,
             NONCE
         );
-        assert!(create_nonce_disk(&path, NONCE).is_err());
+        assert!(create_nonce_disk(&path, NONCE, &[]).is_err());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
@@ -783,12 +815,12 @@ mod tests {
     #[test]
     fn nonce_parser_refuses_bad_header_padding_and_length() {
         for index in [0, NONCE_HEADER.len(), NONCE_DISK_SIZE - 1] {
-            let mut bytes = nonce_bytes(NONCE).unwrap();
+            let mut bytes = nonce_bytes(NONCE, &[]).unwrap();
             bytes[index] = b'X';
-            assert!(read_nonce(bytes.as_slice()).is_err());
+            assert!(read_boot_config(bytes.as_slice()).is_err());
         }
-        assert!(read_nonce(&b"short"[..]).is_err());
-        assert!(nonce_bytes("ABCDEF01234567890123456789012345").is_err());
+        assert!(read_boot_config(&b"short"[..]).is_err());
+        assert!(nonce_bytes("ABCDEF01234567890123456789012345", &[]).is_err());
     }
 }
 
@@ -1057,11 +1089,11 @@ pub mod process {
     /// Failure means cleanup and slot reuse must remain blocked. Qualification
     /// must establish that VM disk holders use the motor UID.
     pub fn release_proven(
-        service: ProcessIdentity,
+        service: Option<ProcessIdentity>,
         clone: &Path,
         nonce_disk: &Path,
     ) -> io::Result<bool> {
-        if identity_alive(service)? {
+        if service.map(identity_alive).transpose()?.unwrap_or(false) {
             return Ok(false);
         }
         let keys = [
@@ -1078,6 +1110,34 @@ pub mod process {
             }
         }
         Ok(true)
+    }
+    /// A stopped helper may not have reported its service. Match only services
+    /// that actually hold this job's private boot-disk vnode, never by PID/name alone.
+    pub fn disk_services(clone: &Path) -> io::Result<Vec<ProcessIdentity>> {
+        let boot = file_key(&clone.join(BOOT_DISK))?;
+        let mut services = Vec::new();
+        for pid in same_uid_pids()? {
+            let path = match executable(pid) {
+                Ok(path) => path,
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(e) => return Err(e),
+            };
+            if path.file_name() != Some(std::ffi::OsStr::new(SERVICE))
+                || !path
+                    .components()
+                    .any(|c| c.as_os_str() == "Virtualization.framework")
+            {
+                continue;
+            }
+            let identity = process_identity(pid)?;
+            if open_files(pid)?.contains(&boot) {
+                if process_identity(pid)? != identity {
+                    return Err(io::Error::other("VM service identity changed"));
+                }
+                services.push(identity);
+            }
+        }
+        Ok(services)
     }
 
     #[cfg(test)]
@@ -1168,12 +1228,28 @@ mod native_tests {
         let identity = process_identity(std::process::id() as i32).unwrap();
         assert!(
             !process::release_proven(
-                identity,
+                Some(identity),
                 Path::new("/nonexistent-clone"),
                 Path::new("/nonexistent-nonce")
             )
             .unwrap()
         );
+    }
+    #[test]
+    #[ignore = "operator: same-UID libproc descriptor visibility on the rented Mac"]
+    fn disk_holder_blocks_release_without_reported_service() {
+        let scratch = cortexkit_test_support::ScratchDir::new("macvm-unreported-holder");
+        let clone = scratch.join("clone");
+        std::fs::create_dir(&clone).unwrap();
+        for name in [BOOT_DISK, AUXILIARY_STORAGE] {
+            std::fs::write(clone.join(name), "disk").unwrap();
+        }
+        let nonce = scratch.join("nonce");
+        std::fs::write(&nonce, "nonce").unwrap();
+        let holder = std::fs::File::open(clone.join(BOOT_DISK)).unwrap();
+        assert!(!process::release_proven(None, &clone, &nonce).unwrap());
+        drop(holder);
+        assert!(process::release_proven(None, &clone, &nonce).unwrap());
     }
 }
 

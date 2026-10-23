@@ -304,7 +304,11 @@ mod native {
             }
             match lifecycle.next_action() {
                 Some(HelperAction::Start) => break,
-                Some(HelperAction::Exit) => return report(HelperReport::Stopped),
+                Some(HelperAction::Exit) => {
+                    return report(HelperReport::Stopped {
+                        reason: lifecycle.stop_reason(true, false, false),
+                    });
+                }
                 _ => {}
             }
         }
@@ -330,8 +334,13 @@ mod native {
                 ));
             }
             let _slot = File::from_raw_fd(4);
+            // fd 4 survives this exec intentionally, but must not leak through
+            // any later exec performed by framework code in the helper.
+            if libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
+                return Err(io::Error::last_os_error());
+            }
             let session = UnixStream::from_raw_fd(3);
-            let nonce = read_nonce(File::open(&plan.request().nonce_disk)?)?;
+            let nonce = read_boot_config(File::open(&plan.request().nonce_disk)?)?.nonce;
             let config = job_configuration(&plan)?;
             let vm = VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &config);
             let state = ListenerState {
@@ -368,10 +377,15 @@ mod native {
             let mut service_reported = false;
             let mut started_at = Instant::now();
             let mut failed = false;
+            let mut gate_eof = false;
+            let mut stop_called = false;
             loop {
                 for event in rx.try_iter() {
                     match event {
-                        Event::Gate(e) => lifecycle.gate(e),
+                        Event::Gate(e) => {
+                            gate_eof |= e == GateEvent::Eof;
+                            lifecycle.gate(e);
+                        }
                         Event::Started(Ok(())) => {
                             started = true;
                             start_completed = true;
@@ -384,6 +398,9 @@ mod native {
                         }
                         Event::Stopped => lifecycle.vm_stopped(),
                         Event::Failed(detail) => {
+                            if gate_eof && stop_called {
+                                continue;
+                            }
                             failed = true;
                             let _ = report(HelperReport::Failed { detail });
                             lifecycle.gate(GateEvent::Eof);
@@ -424,7 +441,9 @@ mod native {
                 }
                 match lifecycle.next_action() {
                     Some(HelperAction::Exit) => {
-                        report(HelperReport::Stopped)?;
+                        report(HelperReport::Stopped {
+                            reason: lifecycle.stop_reason(gate_eof, stop_called, failed),
+                        })?;
                         return if failed {
                             Err(error("VM job helper failed"))
                         } else {
@@ -432,6 +451,7 @@ mod native {
                         };
                     }
                     Some(HelperAction::Stop) if vm.canStop() => {
+                        stop_called = true;
                         let stop_tx = tx.clone();
                         vm.stopWithCompletionHandler(&block2::RcBlock::new(
                             move |e: *mut NSError| {
