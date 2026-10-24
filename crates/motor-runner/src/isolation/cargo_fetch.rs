@@ -5,6 +5,56 @@ use std::{
     time::{Duration, Instant},
 };
 
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A fresh Cargo home prevents a warm tenant cache or the offline fallback from
+/// hiding a broken online preparation path. The caller runs the production helper.
+pub(super) fn check_online_via(
+    scratch: &std::path::Path,
+    rustup: &std::path::Path,
+    run: impl FnOnce(&mut Command, Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::{collections::BTreeMap, fs};
+    fs::create_dir(scratch)?;
+    let state = scratch.join("state");
+    let workspace = scratch.join("workspace");
+    let cargo = scratch.join("cargo-home");
+    for path in [&state, &workspace.join("src"), &cargo] {
+        fs::create_dir_all(path)?;
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        include_str!("../../test-fixtures/cargo-fetch/Cargo.toml"),
+    )?;
+    fs::write(
+        workspace.join("Cargo.lock"),
+        include_str!("../../test-fixtures/cargo-fetch/Cargo.lock"),
+    )?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        include_str!("../../test-fixtures/cargo-fetch/src/lib.rs"),
+    )?;
+    let mut command = crate::workspace::dependencies::fetch_command(
+        &state,
+        &workspace,
+        &BTreeMap::new(),
+        &cargo,
+        rustup,
+    )?;
+    command.env("CARGO_NET_OFFLINE", "false");
+    run(&mut command, ONLINE_TIMEOUT)?;
+    let cache = cargo.join("registry/cache");
+    let downloaded = cache.is_dir()
+        && fs::read_dir(cache)?
+            .any(|entry| entry.is_ok_and(|entry| entry.path().join("itoa-1.0.18.crate").is_file()));
+    if !downloaded {
+        return Err(io::Error::other(
+            "trusted online fetch did not download itoa 1.0.18 into the cold cache",
+        ));
+    }
+    Ok(())
+}
+
 /// Runs a tenant runner's root fetch: online first, then an offline fallback
 /// that can still use the cache during an outage. `run` runs each attempt
 /// under its limit, as a plain bounded child or in a sibling snapshot helper
@@ -13,12 +63,7 @@ pub(super) fn prepare_via(
     command: impl FnMut() -> io::Result<Command>,
     run: impl FnMut(&mut Command, Duration) -> io::Result<()>,
 ) -> io::Result<()> {
-    prepare_with_limits_via(
-        command,
-        Duration::from_secs(120),
-        Duration::from_secs(30),
-        run,
-    )
+    prepare_with_limits_via(command, ONLINE_TIMEOUT, Duration::from_secs(30), run)
 }
 
 #[cfg(test)]
@@ -138,6 +183,46 @@ fn drain(stderr: &mut impl Read, diagnostic: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_online_qualification_requires_a_new_cache_and_a_downloaded_crate() {
+        let root = cortexkit_test_support::ScratchDir::new("tenant-fetch-qualification");
+        let scratch = root.join("probe");
+        let rustup = root.join("rustup");
+        let error = check_online_via(&scratch, &rustup, |command, limit| {
+            assert_eq!(limit, Duration::from_secs(120));
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                env[std::ffi::OsStr::new("CARGO_NET_OFFLINE")],
+                Some(std::ffi::OsStr::new("false"))
+            );
+            assert_eq!(
+                env[std::ffi::OsStr::new("CARGO_HOME")],
+                Some(scratch.join("cargo-home").as_os_str())
+            );
+            assert!(!scratch.join("cargo-home/registry").exists());
+            assert!(command.get_args().any(|arg| arg == "--locked"));
+            assert!(!command.get_args().any(|arg| arg == "--offline"));
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("did not download itoa 1.0.18"));
+        let error =
+            check_online_via(&scratch, &rustup, |_, _| panic!("reused a warm cache")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let fresh = root.join("fresh");
+        check_online_via(&fresh, &rustup, |_, _| {
+            let cache = fresh.join("cargo-home/registry/cache/index.crates.io-test");
+            std::fs::create_dir_all(&cache)?;
+            std::fs::write(cache.join("itoa-1.0.18.crate"), "downloaded")
+        })
+        .unwrap();
+        let error = check_online_via(&root.join("failed"), &rustup, |_, _| {
+            Err(io::Error::other("online DNS failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "online DNS failure");
+    }
 
     #[test]
     fn tenant_online_fetch_uses_persistent_cache_and_skips_fallback_on_success() {

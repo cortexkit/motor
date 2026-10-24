@@ -67,6 +67,22 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if args
         .first()
+        .is_some_and(|arg| arg == "check-tenant-cargo-fetch")
+    {
+        if args.len() != 3 || args[1] != "--scratch" {
+            return Err(io::Error::other(
+                "check-tenant-cargo-fetch requires --scratch DIR",
+            ));
+        }
+        motor_runner::check_tenant_cargo_fetch(std::path::Path::new(&args[2]))?;
+        println!(
+            "PASS runner trusted cargo prefetch: itoa 1.0.18 fetched online into a cold cache"
+        );
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
         .is_some_and(|arg| arg == "check-javascript-setup")
     {
         return check_javascript_setup(&args[1..]);
