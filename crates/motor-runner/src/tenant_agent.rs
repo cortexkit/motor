@@ -16,8 +16,10 @@ mod diagnostics;
 pub(crate) mod dns;
 mod network;
 mod paths;
+mod resize;
 mod runner_socket;
 mod snapshot;
+mod trim;
 
 const ARGS: &str = "/tenant/runner-args";
 pub(crate) use crate::tenant::DNS_MARKER;
@@ -30,6 +32,8 @@ pub async fn serve_agent() -> io::Result<()> {
     let listener = crate::vsock::Listener::bind(54)?;
     let attach = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
+    let trim_lock = attach.clone();
+    tasks.spawn(async move { trim::watch(trim_lock).await });
     loop {
         let socket = tokio::select! {
             socket = listener.accept() => socket?,
@@ -76,20 +80,31 @@ async fn agent_session<S: AsyncRead + AsyncWrite + Unpin>(
     attach: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> io::Result<()> {
     while let Some(value) = read_json(&mut socket).await? {
-        let result = match serde_json::from_value(value) {
-            Ok(request) => dispatch(request, &attach).await,
-            Err(error) => Err(io::Error::other(error)),
-        };
-        let reply = match result {
-            Ok(value) => value,
-            Err(error) if error.to_string().starts_with("tenant_recovery_failed") => {
-                json!({"ok":false,"error":"tenant_recovery_failed","detail":error.to_string()})
-            }
-            Err(error) => json!({"ok":false,"error":error.to_string()}),
-        };
-        write_json(&mut socket, &reply).await?;
+        let result = dispatch_value(value, &attach).await;
+        write_json(&mut socket, &agent_result(result)).await?;
     }
     Ok(())
+}
+
+fn agent_result(result: io::Result<Value>) -> Value {
+    match result {
+        Ok(value) => value,
+        Err(error) if error.to_string().starts_with("tenant_recovery_failed") => {
+            json!({"ok":false,"error":"tenant_recovery_failed","detail":error.to_string()})
+        }
+        Err(error) => json!({"ok":false,"error":error.to_string()}),
+    }
+}
+
+async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Result<Value> {
+    // Image capabilities can evolve without extending the shared job protocol.
+    // Resize uses the same host-only agent listener as attachment and snapshots.
+    if value["op"] == "apply_resize" {
+        let args = resize::parse(value)?;
+        let _guard = attach.lock().await;
+        return resize::apply(args).await;
+    }
+    dispatch(serde_json::from_value(value)?, attach).await
 }
 
 async fn dispatch(

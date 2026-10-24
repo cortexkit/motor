@@ -26,6 +26,7 @@ import uuid
 from typing import Any
 
 from build_storage import mounts_under, require_private_view
+from discard_fixture import allocated, assert_reclaimed, without_discard
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -58,7 +59,7 @@ TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
           "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
-         "guest units", "teardown")
+          "cold discard", "warm discard", "guest units", "teardown")
 
 
 def module(name, path):
@@ -544,6 +545,7 @@ class Harness:
             dest = mount / "qualification"
             dest.mkdir(mode=0o700)
             shutil.copyfile(HERE / "guest/hosted_qualify.py", dest / "run.py")
+            shutil.copyfile(HERE / "discard_fixture.py", dest / "discard_fixture.py")
             # The guest checks ownership with this checkout's rule, not the image's copy.
             shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")
             for name in PARITY_FILES:
@@ -554,7 +556,17 @@ class Harness:
 
         with (self.results / "base-console.log").open("ab", buffering=0) as console:
             def base(c, image, path):
-                self.provisioner.build_base(c, image, path, console=console, diagnostics=self.results / "base-boot")
+                requests = self.provisioner.base_requests
+                if getattr(self.args, "without_discard", False):
+                    def control(c, args):
+                        result = without_discard(requests(c, args))
+                        self.record("discard_negative_control", tenant_drive=dict(result)["/drives/tenant"])
+                        return result
+                    self.provisioner.base_requests = control
+                try:
+                    self.provisioner.build_base(c, image, path, console=console, diagnostics=self.results / "base-boot")
+                finally:
+                    self.provisioner.base_requests = requests
             self.provisioner.provision(self.config, make_base=base, stage=stage)
         # The helper has one inert job slot because its existing configuration
         # requires one. Only persistent-tenant operations are sent by this lane.
@@ -622,7 +634,7 @@ class Harness:
         self.launch(self.binary_dir / "motor-host", self.work / "host.json", host_user=True)
         self.wait(lambda: listening(self.port), "host admission did not start", 30)
 
-    def job(self, number):
+    def job(self, number, command_override=None):
         identifier = job_id()
         fixture = self.work / "fixture"
         if not fixture.exists():
@@ -666,6 +678,8 @@ class Harness:
             command += 'touch qualification-finish; '
         command += (f"printf 'QUALIFY_STDOUT_{number}\\n'; printf 'QUALIFY_STDERR_{number}\\n' >&2; "
                     'printf "TARGET %s %s\\n" "$d" "$(stat -c %i "$d")"; ' + ("exit 23" if number == 1 else "exit 0"))
+        if command_override is not None:
+            command = command_override
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -680,6 +694,23 @@ class Harness:
                 raise RuntimeError("host TLS SPKI did not match the fake broker lease")
             send_frame(conn, dict(type="lease_hello", v=1, token=lease["job_token"], requester_jwk=self.requester_jwk))
             return self.converse(conn, identifier, lease, run_request(identifier, commit, tree, bundle, command), bundle)
+
+    def isolated_discard(self, phase):
+        def signal(name):
+            frames = self.job(2, command_override=f"set -eu; touch {name}; printf 'DISCARD_SIGNAL\\n'")
+            assert_job(frames, 0, b"DISCARD_SIGNAL\n", b"")
+        if phase == "warm":
+            signal("discard-warm-start")
+        self.expect_console(f"DISCARD {phase} allocated")
+        disk = self.home / "disk.img"
+        before = allocated(disk)
+        signal(f"discard-{phase}-measured")
+        self.expect_console(f"DISCARD {phase} trimmed")
+        after = allocated(disk)
+        evidence = dict(phase=phase, before_bytes=before, after_bytes=after)
+        self.record("discard_measurement", **evidence)
+        evidence["reclaimed_bytes"] = assert_reclaimed(before, after)
+        return evidence
 
     def sign(self, signing_input):
         message = self.work / "challenge"
@@ -864,6 +895,7 @@ class Harness:
                 return assert_job(frames, 23 if number == 1 else 0,
                                   f"QUALIFY_STDOUT_{number}\n".encode(), f"QUALIFY_STDERR_{number}\n".encode())
             first = self.step("first job", lambda: [v.decode() for v in result(self.first_frames, 1)])
+            self.step("cold discard", lambda: self.isolated_discard("cold"))
             def warm():
                 second = [v.decode() for v in result(self.job(2), 2)]
                 if second != first:
@@ -885,6 +917,7 @@ class Harness:
                     raise RuntimeError(f"restore fell back to a fresh base: {reply}")
                 return reply
             self.step("restore", restore)
+            self.step("warm discard", lambda: self.isolated_discard("warm"))
             def restored_job():
                 restored = [v.decode() for v in result(self.job(3), 3)]
                 if restored != first:
@@ -935,6 +968,8 @@ def main():
     parser.add_argument("--host-user", default="nobody")
     parser.add_argument("--cpuset", required=True, help="two available host CPUs, excluding reserved Windows CPUs")
     parser.add_argument("--tap-index", type=int, default=254)
+    parser.add_argument("--without-discard", action="store_true",
+                        help="negative control: build the base with tenant discard disabled; qualification must fail")
     args = parser.parse_args()
     if sys.platform != "linux" or os.geteuid() != 0:
         parser.error("operator-only: run as root on the dedicated Linux KVM host, never through runon")
