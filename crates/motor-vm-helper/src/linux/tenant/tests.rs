@@ -3,6 +3,157 @@ use std::io::BufRead;
 use std::os::unix::net::UnixListener;
 
 #[test]
+fn oom_protection_verifies_identity_write_and_readback() {
+    let scratch = cortexkit_test_support::ScratchDir::new("vmm-oom");
+    std::fs::write(scratch.join("comm"), "firecracker\n").unwrap();
+    std::fs::write(scratch.join("oom_score_adj"), "0\n").unwrap();
+    protect_vmm_at(scratch.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("oom_score_adj")).unwrap(),
+        "-500"
+    );
+    std::fs::write(scratch.join("comm"), "jailer\n").unwrap();
+    assert_eq!(
+        protect_vmm_at(scratch.path()).unwrap_err().case,
+        StartRefusalCase::Oom
+    );
+    let error = protect_vmm_with(
+        |name| {
+            Ok(if name == "comm" {
+                "firecracker\n"
+            } else {
+                "0\n"
+            }
+            .into())
+        },
+        |value| {
+            assert_eq!(value, "-500");
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.case, StartRefusalCase::Oom);
+    assert!(error.message.contains("expected -500"));
+}
+
+#[test]
+fn both_snapshot_load_paths_apply_oom_protection_before_the_api_request() {
+    for prefix in ["base", "suspend"] {
+        let scratch = cortexkit_test_support::ScratchDir::new("guarded-load");
+        std::fs::write(scratch.join("comm"), "firecracker\n").unwrap();
+        std::fs::write(scratch.join("oom_score_adj"), "0\n").unwrap();
+        let listener = UnixListener::bind(scratch.join("api.sock")).unwrap();
+        let score = scratch.join("oom_score_adj");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "PUT /snapshot/load HTTP/1.1\r\n");
+            assert_eq!(std::fs::read_to_string(score).unwrap(), "-500");
+            let mut len = None;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    len = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut bytes = vec![0; len.unwrap()];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["snapshot_path"], format!("/state/{prefix}.vmstate"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        guarded_snapshot_load(scratch.path(), prefix, "mtap1", || {
+            protect_vmm_at(scratch.path())
+        })
+        .unwrap();
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+#[cfg(feature = "linux-service-tests")]
+fn isolated_tenant_load_paths_verify_firecracker_oom_score() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let tenant = std::env::var("MOTOR_VM_TEST_TENANT").expect("set MOTOR_VM_TEST_TENANT to a stopped disposable tenant with saved snapshots and a matching size base");
+    for unit in ["motor-host.service", "motor-vm-helper.service"] {
+        let output = Command::new("systemctl")
+            .args(["show", "-p", "ActiveState", "--value", unit])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "inactive",
+            "{unit} must be stopped on the dedicated fixture host"
+        );
+    }
+    let config: Config =
+        serde_json::from_reader(File::open("/etc/motor-vm-helper.json").unwrap()).unwrap();
+    let groups = super::super::cgroup::Cgroups::discover().unwrap();
+    groups.enable().unwrap();
+    let mut backend = LinuxTenants::new(&config, groups.root);
+    let r = backend.registry(&tenant).unwrap();
+    let group = backend.groups.join(format!("tenant-{}", r.tap_index));
+    assert!(!backend.vm_present(&tenant).unwrap());
+    assert!(!group.exists());
+    assert!(!backend.was_running(&r).unwrap());
+    let generation = std::fs::read(&r.generation).unwrap();
+    let saved: Vec<_> = ["suspend.vmstate", "suspend.memory", "key.json"]
+        .iter()
+        .map(|file| {
+            (
+                r.suspend.join(file),
+                std::fs::metadata(r.suspend.join(file)).unwrap(),
+            )
+        })
+        .collect();
+    for warm in [false, true] {
+        backend.check_start(&tenant).unwrap();
+        let loaded = backend.load(&tenant, &r, warm);
+        let observed = if loaded.is_ok() {
+            let pid = backend.running[&tenant].child.id();
+            Some((
+                std::fs::read_to_string(format!("/proc/{pid}/comm")),
+                std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")),
+            ))
+        } else {
+            None
+        };
+        backend.stop(&tenant).unwrap();
+        backend.clear_running(&r).unwrap();
+        loaded.unwrap();
+        let (comm, oom) = observed.unwrap();
+        assert_eq!(comm.unwrap(), "firecracker\n");
+        assert_eq!(oom.unwrap().trim(), "-500");
+        assert!(!backend.vm_present(&tenant).unwrap());
+        assert!(!group.exists());
+        assert!(!backend.was_running(&r).unwrap());
+    }
+    assert_eq!(std::fs::read(&r.generation).unwrap(), generation);
+    use std::os::unix::fs::MetadataExt;
+    for (path, before) in saved {
+        let after = std::fs::metadata(path).unwrap();
+        assert_eq!(
+            (after.ino(), after.len(), after.mtime(), after.mtime_nsec()),
+            (
+                before.ino(),
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec()
+            )
+        );
+    }
+}
+
+#[test]
 fn snapshot_deadline_scales_with_memory_and_reserves_helper_cleanup_budget() {
     assert_eq!(snapshot_create_timeout(1024), Duration::from_secs(60));
     assert_eq!(snapshot_create_timeout(28 * 1024), Duration::from_secs(478));

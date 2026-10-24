@@ -126,3 +126,32 @@ symlink: provision regular files in protected directories rather than relaxing
 the no-symlink policy. In particular a system utility reached through an
 alternatives/uutils symlink is not a suitable loader input without a regular,
 root-owned staged copy.
+
+## Tenant start policy
+
+`Ensure` and `Restore` check `/etc/motor-host/capacity.json`, the sum of all
+registered tenants' RAM and VMM headroom against `MemTotal`, the live
+`motor-jobs.slice` cap, and the tenant's `resize.json` before attempting a wake.
+The helper never writes the jobs-slice drop-in. When the slice is not installed,
+the helper requires `/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf` to
+match the capacity render exactly. Its `MemoryMax` is the checked sum of
+`jobs_min_bytes` and `windows_vm_bytes`, since the Windows VM shares the slice
+with direct Linux jobs. `MemoryHigh` is `max - floor(max / 6)`. The
+pinned 40 GiB drop-in is `tests/vectors/jobs-slice-capacity.conf`.
+
+A policy refusal replies with `result: "start_refused"`, a typed `case` of
+`capacity_json`, `fit`, `live_cap`, `drop_in`, `resize_journal` or `oom`, and a
+diagnostic `message`. These refusals do not disable Stop, Metrics, removal or
+startup reconciliation. Both snapshot load paths verify the VMM is named
+`firecracker` and set and read back `oom_score_adj=-500` before snapshot load.
+An OOM protection failure stops and reaps the VMM without consuming saved state,
+advancing the generation or attempting a base fallback.
+
+On a dedicated fixture host with a stopped disposable tenant, saved snapshots,
+a matching size base, and valid capacity policy, the operator-only
+`isolated_tenant_load_paths_verify_firecracker_oom_score` test exercises both
+real load paths. Stop motor-host and motor-vm-helper first, set
+`MOTOR_VM_TEST_TENANT` to that tenant, and run the helper tests with
+`--features linux-service-tests` in a delegated service. This lane requires
+root, systemd, KVM and the pinned jailer
+and Firecracker; it is not part of the portable suite.

@@ -1,8 +1,11 @@
 //! Ordinary-file Firecracker snapshots, independent of job UFFD/hugepage VMs.
+mod capacity;
 use super::{fs, process, tenant_network};
 use crate::{
     config::Config,
-    tenant::{Backend, Registry, SnapshotKey, REGISTRY},
+    tenant::{
+        Backend, Registry, SnapshotKey, StartRefusal, StartRefusalCase, StartResult, REGISTRY,
+    },
     Error, Result,
 };
 use serde_json::{json, Value};
@@ -184,6 +187,36 @@ fn read_deadline(
     Ok(())
 }
 impl Backend for LinuxTenants {
+    fn check_start(&mut self, tenant: &str) -> std::result::Result<(), StartRefusal> {
+        capacity::check_journal(&Path::new(crate::tenant::TENANTS).join(tenant))?;
+        let capacity = capacity::read_capacity(Path::new(capacity::CONFIG))?;
+        let registries = self
+            .registries()
+            .map_err(|error| crate::tenant::start_refused(StartRefusalCase::Fit, error))?;
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|error| crate::tenant::start_refused(StartRefusalCase::Fit, error))?;
+        capacity.check_fit(&registries, &meminfo)?;
+        let output = Command::new("systemctl")
+            .args(["show", "-p", "LoadState,MemoryMax", "motor-jobs.slice"])
+            .output()
+            .map_err(|error| crate::tenant::start_refused(StartRefusalCase::LiveCap, error))?;
+        let properties = String::from_utf8_lossy(&output.stdout);
+        // systemctl may exit nonzero for an absent unit. Only its explicit
+        // not-found state can use the exact-drop-in alternative below.
+        if !output.status.success() && !properties.lines().any(|line| line == "LoadState=not-found")
+        {
+            return Err(crate::tenant::start_refused(
+                StartRefusalCase::LiveCap,
+                format!(
+                    "systemctl show failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        capacity.check_live_cap(&properties, || {
+            std::fs::read(capacity::DROP_IN).map_err(Error::from)
+        })
+    }
     fn unclean(&mut self, registry: &Registry) -> Result<bool> {
         let path = registry.generation.with_file_name("unclean-stop.json");
         match fs::trusted_file(&path) {
@@ -300,9 +333,9 @@ impl Backend for LinuxTenants {
     fn was_restored(&self, tenant: &str) -> bool {
         self.running.get(tenant).is_some_and(|vm| vm.restored)
     }
-    fn load(&mut self, tenant: &str, r: &Registry, saved: bool) -> Result<()> {
+    fn load(&mut self, tenant: &str, r: &Registry, saved: bool) -> StartResult<()> {
         if self.running(tenant) {
-            return Err(Error("tenant already running".into()));
+            return Err(Error("tenant already running".into()).into());
         }
         if self.running.contains_key(tenant) {
             self.mark_unclean(r, "vm_process_lost")?;
@@ -311,10 +344,10 @@ impl Backend for LinuxTenants {
         let uid = self.uid(r)?;
         let disk = fs::trusted_file(&r.disk)?;
         if disk.metadata()?.len() != r.disk_quota_bytes {
-            return Err(Error("tenant disk size mismatch".into()));
+            return Err(Error("tenant disk size mismatch".into()).into());
         }
         if unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error("tenant disk already attached".into()));
+            return Err(Error("tenant disk already attached".into()).into());
         }
         let boundary = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
         let id = format!("tenant-{}", r.tap_index);
@@ -464,10 +497,10 @@ impl Backend for LinuxTenants {
                 };
                 for cleanup in [ownership, mounts, cgroup, marker] {
                     if let Err(error) = cleanup {
-                        return Err(Error(format!("{e}; tenant cleanup failed: {error}")));
+                        return Err(Error(format!("{e}; tenant cleanup failed: {error}")).into());
                     }
                 }
-                return Err(e);
+                return Err(e.into());
             }
         };
         self.running.insert(
@@ -488,7 +521,8 @@ impl Backend for LinuxTenants {
         let socket_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
         let socket = super::wait_socket(&socket_root.join("api.sock"), Duration::from_secs(10))?;
         drop(socket);
-        api(&root, "PUT", "/snapshot/load", &load_body(prefix, &r.tap()))
+        let pid = self.vm(tenant)?.child.id();
+        guarded_snapshot_load(&root, prefix, &r.tap(), || protect_vmm(pid))
     }
     fn drive(&mut self, tenant: &str, _: &Registry) -> Result<()> {
         let vm = self.vm(tenant)?;
@@ -666,6 +700,49 @@ impl Backend for LinuxTenants {
         );
         Ok(Some(quarantine))
     }
+}
+
+pub(crate) fn guarded_snapshot_load(
+    root: &Path,
+    prefix: &str,
+    tap: &str,
+    protect: impl FnOnce() -> std::result::Result<(), StartRefusal>,
+) -> StartResult<()> {
+    protect()?;
+    api(root, "PUT", "/snapshot/load", &load_body(prefix, tap)).map_err(Into::into)
+}
+
+fn protect_vmm(pid: u32) -> std::result::Result<(), StartRefusal> {
+    protect_vmm_at(&PathBuf::from(format!("/proc/{pid}")))
+}
+
+fn protect_vmm_at(process: &Path) -> std::result::Result<(), StartRefusal> {
+    protect_vmm_with(
+        |name| std::fs::read_to_string(process.join(name)),
+        |value| std::fs::write(process.join("oom_score_adj"), value),
+    )
+}
+
+pub(crate) fn protect_vmm_with(
+    mut read: impl FnMut(&str) -> std::io::Result<String>,
+    write: impl FnOnce(&str) -> std::io::Result<()>,
+) -> std::result::Result<(), StartRefusal> {
+    let check = || -> Result<()> {
+        let comm = read("comm")?;
+        if comm.trim_end() != "firecracker" {
+            return Err(Error(format!("expected firecracker, comm={comm:?}")));
+        }
+        write("-500").map_err(|error| Error(format!("oom write: {error}")))?;
+        let actual =
+            read("oom_score_adj").map_err(|error| Error(format!("oom readback: {error}")))?;
+        if actual.trim() != "-500" {
+            return Err(Error(format!(
+                "oom readback: expected -500, got {actual:?}"
+            )));
+        }
+        Ok(())
+    };
+    check().map_err(|error| crate::tenant::start_refused(StartRefusalCase::Oom, error))
 }
 
 fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {

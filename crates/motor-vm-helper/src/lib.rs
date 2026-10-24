@@ -181,6 +181,10 @@ pub enum Reply {
     Error {
         message: String,
     },
+    StartRefused {
+        case: tenant::StartRefusalCase,
+        message: String,
+    },
     Tenant {
         running: bool,
         restored: bool,

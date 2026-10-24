@@ -501,12 +501,15 @@ fn cgroup_placement_service() {
     let mut settings: crate::config::Config =
         serde_json::from_str(include_str!("../../fixtures/helper.json")).unwrap();
     settings.slots = vec![config];
+    let tenants =
+        crate::tenant::Controller(tenant::LinuxTenants::new(&settings, groups.root.clone()));
     let machine = LinuxMachine {
         config: settings,
         base: File::open(&base).unwrap(),
         base_path: base.clone(),
         cgroups: groups,
         running: BTreeMap::new(),
+        tenants,
     };
     let mut helper = crate::Helper::new(machine, 1, vec![1000]).unwrap();
     assert!(!child.wait().unwrap().success());
