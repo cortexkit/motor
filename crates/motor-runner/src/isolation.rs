@@ -1999,6 +1999,9 @@ pub(crate) struct Sandbox {
     parent_umask: u32,
     #[cfg(test)]
     memory_floor_gib: Option<u64>,
+    /// The jobs slice's limits, as observed when this sandbox started its unit.
+    /// The unit's `MemoryMax` is clamped to the slice's.
+    slice_budget: std::sync::Mutex<Option<crate::systemd::JobMemoryBudget>>,
     // Operator fixtures reuse the production mount layout with the writer identity.
     user: &'static str,
     writer: bool,
@@ -3029,6 +3032,7 @@ impl Sandbox {
             parent_umask: 0o022,
             #[cfg(test)]
             memory_floor_gib: None,
+            slice_budget: std::sync::Mutex::new(None),
             user: if writer { WRITER_USER } else { USER },
             writer,
             network: false,
@@ -3099,6 +3103,14 @@ impl Sandbox {
     #[cfg(test)]
     pub(crate) fn with_memory_floor_gib(mut self, floor_gib: Option<u64>) -> Self {
         self.memory_floor_gib = floor_gib;
+        self
+    }
+
+    /// Pin the jobs slice limits a unit would observe at launch, without
+    /// running systemctl; production reads them from the slice itself.
+    #[cfg(test)]
+    pub(crate) fn with_slice_budget(self, budget: crate::systemd::JobMemoryBudget) -> Self {
+        self.slice_budget.lock().unwrap().replace(budget);
         self
     }
 
@@ -3248,7 +3260,18 @@ impl Sandbox {
         let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
         let memory_max = crate::backend::memory_max(requested_vcpus);
+        // A job's limit is a ceiling, while the shared slice's is a budget: a
+        // request larger than the slice can never be honoured, so the unit asks
+        // for the slice's own `MemoryMax` instead. An overrun still ends as an
+        // OOM kill, either from the slice or from the unit's own limit. With no
+        // observed budget (a command built before any unit started), the
+        // requested limit stands as it always has.
         let memory_max = self.boat_memory_max.unwrap_or(memory_max);
+        let memory_max = self
+            .slice_budget
+            .lock()
+            .unwrap()
+            .map_or(memory_max, |budget| memory_max.min(budget.max));
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.
@@ -3386,7 +3409,11 @@ impl Sandbox {
         cpus: &[u32],
         requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
-        crate::systemd::require_job_memory_budget()?;
+        // Resolved before the unit exists and kept for the command built below.
+        self.slice_budget
+            .lock()
+            .unwrap()
+            .replace(crate::systemd::read_job_memory_budget()?);
         #[cfg(test)]
         crate::test_cleanup::record_unit(self.id, cwd);
         #[cfg(test)]

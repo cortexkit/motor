@@ -730,8 +730,20 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
 
     // Doubling a small request can stay at the memory floor. Start from four
     // vCPUs so the recommendation actually buys more memory, and cap it at the
-    // largest job this host can admit.
-    let more = (weight.max(4) * 2).min(capacity);
+    // largest job this host can admit. When the jobs slice caps job limits, a
+    // larger vCPU count cannot buy more memory, so the advice names that cap.
+    let mut more = (weight.max(4) * 2).min(capacity);
+    if let Ok(budget) = crate::systemd::read_job_memory_budget() {
+        // The slice clamps this job's limit, so only a request that still
+        // raises the limit below the clamp is worth recommending.
+        #[cfg(test)]
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(budget.max);
+        #[cfg(not(test))]
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(budget.max);
+        if more > weight && raised(more) <= raised(weight) {
+            more = weight;
+        }
+    }
     let advice = if more > weight {
         #[cfg(test)]
         let more_limit = crate::backend::memory_limit_gib(more, floor_gib);
@@ -3125,6 +3137,28 @@ impl Runner {
         }
     }
 
+    /// A Linux job unit takes its memory limit from the shared jobs slice. A
+    /// slice too small for the floor every job requests refuses the job before
+    /// it starts, instead of letting the slice OOM-kill it on arrival. An
+    /// unreadable slice is left to the start path's existing refusal.
+    #[cfg(target_os = "linux")]
+    fn slice_memory_refusal(&self) -> Option<String> {
+        if !self.core.config.isolate_jobs || self.core.config.windows_instance() {
+            return None;
+        }
+        #[cfg(test)]
+        let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
+        #[cfg(not(test))]
+        let floor = crate::backend::memory_floor();
+        let budget = crate::systemd::read_job_memory_budget().ok()?;
+        crate::backend::slice_refusal(floor, budget)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn slice_memory_refusal(&self) -> Option<String> {
+        None
+    }
+
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
         #[cfg(unix)]
         if request.platform == Some(Platform::Macos) {
@@ -3200,6 +3234,8 @@ impl Runner {
             request.weight_hint.unwrap_or(2)
         }) {
             Some(refusal)
+        } else if let Some(detail) = self.slice_memory_refusal() {
+            Some((RefusalReason::RunnerFull, detail))
         } else if inner.drain_deadline.is_some() {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()

@@ -6,9 +6,22 @@ use std::{
 
 pub(crate) use crate::JOB_MEMORY_PROPERTIES;
 
-/// Refuse execution rather than let systemd synthesize an uncapped implicit slice
-/// when an operator has not yet installed the shared memory policy.
-pub(crate) fn require_job_memory_budget() -> io::Result<()> {
+/// What the shared jobs slice allows a job unit to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobMemoryBudget {
+    /// The slice's `MemoryMax`: the most memory the slice as a whole may use.
+    pub(crate) max: u64,
+    /// The slice's `MemoryHigh`: from here the kernel throttles the whole slice.
+    /// No decision reads it, but it is part of the same reading and the policy
+    /// check requires it to sit strictly below `max`.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) high: u64,
+}
+
+/// Read the shared jobs slice's limits. Refuses rather than letting systemd
+/// synthesize an uncapped implicit slice when an operator has not yet
+/// installed the shared memory policy.
+pub(crate) fn read_job_memory_budget() -> io::Result<JobMemoryBudget> {
     let output = systemctl(
         &[
             "show",
@@ -23,15 +36,14 @@ pub(crate) fn require_job_memory_budget() -> io::Result<()> {
             .find_map(|line| line.strip_prefix(key))
             .and_then(|n| n.parse::<u64>().ok())
     };
-    if output.status.success()
-        && number("MemoryHigh=")
-            .zip(number("MemoryMax="))
-            .is_some_and(|(high, max)| high > 0 && high < max && max < u64::MAX)
-    {
-        Ok(())
-    } else {
-        Err(io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
-    }
+    let budget = output
+        .status
+        .success()
+        .then(|| number("MemoryHigh=").zip(number("MemoryMax=")))
+        .flatten()
+        .filter(|(high, max)| *high > 0 && high < max && *max < u64::MAX)
+        .map(|(high, max)| JobMemoryBudget { max, high });
+    budget.ok_or_else(|| io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
 }
 
 #[cfg(test)]

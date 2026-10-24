@@ -315,6 +315,52 @@ pub(crate) fn memory_max(vcpus: u32, floor_gib: Option<u64>) -> u64 {
     memory_max_with_floor(vcpus, floor_gib.unwrap_or(MEMORY_FLOOR_GIB))
 }
 
+#[cfg(test)]
+pub(crate) fn memory_floor(floor_gib: Option<u64>) -> u64 {
+    floor_gib
+        .unwrap_or(MEMORY_FLOOR_GIB)
+        .saturating_mul(1 << 30)
+}
+
+/// The smallest memory limit any job asks for: the floor every job unit gets.
+#[cfg(not(test))]
+pub(crate) fn memory_floor() -> u64 {
+    MEMORY_FLOOR_GIB * (1 << 30)
+}
+
+/// Why a Linux job unit cannot run inside the shared jobs slice at all: the
+/// slice's `MemoryMax` is below the floor every job unit requests, so no
+/// admission could ever be honoured. A job whose own limit is merely clamped
+/// is not refused; the slice's OOM killer reports it as it always has.
+pub(crate) fn slice_refusal(floor: u64, budget: crate::systemd::JobMemoryBudget) -> Option<String> {
+    (floor > budget.max).then(|| {
+        format!(
+            "the shared jobs slice MemoryMax={} is below the {} GiB memory floor every job unit requests",
+            budget.max,
+            format_memory_limit_gib(floor)
+        )
+    })
+}
+
+#[test]
+fn slice_below_the_job_floor_is_refused_and_a_clamp_is_not() {
+    let budget = |max| crate::systemd::JobMemoryBudget {
+        max,
+        high: max - max / 6,
+    };
+    // 16 GiB is the floor every job unit requests.
+    let floor = 17_179_869_184;
+    let detail = slice_refusal(floor, budget((16 << 30) - 1)).unwrap();
+    assert_eq!(
+        detail,
+        "the shared jobs slice MemoryMax=17179869183 is below the 16 GiB memory floor every job unit requests"
+    );
+    // At exactly the floor, and above it, jobs run: a clamped job is an
+    // ordinary in-slice OOM, not a refusal.
+    assert_eq!(slice_refusal(floor, budget(floor)), None);
+    assert_eq!(slice_refusal(floor, budget(24 << 30)), None);
+}
+
 fn format_memory_limit_gib(bytes: u64) -> String {
     let whole = bytes / (1 << 30);
     if bytes.is_multiple_of(1 << 30) {

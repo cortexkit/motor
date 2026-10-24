@@ -886,7 +886,7 @@ fn start(config: &Config, arguments: &[String]) -> io::Result<()> {
     let _ = config;
     #[cfg(target_os = "linux")]
     {
-        crate::systemd::require_job_memory_budget()?;
+        crate::systemd::read_job_memory_budget()?;
         use std::{io::Read, process::Stdio};
         let mut child = crate::privilege::command("/usr/bin/systemd-run")
             .args(arguments)

@@ -236,7 +236,7 @@ fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Out
     }
     #[cfg(target_os = "linux")]
     {
-        crate::systemd::require_job_memory_budget()?;
+        crate::systemd::read_job_memory_budget()?;
         use std::{io::Read, process::Stdio, time::Duration};
         let mut child = Command::new("/usr/bin/sudo")
             .args(args)
