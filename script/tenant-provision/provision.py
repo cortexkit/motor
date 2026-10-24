@@ -967,7 +967,7 @@ def protect_vmm(pid, proc=Path("/proc"), oom=Path("/proc"), reread=None):
         raise RuntimeError(f"cannot set the VMM oom_score_adj: {error}") from error
     if actual != str(VMM_OOM_SCORE_ADJ):
         raise RuntimeError(f"oom readback: expected {VMM_OOM_SCORE_ADJ}, got {actual!r}")
-    return dict(pid=pid, comm=comm, oom_score_adj=int(actual), reread=reread is not None)
+    return dict(pid=pid, comm=comm, oom_score_adj=int(actual))
 
 
 class BootEvidence:

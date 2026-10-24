@@ -286,10 +286,11 @@ class CapacityTests(unittest.TestCase):
         tenant = dict(tenant="tenant-1", guest_ram_mib=79872, idle_suspend_s=0,
                       host_floor_bytes=128 * GIB, disk_quota_bytes=600 * GIB)
         idle = dict(tenant, idle_suspend_s=600)
-        # Idle suspend reserves the guest's RAM, so both figures rise by it.
-        self.assertEqual(p.storage_threshold(idle, CAPACITY) - p.storage_threshold(tenant, CAPACITY), 79872 * MIB)
-        self.assertEqual(p.pre_operation_free_bytes(idle, CAPACITY, True) - p.pre_operation_free_bytes(tenant, CAPACITY, True),
-                         79872 * MIB)
+        # Idle suspend reserves the guest's RAM in the threshold itself, and
+        # the requirement carries it once more through the host floor term.
+        self.assertEqual(p.storage_threshold(idle, CAPACITY), 136 * GIB + 79872 * MIB)
+        self.assertEqual(p.pre_operation_free_bytes(idle, CAPACITY, True),
+                         p.pre_operation_free_bytes(tenant, CAPACITY, True) + 79872 * MIB)
         # A second tenant with a larger host floor sets a higher threshold.
         big = dict(tenant="tenant-2", guest_ram_mib=79872, idle_suspend_s=0,
                    host_floor_bytes=256 * GIB, disk_quota_bytes=600 * GIB)
