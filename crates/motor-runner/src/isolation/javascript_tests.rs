@@ -37,8 +37,20 @@ fn stub_tools(f: &Fixture) -> JavascriptTools {
 }
 
 /// The build server's real tools, at the toolchain manifest's locations.
+/// The build-server layout, except that Bun is taken from wherever the test
+/// host installed it: the build server keeps it in the operator's home, while
+/// CI's setup-bun installs it under the runner account's home.
 fn installed_tools() -> JavascriptTools {
-    JavascriptTools::for_role(ToolchainRole::BuildServer)
+    let layout = JavascriptTools::for_role(ToolchainRole::BuildServer);
+    let host_bun = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).find(|dir| dir.join("bun").is_file()));
+    match host_bun {
+        Some(bun_dir) => {
+            let node = layout.executable("node");
+            JavascriptTools::at(ToolchainRole::BuildServer, &bun_dir, node.parent().unwrap())
+        }
+        None => layout,
+    }
 }
 
 /// Refuses the root install of `f.workspace` with tools whose directories
