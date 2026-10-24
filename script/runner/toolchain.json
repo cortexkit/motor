@@ -17,6 +17,7 @@
       ],
       "build-server": [
         "binaryen",
+        "ccache",
         "gnu-coreutils"
       ],
       "tenant": [
@@ -28,6 +29,7 @@
       "binaryen": "120-4build1",
       "build-essential": "12.12ubuntu2.26.04.2",
       "ca-certificates": "20260816ubuntu0.26.04.1",
+      "ccache": "4.12.3-1",
       "clang": "1:21.1.6-71",
       "curl": "8.18.0-1ubuntu2.8",
       "g++-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
@@ -572,6 +574,31 @@
   },
   "rustup": "1.29.1",
   "rustup_home": "/home/ubuntu/.rustup",
+  "ccache": {
+    "version": "4.12.3",
+    "path_by_role": {
+      "build-server": "/usr/bin/ccache",
+      "boat": "/usr/local/bin/ccache",
+      "tenant": "/usr/local/bin/ccache"
+    },
+    "provisioned_by_role": {
+      "build-server": true,
+      "boat": false,
+      "tenant": false
+    },
+    "build_server_package": "4.12.3-1",
+    "source": {
+      "url": "https://github.com/ccache/ccache/releases/download/v4.12.3/ccache-4.12.3.tar.xz",
+      "sha256": "c8e3ef79531966ecfa05bd1666c483b473df9af00896935cc468cb5ed573c16e"
+    },
+    "rollout": "Build-server activation requires the exact pinned binary on PATH. Boat and tenant source installation and image wiring must land before provisioned_by_role can become true; ccache activation is refused there until then. This separate section avoids making existing image parity require an unprovisioned tool.",
+    "print_stats": {
+      "remote_hit": "remote_storage_hit",
+      "remote_error": "remote_storage_error",
+      "remote_timeout": "remote_storage_timeout",
+      "remote_write": "remote_storage_write"
+    }
+  },
   "sccache": {
     "build_server_sha256": {
       "sccache": "d0b240d80a8a9d595bf35ba1341d838bc3f938c81e9359ff9eee66944df0aec4",

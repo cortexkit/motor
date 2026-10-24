@@ -13,7 +13,7 @@ use super::transport::Forwarder;
 
 /// Settings inherited from the runner's own environment are removed from
 /// every job before the runner adds anything, on every host type.
-pub(crate) const INHERITED_PREFIXES: [&str; 2] = ["SCCACHE_", "AWS_"];
+pub(crate) const INHERITED_PREFIXES: [&str; 3] = ["SCCACHE_", "AWS_", "CCACHE_"];
 
 pub(crate) const READ_ONLY_MODE: &str = "READ_ONLY";
 pub(crate) const READ_WRITE_MODE: &str = "READ_WRITE";
@@ -27,11 +27,12 @@ pub(crate) fn delta(
     bucket: &str,
     region: &str,
 ) -> BTreeMap<String, String> {
-    let mut env = small_values(role);
-    env.insert("SCCACHE_BUCKET".into(), bucket.into());
-    env.insert("SCCACHE_REGION".into(), region.into());
+    let mut env = BTreeMap::new();
     // Each tool's forwarder exposes that tool's own socket as a URL.
     if let Some(forwarder) = forwarders.iter().find(|f| f.tool() == Tool::Sccache) {
+        env.extend(small_values(role));
+        env.insert("SCCACHE_BUCKET".into(), bucket.into());
+        env.insert("SCCACHE_REGION".into(), region.into());
         env.insert("SCCACHE_ENDPOINT".into(), forwarder.url());
     }
     env

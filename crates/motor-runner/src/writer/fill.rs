@@ -226,31 +226,17 @@ fn count_in(value: &serde_json::Value) -> Option<u64> {
 /// the publication: statistics that cannot be read say nothing about the
 /// writes that happened.
 pub(crate) fn ccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
-    let bytes = read_output(state, id, "ccache-stats")?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| io::Error::other("ccache statistics are not text"))?;
-    let mut total = 0u64;
-    let mut named = 0usize;
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        if !matches!(name, "remote_storage_error" | "remote_storage_timeout") {
-            continue;
-        }
-        let count = value
-            .parse::<u64>()
-            .map_err(|_| io::Error::other(format!("ccache counter {name} is not a number")))?;
-        total = total.saturating_add(count);
-        named += 1;
-    }
-    if named == 0 {
-        return Err(io::Error::other(
-            "ccache statistics carry no remote-storage counter",
-        ));
-    }
-    Ok(total)
+    use crate::remote_cache::ccache::{REMOTE_ERROR, REMOTE_TIMEOUT};
+    let stats = ccache_statistics(state, id)?;
+    Ok(stats[REMOTE_ERROR].saturating_add(stats[REMOTE_TIMEOUT]))
+}
+
+pub(crate) fn ccache_statistics(
+    state: &Path,
+    id: motor_protocol::Uuid,
+) -> io::Result<std::collections::BTreeMap<String, u64>> {
+    use crate::remote_cache::ccache;
+    ccache::statistics(&read_output(state, id, ccache::STATS_FILE)?)
 }
 
 /// The writer compiles repository-local packages incrementally, which sccache
