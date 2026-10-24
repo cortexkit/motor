@@ -30,20 +30,26 @@ pub(crate) fn read_job_memory_budget() -> io::Result<JobMemoryBudget> {
         ],
         false,
     )?;
+    job_memory_budget(&output).ok_or_else(|| io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
+}
+
+/// The jobs slice's limits from a `systemctl show` reply, or `None` when the
+/// slice has no finite `MemoryMax` below its `MemoryHigh`. `None` means jobs
+/// must not run: systemd would otherwise give them an uncapped implicit slice.
+pub(crate) fn job_memory_budget(output: &Output) -> Option<JobMemoryBudget> {
     let text = String::from_utf8_lossy(&output.stdout);
     let number = |key| {
         text.lines()
             .find_map(|line| line.strip_prefix(key))
             .and_then(|n| n.parse::<u64>().ok())
     };
-    let budget = output
+    output
         .status
         .success()
         .then(|| number("MemoryHigh=").zip(number("MemoryMax=")))
         .flatten()
         .filter(|(high, max)| *high > 0 && high < max && *max < u64::MAX)
-        .map(|(high, max)| JobMemoryBudget { max, high });
-    budget.ok_or_else(|| io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
+        .map(|(high, max)| JobMemoryBudget { max, high })
 }
 
 #[cfg(test)]

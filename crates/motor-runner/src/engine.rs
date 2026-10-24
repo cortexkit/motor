@@ -3158,7 +3158,16 @@ impl Runner {
         let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
         #[cfg(not(test))]
         let floor = crate::backend::memory_floor();
-        let budget = crate::systemd::read_job_memory_budget().ok()?;
+        let budget = crate::backend::systemctl(
+            &self.core.config,
+            &[
+                "show",
+                "--property=MemoryHigh,MemoryMax",
+                "motor-jobs.slice",
+            ],
+        )
+        .ok()
+        .and_then(|output| crate::systemd::job_memory_budget(&output))?;
         crate::backend::slice_refusal(floor, budget)
     }
 
