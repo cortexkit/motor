@@ -82,6 +82,8 @@ pub struct Config {
     /// create private PID namespaces. All other job isolation remains enabled.
     pub boat_profile: bool,
     /// Set only on a per-attempt config clone after Boat evicts a reused cache.
+    /// Only the Linux backend reads it; Boat sandboxes run Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) boat_cold_materialization: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_readiness_withdraw: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
