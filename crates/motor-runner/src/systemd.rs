@@ -132,15 +132,9 @@ pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::
     Ok(major >= 257 && !boat_profile)
 }
 
-#[cfg(all(target_os = "linux", not(test)))]
-pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
-    let output = systemctl(&["show", "--property=Version", "--value"], false)?;
-    manager_private_pids(&output, boat_profile)
-}
-
 /// Whether the manager behind a `systemctl show --property=Version` reply can
 /// give job units `PrivatePIDs`.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn manager_private_pids(output: &Output, boat_profile: bool) -> io::Result<bool> {
     if !output.status.success() {
         return Err(io::Error::other(
