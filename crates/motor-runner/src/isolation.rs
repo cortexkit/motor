@@ -52,6 +52,7 @@ pub(crate) fn job_identity() -> io::Result<pid_init::JobIdentity> {
     pid_init::JobIdentity::resolve(USER)
 }
 
+#[cfg(not(test))]
 pub(crate) fn validate_account() -> io::Result<()> {
     validate_identity(
         USER,
@@ -59,6 +60,14 @@ pub(crate) fn validate_account() -> io::Result<()> {
         &[],
         account_groups(USER)?.as_deref(),
     )
+}
+
+/// Tests run without the provisioned sandbox account. A test that does need
+/// the account rules calls `validate_identity` through the writer path, and
+/// no test starts a job unit under the account, so only this gate is skipped.
+#[cfg(test)]
+pub(crate) fn validate_account() -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
