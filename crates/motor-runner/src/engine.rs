@@ -638,7 +638,7 @@ impl Config {
 
 pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
     if let Some(bytes) = _config.boat_memory_max_bytes {
-        return format!("the Boat job's measured memory budget of {} bytes was reached; the kernel killed a process and the job was stopped. More vCPUs do not increase this sandbox's usable memory.", bytes);
+        return format!("the kernel OOM-killed a process and the job was stopped (Boat job memory budget {} bytes; the shared host memory budget also applies). More vCPUs do not increase this sandbox's usable memory.", bytes);
     }
     #[cfg(test)]
     let floor_gib = _config.memory_floor_gib;
@@ -663,7 +663,7 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
         format!(" The job is already at the maximum of {more} vCPUs ({limit} GiB).")
     };
     format!(
-        "the job's memory limit of {limit} GiB was reached; the kernel killed a process and the job was stopped.{advice}"
+        "the kernel OOM-killed a process and the job was stopped (per-job memory limit of {limit} GiB; the shared host memory budget also applies).{advice}"
     )
 }
 

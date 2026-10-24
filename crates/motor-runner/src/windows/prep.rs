@@ -199,6 +199,9 @@ fn prep_args(
         "--pipe".into(),
         "--collect".into(),
         format!("--unit=motor-windows-{}-prep-{id}.service", config.instance),
+        crate::systemd::JOB_MEMORY_PROPERTIES[0].into(),
+        crate::systemd::JOB_MEMORY_PROPERTIES[1].into(),
+        crate::systemd::JOB_MEMORY_PROPERTIES[2].into(),
         "--property=User=motor-prep".into(),
         "--property=ProtectSystem=strict".into(),
         "--property=ProtectHome=yes".into(),
@@ -233,6 +236,7 @@ fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Out
     }
     #[cfg(target_os = "linux")]
     {
+        crate::systemd::require_job_memory_budget()?;
         use std::{io::Read, process::Stdio, time::Duration};
         let mut child = Command::new("/usr/bin/sudo")
             .args(args)

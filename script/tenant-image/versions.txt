@@ -18,6 +18,7 @@
     "gettext", "libcurl4-gnutls-dev", "libexpat1-dev", "libpcre2-dev", "zlib1g-dev"
   ],
   "runner_inputs_sha256": {
+    "script/runner/units/system/motor-jobs.slice": "9ff0c0e449aa78f5b0c3ea6d1f0ea86e81983e2bf16569b6e52106777b1ade3d",
     "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
     "script/runner/install-tools.sh": "381d6d1e0b56690a34a2c6df40f86f90eb6574663e2f91e9d7b27120d752a9ea",
     "script/runner/toolchain.json": "2ae7aa1abec0ae961462e3a4b5afbb037facbbffd18f3539781b233198f7a776",
@@ -31,7 +32,7 @@
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
     "script/runner/job-account.py": "11ad13ca3189097879e796b3d96720417676a3c81d8703a616aa1b1bc645388f",
     "script/runner/sysctl/60-motor-inotify.conf": "2ddb7e2127e6c2c04d2d4c96293e12b39f29a81e58adac0c1a3eb8d432b7b9f4",
-    "script/boat-image/install.py": "35d508030261fe3db6c088ecba996e8c1727d74a01923f264d9e22c6718cb721",
+    "script/boat-image/install.py": "f8b45b0d008af5a3b16256fc4349690cc5f0620c4265e88dddf097d7817a5e4c",
     "script/tenant-image/guest/root_paths.py": "2de3c028f009f8e77abe3524fcbbae589b47fd32d5a6af8ab1f55240d0a33c3d"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",

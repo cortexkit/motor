@@ -205,6 +205,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ancestor_slice_oom_keeps_victim_counters_and_vcpu_advice() {
+        let scratch = cortexkit_test_support::ScratchDir::new("ancestor-oom-evidence");
+        let group = scratch.path().join("job.service");
+        fs::create_dir(&group).unwrap();
+        // An ancestor's limit can kill a process without the job's own max or
+        // oom counters increasing. The victim still gets an oom_kill event.
+        fs::write(group.join("memory.events"), "max 0\noom 0\noom_kill 1\n").unwrap();
+        let mut evidence = ExecutionEvidence::default();
+        evidence.unit(
+            "ControlGroup=/job.service\nMemoryMax=17179869184\nResult=signal\n",
+            scratch.path(),
+        );
+        assert!(evidence.oom_killed());
+        assert!(evidence.detail().contains("max=0,oom=0,oom_kill=1"));
+        let config = Config::new("unused", "main");
+        assert!(oom_memory_limit_detail(&config, 2, 80).contains("Request more vCPUs"));
+    }
+
+    #[test]
     fn terminal_evidence_keeps_last_cgroup_counters_when_unit_vanishes() {
         let scratch = cortexkit_test_support::ScratchDir::new("terminal-evidence");
         let group = scratch.path().join("motor-job.service");

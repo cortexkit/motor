@@ -46,6 +46,22 @@ From the root of the checkout:
 script/runner/server-gate.sh
 ```
 
+To check only the installed memory policy, after installing units with
+`script/runner/install-units.sh`, draining all instances, rebooting, and starting
+the runner user service, run as the operator on a dedicated host (not through a
+remote build job):
+
+```sh
+MOTOR_TEST_RUNNER_UNIT=motor-runner.service TMPDIR=/srv/build/tmp \
+  env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  cargo nextest run -p motor-runner --lib --locked --run-ignored only \
+  -E 'test(=isolation::tests::isolated_job_memory_budget_and_oom_priority_protect_runner)'
+```
+
+Use `motor-runner@windows.service` to inspect the Windows instance instead.
+The test requires delegated sudo for real job units and the matching installed
+permission helper. It reads the live runner's OOM score, not the test harness's.
+
 ## What it runs
 
 Each step prints `== <name>`, then `gate <name> ok` or `gate <name> FAILED`.

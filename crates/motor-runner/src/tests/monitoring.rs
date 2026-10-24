@@ -248,7 +248,7 @@ fn oom_result_records_detail_and_preserves_the_exit_code() {
             let job: Job = read_json(&runner.record_path(id)).unwrap();
             assert_eq!(job.terminal.unwrap().outcome, Outcome::Exit { code });
             let detail = format!(
-            "the job's memory limit of {limit} GiB was reached; the kernel killed a process and the job was stopped.{advice}"
+            "the kernel OOM-killed a process and the job was stopped (per-job memory limit of {limit} GiB; the shared host memory budget also applies).{advice}"
         );
             assert_eq!(job.memory_limit_detail, oom.then_some(detail.clone()));
             assert_eq!(

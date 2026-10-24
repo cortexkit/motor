@@ -28,11 +28,11 @@ fn assert_oom_detail_uses_configured_limits(runner: &Runner, job: &Job, detail: 
 }
 
 #[test]
-fn oom_detail_keeps_the_production_sixteen_and_twenty_eight_gib_wording() {
+fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_hit() {
     let config = Config::new("unused", "main");
     assert_eq!(
         crate::engine::oom_memory_limit_detail(&config, 2, 8),
-        "the job's memory limit of 16 GiB was reached; the kernel killed a process and the job was stopped. Request more vCPUs, for example linux,8c, to raise the limit to 28 GiB."
+        "the kernel OOM-killed a process and the job was stopped (per-job memory limit of 16 GiB; the shared host memory budget also applies). Request more vCPUs, for example linux,8c, to raise the limit to 28 GiB."
     );
 }
 

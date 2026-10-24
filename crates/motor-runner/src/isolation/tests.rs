@@ -97,6 +97,13 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
             17_179_869_184_u64
         };
         assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+        for property in [
+            "Slice=motor-jobs.slice",
+            "OOMScoreAdjust=900",
+            "OOMPolicy=kill",
+        ] {
+            assert!(args.contains(&format!("--property={property}").as_str()));
+        }
         assert!(args.contains(
             &format!(
                 "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
@@ -117,6 +124,82 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
         }
         assert!(!args.iter().any(|arg| arg.contains("CPUQuota")));
     }
+}
+
+#[test]
+#[ignore = "requires installed memory-policy units and a running user-service runner on a dedicated host"]
+fn isolated_job_memory_budget_and_oom_priority_protect_runner() {
+    let f = Fixture::new();
+    let sandbox = f.sandbox();
+    let (status, stdout, stderr) = output(
+        &sandbox,
+        "cat /proc/self/oom_score_adj /proc/self/cgroup",
+        &f.workspace,
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout.lines().next(), Some("900"));
+    assert!(
+        stdout.contains("/motor.slice/motor-jobs.slice/"),
+        "{stdout}"
+    );
+
+    let runner_unit =
+        std::env::var("MOTOR_TEST_RUNNER_UNIT").unwrap_or_else(|_| "motor-runner.service".into());
+    let runner = Command::new("/usr/bin/systemctl")
+        .args([
+            "--user",
+            "show",
+            "--value",
+            "--property=MainPID",
+            &runner_unit,
+        ])
+        .output()
+        .unwrap();
+    assert!(runner.status.success());
+    let pid: u32 = String::from_utf8(runner.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        pid > 0,
+        "start the installed runner user service before this test"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+            .unwrap()
+            .trim(),
+        "-900"
+    );
+    let group = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert!(!group.contains("/motor-jobs.slice"), "{group}");
+
+    crate::systemd::require_job_memory_budget().unwrap();
+    let group = Path::new("/sys/fs/cgroup/motor.slice/motor-jobs.slice");
+    let limit = |name| {
+        fs::read_to_string(group.join(name))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let high = limit("memory.high");
+    let max = limit("memory.max");
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap();
+    let total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        * 1024;
+    assert!(
+        high > 0 && high < max && max < total,
+        "high={high} max={max} total={total}"
+    );
 }
 
 fn test_identity() -> pid_init::JobIdentity {

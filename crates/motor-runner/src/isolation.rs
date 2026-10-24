@@ -3103,6 +3103,7 @@ impl Sandbox {
             "--expand-environment=no",
         ])
         .arg(format!("--unit={}", unit(self.id)));
+        cmd.args(crate::systemd::JOB_MEMORY_PROPERTIES);
         if self.tenant_vm {
             cmd.args(tenant_unit_properties());
         }
@@ -3309,6 +3310,7 @@ impl Sandbox {
         cpus: &[u32],
         requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
+        crate::systemd::require_job_memory_budget()?;
         #[cfg(test)]
         crate::test_cleanup::record_unit(self.id, cwd);
         #[cfg(test)]
@@ -3403,8 +3405,17 @@ impl Sandbox {
                 println!("MOTOR_NET_ATTACH_US {}", active_at.elapsed().as_micros());
             }
         }
-        let mut identity = platform::identity(child.id() as i32)
-            .ok_or_else(|| io::Error::other("sandbox client vanished"))?;
+        let Some(mut identity) = platform::identity(child.id() as i32) else {
+            // The launcher can be OOM-killed after the service became active.
+            // The stdin gate is still closed: discard the unit before reporting
+            // a setup refusal, rather than abandoning an unrecorded service.
+            discard_unstarted(self.id);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(
+                "sandbox did not start: sandbox client vanished",
+            ));
+        };
         identity.unit = Some(self.id);
         Ok(platform::Launch {
             #[cfg(test)]

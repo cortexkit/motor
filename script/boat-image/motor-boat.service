@@ -4,6 +4,8 @@ Requires=motor-boat-restored.service motor-boat-storage.service
 After=network-online.target motor-boat-restored.service motor-boat-storage.service
 
 [Service]
+OOMScoreAdjust=-900
+OOMPolicy=continue
 User=root
 Group=root
 RuntimeDirectory=motor-tenant

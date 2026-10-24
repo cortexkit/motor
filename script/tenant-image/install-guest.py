@@ -288,6 +288,9 @@ def configure(pins):
     shutil.copy2(BUILD / "guest/hosted_image_check.py", "/usr/local/libexec/hosted_image_check.py")
     Path("/usr/local/libexec/hosted_image_check.py").chmod(0o755)
     install_services(BUILD / "guest", Path("/etc/systemd/system"))
+    run("install", "-o", "root", "-g", "root", "-m", "0644",
+        str(BUILD / "script/runner/units/system/motor-jobs.slice"),
+        "/etc/systemd/system/motor-jobs.slice")
     clear_module_load_requests(Path("/"))
     rules = (BUILD / "script/runner/motor-net.nft").read_text()
     if rules.count("enp6s0") != 3:
@@ -380,7 +383,8 @@ def verify(pins):
     inventory["python"] = run("python3", "--version", capture=True)
     inventory["nextest"] = run("cargo", "nextest", "--version", capture=True)
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-tenant-agent.service",
-        "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service")
+        "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service",
+        "/etc/systemd/system/motor-jobs.slice")
     # Last, after every tool above has run and could have added files.
     inventory["world_readable_tool_trees"] = verify_tool_trees()
     inventory["root_owned_paths"] = root_paths.require(root_paths.TENANT_ROOTS)
