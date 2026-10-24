@@ -14,10 +14,8 @@ pub(super) struct Capacity {
     windows_vm_bytes: u64,
     host_reserve_bytes: u64,
     jobs_min_bytes: u64,
-    #[serde(rename = "storage_margin_bytes")]
-    _storage_margin_bytes: u64,
-    #[serde(rename = "growth_allowance_bytes")]
-    _growth_allowance_bytes: u64,
+    storage_margin_bytes: u64,
+    growth_allowance_bytes: u64,
     #[serde(rename = "tenant_memory_reserve_bytes")]
     _tenant_memory_reserve_bytes: u64,
 }
@@ -44,6 +42,36 @@ impl Capacity {
                     "jobs_min_bytes + windows_vm_bytes overflows u64",
                 )
             })
+    }
+
+    pub(super) fn check_post_grow(&self, registries: &[Registry], available: u64) -> Result<()> {
+        let mut term = None;
+        for r in registries {
+            let reserve = if r.idle_suspend_s == 0 {
+                0
+            } else {
+                r.guest_ram_mib
+                    .checked_mul(1048576)
+                    .ok_or_else(|| Error("suspend reserve overflow".into()))?
+            };
+            let bytes = r
+                .host_floor_bytes
+                .checked_add(reserve)
+                .ok_or_else(|| Error("storage threshold overflow".into()))?;
+            term = Some(term.unwrap_or(0).max(bytes));
+        }
+        // Host admission resumes at the largest floor/reserve term plus two
+        // storage margins. Activation additionally requires the growth allowance.
+        let required = term
+            .ok_or_else(|| Error("no tenants on storage filesystem".into()))?
+            .checked_add(self.storage_margin_bytes)
+            .and_then(|n| n.checked_add(self.storage_margin_bytes))
+            .and_then(|n| n.checked_add(self.growth_allowance_bytes))
+            .ok_or_else(|| Error("operating requirement overflow".into()))?;
+        if available < required {
+            return Err(Error(format!("post-grow available_bytes={available} below operating_requirement_bytes={required}")));
+        }
+        Ok(())
     }
 
     pub(super) fn check_fit(

@@ -3,6 +3,8 @@
 use crate::{Error, Reply, Response, Result};
 use serde::{Deserialize, Serialize};
 use std::{os::fd::OwnedFd, path::PathBuf};
+pub(crate) mod activation;
+pub use activation::ResizeActivation;
 
 pub const REGISTRY: &str = "/etc/motor-vm-helper/tenants";
 pub const TENANTS: &str = "/var/lib/motor-vm/tenants";
@@ -203,6 +205,21 @@ pub trait Backend {
     fn consume(&mut self, r: &Registry) -> Result<()>;
     fn advance(&mut self, r: &Registry) -> Result<u64>;
     fn resume(&mut self, tenant: &str) -> Result<()>;
+    fn staged_resize(&mut self, _r: &Registry) -> Result<Option<ResizeActivation>> {
+        Ok(None)
+    }
+    fn apply_resize(&mut self, _tenant: &str, _activation: &ResizeActivation) -> Result<()> {
+        Err(Error("resize activation unavailable".into()))
+    }
+    fn sync_disk(&mut self, _tenant: &str) -> Result<()> {
+        Err(Error("tenant disk sync unavailable".into()))
+    }
+    fn post_grow_check(&mut self, _r: &Registry) -> Result<()> {
+        Err(Error("post-grow space check unavailable".into()))
+    }
+    fn complete_resize(&mut self, _r: &Registry, _activation: &ResizeActivation) -> Result<()> {
+        Err(Error("resize completion unavailable".into()))
+    }
     fn prepare(&mut self, tenant: &str) -> Result<()>;
     fn thaw(&mut self, tenant: &str) -> Result<()>;
     fn snapshot(&mut self, tenant: &str, r: &Registry, key: &SnapshotKey) -> Result<()>;
@@ -244,6 +261,8 @@ pub enum StartRefusalCase {
     DropIn,
     ResizeJournal,
     Oom,
+    Activation,
+    PostGrowSpace,
 }
 #[derive(Debug)]
 pub struct StartRefusal {
@@ -308,6 +327,19 @@ impl<B: Backend> Controller<B> {
         let mut restored = self.0.was_restored(tenant);
         match op {
             Operation::Ensure | Operation::Restore => {
+                if self.0.running(tenant) {
+                    // A failed activation stop may have left a live VM. Never
+                    // adopt it while durable provisioning intent is pending.
+                    match self.0.staged_resize(&r) {
+                        Ok(Some(_)) => {
+                            if let Err(error) = self.stop_cleanly(tenant, &r) {
+                                return Ok(refused_response(start_refused(StartRefusalCase::Activation, error)));
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) => return Ok(refused_response(start_refused(StartRefusalCase::Activation, error))),
+                    }
+                }
                 if self.0.unclean(&r)? && self.0.running(tenant) {
                     self.0.stop(tenant)?;
                 }
@@ -343,24 +375,7 @@ impl<B: Backend> Controller<B> {
                 })
             }
             Operation::Stop => {
-                if self.0.running(tenant) {
-                    let prepared = self.0.prepare_stop(tenant);
-                    let record = match &prepared {
-                        Ok(()) => Ok(()),
-                        Err(error) => self.0.mark_unclean(&r, &error.to_string()),
-                    };
-                    let prepared = prepared.is_ok();
-                    if let Err(error) = self.0.stop(tenant) {
-                        let _ = self.0.thaw(tenant);
-                        return Err(error);
-                    }
-                    record?;
-                    // Only a stop whose guest flush succeeded is clean. After a
-                    // failed flush the marker stays as a second durable record.
-                    if prepared {
-                        self.0.clear_running(&r)?;
-                    }
-                }
+                self.stop_cleanly(tenant, &r)?;
             }
             Operation::Suspend => {
                 if !self.0.running(tenant) {
@@ -495,14 +510,72 @@ impl<B: Backend> Controller<B> {
         }
         failures
     }
+    fn stop_cleanly(&mut self, tenant: &str, r: &Registry) -> Result<()> {
+        if self.0.running(tenant) {
+            let prepared = self.0.prepare_stop(tenant);
+            let record = match &prepared {
+                Ok(()) => Ok(()),
+                Err(error) => self.0.mark_unclean(r, &error.to_string()),
+            };
+            let prepared = prepared.is_ok();
+            if let Err(error) = self.0.stop(tenant) {
+                let _ = self.0.thaw(tenant);
+                return Err(error);
+            }
+            record?;
+            // Only a stop whose guest flush succeeded is clean. After a failed
+            // flush the running marker stays as a second durable recovery record.
+            if prepared {
+                self.0.clear_running(r)?;
+            }
+        }
+        Ok(())
+    }
+    fn activate(
+        &mut self,
+        tenant: &str,
+        r: &Registry,
+        activation: &ResizeActivation,
+    ) -> StartResult<()> {
+        let result = (|| {
+            self.0
+                .apply_resize(tenant, activation)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+            self.0
+                .sync_disk(tenant)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+            if activation.quota_grew {
+                self.0
+                    .post_grow_check(r)
+                    .map_err(|e| start_refused(StartRefusalCase::PostGrowSpace, e))?;
+            }
+            self.0
+                .complete_resize(r, activation)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))
+        })();
+        if let Err(mut refusal) = result {
+            if let Err(stop) = self.stop_cleanly(tenant, r) {
+                refusal
+                    .message
+                    .push_str(&format!("; clean stop failed: {stop}"));
+            }
+            return Err(refusal.into());
+        }
+        Ok(())
+    }
     fn wake(&mut self, tenant: &str, r: &Registry) -> StartResult<bool> {
-        let key = self.0.key(r)?;
-        let saved = self
+        let activation = self
             .0
-            .saved_key(r)
-            .ok()
-            .flatten()
-            .is_some_and(|saved| saved == key)
+            .staged_resize(r)
+            .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+        let key = self.0.key(r)?;
+        let saved = activation.is_none()
+            && self
+                .0
+                .saved_key(r)
+                .ok()
+                .flatten()
+                .is_some_and(|saved| saved == key)
             && !self.0.unclean(r)?;
         self.0.egress(tenant, r)?;
         if saved {
@@ -555,7 +628,11 @@ impl<B: Backend> Controller<B> {
                 self.0.clear_running(r)?;
             }
         }
-        result.map(|()| false)
+        result?;
+        if let Some(activation) = activation {
+            self.activate(tenant, r, &activation)?;
+        }
+        Ok(false)
     }
 }
 

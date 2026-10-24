@@ -18,6 +18,48 @@ fn policy() -> Capacity {
 }
 
 #[test]
+fn post_grow_requires_operating_space_not_the_latch_release_point() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let mut r = crate::tenant::tests::registry("a");
+    r.guest_ram_mib = 78 * 1024;
+    r.idle_suspend_s = 0;
+    r.host_floor_bytes = 128 * GIB;
+    for available in [160 * GIB, 208 * GIB - 1] {
+        let error = policy()
+            .check_post_grow(&[r.clone()], available)
+            .unwrap_err();
+        assert!(error.0.contains("operating_requirement_bytes=223338299392"));
+    }
+    policy().check_post_grow(&[r.clone()], 208 * GIB).unwrap();
+    r.host_floor_bytes = 223875170304;
+    policy()
+        .check_post_grow(&[r.clone()], 309774516224)
+        .unwrap();
+    assert!(policy()
+        .check_post_grow(&[r.clone()], 309774516223)
+        .is_err());
+    let mut other = r.clone();
+    other.host_floor_bytes = 150 * GIB;
+    other.idle_suspend_s = 600;
+    // The larger term is 150 GiB host floor + 78 GiB suspend reserve, followed
+    // by 16 GiB in storage margins and the 64 GiB growth allowance.
+    policy()
+        .check_post_grow(&[r.clone(), other.clone()], 308 * GIB)
+        .unwrap();
+    assert!(policy()
+        .check_post_grow(&[r, other.clone()], 308 * GIB - 1)
+        .is_err());
+    other.guest_ram_mib = u64::MAX;
+    assert!(policy()
+        .check_post_grow(&[other.clone()], u64::MAX)
+        .is_err());
+    other.idle_suspend_s = 0;
+    other.host_floor_bytes = u64::MAX;
+    assert!(policy().check_post_grow(&[other], u64::MAX).is_err());
+    assert!(policy().check_post_grow(&[], u64::MAX).is_err());
+}
+
+#[test]
 fn capacity_json_is_strict_and_requires_every_input() {
     let valid = values();
     for key in valid.as_object().unwrap().keys() {
