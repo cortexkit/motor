@@ -240,7 +240,14 @@ impl QuotaSystem for System {
     fn attributes(&self, file: &File) -> io::Result<FsXattr> {
         let mut attr = FsXattr::default();
         // SAFETY: FS_IOC_FSGETXATTR writes a correctly sized live fsxattr.
-        if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSGETXATTR as libc::Ioctl, &mut attr) } == -1 {
+        if unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                FS_IOC_FSGETXATTR as libc::Ioctl,
+                &mut attr,
+            )
+        } == -1
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(attr)
