@@ -109,9 +109,25 @@ admitted limit until a peak is measured. Cargo invocations within this build
 are serial; `--jobs` caps each build's parallelism. Both Rust compiler-wrapper
 environment variables are explicitly cleared, including in the chroot.
 
+Build the static `motor-runner` on a Linux x86_64 build server before passing it
+to the image builder. Install the operator-only `musl-tools` apt package and the
+Rust musl target. The runner's `ring` dependency compiles C code: set
+`CC_x86_64_unknown_linux_musl=musl-gcc` explicitly because the default
+`x86_64-linux-musl-gcc` executable is not provided by `musl-tools`.
+
+```sh
+sudo apt-get install -y musl-tools
+rustup target add x86_64-unknown-linux-musl
+command -v musl-gcc >/dev/null || { echo 'musl-gcc is required; install musl-tools' >&2; exit 1; }
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --locked --target x86_64-unknown-linux-musl -p motor-runner
+```
+
 ```sh
 sudo python3 script/tenant-image/build.py build EXAMPLE_VERSION \
-  --runner /absolute/path/to/motor-runner --jobs 4 --build-budget-gib 64
+  --runner "$PWD/target/x86_64-unknown-linux-musl/release/motor-runner" \
+  --jobs 4 --build-budget-gib 64
 python3 script/tenant-image/build.py inventory \
   /var/lib/motor-vm/tenant-images/EXAMPLE_VERSION
 ```

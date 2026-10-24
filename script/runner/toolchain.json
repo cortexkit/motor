@@ -17,7 +17,8 @@
       ],
       "build-server": [
         "binaryen",
-        "gnu-coreutils"
+        "gnu-coreutils",
+        "musl-tools"
       ],
       "tenant": [
         "coreutils"
@@ -44,6 +45,7 @@
       "libxkbcommon-x11-dev": "1.13.1-1",
       "lld": "1:21.1.6-71",
       "mesa-vulkan-drivers": "26.0.8-1ubuntu0.3",
+      "musl-tools": "1.2.5-3build1",
       "nftables": "1.1.6-1",
       "openssh-server": "1:10.2p1-2ubuntu3.8",
       "patch": "2.8-2build1",
@@ -98,7 +100,7 @@
       "libxkbcommon-x11-dev"
     ]
   },
-  "capture_sha256": "679c1f888e9768d961fbc81956fe3c775b1366e7ec7571db8867e47f4fc75cd1",
+  "capture_sha256": "ccee06b54c9e75f1462c00a546c929a798e14293fc60b177263e8d17b72b50b3",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
