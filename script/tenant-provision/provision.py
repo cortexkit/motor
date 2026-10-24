@@ -215,20 +215,33 @@ def storage_threshold(c, capacity):
     return u64(threshold + capacity["storage_margin_bytes"], "storage threshold")
 
 
-def operating_requirement(c, capacity):
-    """Free bytes provisioning and resize must leave for motor-host."""
-    return u64(storage_threshold(c, capacity) + capacity["storage_margin_bytes"]
+def operating_requirement(c, capacity, threshold=None):
+    """Free bytes provisioning and resize must leave for motor-host.
+
+    threshold, when given, is the host-wide storage threshold over every
+    tenant (see host_storage_threshold); otherwise only c's own term counts.
+    """
+    threshold = storage_threshold(c, capacity) if threshold is None else threshold
+    return u64(threshold + capacity["storage_margin_bytes"]
                + capacity["growth_allowance_bytes"], "operating requirement")
 
 
-def pre_operation_free_bytes(c, capacity, base_present):
+def host_storage_threshold(capacity, replacement):
+    """The storage threshold over every registered tenant, with replacement's
+    record (which names its tenant) standing in for that tenant's registry
+    entry. motor-host refuses leases below the largest per-tenant term."""
+    records = [record for name, record in registered_tenants() if name != replacement["tenant"]]
+    return max(storage_threshold(record, capacity) for record in records + [replacement])
+
+
+def pre_operation_free_bytes(c, capacity, base_present, threshold=None):
     """Free host bytes the operation needs before it creates anything.
 
     A resize of the size base itself must fit: an absent base needs the
     guest's RAM plus the 512 MiB placeholder, and every operation needs 2 GiB
     for the filesystem metadata mkfs writes.
     """
-    needed = u64(operating_requirement(c, capacity) + METADATA_ALLOWANCE_BYTES, "metadata allowance")
+    needed = u64(operating_requirement(c, capacity, threshold) + METADATA_ALLOWANCE_BYTES, "metadata allowance")
     if not base_present:
         needed = u64(needed + c["guest_ram_mib"] * 1048576 + 512 * 1048576, "size base space")
     return needed
@@ -239,12 +252,17 @@ def base_present(c, image):
     return base.exists() and all((base / name).is_file() for name in ("base.vmstate", "base.memory"))
 
 
-def sparse_v1(manifest):
-    """Whether an image manifest lists the sparse-v1 capability."""
+def image_capability(manifest, name):
+    """Whether an image manifest lists the named capability."""
     capabilities = manifest.get("capabilities", [])
     if not isinstance(capabilities, list):
         raise ValueError("image manifest capabilities must be a list")
-    return "sparse-v1" in capabilities
+    return name in capabilities
+
+
+def sparse_v1(manifest):
+    """Whether an image manifest lists the sparse-v1 capability."""
+    return image_capability(manifest, "sparse-v1")
 
 
 def component(value):
@@ -466,6 +484,7 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
     lock_path = ROOT / "provision.lock"
     with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        refuse_resize_journal()
         check_service = systemd_active_state if check_service is None else check_service
         validate_image = inventory_image if validate_image is None else validate_image
         make_base = build_base if make_base is None else make_base
@@ -575,6 +594,7 @@ def repair_from_registry(tenant, validate_image=None, check_trusted=None, output
     check_trusted = trusted if check_trusted is None else check_trusted
     with (ROOT / "provision.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        refuse_resize_journal()
         provision_path = PROVISION / f"{tenant}.json"
         registry_path = REGISTRY / f"{tenant}.json"
         original_config = json.loads(provision_path.read_text())
@@ -1173,6 +1193,8 @@ def build_base(c, image, base, console=None, diagnostics=None):
 
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     capacity = read_capacity()
+    # An unfinished resize holds host sizing fixed until it is resumed or aborted.
+    refuse_resize_journal()
     home = ROOT / "tenants" / c["tenant"]
     image = ROOT / "tenant-images" / c["image_version"]
     base = base_path(c, image)
@@ -1258,6 +1280,503 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     BINDINGS.chmod(0o644)
 
 
+# ---------------------------------------------------------------------------
+# Offline resize
+#
+# provision.py resize <tenant> changes a stopped tenant's vCPU ceiling, guest
+# RAM, cpuset, permit budget, idle suspend and disk quota. RAM and disk only
+# grow. Every step is recorded first in the tenant's resize.json journal, so a
+# crash at any point leaves either the old state (resize --abort restores it
+# exactly) or a committed state that a same-argument re-run finishes. The host
+# never mounts the tenant disk here: the file only grows sparsely, and the
+# guest grows its filesystem and installs the new runner arguments itself on
+# the next cold start, from runner-args.staged.
+# ---------------------------------------------------------------------------
+
+HELPER_CONFIG = Path("/etc/motor-vm-helper.json")
+# motor-vm-helper runs in system.slice with DelegateSubgroup=helper and places
+# each tenant VMM in <its service cgroup>/tenants/tenant-<tap_index>
+# (crates/motor-vm-helper/src/linux/tenant.rs). With the helper stopped, one
+# that still exists means a VM's processes or cleanup outlived it.
+HELPER_CGROUPS = Path("/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenants")
+# The Windows build VM's threads. hosted-host/hosted_host.py has the same
+# WINDOWS_CPUS; a test keeps the two equal.
+WINDOWS_CPUS = "12-15,28-31"
+RESIZE_SCHEMA = 1
+# The record fields a resize may change; every other field stays as provisioned.
+RESIZE_FIELDS = ("vcpu_ceiling", "guest_ram_mib", "cpuset", "max_weight", "idle_suspend_s", "disk_quota_bytes")
+# Forward phases, in order. Before "committed" the published records are the
+# old ones and resize --abort restores everything; from "committed" on the
+# resize only rolls forward.
+RESIZE_PHASES = ("started", "base_built", "staged", "set_aside", "committed", "published", "extended")
+RESIZE_COMMITTED = RESIZE_PHASES.index("committed")
+# Written durably before the first compensation; a forward resume then refuses.
+RESIZE_ABORTING = "aborting"
+RESIZE_JOURNAL_KEYS = {"schema", "tenant", "phase", "old", "new", "provision_old", "provision_new",
+                       "registry_old", "registry_new", "helper_old", "helper_new", "runner_args",
+                       "quota_grew", "base", "base_existed", "set_aside", "staged"}
+JOURNAL_RECOVERY = ("the tenant stays start-refused and resize and abort refuse; "
+                    "follow 'Malformed resize journal' in script/tenant-provision/README.md")
+
+
+def cpu_numbers(cpuset):
+    """The CPU numbers of a cpuset list such as 0-11,16-27."""
+    numbers = set()
+    for part in cpuset.split(","):
+        bounds = [int(n) for n in part.split("-")]
+        numbers.update(range(bounds[0], bounds[-1] + 1))
+    return numbers
+
+
+def registered_tenants():
+    """(tenant, helper registry record) of every registered tenant."""
+    return [(entry.stem, json.loads(entry.read_text())) for entry in sorted(REGISTRY.glob("*.json"))]
+
+
+def durable_write(path, data, mode):
+    """Replace path: write an fsynced temporary file, rename it over path and
+    fsync the directory, so after a crash path holds the old or the new bytes."""
+    _atomic_restore(path, data.encode() if isinstance(data, str) else data, mode)
+
+
+def resize_journal_path(tenant):
+    return ROOT / "tenants" / tenant / "resize.json"
+
+
+def resize_staged_paths(tenant):
+    """Files a resize stages before its commit point. The helper reads
+    runner-args.staged on the tenant's next cold start; the copies show the
+    operator what the commit will publish."""
+    home = ROOT / "tenants" / tenant
+    copies = home / "resize-staged"
+    return {"runner_args": home / "runner-args.staged", "provision": copies / "provision.json",
+            "registry": copies / "registry.json", "helper": copies / "motor-vm-helper.json"}
+
+
+def staged_activation(arguments, quota_grew):
+    """runner-args.staged bytes in the helper's format; the helper pins them in
+    crates/motor-vm-helper/tests/vectors/runner-args-staged.json. quota_grew
+    makes the helper check host free space after the guest grows its disk."""
+    return json.dumps({"runner_args": arguments, "quota_grew": quota_grew}, separators=(",", ":")) + "\n"
+
+
+def write_resize_journal(journal):
+    durable_write(resize_journal_path(journal["tenant"]), json.dumps(journal, indent=2) + "\n", 0o600)
+
+
+def read_resize_journal(tenant):
+    """The tenant's resize journal, refusing anything unreadable, malformed,
+    of another schema version or naming paths a resize would not create."""
+    path = resize_journal_path(tenant)
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError("not a regular file")
+        journal = json.loads(path.read_text())
+        if type(journal) is not dict or set(journal) != RESIZE_JOURNAL_KEYS:
+            raise ValueError("missing or unknown keys")
+        if type(journal["schema"]) is not int or journal["schema"] != RESIZE_SCHEMA:
+            raise ValueError(f"unknown schema version {journal['schema']!r}")
+        if journal["tenant"] != tenant:
+            raise ValueError("it names another tenant")
+        if journal["phase"] not in RESIZE_PHASES + (RESIZE_ABORTING,):
+            raise ValueError(f"unknown phase {journal['phase']!r}")
+        for name in ("provision_old", "provision_new", "registry_old", "registry_new", "helper_old", "helper_new",
+                     "runner_args", "base", "set_aside"):
+            if type(journal[name]) is not str:
+                raise ValueError(f"{name} is not a string")
+        for name in ("quota_grew", "base_existed"):
+            if type(journal[name]) is not bool:
+                raise ValueError(f"{name} is not a boolean")
+        old, new = checked(journal["old"]), checked(journal["new"])
+        if json.loads(journal["provision_old"]) != journal["old"] or json.loads(journal["provision_new"]) != journal["new"]:
+            raise ValueError("recorded provisioning bytes differ from the recorded records")
+        # Abort deletes the base and the staged files and renames the set-aside
+        # snapshots, so each path must be exactly one this resize would create.
+        home = ROOT / "tenants" / tenant
+        if journal["base"] != str(base_path(new, ROOT / "tenant-images" / new["image_version"])):
+            raise ValueError("the size base path is not the new size's base")
+        set_aside = Path(journal["set_aside"])
+        if set_aside.parent != home or not set_aside.name.startswith("suspend.resize-"):
+            raise ValueError("the snapshot set-aside path is outside the tenant home")
+        if journal["staged"] != {name: str(value) for name, value in resize_staged_paths(tenant).items()}:
+            raise ValueError("unexpected staged file paths")
+        if journal["runner_args"] != runner_args(new) or \
+                journal["quota_grew"] != (new["disk_quota_bytes"] > old["disk_quota_bytes"]):
+            raise ValueError("recorded activation does not match the new record")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise ValueError(f"malformed resize journal {path}: {error}; {JOURNAL_RECOVERY}") from error
+    return journal
+
+
+def vmm_processes(proc=Path("/proc")):
+    """Pids of every live Firecracker VMM or jailer on this host."""
+    found = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue  # exited, or a kernel thread
+        if comm in ("firecracker", "jailer"):
+            found.append(int(entry.name))
+    return sorted(found)
+
+
+def require_services_stopped(check_service, action):
+    for unit in ("motor-host.service", "motor-vm-helper.service"):
+        state = check_service(unit)
+        if state != "inactive":
+            raise ValueError(f"{unit} must be stopped before {action} (ActiveState={state}). "
+                             f"Stop both with: {STOP_COMMAND} "
+                             "(the helper stops each running tenant VM cleanly before it exits)")
+
+
+def require_quiescent(check_service, vmms):
+    """Resize is a host-wide outage: both services stopped, no VMM, and no
+    tenant with evidence that its VM runs or did not stop cleanly."""
+    require_services_stopped(check_service, "a resize")
+    live = vmms()
+    if live:
+        raise ValueError(f"a Firecracker VMM or jailer is still running (pid {live[0]}); "
+                         "a resize needs every VM on the host stopped")
+    for name, record in registered_tenants():
+        home = ROOT / "tenants" / name
+        if (home / RUNNING_MARKER).exists():
+            raise ValueError(f"tenant {name} has {home / RUNNING_MARKER}: its VM runs or its last stop was not clean; "
+                             "start and cleanly stop it before resizing")
+        if (home / "unclean-stop.json").exists():
+            raise ValueError(f"tenant {name} has {home / 'unclean-stop.json'}: its last stop was not clean; "
+                             "start and cleanly stop it before resizing")
+        for group in (HELPER_CGROUPS / f"tenant-{record.get('tap_index')}", HELPER_CGROUPS / name):
+            if group.exists():
+                raise ValueError(f"tenant {name} has a leftover cgroup {group}; "
+                                 "start and stop the helper so it reconciles before resizing")
+        jail = ROOT / "jail" / "tenants" / name
+        if jail.exists() or jail.is_symlink():
+            raise ValueError(f"tenant {name} has a leftover jail {jail}; "
+                             "start and stop the helper so it reconciles before resizing")
+
+
+def resize_target(old_config, arguments):
+    """The provisioning record a resize with these arguments publishes."""
+    if set(arguments) - set(RESIZE_FIELDS):
+        raise ValueError(f"a resize changes only {', '.join(RESIZE_FIELDS)}")
+    return {**old_config, **arguments}
+
+
+def render_helper_config(text, old_cpuset, new_cpuset):
+    """/etc/motor-vm-helper.json with its slot CPUs moved to the new cpuset,
+    in the layout hosted-host/install.sh writes (two-space JSON and a newline)."""
+    if old_cpuset == new_cpuset:
+        return text
+    try:
+        config = json.loads(text)
+    except ValueError as error:
+        raise ValueError(f"{HELPER_CONFIG} is not JSON: {error}") from error
+    slots = config.get("slots") if isinstance(config, dict) else None
+    if not isinstance(slots, list) or not slots or \
+            any(not isinstance(slot, dict) or slot.get("cpus") != old_cpuset for slot in slots):
+        raise ValueError(f"{HELPER_CONFIG} slots do not all use the tenant's cpuset {old_cpuset}; "
+                         "reinstall the helper config before resizing")
+    for slot in slots:
+        slot["cpus"] = new_cpuset
+    return json.dumps(config, indent=2) + "\n"
+
+
+def plan_resize(tenant, arguments):
+    """Check every precondition and return the new journal; writes nothing."""
+    capacity = read_capacity()
+    for name, _record in registered_tenants():
+        staged = ROOT / "tenants" / name / "runner-args.staged"
+        if staged.exists() or staged.is_symlink():
+            raise ValueError(f"tenant {name} has a pending resize activation ({staged}); "
+                             "start it once so its next start delivers the activation, then stop it again")
+    home = ROOT / "tenants" / tenant
+    provision_path = PROVISION / f"{tenant}.json"
+    registry_path = REGISTRY / f"{tenant}.json"
+    provision_old = provision_path.read_text()
+    old_config = json.loads(provision_old)
+    old = checked(old_config)
+    if old["tenant"] != tenant:
+        raise ValueError(f"provisioning record tenant does not match {tenant}")
+    registry_old = registry_path.read_text()
+    record = json.loads(registry_old)
+    if not isinstance(record, dict):
+        raise ValueError("helper registry entry is not an object")
+    for name, value in record.items():
+        if name in old and value != old[name]:
+            raise ValueError(f"provisioning record and helper registry differ at {name}")
+    image = ROOT / "tenant-images" / old["image_version"]
+    if not image_capability(json.loads((image / "manifest.json").read_text()), "resize-v1"):
+        raise ValueError(f"image {old['image_version']} does not list the resize-v1 capability; switch-image to "
+                         "an image whose guest grows its disk and applies runner arguments before resizing")
+
+    new_config = resize_target(old_config, arguments)
+    new = checked(new_config)
+    if new == old:
+        raise ValueError("the resize changes nothing")
+    if new["disk_quota_bytes"] < old["disk_quota_bytes"]:
+        raise ValueError(f"disk shrink from {old['disk_quota_bytes']} to {new['disk_quota_bytes']} bytes is refused; "
+                         "a tenant disk only grows")
+    if new["guest_ram_mib"] < old["guest_ram_mib"]:
+        raise ValueError(f"RAM decrease from {old['guest_ram_mib']} to {new['guest_ram_mib']} MiB is refused; "
+                         "guest RAM only grows")
+    disk = home / "disk.img"
+    length = disk.stat().st_size
+    if length != old["disk_quota_bytes"]:
+        raise ValueError(f"disk length {length} differs from the recorded quota {old['disk_quota_bytes']}; "
+                         "inspect the disk before resizing")
+    suspend = home / "suspend"
+    if suspend.is_symlink() or not suspend.is_dir():
+        raise ValueError(f"suspend path is not a directory: {suspend}")
+    if new["vcpu_ceiling"] > 32 or (new["vcpu_ceiling"] != 1 and new["vcpu_ceiling"] % 2):
+        raise ValueError(f"vcpu_ceiling {new['vcpu_ceiling']} must be 1 or an even number of at most 32")
+    cpus = cpu_numbers(new["cpuset"])
+    if cpus & cpu_numbers(WINDOWS_CPUS):
+        raise ValueError(f"cpuset {new['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
+    for name, other in registered_tenants():
+        if name != tenant and cpus & cpu_numbers(other["cpuset"]):
+            raise ValueError(f"cpuset {new['cpuset']} overlaps tenant {name}'s cpuset {other['cpuset']}")
+
+    base = base_path(new, image)
+    existed = base.exists() or base.is_symlink()
+    if existed and not base_present(new, image):
+        raise ValueError("incomplete size base; refusing to reuse it")
+    replacement = dict(new, tenant=tenant)
+    needed = pre_operation_free_bytes(new, capacity, existed, threshold=host_storage_threshold(capacity, replacement))
+    free = shutil.disk_usage(ROOT).free
+    if free < needed:
+        message = f"resize needs {needed} free bytes on {ROOT}; {free} are available"
+        if set(arguments) <= {"max_weight", "idle_suspend_s"}:
+            message += ("; a resize that changes only max_weight or idle_suspend_s needs the same space, "
+                        "because it rebuilds nothing but must leave room for motor-host to keep admitting")
+        raise ValueError(message)
+    memory_fit(capacity, replacement=replacement)
+    verify_jobs_slice(capacity)
+    try:
+        helper_old = HELPER_CONFIG.read_text()
+    except OSError as error:
+        raise ValueError(f"cannot read the helper config {HELPER_CONFIG}: {error}") from error
+    helper_new = render_helper_config(helper_old, old["cpuset"], new["cpuset"])
+
+    registry_new = dict(record)
+    registry_new.update({name: new_config[name] for name in arguments})
+    return {
+        "schema": RESIZE_SCHEMA, "tenant": tenant, "phase": RESIZE_PHASES[0],
+        "old": old_config, "new": new_config,
+        "provision_old": provision_old, "provision_new": json.dumps(new_config, indent=2) + "\n",
+        "registry_old": registry_old, "registry_new": json.dumps(registry_new, indent=2) + "\n",
+        "helper_old": helper_old, "helper_new": helper_new,
+        "runner_args": runner_args(new), "quota_grew": new["disk_quota_bytes"] > old["disk_quota_bytes"],
+        "base": str(base), "base_existed": existed,
+        "set_aside": str(home / f"suspend.resize-{time.time_ns()}"),
+        "staged": {name: str(path) for name, path in resize_staged_paths(tenant).items()},
+    }
+
+
+def publish(path, text):
+    """Replace a published file durably, keeping its mode."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"refusing to replace a non-regular file: {path}")
+    durable_write(path, text, stat.S_IMODE(info.st_mode))
+
+
+def resize_forward(journal, make_base, hook, output):
+    """Run every step after the journal's phase. Each step is idempotent, so a
+    re-run after a crash anywhere in a step repeats it safely."""
+    tenant = journal["tenant"]
+    home = ROOT / "tenants" / tenant
+    old, new = checked(journal["old"]), checked(journal["new"])
+    image = ROOT / "tenant-images" / new["image_version"]
+    disk = home / "disk.img"
+    suspend = home / "suspend"
+    set_aside = Path(journal["set_aside"])
+    staged = {name: Path(path) for name, path in journal["staged"].items()}
+    position = RESIZE_PHASES.index(journal["phase"])
+
+    def advance(phase):
+        nonlocal position
+        journal["phase"] = phase
+        write_resize_journal(journal)
+        position = RESIZE_PHASES.index(phase)
+        hook(f"phase:{phase}")
+
+    def pending(phase):
+        return position < RESIZE_PHASES.index(phase)
+
+    # Before the commit point the disk is untouched; after it the extension may
+    # or may not have happened. Any other length means something else wrote it.
+    lengths = [old["disk_quota_bytes"]] if pending("committed") else [old["disk_quota_bytes"], new["disk_quota_bytes"]]
+    length = disk.stat().st_size
+    if length not in lengths:
+        raise ValueError(f"disk length {length} is not the expected {' or '.join(map(str, lengths))} bytes; "
+                         "the disk changed outside the resize, inspect it")
+    activation = staged_activation(journal["runner_args"], journal["quota_grew"])
+
+    if pending("base_built"):
+        if not base_present(new, image):
+            make_base(new, image, Path(journal["base"]))
+        hook("step:base")
+        advance("base_built")
+    if pending("staged"):
+        durable_write(staged["runner_args"], activation, 0o600)
+        hook("step:stage:runner_args")
+        staged["provision"].parent.mkdir(mode=0o700, exist_ok=True)
+        sync_dir(home)
+        for name, key in (("provision", "provision_new"), ("registry", "registry_new"), ("helper", "helper_new")):
+            durable_write(staged[name], journal[key], 0o600)
+        hook("step:stage:copies")
+        advance("staged")
+    if pending("set_aside"):
+        # Suspend keys omit the size, so an old-size snapshot left in place
+        # would be selectable with the new sizing.
+        if not (set_aside.exists() or set_aside.is_symlink()):
+            os.rename(suspend, set_aside)
+            sync_dir(home)
+        if not suspend.exists():
+            suspend.mkdir(mode=0o700)
+            sync_dir(home)
+        hook("step:set_aside")
+        advance("set_aside")
+    if pending("committed"):
+        advance("committed")
+
+    # After the commit point a re-run republishes all three files from the
+    # journal, since a crash may fall between any two of them.
+    for path, key, name in ((PROVISION / f"{tenant}.json", "provision_new", "provision"),
+                            (REGISTRY / f"{tenant}.json", "registry_new", "registry"),
+                            (HELPER_CONFIG, "helper_new", "helper")):
+        publish(path, journal[key])
+        hook(f"step:publish:{name}")
+    if pending("published"):
+        advance("published")
+    if disk.stat().st_size != new["disk_quota_bytes"]:
+        # Sparse: no blocks are allocated and nothing is mounted. The guest
+        # grows its filesystem into the new length on its next cold start.
+        os.truncate(disk, new["disk_quota_bytes"])
+    with disk.open("rb") as file:
+        os.fsync(file.fileno())
+    hook("step:extend")
+    if pending("extended"):
+        advance("extended")
+    current = staged["runner_args"]
+    info = current.lstat() if current.exists() or current.is_symlink() else None
+    if info is None or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 \
+            or current.read_text() != activation:
+        durable_write(current, activation, 0o600)
+    hook("step:args")
+    for name in ("provision", "registry", "helper"):
+        staged[name].unlink(missing_ok=True)
+    if staged["provision"].parent.exists():
+        staged["provision"].parent.rmdir()
+    sync_dir(home)
+    resize_journal_path(tenant).unlink()
+    sync_dir(home)
+    output(f"{tenant}: resized; the old suspend snapshots are kept in {set_aside}")
+    output(f"start the services: the tenant's next start cold-boots and applies {current}")
+
+
+def resize(tenant, arguments, make_base=None, check_service=None, vmms=None, hook=None, output=print):
+    """Resize a stopped tenant, or resume its journaled resize with the same arguments.
+
+    hook(point) runs after every step and every journal phase write; tests use
+    it to stop the resize at each point as a crash would.
+    """
+    tenant = component(tenant)
+    make_base = build_base if make_base is None else make_base
+    check_service = systemd_active_state if check_service is None else check_service
+    vmms = vmm_processes if vmms is None else vmms
+    hook = (lambda _point: None) if hook is None else hook
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        require_quiescent(check_service, vmms)
+        own = resize_journal_path(tenant)
+        for path in sorted((ROOT / "tenants").glob("*/resize.json")):
+            if path != own:
+                raise ValueError(f"another tenant's resize journal exists: {path}; resume or abort that resize first")
+        if own.exists() or own.is_symlink():
+            journal = read_resize_journal(tenant)
+            if journal["phase"] == RESIZE_ABORTING:
+                raise ValueError(f"the resize of {tenant} is being aborted; finish it with: resize --abort {tenant}")
+            if resize_target(journal["old"], arguments) != journal["new"]:
+                raise ValueError(f"these arguments differ from the pending resize in {own}; re-run it with the "
+                                 "same arguments, or abort it if it is not committed")
+            output(f"{tenant}: resuming the resize from phase {journal['phase']}")
+        else:
+            journal = plan_resize(tenant, arguments)
+            write_resize_journal(journal)
+            hook(f"phase:{journal['phase']}")
+        resize_forward(journal, make_base, hook, output)
+
+
+def base_referenced(base):
+    """Whether any registered tenant boots from this size base."""
+    return any(base_path(record, ROOT / "tenant-images" / record["image_version"]) == base
+               for _name, record in registered_tenants())
+
+
+def resize_abort(tenant, check_service=None, hook=None, output=print):
+    """Undo a resize that has not reached its commit point.
+
+    Each compensation is idempotent, so a crash during abort is finished by
+    running abort again. The jobs-slice drop-in is left in place.
+    """
+    tenant = component(tenant)
+    check_service = systemd_active_state if check_service is None else check_service
+    hook = (lambda _point: None) if hook is None else hook
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        require_services_stopped(check_service, "aborting a resize")
+        path = resize_journal_path(tenant)
+        if not (path.exists() or path.is_symlink()):
+            raise ValueError(f"no resize journal for tenant {tenant}: {path}")
+        journal = read_resize_journal(tenant)
+        if journal["phase"] != RESIZE_ABORTING and RESIZE_PHASES.index(journal["phase"]) >= RESIZE_COMMITTED:
+            raise ValueError(f"the resize of {tenant} is committed and only rolls forward; "
+                             "re-run it with the same arguments to finish it")
+        if journal["phase"] != RESIZE_ABORTING:
+            journal["phase"] = RESIZE_ABORTING
+            write_resize_journal(journal)
+            hook(f"phase:{RESIZE_ABORTING}")
+        home = ROOT / "tenants" / tenant
+        suspend = home / "suspend"
+        set_aside = Path(journal["set_aside"])
+        if set_aside.exists() or set_aside.is_symlink():
+            if suspend.exists() or suspend.is_symlink():
+                # Only the empty directory the set-aside step created; a
+                # non-empty one fails here and keeps the journal for inspection.
+                suspend.rmdir()
+            os.rename(set_aside, suspend)
+            sync_dir(home)
+        hook("abort:snapshots")
+        staged = {name: Path(value) for name, value in journal["staged"].items()}
+        for value in staged.values():
+            value.unlink(missing_ok=True)
+        if staged["provision"].parent.exists():
+            staged["provision"].parent.rmdir()
+        sync_dir(home)
+        hook("abort:staged")
+        base = Path(journal["base"])
+        if not journal["base_existed"] and base.exists() and not base_referenced(base):
+            shutil.rmtree(base)
+            sync_dir(base.parent)
+        hook("abort:base")
+        for published, key in ((PROVISION / f"{tenant}.json", "provision_old"),
+                               (REGISTRY / f"{tenant}.json", "registry_old"), (HELPER_CONFIG, "helper_old")):
+            if published.read_text() != journal[key]:
+                raise ValueError(f"{published} differs from its state before the resize; inspect it before "
+                                 f"removing {path}")
+        quota = checked(journal["old"])["disk_quota_bytes"]
+        length = (home / "disk.img").stat().st_size
+        if length != quota:
+            raise ValueError(f"disk length {length} differs from the old quota {quota}; inspect it before removing {path}")
+        path.unlink()
+        sync_dir(home)
+        output(f"{tenant}: resize aborted; the old records, helper config, disk and snapshots are in place")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
@@ -1278,6 +1797,15 @@ def main():
     remove.add_argument("tenant")
     remove.add_argument("--dry-run", action="store_true", help="list everything that would be removed; change nothing")
     remove.add_argument("--purge-now", action="store_true", help="delete at once instead of quarantining")
+    resize_command = commands.add_parser(
+        "resize", help="offline resize of a tenant: RAM and disk only grow; every tenant must be stopped "
+        f"with: {STOP_COMMAND}. Re-run with the same options to resume after a failure")
+    resize_command.add_argument("tenant")
+    resize_command.add_argument("--abort", action="store_true",
+                                help="undo a resize that has not reached its commit point")
+    for field, kind in (("vcpu_ceiling", int), ("guest_ram_mib", int), ("cpuset", str), ("max_weight", int),
+                        ("idle_suspend_s", int), ("disk_quota_bytes", int)):
+        resize_command.add_argument("--" + field.replace("_", "-"), dest=field, type=kind)
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
@@ -1310,6 +1838,31 @@ def main():
             if path.exists() or path.is_symlink():
                 trusted(path)
         remove_tenant(tenant, dry_run=args.dry_run, purge_now=args.purge_now)
+        return
+    if args.command == "resize":
+        if args.config is not None:
+            parser.error("resize takes a tenant and sizing options, not --config")
+        tenant = component(args.tenant)
+        arguments = {name: getattr(args, name) for name in RESIZE_FIELDS if getattr(args, name) is not None}
+        if args.abort and arguments:
+            parser.error("--abort takes no sizing options")
+        if not args.abort and not arguments:
+            parser.error("name at least one size to change")
+        for directory in (ROOT, REGISTRY, PROVISION, ROOT / "tenants", ROOT / "tenants" / tenant):
+            trusted(directory)
+        for path in (PROVISION / f"{tenant}.json", REGISTRY / f"{tenant}.json", HELPER_CONFIG):
+            trusted(path)
+        if args.abort:
+            resize_abort(tenant)
+            return
+        image = ROOT / "tenant-images" / checked(json.loads((PROVISION / f"{tenant}.json").read_text()))["image_version"]
+        for name in ("manifest.json", "vmlinux", "rootfs"):
+            trusted(image / name)
+        for binary in (BIN / "firecracker", BIN / "jailer"):
+            trusted(binary)
+            if "1.17.0" not in run(binary, "--version").stdout:
+                raise ValueError("Firecracker and jailer must both be 1.17.0")
+        resize(tenant, arguments)
         return
     if args.command == "switch-image":
         if args.config is not None:
