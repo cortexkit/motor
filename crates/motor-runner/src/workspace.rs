@@ -613,19 +613,64 @@ pub(crate) fn record_siblings(catalog: &mut Catalog, siblings: &[SiblingSnapshot
 /// (or under `[package.metadata.motor]` for a single-package repository), and
 /// they run in order. A Cargo project that declares nothing builds every
 /// target of its whole workspace, and a tree with no root `Cargo.toml` has
-/// nothing to warm. The runner never assumes a particular repository's
-/// package names.
+/// nothing to warm from Cargo. The runner never assumes a particular
+/// repository's package names.
+#[cfg(test)]
 pub(crate) fn warm_command(mirror: &Path, commit: &str) -> String {
     warm_plan(mirror, commit).0
 }
 
 /// Keep whether the command was explicitly requested, even when it equals the
 /// default: a requested command must run rather than take a no-dependency shortcut.
+///
+/// A tree with no root `Cargo.toml` has no Cargo fill, so whatever its
+/// `.motor/cache.toml` declares is the whole warm plan. Its steps are
+/// explicit for the same reason, and a tree that declares nothing still runs
+/// `true`.
+///
+/// The one command a fill runs is the plan's steps joined with `&&`, which is
+/// what [`warm_steps`] returns separately for a caller that keeps the steps.
+#[cfg(test)]
 pub(crate) fn warm_plan(mirror: &Path, commit: &str) -> (String, bool) {
-    let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) else {
-        return ("true".to_string(), false);
-    };
-    manifest_warm_plan(&manifest, commit)
+    let (steps, explicit) = warm_steps(mirror, commit);
+    (steps.join(" && "), explicit)
+}
+
+/// The warm build as the ordered steps a fill runs, together with whether any
+/// of them was explicitly requested.
+///
+/// A Cargo tree warms with Cargo's own command, then with whatever
+/// `.motor/cache.toml` declares. A tree with no root `Cargo.toml` has no Cargo
+/// command and warms from its declaration alone. Steps run in this order in one
+/// shell, so a failing step fails the fill.
+pub(crate) fn warm_steps(mirror: &Path, commit: &str) -> (Vec<String>, bool) {
+    let declared: Vec<String> = crate::writer::declaration::read(mirror, commit)
+        .ok()
+        .flatten()
+        .map(|declaration| {
+            declaration
+                .fills
+                .iter()
+                .map(crate::writer::declaration::Step::command)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut steps = Vec::new();
+    let mut explicit = false;
+    if let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) {
+        let (cargo, requested) = manifest_warm_plan(&manifest, commit);
+        steps.push(cargo);
+        explicit = requested;
+    }
+    // Declared steps follow the Cargo warm command in the same fill, so a Cargo
+    // tree that also declares a ccache step runs both. A tree with neither
+    // warms with `true`, as it did before declarations existed.
+    steps.extend(declared.iter().cloned());
+    explicit |= !declared.is_empty();
+    if steps.is_empty() {
+        steps.push("true".to_string());
+    }
+    (steps, explicit)
 }
 
 /// The warm command a root `Cargo.toml` declares, or the whole-workspace

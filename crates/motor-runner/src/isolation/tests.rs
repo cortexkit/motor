@@ -1854,6 +1854,13 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
     ] {
         crate::test_helpers::write_test_executable(&tools.join(name), script.as_bytes()).unwrap();
     }
+    // The writer shell runs this from the tool mount, as the sandbox installs
+    // it; its Cargo check itself is the stub `python3` above.
+    crate::test_helpers::write_test_executable(
+        &tools.join("writer-cargo-check.sh"),
+        crate::writer::fill::CARGO_CHECK.as_bytes(),
+    )
+    .unwrap();
     let mut sandbox = Sandbox {
         id: Uuid::now_v7(),
         root: f.scratch.join("root"),
@@ -1905,7 +1912,10 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
             let shell = args[args.len() - 3]
                 .to_str()
                 .unwrap()
-                .replace("/motor-output", output.to_str().unwrap());
+                .replace("/motor-output", output.to_str().unwrap())
+                // The writer shell reaches the installed helpers through the
+                // tool mount; this fixture provides them in a directory.
+                .replace("/motor-tools", tools.to_str().unwrap());
             let mut child = Command::new("/bin/bash")
                 .args(["-c", &shell, USER, raw])
                 .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))

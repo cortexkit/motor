@@ -160,15 +160,13 @@ fn descriptor_changes_for_toolchain_and_command_without_lockfile_changes() {
     let f = Fixture::new();
     let tip = git(&f.main, &["rev-parse", "HEAD"]);
     let descriptor = crate::writer::fill::descriptor;
-    let first = descriptor(&f.main, &tip, "rustc A", "cargo build").unwrap();
-    assert_ne!(
-        first,
-        descriptor(&f.main, &tip, "rustc B", "cargo build").unwrap()
-    );
-    assert_ne!(
-        first,
-        descriptor(&f.main, &tip, "rustc A", "cargo test").unwrap()
-    );
+    let compilers = Compilers::default();
+    let of = |toolchain: &str, command: &str| {
+        descriptor(&f.main, &tip, toolchain, command, None, &compilers).unwrap()
+    };
+    let first = of("rustc A", "cargo build");
+    assert_ne!(first, of("rustc B", "cargo build"));
+    assert_ne!(first, of("rustc A", "cargo test"));
 }
 
 #[tokio::test]
@@ -893,13 +891,15 @@ fn failed_descriptor_request_queues_nothing() {
     let mut prepare = prepare_for(&r);
     prepare.bundles = r.bundles.clone();
     runner.fetch_prepare(&prepare, &upload.directory).unwrap();
-    let descriptor = crate::writer::fill::descriptor(
-        &runner.core.trees.mirror(&f.root),
-        &r.integration_tip,
-        &runner.core.rustc_version,
-        &runner.config().base_commands.join(" && "),
-    )
-    .unwrap();
+    let descriptor = runner
+        .fill_identity(
+            &runner.core.trees.mirror(&f.root),
+            &r.integration_tip,
+            &runner.config().base_commands.join(" && "),
+            true,
+        )
+        .0
+        .unwrap();
     let mut inner = runner.core.inner.lock().unwrap();
     inner
         .catalog

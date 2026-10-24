@@ -2,6 +2,7 @@ use super::*;
 #[path = "tests/tenant.rs"]
 mod tenant;
 use crate::spool::Upload;
+use crate::writer::declaration::Compilers;
 use cortexkit_test_support::ScratchDir;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -15,6 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 mod boat_disk;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
+#[path = "tests/declared_fills.rs"]
+mod declared_fills;
 #[path = "tests/dependency_writer.rs"]
 mod dependency_writer;
 #[path = "tests/disk_pressure.rs"]

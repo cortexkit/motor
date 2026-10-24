@@ -4,6 +4,7 @@ use crate::{
     platform,
     storage::*,
     workspace::{self, Trees},
+    writer::declaration::Compilers,
 };
 use fs2::FileExt;
 use motor_protocol::*;
@@ -1208,6 +1209,10 @@ struct Core {
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
+    /// Build server compiler versions a declared fill's descriptor extends. They
+    /// are read once, at startup, so one runner's descriptors do not move under
+    /// a host whose tools change.
+    compilers: Compilers,
     cpus: CpuTopology,
 }
 
@@ -2045,6 +2050,7 @@ impl Runner {
                 repository_usage: Mutex::new(repository_usage),
                 _lock: lock,
                 rustc_version,
+                compilers: Compilers::probe(&["cc", "c++", "ccache"]),
                 cpus,
             }),
         };
@@ -3658,18 +3664,26 @@ impl Runner {
     /// change, so the reads stay valid until the plan is used. With
     /// `with_fill`, it also reads the inputs of a new fill job, otherwise
     /// `queue_base_planned` reads them if it queues one.
+    /// Read what `queue_base_planned` needs from the repository's mirror.
+    /// Each read runs git, which is slow on a loaded host, so callers do this
+    /// before taking the state lock where they can. A commit's contents never
+    /// change, so the reads stay valid until the plan is used. With
+    /// `with_fill`, it also reads the inputs of a new fill job, otherwise
+    /// `queue_base_planned` reads them if it queues one.
     fn base_plan(&self, root: &str, tip: &str, with_fill: bool) -> BasePlan {
         let mirror = self.core.trees.mirror(root);
-        let (command, explicit_command) = if self.core.config.base_commands.is_empty() {
-            workspace::warm_plan(&mirror, tip)
+        // The override, the repository's declaration and Cargo's own warm
+        // command are all read here so `fill_identity` can tell which of them
+        // produced the command the fill will run.
+        let overridden = !self.core.config.base_commands.is_empty();
+        let (command, declared) = if overridden {
+            (self.core.config.base_commands.join(" && "), false)
         } else {
-            (self.core.config.base_commands.join(" && "), true)
+            let (steps, declared) = workspace::warm_steps(&mirror, tip);
+            (steps.join(" && "), declared)
         };
-        let descriptor =
-            crate::writer::fill::descriptor(&mirror, tip, &self.core.rustc_version, &command);
-        let dependency_free = !explicit_command
-            && descriptor.is_ok()
-            && crate::writer::fill::dependency_free(&mirror, tip).unwrap_or(false);
+        let explicit_command = overridden || declared;
+        let (descriptor, dependency_free) = self.fill_identity(&mirror, tip, &command, overridden);
         BasePlan {
             tip: tip.to_owned(),
             command,
@@ -3678,6 +3692,54 @@ impl Runner {
             dependency_free,
             fill: with_fill.then(|| self.fill_inputs(root, tip)),
         }
+    }
+    /// The tip's fill descriptor and whether the dependency-free shortcut may
+    /// stand in for a fill.
+    ///
+    /// Both readers of a descriptor (queueing a fill, and a reader miss asking
+    /// for a refill) go through here, so they always agree on it. A declaration
+    /// that does not parse fails the tip the way an unavailable tip does.
+    /// `Config::base_commands` overrides every command, including a declared
+    /// one, so a declaration only takes part while it is in effect.
+    fn fill_identity(
+        &self,
+        mirror: &Path,
+        tip: &str,
+        command: &str,
+        overridden: bool,
+    ) -> (io::Result<String>, bool) {
+        let declares = !overridden;
+        let declaration = if declares {
+            // A declaration that does not parse fails the tip: a fill of
+            // something other than what the repository declared is worse than
+            // no fill, since its descriptor would name inputs nobody checked.
+            match crate::writer::declaration::read(mirror, tip) {
+                Ok(declaration) => declaration,
+                Err(error) => return (Err(error), false),
+            }
+        } else {
+            None
+        };
+        let compilers = if declares {
+            self.core.compilers.clone()
+        } else {
+            Compilers::default()
+        };
+        let descriptor = crate::writer::fill::descriptor(
+            mirror,
+            tip,
+            &self.core.rustc_version,
+            command,
+            declaration.as_ref(),
+            &compilers,
+        );
+        // A declaration's steps are always run, so the shortcut that records a
+        // fill without running one only applies to a graph that has neither a
+        // declaration nor an override.
+        let dependency_free = descriptor.is_ok()
+            && crate::writer::fill::dependency_free(mirror, tip, declaration.as_ref())
+                .unwrap_or(false);
+        (descriptor, dependency_free)
     }
     /// A new fill job's locked git dependencies and, when those are usable,
     /// the tip's tree.
@@ -7236,21 +7298,18 @@ impl Runner {
         let reader_descriptor =
             if !job.base && crate::writer::fill::reader_missed(&self.core.trees.state, id) {
                 let r = job.request.as_ref().unwrap();
-                let command = if self.core.config.base_commands.is_empty() {
-                    workspace::warm_command(
-                        &self.core.trees.mirror(&r.repository_root),
-                        &r.snapshot_commit,
-                    )
+                let mirror = self.core.trees.mirror(&r.repository_root);
+                let (steps, declared) = if self.core.config.base_commands.is_empty() {
+                    workspace::warm_steps(&mirror, &r.snapshot_commit)
                 } else {
-                    self.core.config.base_commands.join(" && ")
+                    (self.core.config.base_commands.clone(), false)
                 };
-                crate::writer::fill::descriptor(
-                    &self.core.trees.mirror(&r.repository_root),
-                    &r.snapshot_commit,
-                    &self.core.rustc_version,
-                    &command,
-                )
-                .ok()
+                let (command, declared) = (steps.join(" && "), declared);
+                let overridden = !self.core.config.base_commands.is_empty();
+                let _ = declared;
+                self.fill_identity(&mirror, &r.snapshot_commit, &command, overridden)
+                    .0
+                    .ok()
             } else {
                 None
             };
