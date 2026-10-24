@@ -47,3 +47,44 @@ fn assert_refused_without_start(runner: &Runner, f: &Fixture, request: &Run) {
     assert_eq!(runner.status().queue_depth, 0);
     assert!(!Path::new(&f.key).join("must-not-start").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    config.memory_floor_gib = Some(16);
+    config.systemd_command = Some(engine_replies((16 << 30) - 1));
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("touch must-not-start");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Refused(RefusalReason::RunnerFull)
+    ));
+    assert_refused_without_start(&runner, &f, &request);
+}
+
+/// At exactly the floor the job is admitted as usual; only its unit's
+/// `MemoryMax` is clamped, and the slice's own OOM killer reports an overrun.
+#[cfg(target_os = "linux")]
+#[test]
+fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    config.memory_floor_gib = Some(16);
+    config.systemd_command = Some(engine_replies(16 << 30));
+    let floor = config.memory_floor_gib;
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(0)
+    ));
+    assert_eq!(
+        crate::backend::memory_max(30, floor).min(16 << 30),
+        16 << 30
+    );
+    runner.cancel(request.job_id).unwrap();
+}
