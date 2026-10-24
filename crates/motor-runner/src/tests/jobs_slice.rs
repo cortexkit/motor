@@ -56,11 +56,6 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies((16 << 30) - 1));
-    // Standing in for the host's library trees keeps this test from granting
-    // access to them; admission itself never reads them.
-    let shared = config.state_dir().join("shared");
-    fs::create_dir_all(&shared).unwrap();
-    config.shared_read_roots = Some((shared.clone(), shared, None));
     let runner = Runner::open(config).unwrap();
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
@@ -80,6 +75,11 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies(16 << 30));
+    // Standing in for the host's library trees keeps this test from granting
+    // access to them; admission itself never reads them.
+    let shared = config.state_dir().join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    config.shared_read_roots = Some((shared.clone(), shared, None));
     let floor = config.memory_floor_gib;
     let runner = Runner::open(config).unwrap();
     let (request, _) = f.run("true");
