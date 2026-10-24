@@ -25,6 +25,12 @@ REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
 PROVISION = Path("/etc/motor-host/provision")
 BIN = Path("/usr/local/lib/firecracker/1.17.0")
+CAPACITY = Path("/etc/motor-host/capacity.json")
+MEMINFO = Path("/proc/meminfo")
+JOBS_DROP_IN = Path("/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf")
+U64_MAX = 2**64 - 1
+CAPACITY_KEYS = {"windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes", "storage_margin_bytes",
+                 "growth_allowance_bytes", "tenant_memory_reserve_bytes"}
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "tenant-vm-spike/api_schema.py"
 spec = importlib.util.spec_from_file_location("tenant_firecracker_schema", SCHEMA_PATH)
 assert spec is not None and spec.loader is not None
@@ -35,6 +41,149 @@ SCHEMA = schema_module.SCHEMA
 
 def run(*args):
     return subprocess.run([str(a) for a in args], check=True, capture_output=True, text=True, timeout=300)
+
+
+def u64(value, name):
+    if type(value) is not int or not 0 <= value <= U64_MAX:
+        raise ValueError(f"{name} must be a nonnegative u64 integer")
+    return value
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate capacity.json key: {key}")
+        result[key] = value
+    return result
+
+
+def read_capacity():
+    try:
+        fd = os.open(CAPACITY, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                raise ValueError("capacity.json must be a root-owned regular file, not group/world-writable")
+            capacity = json.load(source, object_pairs_hook=unique_object)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid capacity.json: {error}") from error
+    if type(capacity) is not dict or set(capacity) != CAPACITY_KEYS:
+        raise ValueError("capacity.json must contain exactly the six capacity keys")
+    for key, value in capacity.items():
+        u64(value, f"capacity.json {key}")
+    if capacity["jobs_min_bytes"] == 0:
+        raise ValueError("capacity.json jobs_min_bytes must be at least 1")
+    if capacity["windows_vm_bytes"] > capacity["jobs_min_bytes"]:
+        raise ValueError("capacity.json windows_vm_bytes exceeds jobs_min_bytes")
+    return capacity
+
+
+def memtotal_bytes():
+    try:
+        text = MEMINFO.read_text()
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read MemTotal: {error}") from error
+    matches = re.findall(r"^MemTotal:\s+([0-9]+) kB\s*$", text, re.MULTILINE)
+    if len(matches) != 1:
+        raise ValueError("missing or malformed MemTotal in /proc/meminfo")
+    return u64(int(matches[0]) * 1024, "MemTotal conversion")
+
+
+def memory_fit(capacity, replacement=None):
+    total = sum(capacity[key] for key in ("windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes"))
+    tenants = []
+    for entry in sorted(REGISTRY.glob("*.json")):
+        if replacement is None or entry.stem != replacement["tenant"]:
+            tenants.append(json.loads(entry.read_text()))
+    if replacement is not None:
+        tenants.append(replacement)
+    for tenant in tenants:
+        ram = u64(tenant["guest_ram_mib"], "guest_ram_mib")
+        headroom = u64(tenant["memory_headroom_mib"], "memory_headroom_mib")
+        total = u64(total + (ram + headroom) * 1048576, "memory fit sum")
+    u64(total, "memory fit sum")
+    available = memtotal_bytes()
+    if total > available:
+        raise ValueError(f"memory fit requires {total} bytes, MemTotal is {available} bytes")
+
+
+def jobs_slice_render(capacity):
+    maximum = u64(capacity["jobs_min_bytes"], "jobs_min_bytes")
+    if maximum == 0:
+        raise ValueError("jobs_min_bytes must be at least 1")
+    # Windows already runs inside this slice; its reservation is not deducted.
+    high = maximum - maximum // 6
+    return f"[Slice]\nMemoryMax={maximum}\nMemoryHigh={high}\n"
+
+
+def slice_properties(names):
+    try:
+        result = run("systemctl", "show", "-p", ",".join(names), "motor-jobs.slice")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f"could not read motor-jobs.slice {','.join(names)}: {error}") from error
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if any(name not in values for name in names):
+        raise ValueError(f"missing motor-jobs.slice properties: {','.join(names)}")
+    return values
+
+
+def slice_bytes(value, name):
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ValueError(f"motor-jobs.slice {name} is not a byte value: {value}")
+    return u64(int(value), f"motor-jobs.slice {name}")
+
+
+def verify_jobs_slice(capacity):
+    try:
+        exact = JOBS_DROP_IN.read_text() == jobs_slice_render(capacity)
+    except OSError as error:
+        raise ValueError(f"missing or unreadable jobs-slice drop-in: {JOBS_DROP_IN}") from error
+    if not exact:
+        raise ValueError("jobs-slice drop-in differs from capacity.json; run apply-jobs-slice")
+    values = slice_properties(("LoadState", "MemoryMax"))
+    if values["LoadState"] == "not-found":
+        return
+    if values["LoadState"] != "loaded":
+        raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
+    maximum = slice_bytes(values["MemoryMax"], "MemoryMax")
+    if maximum > capacity["jobs_min_bytes"]:
+        raise ValueError(f"motor-jobs.slice MemoryMax={maximum} exceeds {capacity['jobs_min_bytes']}")
+
+
+def refuse_resize_journal():
+    journals = sorted((ROOT / "tenants").glob("*/resize.json"))
+    if journals:
+        raise ValueError(f"pending resize journal: {journals[0]}")
+
+
+def apply_jobs_slice():
+    # Validate before creating even the lock file, then re-read under the lock.
+    read_capacity()
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        capacity = read_capacity()
+        refuse_resize_journal()
+        memory_fit(capacity)
+        rendered = jobs_slice_render(capacity)
+        values = slice_properties(("LoadState", "MemoryCurrent"))
+        if values["LoadState"] == "not-found":
+            current = 0
+        elif values["LoadState"] == "loaded":
+            current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
+        else:
+            raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
+        high = capacity["jobs_min_bytes"] - capacity["jobs_min_bytes"] // 6
+        if current > high:
+            raise ValueError(f"motor-jobs.slice MemoryCurrent={current} exceeds rendered MemoryHigh={high}")
+        JOBS_DROP_IN.parent.mkdir(parents=True, exist_ok=True)
+        atomic(JOBS_DROP_IN, rendered)
+        JOBS_DROP_IN.chmod(0o644)
+        try:
+            run("systemctl", "daemon-reload")
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"failed to apply jobs-slice drop-in: {error}") from error
+        verify_jobs_slice(capacity)
 
 
 def component(value):
@@ -917,6 +1066,7 @@ def build_base(c, image, base, console=None, diagnostics=None):
 
 
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
+    capacity = read_capacity()
     home = ROOT / "tenants" / c["tenant"]
     image = ROOT / "tenant-images" / c["image_version"]
     base = base_path(c, image)
@@ -931,6 +1081,8 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     for entry in REGISTRY.glob("*.json"):
         if json.loads(entry.read_text())["tap_index"] == c["tap_index"]:
             raise ValueError("tap index already assigned")
+    memory_fit(capacity, replacement=c)
+    verify_jobs_slice(capacity)
     manifest = json.loads((image / "manifest.json").read_text())
     if manifest["version"] != c["image_version"]:
         raise ValueError("image version mismatch")
@@ -997,6 +1149,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     commands = parser.add_subparsers(dest="command")
+    commands.add_parser("apply-jobs-slice", help="validate capacity and apply the direct jobs slice limits")
     switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image; "
                                  f"stop both services first: {STOP_COMMAND}")
     switch.add_argument("tenant")
@@ -1015,6 +1168,12 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
+    if args.command == "apply-jobs-slice":
+        if args.config is not None:
+            parser.error("apply-jobs-slice does not take --config")
+        trusted(ROOT)
+        apply_jobs_slice()
+        return
     if args.command == "repair-from-registry":
         if args.config is not None:
             parser.error("repair-from-registry takes a tenant, not --config")
@@ -1064,6 +1223,9 @@ def main():
         parser.error("--config is required when provisioning a new tenant")
     trusted(args.config.resolve())
     c = checked(json.loads(args.config.read_text()))
+    capacity = read_capacity()
+    memory_fit(capacity, replacement=c)
+    verify_jobs_slice(capacity)
     for directory in (ROOT, REGISTRY, BINDINGS.parent, ROOT / "jail", ROOT / "tenants"):
         directory.mkdir(parents=True, exist_ok=True)
         trusted(directory)
