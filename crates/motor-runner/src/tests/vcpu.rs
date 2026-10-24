@@ -282,6 +282,7 @@ fn cpu_reservations_release_on_terminal() {
                     RefusalReason::LostToRestart,
                     "restart before launch",
                     Some("restart before launch".into()),
+                    None,
                     runner.now(),
                 );
                 runner.save(&inner.jobs[&request.job_id]).unwrap();
@@ -1017,6 +1018,7 @@ fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit
         runner.follow_unit(request.job_id).unwrap();
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
         let terminal = job.terminal.clone().unwrap();
+        assert_execution_ended_wire(&terminal, true);
         if case == "setup failure" {
             assert_eq!(
                 terminal.outcome,

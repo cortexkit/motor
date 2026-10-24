@@ -209,7 +209,12 @@ def capture(manifest=None, job=False, role="build-server", remote_cache_on=False
     for directory in env["PATH"].split(":"):
         if directory:
             names.update(path.name for path in Path(directory).glob("gnu*") if path.is_file())
-    for name in sorted(names):
+    # A tool whose version is read from another tool's measurement (pnpm's
+    # pn, pnpx and pnx aliases take pnpm's) is measured after the tools without
+    # one. Alphabetical order alone would reach pn before pnpm and record no
+    # version for it.
+    specs = paths.get("tools", {})
+    for name in sorted(names, key=lambda name: (bool(specs.get(name, {}).get("version_from")), name)):
         path = shutil.which(name, path=env["PATH"])
         if path is None and name in paths.get("gnu_coreutils", {}):
             candidate = paths["gnu_coreutils"][name]

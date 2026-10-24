@@ -77,7 +77,7 @@ is omitted on the wire. The withdrawal eligibility and no-start proof are
 unchanged: the terminal retains `queue_wait_exceeded` with `ran: none`, and its
 detail begins `spill_withdrawal: `. The runner counts these jobs separately as
 `health.queue_wait_1h.spill_withdrawals`, not in hourly or per-repository queue-wait
-refusals. The new count defaults to zero and is omitted at zero. Older runners
+refusals. A spill withdrawal never carries `retry_after_ms` (5.6). The new count defaults to zero and is omitted at zero. Older runners
 ignore the spill flag and continue counting it as a refusal; older clients
 remain compatible but cannot identify their spills. Tests:
 `spill_withdrawal_fields_are_additive_and_omitted_at_default`,
@@ -275,11 +275,74 @@ rather than rejecting them. Do not match their human-text prefixes for execution
 or retry decisions. Test:
 `unknown_refusal_retains_the_before_start_arm`.
 
-5.5. `retry_after_ms` is a hint that a refusal is transient (draining sends the
-time left to the drain deadline). Disk-full refusals carry no hint, because
-nothing re-probes on a schedule. A started job's terminal never carries one.
-Tests: `drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame`,
-`retry_hint_is_removed_from_started_job_terminal`.
+`execution_ended`, when present and `true`, proves that no process of the job
+remains. The runner sets it after reading a real exit status, confirming the
+unit is inactive, or proving the job never started (including before-start
+cancellation and refusal). It does not imply success or a known exit code:
+an `outcome_unknown` terminal can carry it. Absent or `false` means execution
+has not been proven ended and the job may still be running. Restart loss,
+uncertain monitoring or VM state, and execution-gate release failures do not
+by themselves establish this proof. False is omitted for older clients.
+Tests: `execution_ended_wire_real_status`,
+`execution_ended_wire_before_start`, `execution_ended_wire_unknown_monitor`,
+`cancelled_exited_unit_without_real_status_still_finalizes`.
+
+5.5. `retry_after_ms` is a hint that a refusal is transient: how long a caller
+should wait before asking again, never shorter than the caller's own remaining
+budget allows. A started job's terminal never carries one. Three refusals carry
+it:
+
+- `runner_draining`, on the private `refusal` frame: the time left to the drain
+  deadline. Test: `drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame`.
+- `runner_authentication_failed` with a transient signing detail
+  (`runner_sign_unavailable`, `runner_sign_invalid_response`): the time left in
+  the signing agent's backoff. The other signing details carry no hint, because
+  they need an operator. See [module.md](module.md#retry-hints-on-credential-refusals).
+- `queue_wait_exceeded`, on the job's terminal record: the recent build-server
+  queue wait, in the rules 5.6 gives.
+
+Disk-full refusals carry no hint, because nothing re-probes on a schedule.
+Test: `retry_hint_is_removed_from_started_job_terminal`.
+
+5.6. A queue-wait refusal (`refused_before_start`, reason
+`queue_wait_exceeded`) carries `retry_after_ms` when — and only when — the job
+was waiting for something another job's completion frees: enough free permits
+(`waiting_on=permits`), a running job's workspace (`workspace owner`), a queued
+job ahead of it in a workspace whose files overlap (`queued workspace job`), or
+the job that checks this directory out as a sibling instead (`sibling user of
+this checkout`). The value is the median of the queue waits of the jobs the
+runner started in the last hour (`health.queue_wait_1h.p50_ms`), clamped to
+1000–60000 ms. The floor keeps a caller from retrying before even a job whose
+start failed once would be retried; the ceiling is the runner's own longest
+start backoff, so a caller's deadline is never spent on a hint longer than the
+runner's experience of the queue.
+
+The runner sets this hint, because only it knows the phase a job was waiting
+in; `ck-motor` passes the terminal record through unchanged. A deployment that
+wants existing jobs to start carrying it therefore ships a new runner, not a
+new `ck-motor`: until the runner is upgraded, capacity refusals keep arriving
+without a hint.
+
+No hint accompanies a refusal that waiting cannot clear:
+
+| Refusal | Hint |
+| --- | --- |
+| `queue_wait_exceeded` with `waiting_on=demand exceeds capacity` (the job asks for more permits than the runner can ever grant) | Absent. |
+| Any other `queue_wait_exceeded` phase (behind a gate job, a cache fill, an older job, an upload, workspace setup) | Absent: no wait is known to end it. |
+| `queue_wait_exceeded` when no job started in the last hour | Absent: there is no recent wait to report, and zero would read as "retry at once". |
+| A spill withdrawal (`withdraw {spill: true}` handed to hosted capacity, detail `spill_withdrawal: `) | Absent: the caller is never refused, so it never sees the record. |
+| Every other reason (disk full, draining's queued-job refusal, lost to restart, request rejected, platform or network unsupported) | Absent. |
+
+Older clients already know the field (it has carried signing and drain hints),
+so they read it as written and ignore it for reasons they do not act on. Tests:
+`capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
+`capacity_retry_hint_is_clamped_to_its_bounds`,
+`impossible_demand_refusal_carries_no_retry_hint`,
+`capacity_refusal_without_recent_starts_carries_no_retry_hint`,
+`spill_withdrawal_carries_no_retry_hint`
+(`crates/motor-runner/src/tests.rs`), and the old-client check
+`oldest_production_client_keeps_typed_queue_and_setup_refusal_details`
+(`python3 scripts/mixed-version.py`).
 
 ## 6. Sequence numbers, started and output
 

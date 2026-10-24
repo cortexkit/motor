@@ -199,9 +199,9 @@ fn prep_args(
         "--pipe".into(),
         "--collect".into(),
         format!("--unit=motor-windows-{}-prep-{id}.service", config.instance),
-        crate::systemd::JOB_MEMORY_PROPERTIES[0].into(),
-        crate::systemd::JOB_MEMORY_PROPERTIES[1].into(),
-        crate::systemd::JOB_MEMORY_PROPERTIES[2].into(),
+        crate::JOB_MEMORY_PROPERTIES[0].into(),
+        crate::JOB_MEMORY_PROPERTIES[1].into(),
+        crate::JOB_MEMORY_PROPERTIES[2].into(),
         "--property=User=motor-prep".into(),
         "--property=ProtectSystem=strict".into(),
         "--property=ProtectHome=yes".into(),
@@ -552,10 +552,21 @@ fn fetch_manifest(
     manifest: &Path,
     fetch: &mut impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
+    // The job VM is offline, so every crate a Windows build may need has to be
+    // fetched here. Both Windows targets are fetched: the image carries the
+    // ARM64 toolchain, and a job building with `--target
+    // aarch64-pc-windows-msvc` needs that target's platform crates too.
     let mut cmd = cargo_command(
         plan,
         manifest,
-        &["fetch", "--locked", "--target", "x86_64-pc-windows-msvc"],
+        &[
+            "fetch",
+            "--locked",
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "--target",
+            "aarch64-pc-windows-msvc",
+        ],
     );
     cmd.args(["--config", "net.git-fetch-with-cli=true"]);
     crate::workspace::dependencies::configure_fetch_git(

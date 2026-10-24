@@ -370,6 +370,7 @@ try:
     backing = pathlib.Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/loop/backing_file')
     data['backing_file'] = backing.read_text().strip()
     data['expected_backing'] = pathlib.Path(data['backing_file']).samefile('/var/lib/motor-boat.xfs')
+    data['backing_allocated_blocks'] = int(subprocess.check_output(['stat','-c','%b',data['backing_file']], text=True))
     data['users_bind'] = pathlib.Path('/Users').samefile('/var/lib/motor-boat/state/workspaces')
     data['prepared'] = json.loads(pathlib.Path('/run/motor-boat-storage.json').read_text())
 except OSError as error:
@@ -1450,6 +1451,10 @@ class RunnerHost:
                         self.check_job(label + "." + name, parsed, expected, marker=marker)
                     state = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
                     record.setdefault('storage_after_jobs', {})[name] = state
+                    if label == 'resumed' and name == 'node_modules_first' and 'disk_quota' in self.data:
+                        # A larger sandbox may stay above the floor at resume;
+                        # its retained target is evicted on the first cold retry.
+                        self.quota_reclaimed(state)
                     for key, passed in storage_checks(state).items():
                         self.check(label + '.' + name + '.' + key, passed, state)
                 # Observe and stop the unit from the sandbox's root namespace
@@ -1529,6 +1534,14 @@ class RunnerHost:
         with self.phase_evidence(sid, record):
             return self._disk_quota(sid, directory, public, repository, client, record)
 
+    def quota_reclaimed(self, storage):
+        import disk_quota
+        record = self.data['disk_quota']
+        before = record.get('lanes', {}).get(disk_quota.RETAINED_LANE, {}).get('pre_stop_storage', {})
+        evidence = record['resumed_backing_allocation'] = {'before': before, 'after': storage}
+        self.check('disk_quota.backing_allocation_dropped_after_resume',
+                   disk_quota.backing_allocation_dropped(before, storage), evidence)
+
     def _disk_quota(self, sid, directory, public, repository, client, record):
         import disk_quota
         import quota_adversarial
@@ -1580,6 +1593,8 @@ class RunnerHost:
                             row['pre_stop'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])))['stdout'])
                             if row['pre_stop'].get('job_running') is not True:
                                 raise ValueError('retained target job is no longer live before snapshot')
+                            row['pre_stop_storage'] = json.loads(self.execute(
+                                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
                             # Keep the job at its barrier so idle eviction cannot
                             # remove the full target before the provider snapshots it.
                             record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})

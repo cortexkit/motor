@@ -384,6 +384,13 @@ impl Job {
         self.state = JobState::Terminal;
     }
 
+    /// Finish with proof that no process of the job remains, independently of
+    /// whether its exit status is known.
+    pub fn terminal_ended(&mut self, outcome: Outcome, now: u64) {
+        self.terminal(outcome, now);
+        self.terminal = self.terminal.take().map(|t| t.with_execution_ended());
+    }
+
     pub fn queue_wait_ms(&self, now: u64) -> u64 {
         if self.queue_wait_clock_initialized.load(Ordering::Acquire) {
             queue_clock_at(&self.queue_entry, &self.queue_elapsed, now).1

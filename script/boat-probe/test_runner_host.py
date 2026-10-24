@@ -979,11 +979,15 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                                    kernel_usage=dict(hard_bytes=2**30, used_bytes=2**30),
                                    before=dict(physical_allowance_bytes=2**30), retained_allocated_bytes=2**30 if valid else 0,
                                    root_free_bytes=disk_quota.RESERVE_BYTES, xfs_free_bytes=disk_quota.RESERVE_BYTES)
-                runner.execute = Mock(side_effect=[{'stdout': json.dumps(control)},
-                                                   {'stdout': json.dumps(dict(ready=True, leases=[]))},
-                                                   {'stdout': json.dumps(observation)},
-                                                   {'stdout': json.dumps(dict(job_running=True, allocated_bytes=2**30))}])
                 order = []
+                responses = iter([control, dict(ready=True, leases=[]), observation,
+                                  dict(job_running=True, allocated_bytes=2**30),
+                                  dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)])
+                def execute(sid, command, **kwargs):
+                    if 'backing_allocated_blocks' in command:
+                        order.append('backing_allocation')
+                    return {'stdout': json.dumps(next(responses))}
+                runner.execute = Mock(side_effect=execute)
                 probe.request.side_effect = lambda *args: order.append('stop') or {}
                 probe.wait_sandbox.side_effect = lambda *args: order.append('archived')
                 child = Mock(returncode=-15)
@@ -995,7 +999,7 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                      patch.object(host, '_quota_popen', return_value=child):
                     if valid:
                         runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
-                        self.assertEqual(order, ['stop', 'archived', 'terminate'])
+                        self.assertEqual(order, ['backing_allocation', 'stop', 'archived', 'terminate'])
                         self.assertTrue(runner.data['disk_quota']['stopped_with_retained_target'])
                         self.assertFalse(runner.data['disk_quota']['reserve_assurance']['sufficiency_proven'])
                     else:
@@ -1003,6 +1007,21 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                             runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
                         probe.request.assert_not_called()
                 self.assertTrue(any('HOLD_AT_LIMIT=True' in call.args[1] for call in runner.execute.call_args_list))
+
+    def test_resume_records_and_checks_backing_allocation_drop(self):
+        import disk_quota
+        for blocks, passed in ((100, True), (1000, False), (None, False)):
+            with self.subTest(blocks=blocks):
+                probe = Mock()
+                before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)
+                probe.data = {}
+                runner = host.RunnerHost(probe)
+                runner.data['disk_quota'] = {'lanes': {disk_quota.RETAINED_LANE: {'pre_stop_storage': before}}}
+                runner.check = Mock()
+                after = dict(before, backing_allocated_blocks=blocks)
+                runner.quota_reclaimed(after)
+                runner.check.assert_called_once_with('disk_quota.backing_allocation_dropped_after_resume', passed,
+                                                     {'before': before, 'after': after})
 
 
 if __name__ == "__main__":

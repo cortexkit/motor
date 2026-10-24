@@ -216,9 +216,12 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     .get_args()
                     .map(|s| s.to_str().unwrap())
                     .collect::<Vec<_>>();
-                assert!(args
-                    .windows(2)
-                    .any(|a| a == ["--target", "x86_64-pc-windows-msvc"]));
+                for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                    assert!(
+                        args.windows(2).any(|a| a == ["--target", target]),
+                        "prep must fetch crates for {target}: {args:?}"
+                    );
+                }
                 assert!(args.contains(&"--locked"));
                 let home = cmd
                     .get_envs()
@@ -1075,8 +1078,14 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
             .await
             .unwrap();
         }
+        let terminal = terminal(&runner, r.job_id).await;
+        if matches!(fault, Fault::RejectStart | Fault::Start) {
+            assert_execution_ended_wire(&terminal, false);
+        } else {
+            assert_execution_ended_wire(&terminal, true);
+        }
         assert_eq!(
-            terminal(&runner, r.job_id).await.outcome,
+            terminal.outcome,
             if matches!(fault, Fault::RejectStart | Fault::Start) {
                 Outcome::OutcomeUnknown
             } else {

@@ -4,13 +4,7 @@ use std::{
     time::Duration,
 };
 
-// PID 1 starts these system services, independently of the user manager's
-// protected runner processes. OOMPolicy also stops surviving job descendants.
-pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
-    "--property=Slice=motor-jobs.slice",
-    "--property=OOMScoreAdjust=900",
-    "--property=OOMPolicy=kill",
-];
+pub(crate) use crate::JOB_MEMORY_PROPERTIES;
 
 /// Refuse execution rather than let systemd synthesize an uncapped implicit slice
 /// when an operator has not yet installed the shared memory policy.

@@ -82,6 +82,46 @@ fn run_prefetch(config: &Config, scratch: &ScratchDir, limit: Duration) -> io::R
 }
 
 #[test]
+fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
+    let scratch = ScratchDir::new("tenant-helper-dns");
+    let mut config = Config::new(&*scratch, "tenant-dns");
+    fs::create_dir_all(config.state_dir()).unwrap();
+    let command = shell(&config.state_dir());
+    let view = View::prefetch(&scratch.join("worktrees/a"), &[]).unwrap();
+    let files = Files::new(&config, Uuid::now_v7());
+    for tenant_vm in [false, true] {
+        config.tenant_vm = tenant_vm;
+        let arguments = arguments(
+            &config,
+            "motor-snaphelper-tenant-dns-test.service",
+            Duration::from_secs(120),
+            &command,
+            &view,
+            &files,
+        )
+        .unwrap();
+        let bindings: Vec<_> = arguments
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--property=BindReadOnlyPaths="))
+            .collect();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0]
+                .split_whitespace()
+                .any(|binding| binding == "/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"),
+            tenant_vm,
+            "{arguments:?}"
+        );
+        assert!(!arguments
+            .iter()
+            .any(|arg| arg.contains("TemporaryFileSystem=/etc")));
+        assert!(!arguments
+            .iter()
+            .any(|arg| arg.contains("PrivateNetwork=") || arg.contains("NetworkNamespacePath=")));
+    }
+}
+
+#[test]
 fn snapshot_helper_names_match_only_their_own_instance() {
     let id = Uuid::now_v7();
     assert!(belongs_to("main", &unit_name("main", id)));

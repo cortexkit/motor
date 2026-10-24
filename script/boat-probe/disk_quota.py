@@ -122,6 +122,16 @@ sys.exit(73 if observed in (errno.EDQUOT, errno.ENOSPC) else 74)
 '''
 
 
+def backing_allocation_dropped(before, after):
+    # Boat can recreate the backing inode on restore; compare the verified
+    # backing path and allocated sectors, not inode numbers across snapshots.
+    return (before.get('expected_backing') is True and after.get('expected_backing') is True
+            and before.get('backing_file') == after.get('backing_file') == '/var/lib/motor-boat.xfs'
+            and type(before.get('backing_allocated_blocks')) is int
+            and type(after.get('backing_allocated_blocks')) is int
+            and 0 <= after['backing_allocated_blocks'] < before['backing_allocated_blocks'])
+
+
 def job(lane, token=None):
     if lane not in LANES + (RETAINED_LANE,):
         raise ValueError('unknown quota probe lane')
@@ -139,13 +149,15 @@ def free(path):
     value = os.statvfs(path)
     return value.f_bavail * value.f_frsize
 def kernel_usage(lease):
+    # Boat's Ubuntu 24.04 ships glibc 2.39, which has no quotactl_fd wrapper,
+    # so call the system call by number (443 on x86-64), as the runner does.
     libc = ctypes.CDLL(None, use_errno=True)
-    libc.quotactl_fd.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
-    libc.quotactl_fd.restype = ctypes.c_int
+    libc.syscall.restype = ctypes.c_long
     data = ctypes.create_string_buffer(112)
     fd = os.open('/var/lib/motor-boat', os.O_RDONLY | os.O_DIRECTORY)
     try:
-        if libc.quotactl_fd(fd, ((0x5803 << 8) | 2), lease['project'], ctypes.byref(data)) != 0:
+        if libc.syscall(ctypes.c_long(443), ctypes.c_int(fd), ctypes.c_uint((0x5803 << 8) | 2),
+                        ctypes.c_uint(lease['project']), ctypes.byref(data)) != 0:
             raise OSError(ctypes.get_errno(), 'Q_XGETQUOTA')
         return dict(hard_bytes=struct.unpack_from('=Q', data, 8)[0] * 512,
                     used_bytes=struct.unpack_from('=Q', data, 40)[0] * 512)

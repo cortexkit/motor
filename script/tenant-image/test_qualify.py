@@ -105,6 +105,35 @@ class QualificationTests(unittest.TestCase):
             result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
             self.assertEqual('the pnpm fixture lifecycle script ran\n', result.stderr)
 
+    def test_trusted_cargo_fetch_runs_online_in_a_helper_with_a_cold_cache(self):
+        guest = q.module('cargo_fetch_guest', q.HERE / 'guest/hosted_qualify.py')
+        self.assertEqual(q.CARGO_FETCH, guest.CARGO_FETCH)
+        self.assertLess(q.STEPS.index("javascript setup"), q.STEPS.index("trusted cargo fetch"))
+        self.assertLess(q.STEPS.index("trusted cargo fetch"), q.STEPS.index("first job"))
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            target = scratch / 'cargo-fetch'
+            target.mkdir()
+            (target / 'warm-cache').write_text('must not be reused')
+
+            def runner(*args):
+                self.assertFalse(target.exists())
+                target.mkdir()
+                return guest.RUNNER_CARGO_FETCH_PASS + '\n'
+            with mock.patch.object(guest, 'run', side_effect=runner) as run, \
+                 mock.patch('builtins.print') as printed:
+                guest.cargo_fetch_probe(scratch)
+            self.assertEqual(('/usr/local/bin/motor-runner', 'check-tenant-cargo-fetch',
+                              '--scratch', str(target)), run.call_args.args)
+            self.assertFalse(target.exists())
+            printed.assert_called_once_with(q.CARGO_FETCH, flush=True)
+            with mock.patch.object(guest, 'run', return_value='FAIL\n'), \
+                 self.assertRaisesRegex(RuntimeError, 'did not pass'):
+                guest.cargo_fetch_probe(scratch)
+            with mock.patch.object(guest, 'run', side_effect=RuntimeError('DNS failed')), \
+                 self.assertRaisesRegex(RuntimeError, 'DNS failed'):
+                guest.cargo_fetch_probe(scratch)
+
     def test_guest_host_parity_must_match_image_gnutest_inventory(self):
         guest = q.module('parity_guest', q.HERE / 'guest/hosted_qualify.py')
         with tempfile.TemporaryDirectory() as tmp:

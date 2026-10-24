@@ -263,6 +263,7 @@ impl Resources {
                 "Windows VM host requires Linux",
             ));
         }
+        #[cfg(target_os = "linux")]
         crate::systemd::require_job_memory_budget()?;
         self.child = Box::new(SystemdChild {
             child: Command::new("/usr/bin/sudo")
@@ -451,9 +452,9 @@ pub(super) fn qemu_args(
         "--wait".into(),
         "--collect".into(),
         format!("--unit={unit}"),
-        crate::systemd::JOB_MEMORY_PROPERTIES[0].into(),
-        crate::systemd::JOB_MEMORY_PROPERTIES[1].into(),
-        crate::systemd::JOB_MEMORY_PROPERTIES[2].into(),
+        crate::JOB_MEMORY_PROPERTIES[0].into(),
+        crate::JOB_MEMORY_PROPERTIES[1].into(),
+        crate::JOB_MEMORY_PROPERTIES[2].into(),
         "--property=User=motor-qemu".into(),
         "--property=SupplementaryGroups=kvm".into(),
         "--property=ProtectSystem=strict".into(),

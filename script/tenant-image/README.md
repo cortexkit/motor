@@ -329,6 +329,20 @@ runner JavaScript setup`), and every leased job's repository carries the same
 three fixtures, so each job's real workspace setup installs them and the job
 fails unless it did.
 
+Qualification also runs `motor-runner check-tenant-cargo-fetch --scratch DIR`
+after attachment. It creates a new, empty Cargo home, materializes an embedded
+workspace locked to `itoa` 1.0.18, and runs the production trusted online fetch
+command in a real snapshot helper unit with the normal 120-second online bound.
+There is no offline fallback in this check: it requires a successful online
+attempt and the downloaded crate archive in the new cache. The helper has its
+own mount namespace, so merely testing DNS in the daemon or a `net` job cannot
+substitute for this check. The host requires the exact `PASS guest trusted cargo
+prefetch` line as the `trusted cargo fetch` qualification step; a warm persistent
+tenant cache cannot make it pass. Portable coverage is
+`tenant_online_qualification_requires_a_new_cache_and_a_downloaded_crate` and
+`test_trusted_cargo_fetch_runs_online_in_a_helper_with_a_cold_cache`; only the
+booted qualification run establishes online reachability.
+
 On a host with a registered tenant, `qualify.py` deliberately refuses. Do not
 remove a registration or stop a live helper to bypass this fence. After the
 operator deploys the new image through the normal tenant replacement workflow,
@@ -441,8 +455,15 @@ privileged guest-exec RPC, SSH service, or normal-boot qualification unit.
 
 The name-service probe checks what once stalled tenant runner startup. Attach
 keeps the VM-global resolver empty and maps the tenant hostname in `/etc/hosts`.
-The daemon has a private, root-only resolver
-binding for trusted dependency fetches; `net` jobs get separate resolver bindings.
+The daemon and its trusted snapshot helpers bind the same private, root-only
+`/run/motor-tenant-daemon/resolv.conf` read-only over `/etc/resolv.conf`; the
+backing file contains the attachment's resolver addresses and
+`options timeout:2 attempts:1`. No `RESOLV_CONF` override is used. Helpers are
+separate systemd services, not children that inherit the daemon's private mount
+namespace, so their resolver bind must be explicit
+(`tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc`). They retain the
+VM's network namespace and `/etc/nsswitch.conf`; `net` jobs get separate network
+namespaces and resolver bindings.
 The root namespace has a default route after attach, but DNS reachability during
 early startup must not be assumed. With `nameserver 1.1.1.1` temporarily in the
 global resolver, `getent ahosts <hostname>` and `sudo -n true` must each

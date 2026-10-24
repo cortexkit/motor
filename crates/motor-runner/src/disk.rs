@@ -917,7 +917,8 @@ impl Runner {
             .map(|_| ())
             .map_err(|error| io::Error::new(error.kind(), error.to_string()));
         self.record_disk_removal(&candidate, deleted, false);
-        result
+        result?;
+        (self.core.config.boat_storage_trim)()
     }
 
     /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
@@ -1063,7 +1064,7 @@ impl Runner {
                 };
                 self.record_disk_removal(&candidate, deleted, false);
                 free = probe()?;
-                if free >= soft && !sweep_idle_workspaces {
+                if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
                     self.core.health.lock().unwrap().record(self.now(), |c| {
                         c.skipped_recent += skipped_recent.len() as u64;
                     });
@@ -1205,12 +1206,19 @@ impl Runner {
             });
             self.record_disk_removal(&candidate, deleted, cache_cleared);
             free = probe()?;
-            if free >= soft && !sweep_idle_workspaces {
+            if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
                 self.core.health.lock().unwrap().record(self.now(), |c| {
                     c.skipped_recent += skipped_recent.len() as u64;
                 });
                 return Ok(None);
             }
+        }
+        #[cfg(target_os = "linux")]
+        if self.core.config.boat_profile && (!attempted.is_empty() || free < floor) {
+            // Batch discard after eviction: XFS free space alone does not mean
+            // the sparse loop image returned its blocks to the root disk.
+            (self.core.config.boat_storage_trim)()?;
+            free = probe()?;
         }
         if free >= soft {
             self.core.health.lock().unwrap().record(self.now(), |c| {

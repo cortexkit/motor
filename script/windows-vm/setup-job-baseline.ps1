@@ -176,9 +176,59 @@ if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $toolchain" -or $rustc
 $rustc | Write-Host
 & 'C:\rust\cargo\bin\cargo.exe' --version
 if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Cargo verification failed' }
-if (Test-Path "$PSScriptRoot\hyperv-runner") {
-    & 'C:\rust\cargo\bin\rustup.exe' component add clippy rustfmt --toolchain $toolchain
-    if ($LASTEXITCODE -ne 0) { throw 'Sealed hvsock image gate components failed to install' }
+$rustup = 'C:\rust\cargo\bin\rustup.exe'
+& $rustup component add clippy rustfmt --toolchain $toolchain
+if ($LASTEXITCODE -ne 0) { throw 'Job image Rust components failed to install' }
+& $rustup target add aarch64-pc-windows-msvc --toolchain $toolchain
+if ($LASTEXITCODE -ne 0) { throw 'Job image ARM64 Rust target failed to install' }
+$components = & $rustup component list --installed --toolchain $toolchain
+if ($LASTEXITCODE -ne 0) { throw 'Listing installed Rust components failed' }
+foreach ($component in @('clippy', 'rustfmt')) {
+    if ($components -notcontains "$component-$hostTriple") { throw "Missing Rust component: $component" }
+}
+$targets = & $rustup target list --installed --toolchain $toolchain
+if ($LASTEXITCODE -ne 0) { throw 'Listing installed Rust targets failed' }
+foreach ($target in @($hostTriple, 'aarch64-pc-windows-msvc')) {
+    if ($targets -notcontains $target) { throw "Missing Rust target: $target" }
+}
+$components | Write-Host
+$targets | Write-Host
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw 'Visual Studio locator is missing' }
+$vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+if ($LASTEXITCODE -ne 0 -or -not $vsInstall) { throw 'Visual Studio ARM64 tools are missing' }
+$arm64Linker = Get-ChildItem "$vsInstall\VC\Tools\MSVC\*\bin\Hostx64\arm64\link.exe" -File | Select-Object -First 1
+if (-not $arm64Linker) { throw 'MSVC Hostx64 ARM64 link.exe is missing' }
+Write-Host "Verified ARM64 linker: $($arm64Linker.FullName)"
+
+# A dependency-free executable exercises the ARM64 standard library, linker and
+# Windows SDK without fetching crates or running an ARM64 binary on the x64 host.
+$arm64Probe = Join-Path $env:TEMP 'motor-arm64-toolchain-probe'
+if (Test-Path $arm64Probe) { Remove-Item $arm64Probe -Recurse -Force }
+New-Item "$arm64Probe\src" -ItemType Directory -Force | Out-Null
+try {
+    Set-Content "$arm64Probe\Cargo.toml" @'
+[package]
+name = "motor-arm64-toolchain-probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+'@ -Encoding ascii
+    Set-Content "$arm64Probe\src\main.rs" 'fn main() { println!("ARM64 toolchain verified"); }' -Encoding ascii
+    Push-Location $arm64Probe
+    try {
+        & 'C:\rust\cargo\bin\cargo.exe' "+$toolchain" build --offline --target aarch64-pc-windows-msvc --target-dir "$arm64Probe\target"
+        if ($LASTEXITCODE -ne 0) { throw "Offline ARM64 Cargo build failed: $LASTEXITCODE" }
+        if (-not (Test-Path "$arm64Probe\target\aarch64-pc-windows-msvc\debug\motor-arm64-toolchain-probe.exe")) {
+            throw 'Offline ARM64 Cargo build did not produce an executable'
+        }
+    } finally {
+        Pop-Location
+    }
+} finally {
+    Remove-Item $arm64Probe -Recurse -Force
 }
 $git = 'C:\Program Files\Git\cmd\git.exe'
 if (-not (Test-Path 'C:\Program Files\Git\bin\bash.exe')) { throw 'Git Bash is missing' }

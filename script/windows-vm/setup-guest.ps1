@@ -107,14 +107,25 @@ Write-Host ""
 $VSWherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $HasVCTools = $false
 if (Test-Path $VSWherePath) {
-    # -requires Microsoft.VisualStudio.Component.VC.Tools.* checks for the
-    # C++ build tools workload specifically (any architecture variant).
+    # Detect the C++ workload first so an existing installation can be repaired
+    # in place if it predates the ARM64 cross-linker requirement.
     $vsInstance = & $VSWherePath -latest -products * `
         -requires Microsoft.VisualStudio.Workload.VCTools `
         -property installationPath 2>$null
     if ($vsInstance) {
         $HasVCTools = $true
         Write-Host "Visual Studio Build Tools (VC++) already installed at: $vsInstance"
+    }
+}
+
+if ($HasVCTools) {
+    $arm64Instance = & $VSWherePath -latest -products * `
+        -requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+        -property installationPath 2>$null
+    if (-not $arm64Instance) {
+        Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_buildtools.exe' -OutFile "$env:TEMP\vs_buildtools.exe" -UseBasicParsing
+        $p = Start-Process "$env:TEMP\vs_buildtools.exe" -ArgumentList "modify --quiet --wait --norestart --nocache --installPath `"$vsInstance`" --add Microsoft.VisualStudio.Component.VC.Tools.ARM64" -Wait -PassThru
+        if ($p.ExitCode -notin @(0,3010)) { throw "VS ARM64 tools install failed: $($p.ExitCode)" }
     }
 }
 
@@ -127,16 +138,8 @@ if (-not $HasVCTools) {
         # before the install actually finishes (otherwise rustup runs against
         # a half-installed toolchain and we hit the linker error anyway).
         #
-        # IMPORTANT: on ARM64 Windows, Microsoft's --includeRecommended for the
-        # VCTools workload installs ONLY the x64-host C++ toolchain, NOT the
-        # ARM64-native compiler. That's enough to satisfy vswhere ("VCTools
-        # workload installed") but NOT to actually link an aarch64-msvc Rust
-        # build, because cargo defaults to the host triple
-        # (aarch64-pc-windows-msvc) and looks for Hostarm64\arm64\link.exe,
-        # which only ships with the explicit VC.Tools.ARM64 component.
-        # We add it unconditionally; on x64 hosts it's a small no-op
-        # extra, on ARM64 hosts it's the difference between cargo working
-        # and the "linker `link.exe` not found" error.
+        # Recommended VCTools components do not include the ARM64 target tools.
+        # Explicitly request them so x64 job VMs can link aarch64-msvc binaries.
         $vsArgs = @(
             "--quiet"
             "--wait"
@@ -157,7 +160,7 @@ if (-not $HasVCTools) {
         }
     } else {
         Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_buildtools.exe' -OutFile "$env:TEMP\vs_buildtools.exe" -UseBasicParsing
-        $p = Start-Process "$env:TEMP\vs_buildtools.exe" -ArgumentList '--quiet --wait --norestart --nocache --installPath C:\BuildTools --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' -Wait -PassThru
+        $p = Start-Process "$env:TEMP\vs_buildtools.exe" -ArgumentList '--quiet --wait --norestart --nocache --installPath C:\BuildTools --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --includeRecommended' -Wait -PassThru
         if ($p.ExitCode -notin @(0,3010)) { throw "VS install failed: $($p.ExitCode)" }
         $vsInstance = & $VSWherePath -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath
         if (-not $vsInstance) { throw 'VS installer returned without a VC++ workload' }

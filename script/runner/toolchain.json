@@ -35,9 +35,15 @@
       "git": "1:2.53.0-1ubuntu1.1",
       "gnu-coreutils": "9.7-3ubuntu2.1",
       "iproute2": "6.19.0-1ubuntu1.1",
+      "libfontconfig-dev": "2.17.1-3ubuntu1",
       "libsqlite3-dev": "3.46.1-9ubuntu0.3",
       "libssl-dev": "3.5.5-1ubuntu3.7",
+      "libvulkan1": "1.4.341.0-1",
+      "libwayland-dev": "1.24.0-2",
+      "libx11-xcb-dev": "2:1.8.13-1ubuntu0.1",
+      "libxkbcommon-x11-dev": "1.13.1-1",
       "lld": "1:21.1.6-71",
+      "mesa-vulkan-drivers": "26.0.8-1ubuntu0.3",
       "nftables": "1.1.6-1",
       "openssh-server": "1:10.2p1-2ubuntu3.8",
       "patch": "2.8-2build1",
@@ -50,7 +56,9 @@
       "ufw": "0.36.2-9build1",
       "unzip": "6.0-29ubuntu1",
       "util-linux": "2.41.3-3ubuntu2.2",
+      "x11-apps": "7.7+11build4",
       "xfsprogs": "6.18.0-3",
+      "xvfb": "2:21.1.22-1ubuntu1.3",
       "xz-utils": "5.8.3-1ubuntu0.1"
     },
     "required": [
@@ -79,10 +87,18 @@
       "openssh-server",
       "ufw",
       "gcc-mingw-w64-x86-64",
-      "g++-mingw-w64-x86-64"
+      "g++-mingw-w64-x86-64",
+      "xvfb",
+      "x11-apps",
+      "mesa-vulkan-drivers",
+      "libvulkan1",
+      "libfontconfig-dev",
+      "libwayland-dev",
+      "libx11-xcb-dev",
+      "libxkbcommon-x11-dev"
     ]
   },
-  "capture_sha256": "046e4800bb6ccc658a8a267c4ed51e32849022f66e2e0fc2c5c543070f0de985",
+  "capture_sha256": "679c1f888e9768d961fbc81956fe3c775b1366e7ec7571db8867e47f4fc75cd1",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
@@ -650,6 +666,12 @@
       "path": "/usr/local/bin/npx",
       "realpath_suffix": "/lib/node_modules/npm/bin/npx-cli.js",
       "version": "11.19.0"
+    },
+    "pn": {
+      "path": "/usr/local/bin/pn",
+      "realpath_suffix": "/lib/node_modules/pnpm/bin/pnpm.mjs",
+      "version": "11.1.2",
+      "version_from": "pnpm"
     },
     "pnpm": {
       "path": "/usr/local/bin/pnpm",

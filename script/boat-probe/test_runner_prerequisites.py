@@ -70,6 +70,22 @@ class PrerequisitesTests(unittest.TestCase):
             token.unlink()
             self.assertTrue(namespace["credential_audit"]([root], {})["clean"])
 
+    def test_toolchain_source_files_are_lookalikes_but_stores_still_count(self):
+        # Boat's base caches Node's sources under ~/.nvm/.cache; their file names
+        # contain "credentials" but they are code, not account credential stores.
+        namespace = {}
+        exec(prerequisites.SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as root:
+            sources = [Path(root, name) for name in ("node_credentials.cc", "test-http-proxy-request-invalid-credentials.mjs")]
+            store = Path(root, "aws-credentials")
+            for path in [*sources, store]:
+                path.write_text("x")
+            data = namespace["credential_audit"]([root], {})
+            self.assertEqual(data["source_lookalikes"], sorted(map(str, sources)))
+            self.assertEqual(data["credential_paths"], [str(store)])
+            store.unlink()
+            self.assertTrue(namespace["credential_audit"]([root], {})["clean"])
+
     def test_provider_environment_is_scoped_and_npmrc_keys_are_classified(self):
         namespace = {}
         exec(prerequisites.SOURCE, namespace)

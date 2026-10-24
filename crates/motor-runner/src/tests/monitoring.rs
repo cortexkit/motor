@@ -38,6 +38,120 @@ fn running_record(f: &Fixture, runner: &Runner) -> Uuid {
     request.job_id
 }
 
+#[test]
+fn execution_ended_wire_real_status() {
+    use std::os::unix::process::ExitStatusExt;
+    for status in [
+        backend::ExecutionOutcome::Unix(std::process::ExitStatus::from_raw(7 << 8)),
+        backend::ExecutionOutcome::Signal { signal: 15 },
+        backend::ExecutionOutcome::WindowsExit { code: 0xC000_0005 },
+    ] {
+        let f = Fixture::new();
+        let runner = Runner::open(f.config()).unwrap();
+        let id = running_record(&f, &runner);
+        runner.finish_execution(id, Ok(status), false).unwrap();
+        let disk: Job = read_json(&runner.record_path(id)).unwrap();
+        let terminal = disk.terminal.unwrap();
+        assert_eq!(terminal.outcome, status.wire());
+        assert_execution_ended_wire(&terminal, true);
+    }
+}
+
+#[test]
+fn execution_ended_wire_before_start() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let cancel = Uuid::now_v7();
+    runner.cancel(cancel).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request.clone()).unwrap();
+    runner
+        .refuse(
+            request.job_id,
+            RefusalReason::WorkspaceSetupFailed,
+            "setup failed",
+        )
+        .unwrap();
+    for id in [cancel, request.job_id] {
+        let disk: Job = read_json(&runner.record_path(id)).unwrap();
+        let terminal = disk.terminal.unwrap();
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert_execution_ended_wire(&terminal, true);
+    }
+}
+
+#[test]
+fn execution_ended_wire_unknown_monitor() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = running_record(&f, &runner);
+    runner
+        .finish(id, Err(io::Error::other("monitor unavailable")))
+        .unwrap();
+    let disk: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, false);
+}
+
+#[test]
+fn execution_ended_wire_restart_lost() {
+    let f = Fixture::new();
+    let config = f.config();
+    let mut job = Job::new(Uuid::now_v7(), None, (config.clock)(), 0, 0);
+    job.state = JobState::Running;
+    job.started_ms = Some((config.clock)());
+    let record = config
+        .state_dir()
+        .join("jobs")
+        .join(job.id.to_string())
+        .join("record.json");
+    atomic_json(&record, &job).unwrap();
+    let runner = Runner::open(config).unwrap();
+    let disk: Job = read_json(&record).unwrap();
+    assert_eq!(disk.state, JobState::Lost);
+    assert_execution_ended_wire(disk.terminal.as_ref().unwrap(), false);
+    assert_execution_ended_wire(
+        runner.core.inner.lock().unwrap().jobs[&job.id]
+            .terminal
+            .as_ref()
+            .unwrap(),
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn execution_ended_wire_cache_fill_setup() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (request, _) = f.run("true");
+    let mut job = Job::new(request.job_id, Some(request), runner.now(), 1, 0);
+    job.base = true;
+    let error = crate::writer::CacheFill::begin(runner.config())
+        .err()
+        .unwrap();
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner
+        .catalog
+        .repositories
+        .entry(f.root.clone())
+        .or_default();
+    inner.writer = Some(job.id);
+    inner.jobs.insert(job.id, job.clone());
+    runner.fail_cache_fill(&mut inner, &job, error).unwrap();
+    drop(inner);
+    assert!(poll(Duration::from_secs(5), || {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.writer.is_none() && !inner.base_finishes.contains_key(&job.id)
+    }));
+    let disk: Job = read_json(&runner.record_path(job.id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_execution_ended_wire(&terminal, true);
+}
+
 #[tokio::test]
 async fn monitor_output_enospc_retries_terminal_and_drain_completes() {
     let f = Fixture::new();
@@ -122,10 +236,38 @@ async fn cancel_after_monitor_lost_an_exited_process_finalizes_record() {
     let terminal = disk.terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
     assert_eq!(terminal.killed, Some(Killed::Cancel));
+    assert_execution_ended_wire(&terminal, false);
 }
 
 fn systemd_runner(f: &Fixture, state: &str) -> (Runner, Arc<Mutex<Vec<Vec<String>>>>) {
     systemd_runner_with_state(f, Arc::new(Mutex::new(state.to_string())))
+}
+
+#[test]
+fn execution_ended_wire_oom_without_liveness() {
+    let f = Fixture::new();
+    let (runner, _) = systemd_runner(&f, "Result=oom-kill\n");
+    let id = running_record(&f, &runner);
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .process = Some(platform::ProcessIdentity {
+        pid: 0,
+        start: 0,
+        unit: Some(Uuid::now_v7()),
+    });
+    runner
+        .finish(id, Err(io::Error::other("exit status lost")))
+        .unwrap();
+    let disk: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+    assert_execution_ended_wire(&terminal, false);
 }
 
 /// Like `systemd_runner`, but the reported unit state can change during the test.
@@ -356,7 +498,9 @@ async fn cancel_recorded_after_unit_exit_finalizes_without_signalling() {
         .unwrap()
         .kill = None;
     runner.cancel(id).unwrap();
-    assert_eq!(terminal(&runner, id).await.outcome, Outcome::OutcomeUnknown);
+    let terminal = terminal(&runner, id).await;
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, true);
     assert!(commands
         .lock()
         .unwrap()
@@ -386,6 +530,7 @@ async fn pipe_output_failure_drains_verbose_child_and_releases_workspace() {
     f.submit(&runner, &request, &bytes);
     let result = terminal(&runner, request.job_id).await;
     assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&result, true);
     assert!(Path::new(&f.key).join("pipe-completed").exists());
     let inner = runner.core.inner.lock().unwrap();
     assert!(!Runner::occupied(&inner, &f.key));
@@ -2070,6 +2215,7 @@ fn boat_oom_killed_init_without_exit_is_definite_and_explained() {
     let job: Job = read_json(&runner.record_path(id)).unwrap();
     let terminal = job.terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+    assert_execution_ended_wire(&terminal, true);
     assert_eq!(terminal.ran, Some(Ran::Remote));
     let detail = terminal.refusal_detail().unwrap();
     for expected in [
