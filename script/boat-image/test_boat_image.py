@@ -1254,9 +1254,11 @@ class PnpmInstallTests(unittest.TestCase):
              patch.object(install, "digest", return_value=source["sha512"]), \
              patch.object(install.urllib.request, "urlopen",
                           return_value=io.BytesIO(json.dumps({"dist": {
-                              "integrity": "sha512-" + source["sha512"], "tarball": tarball}}).encode())), \
+                              "integrity": "sha512-" + source["sha512"], "tarball": tarball}}).encode())) as metadata, \
              patch.object(install, "run") as run:
             install.install_pnpm(manifest)
+        # The registry's per-version metadata path; name@version 404s there.
+        self.assertEqual(metadata.call_args.args[0], "https://registry.npmjs.org/pnpm/11.1.2")
         commands = [call.args for call in run.call_args_list]
         self.assertFalse([args for args in commands if args[:2] == ("npm", "install")])
         installer = commands[-1]

@@ -480,8 +480,10 @@ def install_pnpm(manifest):
     archive and writes the same npm bin links instead (see that script)."""
     spec = manifest["tools"]["pnpm"]
     source = spec["source"]
-    name = source["package"].split("@", 1)[0]
-    metadata = json.loads(urllib.request.urlopen(source["registry"] + source["package"], timeout=60).read())
+    name, version = source["package"].split("@", 1)
+    # The registry serves one version's metadata at <name>/<version>; the
+    # name@version spelling is the pin's notation, not a registry path.
+    metadata = json.loads(urllib.request.urlopen(f"{source['registry']}{name}/{version}", timeout=60).read())
     algorithm, published = metadata["dist"]["integrity"].split("-", 1)
     if algorithm != "sha512" or published != source["sha512"]:
         raise ValueError("pnpm registry integrity differs from the manifest pin")

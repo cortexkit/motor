@@ -35,7 +35,7 @@
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
     "script/runner/job-account.py": "21f185ddc868150a8bbfe94aa8eac18a50485b87bf8fa043944348dac77ef4ca",
     "script/runner/sysctl/60-motor-inotify.conf": "2ddb7e2127e6c2c04d2d4c96293e12b39f29a81e58adac0c1a3eb8d432b7b9f4",
-    "script/boat-image/install.py": "ea97d0e7da36b5eaf76df1036119f79849f176da24d2a513d25f933fe244b683",
+    "script/boat-image/install.py": "2bdcdd140c1e94b36a281efdbe66f68c70b0546426aede29608d80e0b3a0b2f8",
     "script/tenant-image/guest/root_paths.py": "2de3c028f009f8e77abe3524fcbbae589b47fd32d5a6af8ab1f55240d0a33c3d"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",
