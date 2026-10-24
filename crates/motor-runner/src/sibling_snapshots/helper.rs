@@ -217,16 +217,21 @@ impl View {
         path.to_path_buf()
     }
 
-    /// The `systemd-run` properties that build this view.
-    fn properties(&self, tenant_vm: bool) -> io::Result<Vec<String>> {
+    /// The `systemd-run` properties that build this view. `tenant_resolver`
+    /// says whether the tenant attachment installed the daemon's private
+    /// resolver, as [`TenantResolver`] works out.
+    fn properties(&self, tenant_resolver: &TenantResolver) -> io::Result<Vec<String>> {
         let hidden = self.hidden();
         let mut read_only = Vec::new();
         let mut read_write = Vec::new();
-        if tenant_vm {
-            // systemd starts helpers outside the daemon's private mount namespace.
-            // The VM-global resolver is empty; only trusted preparation units get
-            // the daemon's resolver bind. Do not hide the rest of /etc as a checkout.
-            read_only.push("/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf".into());
+        if let Some(resolver) = tenant_resolver.resolver()? {
+            // systemd starts helpers outside the daemon's private mount
+            // namespace, where the tenant attachment binds the daemon's
+            // resolver over /etc/resolv.conf. The VM's own resolver is empty,
+            // so a trusted preparation unit needs the same bind to resolve.
+            // Only /etc/resolv.conf is bound: the rest of /etc must not be
+            // hidden as if it were a checkout.
+            read_only.push(bind(&resolver, Path::new("/etc/resolv.conf"))?);
         }
         for (source, destination) in &self.read_only {
             read_only.push(bind(source, destination)?);
@@ -271,6 +276,91 @@ impl View {
         }
         Ok(properties)
     }
+}
+
+/// Where a helper unit of this runner gets its resolver.
+///
+/// A tenant VM's own `/etc/resolv.conf` is empty: attachment keeps it empty and
+/// the daemon runs with the attachment's resolver bound over it. Helpers are
+/// separate units outside that mount namespace, so they need the bind too, from
+/// the private file attachment writes. Boat runs as `--tenant-vm` without a
+/// tenant attachment (it is a single-tenant sandbox, not a tenant VM), so its
+/// helpers keep the sandbox's own resolver and must not be given a bind for a
+/// file nobody installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TenantResolver {
+    /// The host's own name service: a profile that is not a tenant VM, or
+    /// Boat, whose sandbox supplies a resolver and which no attachment serves.
+    Host,
+    /// A tenant attachment has installed the private resolver in `directory`.
+    Attached { directory: PathBuf },
+    /// A tenant VM whose attachment has not (yet) installed the resolver in
+    /// `directory`: the runner started while the tenant was attached but
+    /// before the file was written, or the file has been removed since. A
+    /// private resolver is expected here, so leaving the empty VM resolver in
+    /// place would only surface later as a fetch that cannot resolve.
+    Missing { directory: PathBuf },
+}
+
+impl TenantResolver {
+    pub(crate) fn new(config: &Config) -> Self {
+        Self::under(
+            config.tenant_vm,
+            config.boat_profile,
+            Path::new(crate::tenant_agent::DNS_MARKER),
+            Path::new(crate::tenant_agent::DNS_DIRECTORY),
+        )
+    }
+
+    /// [`Self::new`], reading the attachment's marker from `marker` and the
+    /// private resolver from `directory`, so tests need not touch `/run`.
+    ///
+    /// A runner that is not a tenant VM, and Boat, which runs as one without a
+    /// tenant attachment, keep the host's name service. Any other tenant VM is
+    /// [`Self::Attached`] only when the marker holds a generation, and is
+    /// [`Self::Missing`] when the marker is empty or unreadable.
+    fn under(tenant_vm: bool, boat_profile: bool, marker: &Path, directory: &Path) -> Self {
+        if !tenant_vm || boat_profile {
+            return Self::Host;
+        }
+        match fs::read_to_string(marker) {
+            Ok(generation) if !generation.trim().is_empty() => Self::Attached {
+                directory: directory.to_path_buf(),
+            },
+            Ok(_) | Err(_) => Self::Missing {
+                directory: directory.to_path_buf(),
+            },
+        }
+    }
+
+    /// The private resolver a helper must bind, when it needs one. Whether the
+    /// tenant has one is decided by the attachment's marker, never by whether
+    /// this file exists, so a missing file here is an error rather than "no
+    /// tenant".
+    fn resolver(&self) -> io::Result<Option<PathBuf>> {
+        match self {
+            Self::Host => Ok(None),
+            Self::Attached { directory } => {
+                let resolver = directory.join("resolv.conf");
+                match fs::symlink_metadata(&resolver) {
+                    Ok(metadata) if metadata.is_file() => Ok(Some(resolver)),
+                    _ => Err(missing(directory)),
+                }
+            }
+            Self::Missing { directory } => Err(missing(directory)),
+        }
+    }
+}
+
+/// The error for a tenant whose private resolver the attachment does not
+/// provide, naming the directory and file a helper would need.
+fn missing(directory: &Path) -> io::Error {
+    io::Error::other(format!(
+        "the tenant's private resolver is missing: a --tenant-vm runner needs {}/resolv.conf, \
+         which tenant attachment installs; the VM's own resolver is empty, so dependency \
+         preparation cannot resolve online until the tenant is attached again",
+        directory.display()
+    ))
 }
 
 /// `motor-snaphelper-<instance>-<id>.service`.
@@ -326,7 +416,17 @@ pub(crate) fn run(
     let started = Instant::now();
     let observed = files
         .create(command)
-        .and_then(|()| arguments(config, &unit, limit, command, view, &files))
+        .and_then(|()| {
+            arguments(
+                config,
+                &unit,
+                limit,
+                command,
+                view,
+                &files,
+                TenantResolver::new(config),
+            )
+        })
         .and_then(|arguments| {
             crate::setup_log::phase(helper.label(), || {
                 start(config, &arguments)?;
@@ -604,6 +704,7 @@ fn arguments(
     command: &Command,
     view: &View,
     files: &Files,
+    tenant_resolver: TenantResolver,
 ) -> io::Result<Vec<String>> {
     let program = program(command)?;
     let directory = command
@@ -655,7 +756,7 @@ fn arguments(
         "--property=UMask=0022".into(),
     ];
     arguments.extend(crate::systemd::JOB_MEMORY_PROPERTIES.map(str::to_owned));
-    arguments.extend(view.properties(config.tenant_vm)?);
+    arguments.extend(view.properties(&tenant_resolver)?);
     arguments.push("--".into());
     arguments.push(
         program

@@ -89,29 +89,70 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     let command = shell(&config.state_dir());
     let view = View::prefetch(&scratch.join("worktrees/a"), &[]).unwrap();
     let files = Files::new(&config, Uuid::now_v7());
-    for tenant_vm in [false, true] {
-        config.tenant_vm = tenant_vm;
-        let arguments = arguments(
-            &config,
+    let directory = scratch.join("resolver");
+    let resolver = directory.join("resolv.conf");
+    let marker = scratch.join("dns-marker");
+    // The state a running runner derives, from this config and from the
+    // attachment's marker (read from a test file instead of /run).
+    let tenant = |config: &Config| {
+        TenantResolver::under(config.tenant_vm, config.boat_profile, &marker, &directory)
+    };
+    // The read-only binding of /etc/resolv.conf the unit would get, if any.
+    let resolv = |arguments: &[String]| {
+        arguments
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--property=BindReadOnlyPaths="))
+            .flat_map(str::split_whitespace)
+            .find(|binding| binding.ends_with(":/etc/resolv.conf"))
+            .map(str::to_owned)
+    };
+    let run = |config: &Config, tenant: TenantResolver| {
+        arguments(
+            config,
             "motor-snaphelper-tenant-dns-test.service",
             Duration::from_secs(120),
             &command,
             &view,
             &files,
+            tenant,
         )
-        .unwrap();
-        let bindings: Vec<_> = arguments
+    };
+
+    config.tenant_vm = false;
+    config.boat_profile = false;
+    let host = run(&config, tenant(&config)).unwrap();
+    assert_eq!(resolv(&host), None, "{host:?}");
+
+    // Boat runs as --tenant-vm in a sandbox that no tenant ever attached to: it
+    // has no private resolver and its /etc/resolv.conf is the sandbox's own, so
+    // its helpers get the resolver they always had before tenant helpers needed
+    // a bind, and the unit arguments are the same as on an unattached host.
+    config.tenant_vm = true;
+    config.boat_profile = true;
+    let boat = run(&config, tenant(&config)).unwrap();
+    assert_eq!(resolv(&boat), None, "{boat:?}");
+    let without_unit = |arguments: &[String]| {
+        arguments
             .iter()
-            .filter_map(|arg| arg.strip_prefix("--property=BindReadOnlyPaths="))
-            .collect();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(
-            bindings[0]
-                .split_whitespace()
-                .any(|binding| binding == "/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"),
-            tenant_vm,
-            "{arguments:?}"
-        );
+            .filter(|arg| !arg.starts_with("--unit="))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(without_unit(&boat), without_unit(&host), "{boat:?}");
+
+    // A tenant whose attachment installed the private resolver gets it bound.
+    config.boat_profile = false;
+    crate::tenant_agent::dns::install(&directory, &["1.1.1.1".into()], unsafe { libc::geteuid() })
+        .unwrap();
+    fs::write(&marker, "1\n").unwrap();
+    let attached = run(&config, tenant(&config)).unwrap();
+    assert_eq!(
+        resolv(&attached),
+        Some(bind(&resolver, Path::new("/etc/resolv.conf")).unwrap()),
+        "{attached:?}"
+    );
+
+    for arguments in [&host, &boat, &attached] {
         assert!(!arguments
             .iter()
             .any(|arg| arg.contains("TemporaryFileSystem=/etc")));
@@ -119,6 +160,25 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
             .iter()
             .any(|arg| arg.contains("PrivateNetwork=") || arg.contains("NetworkNamespacePath=")));
     }
+
+    // A tenant that expects a private resolver but has none fails by name
+    // instead of resolving through the VM's empty global resolver.
+    fs::remove_file(&resolver).unwrap();
+    let error = run(&config, tenant(&config)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the tenant's private resolver is missing"),
+        "{error}"
+    );
+    fs::remove_file(&marker).unwrap();
+    let error = run(&config, tenant(&config)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the tenant's private resolver is missing"),
+        "{error}"
+    );
 }
 
 #[test]
