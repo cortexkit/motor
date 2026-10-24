@@ -2169,6 +2169,7 @@ fn run_cargo_fetch_on_host(command: &mut Command, fetch: CargoFetch) -> io::Resu
 /// Qualifies the online tenant prefetch in a real snapshot helper, not merely
 /// the daemon's namespace. A new scratch directory supplies an empty Cargo cache.
 pub(crate) fn check_tenant_cargo_fetch(scratch: &Path) -> io::Result<()> {
+    crate::privilege::run_helpers_directly_as_root()?;
     let rustup =
         PathBuf::from(std::env::var_os("RUSTUP_HOME").ok_or_else(|| {
             io::Error::other("RUSTUP_HOME is required for the tenant fetch check")
