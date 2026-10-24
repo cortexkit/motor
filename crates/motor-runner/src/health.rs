@@ -47,6 +47,22 @@ impl Health {
             .or_default() += 1;
     }
 
+    /// Forget every recorded queue wait, so a caller can record exactly the
+    /// samples it means to measure, without waits from other jobs.
+    #[cfg(test)]
+    pub fn reset_queue_waits(&mut self) {
+        self.queue_waits.clear();
+    }
+
+    /// The median queue wait of jobs started in the window, or `None` when no
+    /// job started in it. Zero samples is not a zero-length wait, and a caller
+    /// that reads it as one would retry immediately.
+    pub fn recent_queue_wait_p50(&mut self, now: u64) -> Option<u64> {
+        let p50_ms = self.queue_wait(now).p50_ms;
+        let sampled = self.queue_waits.values().any(|waits| !waits.is_empty());
+        sampled.then_some(p50_ms)
+    }
+
     pub fn queue_wait(&mut self, now: u64) -> HealthQueueWait {
         self.prune(now);
         let mut histogram = BTreeMap::<u64, u64>::new();

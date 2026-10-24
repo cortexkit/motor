@@ -282,6 +282,7 @@ fn cpu_reservations_release_on_terminal() {
                     RefusalReason::LostToRestart,
                     "restart before launch",
                     Some("restart before launch".into()),
+                    None,
                     runner.now(),
                 );
                 runner.save(&inner.jobs[&request.job_id]).unwrap();

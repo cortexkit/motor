@@ -2563,7 +2563,6 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
     );
     let detail = record.refusal_detail().expect("missing queue diagnostic");
     assert_eq!(record.ran, Some(Ran::None));
-    assert_eq!(record.retry_after_ms(), None);
     assert!(detail.starts_with("waiting_on=permits"), "{detail}");
     assert!(
         detail.contains("requested_permits=16; held_permits=20/28"),
@@ -2592,6 +2591,317 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
     assert!(!Path::new(&waiting.workspace_key)
         .join("must-not-run")
         .exists());
+}
+
+/// The queue wait that ended `id`, as a withdrawal would report it: the
+/// side-effect-free `job_status` reports the same `waiting_on` phase that the
+/// refusal detail starts with, and it does not dispatch the job.
+fn waiting_phase(runner: &Runner, id: Uuid) -> Option<String> {
+    runner.job_status(id).unwrap().waiting_on
+}
+
+/// Replaces the recent queue waits in the runner's health window with
+/// `waits_ms`, so the median a refusal reports is the one the test names. A
+/// job that waited no time at all records a zero wait of its own, and those
+/// would otherwise decide a median of one or two samples.
+fn record_queue_waits(runner: &Runner, waits_ms: &[u64]) {
+    let mut health = runner.core.health.lock().unwrap();
+    let now = runner.now();
+    health.reset_queue_waits();
+    for &wait_ms in waits_ms {
+        health.record_queue_wait(now, wait_ms);
+    }
+}
+
+/// Holds a job in its running phase until released, and releases it when the
+/// test unwinds, so a failing assertion cannot leave a holder running.
+struct ReleaseWriter(Option<PathBuf>);
+impl ReleaseWriter {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn release(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::write(path, "");
+        }
+    }
+}
+impl std::ops::Drop for ReleaseWriter {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Withdraws a job that has waited `waited_ms` past its queue-wait limit, so
+/// the runner refuses it with `queue_wait_exceeded`, and returns its record.
+/// `recent` replaces the queue waits in the health window first, so the median
+/// a refusal reports is the one the test names.
+fn capacity_refusal(
+    runner: &Runner,
+    f: &Fixture,
+    name: &str,
+    weight_hint: u32,
+    recent: &[u64],
+    waited_ms: u64,
+) -> TerminalRecord {
+    let (mut waiting, bytes) = job_at(f, name, "true");
+    waiting.weight_hint = Some(weight_hint);
+    waiting.queue_wait_limit_s = 1;
+    f.submit(runner, &waiting, &bytes);
+    // The clock says this job has waited past its limit, so no dispatch pass
+    // can start it: the next withdrawal refuses it.
+    f.clock.fetch_add(waited_ms, Ordering::SeqCst);
+    let waiting_on = waiting_phase(runner, waiting.job_id);
+    record_queue_waits(runner, recent);
+    let outcome = runner
+        .withdraw(waiting.job_id)
+        .unwrap_or_else(|error| panic!("withdrawing {} failed: {error}", waiting.job_id));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "job {} was not queued, waiting_on={waiting_on:?}; {}",
+        waiting.job_id,
+        runner_diagnostics(runner)
+    );
+    let record = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&waiting.job_id)
+        .and_then(|job| job.terminal.clone())
+        .expect("a withdrawn job has a terminal record");
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        },
+        "record: {record:?}"
+    );
+    assert_eq!(record.ran, Some(Ran::None));
+    record
+}
+
+/// Starts a holder that occupies every permit of the runner's capacity, and
+/// returns the guard that releases it, also when the test unwinds.
+async fn full_permit_holder(f: &Fixture, runner: &Runner, name: &str) -> ReleaseWriter {
+    let release = f.scratch.join(name);
+    let release_writer = ReleaseWriter::new(release.clone());
+    let (mut holder, bytes) = f.run(&format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    ));
+    holder.weight_hint = Some(4);
+    f.submit(runner, &holder, &bytes);
+    until(|| runner.job_status(holder.job_id).unwrap().state == "running").await;
+    release_writer
+}
+
+#[tokio::test]
+async fn capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-retry-hint-holder").await;
+    // The holder started without waiting and recorded a zero wait of its own;
+    // these samples replace it, so the hint has a known median to report.
+    let record = capacity_refusal(&runner, &f, "retry-hint-ok", 2, &[30_000], 1_000);
+    drop(holder);
+    assert_eq!(record.retry_after_ms(), Some(30_000));
+}
+
+/// The hint is the measured median clamped to the bounds the constants
+/// document, not the raw measurement.
+#[tokio::test]
+async fn capacity_retry_hint_is_clamped_to_its_bounds() {
+    // One sample per case, so the holder's own zero wait cannot pull the
+    // median down. 500 ms is under the floor and 500 s over the ceiling.
+    for (sample_ms, expected) in [
+        (500, CAPACITY_RETRY_MIN_MS),
+        (500_000, CAPACITY_RETRY_MAX_MS),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.max_weight = 4;
+        let runner = Runner::open(config).unwrap();
+        warm(&f, &runner).await;
+        let holder = full_permit_holder(&f, &runner, "release-clamped-hint-holder").await;
+        let record = capacity_refusal(&runner, &f, "retry-hint-clamped", 2, &[sample_ms], 10_000);
+        drop(holder);
+        assert_eq!(
+            record.retry_after_ms(),
+            Some(expected),
+            "median {sample_ms} must clamp to {expected}"
+        );
+    }
+}
+
+/// A job too heavy for the runner can never start, so a recent median queue
+/// wait is no reason to send the caller back.
+#[tokio::test]
+async fn impossible_demand_refusal_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    warm(&f, &runner).await;
+    let record = capacity_refusal(&runner, &f, "retry-hint-impossible", 30, &[30_000], 1_000);
+    let detail = record
+        .refusal_detail()
+        .expect("missing capacity diagnostic");
+    assert!(
+        detail.starts_with("waiting_on=demand exceeds capacity"),
+        "{detail}"
+    );
+    assert_eq!(record.retry_after_ms(), None);
+}
+
+/// A runner that has started no job in the last hour has no median to report;
+/// zero samples is not a very short wait.
+#[tokio::test]
+async fn capacity_refusal_without_recent_starts_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-hintless-holder").await;
+    record_queue_waits(&runner, &[]);
+    let measured = runner
+        .core
+        .health
+        .lock()
+        .unwrap()
+        .recent_queue_wait_p50(runner.now());
+    assert_eq!(
+        measured, None,
+        "this test needs a window with no started job, or it proves nothing"
+    );
+    let record = capacity_refusal(&runner, &f, "retry-hint-absent", 2, &[], 300_000);
+    drop(holder);
+    assert_eq!(record.retry_after_ms(), None);
+}
+
+/// The withdrawal that refuses a job refreshes its queue-wait clock first, so
+/// the record reports the wait up to the withdrawal, not up to the pass before.
+#[tokio::test]
+async fn withdrawal_refusal_reports_the_wait_up_to_the_withdrawal() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-clock-holder").await;
+    let (mut waiting, bytes) = job_at(&f, "clock-withdraw", "true");
+    waiting.weight_hint = Some(2);
+    waiting.queue_wait_limit_s = 0;
+    f.submit(&runner, &waiting, &bytes);
+    until(|| {
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&waiting.job_id)
+            .is_some_and(|job| job.state == JobState::Queued)
+    })
+    .await;
+    // A pass starts the queue-wait clock. It cannot refuse or start the job
+    // here: a limit of zero only stops what has already been measured.
+    runner.tick().unwrap();
+    runner.maintenance().unwrap();
+    let started = runner
+        .job_status(waiting.job_id)
+        .unwrap()
+        .queue_wait_ms
+        .unwrap_or_else(|| {
+            panic!(
+                "the clock must be counting: {}",
+                runner_diagnostics(&runner)
+            )
+        });
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(started + 300_000),
+        "time since the last pass must count toward the job: {}",
+        runner_diagnostics(&runner)
+    );
+    let outcome = runner
+        .withdraw(waiting.job_id)
+        .unwrap_or_else(|error| panic!("withdrawing failed: {error}"));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "{}",
+        runner_diagnostics(&runner)
+    );
+    let record = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    drop(holder);
+    assert_eq!(
+        record.queue_wait_ms, 300_000,
+        "the withdrawal must count the wait up to itself, not up to the pass before; record: {record:?}"
+    );
+}
+
+/// A spill withdrawal becomes a hosted job: its caller is never refused, so it
+/// is not sent a hint either, even for a wait that would clear on its own.
+#[tokio::test]
+async fn spill_withdrawal_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-spill-hint-holder").await;
+    // A spill withdrawal needs the job still queued when the client asks. This
+    // one is queued by hand with its limit already spent, which is what the
+    // frame path refuses; nothing runs a dispatch pass here to start it.
+    let (mut waiting, _) = job_at(&f, "spill-hintless", "true");
+    waiting.queue_wait_limit_s = 0;
+    runner.accept(waiting.clone()).unwrap();
+    let waiting_on = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        {
+            let now = runner.now();
+            let job = inner.jobs.get_mut(&waiting.job_id).unwrap();
+            job.state = JobState::Queued;
+            job.queued_ms = Some(now);
+            runner.save(job).unwrap();
+        }
+        runner
+            .queue_wait_phase(&inner, &DispatchIndex::build(&inner), waiting.job_id)
+            .map(str::to_owned)
+    };
+    record_queue_waits(&runner, &[30_000]);
+    let outcome = runner
+        .withdraw_for(waiting.job_id, None, true)
+        .unwrap_or_else(|error| panic!("withdrawing failed: {error}"));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "job was not queued, waiting_on={waiting_on:?}; {}",
+        runner_diagnostics(&runner)
+    );
+    let record = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&waiting.job_id)
+        .and_then(|job| job.terminal.clone())
+        .expect("a withdrawn job has a terminal record");
+    drop(holder);
+    assert!(record
+        .refusal_detail()
+        .is_some_and(|d| d.starts_with(motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX)));
+    assert_eq!(record.retry_after_ms(), None);
 }
 
 /// A job that would fit, held behind an older head that is past its backfill
