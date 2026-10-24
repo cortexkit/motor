@@ -92,9 +92,11 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     let directory = scratch.join("resolver");
     let resolver = directory.join("resolv.conf");
     let marker = scratch.join("dns-marker");
-    // The state a running runner derives from the attachment's marker.
-    let tenant = || TenantResolver::under(true, &marker, &directory);
-    let host = TenantResolver::Host;
+    // The state a running runner derives, from this config and from the
+    // attachment's marker (read from a test file instead of /run).
+    let tenant = |config: &Config| {
+        TenantResolver::under(config.tenant_vm, config.boat_profile, &marker, &directory)
+    };
     // The read-only binding of /etc/resolv.conf the unit would get, if any.
     let resolv = |arguments: &[String]| {
         arguments
@@ -117,7 +119,8 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     };
 
     config.tenant_vm = false;
-    let host = run(&config, host.clone()).unwrap();
+    config.boat_profile = false;
+    let host = run(&config, tenant(&config)).unwrap();
     assert_eq!(resolv(&host), None, "{host:?}");
 
     // Boat runs as --tenant-vm in a sandbox that no tenant ever attached to: it
@@ -126,7 +129,7 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     // a bind, and the unit arguments are the same as on an unattached host.
     config.tenant_vm = true;
     config.boat_profile = true;
-    let boat = run(&config, TenantResolver::Host).unwrap();
+    let boat = run(&config, tenant(&config)).unwrap();
     assert_eq!(resolv(&boat), None, "{boat:?}");
     let without_unit = |arguments: &[String]| {
         arguments
@@ -142,7 +145,7 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     crate::tenant_agent::dns::install(&directory, &["1.1.1.1".into()], unsafe { libc::geteuid() })
         .unwrap();
     fs::write(&marker, "1\n").unwrap();
-    let attached = run(&config, tenant()).unwrap();
+    let attached = run(&config, tenant(&config)).unwrap();
     assert_eq!(
         resolv(&attached),
         Some(bind(&resolver, Path::new("/etc/resolv.conf")).unwrap()),
@@ -161,7 +164,7 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     // A tenant that expects a private resolver but has none fails by name
     // instead of resolving through the VM's empty global resolver.
     fs::remove_file(&resolver).unwrap();
-    let error = run(&config, tenant()).unwrap_err();
+    let error = run(&config, tenant(&config)).unwrap_err();
     assert!(
         error
             .to_string()
@@ -169,7 +172,7 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
         "{error}"
     );
     fs::remove_file(&marker).unwrap();
-    let error = run(&config, tenant()).unwrap_err();
+    let error = run(&config, tenant(&config)).unwrap_err();
     assert!(
         error
             .to_string()

@@ -289,24 +289,24 @@ impl View {
 /// file nobody installed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TenantResolver {
-    /// Any profile with no tenant attachment: the host's own name service.
+    /// The host's own name service: a profile that is not a tenant VM, or
+    /// Boat, whose sandbox supplies a resolver and which no attachment serves.
     Host,
     /// A tenant attachment has installed the private resolver in `directory`.
     Attached { directory: PathBuf },
-    /// The attachment has not (yet) installed it: the runner started while the
-    /// tenant was attached but before its resolver file was written, or that
-    /// file has been removed since. A private resolver is expected here, so
-    /// leaving the empty VM resolver in place would only surface later as a
-    /// fetch that cannot resolve.
+    /// A tenant VM whose attachment has not (yet) installed the resolver in
+    /// `directory`: the runner started while the tenant was attached but
+    /// before the file was written, or the file has been removed since. A
+    /// private resolver is expected here, so leaving the empty VM resolver in
+    /// place would only surface later as a fetch that cannot resolve.
     Missing { directory: PathBuf },
 }
 
 impl TenantResolver {
-    /// The attachment installs the resolver for every `--tenant-vm` runner, so
-    /// only an attached profile can be [`Self::Attached`].
     pub(crate) fn new(config: &Config) -> Self {
         Self::under(
             config.tenant_vm,
+            config.boat_profile,
             Path::new(crate::tenant_agent::DNS_MARKER),
             Path::new(crate::tenant_agent::DNS_DIRECTORY),
         )
@@ -314,8 +314,13 @@ impl TenantResolver {
 
     /// [`Self::new`], reading the attachment's marker from `marker` and the
     /// private resolver from `directory`, so tests need not touch `/run`.
-    fn under(tenant_vm: bool, marker: &Path, directory: &Path) -> Self {
-        if !tenant_vm {
+    ///
+    /// A runner that is not a tenant VM, and Boat, which runs as one without a
+    /// tenant attachment, keep the host's name service. Any other tenant VM is
+    /// [`Self::Attached`] only when the marker holds a generation, and is
+    /// [`Self::Missing`] when the marker is empty or unreadable.
+    fn under(tenant_vm: bool, boat_profile: bool, marker: &Path, directory: &Path) -> Self {
+        if !tenant_vm || boat_profile {
             return Self::Host;
         }
         match fs::read_to_string(marker) {
