@@ -788,6 +788,32 @@ def job_result(text):
     return result
 
 
+JOURNAL_CURSOR_PREFIX = '-- cursor: '
+
+
+def journal_cursor(stdout):
+    """The cursor `journalctl --lines=0 --show-cursor` printed.
+
+    journalctl prints `-- No entries --` before the cursor line whenever it
+    showed no entries, which `--lines=0` guarantees, so the cursor is the line
+    that carries the prefix, not necessarily the first line."""
+    cursors = [line.removeprefix(JOURNAL_CURSOR_PREFIX) for line in (stdout or '').splitlines()
+               if line.startswith(JOURNAL_CURSOR_PREFIX) and line.removeprefix(JOURNAL_CURSOR_PREFIX).strip()]
+    if len(cursors) != 1:
+        raise ValueError('runner journal did not provide exactly one pre-stop eviction cursor line ('
+                         + repr(JOURNAL_CURSOR_PREFIX) + '...); journalctl printed ' + repr(stdout))
+    return cursors[0].strip()
+
+
+# Boat has reported a detached command as exited with code 0 and an empty
+# stdout tail even though the command's only exit-0 path prints: the disk-quota
+# cleanup wait did this once after the reused_target lane. Before treating the
+# output as missing, poll the finished command again in case Boat delivers it
+# late; every poll is kept as evidence either way.
+EMPTY_OUTPUT_REPOLLS = 5
+EMPTY_OUTPUT_REPOLL_SECONDS = 1.0
+
+
 def isolation_result_checks(result, host, weight=None):
     if result['code'] != 0:
         return {'isolation_job_completed': False}
@@ -1172,6 +1198,40 @@ class RunnerHost:
             self.unit_diagnostics(sid, failure)
             raise ValueError("guest command failed or truncated; see runner_host.guest_failures unit_diagnostics: " + json.dumps(result))
         return result
+
+    def guest_json(self, sid, command, label, timeout=120):
+        """Run a guest command that must print one JSON value, and return it parsed.
+
+        `label` names the step in the error, so an empty or malformed result
+        reads as which call returned what, not as a bare JSON decode error."""
+        result = self.execute(sid, command, timeout=timeout)
+        repolls = []
+        process = result.get('processId')
+        while not (result.get('stdout') or '').strip() and type(process) is int and len(repolls) < EMPTY_OUTPUT_REPOLLS:
+            time.sleep(EMPTY_OUTPUT_REPOLL_SECONDS)
+            result = self.probe.command_status(sid, process)
+            repolls.append(result)
+        if repolls:
+            self.data.setdefault('empty_output_repolls', []).append(
+                {'label': label, 'process': process, 'output_arrived': bool((result.get('stdout') or '').strip()), 'polls': repolls})
+        if repolls and (result.get('exitCode') != 0 or result.get('stdoutTruncated') or result.get('stderrTruncated')):
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'repolls': repolls, 'reason': 're-poll changed the finished result'})
+            raise ValueError(f'{label}: re-poll of finished Boat process {process} reported a failed or truncated result: '
+                             + json.dumps(result)[:500])
+        stdout = result.get('stdout') or ''
+        if not stdout.strip():
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'repolls': repolls, 'reason': 'empty stdout'})
+            raise ValueError(f'{label}: guest command exited {result.get("exitCode")} with empty stdout '
+                             f'(stderr {(result.get("stderr") or "")[:200]!r}) after {len(repolls)} re-polls of Boat '
+                             f'process {process}; expected one JSON value; see runner_host.guest_failures')
+        try:
+            return json.loads(stdout)
+        except ValueError as error:
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'reason': 'stdout is not JSON: ' + str(error)})
+            raise ValueError(f'{label}: guest command stdout is not JSON ({error}): {stdout[:200]!r}') from None
 
     def route(self, sid, directory, public):
         response = self.probe.request("POST", f"/sandboxes/{sid}/sshkey", {"key": public})
@@ -1738,9 +1798,10 @@ class RunnerHost:
         row = self.data['disk_quota']['lanes'][disk_quota.RETAINED_LANE]
         before = row['at_limit']
         workspace = before['lease']['roots'][0]
-        evidence = phase['workspace_eviction'] = json.loads(self.execute(
+        evidence = phase['workspace_eviction'] = self.guest_json(
             sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(
-                quota_adversarial.resume_eviction_source(workspace, row['eviction_journal_cursor'])))['stdout'])
+                quota_adversarial.resume_eviction_source(workspace, row['eviction_journal_cursor'])),
+            'resumed workspace eviction read')
         ready = phase['existing_then_reinstall']['first']['ready']
         for name, passed in disk_quota.resume_eviction_checks(before, evidence, ready).items():
             self.check('resumed.' + name, passed, {'before': before, 'after': evidence, 'ready': ready})
@@ -1749,8 +1810,8 @@ class RunnerHost:
         import disk_quota
         import quota_adversarial
         import uuid
-        control = record['setter_positive_control'] = json.loads(self.execute(
-            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
+        control = record['setter_positive_control'] = self.guest_json(
+            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL), 'disk_quota setter positive control')
         self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)
         if not disk_quota.positive_control_passed(control):
             raise ValueError('unfiltered XFS attribute positive control failed')
@@ -1767,14 +1828,16 @@ class RunnerHost:
                     return parsed
                 with self.section('deep_tree'):
                     simple_job('deep_tree', disk_quota.DEEP_JOB)
-                    record['deep_cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                    record['deep_cleanup'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP),
+                                                             'disk_quota cleanup after deep_tree', timeout=100)
                     self.check('disk_quota.deep_tree_capacity_recovered', record['deep_cleanup'].get('ready') is True and record['deep_cleanup'].get('leases') == [], record['deep_cleanup'])
                 for lane in disk_quota.LANES + (disk_quota.RETAINED_LANE,):
                     with self.section('lane ' + lane):
                         if lane == 'reused_target':
                             simple_job('baseline_seed', disk_quota.BASELINE_JOB, marker='baseline-seeded')
                         if lane == 'reflink_target':
-                            capacity = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CAPACITY))['stdout'])
+                            capacity = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CAPACITY),
+                                                       'disk_quota reflink seed capacity')
                             record['reflink_seed_capacity'] = capacity
                             if capacity['baseline_bytes'] < 64 * 1024**2:
                                 self.check('disk_quota.reflink_baseline_headroom', False, capacity, status='INCONCLUSIVE')
@@ -1790,20 +1853,21 @@ class RunnerHost:
                                                  text=True, env={key: value for key, value in os.environ.items() if key != 'BOAT_API_KEY'})
                         complete = False
                         try:
-                            row['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.observer(token, lane == disk_quota.RETAINED_LANE)), timeout=950)['stdout'])
+                            row['at_limit'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.observer(token, lane == disk_quota.RETAINED_LANE)),
+                                                              'disk_quota observer for lane ' + lane, timeout=950)
                             if lane == disk_quota.RETAINED_LANE:
                                 self.check('disk_quota.retained_target_at_limit', disk_quota.retained_checks(row['at_limit']), row['at_limit'])
                                 if not disk_quota.retained_checks(row['at_limit']):
                                     raise ValueError('retained target did not reach an enforced quota boundary')
-                                row['pre_stop'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])))['stdout'])
+                                row['pre_stop'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])),
+                                                                  'disk_quota retained target pre-stop guard')
                                 if row['pre_stop'].get('job_running') is not True:
                                     raise ValueError('retained target job is no longer live before snapshot')
-                                row['pre_stop_storage'] = json.loads(self.execute(
-                                    sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
-                                cursor = self.execute(sid, 'sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor')['stdout'].strip()
-                                if not cursor.startswith('-- cursor: '):
-                                    raise ValueError('runner journal did not provide a pre-stop eviction cursor')
-                                row['eviction_journal_cursor'] = cursor.removeprefix('-- cursor: ')
+                                row['pre_stop_storage'] = self.guest_json(
+                                    sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'disk_quota retained target pre-stop storage')
+                                journal = self.execute(sid, 'sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor')
+                                row['eviction_journal_cursor_output'] = journal.get('stdout')
+                                row['eviction_journal_cursor'] = journal_cursor(journal.get('stdout'))
                                 # Keep the job at its barrier so idle eviction cannot
                                 # remove the full target before the provider snapshots it.
                                 record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
@@ -1820,7 +1884,8 @@ class RunnerHost:
                             result = dict(argv=invocation, exit_code=child.returncode, stdout=stdout, stderr=stderr, seconds=time.monotonic()-started)
                             row['client'] = result
                             row['result'] = job_result(stdout) if child.returncode == 0 else {}
-                            row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
+                            row['cleanup'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP),
+                                                             'disk_quota cleanup after lane ' + lane, timeout=100)
                             row['fill_target_bytes'] = disk_quota.fill_bytes(lane)
                             for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup'],
                                                                   row['fill_target_bytes']).items():

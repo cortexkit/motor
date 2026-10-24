@@ -263,13 +263,17 @@ class Probe:
         # Boat does not time-limit detached commands; deletion bounds abandoned work.
         until = min(self.deadline, time.monotonic() + poll_seconds + 20)
         while time.monotonic() < until:
-            status = self.request("GET", f"/sandboxes/{sid}/commands/{process}?tailBytes=8388608")
+            status = self.command_status(sid, process)
             if status.get("status") == "exited":
                 return status
             if status.get("status") == "lost":
                 raise ProbeError("Boat lost detached command after agent restart")
             time.sleep(2)
         raise ProbeError("timed out polling command " + str(process))
+
+    def command_status(self, sid, process):
+        """One status poll of a detached command, with up to 8 MiB of its output."""
+        return self.request("GET", f"/sandboxes/{sid}/commands/{process}?tailBytes=8388608")
 
     def guest(self, sid, phase, timeout=90, version="1.85.1", port=None):
         encoded = base64.b64encode(self.source).decode()
