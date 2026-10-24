@@ -26,9 +26,9 @@ fn commit_declaration(f: &Fixture, text: &str) -> String {
     git(&f.main, &["rev-parse", "HEAD"])
 }
 
+use crate::workspace::warm_steps;
 use crate::writer::declaration::{self, Compilers};
 use crate::writer::fill::{dependency_free, descriptor};
-use crate::workspace::warm_steps;
 
 #[test]
 fn a_descriptor_changes_with_its_declared_steps_and_matched_files() {
@@ -364,8 +364,15 @@ fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
         workspace::manifest_warm_command("[workspace]\nmembers = []\n", "tip"),
         "the command changed for an undeclared Cargo tree"
     );
-    let with_none = descriptor(&f.main, &plain, "rustc A", &command, None, &Compilers::default())
-        .unwrap();
+    let with_none = descriptor(
+        &f.main,
+        &plain,
+        "rustc A",
+        &command,
+        None,
+        &Compilers::default(),
+    )
+    .unwrap();
     assert_eq!(with_none.len(), 64, "the descriptor changed shape");
     // The shortcut still applies to a graph with nothing to cache.
     fs::write(
@@ -453,10 +460,7 @@ fn a_cargo_tree_runs_its_declared_steps_after_the_cargo_warm_command() {
 fn a_tree_without_cargo_or_a_declaration_warms_nothing() {
     let f = Fixture::new();
     let tip = git(&f.main, &["rev-parse", "HEAD"]);
-    assert_eq!(
-        warm_steps(&f.main, &tip),
-        (vec!["true".to_string()], false)
-    );
+    assert_eq!(warm_steps(&f.main, &tip), (vec!["true".to_string()], false));
     assert_eq!(workspace::warm_plan(&f.main, &tip), ("true".into(), false));
     assert!(dependency_free(&f.main, &tip, None).unwrap());
 }

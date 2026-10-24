@@ -3683,8 +3683,7 @@ impl Runner {
             (steps.join(" && "), declared)
         };
         let explicit_command = overridden || declared;
-        let (descriptor, dependency_free) =
-            self.fill_identity(&mirror, tip, &command, overridden);
+        let (descriptor, dependency_free) = self.fill_identity(&mirror, tip, &command, overridden);
         BasePlan {
             tip: tip.to_owned(),
             command,
