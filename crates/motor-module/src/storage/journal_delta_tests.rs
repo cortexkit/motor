@@ -211,6 +211,7 @@ fn typed_delta_compares_every_serialized_job_field() {
     rich.terminal_delivered_at_ms = Some(2);
     rich.build_server_job_id = Some(Uuid::now_v7());
     rich.routed_direct_reason = Some("no_host_fits".into());
+    rich.routed_direct_hosted_max_vcpus = Some(21);
     let baseline = serde_json::to_value(Job::default()).unwrap();
     let mut before = State::default();
     before.jobs.insert(id, Job::default());

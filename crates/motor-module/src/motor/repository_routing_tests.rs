@@ -662,7 +662,7 @@ async fn stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored
 }
 
 /// Broker request paths that release, finish or reattach to a hosted lease.
-fn lease_settlement_requests(h: &Harness) -> Vec<String> {
+pub(super) fn lease_settlement_requests(h: &Harness) -> Vec<String> {
     h.requests
         .lock()
         .unwrap()
@@ -911,11 +911,11 @@ async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
 /// harness's real loopback sockets, which would fire queue-wait deadlines in
 /// the middle of a lease request. Tokio makes no such jump while a blocking
 /// task runs, so this holds one open.
-struct HeldClock {
+pub(super) struct HeldClock {
     _release: std::sync::mpsc::Sender<()>,
 }
 impl HeldClock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let (release, held) = std::sync::mpsc::channel::<()>();
         tokio::task::spawn_blocking(move || {
             let _ = held.recv();
@@ -925,7 +925,7 @@ impl HeldClock {
 }
 
 /// Waits in real time, without moving the held clock, until `done` holds.
-async fn until(what: &str, mut done: impl FnMut() -> bool) {
+pub(super) async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let started = std::time::Instant::now();
     while !done() {
         assert!(
@@ -963,7 +963,7 @@ async fn until_host_full_wait(h: &Harness, motor: &Motor, id: Uuid, leases: usiz
 
 /// The terminal record of the job whose records `job` collects, awaited in
 /// real time: the job must end without the held clock moving any further.
-async fn terminal_without_more_time(
+pub(super) async fn terminal_without_more_time(
     job: tokio::task::JoinHandle<(Vec<u8>, TerminalRecord)>,
 ) -> TerminalRecord {
     until("the terminal record", || job.is_finished()).await;
