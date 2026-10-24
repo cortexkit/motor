@@ -433,8 +433,13 @@ class RunnerHostTests(unittest.TestCase):
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
         probe.create.return_value = ({'id':'bx_test', 'vcpu':8, 'memoryGB':16}, {})
         runner = host.RunnerHost(probe)
-        with self.assertRaisesRegex(ValueError, 'default sizing'):
-            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
+             patch.object(host, 'job_repository'):
+            Path(tmp, '.cortexkit').mkdir()
+            with self.assertRaisesRegex(ValueError, 'default sizing'):
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+        self.assertEqual({name: record['status'] for name, record in runner.data['verify_phases'].items()},
+                         {'core': 'failed', 'disk-quota': 'failed', 'idle': 'failed'})
 
     def test_policy_uses_effective_sshd_values(self):
         sample = {"sshd": {"exit_code": 0, "stdout": "\n".join(k+" "+v for k, v in host.POLICY.items())}}
@@ -936,33 +941,159 @@ class RunnerHostTests(unittest.TestCase):
             self.assertEqual('installed\n', subprocess.run(['sh', '-c', command], cwd=repo,
                                                            capture_output=True, text=True).stdout)
 
-    def test_verify_prepared_hydrates_before_identity_phase_without_recipe_or_restart(self):
+class VerifyPhaseTests(unittest.TestCase):
+    """--verify-prepared-image runs each phase in its own sandbox restored from the same image."""
+
+    def runner(self, fail=None):
         probe = Mock()
         probe.data = {}
         probe.size = 'default'
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
-        probe.create.return_value = ({'id':'bx_test', 'vcpu':4, 'memoryGB':8}, {})
-        runner = host.RunnerHost(probe)
+        sandboxes = iter(['bx_core', 'bx_quota', 'bx_idle'])
         order = []
-        probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
+        def create(name):
+            sid = next(sandboxes)
+            order.append(('create', name, sid))
+            return {'id': sid, 'vcpu': 4, 'memoryGB': 8}, {}
+        probe.create.side_effect = create
+        probe.wait_hydrated.side_effect = lambda sid: order.append(('hydrated', sid))
+        runner = host.RunnerHost(probe)
+        def step(name, sid):
+            order.append((name, sid))
+            if name == fail:
+                raise ValueError(name + ' broke')
+            runner.check(name + '.ran', True, {})
         def phase(sid, label, *args, **kwargs):
-            order.append(label)
-            return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules'}}}
+            step(label, sid)
+            order.append(('idle_wait_in_phase', kwargs.get('idle', True)))
+            return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules',
+                                                      'terminal': {'outcome': {'type': 'exit', 'code': 0}}}}}
         runner.phase = Mock(side_effect=phase)
-        def disk_quota(*args):
-            order.append('disk_quota')
+        runner.clone_ready = Mock(side_effect=lambda sid, label, *args: step(label, sid))
+        def disk_quota(sid, *args):
+            step('disk_quota', sid)
             runner.data['disk_quota'] = {'stopped_with_retained_target': True}
         runner.disk_quota = Mock(side_effect=disk_quota)
-        runner.replay_cleanup = Mock(side_effect=lambda sid: order.append('cleanup_replay'))
+        runner.replay_cleanup = Mock(side_effect=lambda sid: step('cleanup_replay', sid))
+        runner.verify_idle = Mock(side_effect=lambda sid, *args: step('idle', sid))
+        runner.release_sandbox = Mock(side_effect=lambda phase, record: order.append(('released', record['sandbox'])))
         runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
+        return runner, probe, order
+
+    def verify(self, runner, phases=None):
         with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
-             patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe':Mock(READY={'running'})}):
+             patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe': Mock(READY={'running'})}):
             Path(tmp, '.cortexkit').mkdir()
-            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
-        self.assertEqual(order, ['hydrated', 'prepared_clone', 'disk_quota', 'hydrated', 'resumed', 'cleanup_replay'])
+            if phases is None:
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+            else:
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'), phases)
+
+    def statuses(self, runner):
+        return {name: record['status'] for name, record in runner.data['verify_phases'].items()}
+
+    def test_no_phase_runs_every_phase_in_its_own_sandbox_and_releases_each(self):
+        runner, probe, order = self.runner()
+        self.verify(runner)
+        self.assertEqual(order, [
+            ('create', 'prepared', 'bx_core'), ('hydrated', 'bx_core'), ('prepared_clone', 'bx_core'),
+            ('idle_wait_in_phase', False), ('released', 'bx_core'),
+            ('create', 'prepared', 'bx_quota'), ('hydrated', 'bx_quota'), ('disk_quota_clone', 'bx_quota'),
+            ('disk_quota', 'bx_quota'), ('hydrated', 'bx_quota'), ('resumed', 'bx_quota'), ('idle_wait_in_phase', True),
+            ('cleanup_replay', 'bx_quota'), ('released', 'bx_quota'),
+            ('create', 'prepared', 'bx_idle'), ('hydrated', 'bx_idle'), ('idle', 'bx_idle'), ('released', 'bx_idle')])
+        self.assertEqual(self.statuses(runner), {'core': 'passed', 'disk-quota': 'passed', 'idle': 'passed'})
+        self.assertEqual(runner.data['verify_phases']['core']['check_names'], ['prepared_clone.ran'])
+        self.assertIn('disk_quota.normal_job_after_stop_resume', runner.data['verify_phases']['disk-quota']['check_names'])
         runner.execute.assert_not_called()
-        probe.create.assert_called_once_with('prepared')
-        self.assertFalse(any(call.args[0] == 'POST' and call.args[1].endswith('/stop') for call in probe.request.call_args_list))
+        # Only the disk-quota sandbox is stopped (with its target held) and resumed.
+        posts = [call.args[1] for call in probe.request.call_args_list if call.args[0] == 'POST']
+        self.assertEqual(posts, ['/sandboxes/bx_quota/resume'])
+        timed = [row['name'] for row in runner.data['section_timings']]
+        for name in ('core', 'core/create', 'core/hydrate', 'disk-quota/disk_quota', 'disk-quota/resume',
+                     'disk-quota/cleanup_replay', 'idle'):
+            self.assertIn(name, timed)
+        self.assertTrue(all(row['outcome'] == 'completed' and row['seconds'] is not None
+                            for row in runner.data['section_timings']))
+
+    def test_one_phase_runs_alone_and_the_others_are_not_run_never_passed(self):
+        for phase in host.VERIFY_PHASES:
+            with self.subTest(phase=phase):
+                runner, probe, order = self.runner()
+                self.verify(runner, (phase,))
+                self.assertEqual(probe.create.call_count, 1)
+                statuses = self.statuses(runner)
+                self.assertEqual(statuses.pop(phase), 'passed')
+                self.assertEqual(set(statuses.values()), {'not_run'})
+                for name in statuses:
+                    record = runner.data['verify_phases'][name]
+                    self.assertEqual((record['requested'], record['ran']), (False, False))
+                    self.assertNotIn('check_names', record)
+
+    def test_a_failed_phase_is_recorded_the_next_still_runs_and_the_run_fails(self):
+        runner, probe, order = self.runner(fail='prepared_clone')
+        with self.assertRaisesRegex(ValueError, 'verify phase failed: core: prepared_clone broke'):
+            self.verify(runner)
+        self.assertEqual(self.statuses(runner), {'core': 'failed', 'disk-quota': 'passed', 'idle': 'passed'})
+        self.assertEqual(runner.data['verify_phases']['core']['error'], 'prepared_clone broke')
+        self.assertEqual(probe.create.call_count, 3)
+        self.assertIn(('released', 'bx_core'), order)
+        core = next(row for row in runner.data['section_timings'] if row['name'] == 'core')
+        self.assertEqual((core['outcome'], core['error']), ('error', 'prepared_clone broke'))
+
+    def test_a_size_refusal_stops_every_later_phase(self):
+        runner, probe, order = self.runner()
+        def refused(name):
+            probe.data['snapshot_size_bound'] = {'requested_size': 'default'}
+            raise RuntimeError('Boat refused the size')
+        probe.create.side_effect = refused
+        with self.assertRaisesRegex(RuntimeError, 'refused'):
+            self.verify(runner)
+        self.assertEqual(self.statuses(runner), {'core': 'snapshot_size_bound', 'disk-quota': 'not_run', 'idle': 'not_run'})
+        runner.release_sandbox.assert_not_called()
+
+    def test_each_phase_restarts_the_wall_clock_budget(self):
+        runner, probe, order = self.runner()
+        runner.budget_seconds = 1800
+        deadlines = []
+        runner.release_sandbox = Mock(side_effect=lambda phase, record: deadlines.append(probe.deadline))
+        clock = __import__('itertools').count()
+        with patch.object(host.time, 'monotonic', side_effect=lambda: float(next(clock))):
+            self.verify(runner)
+        self.assertEqual(len(deadlines), 3)
+        self.assertTrue(deadlines[0] < deadlines[1] < deadlines[2])
+        self.assertTrue(all(deadline >= 1800 for deadline in deadlines))
+
+    def test_the_core_phase_leaves_the_idle_wait_to_the_idle_phase(self):
+        source = __import__('inspect').getsource(host.RunnerHost._phase)
+        self.assertIn("if label in ('prepared_clone', 'snapshot_clone') and idle:", source)
+        idle = __import__('inspect').getsource(host.RunnerHost.verify_idle)
+        self.assertIn('self.idle_reclaim_wait(sid, label, record)', idle)
+        self.assertIn("self.check_job(label + '.after_idle', parsed, 0, marker='boat-node-modules')", idle)
+
+
+class SectionTimingTests(unittest.TestCase):
+    def test_sections_nest_record_seconds_and_stay_visible_while_running(self):
+        probe = Mock()
+        probe.data = {}
+        runner = host.RunnerHost(probe)
+        seen = []
+        probe.checkpoint.side_effect = lambda: seen.append([dict(row) for row in runner.data.get('section_timings', [])])
+        with runner.section('core'):
+            with runner.section('create'):
+                pass
+            with self.assertRaises(ValueError):
+                with runner.section('hydrate'):
+                    raise ValueError('timed out waiting for sandbox')
+        rows = {row['name']: row for row in runner.data['section_timings']}
+        self.assertEqual(list(rows), ['core', 'core/create', 'core/hydrate'])
+        self.assertEqual(rows['core/hydrate']['outcome'], 'error')
+        self.assertIn('timed out', rows['core/hydrate']['error'])
+        self.assertEqual((rows['core']['outcome'], rows['core/create']['outcome']), ('completed', 'completed'))
+        self.assertTrue(all(isinstance(row['seconds'], float) for row in rows.values()))
+        # The first checkpoint already shows the step as running, so a killed run names it.
+        self.assertEqual(seen[0], [dict(name='core', started_at=seen[0][0]['started_at'], seconds=None, outcome='running')])
+        self.assertEqual(runner._sections, [])
 
 
 class RetainedQuotaSnapshotTests(unittest.TestCase):

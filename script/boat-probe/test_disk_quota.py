@@ -149,6 +149,72 @@ class DiskQuotaChecks(unittest.TestCase):
         observation['retained_allocated_bytes'] = 2*1024*mib
         self.assertFalse(disk_quota.reflink_bound(observation))
 
+    def charge_evidence(self, lane='home'):
+        """A lane that wrote CHARGE_BYTES below its limit, with the kernel charge before and after."""
+        result, at_limit, cleanup = self.evidence()
+        report = json.loads(result['stdout'])
+        report.update(lane=lane, errno=None, bytes_written=disk_quota.CHARGE_BYTES, fill_target_bytes=disk_quota.CHARGE_BYTES)
+        result.update(code=0, stdout=json.dumps(report))
+        at_limit.update(errno=None, bytes_written=disk_quota.CHARGE_BYTES, kernel_hard_limit_warning=False,
+                        kernel_usage=dict(hard_bytes=2**30, used_bytes=(100 << 20) + disk_quota.CHARGE_BYTES))
+        at_limit['before'] = dict(at_limit['before'], kernel_usage=dict(hard_bytes=2**30, used_bytes=100 << 20))
+        return result, at_limit, cleanup
+
+    def test_only_reflink_and_retained_lanes_fill_to_the_real_cap(self):
+        self.assertEqual(disk_quota.FULL_LANES, ('reflink_target', disk_quota.RETAINED_LANE))
+        for lane in disk_quota.LANES + (disk_quota.RETAINED_LANE,):
+            with self.subTest(lane=lane):
+                expected = 0 if lane in disk_quota.FULL_LANES else disk_quota.CHARGE_BYTES
+                self.assertEqual(disk_quota.fill_bytes(lane), expected)
+                self.assertIn('\nQUOTA_FILL_BYTES=' + str(expected) + '\n', disk_quota.job(lane, 'token'))
+        # Whole 8 MiB writes and 1 MiB fallocate steps land exactly on the target.
+        self.assertEqual(disk_quota.CHARGE_BYTES % (8 << 20), 0)
+
+    def test_charge_lane_passes_when_the_kernel_charged_its_bytes_to_the_job(self):
+        checks = disk_quota.checks(*self.charge_evidence(), disk_quota.CHARGE_BYTES)
+        self.assertTrue(all(checks.values()), checks)
+        # A charge-only lane never claims the at-limit proofs the full lanes make.
+        for name in ('job_write_failed', 'filled_real_quota', 'reserve_at_limit', 'reflink_physical_bound'):
+            self.assertNotIn(name, checks)
+        self.assertNotIn('charge_fill_completed', disk_quota.checks(*self.evidence()))
+
+    def test_charge_lane_rejects_bytes_the_kernel_did_not_charge_to_the_job(self):
+        for change in ({'used_bytes': 100 << 20}, {'used_bytes': (100 << 20) + disk_quota.CHARGE_BYTES - (17 << 20)}):
+            with self.subTest(change=change):
+                result, at_limit, cleanup = self.charge_evidence()
+                at_limit['kernel_usage'].update(change)
+                self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['fill_charged_to_job_project'])
+        result, at_limit, cleanup = self.charge_evidence()
+        del at_limit['before']['kernel_usage']
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['fill_charged_to_job_project'])
+        result, at_limit, cleanup = self.charge_evidence()
+        at_limit['kernel_usage']['hard_bytes'] = 2**31
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['fill_charged_to_job_project'])
+
+    def test_charge_lane_rejects_a_short_failed_or_mislabelled_fill(self):
+        for change in ({'errno': errno.EDQUOT}, {'bytes_written': disk_quota.CHARGE_BYTES - (8 << 20)},
+                       {'fill_target_bytes': 0}, {'observer_timeout': True}):
+            with self.subTest(change=change):
+                result, at_limit, cleanup = self.charge_evidence()
+                result['stdout'] = json.dumps(dict(json.loads(result['stdout']), **change))
+                self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['charge_fill_completed'])
+        result, at_limit, cleanup = self.charge_evidence()
+        result['code'] = 74
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['charge_fill_completed'])
+
+    def test_charge_lane_still_requires_every_path_in_the_job_project_and_a_charged_stdout(self):
+        result, at_limit, cleanup = self.charge_evidence()
+        report = json.loads(result['stdout'])
+        report['projects']['var_tmp'] = 0
+        result['stdout'] = json.dumps(report)
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['all_writable_paths_charged'])
+        result, at_limit, cleanup = self.charge_evidence('output_stdout')
+        report = dict(json.loads(result['stdout']), output_allocated_bytes=disk_quota.CHARGE_BYTES, output_size_bytes=0)
+        result['stdout'] = json.dumps(report)
+        self.assertTrue(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['output_inode_was_charged'])
+        result['stdout'] = json.dumps(dict(report, output_allocated_bytes=disk_quota.CHARGE_BYTES - 4096))
+        self.assertFalse(disk_quota.checks(result, at_limit, cleanup, disk_quota.CHARGE_BYTES)['output_inode_was_charged'])
+
     def control(self, supported=True):
         return dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,
                     before_project=0, after_project=0, file_setattr_supported=supported,

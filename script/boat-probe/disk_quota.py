@@ -8,6 +8,21 @@ from quota_adversarial import BASELINE_JOB, CAPACITY, DEEP_JOB, reflink_seed
 RESERVE_BYTES = 24 * 1024**3  # Provisional until stop/resume headroom is measured.
 LANES = ('tmp', 'home', 'var_tmp', 'output_stdout', 'workspace', 'target', 'reused_target', 'reflink_target')
 RETAINED_LANE = 'retained_target'
+# Filling a lane to the real cap writes about 12 GiB and takes a minute or more,
+# so only the lanes whose proof needs the limit fill to it: the retained target
+# (EDQUOT/ENOSPC at the job's own hard limit, the reserve at that limit, and a
+# quota-sized target kept across stop/resume) and the reflink target (unique
+# data written after released reflink copies stays inside the physical
+# allowance). Every other lane writes CHARGE_BYTES and proves the kernel
+# charged those bytes to the job's project, which is what makes that path
+# subject to the limit the full lanes prove.
+FULL_LANES = ('reflink_target', RETAINED_LANE)
+CHARGE_BYTES = 256 * 1024**2  # A multiple of the 8 MiB write and 1 MiB fallocate steps.
+
+
+def fill_bytes(lane):
+    """Bytes the lane's job writes; 0 means until the kernel refuses the write."""
+    return 0 if lane in FULL_LANES else CHARGE_BYTES
 
 # Keep the fill alive until the host measures both filesystems. The barrier is
 # allocated before filling: publishing the errno must not need another block.
@@ -80,10 +95,13 @@ with marker.open('w+b', buffering=0) as barrier:
     for path in copies: path.unlink()
     observed = None
     written = 0
+    def more():
+        # QUOTA_FILL_BYTES 0 fills until the quota refuses a write.
+        return written < QUOTA_FILL_BYTES if QUOTA_FILL_BYTES else written <= 32 * 1024**3
     try:
         if QUOTA_LANE == 'output_stdout':
             output_fd = os.open('/motor-output/stdout', os.O_RDWR)
-            while written <= 32 * 1024**3:
+            while more():
                 # KEEP_SIZE allocates this existing inode without streaming tens
                 # of GiB through the client. It exercises the same block quota.
                 if libc.fallocate(output_fd, 1, written, 1024 * 1024) != 0:
@@ -92,14 +110,16 @@ with marker.open('w+b', buffering=0) as barrier:
                 os.fsync(output_fd)
         else:
             with fill.open('wb', buffering=0) as output:
-                while written <= 32 * 1024**3:
+                while more():
                     count = output.write(os.urandom(8 * 1024 * 1024))
                     if not count: raise OSError(errno.EIO, 'zero-length quota probe write')
                     written += count
                     os.fsync(output.fileno())
     except OSError as error:
         observed = error.errno
-    report = {'phase': 'at-limit', 'lane': QUOTA_LANE, 'errno': observed, 'bytes_written': written, 'inheritance': inheritance, 'projects': projects,
+    # 'at-limit' marks the end of the fill: at the quota, or at QUOTA_FILL_BYTES.
+    report = {'phase': 'at-limit', 'lane': QUOTA_LANE, 'errno': observed, 'bytes_written': written,
+              'fill_target_bytes': QUOTA_FILL_BYTES, 'inheritance': inheritance, 'projects': projects,
               'baseline_bytes': baseline_bytes, 'baseline_project_ids': baseline_project_ids, 'released_logical_bytes': released_logical_bytes,
               'fill_relative': str(fill.relative_to(base)), 'probe_token': QUOTA_PROBE_TOKEN}
     if output_fd is not None:
@@ -118,6 +138,8 @@ with marker.open('w+b', buffering=0) as barrier:
     if QUOTA_LANE == 'reflink_target': (shared / 'source').unlink(); shared.rmdir()
     marker.unlink()
 print(json.dumps(report), flush=True)
+if QUOTA_FILL_BYTES:
+    sys.exit(0 if observed is None and written == QUOTA_FILL_BYTES else 74)
 sys.exit(73 if observed in (errno.EDQUOT, errno.ENOSPC) else 74)
 '''
 
@@ -148,7 +170,8 @@ def job(lane, token=None):
     if lane not in LANES + (RETAINED_LANE,):
         raise ValueError('unknown quota probe lane')
     token = token or uuid.uuid4().hex
-    return 'QUOTA_LANE=' + repr(lane) + '\nQUOTA_PROBE_TOKEN=' + repr(token) + '\n' + INHERITANCE + JOB_SOURCE
+    return ('QUOTA_LANE=' + repr(lane) + '\nQUOTA_PROBE_TOKEN=' + repr(token) + '\nQUOTA_FILL_BYTES='
+            + repr(fill_bytes(lane)) + '\n' + INHERITANCE + JOB_SOURCE)
 
 OBSERVER = r'''
 import ctypes, json, os, pathlib, struct, subprocess, time
@@ -190,6 +213,12 @@ while time.monotonic() < deadline:
         if report.get('phase') == 'before-fill':
             before = dict(root_free_bytes=free('/'), xfs_free_bytes=free('/var/lib/motor-boat'))
             before['physical_allowance_bytes'] = max(0, min(32 * 1024**3, min(before.values()) - 24 * 1024**3 - 64 * 1024**2))
+            # The project's charge before any fill byte, so a charge-only lane
+            # can show its own writes were added to the job's quota.
+            try:
+                before['kernel_usage'] = kernel_usage(json.loads((state / 'boat-quotas' / (marker.parts[-4] + '.json')).read_text()))
+            except (OSError, ValueError, KeyError) as error:
+                before['kernel_usage_error'] = str(error)
             with marker.open('r+b', buffering=0) as output:
                 output.write(b'!'); os.fsync(output.fileno())
             continue
@@ -206,7 +235,8 @@ while time.monotonic() < deadline:
             metadata = path.lstat()
             report.update(host_fill_path=str(path), retained_allocated_bytes=metadata.st_blocks * 512)
         hit = state / 'boat-quotas' / (marker.parts[-4] + '.hit')
-        warning_deadline = time.monotonic() + 5
+        # A charge-only fill stops below the limit, so no warning can arrive.
+        warning_deadline = time.monotonic() + (0 if report.get('fill_target_bytes') else 5)
         while not hit.exists() and time.monotonic() < warning_deadline:
             time.sleep(.1)
         report['kernel_hard_limit_warning'] = hit.exists()
@@ -257,7 +287,10 @@ else:
 '''
 
 
-def checks(result, observation, cleanup):
+def checks(result, observation, cleanup, charge_bytes=0):
+    """Checks for one ordinary lane. charge_bytes 0 is a lane filled until the
+    quota refused a write; otherwise the lane wrote exactly charge_bytes and must
+    show them charged to the job's project (see FULL_LANES)."""
     try:
         report = json.loads(result.get('stdout', ''))
     except (ValueError, TypeError):
@@ -269,6 +302,41 @@ def checks(result, observation, cleanup):
     initial_bytes = lease.get('initial_blocks', 0) * 512
     kernel = observation.get('kernel_usage', {})
     physical_allowance = observation.get('before', {}).get('physical_allowance_bytes', -1)
+    common = {
+        'total_cap_bound': hard_bytes > 0 and physical_allowance >= 0 and hard_bytes <= physical_allowance + 16 * 1024**2,
+        'inheritance_escape_denied': inheritance.get('project', 0) == lease.get('project', -1)
+                                     and inheritance.get('child_project') == lease.get('project', -1)
+                                     and inheritance.get('setters_refused') == [0x401c5820, 0x40086602, 0x40046602],
+        'all_writable_paths_charged': set(projects) == {'workspace', 'target', 'home', 'tmp', 'var_tmp', 'stdout', 'stderr', 'exit', 'cache-stats'}
+                                      and set(projects.values()) == {lease.get('project', -1)},
+        'output_inode_was_charged': report.get('lane') != 'output_stdout' or (
+            report.get('output_allocated_bytes', 0) >= (charge_bytes or max(1024**2, lease.get('growth_bytes', 0) - 16 * 1024**2))
+            and report.get('output_size_bytes') == 0),
+        'baseline_consumes_cap': report.get('lane') not in ('reused_target', 'reflink_target') or (
+            report.get('baseline_bytes', 0) >= 64 * 1024**2
+            and initial_bytes >= report.get('baseline_bytes', 0)
+            and initial_bytes + lease.get('growth_bytes', 0) == hard_bytes
+            and lease.get('growth_bytes', 0) < physical_allowance
+            and report.get('baseline_project_ids') == [lease.get('project')]),
+        'cleanup_ready': cleanup.get('ready') is True and cleanup.get('leases') == [],
+        'reserve_after_cleanup': all(cleanup.get(key, -1) >= RESERVE_BYTES for key in ('root_free_bytes', 'xfs_free_bytes')),
+    }
+    if charge_bytes:
+        before = observation.get('before', {}).get('kernel_usage', {})
+        charged = kernel.get('used_bytes', 0) - before.get('used_bytes', kernel.get('used_bytes', 0))
+        return {
+            'charge_fill_completed': result.get('code') == 0 and report.get('errno') is None
+                                     and report.get('fill_target_bytes') == charge_bytes
+                                     and report.get('bytes_written') == charge_bytes
+                                     and observation.get('bytes_written') == charge_bytes
+                                     and not report.get('observer_timeout'),
+            # The kernel, not the job, reports that this path's bytes count
+            # against the job's own hard limit.
+            'fill_charged_to_job_project': hard_bytes > 0 and kernel.get('hard_bytes') == hard_bytes
+                                           and 'used_bytes' in before
+                                           and charged >= charge_bytes - 16 * 1024**2,
+            **common,
+        }
     return {
         'job_write_failed': result.get('code') == 73 and report.get('errno') in (errno.EDQUOT, errno.ENOSPC)
                             and report.get('errno') == observation.get('errno') and not report.get('observer_timeout'),
@@ -277,25 +345,9 @@ def checks(result, observation, cleanup):
                              and observation.get('bytes_written', 0) >= max(1024**2, lease.get('growth_bytes', 0) - 16 * 1024**2)
                              and kernel.get('hard_bytes') == hard_bytes
                              and kernel.get('used_bytes', 0) >= hard_bytes - 16 * 1024**2,
-        'total_cap_bound': hard_bytes > 0 and physical_allowance >= 0 and hard_bytes <= physical_allowance + 16 * 1024**2,
-        'inheritance_escape_denied': inheritance.get('project', 0) == lease.get('project', -1)
-                                     and inheritance.get('child_project') == lease.get('project', -1)
-                                     and inheritance.get('setters_refused') == [0x401c5820, 0x40086602, 0x40046602],
-        'all_writable_paths_charged': set(projects) == {'workspace', 'target', 'home', 'tmp', 'var_tmp', 'stdout', 'stderr', 'exit', 'cache-stats'}
-                                      and set(projects.values()) == {lease.get('project', -1)},
-        'output_inode_was_charged': report.get('lane') != 'output_stdout' or (
-            report.get('output_allocated_bytes', 0) >= max(1024**2, lease.get('growth_bytes', 0) - 16 * 1024**2)
-            and report.get('output_size_bytes') == 0),
-        'baseline_consumes_cap': report.get('lane') not in ('reused_target', 'reflink_target') or (
-            report.get('baseline_bytes', 0) >= 64 * 1024**2
-            and initial_bytes >= report.get('baseline_bytes', 0)
-            and initial_bytes + lease.get('growth_bytes', 0) == hard_bytes
-            and lease.get('growth_bytes', 0) < physical_allowance
-            and report.get('baseline_project_ids') == [lease.get('project')]),
+        **common,
         'reflink_physical_bound': report.get('lane') != 'reflink_target' or reflink_bound(observation),
         'reserve_at_limit': all(observation.get(key, -1) >= RESERVE_BYTES for key in ('root_free_bytes', 'xfs_free_bytes')),
-        'cleanup_ready': cleanup.get('ready') is True and cleanup.get('leases') == [],
-        'reserve_after_cleanup': all(cleanup.get(key, -1) >= RESERVE_BYTES for key in ('root_free_bytes', 'xfs_free_bytes')),
     }
 
 

@@ -292,11 +292,14 @@ The exit status reports the measurement verdict, and cleanup separately:
 accepted deletes never fails a run: nothing is left running and retrying cannot
 speed it up.
 
-`verdict.inconclusive` lists provider idle-reclaim checks marked `INCONCLUSIVE`. They
-remain `INCONCLUSIVE` in the check list rather than counting as passes, but do
-not block the runner-host verdict. Every parity, storage and other required check
-still needs `PASS`; a failed required check cannot be hidden by an inconclusive
-reclaim observation.
+`verdict.inconclusive` lists every check marked `INCONCLUSIVE`. They remain
+`INCONCLUSIVE` in the check list rather than counting as passes. Only two kinds
+do not block the runner-host verdict, each listed with its reason in
+`verdict.tolerated_inconclusive` and the findings: provider idle-reclaim checks,
+and a file_setattr refusal on a kernel its own control proves lacks the syscall
+(see Disk-quota qualification). Every parity, storage and other required check
+still needs `PASS`; a failed required check cannot be hidden by a tolerated
+inconclusive check.
 
 `Error: none recorded` in rendered findings means no measurement exception was
 caught. It does not override `cleanup_complete: false` or a failed network probe.
@@ -322,28 +325,39 @@ invented provider firewall API. No live provider assertion follows from these
 portable tests.
 ## Disk-quota qualification
 
-The runner-host probe fills the real total quota (up to 32 GiB, with nonzero
+The runner-host probe proves the real total quota (up to 32 GiB, with nonzero
 random data and fsync) before its stop/resume cycle. It
 first tries native and compat attribute setters, requires EPERM, checks that a
 new file still inherits the job project, then fills that same directory. A
 preallocated barrier lets the root observer measure **both** root and XFS free
 space while the failed write's data is still present. A pre-fill handshake
-captures physical headroom before writes begin. Ordinary lanes require the
-root-read kernel hard limit and near-limit charge, EDQUOT/ENOSPC, a normal failed
-terminal, cleanup/readiness, and a normal next job. Netlink warnings are recorded
+captures physical headroom and the job project's kernel usage before writes begin.
+Both lanes filled to the cap require the root-read kernel hard limit, near-limit
+charge and EDQUOT/ENOSPC. The reflink lane and every charge-only lane then require
+a normal terminal, cleanup/readiness and a normal next job; the retained-target lane
+instead stays live at its limit through the stop and is checked after the resume. Netlink warnings are recorded
 but are not a substitute for those checks: multicast loss must not fake either
 success or failure. Probe results retain `runner_host.disk_quota`,
-including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes`, so the
+including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes` from the first
+ordinary lane filled to the cap, so the
 provisional 24-GiB reserve can be tuned empirically. `reserve_at_limit` proves
 only enforcement of that floor, **not its sufficiency**; `reserve_assurance`
 explicitly leaves `sufficiency_proven` false.
 
-Separate jobs exhaust workspace, target, scratch, HOME and `/var/tmp`, and allocate past the same
-limit on the existing root-created `/motor-output/stdout` inode. The stdout lane
-uses `fallocate(KEEP_SIZE)`: it must allocate nearly the entire allowance before
-EDQUOT/ENOSPC and a matching near-full kernel quota, while preserving the root-disk
-reserve. It verifies `st_blocks` as well as project ID, so a refused no-op is not
-a pass. Keeping the file size at zero avoids streaming tens of GiB into the
+Separate jobs write into workspace, target, scratch, HOME and `/var/tmp`, and allocate on
+the existing root-created `/motor-output/stdout` inode. Filling a lane to the real cap
+writes about 12 GiB, so only the lanes whose proof needs the limit do so
+(`disk_quota.FULL_LANES`): the reflink target and the retained target. Each of those
+must reach EDQUOT/ENOSPC with a matching near-full kernel quota while the reserve
+holds. Every other lane writes `disk_quota.CHARGE_BYTES` (256 MiB) and passes
+`charge_fill_completed` and `fill_charged_to_job_project`. The root observer reads the
+job project's kernel usage before the first fill byte and again after the last. The
+difference must cover the bytes written, so the kernel charged that path to the same
+hard limit the full lanes prove. A charge-only lane never reports the at-limit checks
+(`job_write_failed`, `filled_real_quota`, `reserve_at_limit`). The stdout lane
+uses `fallocate(KEEP_SIZE)`: its allocated blocks must cover the bytes it allocated,
+with file size zero. It verifies `st_blocks` as well as project ID, so a refused
+no-op is not a pass. Keeping the file size at zero avoids streaming data into the
 operator client; the lane punches its unwritten extents before reporting. Every
 lane checks project IDs for workspace, target, HOME, `/tmp`, `/var/tmp`, stdout,
 stderr, exit and cache-stats. Only quota jobs request the operator example's
@@ -380,19 +394,25 @@ job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
 kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
 returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
 syscall filter. The result records the
-root control, errno and kernel release. The probe still collects quota and
-stop/resume evidence, but does not claim every required check passed when the
-path-setter case is inconclusive.
+root control, errno and kernel release. That INCONCLUSIVE does not block the
+verdict only when the check's own control shows the kernel lacks the syscall
+(`file_setattr_supported` false and errno 38, Linux ENOSYS): no job can call it
+there either, and the seccomp rule that denies it on newer kernels is covered by
+the runner's own tests. Findings print it as, for example, "file_setattr absent on
+kernel 6.8.0 (ENOSYS); not applicable". A file_setattr INCONCLUSIVE whose control
+is missing, malformed or reports the syscall present still fails the verdict.
 
 Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
-image. Use the existing credential reader and seed arguments:
+image. Use the existing credential reader and seed arguments. The quota lanes run
+in the `disk-quota` verify phase (see `--verify-phase` in
+[`script/boat-image/README.md`](../boat-image/README.md#operator-probe)):
 
 ```sh
 set -o pipefail
 <key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
-  --size xlarge --verify-prepared-image <new-prepared-image> \
-  --cargo-seed-manifest <seed.json> --cargo-seed-archive <seed.tar.gz> \
-  --cargo-seed-sha256 <manifest-sha256> --acknowledge-tenant-one-private-cache \
+  --size xlarge --verify-prepared-image <new-prepared-image> --verify-phase disk-quota \
+  --cargo-seed-manifest <seed.json> --cargo-seed-sha256 <manifest-sha256> \
+  --acknowledge-tenant-one-private-cache \
   --max-minutes 30 --output .cortexkit/internal-docs/research/boat-disk-quota
 ```
 
