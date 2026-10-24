@@ -37,6 +37,19 @@ def resolved_config():
 
 
 class ImageTests(unittest.TestCase):
+    def test_configure_uses_tenants_pinned_job_identity(self):
+        class StopAfterIdentity(Exception):
+            pass
+        account = mock.Mock()
+        account.ensure.side_effect = StopAfterIdentity
+        spec = mock.Mock()
+        with mock.patch.object(guest, 'BUILD', HERE.parents[1]), \
+             mock.patch.object(guest.importlib.util, 'spec_from_file_location', return_value=spec), \
+             mock.patch.object(guest.importlib.util, 'module_from_spec', return_value=account):
+            with self.assertRaises(StopAfterIdentity):
+                guest.configure({})
+        account.ensure.assert_called_once_with({'uid': 999, 'gid': 986}, guest.run)
+
     def test_default_build_output_uses_root_trusted_vm_bind_view(self):
         with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
             image.main()

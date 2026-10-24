@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import tarfile
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -80,16 +81,70 @@ class JobAccountTests(unittest.TestCase):
                  patch.object(self.account.pwd, 'getpwuid', side_effect=KeyError if namespace == 'gid' else None,
                               return_value=('base-user',)), \
                  patch.object(self.account.grp, 'getgrgid', return_value=('base-group',)), \
+                 patch.object(self.account.pwd, 'getpwnam', side_effect=KeyError), \
+                 patch.object(self.account.grp, 'getgrnam', side_effect=KeyError), \
                  patch.object(parity, 'output') as run:
                 with self.assertRaisesRegex(ValueError, 'already owned by base-' + ('user' if namespace == 'uid' else 'group')):
                     self.account.ensure(self.identity, run)
                 run.assert_not_called()
+
+    def test_boat_system_identity_leaves_occupied_numbers_untouched(self):
+        users = {'dnsmasq': SimpleNamespace(pw_uid=999, pw_gid=986)}
+        groups = {'dnsmasq': SimpleNamespace(gr_gid=986)}
+        commands = []
+
+        def run(*args):
+            commands.append(args)
+            if args[0] == 'groupadd':
+                self.assertEqual(('groupadd', '--system', 'motor-job'), args)
+                groups['motor-job'] = SimpleNamespace(gr_gid=985)
+            else:
+                self.assertEqual(('useradd', '--system', '--gid', 'motor-job', '--home-dir',
+                                  '/nonexistent', '--shell', '/usr/sbin/nologin', 'motor-job'), args)
+                users['motor-job'] = SimpleNamespace(pw_uid=998, pw_gid=985)
+
+        with patch.object(self.account.pwd, 'getpwnam', side_effect=users.__getitem__), \
+             patch.object(self.account.grp, 'getgrnam', side_effect=groups.__getitem__), \
+             patch.object(self.account.pwd, 'getpwuid', return_value=('dnsmasq',)), \
+             patch.object(self.account.grp, 'getgrgid', return_value=('dnsmasq',)):
+            self.account.ensure('system-assigned', run)
+            self.account.ensure('system-assigned', run)
+        self.assertEqual(2, len(commands))
+        self.assertEqual((998, 985), (users['motor-job'].pw_uid, users['motor-job'].pw_gid))
+        self.assertEqual((999, 986), (users['dnsmasq'].pw_uid, groups['dnsmasq'].gr_gid))
+
+    def test_boat_existing_account_must_have_its_own_primary_group(self):
+        with patch.object(self.account.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=986)), \
+             patch.object(self.account.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=985)), \
+             patch.object(parity, 'output') as run:
+            with self.assertRaisesRegex(ValueError, 'own primary group'):
+                self.account.ensure('system-assigned', run)
+            run.assert_not_called()
 
 
 class CaptureTests(unittest.TestCase):
     def test_job_identity_is_the_process_not_a_host_account_lookup(self):
         with patch.object(parity.os, 'getuid', return_value=997), patch.object(parity.os, 'getgid', return_value=996):
             self.assertEqual({'uid': 997, 'gid': 996}, parity.job_identity(True))
+            self.assertEqual({'uid': 997, 'gid': 996}, parity.job_identity(True, 'boat'))
+
+    def test_boat_host_capture_records_account_properties_and_login_defs_limit(self):
+        import grp
+        import pwd
+        user = SimpleNamespace(pw_uid=798, pw_gid=797, pw_shell='/usr/sbin/nologin')
+        with patch.object(pwd, 'getpwnam', return_value=user) as lookup, \
+             patch.object(grp, 'getgrgid', return_value=SimpleNamespace(gr_name='motor-job')) as group, \
+             patch.object(parity, 'optional_text', return_value='# UID_MIN 1000\nUID_MIN 800 # local policy\n') as text:
+            self.assertEqual({'uid': 798, 'gid': 797, 'primary_group': 'motor-job',
+                              'shell': '/usr/sbin/nologin', 'uid_min': 800}, parity.job_identity(False, 'boat'))
+        lookup.assert_called_once_with('motor-job')
+        group.assert_called_once_with(797)
+        text.assert_called_once_with('/etc/login.defs')
+
+    def test_missing_boat_host_account_is_recorded(self):
+        import pwd
+        with patch.object(pwd, 'getpwnam', side_effect=KeyError):
+            self.assertIsNone(parity.job_identity(False, 'boat'))
 
     def test_runtime_capture_executes_in_tmpdir_and_records_noexec_failure(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, TMPDIR=tmp), \
@@ -227,7 +282,9 @@ class ParityTests(unittest.TestCase):
                 'runtime': {'proc': {name: True for name in ('self/mountinfo', 'cpuinfo', 'meminfo')},
                             'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
                             'tmpdir_exec': True, 'sshd_executable': True},
-                'job_identity': dict(manifest['job_identity']),
+                'job_identity': ({'uid': 998, 'gid': 985, 'uid_min': 1000,
+                                  'primary_group': 'motor-job', 'shell': '/usr/sbin/nologin'}
+                                 if role == 'boat' else dict(manifest['job_identity_by_role'][role])),
                 'syscalls': {**{name: {'errno': 0} for name in parity.syscall_surface.SUCCESS},
                              'openat2.reject_symlink': {'errno': errno.ELOOP},
                              'mount_setattr.invalid': {'errno': errno.EINVAL},
@@ -374,8 +431,8 @@ class ParityTests(unittest.TestCase):
             parity.capture(parity.role_manifest(self.manifest, 'tenant'), role='tenant')
         self.assertEqual('/usr/local/lib/motor/bun/bin', searched[0].split(':')[1])
 
-    def test_every_role_checks_exact_job_uid_and_gid(self):
-        for role in ('build-server', 'boat', 'tenant'):
+    def test_pinned_roles_check_exact_job_uid_and_gid(self):
+        for role in ('build-server', 'tenant'):
             for field in ('uid', 'gid'):
                 with self.subTest(role=role, field=field):
                     actual = self.observed(role, job=True)
@@ -383,6 +440,40 @@ class ParityTests(unittest.TestCase):
                     errors = self.report(actual, job=True, role=role)['errors']
                     self.assertEqual(1, len(errors))
                     self.assertIn('motor-job identity:', errors[0])
+
+    def test_boat_parity_accepts_system_assigned_numbers(self):
+        actual = self.observed('boat')
+        actual['sccache_artifacts'] = {'inputs_sha256': self.manifest['sccache']['inputs_sha256'], 'binaries': {
+            name: actual['cargo_binaries'][name]['sha256'] for name in self.manifest['sccache']['build_server_sha256']}}
+        self.assertEqual([], parity.differences(self.manifest, actual, role='boat'))
+        self.assertEqual([], self.report(actual, job=True, role='boat')['errors'])
+
+    def test_boat_host_parity_requires_system_account_properties(self):
+        for change, expected in ((None, 'missing non-root job account'),
+                                 ({'uid': 0}, 'missing non-root job account'),
+                                 ({'gid': 0}, 'missing non-root job account'),
+                                 ({'uid': 1000}, 'uid must be below UID_MIN'),
+                                 ({'uid_min': None}, 'uid must be below UID_MIN'),
+                                 ({'primary_group': 'dnsmasq'}, 'motor-job primary group:'),
+                                 ({'shell': '/bin/bash'}, 'login shell is not disabled')):
+            with self.subTest(change=change):
+                actual = self.observed('boat')
+                if change is None:
+                    actual['job_identity'] = None
+                else:
+                    actual['job_identity'].update(change)
+                errors = parity.differences(self.manifest, actual, role='boat')
+                identity_errors = [error for error in errors if error.startswith('motor-job')]
+                self.assertEqual(1, len(identity_errors), errors)
+                self.assertIn(expected, identity_errors[0])
+
+    def test_role_identity_rules_survive_server_refresh(self):
+        expected = {'boat': 'system-assigned', 'build-server': {'uid': 999, 'gid': 986},
+                    'tenant': {'uid': 999, 'gid': 986}}
+        self.assertEqual(expected, self.manifest['job_identity_by_role'])
+        refreshed = parity.refresh(self.manifest, self.observed())
+        self.assertEqual(expected, refreshed['job_identity_by_role'])
+        self.assertNotIn('job_identity', refreshed)
 
     def test_gnu_dd_and_test_exact_server_outputs_are_accepted(self):
         actual = self.observed()

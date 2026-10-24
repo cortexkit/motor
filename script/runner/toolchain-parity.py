@@ -126,15 +126,25 @@ def runtime_capture():
     return runtime
 
 
-def job_identity(job):
+def job_identity(job, role='build-server'):
     if job:
         return {'uid': os.getuid(), 'gid': os.getgid()}
     import pwd
     try:
         account = pwd.getpwnam('motor-job')
-        return {'uid': account.pw_uid, 'gid': account.pw_gid}
     except KeyError:
         return None
+    identity: dict[str, object] = {'uid': account.pw_uid, 'gid': account.pw_gid}
+    if role == 'boat':
+        import grp
+        try:
+            primary_group = grp.getgrgid(account.pw_gid).gr_name
+        except KeyError:
+            primary_group = None
+        minimum = re.search(r'^\s*UID_MIN\s+(\d+)\s*(?:#.*)?$', optional_text('/etc/login.defs') or '', re.M)
+        identity.update(primary_group=primary_group, shell=account.pw_shell,
+                        uid_min=int(minimum.group(1)) if minimum else None)
+    return identity
 
 
 def macos_parity():
@@ -252,7 +262,7 @@ def capture(manifest=None, job=False, role="build-server"):
         "mountinfo": mountinfo,
         "runtime": runtime_capture() if job else {},
         "syscalls": syscall_surface.capture(),
-        "job_identity": job_identity(job),
+        "job_identity": job_identity(job, role),
         "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
     }
 
@@ -276,9 +286,14 @@ def validate(manifest, role="build-server"):
         return
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
-    if (set(manifest.get('job_identity', {})) != {'uid', 'gid'}
-            or any(type(value) is not int or value <= 0 for value in manifest['job_identity'].values())):
-        raise ValueError('invalid numeric job identity')
+    identities = manifest.get('job_identity_by_role', {})
+    if set(identities) != {'build-server', 'boat', 'tenant'} or identities['boat'] != 'system-assigned':
+        raise ValueError('invalid role-specific job identities')
+    for pinned_role in ('build-server', 'tenant'):
+        identity = identities[pinned_role]
+        if (not isinstance(identity, dict) or set(identity) != {'uid', 'gid'}
+                or any(type(value) is not int or value <= 0 for value in identity.values())):
+            raise ValueError('invalid numeric job identity: ' + pinned_role)
     for key in ("rustup",):
         if not re.fullmatch(r"\d+\.\d+\.\d+", manifest[key]):
             raise ValueError("unpinned version: " + key)
@@ -430,7 +445,19 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         if expected != observed:
             errors.append(f"{name}: expected {expected!r}, observed {observed!r}")
 
-    equal('motor-job identity', manifest['job_identity'], actual.get('job_identity'))
+    identity = actual.get('job_identity')
+    if manifest['job_identity_by_role'][role] == 'system-assigned':
+        if not identity or any(type(identity.get(key)) is not int or identity[key] <= 0 for key in ('uid', 'gid')):
+            errors.append('motor-job identity: missing non-root job account')
+        elif not job:
+            minimum = identity.get('uid_min')
+            if type(minimum) is not int or not 0 < identity['uid'] < minimum:
+                errors.append('motor-job identity: uid must be below UID_MIN')
+            equal('motor-job primary group', 'motor-job', identity.get('primary_group'))
+            if identity.get('shell') not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'):
+                errors.append('motor-job identity: login shell is not disabled')
+    else:
+        equal('motor-job identity', manifest['job_identity_by_role'][role], identity)
     errors.extend(syscall_surface.differences(actual.get('syscalls', {}), job=job))
 
     for key in ("rust_default", "rust_profile", "cargo_home", "rustup_home"):
