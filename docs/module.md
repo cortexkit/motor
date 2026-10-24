@@ -199,7 +199,8 @@ refused. The exact rules are in
 [wire-protocol.md](wire-protocol.md#5-refusals-and-the-no-start-proof) (5.5 and
 5.6). The field is the same one signing refusals use, so a client that already
 reads it needs no change, and can wait out the hint and retry remotely instead of
-running the job somewhere else.
+running the job somewhere else. The runner computes the hint, so it appears once
+the runner is deployed: `ck-motor` only passes the terminal record through.
 
 Tests: `capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
 `capacity_retry_hint_is_clamped_to_its_bounds`,

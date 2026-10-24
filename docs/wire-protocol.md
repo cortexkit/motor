@@ -305,6 +305,12 @@ start failed once would be retried; the ceiling is the runner's own longest
 start backoff, so a caller's deadline is never spent on a hint longer than the
 runner's experience of the queue.
 
+The runner sets this hint, because only it knows the phase a job was waiting
+in; `ck-motor` passes the terminal record through unchanged. A deployment that
+wants existing jobs to start carrying it therefore ships a new runner, not a
+new `ck-motor`: until the runner is upgraded, capacity refusals keep arriving
+without a hint.
+
 No hint accompanies a refusal that waiting cannot clear:
 
 | Refusal | Hint |

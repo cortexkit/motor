@@ -1060,6 +1060,10 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
         fs::write(&config, serde_json::to_vec(&f.config).unwrap()).unwrap();
         let mut request = f.request("echo forbidden > typed-refusal-marker");
         if !setup_failure {
+            // The runner is the only job in its queue, so its waiting phase is
+            // "demand exceeds capacity": it asks for more permits than the
+            // one-permit runner can ever grant, and a wait cannot help it.
+            // That is the refusal this pinned client must read, hint or not.
             request.queue_wait_limit_s = Some(0);
         }
         fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
@@ -1098,17 +1102,9 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
             assert!(detail.contains("held_permits=0/1"), "{detail}");
         }
         assert_eq!(terminal.ran, Some(Ran::None));
-        if setup_failure {
-            assert_eq!(terminal.retry_after_ms(), None);
-        } else {
-            // The runner now hints a capacity refusal with the recent median
-            // queue wait; the pinned client must read it, without failing on
-            // the field it already knows.
-            assert!(
-                terminal.retry_after_ms().is_some_and(|hint| hint > 0),
-                "old client lost the capacity retry hint: {terminal:?}"
-            );
-        }
+        // A refusal that waiting cannot clear carries no hint, and the pinned
+        // client reads the field it already knows as written.
+        assert_eq!(terminal.retry_after_ms(), None);
         assert!(!live
             .iter()
             .any(|record| matches!(record, StreamRecord::Started(_) | StreamRecord::Output(_))));
