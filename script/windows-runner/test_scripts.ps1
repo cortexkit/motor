@@ -609,11 +609,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             if ($script:peerBootPoll -eq 1) { return $script:peerBootUnrelated }
             return $script:peerBootCurrent
         }
-        # The native fixture folder was removed when its block finished, so the
-        # peer-boot evidence gets its own folder.
-        $peerBootRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-peer-boot-' + [Guid]::NewGuid())
-        New-Item -ItemType Directory -Path $peerBootRoot | Out-Null
-        $eventPath = Join-Path $peerBootRoot 'peer-boot-fixture.xml'
+        $eventPath = Join-Path $fixture 'peer-boot-fixture.xml'
         $bootMatch = Wait-RunnerPeerBoot $victimVm $since $eventPath
         $queryEvidence = Get-Content -LiteralPath ($eventPath + '.queries.json') -Raw | ConvertFrom-Json
         if ($script:peerBootPoll -lt 2 -or $bootMatch.record_id -ne 42 -or $queryEvidence.queries.Count -lt 2) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
@@ -637,16 +633,16 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             return [pscustomobject]@{job="fixture-$ProcessId"; process=$process}
         }
         $script:peerMonitorExit = 137
-        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 2 43210) $nativeFixtureRoot 'fixture boot-gate failure'
-        if (-not $monitorStatus.forced -or -not $monitorStatus.terminated -or $monitorStatus.reason -notmatch 'fixture boot-gate failure' -or -not (Test-Path (Join-Path $nativeFixtureRoot 'peer-monitor-43210.status.json'))) { throw 'FAIL peer-monitor-intentional-kill-retains-reason-with-empty-output' }
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 2 43210) $fixture 'fixture boot-gate failure'
+        if (-not $monitorStatus.forced -or -not $monitorStatus.terminated -or $monitorStatus.reason -notmatch 'fixture boot-gate failure' -or -not (Test-Path (Join-Path $fixture 'peer-monitor-43210.status.json'))) { throw 'FAIL peer-monitor-intentional-kill-retains-reason-with-empty-output' }
         Write-Host 'PASS peer-monitor-intentional-kill-retains-reason-with-empty-output'
         $count++
         $script:peerMonitorExit = 7
-        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 1 43211) $nativeFixtureRoot $null
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 1 43211) $fixture $null
         if (-not $monitorStatus.terminated -or $monitorStatus.failure -notmatch 'Run monitor exited nonzero') { throw 'FAIL peer-monitor-unexpected-nonzero-has-explicit-reason' }
         Write-Host 'PASS peer-monitor-unexpected-nonzero-has-explicit-reason'
         $count++
-        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 99 43212) $nativeFixtureRoot $null
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 99 43212) $fixture $null
         $qualifySource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'qualify.ps1'))
         if ($monitorStatus.terminated -or $qualifySource -notmatch 'if \(-not \$status\.terminated\) \{ \$canRemove = \$false \}') { throw 'FAIL peer-monitor-unreaped-preserves-disks' }
         Write-Host 'PASS peer-monitor-unreaped-preserves-disks'
