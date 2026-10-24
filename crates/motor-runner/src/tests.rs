@@ -2629,12 +2629,6 @@ impl std::ops::Drop for ReleaseWriter {
     }
 }
 
-/// Waits until the runner reports `phase` as what is holding `id` back, using
-/// `job_status`, which does not dispatch the job.
-async fn wait_for_phase(runner: &Runner, id: Uuid, phase: &str) {
-    until(|| waiting_phase(runner, id).as_deref() == Some(phase)).await;
-}
-
 /// Withdraws a job that has waited `waited_ms` past its queue-wait limit, so
 /// the runner refuses it with `queue_wait_exceeded`, and returns its record.
 /// `recent` replaces the queue waits in the health window first, so the median

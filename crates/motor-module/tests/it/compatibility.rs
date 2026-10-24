@@ -1098,7 +1098,17 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
             assert!(detail.contains("held_permits=0/1"), "{detail}");
         }
         assert_eq!(terminal.ran, Some(Ran::None));
-        assert_eq!(terminal.retry_after_ms(), None);
+        if setup_failure {
+            assert_eq!(terminal.retry_after_ms(), None);
+        } else {
+            // The runner now hints a capacity refusal with the recent median
+            // queue wait; the pinned client must read it, without failing on
+            // the field it already knows.
+            assert!(
+                terminal.retry_after_ms().is_some_and(|hint| hint > 0),
+                "old client lost the capacity retry hint: {terminal:?}"
+            );
+        }
         assert!(!live
             .iter()
             .any(|record| matches!(record, StreamRecord::Started(_) | StreamRecord::Output(_))));

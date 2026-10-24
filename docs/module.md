@@ -185,6 +185,28 @@ when there is no hint, and older callers that know it read it as written. Tests:
 `a_refusal_line_names_its_retry_hint_only_when_it_has_one`,
 `oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
 
+### Retry hints on capacity refusals
+
+A job the build server refuses because its queue wait ran out
+(`refused_before_start`, reason `queue_wait_exceeded`) carries a
+`retry_after_ms` hint when another job's completion is what frees it: enough
+free permits, a running job's workspace, a queued job ahead in the same files,
+or a job using this checkout as a sibling. The hint is the median queue wait of
+the jobs the runner started in the last hour, clamped to 1000-60000 ms, and it
+is absent when the job can never fit or when nothing started recently. A job
+moved to hosted capacity by a spill withdrawal carries none: its caller is never
+refused. The exact rules are in
+[wire-protocol.md](wire-protocol.md#5-refusals-and-the-no-start-proof) (5.5 and
+5.6). The field is the same one signing refusals use, so a client that already
+reads it needs no change, and can wait out the hint and retry remotely instead of
+running the job somewhere else.
+
+Tests: `capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
+`capacity_retry_hint_is_clamped_to_its_bounds`,
+`impossible_demand_refusal_carries_no_retry_hint`,
+`capacity_refusal_without_recent_starts_carries_no_retry_hint`,
+`spill_withdrawal_carries_no_retry_hint`.
+
 ## Storage
 
 The daemon delivers a SQLite storage descriptor, but `ck-motor` never opens

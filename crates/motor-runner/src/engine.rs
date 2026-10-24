@@ -4523,8 +4523,8 @@ impl Runner {
     /// has nothing that a wait is known to end. The value is the median queue
     /// wait of jobs started in the last hour (`health.queue_wait_1h.p50_ms`),
     /// clamped to `CAPACITY_RETRY_MIN_MS..=CAPACITY_RETRY_MAX_MS` for the
-    /// reasons on those constants. With no recent start the median is zero,
-    /// which is no sample rather than a short wait, so the hint is omitted.
+    /// reasons on those constants, and omitted when no job started in that
+    /// window: there is then no wait to report, and a zero would read as one.
     fn queue_clear_retry_after_ms(
         &self,
         inner: &Inner,
