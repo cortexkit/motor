@@ -686,6 +686,86 @@ async fn an_initial_build_failure_keeps_the_legacy_hold() {
 }
 
 #[tokio::test]
+async fn an_already_terminal_fill_retries_settlement_after_spawn_panic_and_save_failures() {
+    for panic_in_cleanup in [false, true] {
+        let f = Fixture::new();
+        declare(&f, &controlled_command(&f));
+        let panic_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let save_failures = Arc::new(AtomicU64::new(0));
+        let runner = controlled_runner_with(&f, |config| {
+            let panic_once = panic_once.clone();
+            config.long_work = Some(Arc::new(move |label| {
+                if label == "base_cleanup" && panic_once.swap(false, Ordering::SeqCst) {
+                    panic!("injected fill cleanup panic");
+                }
+            }));
+            let save_failures = save_failures.clone();
+            config.catalog_write = Some(Arc::new(move |step| {
+                if step == CatalogWrite::Starting && save_failures.load(Ordering::SeqCst) > 0 {
+                    save_failures.fetch_sub(1, Ordering::SeqCst);
+                    return Err(io::Error::other("injected catalog save failure"));
+                }
+                Ok(())
+            }));
+        });
+        submit_reader(&f, &runner).await;
+        let first = running_fill(&runner, 0).await;
+        settle(&f, &runner, &first).await;
+        f.clock.fetch_add(HOUR, Ordering::SeqCst);
+        let mut failed = first.clone();
+        failed.id = Uuid::now_v7();
+        failed.request.as_mut().unwrap().job_id = failed.id;
+        failed.fill_started_ms = Some(runner.now());
+        failed.terminal(Outcome::Exit { code: 1 }, runner.now());
+        let id = failed.id;
+        let request = failed.request.clone().unwrap();
+        if panic_in_cleanup {
+            panic_once.store(true, Ordering::SeqCst);
+            save_failures.store(2, Ordering::SeqCst);
+        } else {
+            runner
+                .config()
+                .fail_setup_spawn
+                .store(true, Ordering::SeqCst);
+        }
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            inner.maintained_ms = runner.now();
+            inner.writer = Some(id);
+            inner.jobs.insert(id, failed);
+            let result = runner.finish_base(&mut inner, &request, false, None);
+            assert_eq!(result.is_err(), !panic_in_cleanup);
+            assert_eq!(inner.writer, Some(id));
+            assert!(inner.base_finishes.contains_key(&id));
+        }
+        runner
+            .config()
+            .fail_setup_spawn
+            .store(false, Ordering::SeqCst);
+        drive(&runner, || {
+            !runner
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .base_finishes
+                .contains_key(&id)
+        })
+        .await;
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(inner.writer.is_none());
+        assert!(!inner.finalizing.contains(&id));
+        assert_eq!(
+            inner.catalog.repositories[&f.root].publish_failures
+                [first.writer_descriptor.as_ref().unwrap()]
+            .attempts,
+            1,
+            "persistence retry recorded the same failure twice"
+        );
+    }
+}
+
+#[tokio::test]
 async fn switch_on_after_restart_and_prefix_changes_queue_real_fills_at_the_reread() {
     let f = Fixture::new();
     declare(&f, &controlled_command(&f));
@@ -1080,6 +1160,12 @@ async fn the_refresh_timer_skips_a_shortcut_record() {
         .catalog
         .repositories
         .insert(f.root.clone(), record);
+    {
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(runner
+            .refresh_bases(&inner, &runner.publishing_policy(), runner.now())
+            .is_empty());
+    }
     runner.tick().unwrap();
     runner.tick().unwrap();
     assert_eq!(count_fills(&runner), 0);

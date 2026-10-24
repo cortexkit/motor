@@ -198,7 +198,7 @@ pub(crate) struct Job {
     /// of that fill were written.
     #[serde(default)]
     pub fill_started_ms: Option<u64>,
-    /// Store active when the fill was launched, not when it was queued.
+    /// Store active when fill setup began, updated when the command launches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_identity: Option<StoreIdentity>,
     pub kill: Option<(Killed, u64)>,

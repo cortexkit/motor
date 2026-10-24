@@ -770,6 +770,7 @@ struct Inner {
     /// Per fill, the write ledgers of its cache sockets, kept until its
     /// publication is decided.
     fill_ledgers: BTreeMap<Uuid, Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>>,
+    base_finishes: BTreeMap<Uuid, BaseFinish>,
     drain_deadline: Option<std::time::Instant>,
     jobs: BTreeMap<Uuid, Job>,
     pending_replays: BTreeSet<Uuid>,
@@ -959,6 +960,16 @@ struct BaseCleanup {
     /// runner's access to it when Linux job isolation is on.
     scratch: io::Result<()>,
     publication: Option<(StoreIdentity, publication::Outcome)>,
+}
+
+/// Retained until an already-terminal fill's settlement is durably saved.
+/// A failed thread spawn or a worker unwind leaves it available to the timer.
+#[derive(Clone)]
+struct BaseFinish {
+    request: Run,
+    success: bool,
+    failure: Option<String>,
+    recorded: bool,
 }
 
 /// Clears an in-memory marker that was set under the state lock. Its owner
@@ -2119,6 +2130,7 @@ impl Runner {
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
                     fill_ledgers: BTreeMap::new(),
+                    base_finishes: BTreeMap::new(),
                     drain_deadline: None,
                     jobs,
                     pending_replays: BTreeSet::new(),
@@ -5218,9 +5230,10 @@ impl Runner {
             .jobs
             .values()
             .filter(|j| {
-                j.finished_ms.is_some_and(|t| {
-                    self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
-                })
+                !inner.base_finishes.contains_key(&j.id)
+                    && j.finished_ms.is_some_and(|t| {
+                        self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
+                    })
             })
             .map(|j| j.id)
             .collect();
@@ -5744,6 +5757,9 @@ impl Runner {
         self.enforce_kills(std::time::Instant::now())?;
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
+        for id in inner.base_finishes.keys().copied().collect::<Vec<_>>() {
+            self.start_base_finish(&mut inner, id)?;
+        }
         let mut now = self.now();
         if now.saturating_sub(inner.maintained_ms) >= 60_000 {
             inner.maintained_ms = now;
@@ -7908,52 +7924,98 @@ impl Runner {
         success: bool,
         failure: Option<String>,
     ) -> io::Result<()> {
-        if !inner.finalizing.insert(r.job_id) {
+        inner
+            .base_finishes
+            .entry(r.job_id)
+            .or_insert_with(|| BaseFinish {
+                request: r.clone(),
+                success,
+                failure,
+                recorded: false,
+            });
+        self.start_base_finish(inner, r.job_id)
+    }
+
+    /// Claim a pending settlement while holding state, then do its work on a
+    /// separate thread. No cleanup resources move until that thread starts.
+    fn start_base_finish(&self, inner: &mut Inner, id: Uuid) -> io::Result<()> {
+        if !inner.finalizing.insert(id) {
             return Ok(());
         }
         let runner = self.clone();
-        let r = r.clone();
-        let id = r.job_id;
         let spawned = self.spawn_setup(move || {
-            let result = (|| -> io::Result<()> {
-                let (fill, ledgers, identity) = {
-                    let mut inner = runner.core.inner.lock().unwrap();
-                    (
-                        Self::take_cache_fill(&mut inner, r.job_id),
-                        inner.fill_ledgers.remove(&r.job_id).unwrap_or_default(),
-                        inner.jobs[&r.job_id].fill_identity.clone(),
-                    )
-                };
-                let mut cleanup = runner.clean_base(r.job_id, fill);
-                cleanup.publication = identity.map(|identity| {
-                    let outcome = runner.fill_publication(&identity, r.job_id, &ledgers);
-                    (identity, outcome)
-                });
-                let (catalog, next) = {
-                    let mut inner = runner.core.inner.lock().unwrap();
-                    runner.record_base(&mut inner, &r, success, failure, cleanup)?;
-                    inner.finalizing.remove(&r.job_id);
-                    (
-                        runner.catalog_snapshot(&inner)?,
-                        inner.catalog.repositories[&r.repository_root]
-                            .desired
-                            .clone(),
-                    )
-                };
-                runner.write_catalog(catalog)?;
-                if let Some(next) = next {
-                    runner.queue_next_base(&r.repository_root, &next)?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                tracing::warn!(job_id = %r.job_id, %error, "warm build settlement failed");
+            if let Err(error) = runner.settle_base(id) {
+                tracing::warn!(job_id = %id, %error, "warm build settlement will be retried");
             }
         });
         if spawned.is_err() {
             inner.finalizing.remove(&id);
         }
         spawned
+    }
+
+    fn settle_base(&self, id: Uuid) -> io::Result<()> {
+        let marker = Marker::new(self, move |inner| {
+            inner.finalizing.remove(&id);
+        });
+        let pending = self.core.inner.lock().unwrap().base_finishes[&id].clone();
+        if !pending.recorded {
+            let (fill, ledgers, identity) = {
+                let mut inner = self.core.inner.lock().unwrap();
+                (
+                    Self::take_cache_fill(&mut inner, id),
+                    inner.fill_ledgers.remove(&id).unwrap_or_default(),
+                    inner.jobs[&id].fill_identity.clone(),
+                )
+            };
+            self.long_work("base_cleanup");
+            let mut cleanup = self.clean_base(id, fill);
+            let mut delay = Duration::from_millis(50);
+            while let Err(error) = &cleanup.scratch {
+                tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
+                std::thread::park_timeout(delay);
+                delay = (delay * 2).min(Duration::from_secs(5));
+                cleanup.scratch = self.clean_base(id, None).scratch;
+            }
+            cleanup.publication = identity.map(|identity| {
+                let outcome = self.fill_publication(&identity, id, &ledgers);
+                (identity, outcome)
+            });
+            let mut inner = self.core.inner.lock().unwrap();
+            self.record_base(
+                &mut inner,
+                &pending.request,
+                pending.success,
+                pending.failure,
+                cleanup,
+            )?;
+            // Re-running record_base would count the same failed build twice.
+            inner.base_finishes.get_mut(&id).unwrap().recorded = true;
+        }
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let catalog = self.catalog_snapshot(&self.core.inner.lock().unwrap())?;
+            match self.write_catalog(catalog) {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(job_id = %id, %error, "warm build catalog save will be retried");
+                    std::thread::park_timeout(delay);
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        let next = {
+            let mut inner = self.core.inner.lock().unwrap();
+            inner.base_finishes.remove(&id);
+            marker.clear(&mut inner);
+            inner.catalog.repositories[&pending.request.repository_root]
+                .desired
+                .clone()
+        };
+        if let Some(next) = next {
+            self.queue_next_base(&pending.request.repository_root, &next)?;
+        }
+        Ok(())
     }
 
     /// Take the cache fill begun when warm build `id` was dispatched, if any,
