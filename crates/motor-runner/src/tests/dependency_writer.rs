@@ -1288,6 +1288,7 @@ async fn empty_and_invalid_writer_statistics_fail_with_a_persisted_reason() {
                 Ok(backend::ExecutionOutcome::Unix(
                     std::process::ExitStatus::from_raw(0),
                 )),
+                true,
             )
             .unwrap();
         let g = repository(&f, &runner);

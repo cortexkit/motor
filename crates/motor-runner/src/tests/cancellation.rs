@@ -241,7 +241,9 @@ fn cancelled_exited_unit_without_real_status_still_finalizes() {
             .is_some()
     }));
     let persisted: Job = read_json(&f.runner.record_path(id)).unwrap();
-    assert_eq!(persisted.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
+    let terminal = persisted.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, true);
     assert_eq!(
         persisted.monitoring_error.as_deref(),
         Some("cancelled unit already exited")
@@ -250,6 +252,33 @@ fn cancelled_exited_unit_without_real_status_still_finalizes() {
     let inner = f.runner.core.inner.lock().unwrap();
     assert!(!inner.finalizing.contains(&id));
     assert!(!inner.kill_retries.contains_key(&id));
+}
+
+#[test]
+fn execution_ended_wire_competing_proof() {
+    let f = CancellationFixture::new();
+    f.collect.arm();
+    let release = Release(f.collect.clone());
+    let runner = f.runner.clone();
+    let id = f.id;
+    let owner =
+        std::thread::spawn(move || runner.finish(id, Err(io::Error::other("monitor lost"))));
+    assert!(poll(Duration::from_secs(10), || f.collect.held()));
+    f.runner
+        .finish_execution(id, Err(io::Error::other("unit inactive")), true)
+        .unwrap();
+    drop(release);
+    owner.join().unwrap().unwrap();
+    let disk: Job = read_json(&f.runner.record_path(id)).unwrap();
+    assert_execution_ended_wire(disk.terminal.as_ref().unwrap(), true);
+    assert!(f
+        .runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .ended_executions
+        .is_empty());
 }
 
 #[test]

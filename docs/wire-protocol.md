@@ -275,6 +275,18 @@ rather than rejecting them. Do not match their human-text prefixes for execution
 or retry decisions. Test:
 `unknown_refusal_retains_the_before_start_arm`.
 
+`execution_ended`, when present and `true`, proves that no process of the job
+remains. The runner sets it after reading a real exit status, confirming the
+unit is inactive, or proving the job never started (including before-start
+cancellation and refusal). It does not imply success or a known exit code:
+an `outcome_unknown` terminal can carry it. Absent or `false` means execution
+has not been proven ended and the job may still be running. Restart loss,
+uncertain monitoring or VM state, and execution-gate release failures do not
+by themselves establish this proof. False is omitted for older clients.
+Tests: `execution_ended_wire_real_status`,
+`execution_ended_wire_before_start`, `execution_ended_wire_unknown_monitor`,
+`cancelled_exited_unit_without_real_status_still_finalizes`.
+
 5.5. `retry_after_ms` is a hint that a refusal is transient: how long a caller
 should wait before asking again, never shorter than the caller's own remaining
 budget allows. A started job's terminal never carries one. Three refusals carry
