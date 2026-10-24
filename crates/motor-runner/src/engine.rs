@@ -7437,6 +7437,9 @@ impl Runner {
             }
             inner.jobs[&id].clone()
         };
+        let _finalizing = Marker::new(self, move |inner| {
+            inner.finalizing.remove(&id);
+        });
         self.finish_step(id, &job.kill, "finalization claimed", finish_started);
         let ended_ms = self.now();
         let evidence = self.execution_evidence(&job);
@@ -7775,7 +7778,9 @@ impl Runner {
                             });
                     }
                     inner.kill_retries.remove(&id);
-                    inner.finalizing.remove(&id);
+                    if !job.base {
+                        inner.finalizing.remove(&id);
+                    }
                     inner.exit_statuses.remove(&id);
                     inner.cpu_times.remove(&id);
                     if failing.is_some() {
