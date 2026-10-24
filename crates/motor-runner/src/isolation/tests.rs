@@ -699,7 +699,7 @@ fn capped_cpu_placement_keeps_requested_memory_limit() {
 #[test]
 fn job_memory_limit_never_exceeds_the_slice_memory_max() {
     let f = Fixture::new();
-    // A 24 GiB slice, the owner's value for `jobs_min_bytes`.
+    // A 24 GiB slice: the value the capacity file uses for `jobs_min_bytes`.
     let slice = crate::systemd::JobMemoryBudget {
         max: 25_769_803_776,
         high: 21_474_836_480,

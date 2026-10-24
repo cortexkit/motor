@@ -168,7 +168,7 @@ pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
 
 /// A portable test has no sandbox account, so the grant that lets the job
 /// account traverse the runner state has nothing to apply to; it would only
-/// need root. The operator fixtures cover the real grant.
+/// need root. Only the root-only operator tests run the grant itself.
 #[cfg(test)]
 pub(crate) fn prepare_private_state(_state: &Path) -> io::Result<()> {
     Ok(())
@@ -322,8 +322,7 @@ fn prepare_shared_read_access_from_as(
 ) -> io::Result<()> {
     // A portable test has no sandbox account and no job unit, so the grant
     // that makes the host's toolchain trees readable to the job account has
-    // nothing to apply to. The activation fixture is the one that runs the
-    // same grants on a real host.
+    // nothing to apply to. Only a test on a real host runs these grants.
     #[cfg(test)]
     {
         let _ = (cargo_home, rustup_home, bun_bin, user);

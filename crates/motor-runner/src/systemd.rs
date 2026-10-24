@@ -34,8 +34,8 @@ pub(crate) fn read_job_memory_budget() -> io::Result<JobMemoryBudget> {
 }
 
 /// The jobs slice's limits from a `systemctl show` reply, or `None` when the
-/// slice has no finite `MemoryMax` below its `MemoryHigh`. `None` means jobs
-/// must not run: systemd would otherwise give them an uncapped implicit slice.
+/// slice has no finite `MemoryMax` greater than its `MemoryHigh`. `None` means
+/// jobs must not run: systemd would otherwise give them an uncapped slice.
 pub(crate) fn job_memory_budget(output: &Output) -> Option<JobMemoryBudget> {
     let text = String::from_utf8_lossy(&output.stdout);
     let number = |key| {
