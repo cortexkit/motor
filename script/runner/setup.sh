@@ -35,8 +35,9 @@ sudo -n apt-get update
 # Workspace build.rs files invoke rustc and hash Cargo.lock, with no generators.
 # Bundled SQLite/crypto dependencies need the C toolchain. unzip is required by
 # Bun's installer; xz and CA certificates are required by toolchain downloads.
+# musl-tools supplies musl-gcc to compile the ring crate's C code for the static tenant runner.
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  build-essential clang lld pkg-config libssl-dev sqlite3 git rsync curl jq \
+  build-essential clang lld musl-tools pkg-config libssl-dev sqlite3 git rsync curl jq \
   ca-certificates unzip xz-utils binaryen unattended-upgrades ufw nodejs npm
 sudo -n install -d -o ubuntu -g ubuntu /srv/build /srv/build/src /srv/build/target /srv/build/cargo-home /srv/build/tools-target /srv/build/mirrors /srv/build/bundles
 

@@ -617,6 +617,22 @@ class ParityTests(unittest.TestCase):
         boat_errors = parity.differences(manifest, self.observed('boat'), role='boat')
         self.assertNotIn('missing apt package: binaryen', boat_errors)
 
+    def test_musl_tools_is_required_only_on_the_build_server(self):
+        manifest = self.manifest
+        self.assertIn('musl-tools', manifest['apt_packages']['by_role']['build-server'])
+        self.assertNotIn('musl-tools', manifest['apt_packages']['required'])
+        setup = (parity.HERE / 'setup.sh').read_text()
+        self.assertIn('build-essential clang lld musl-tools pkg-config', setup)
+        server = self.observed('build-server')
+        server['apt_packages'].pop('musl-tools')
+        self.assertIn('missing apt package: musl-tools',
+                      parity.differences(manifest, server, role='build-server'))
+        for role in ('boat', 'tenant'):
+            with self.subTest(role=role):
+                self.assertNotIn('musl-tools', manifest['apt_packages']['by_role'][role])
+                self.assertNotIn('missing apt package: musl-tools',
+                                 parity.differences(manifest, self.observed(role), role=role))
+
     def test_build_server_job_visible_tools_are_in_the_catalogue(self):
         actual = self.observed()
         actual['local_bin_entries'].extend(

@@ -101,6 +101,32 @@ jobs:
       - name: Protocol vectors
         run: python3 crates/motor-protocol/tests/generate_vectors.py --check
 
+  linux-musl-runner:
+    name: Linux musl runner
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Install musl C compiler and Rust target
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build static tenant runner
+        run: |
+          command -v musl-gcc >/dev/null || { echo 'musl-gcc is required; install musl-tools' >&2; exit 1; }
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo build --locked --target x86_64-unknown-linux-musl -p motor-runner
+
   python-safety:
     name: Python safety
     runs-on: ubuntu-24.04
@@ -129,10 +155,11 @@ jobs:
   ci-success:
     name: CI success
     runs-on: ubuntu-24.04
-    needs: [linux-ordinary, python-safety]
+    needs: [linux-ordinary, linux-musl-runner, python-safety]
     if: ${{ always() }}
     steps:
-      - name: Both jobs succeeded
+      - name: All jobs succeeded
         run: |
           test "${{ needs.linux-ordinary.result }}" = success
+          test "${{ needs.linux-musl-runner.result }}" = success
           test "${{ needs.python-safety.result }}" = success
