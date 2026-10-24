@@ -55,8 +55,9 @@ contain exactly these six byte-valued, nonnegative u64 integers:
 }
 ```
 
-`jobs_min_bytes` must be positive and at least `windows_vm_bytes`. Missing,
-unreadable or invalid capacity input refuses provisioning without writes.
+`jobs_min_bytes` must be positive. It may be smaller than `windows_vm_bytes`,
+but their sum must fit in u64. Missing, unreadable or invalid capacity input
+refuses provisioning without writes.
 Memory fit uses `/proc/meminfo`'s `MemTotal` in checked bytes, not `MemAvailable`:
 
 ```text
@@ -82,10 +83,16 @@ live limits before retrying. The drop-in is written even if the slice is not
 installed yet. Provisioning requires its exact rendered bytes and checks the
 live cap too; an unloaded, `not-found` slice requires the same exact file.
 
-`MemoryMax = jobs_min_bytes` and
-`MemoryHigh = jobs_min_bytes - floor(jobs_min_bytes / 6)`, giving 24/20 GiB with
-the example values. Windows already runs inside the slice, so its reservation
-is not subtracted from the cap again.
+`MemoryMax = jobs_min_bytes + windows_vm_bytes` and
+`MemoryHigh = MemoryMax - floor(MemoryMax / 6)`. The slice holds the Windows VM
+plus direct Linux jobs: `jobs_min_bytes` is what direct Linux jobs keep when
+Windows uses its full allowance. The example values render exactly:
+
+```ini
+[Slice]
+MemoryMax=42949672960
+MemoryHigh=35791394134
+```
 
 ## Tenant allocation
 

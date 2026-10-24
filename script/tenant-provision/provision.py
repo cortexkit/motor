@@ -72,10 +72,7 @@ def read_capacity():
         raise ValueError("capacity.json must contain exactly the six capacity keys")
     for key, value in capacity.items():
         u64(value, f"capacity.json {key}")
-    if capacity["jobs_min_bytes"] == 0:
-        raise ValueError("capacity.json jobs_min_bytes must be at least 1")
-    if capacity["windows_vm_bytes"] > capacity["jobs_min_bytes"]:
-        raise ValueError("capacity.json windows_vm_bytes exceeds jobs_min_bytes")
+    jobs_slice_limits(capacity)
     return capacity
 
 
@@ -108,12 +105,20 @@ def memory_fit(capacity, replacement=None):
         raise ValueError(f"memory fit requires {total} bytes, MemTotal is {available} bytes")
 
 
-def jobs_slice_render(capacity):
-    maximum = u64(capacity["jobs_min_bytes"], "jobs_min_bytes")
-    if maximum == 0:
-        raise ValueError("jobs_min_bytes must be at least 1")
-    # Windows already runs inside this slice; its reservation is not deducted.
+def jobs_slice_limits(capacity):
+    jobs = u64(capacity["jobs_min_bytes"], "capacity.json jobs_min_bytes")
+    windows = u64(capacity["windows_vm_bytes"], "capacity.json windows_vm_bytes")
+    if jobs == 0:
+        raise ValueError("capacity.json jobs_min_bytes must be at least 1")
+    # The slice holds Windows and direct Linux jobs. jobs_min_bytes remains
+    # available for Linux when Windows uses its full allowance.
+    maximum = u64(jobs + windows, "capacity.json jobs-slice MemoryMax")
     high = maximum - maximum // 6
+    return maximum, high
+
+
+def jobs_slice_render(capacity):
+    maximum, high = jobs_slice_limits(capacity)
     return f"[Slice]\nMemoryMax={maximum}\nMemoryHigh={high}\n"
 
 
@@ -147,8 +152,9 @@ def verify_jobs_slice(capacity):
     if values["LoadState"] != "loaded":
         raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
     maximum = slice_bytes(values["MemoryMax"], "MemoryMax")
-    if maximum > capacity["jobs_min_bytes"]:
-        raise ValueError(f"motor-jobs.slice MemoryMax={maximum} exceeds {capacity['jobs_min_bytes']}")
+    limit, _high = jobs_slice_limits(capacity)
+    if maximum > limit:
+        raise ValueError(f"motor-jobs.slice MemoryMax={maximum} exceeds {limit}")
 
 
 def refuse_resize_journal():
@@ -173,7 +179,7 @@ def apply_jobs_slice():
             current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
         else:
             raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
-        high = capacity["jobs_min_bytes"] - capacity["jobs_min_bytes"] // 6
+        _maximum, high = jobs_slice_limits(capacity)
         if current > high:
             raise ValueError(f"motor-jobs.slice MemoryCurrent={current} exceeds rendered MemoryHigh={high}")
         JOBS_DROP_IN.parent.mkdir(parents=True, exist_ok=True)

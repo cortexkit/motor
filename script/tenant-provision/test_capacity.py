@@ -19,7 +19,7 @@ GIB = 1024**3
 CAPACITY = dict(windows_vm_bytes=16 * GIB, host_reserve_bytes=6 * GIB, jobs_min_bytes=24 * GIB,
                 storage_margin_bytes=8 * GIB, growth_allowance_bytes=64 * GIB,
                 tenant_memory_reserve_bytes=2 * GIB)
-RENDERED = "[Slice]\nMemoryMax=25769803776\nMemoryHigh=21474836480\n"
+RENDERED = "[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n"
 
 
 class CapacityTests(unittest.TestCase):
@@ -58,7 +58,7 @@ class CapacityTests(unittest.TestCase):
             if self.fail_reload:
                 raise subprocess.CalledProcessError(1, args, stderr="injected reload failure")
             if self.apply_limit:
-                self.maximum = 24 * GIB
+                self.maximum = 40 * GIB
             return SimpleNamespace(stdout="")
         self.assertEqual(args[:3], ("systemctl", "show", "-p"))
         self.assertEqual(args[4:], ("motor-jobs.slice",))
@@ -92,7 +92,7 @@ class CapacityTests(unittest.TestCase):
             for value in (True, "1", 1.0, None, -1, 2**64):
                 invalid.append(json.dumps(dict(CAPACITY, **{key: value})))
         invalid.extend(json.dumps(value) for value in (dict(CAPACITY, surprise=0), dict(CAPACITY, jobs_min_bytes=0),
-                                                      dict(CAPACITY, windows_vm_bytes=24 * GIB + 1)))
+                                                      dict(CAPACITY, windows_vm_bytes=2**64 - 1)))
         for content in invalid:
             with self.subTest(content=content):
                 p.CAPACITY.write_text(content)
@@ -118,6 +118,20 @@ class CapacityTests(unittest.TestCase):
         minimal["growth_allowance_bytes"] = 2**64 - 1
         p.CAPACITY.write_text(json.dumps(minimal))
         self.assertEqual(p.read_capacity(), minimal)
+        minimal["windows_vm_bytes"] = 2
+        p.CAPACITY.write_text(json.dumps(minimal))
+        self.assertEqual(p.read_capacity(), minimal)
+        self.assertEqual(p.jobs_slice_render(minimal), "[Slice]\nMemoryMax=3\nMemoryHigh=3\n")
+        minimal["windows_vm_bytes"] = 2**64 - 2
+        p.CAPACITY.write_text(json.dumps(minimal))
+        self.assertEqual(p.read_capacity(), minimal)
+
+    def test_jobs_slice_sum_overflow_refuses_without_writes(self):
+        capacity = dict(CAPACITY, jobs_min_bytes=1, windows_vm_bytes=2**64 - 1)
+        p.CAPACITY.write_text(json.dumps(capacity))
+        self.assert_capacity_refused_without_writes()
+        with self.assertRaisesRegex(ValueError, "jobs-slice MemoryMax"):
+            p.jobs_slice_render(capacity)
 
     def test_cli_invalid_capacity_precedes_directory_and_lock_creation(self):
         config = self.root / "new.json"
@@ -183,11 +197,11 @@ class CapacityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "MemTotal"):
                 p.memory_fit(CAPACITY, replacement=dict(tenant="a", guest_ram_mib=79872, memory_headroom_mib=512))
 
-    def test_jobs_slice_render_does_not_subtract_windows(self):
+    def test_jobs_slice_render_adds_windows_to_direct_jobs_budget(self):
         self.assertEqual(p.jobs_slice_render(CAPACITY), RENDERED)
         for maximum, high in ((6, 5), (5, 5), (1, 1)):
             with self.subTest(maximum=maximum):
-                self.assertEqual(p.jobs_slice_render(dict(CAPACITY, jobs_min_bytes=maximum)),
+                self.assertEqual(p.jobs_slice_render(dict(CAPACITY, jobs_min_bytes=maximum, windows_vm_bytes=0)),
                                  f"[Slice]\nMemoryMax={maximum}\nMemoryHigh={high}\n")
 
     def test_apply_writes_then_reloads_then_reads_back(self):
@@ -199,14 +213,14 @@ class CapacityTests(unittest.TestCase):
             p.apply_jobs_slice()
         self.assertEqual(p.JOBS_DROP_IN.read_text(), RENDERED)
         self.assertEqual(stat.S_IMODE(p.JOBS_DROP_IN.stat().st_mode), 0o644)
-        self.assertEqual(self.maximum, 25769803776)
+        self.assertEqual(self.maximum, 42949672960)
         self.assertEqual(self.events, [("systemctl", "show", "-p", "LoadState,MemoryCurrent", "motor-jobs.slice"),
                                        ("write",), ("systemctl", "daemon-reload"),
                                        ("systemctl", "show", "-p", "LoadState,MemoryMax", "motor-jobs.slice")])
 
     def test_apply_refuses_above_cap_readback_and_reload_failure(self):
         self.apply_limit = False
-        with self.assertRaisesRegex(ValueError, "MemoryMax=.* exceeds 25769803776"):
+        with self.assertRaisesRegex(ValueError, "MemoryMax=.* exceeds 42949672960"):
             p.apply_jobs_slice()
         self.fail_reload = True
         with self.assertRaisesRegex(ValueError, "failed to apply jobs-slice"):
@@ -228,19 +242,19 @@ class CapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "memory fit requires"):
             p.apply_jobs_slice()
         self.assertEqual(self.tree(), before)
-        self.assertEqual(self.maximum, 25769803776)
+        self.assertEqual(self.maximum, 42949672960)
         self.assertEqual(self.events, [])
 
     def test_apply_usage_equal_to_high_passes_one_byte_above_writes_nothing(self):
-        self.current = 21474836480
+        self.current = 35791394134
         p.apply_jobs_slice()
-        self.current = 21474836481
+        self.current = 35791394135
         before = self.tree()
         self.events.clear()
-        with self.assertRaisesRegex(ValueError, "MemoryCurrent=21474836481 exceeds rendered MemoryHigh=21474836480"):
+        with self.assertRaisesRegex(ValueError, "MemoryCurrent=35791394135 exceeds rendered MemoryHigh=35791394134"):
             p.apply_jobs_slice()
         self.assertEqual(self.tree(), before)
-        self.assertEqual(self.maximum, 25769803776)
+        self.assertEqual(self.maximum, 42949672960)
         self.assertEqual(len(self.events), 1)
 
     def test_apply_refuses_any_resize_journal_without_writes(self):
@@ -256,8 +270,8 @@ class CapacityTests(unittest.TestCase):
     def test_live_cap_exact_limit_and_not_found_require_exact_dropin(self):
         p.apply_jobs_slice()
         p.verify_jobs_slice(CAPACITY)
-        self.maximum = 25769803777
-        with self.assertRaisesRegex(ValueError, "MemoryMax=25769803777 exceeds"):
+        self.maximum = 42949672961
+        with self.assertRaisesRegex(ValueError, "MemoryMax=42949672961 exceeds"):
             p.verify_jobs_slice(CAPACITY)
         self.maximum = "infinity"
         with self.assertRaisesRegex(ValueError, "MemoryMax is not a byte value: infinity"):

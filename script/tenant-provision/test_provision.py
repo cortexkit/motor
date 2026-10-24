@@ -60,10 +60,10 @@ class ProvisionTests(unittest.TestCase):
                                                                  "host_reserve_bytes": 6 * 1024**3,
                                                                  "jobs_min_bytes": 24 * 1024**3},
                                           memtotal_bytes=lambda: 128 * 1024**3,
-                                          slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "25769803776"},
+                                          slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
                                           runner_processes=lambda: [])
         self.patch.start()
-        p.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=25769803776\nMemoryHigh=21474836480\n")
+        p.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n")
         for directory in [p.REGISTRY, p.PROVISION, p.BINDINGS.parent, p.ROOT / "tenants"]:
             directory.mkdir(parents=True)
         self.image = self.root / "tenant-images/v1"
