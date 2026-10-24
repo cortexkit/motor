@@ -2714,9 +2714,8 @@ async fn capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint
 /// document, not the raw measurement.
 #[tokio::test]
 async fn capacity_retry_hint_is_clamped_to_its_bounds() {
-    // One sample each: with an even count the holder's own zero wait would
-    // pull the median down. One sample sits below the floor and the other
-    // above the ceiling of the documented bounds.
+    // One sample per case, so the holder's own zero wait cannot pull the
+    // median down. 500 ms is under the floor and 500 s over the ceiling.
     for (sample_ms, expected) in [
         (500, CAPACITY_RETRY_MIN_MS),
         (500_000, CAPACITY_RETRY_MAX_MS),
