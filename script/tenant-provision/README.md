@@ -257,19 +257,25 @@ A `resize.json` that cannot be read, is not valid JSON, has missing or unknown
 keys, another schema version, an unknown phase, or names a base, set-aside or
 staged path the resize would not have created is refused by both resize and
 abort, and the tenant stays start-refused. Recover by hand with both services
-stopped:
+stopped. The old state comes from the copies saved before the resize (the
+cutover runbook saves the records and helper config first); if `resize.json` is
+still readable JSON, its `provision_old`, `registry_old` and `helper_old` hold the
+same bytes, and `provision_new`, `registry_new` and `helper_new` the new ones.
 
 1. Compare `/etc/motor-host/provision/<tenant>.json`,
    `/etc/motor-vm-helper/tenants/<tenant>.json` and `/etc/motor-vm-helper.json`
-   with the saved rollback copies, and the `disk.img` length with each record's
+   with the saved copies, and the `disk.img` length with each record's
    `disk_quota_bytes`.
-2. If all of them are still the old ones (nothing was committed): move the newest
-   `suspend.resize-*` back to `suspend/` if `suspend/` is empty, delete
-   `runner-args.staged` and `resize-staged/`, and delete the new size base only if
-   no registry entry names its `<vcpu>-<ram>`.
-3. If any of them is the new one (the resize committed): write all three files at
-   the new size, `truncate -s <new quota> disk.img`, and write
-   `runner-args.staged` as the helper expects (root, 0600).
+2. If all three files and the disk length are still the old ones, return to the
+   old size. This is safe even if the journal had reached `committed`: nothing
+   after the commit point had been published or extended yet, so the host is
+   exactly as it was before the commit. Move the newest `suspend.resize-*` back
+   to `suspend/` if `suspend/` is empty, delete `runner-args.staged` and
+   `resize-staged/`, and delete the new size base only if no registry entry
+   names its `<vcpu>-<ram>`.
+3. If any of them is already the new one, the resize committed: finish it by
+   writing all three files at the new size, `truncate -s <new quota> disk.img`,
+   and writing `runner-args.staged` as the helper expects (root, 0600).
 4. Move `resize.json` out of the tenant home (keep it for the incident record),
    then run `install.sh --check` before starting the services.
 
