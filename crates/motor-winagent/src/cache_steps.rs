@@ -8,10 +8,14 @@ use std::{
 };
 
 fn diagnostic_message(message: &str) -> String {
+    let mut bytes = 0;
     message
         .chars()
-        .take(240)
         .map(|c| if c.is_control() { ' ' } else { c })
+        .take_while(|c| {
+            bytes += c.len_utf8();
+            bytes <= 1024
+        })
         .collect()
 }
 

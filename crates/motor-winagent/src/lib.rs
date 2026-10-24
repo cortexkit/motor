@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 pub mod cache;
+pub mod cache_format;
 pub mod cache_steps;
 pub mod environment;
 pub mod transport;

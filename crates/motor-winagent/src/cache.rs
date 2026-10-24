@@ -177,8 +177,9 @@ pub fn is_volume_guid_path(path: &str) -> bool {
 }
 
 /// Arguments for `format.com`, started directly (no shell) on the new cache
-/// partition's volume: a quick NTFS format with the cache label and no
-/// confirmation prompt.
+/// partition's volume: a quick NTFS format with an explicit cache label.
+/// The caller also supplies the hard-disk confirmation on stdin; /Y only
+/// suppresses dismount/empty-label prompts on Windows versions supporting it.
 pub fn format_arguments(volume: &str) -> io::Result<Vec<String>> {
     if !is_volume_guid_path(volume) {
         return Err(io::Error::other("invalid cache volume path for format"));
@@ -810,7 +811,7 @@ mod tests {
             assert!(at < first_write, "{guard} runs after the first write");
         }
         assert!(body.find("IOCTL_DISK_SET_DRIVE_LAYOUT_EX").unwrap() > first_write);
-        assert!(body.contains("format_arguments("));
+        assert!(body.contains("motor_winagent::cache_format::run(&volume, deadline)"));
         assert!(!body.contains("powershell"));
     }
 }
