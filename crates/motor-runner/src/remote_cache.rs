@@ -8,4 +8,6 @@
 pub(crate) mod environment;
 pub(crate) mod gateway;
 pub(crate) mod provisioning;
+pub(crate) mod publication;
+pub(crate) mod publishing;
 pub(crate) mod transport;

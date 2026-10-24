@@ -140,7 +140,11 @@ fn execution_ended_wire_cache_fill_setup() {
     inner.writer = Some(job.id);
     inner.jobs.insert(job.id, job.clone());
     runner.fail_cache_fill(&mut inner, &job, error).unwrap();
-    assert!(inner.writer.is_none());
+    drop(inner);
+    assert!(poll(Duration::from_secs(5), || {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.writer.is_none() && !inner.base_finishes.contains_key(&job.id)
+    }));
     let disk: Job = read_json(&runner.record_path(job.id)).unwrap();
     let terminal = disk.terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);

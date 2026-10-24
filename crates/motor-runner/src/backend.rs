@@ -151,6 +151,9 @@ pub(crate) struct Launch {
     pub process: Option<platform::ProcessIdentity>,
     pub durable_output: bool,
     pub execution: Box<dyn Execution>,
+    /// The write ledgers of the unit's cache sockets; empty for a unit that is
+    /// not a fill or has no remote cache.
+    pub cache_ledgers: Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>,
 }
 
 pub(crate) struct Output {
@@ -895,10 +898,15 @@ impl Backend for HostBackend {
             // The non-isolated host backend is development-only and does not pin CPUs.
             platform::launch(&s.request.command, &prepared.cwd, &env)
         }?;
+        #[cfg(target_os = "linux")]
+        let cache_ledgers = launch.cache_ledgers();
+        #[cfg(not(target_os = "linux"))]
+        let cache_ledgers = Vec::new();
         Ok(Launch {
             process: Some(launch.identity),
             durable_output: launch.durable_output,
             execution: Box::new(launch),
+            cache_ledgers,
         })
     }
 

@@ -524,6 +524,13 @@ pub(crate) struct StoreIdentity {
     pub(crate) prefix: String,
 }
 
+impl StoreIdentity {
+    /// The same identity in the form the catalog records and compares.
+    pub(crate) fn recorded(&self) -> crate::storage::StoreIdentity {
+        crate::storage::encode_identity(self)
+    }
+}
+
 /// A complete provisioning generation: the config without `enabled`, plus
 /// every key the host holds. It never changes once active; a request signs
 /// with the generation it was admitted under.

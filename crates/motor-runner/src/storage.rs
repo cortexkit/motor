@@ -193,6 +193,14 @@ pub(crate) struct Job {
     pub base: bool,
     #[serde(default)]
     pub writer_descriptor: Option<String>,
+    /// When this fill started, in runner-clock milliseconds. A publication
+    /// record ages from here, and an operator reads it as the time the entries
+    /// of that fill were written.
+    #[serde(default)]
+    pub fill_started_ms: Option<u64>,
+    /// Store active when fill setup began, updated when the command launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_identity: Option<StoreIdentity>,
     pub kill: Option<(Killed, u64)>,
     /// Durable isolated stream positions, advanced atomically with replay chunks.
     #[serde(default)]
@@ -307,6 +315,8 @@ impl Job {
             order,
             base: false,
             writer_descriptor: None,
+            fill_started_ms: None,
+            fill_identity: None,
             kill: None,
             stdout_offset: 0,
             stderr_offset: 0,
@@ -457,6 +467,73 @@ pub(crate) struct Workspace {
     pub sibling_freshness: BTreeMap<String, crate::sibling_snapshots::freshness::Record>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoreIdentity {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+/// The persisted form of a provisioning store identity. The gateway's identity
+/// type lives where it is used to sign; records and comparisons use this one.
+pub(crate) use crate::remote_cache::publishing::Seen;
+
+pub(crate) fn encode_identity(
+    identity: &crate::remote_cache::provisioning::StoreIdentity,
+) -> StoreIdentity {
+    StoreIdentity {
+        endpoint: identity.endpoint.clone(),
+        bucket: identity.bucket.clone(),
+        prefix: identity.prefix.clone(),
+    }
+}
+
+impl StoreIdentity {
+    /// The same identity in the form the gateway signs and tags requests with.
+    #[cfg(test)]
+    pub(crate) fn provisioned(&self) -> crate::remote_cache::provisioning::StoreIdentity {
+        crate::remote_cache::provisioning::StoreIdentity {
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+        }
+    }
+}
+
+/// A key a fill's PUTs stored in the remote store, with the tool whose socket
+/// wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublishedKey {
+    pub tool: String,
+    pub key: String,
+}
+
+/// A fill of one descriptor that published every entry it wrote to the remote
+/// store. The operator reads it to check that a repository's cache is fresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicationRecord {
+    /// The store the fill published into. A record belongs to one identity; a
+    /// key rotation keeps it, a prefix or bucket change forgets it.
+    pub identity: StoreIdentity,
+    /// When the published fill started. Age is measured from here, so a fill
+    /// that ran for hours still counts as fresh when it started.
+    pub started_ms: u64,
+    /// Bare keys (no tenant prefix and no credentials) that the fill's PUTs
+    /// stored, in the order they were first stored, up to the gateway's
+    /// sample size. Operators read this record, so it must stay free of
+    /// anything secret.
+    #[serde(default)]
+    pub keys: Vec<PublishedKey>,
+}
+
+/// The last fill of one descriptor that failed to publish, with the number of
+/// consecutive attempts that failed as builds (not merely remote writes).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublishFailure {
+    pub started_ms: u64,
+    pub attempts: u32,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Repository {
@@ -471,6 +548,11 @@ pub(crate) struct Repository {
     pub finished_ms: Option<u64>,
     pub result: Option<RebuildResult>,
     pub desired: Option<BaseRequest>,
+    /// Per descriptor, the last fill that published it.
+    pub publications: BTreeMap<String, PublicationRecord>,
+    /// Per descriptor, the last fill that failed to publish, while no later
+    /// fill has published.
+    pub publish_failures: BTreeMap<String, PublishFailure>,
 }
 
 /// Exact catalog-owned checkout paths awaiting cheap retirement into trash.
@@ -530,6 +612,10 @@ pub(crate) struct Catalog {
     /// flight counts as use at the current time without being recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_cache_used_ms: Option<u64>,
+    /// The remote cache's switch state this runner last acted on, so a change
+    /// made while it was stopped is still a transition at the first re-read.
+    #[serde(default, skip_serializing_if = "Seen::is_default")]
+    pub publishing_seen: Seen,
 }
 
 impl Default for Catalog {
@@ -544,6 +630,7 @@ impl Default for Catalog {
             transferred: BTreeMap::new(),
             mirror_used_ms: BTreeMap::new(),
             compile_cache_used_ms: None,
+            publishing_seen: Seen::default(),
         }
     }
 }

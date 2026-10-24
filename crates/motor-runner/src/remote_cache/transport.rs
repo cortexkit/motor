@@ -154,6 +154,14 @@ impl Sockets {
     pub(crate) fn forwarders(&self) -> &[Forwarder] {
         &self.forwarders
     }
+    /// The write ledgers of a fill's sockets, one per tool the fill runs.
+    /// A read socket has none, so this is empty for a job.
+    pub(crate) fn ledgers(&self) -> Vec<std::sync::Arc<super::gateway::WriteLedger>> {
+        self.listeners
+            .iter()
+            .filter_map(|listener| listener.binding().ledger().cloned())
+            .collect()
+    }
 }
 
 /// A forwarder the unit's fixed shell starts before the unit's command.

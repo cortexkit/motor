@@ -40,6 +40,8 @@ mod monitoring;
 mod nested_workspaces;
 #[path = "tests/platform.rs"]
 mod platform_refusal;
+#[path = "tests/publication.rs"]
+mod publication;
 #[path = "tests/refusals.rs"]
 mod refusals;
 #[path = "tests/repository_retirement.rs"]
