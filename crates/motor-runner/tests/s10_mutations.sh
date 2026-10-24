@@ -3,7 +3,7 @@
 # path, prints the mutated line, then runs only what should notice. The remote
 # copy is thrown away, so the checkout never holds a mutation.
 set -uo pipefail
-cd "$(dirname "$0")/../.." || exit 2
+cd "$(dirname "$0")/.." || exit 2
 
 mutate() {
     case "$1" in
