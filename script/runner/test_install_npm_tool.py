@@ -151,6 +151,29 @@ class InstallTests(unittest.TestCase):
             installer.install(self.write(release(), "again.tgz"), self.prefix, "pnpm")
         self.assertEqual(sorted(path.name for path in (self.prefix / "bin").iterdir()), sorted(BIN))
 
+    def test_a_shared_bin_directory_that_already_exists_is_kept(self):
+        # In the images node is unpacked into /usr/local first, so
+        # /usr/local/bin and /usr/local/lib/node_modules already exist and hold
+        # other tools; installing must add links there, not refuse or replace.
+        (self.prefix / "bin").mkdir(parents=True)
+        (self.prefix / "bin/node").write_text("node")
+        (self.prefix / "lib/node_modules/npm").mkdir(parents=True)
+        installer.install(self.write(release()), self.prefix, "pnpm")
+        self.assertEqual((self.prefix / "bin/node").read_text(), "node")
+        self.assertTrue((self.prefix / "lib/node_modules/npm").is_dir())
+        self.assertEqual(sorted(path.name for path in (self.prefix / "bin").iterdir()),
+                         sorted(["node", *BIN]))
+
+    def test_an_existing_command_of_the_same_name_is_not_replaced(self):
+        (self.prefix / "bin").mkdir(parents=True)
+        (self.prefix / "bin/pnpm").write_text("other pnpm")
+        with self.assertRaisesRegex(FileExistsError, "existing command"):
+            installer.install(self.write(release()), self.prefix, "pnpm")
+        self.assertEqual((self.prefix / "bin/pnpm").read_text(), "other pnpm")
+        # Nothing of the refused release is left behind.
+        self.assertFalse((self.prefix / "lib/node_modules/package").exists())
+        self.assertFalse((self.prefix / "lib/node_modules/pnpm").exists())
+
 class CommandTests(unittest.TestCase):
     def test_the_cli_refuses_an_archive_that_does_not_match_its_pin(self):
         import subprocess

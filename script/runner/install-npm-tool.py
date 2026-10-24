@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import tarfile
 
 # Where npm keeps global packages beneath a prefix, and where it writes the
@@ -99,26 +100,39 @@ def install(archive, prefix, name):
     packages = prefix / PACKAGES
     root = packages / name
     links = prefix / COMMANDS
-    for path in (root, links):
+    staging = packages / TOP_LEVEL
+    # <prefix>/bin is a shared directory (node, npm and other tools already
+    # live in /usr/local/bin), so only this package's own paths are refused.
+    for path in (root, staging):
         if path.exists() or path.is_symlink():
             raise FileExistsError("refusing to replace an existing install: " + str(path))
     # mkdir honours the caller's umask; every directory this module creates is
     # set explicitly, because root runs programs from the tree and nothing in it
-    # may be group- or other-writable.
-    packages.mkdir(parents=True, exist_ok=True)
-    os.chmod(packages, 0o755)
+    # may be group- or other-writable. Directories that already exist keep
+    # their owner and mode.
+    if not packages.is_dir():
+        packages.mkdir(parents=True)
+        os.chmod(packages, 0o755)
     extract(archive, packages)
-    for directory in (packages, *[path for path in packages.rglob("*") if path.is_dir()]):
-        os.chmod(directory, 0o755)
-    package = packages / TOP_LEVEL
-    if not package.is_dir():
+    if not staging.is_dir():
         raise ValueError("release archive has no package directory")
-    package.rename(root)
-    commands = bin_entries(root)
-    if name not in commands:
-        raise ValueError(f"release package declares no {name} command")
-    links.mkdir()
-    os.chmod(links, 0o755)
+    for directory in (staging, *[path for path in staging.rglob("*") if path.is_dir()]):
+        os.chmod(directory, 0o755)
+    try:
+        commands = bin_entries(staging)
+        if name not in commands:
+            raise ValueError(f"release package declares no {name} command")
+        taken = [links / command for command in commands
+                 if (links / command).exists() or (links / command).is_symlink()]
+        if taken:
+            raise FileExistsError("refusing to replace an existing command: " + str(taken[0]))
+    except BaseException:
+        shutil.rmtree(staging)
+        raise
+    staging.rename(root)
+    if not links.is_dir():
+        links.mkdir(parents=True)
+        os.chmod(links, 0o755)
     for command, relative in commands.items():
         target = root / relative
         target.chmod(target.stat().st_mode | 0o111)
