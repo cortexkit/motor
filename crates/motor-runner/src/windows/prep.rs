@@ -552,10 +552,21 @@ fn fetch_manifest(
     manifest: &Path,
     fetch: &mut impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
+    // The job VM is offline, so every crate a Windows build may need has to be
+    // fetched here. Both Windows targets are fetched: the image carries the
+    // ARM64 toolchain, and a job building with `--target
+    // aarch64-pc-windows-msvc` needs that target's platform crates too.
     let mut cmd = cargo_command(
         plan,
         manifest,
-        &["fetch", "--locked", "--target", "x86_64-pc-windows-msvc"],
+        &[
+            "fetch",
+            "--locked",
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "--target",
+            "aarch64-pc-windows-msvc",
+        ],
     );
     cmd.args(["--config", "net.git-fetch-with-cli=true"]);
     crate::workspace::dependencies::configure_fetch_git(

@@ -216,9 +216,12 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     .get_args()
                     .map(|s| s.to_str().unwrap())
                     .collect::<Vec<_>>();
-                assert!(args
-                    .windows(2)
-                    .any(|a| a == ["--target", "x86_64-pc-windows-msvc"]));
+                for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                    assert!(
+                        args.windows(2).any(|a| a == ["--target", target]),
+                        "prep must fetch crates for {target}: {args:?}"
+                    );
+                }
                 assert!(args.contains(&"--locked"));
                 let home = cmd
                     .get_envs()
