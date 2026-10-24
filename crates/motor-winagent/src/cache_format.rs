@@ -27,7 +27,10 @@ impl Default for FormatOptions {
         Self {
             filesystem: "NTFS",
             label: crate::CACHE_LABEL,
-            allocation_unit_size: 0,
+            // NTFS's default cluster size for volumes up to 16 TiB. The Storage
+            // provider rejects 0 as "invalid cluster size" (ReturnValue 43000)
+            // instead of treating it as "choose the default", so it is explicit.
+            allocation_unit_size: 4096,
             full: false,
             force: true,
         }
@@ -314,7 +317,7 @@ mod tests {
                 FormatOptions {
                     filesystem: "NTFS",
                     label: "motor-target",
-                    allocation_unit_size: 0,
+                    allocation_unit_size: 4096,
                     full: false,
                     force: true,
                 },
@@ -589,7 +592,7 @@ mod provider_contract_tests {
                 [
                     ("FileSystem", RecordedVariant::Bstr("NTFS")),
                     ("FileSystemLabel", RecordedVariant::Bstr("motor-target")),
-                    ("AllocationUnitSize", RecordedVariant::I4(0)),
+                    ("AllocationUnitSize", RecordedVariant::I4(4096)),
                     ("Full", RecordedVariant::Bool(0)),
                     ("Force", RecordedVariant::Bool(-1)),
                 ],
@@ -653,7 +656,7 @@ mod provider_contract_tests {
             [
                 ("FileSystem", FormatValue::Text("NTFS")),
                 ("FileSystemLabel", FormatValue::Text("motor-target")),
-                ("AllocationUnitSize", FormatValue::Number(0)),
+                ("AllocationUnitSize", FormatValue::Number(4096)),
                 ("Full", FormatValue::Boolean(false)),
                 ("Force", FormatValue::Boolean(true)),
             ]

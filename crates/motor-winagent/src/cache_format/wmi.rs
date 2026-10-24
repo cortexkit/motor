@@ -332,7 +332,7 @@ mod tests {
             [
                 ("FileSystem", VT_BSTR, "NTFS"),
                 ("FileSystemLabel", VT_BSTR, "motor-target"),
-                ("AllocationUnitSize", VT_I4, "0"),
+                ("AllocationUnitSize", VT_I4, "4096"),
                 ("Full", VT_BOOL, "0"),
                 ("Force", VT_BOOL, "-1"),
             ]
