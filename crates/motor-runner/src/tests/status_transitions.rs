@@ -154,12 +154,12 @@ async fn status_transition_table_no_dependencies_and_skipped_fill() {
         .any(|job| job.base));
     let empty_tip = declare(&f, "[package]\nname='no-dependencies'\nversion='0.1.0'\n");
     assert!(
-        crate::writer::fill::dependency_free(&f.main, &empty_tip).unwrap(),
+        crate::writer::fill::dependency_free(&f.main, &empty_tip, None).unwrap(),
         "fixture graph has dependencies"
     );
     assert_eq!(prepare_tip(&f, &runner), empty_tip);
     assert!(
-        crate::writer::fill::dependency_free(&runner.core.trees.mirror(&f.root), &empty_tip)
+        crate::writer::fill::dependency_free(&runner.core.trees.mirror(&f.root), &empty_tip, None,)
             .unwrap(),
         "mirror graph has dependencies"
     );
@@ -183,7 +183,7 @@ async fn status_transition_table_no_dependencies_and_skipped_fill() {
     assert_status(&runner, Some(&local_tip), RebuildResult::Ok, Some(0));
     let tip = local_tip;
     let unsupported_tip = declare(&f, "[package]\nname='unsupported'\nversion='0.1.0'\n[dependencies]\nlocal-dep = { path = '../outside' }\n");
-    assert!(!crate::writer::fill::dependency_free(&f.main, &unsupported_tip).unwrap());
+    assert!(!crate::writer::fill::dependency_free(&f.main, &unsupported_tip, None).unwrap());
     f.clock.fetch_add(12_000, Ordering::SeqCst);
     let mut inner = runner.core.inner.lock().unwrap();
     runner

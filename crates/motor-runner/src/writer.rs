@@ -10,6 +10,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 mod cache;
+pub(crate) mod declaration;
 pub(crate) mod fill;
 #[cfg(target_os = "linux")]
 pub use cache::CacheFill;

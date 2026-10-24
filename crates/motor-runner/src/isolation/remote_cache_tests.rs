@@ -66,7 +66,7 @@ fn start_unit_shell(
         .replace("/motor-tools/cache-forwarder", forwarder.to_str().unwrap())
         .replace("/motor-gateway/", "")
         // The writer's Cargo preflight is not what these tests check.
-        .replace("python3 /motor-tools/writer-preflight.py", "true");
+        .replace("/bin/bash /motor-tools/writer-cargo-check.sh", "true");
     let mut child = Command::new("/bin/bash")
         .args(["-c", &shell, USER, command])
         .current_dir(sockets)

@@ -2,7 +2,13 @@
 //! client. Trusted daemon preparation fetches that tip's locked sources before
 //! the writer launches. Offline preflight prevents resolving new sources or compiling a
 //! sibling path graph; submitted branch commits and working files are not inputs.
+//!
+//! A repository without a root `Cargo.toml` has no Cargo fill, so it declares
+//! its own in `.motor/cache.toml` (see [`declaration`]). Everything here that
+//! answers "what does this tip's fill run, and what does it depend on" takes
+//! that declaration into account.
 use crate::workspace::{self, Trees};
+use crate::writer::declaration::{self, Compilers, Declaration};
 use sha2::{Digest, Sha256};
 use std::{fs, io, path::Path};
 
@@ -11,6 +17,8 @@ pub(crate) fn descriptor(
     tip: &str,
     toolchain: &str,
     command: &str,
+    declaration: Option<&Declaration>,
+    compilers: &Compilers,
 ) -> io::Result<String> {
     // One tree traversal includes nested workspace manifests and Cargo configs.
     let tree = workspace::git(
@@ -36,7 +44,35 @@ pub(crate) fn descriptor(
             hash.update([0]);
         }
     }
+    // A declared fill depends on what it declared and on the files those
+    // patterns name, so it is hashed beside the Cargo inputs rather than
+    // instead of them: one tree can declare one fill and build another.
+    if let Some(declaration) = declaration.filter(|declaration| !declaration.fills.is_empty()) {
+        for step in &declaration.fills {
+            declaration::step_hash(&mut hash, step);
+        }
+        compilers.hash(&mut hash);
+        let paths: Vec<&str> = tree
+            .split('\0')
+            .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
+            .collect();
+        for path in declaration::matched(&paths, &declared_inputs(declaration)) {
+            hash.update(path.as_bytes());
+            hash.update([0]);
+            hash.update(&workspace::blob(mirror, &format!("{tip}:{path}"))?);
+            hash.update([0]);
+        }
+    }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Every pattern any declared fill lists, in declaration order.
+fn declared_inputs(declaration: &Declaration) -> Vec<String> {
+    declaration
+        .fills
+        .iter()
+        .flat_map(|step| step.descriptor_inputs.iter().cloned())
+        .collect()
 }
 
 pub(crate) fn locked_git(
@@ -54,6 +90,10 @@ pub(crate) fn locked_git(
 
 /// The checkout remains writer-owned; the daemon reads the expected paths from
 /// its mirror instead of running Git in a foreign-owned checkout.
+///
+/// Only tracked lockfiles are checked. A fill with no Cargo manifest, such as a
+/// declared C compilation, has no lockfile at all; that is not a lockfile that
+/// changed.
 pub(crate) fn lockfiles(
     mirror: &Path,
     tip: &str,
@@ -63,10 +103,12 @@ pub(crate) fn lockfiles(
     tree.split('\0')
         .filter(|p| p.rsplit('/').next() == Some("Cargo.lock"))
         .map(|p| {
-            Ok((
-                p.into(),
-                fs::read(path.join(p)).map_err(|e| io::Error::other(format!("{p}: {e}")))?,
-            ))
+            let bytes = match fs::read(path.join(p)) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(io::Error::other(format!("{p}: {error}"))),
+            };
+            Ok((p.into(), bytes))
         })
         .collect()
 }
@@ -75,6 +117,13 @@ pub(crate) fn lockfiles(
 // the warm command execute in the same tracked, network-isolated writer unit.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const PREFLIGHT: &str = include_str!("preflight.py");
+
+/// Whether the untrusted tree at `path` has a root Cargo manifest. The writer
+/// shell runs its Cargo preflight from this file, because the fill does not
+/// carry the tip's file list; the manifest is checked in the tree being
+/// compiled, not in the commit, so the two cannot disagree about a Cargo fill.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const CARGO_CHECK: &str = include_str!("cargo-check.sh");
 
 pub(crate) fn reader_missed(state: &Path, id: motor_protocol::Uuid) -> bool {
     fn nonzero(value: &serde_json::Value) -> bool {
@@ -123,7 +172,17 @@ pub(crate) fn statistics(state: &Path, id: motor_protocol::Uuid) -> io::Result<s
 /// cannot store. Graphs containing only those packages need no cache writer.
 /// Registry/git sources and paths outside the repository still require the
 /// writer's offline metadata validation before compiling.
-pub(crate) fn dependency_free(mirror: &Path, tip: &str) -> io::Result<bool> {
+///
+/// A declared fill is always run: its commands are explicit, so the shortcut
+/// that records a fill without a writer never applies to it.
+pub(crate) fn dependency_free(
+    mirror: &Path,
+    tip: &str,
+    declaration: Option<&Declaration>,
+) -> io::Result<bool> {
+    if declaration.is_some_and(|declaration| !declaration.fills.is_empty()) {
+        return Ok(false);
+    }
     let tree = workspace::git(mirror, &["ls-tree", "-r", "--name-only", "-z", tip])?;
     let paths: std::collections::BTreeSet<_> = tree
         .split('\0')

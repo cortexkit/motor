@@ -2,6 +2,7 @@ use super::*;
 #[path = "tests/tenant.rs"]
 mod tenant;
 use crate::spool::Upload;
+use crate::writer::declaration::Compilers;
 use cortexkit_test_support::ScratchDir;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};

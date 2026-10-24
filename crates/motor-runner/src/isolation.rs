@@ -2842,6 +2842,11 @@ impl Sandbox {
                         tools.join("writer-preflight.py"),
                         fs::Permissions::from_mode(0o644),
                     )?;
+                    // The writer shell decides from the working tree whether
+                    // Cargo has anything to check.
+                    let cargo_check = tools.join("writer-cargo-check.sh");
+                    fs::write(&cargo_check, crate::writer::fill::CARGO_CHECK)?;
+                    fs::set_permissions(cargo_check, fs::Permissions::from_mode(0o755))?;
                 }
             }
             if remote.is_some() {
@@ -3091,13 +3096,13 @@ impl Sandbox {
         // exit overwrites a preallocated block without truncation; if the shell is killed mid-write, the failed
         // unit retains its status for the engine's systemd fallback to read.
         let shell = if durable && self.writer {
-            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; if test \"$code\" = 0; then /bin/bash -c \"$1\" </dev/null >>/motor-output/stdout 2>>/motor-output/stderr; code=$?; fi; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>>/motor-output/stderr || true; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash /motor-tools/writer-cargo-check.sh >/motor-output/stdout 2>/motor-output/stderr; code=$?; if test \"$code\" = 0; then /bin/bash -c \"$1\" </dev/null >>/motor-output/stdout 2>>/motor-output/stderr; code=$?; fi; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>>/motor-output/stderr || true; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if durable && cached {
             "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if durable {
             "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash -c \"$1\" </dev/null >/motor-output/stdout 2>/motor-output/stderr; code=$?; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\""
         } else if self.writer {
-            "IFS= read -r -n 1 || exit 125; umask 022; python3 /motor-tools/writer-preflight.py || exit $?; exec /bin/bash -c \"$1\" </dev/null"
+            "IFS= read -r -n 1 || exit 125; umask 022; /bin/bash /motor-tools/writer-cargo-check.sh || exit $?; exec /bin/bash -c \"$1\" </dev/null"
         } else {
             "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
         };

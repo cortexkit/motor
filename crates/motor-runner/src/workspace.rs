@@ -613,17 +613,29 @@ pub(crate) fn record_siblings(catalog: &mut Catalog, siblings: &[SiblingSnapshot
 /// (or under `[package.metadata.motor]` for a single-package repository), and
 /// they run in order. A Cargo project that declares nothing builds every
 /// target of its whole workspace, and a tree with no root `Cargo.toml` has
-/// nothing to warm. The runner never assumes a particular repository's
-/// package names.
+/// nothing to warm from Cargo. The runner never assumes a particular
+/// repository's package names.
 pub(crate) fn warm_command(mirror: &Path, commit: &str) -> String {
     warm_plan(mirror, commit).0
 }
 
 /// Keep whether the command was explicitly requested, even when it equals the
 /// default: a requested command must run rather than take a no-dependency shortcut.
+///
+/// A tree with no root `Cargo.toml` has no Cargo fill, so whatever its
+/// `.motor/cache.toml` declares is the whole warm plan. Its steps are
+/// explicit for the same reason, and a tree that declares nothing still runs
+/// `true`.
 pub(crate) fn warm_plan(mirror: &Path, commit: &str) -> (String, bool) {
     let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) else {
-        return ("true".to_string(), false);
+        let declared = crate::writer::declaration::read(mirror, commit)
+            .ok()
+            .flatten()
+            .and_then(|declaration| declaration.command());
+        return match declared {
+            Some(command) => (command, true),
+            None => ("true".to_string(), false),
+        };
     };
     manifest_warm_plan(&manifest, commit)
 }
