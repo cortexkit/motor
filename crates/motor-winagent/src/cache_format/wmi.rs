@@ -1,6 +1,8 @@
 //! Local WMI/COM adapter for MSFT_Volume.Format (Storagewmi.mof).
 
-use super::{FormatOptions, FormatResult, FormatValue, StorageProvider, Volume, remaining_ms};
+use super::{
+    FormatOptions, FormatResult, StorageProvider, Volume, put_format_parameters, remaining_ms,
+};
 use std::{io, sync::OnceLock, time::Instant};
 use windows::{
     Win32::{
@@ -262,17 +264,12 @@ impl StorageProvider for Provider {
         let input = com("create Format parameters", unsafe {
             signature.SpawnInstance(0)
         })?;
-        for (name, value) in options.parameters() {
+        put_format_parameters(options, |name, value: &VARIANT| {
             let name = BSTR::from(name);
-            let value = match value {
-                FormatValue::Text(value) => VARIANT::from(value),
-                FormatValue::Number(value) => VARIANT::from(value),
-                FormatValue::Boolean(value) => VARIANT::from(value),
-            };
-            com("set Format parameter", unsafe {
-                input.Put(PCWSTR(name.as_ptr()), 0, &value, 0)
-            })?;
-        }
+            unsafe { input.Put(PCWSTR(name.as_ptr()), 0, value, 0) }.map_err(|error| {
+                io::Error::other(format!("HRESULT 0x{:08x}: {error}", error.code().0 as u32))
+            })
+        })?;
         remaining_ms(deadline)?;
         com("begin Format", unsafe {
             self.services.ExecMethod(
@@ -308,5 +305,38 @@ impl StorageProvider for Provider {
             extended_status: extended_status(&output)
                 .unwrap_or_else(|error| format!("unavailable: {error}")),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Variant::VT_BOOL;
+
+    #[test]
+    fn format_put_constructs_native_variant_types_and_values() {
+        let mut puts = Vec::new();
+        put_format_parameters(&FormatOptions::default(), |name, value: &VARIANT| {
+            let payload = match value.vt() {
+                VT_BSTR => unsafe { value.Anonymous.Anonymous.Anonymous.bstrVal.to_string() },
+                VT_I4 => unsafe { value.Anonymous.Anonymous.Anonymous.lVal.to_string() },
+                VT_BOOL => unsafe { value.Anonymous.Anonymous.Anonymous.boolVal.0.to_string() },
+                other => panic!("unexpected VARIANT type for {name}: {other:?}"),
+            };
+            puts.push((name.to_owned(), value.vt(), payload));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            puts,
+            [
+                ("FileSystem", VT_BSTR, "NTFS"),
+                ("FileSystemLabel", VT_BSTR, "motor-target"),
+                ("AllocationUnitSize", VT_I4, "0"),
+                ("Full", VT_BOOL, "0"),
+                ("Force", VT_BOOL, "-1"),
+            ]
+            .map(|(name, kind, value)| (name.to_owned(), kind, value.to_owned()))
+        );
     }
 }

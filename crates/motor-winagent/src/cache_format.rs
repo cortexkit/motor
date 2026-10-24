@@ -56,6 +56,33 @@ impl FormatOptions {
     }
 }
 
+// Share constructor dispatch with a portable Put recorder, including both integer
+// constructors so it can distinguish VT_I4 from VT_UI4 without a COM runtime.
+// Format's string inputs use VT_BSTR and its booleans use VT_BOOL (-1/0):
+// https://learn.microsoft.com/en-us/windows/win32/wmisdk/strings
+// https://learn.microsoft.com/en-us/windows/win32/wmisdk/boolean
+fn put_format_parameters<V>(
+    options: &FormatOptions,
+    mut put: impl FnMut(&str, &V) -> io::Result<()>,
+) -> io::Result<()>
+where
+    V: From<&'static str> + From<u32> + From<i32> + From<bool>,
+{
+    for (name, value) in options.parameters() {
+        let value = match value {
+            FormatValue::Text(value) => V::from(value),
+            // WMI carries CIM_UINT32 as VT_I4, not VT_UI4. Preserve all 32 bits.
+            // https://learn.microsoft.com/en-us/windows/win32/wmisdk/numbers
+            FormatValue::Number(value) => V::from(value as i32),
+            FormatValue::Boolean(value) => V::from(value),
+        };
+        put(name, &value).map_err(|error| {
+            io::Error::other(format!("cache WMI set Format parameter {name}: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 struct FormatResult {
     return_value: u32,
     extended_status: String,
@@ -521,6 +548,103 @@ mod tests {
 #[cfg(test)]
 mod provider_contract_tests {
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedVariant {
+        Bstr(&'static str),
+        I4(i32),
+        Ui4(u32),
+        Bool(i16),
+    }
+
+    impl From<&'static str> for RecordedVariant {
+        fn from(value: &'static str) -> Self {
+            Self::Bstr(value)
+        }
+    }
+
+    impl From<i32> for RecordedVariant {
+        fn from(value: i32) -> Self {
+            Self::I4(value)
+        }
+    }
+
+    impl From<u32> for RecordedVariant {
+        fn from(value: u32) -> Self {
+            Self::Ui4(value)
+        }
+    }
+
+    impl From<bool> for RecordedVariant {
+        fn from(value: bool) -> Self {
+            Self::Bool(if value { -1 } else { 0 })
+        }
+    }
+
+    #[test]
+    fn format_put_uses_documented_variant_types() {
+        let cases = [
+            (
+                FormatOptions::default(),
+                [
+                    ("FileSystem", RecordedVariant::Bstr("NTFS")),
+                    ("FileSystemLabel", RecordedVariant::Bstr("motor-target")),
+                    ("AllocationUnitSize", RecordedVariant::I4(0)),
+                    ("Full", RecordedVariant::Bool(0)),
+                    ("Force", RecordedVariant::Bool(-1)),
+                ],
+            ),
+            (
+                FormatOptions {
+                    filesystem: "ReFS",
+                    label: "other-label",
+                    allocation_unit_size: u32::MAX,
+                    full: true,
+                    force: false,
+                },
+                [
+                    ("FileSystem", RecordedVariant::Bstr("ReFS")),
+                    ("FileSystemLabel", RecordedVariant::Bstr("other-label")),
+                    ("AllocationUnitSize", RecordedVariant::I4(-1)),
+                    ("Full", RecordedVariant::Bool(-1)),
+                    ("Force", RecordedVariant::Bool(0)),
+                ],
+            ),
+        ];
+        for (options, expected) in cases {
+            let mut puts = Vec::new();
+            put_format_parameters(&options, |name, value: &RecordedVariant| {
+                puts.push((name.to_owned(), value.clone()));
+                Ok(())
+            })
+            .unwrap();
+            let expected = expected.map(|(name, value)| (name.to_owned(), value));
+            assert_eq!(puts, expected);
+        }
+    }
+
+    #[test]
+    fn format_put_failure_names_the_parameter_and_stops() {
+        let mut names = Vec::new();
+        let error =
+            put_format_parameters(&FormatOptions::default(), |name, _: &RecordedVariant| {
+                names.push(name.to_owned());
+                if name == "AllocationUnitSize" {
+                    Err(io::Error::other("HRESULT 0x80041005: type mismatch"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(
+            names,
+            ["FileSystem", "FileSystemLabel", "AllocationUnitSize"]
+        );
+        assert_eq!(
+            error.to_string(),
+            "cache WMI set Format parameter AllocationUnitSize: HRESULT 0x80041005: type mismatch"
+        );
+    }
 
     #[test]
     fn format_method_parameters_match_the_documented_storage_schema() {
