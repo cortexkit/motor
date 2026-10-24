@@ -1,6 +1,10 @@
+#[cfg(any(target_os = "linux", test))]
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+// Only the Linux helper reads a staged file; other builds keep the portable
+// type for their tests.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const MAX_RUNNER_ARGS: usize = 16 * 1024;
 
 /// Durable provisioning intent, retained until the guest and host barriers pass.
@@ -13,6 +17,7 @@ pub struct ResizeActivation {
     pub quota_grew: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl ResizeActivation {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         let activation: Self = serde_json::from_slice(bytes).map_err(|e| Error(e.to_string()))?;
@@ -23,6 +28,7 @@ impl ResizeActivation {
 
 // Keep the option grammar aligned with the guest's RunnerArgs::parse. These
 // are whitespace-separated arguments, never shell source or executable paths.
+#[cfg(any(target_os = "linux", test))]
 fn validate_runner_args(text: &str) -> Result<()> {
     if text.len() > MAX_RUNNER_ARGS {
         return Err(Error("runner_args exceeds 16 KiB".into()));

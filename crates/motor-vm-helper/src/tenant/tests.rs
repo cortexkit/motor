@@ -591,6 +591,8 @@ impl Backend for Fake {
     }
     fn apply_resize(&mut self, _: &str, activation: &ResizeActivation) -> Result<()> {
         self.call("apply-resize")?;
+        // Only the Linux branch below sends it to a fake guest.
+        let _ = activation;
         #[cfg(target_os = "linux")]
         {
             use std::{
