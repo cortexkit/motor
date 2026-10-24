@@ -1613,10 +1613,10 @@ const SHELL_GATE: &str = "IFS= read -r -n 1 || exit 125; umask 022; ";
 /// Inserts the start of each remote cache forwarder right after the gate, so
 /// the forwarders are listening before anything else of the unit runs, the
 /// writer's preflight included. Without forwarders the shell is unchanged.
-fn with_cache_forwarders(
-    shell: &'static str,
+fn with_cache_forwarders<'a>(
+    shell: &'a str,
     forwarders: &[transport::Forwarder],
-) -> io::Result<std::borrow::Cow<'static, str>> {
+) -> io::Result<std::borrow::Cow<'a, str>> {
     if forwarders.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(shell));
     }
@@ -1629,8 +1629,29 @@ fn with_cache_forwarders(
     )))
 }
 
-/// Lets `account` connect to each socket in `paths`, without following
-/// symlinks.
+/// The same list drives preallocation, bind mounts and writer grants.
+fn cache_output_names(ccache: bool) -> Vec<&'static str> {
+    let mut names = vec!["stdout", "stderr", "exit", "cache-stats"];
+    if ccache {
+        names.push(crate::remote_cache::ccache::STATS_FILE);
+    }
+    names
+}
+
+/// Capture after the command saves its status, so a statistics failure never
+/// replaces the build's exit code. The output inode is allocated before launch.
+fn with_ccache_statistics(shell: &str, enabled: bool) -> String {
+    if enabled {
+        shell.replace(
+            "printf '%s\\n' \"$code\"",
+            "ccache --print-stats >/motor-output/ccache-stats 2>/dev/null || true; printf '%s\\n' \"$code\"",
+        )
+    } else {
+        shell.to_string()
+    }
+}
+
+/// Lets `account` connect to each socket in `paths`, without following symlinks.
 fn grant_sockets(paths: &[PathBuf], account: &str) -> io::Result<()> {
     checked(
         crate::privilege::command("/usr/bin/setfacl")
@@ -2710,9 +2731,12 @@ impl Sandbox {
         fs::create_dir_all(&output)?;
         let mut grant_paths = Vec::new();
         let mut writer_grants = Vec::new();
-        for name in ["stdout", "stderr", "exit", "cache-stats"] {
+        let output_names = cache_output_names(
+            remote.is_some_and(|r| r.has_tool(crate::remote_cache::gateway::Tool::Ccache)),
+        );
+        for name in &output_names {
             let file = output.join(name);
-            if name == "exit" {
+            if *name == "exit" {
                 // Allocate and flush the exit block before job code can fill the
                 // volume. The wrapper overwrites it without truncation.
                 fs::write(&file, [b' '; 32])?;
@@ -2820,7 +2844,7 @@ impl Sandbox {
         mount_destinations.push(PathBuf::from("/etc/hosts"));
         read_only.push(bind(&output, Path::new("/motor-output"))?);
         mount_destinations.push(PathBuf::from("/motor-output"));
-        for name in ["stdout", "stderr", "exit", "cache-stats"] {
+        for name in &output_names {
             let destination = Path::new("/motor-output").join(name);
             read_write.push(bind(&output.join(name), &destination)?);
             mount_destinations.push(destination);
@@ -2837,7 +2861,7 @@ impl Sandbox {
         let tools = runtime.0.join("tools");
         // With a remote cache the tool directory carries the forwarder, so it
         // is mounted even where the shared compile cache is off.
-        if cached_rust || wrapper.is_some() || remote.is_some() {
+        if cached_rust || wrapper.is_some() || remote.is_some() || writer {
             use std::os::unix::fs::PermissionsExt;
             fs::create_dir_all(&tools)?;
             fs::set_permissions(&tools, fs::Permissions::from_mode(0o755))?;
@@ -2865,21 +2889,21 @@ impl Sandbox {
                     fs::Permissions::from_mode(0o644),
                 )?;
                 path = format!("/motor-tools:{path}");
-                if writer {
-                    fs::write(
-                        tools.join("writer-preflight.py"),
-                        crate::writer::fill::PREFLIGHT,
-                    )?;
-                    fs::set_permissions(
-                        tools.join("writer-preflight.py"),
-                        fs::Permissions::from_mode(0o644),
-                    )?;
-                    // The writer shell decides from the working tree whether
-                    // Cargo has anything to check.
-                    let cargo_check = tools.join("writer-cargo-check.sh");
-                    fs::write(&cargo_check, crate::writer::fill::CARGO_CHECK)?;
-                    fs::set_permissions(cargo_check, fs::Permissions::from_mode(0o755))?;
-                }
+            }
+            if writer {
+                fs::write(
+                    tools.join("writer-preflight.py"),
+                    crate::writer::fill::PREFLIGHT,
+                )?;
+                fs::set_permissions(
+                    tools.join("writer-preflight.py"),
+                    fs::Permissions::from_mode(0o644),
+                )?;
+                // The writer shell decides from the working tree whether
+                // Cargo has anything to check.
+                let cargo_check = tools.join("writer-cargo-check.sh");
+                fs::write(&cargo_check, crate::writer::fill::CARGO_CHECK)?;
+                fs::set_permissions(cargo_check, fs::Permissions::from_mode(0o755))?;
             }
             if remote.is_some() {
                 // The forwarder holds no key, so the unit may read and run it.
@@ -2977,7 +3001,7 @@ impl Sandbox {
         prepare_job_checkout_root(workspace)?;
         if let Some(account) = writer_account {
             prepare_writer_trees(&[workspace, target, &host_home, &tmp], account)?;
-            for name in ["stdout", "stderr", "exit", "cache-stats"] {
+            for name in &output_names {
                 writer_grants.push(output.join(name));
             }
             checked(
@@ -3138,7 +3162,15 @@ impl Sandbox {
         } else {
             "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
         };
-        let shell = with_cache_forwarders(shell, &self.cache_forwarders)?;
+        let shell = with_ccache_statistics(
+            shell,
+            durable
+                && self
+                    .cache_forwarders
+                    .iter()
+                    .any(|f| f.tool() == crate::remote_cache::gateway::Tool::Ccache),
+        );
+        let shell = with_cache_forwarders(&shell, &self.cache_forwarders)?;
         cmd.args([
             "--wait",
             "--service-type=exec",

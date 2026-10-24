@@ -12,6 +12,11 @@ use crate::storage::{PublicationRecord, PublishedKey, StoreIdentity};
 #[path = "publication_settlement.rs"]
 mod settlement;
 
+// The real ccache fixture drives the Linux-only transport test harness.
+#[cfg(target_os = "linux")]
+#[path = "ccache_qualification.rs"]
+mod ccache_qualification;
+
 const HOUR: u64 = 60 * 60 * 1000;
 const DAY: u64 = 24 * HOUR;
 
@@ -286,7 +291,7 @@ fn attach(
     binding
 }
 
-const CCACHE_OK: &str = "remote_storage_error 0\nremote_storage_timeout 0\n";
+const CCACHE_OK: &str = "remote_storage_hit 0\nremote_storage_error 0\nremote_storage_timeout 0\n";
 const SCCACHE_OK: &str =
     r#"{"stats":{"cache_misses":{"counts":{}},"cache_write_errors":0,"cache_errors":9}}"#;
 
@@ -372,11 +377,11 @@ async fn active_tool_statistics_are_required_and_write_errors_prevent_publicatio
         (Tool::Ccache, Some("not statistics")),
         (
             Tool::Ccache,
-            Some("remote_storage_error 1\nremote_storage_timeout 0\n"),
+            Some("remote_storage_hit 0\nremote_storage_error 1\nremote_storage_timeout 0\n"),
         ),
         (
             Tool::Ccache,
-            Some("remote_storage_error 0\nremote_storage_timeout 1\n"),
+            Some("remote_storage_hit 0\nremote_storage_error 0\nremote_storage_timeout 1\n"),
         ),
         (Tool::Sccache, None),
         (Tool::Sccache, Some("not statistics")),

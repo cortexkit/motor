@@ -1117,6 +1117,8 @@ pub(crate) fn scrub_inherited_cache_environment(
     if config.remote_cache_available(setup.base).is_none() {
         return;
     }
+    // Declared C/C++ fills and jobs need not contain a Cargo manifest.
+    env.retain(|key, _| !key.starts_with("CCACHE_"));
     #[cfg(target_os = "linux")]
     if !(setup.base || rust_job(setup)) {
         return;
@@ -1154,6 +1156,7 @@ fn remote_cache_environment(
         &forwarders,
         &generation,
         setup.base,
+        &setup.request.workspace_key,
         env,
     );
     Ok(())
@@ -1167,6 +1170,7 @@ pub(crate) fn remote_cache_job_environment(
     forwarders: &[crate::remote_cache::transport::Forwarder],
     generation: &crate::remote_cache::provisioning::ActiveGeneration,
     fill: bool,
+    workspace: &str,
     env: &mut BTreeMap<String, String>,
 ) {
     let mut delta = crate::remote_cache::environment::delta(
@@ -1175,12 +1179,25 @@ pub(crate) fn remote_cache_job_environment(
         &generation.bucket,
         &generation.region,
     );
-    if fill {
+    if fill
+        && forwarders
+            .iter()
+            .any(|f| f.tool() == crate::remote_cache::gateway::Tool::Sccache)
+    {
         delta.extend(crate::remote_cache::environment::fill_values());
         delta.insert(
             "SCCACHE_S3_RW_MODE".into(),
             crate::remote_cache::environment::READ_WRITE_MODE.into(),
         );
+    }
+    if let Some(forwarder) = forwarders
+        .iter()
+        .find(|f| f.tool() == crate::remote_cache::gateway::Tool::Ccache)
+        .filter(|_| crate::remote_cache::ccache::installed(role))
+    {
+        delta.extend(crate::remote_cache::ccache::environment(
+            forwarder, fill, workspace,
+        ));
     }
     env.extend(delta);
 }

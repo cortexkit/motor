@@ -8,7 +8,7 @@ use std::{
 
 /// The daemon's private resolver directory, as attachment installs it and as
 /// the runner's own files outside this module refer to it.
-pub(crate) const DIRECTORY: &str = "/run/motor-tenant-daemon";
+pub(crate) const DIRECTORY: &str = crate::tenant::DNS_DIRECTORY;
 
 /// Root-only backing file for the daemon service's private resolver bind.
 /// Updating the same inode also preserves the binding across a future refresh.

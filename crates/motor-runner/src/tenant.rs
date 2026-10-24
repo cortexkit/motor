@@ -8,6 +8,20 @@ use std::{
     sync::Mutex,
 };
 
+/// Written by tenant attachment once it has placed the daemon's private
+/// resolver file. The runner that attachment starts reads it to decide whether
+/// a snapshot helper unit binds that resolver; every runner is started before
+/// the file exists. It lives on `/run`, which a fresh boot of the VM clears,
+/// so no stale marker outlives the resolver it describes. Defined here, not in
+/// the Linux-only tenant agent, because snapshot helpers name it in tests on
+/// every OS.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const DNS_MARKER: &str = "/run/motor-tenant-dns";
+/// The daemon's private resolver directory, as attachment installs it and as
+/// the runner's own files outside the tenant agent refer to it.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const DNS_DIRECTORY: &str = "/run/motor-tenant-daemon";
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
     started: bool,

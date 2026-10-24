@@ -81,6 +81,8 @@ fn run_prefetch(config: &Config, scratch: &ScratchDir, limit: Duration) -> io::R
     )
 }
 
+// Installs the resolver with the Linux-only tenant agent.
+#[cfg(target_os = "linux")]
 #[test]
 fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
     let scratch = ScratchDir::new("tenant-helper-dns");
