@@ -383,11 +383,23 @@ def positive_control_passed(report):
 
 
 def file_setattr_status(result, control):
+    """PASS, INCONCLUSIVE or FAIL for the job's file_setattr refusal.
+
+    Judged only from the root control and the job's inheritance report. The
+    fill that follows the inheritance probe is checked elsewhere: a lane that
+    writes a partial fill exits 0 with errno null, a full lane exits 73 with
+    EDQUOT/ENOSPC, and neither outcome says anything about this syscall."""
     try:
         report = json.loads(result.get('stdout', ''))
     except (ValueError, TypeError):
         return 'FAIL'
-    refused = result.get('code') == 73 and report.get('inheritance', {}).get('file_setattr_errno') == errno.ENOSYS
+    inheritance = report.get('inheritance') if isinstance(report, dict) else None
+    if not isinstance(inheritance, dict):
+        return 'FAIL'
+    # type() rejects True, which equals 1 and would otherwise pass as an errno.
+    refused = (type(inheritance.get('file_setattr_errno')) is int
+               and inheritance['file_setattr_errno'] == errno.ENOSYS
+               and inheritance.get('setters_refused') == [0x401c5820, 0x40086602, 0x40046602])
     if not refused or not positive_control_passed(control):
         return 'FAIL'
     if control.get('file_setattr_supported') is True and control.get('file_setattr_errno') == 0:

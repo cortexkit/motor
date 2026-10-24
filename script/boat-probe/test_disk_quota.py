@@ -240,6 +240,45 @@ class DiskQuotaChecks(unittest.TestCase):
         self.assertEqual(disk_quota.file_setattr_status(result, self.control(False)), 'FAIL')
         self.assertEqual(disk_quota.file_setattr_status({}, self.control(False)), 'FAIL')
 
+    def partial_fill_job(self):
+        """The tmp lane's job result from the live b5501621 run: a 256 MiB partial fill that exited 0."""
+        return dict(code=0, stdout=json.dumps({
+            'phase': 'at-limit', 'lane': 'tmp', 'errno': None, 'bytes_written': 268435456, 'fill_target_bytes': 268435456,
+            'inheritance': {'project': 2, 'child_project': 2, 'setters_refused': [1075599392, 1074292226, 1074030082],
+                            'file_setattr_errno': 38},
+            'projects': {name: 2 for name in ('workspace', 'target', 'home', 'tmp', 'var_tmp', 'stdout', 'stderr', 'exit', 'cache-stats')},
+            'baseline_bytes': 0, 'baseline_project_ids': [], 'released_logical_bytes': 0}))
+
+    def test_file_setattr_is_judged_without_the_fill_outcome(self):
+        import probe
+        result = self.partial_fill_job()
+        live_control = dict(self.control(False), kernel_release='6.8.0-138-generic')
+        status = disk_quota.file_setattr_status(result, live_control)
+        self.assertEqual(status, 'INCONCLUSIVE')
+        row = {'name': 'disk_quota.tmp.file_setattr_refusal', 'status': status, 'evidence': {'control': live_control}}
+        self.assertEqual(probe.tolerated_inconclusive(row), 'file_setattr absent on kernel 6.8.0-138-generic (ENOSYS); not applicable')
+        self.assertEqual(disk_quota.file_setattr_status(result, self.control()), 'PASS')
+        # A full lane's EDQUOT exit and a failed fill leave the verdict unchanged.
+        for code, fill_errno in ((73, errno.EDQUOT), (74, errno.EIO)):
+            with self.subTest(code=code):
+                changed = dict(result, code=code, stdout=json.dumps(dict(json.loads(result['stdout']), errno=fill_errno)))
+                self.assertEqual(disk_quota.file_setattr_status(changed, live_control), 'INCONCLUSIVE')
+                self.assertEqual(disk_quota.file_setattr_status(changed, self.control()), 'PASS')
+
+    def test_file_setattr_still_requires_the_job_refusals(self):
+        for change in ({'file_setattr_errno': errno.EPERM}, {'file_setattr_errno': None}, {'file_setattr_errno': True},
+                       {'file_setattr_errno': '38'}, {'setters_refused': [0x401c5820, 0x40086602]}, {'setters_refused': None}):
+            with self.subTest(change=change):
+                result = self.partial_fill_job()
+                report = json.loads(result['stdout'])
+                report['inheritance'].update(change)
+                result['stdout'] = json.dumps(report)
+                self.assertEqual(disk_quota.file_setattr_status(result, self.control()), 'FAIL')
+                self.assertEqual(disk_quota.file_setattr_status(result, self.control(False)), 'FAIL')
+        for stdout in (json.dumps({'errno': None}), json.dumps([]), json.dumps({'inheritance': []}), ''):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(disk_quota.file_setattr_status(dict(code=0, stdout=stdout), self.control()), 'FAIL')
+
 
 if __name__ == '__main__':
     unittest.main()
