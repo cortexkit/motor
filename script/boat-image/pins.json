@@ -22,6 +22,6 @@
     "script/runner/install-binaryen.py": "dfd4a8741fe70f2334cfaf63681710f6271f15067a9f3b1012fd82d22416ab6d",
     "script/runner/parity-files.txt": "1c55421937a8077f85bbd1fbb7b24b2999e020477f7e506b8d7f864be716a226",
     "script/runner/remote-cache-environment.py": "08ab82222025a888a3a436435daf2520213d799d4cb944a90b2843a6a7f2b2d2",
-    "script/runner/install-npm-tool.py": "ef6c5a0e02ac68fdb89b77d381187f0ddb48c16c72b8f17e56c40617128cc0e9"
+    "script/runner/install-npm-tool.py": "8eee780634eeb78d815a3ddb53b3754a6a9dad9aa653ebcdf9df0e9b04b25cf7"
   }
 }
