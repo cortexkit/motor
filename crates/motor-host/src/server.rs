@@ -182,6 +182,8 @@ pub struct Runtime {
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
     /// Closed tenants whose removal is running on its own thread.
     removal_workers: Mutex<BTreeSet<String>>,
+    /// Start-refused tenants whose start retry is running on its own thread.
+    start_retry_workers: Mutex<BTreeSet<String>>,
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
@@ -247,6 +249,7 @@ impl Runtime {
             terminal_workers: Mutex::new(BTreeSet::new()),
             tenant_operations,
             removal_workers: Mutex::new(BTreeSet::new()),
+            start_retry_workers: Mutex::new(BTreeSet::new()),
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
             sandbox_identity,
@@ -379,11 +382,45 @@ impl Runtime {
         Ok(claims)
     }
     fn ensure(self: &Arc<Self>, tenant: &str) -> Result<()> {
+        self.ensure_at(tenant, unix_ms())
+    }
+    fn ensure_at(self: &Arc<Self>, tenant: &str, now_ms: u64) -> Result<()> {
         let operations = self.tenant_operations(tenant)?;
         let _operation = operations.lock().expect("tenant operations lock");
-        self.ensure_locked(tenant)?;
+        self.ensure_locked(tenant, now_ms)?;
         self.start_events(tenant.to_owned());
         Ok(())
+    }
+    /// Measures the capacity file and free bytes on the host storage
+    /// filesystem and moves the storage refusal latch. Runs before every
+    /// admission and every heartbeat; a host that does not enforce the
+    /// refusal skips the I/O.
+    pub fn probe_storage(&self) {
+        if !self.host.lock().expect("host lock").storage_enforced() {
+            return;
+        }
+        let capacity = self.control.capacity().map_err(|error| format!("{error:#}"));
+        let free = self
+            .control
+            .available_bytes()
+            .map_err(|error| format!("{error:#}"));
+        self.host
+            .lock()
+            .expect("host lock")
+            .observe_storage(capacity, free);
+    }
+    /// Starts every start-refused tenant whose retry is due, one at a time,
+    /// and returns the first failure. The tick runs the same retries on their
+    /// own threads.
+    pub fn retry_refused_starts(self: &Arc<Self>, now_ms: u64) -> Result<()> {
+        let due = self.host.lock().expect("host lock").start_retries_due(now_ms);
+        let mut failure = None;
+        for tenant in due {
+            if let Err(error) = self.ensure_at(&tenant, now_ms) {
+                failure.get_or_insert(error.context(format!("retry start of tenant {tenant}")));
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
     /// Tenants that are neither ready nor removed. In a sandbox, where the
     /// broker owns the VM and nothing suspends it, such a tenant is one whose
@@ -414,13 +451,21 @@ impl Runtime {
             .cloned()
             .context("unknown tenant operations")
     }
-    fn ensure_locked(&self, tenant: &str) -> Result<()> {
+    fn ensure_locked(&self, tenant: &str, now_ms: u64) -> Result<()> {
         let (ready, generation) = {
             let host = self.host.lock().expect("host lock");
             ensure!(
                 !host.is_suspending(tenant),
                 Error::Refused(Refusal::Capacity)
             );
+            // A start the helper refused is not asked for again before its
+            // retry time, whoever asks: at most one start attempt a minute.
+            if host
+                .start_retry_at(tenant)
+                .is_some_and(|retry_at| now_ms < retry_at)
+            {
+                return Err(Error::Refused(Refusal::HostFull).into());
+            }
             (
                 host.is_ready(tenant),
                 host.snapshot
@@ -432,6 +477,23 @@ impl Runtime {
         if !ready {
             tracing::info!(tenant, initialized_generation = ?generation, "tenant_wake_started");
             let generation = self.control.wake(tenant, generation).map_err(|error| {
+                if let Some(refused) = error.downcast_ref::<crate::helper::StartRefused>() {
+                    // A policy refusal is host capacity, not a fault: the
+                    // lease ends before Run as retryable host_full, and the
+                    // tenant advertises nothing until a start succeeds.
+                    tracing::error!(
+                        tenant,
+                        case = refused.case,
+                        detail = refused.message,
+                        retry_in_ms = crate::state::START_RETRY_MS,
+                        "tenant_start_refused"
+                    );
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .start_refused(tenant, &refused.case, now_ms);
+                    return Error::Refused(Refusal::HostFull);
+                }
                 tracing::error!(tenant, detail=%error, "tenant_recovery_or_initialization_failed");
                 error
                     .downcast_ref::<Error>()
@@ -645,6 +707,34 @@ impl Runtime {
                 self.control.stop(&tenant)?;
                 self.host.lock().expect("host lock").stopped(&tenant)?;
             }
+        }
+        // A start can take minutes, so each due retry of a start-refused
+        // tenant runs on its own thread, at most one per tenant at a time.
+        let retries = self
+            .host
+            .lock()
+            .expect("host lock")
+            .start_retries_due(now_ms);
+        for tenant in retries {
+            if !self
+                .start_retry_workers
+                .lock()
+                .expect("start retry workers")
+                .insert(tenant.clone())
+            {
+                continue;
+            }
+            let runtime = self.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = runtime.ensure_at(&tenant, now_ms) {
+                    tracing::warn!(tenant, detail = %format!("{error:#}"), "tenant_start_retry_failed");
+                }
+                runtime
+                    .start_retry_workers
+                    .lock()
+                    .expect("start retry workers")
+                    .remove(&tenant);
+            });
         }
         // A removal stops the VM and waits on the helper, so it runs on its
         // own thread rather than holding up this tick's cancels and expiry.
@@ -874,7 +964,7 @@ impl Runtime {
             .clone();
         let operations = self.tenant_operations(&tenant)?;
         let _operation = operations.lock().expect("tenant operations lock");
-        self.ensure_locked(&tenant)?;
+        self.ensure_locked(&tenant, unix_ms())?;
         self.start_events(tenant.clone());
         let mut stream = self.control.relay(&tenant, 52).map_err(|error| {
             tracing::error!(tenant, port = 52, detail = %error, "tenant_job_relay_failed");
@@ -1066,6 +1156,12 @@ where
             "expected challenge response",
         ));
     };
+    // Every admission re-measures host storage first, so a lease is never
+    // admitted on a stale reading of the storage refusal latch.
+    let storage_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || storage_runtime.probe_storage())
+        .await
+        .at(Side::Host, "storage_probe")?;
     let verified = (|| -> Result<_, (Error, &'static str)> {
         let mut nonces = Nonces::default();
         nonces

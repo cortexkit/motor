@@ -28,11 +28,43 @@ pub trait Control: Send + Sync {
     fn admin(&self, tenant: &str, request: &Value) -> Result<Value>;
     fn suspend(&self, tenant: &str) -> Result<()>;
     fn available_bytes(&self) -> Result<u64>;
+    /// Reads the host capacity file. Without one, the storage refusal stays
+    /// latched and free memory is advertised as 0.
+    fn capacity(&self) -> Result<crate::capacity::Capacity> {
+        anyhow::bail!("host capacity file unavailable")
+    }
+    /// The running guest's `mem_available_bytes` from the tenant runner's
+    /// health, or `None` when the runner's health reply does not carry it.
+    fn runner_memory(&self, tenant: &str) -> Result<Option<u64>> {
+        let reply = self.admin(tenant, &json!({"op":"status"}))?;
+        ensure!(reply["ok"] == true, "tenant runner status refused");
+        Ok(reply["health"]["mem_available_bytes"].as_u64())
+    }
 }
+
+/// The helper refused to start a tenant VM for a host policy reason, such as
+/// an invalid capacity file, a memory misfit or a failed resize activation.
+/// The lease that asked for the start is refused as `host_full`, which the
+/// requester retries, and the tenant advertises no capacity until a start
+/// succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRefused {
+    /// The helper's refusal case, such as `capacity_json` or `fit`.
+    pub case: String,
+    pub message: String,
+}
+impl std::fmt::Display for StartRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "helper start_refused {}: {}", self.case, self.message)
+    }
+}
+impl std::error::Error for StartRefused {}
 
 pub struct Helper {
     pub socket: PathBuf,
     pub storage: PathBuf,
+    /// The capacity file; production uses [`crate::capacity::CONFIG`].
+    pub capacity: PathBuf,
     pub guest_init: BTreeMap<String, Value>,
 }
 impl Helper {
@@ -169,6 +201,13 @@ impl Control for Helper {
         } else {
             self.request(json!({"op":"ensure", "tenant":tenant}))?
         };
+        if reply["result"] == "start_refused" {
+            return Err(StartRefused {
+                case: reply["case"].as_str().unwrap_or("unknown").to_owned(),
+                message: reply["message"].as_str().unwrap_or("").to_owned(),
+            }
+            .into());
+        }
         let generation = reply["generation"].as_u64().context("helper generation")?;
         let recovery = reply["recovery_required"] == true;
         if recovery || !running || initialized_generation != Some(generation) {
@@ -234,6 +273,9 @@ impl Control for Helper {
     }
     fn available_bytes(&self) -> Result<u64> {
         available_bytes(&self.storage)
+    }
+    fn capacity(&self) -> Result<crate::capacity::Capacity> {
+        crate::capacity::read(&self.capacity, 0)
     }
 }
 

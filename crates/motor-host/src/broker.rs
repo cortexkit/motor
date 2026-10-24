@@ -3,7 +3,7 @@ use crate::{
     billing::{sign_request, Request},
     server::{unix_ms, Runtime},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use motor_lease::Heartbeat;
 use serde_json::Value;
@@ -310,16 +310,18 @@ impl Heartbeats {
             .collect();
         let mut healthy = self.last_state.as_ref().is_none_or(|h| h.healthy);
         let due = now_ms.saturating_sub(self.last_heartbeat) >= 15_000;
-        let memory = mem_available_mib().context("host MemAvailable")?;
+        // A failed probe latches the storage refusal; the heartbeat is still
+        // sent, advertising no free vCPUs.
+        self.runtime.probe_storage();
         let changed = {
             let host = self.runtime.host.lock().expect("host lock");
-            self.last_state.as_ref()
-                != Some(&lifecycle_state(host.heartbeat(now_ms, memory, healthy)))
+            // Free memory is not lifecycle state, so any value compares equal.
+            self.last_state.as_ref() != Some(&lifecycle_state(host.heartbeat(now_ms, 0, healthy)))
         };
         if due || changed {
             let previous_health = healthy;
             healthy = true;
-            for tenant in tenants {
+            for tenant in tenants.iter().cloned() {
                 // Snapshot I/O can exceed an ordinary helper RPC deadline.
                 // Publish lifecycle state without queueing a stale adopt behind
                 // the same tenant's suspend/wake/administrative operation.
@@ -366,7 +368,9 @@ impl Heartbeats {
                 }
             }
         }
+        self.probe_memory(&tenants, now_ms)?;
         let mut host = self.runtime.host.lock().expect("host lock");
+        let memory = host.free_mem_mib(now_ms);
         let heartbeat = host.heartbeat(now_ms, memory, healthy);
         let state = lifecycle_state(heartbeat.clone());
         if due || self.last_state.as_ref() != Some(&state) {
@@ -383,17 +387,52 @@ impl Heartbeats {
         Ok(())
     }
 }
-fn mem_available_mib() -> Result<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo")?;
-    let kb: u64 = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .context("MemAvailable missing")?
-        .split_whitespace()
-        .next()
-        .context("MemAvailable value")?
-        .parse()?;
-    Ok(kb / 1024)
+impl Heartbeats {
+    /// Asks each running tenant's runner for its guest's available memory
+    /// when its last sample is due for renewal. A tenant busy with a wake,
+    /// suspend or other operation is skipped; its sample ages, and a sample
+    /// older than the freshness bound advertises no free memory.
+    fn probe_memory(&self, tenants: &[String], now_ms: u64) -> Result<()> {
+        for tenant in tenants {
+            if !self
+                .runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .memory_probe_due(tenant, now_ms)
+            {
+                continue;
+            }
+            let operations = self.runtime.tenant_operations(tenant)?;
+            let _operation = match operations.try_lock() {
+                Ok(operation) => operation,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("tenant operations lock poisoned")
+                }
+            };
+            if !self
+                .runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .memory_probe_due(tenant, now_ms)
+            {
+                continue;
+            }
+            let reading = self
+                .runtime
+                .control
+                .runner_memory(tenant)
+                .map_err(|error| format!("{error:#}"));
+            self.runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .record_memory(tenant, now_ms, reading);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 
+mod advertise;
+pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tenant {
@@ -200,6 +203,10 @@ pub struct Host {
     pub(crate) provider_managed: bool,
     /// When the next billing-record retention pass is due; see `retention_tick`.
     pub(crate) retention_due_ms: u64,
+    storage: advertise::StorageLatch,
+    /// The capacity file as last read, `None` while it is missing or invalid.
+    capacity: Option<crate::capacity::Capacity>,
+    advert: BTreeMap<String, advertise::TenantAdvert>,
 }
 impl Host {
     pub fn new(
@@ -219,6 +226,9 @@ impl Host {
             prior_alive_ms: 0,
             provider_managed: false,
             retention_due_ms: 0,
+            storage: Default::default(),
+            capacity: None,
+            advert: BTreeMap::new(),
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full
@@ -413,12 +423,15 @@ impl Host {
         let live = self.live.entry(tenant.to_owned()).or_default();
         live.ready = true;
         live.quota_target = None;
+        self.start_succeeded(tenant);
+        self.reset_memory(tenant);
         Ok(())
     }
     pub fn guest_unready(&mut self, tenant: &str) {
         let live = self.live.entry(tenant.to_owned()).or_default();
         live.ready = false;
         live.quota_target = None;
+        self.reset_memory(tenant);
     }
     pub fn events_connected(&mut self, tenant: &str, now_ms: Option<u64>) {
         self.live
@@ -459,6 +472,17 @@ impl Host {
             }
         } else {
             if claims.vcpus > tenant.vcpu_ceiling {
+                return refuse(Refusal::HostFull);
+            }
+            // Low host storage stops new work. A lease already delivered to
+            // the runner may be replaced, because its job can already be in
+            // the guest.
+            if self.storage_refusing() && !old.as_ref().is_some_and(|l| l.delivered) {
+                return refuse(Refusal::HostFull);
+            }
+            // A tenant the helper refused to start gets no lease until a
+            // start succeeds; motor-host retries the start on its own.
+            if self.start_retry_at(&tenant.tenant).is_some() {
                 return refuse(Refusal::HostFull);
             }
             // Released leases still appear in heartbeats, even though they no

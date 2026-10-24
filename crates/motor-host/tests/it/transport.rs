@@ -14,6 +14,8 @@ struct Fake {
     quota_ceiling: Mutex<Option<u32>>,
     calls: Mutex<Vec<String>>,
     peers: Mutex<Vec<UnixStream>>,
+    /// The helper refuses every start with this case.
+    refuse_start: Mutex<Option<&'static str>>,
 }
 impl Control for Fake {
     fn adopt(&self, _: &str) -> Result<bool> {
@@ -23,6 +25,13 @@ impl Control for Fake {
         self.calls.lock().unwrap().push("wake".into());
         if *self.fail.lock().unwrap() == Some("wake") {
             bail!("unsafe guest /usr/local/lib");
+        }
+        if let Some(case) = *self.refuse_start.lock().unwrap() {
+            return Err(motor_host::helper::StartRefused {
+                case: case.into(),
+                message: "injected start refusal".into(),
+            }
+            .into());
         }
         Ok(1)
     }
@@ -154,6 +163,98 @@ async fn wake_quota_and_relay_failures_are_internal_not_capacity() {
             "{stage}"
         );
         assert!(task.await.unwrap().is_err());
+    }
+}
+#[tokio::test]
+async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until_a_start_succeeds() {
+    for case in [
+        "capacity_json",
+        "fit",
+        "live_cap",
+        "drop_in",
+        "resize_journal",
+        "activation",
+        "post_grow_space",
+    ] {
+        let (runtime, fake, broker, requester, claims) = fixture();
+        let capacity = motor_host::capacity::Capacity {
+            windows_vm_bytes: 1,
+            host_reserve_bytes: 1,
+            jobs_min_bytes: 1,
+            storage_margin_bytes: 1,
+            growth_allowance_bytes: 1,
+            tenant_memory_reserve_bytes: 2048 << 20,
+        };
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .observe_storage(Ok(capacity), Ok(u64::MAX));
+        *fake.refuse_start.lock().unwrap() = Some(case);
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(runtime.clone(), server));
+        let challenge = hello(&mut client, &broker, &requester, &claims).await;
+        assert_eq!(
+            respond(&mut client, &requester, &claims, challenge).await,
+            json!({"type":"lease_ok"})
+        );
+        write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+            .await
+            .unwrap();
+        // Retryable host_full, never internal_failure, and no Run: the job
+        // relay was never opened.
+        assert_eq!(
+            read_frame(&mut client).await.unwrap(),
+            json!({"type":"lease_refused","reason":"host_full"}),
+            "{case}"
+        );
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["wake".to_owned()], "{case}");
+        let now = unix_ms();
+        let retry_at = {
+            let mut h = runtime.host.lock().unwrap();
+            assert_eq!(h.start_refusal_case("tenant"), Some(case));
+            let memory = h.free_mem_mib(now);
+            let heartbeat = h.heartbeat(now, memory, true);
+            assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0), "{case}");
+            assert_eq!(h.share("tenant", now), 0);
+            h.start_retry_at("tenant").unwrap()
+        };
+        assert!(retry_at >= now + motor_host::state::START_RETRY_MS - 5_000);
+        // Another lease is refused at admission without asking the helper.
+        let mut second = claims.clone();
+        second.jti = JOB2.into();
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(runtime.clone(), server));
+        let challenge = hello(&mut client, &broker, &requester, &second).await;
+        assert_eq!(
+            respond(&mut client, &requester, &second, challenge).await,
+            json!({"type":"lease_refused","reason":"host_full"})
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        // motor-host retries the start itself, at most once per minute.
+        runtime.retry_refused_starts(retry_at - 1).unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        assert!(runtime.retry_refused_starts(retry_at).is_err());
+        assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        let next = runtime.host.lock().unwrap().start_retry_at("tenant").unwrap();
+        assert_eq!(next, retry_at + motor_host::state::START_RETRY_MS);
+        runtime.retry_refused_starts(next - 1).unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        // A successful start restores the advertisement.
+        *fake.refuse_start.lock().unwrap() = None;
+        runtime.retry_refused_starts(next).unwrap();
+        {
+            let mut h = runtime.host.lock().unwrap();
+            assert!(h.is_ready("tenant"));
+            assert_eq!(h.start_retry_at("tenant"), None);
+            assert_eq!(h.heartbeat(now, 0, true).free_vcpus, 2);
+            h.record_memory("tenant", now, Ok(Some(10 << 30)));
+            assert_eq!(h.free_mem_mib(now), 10_240 - 2_048);
+            h.guest_unready("tenant");
+        }
+        assert!(fake.calls.lock().unwrap().iter().all(|call| call != "relay:52"));
     }
 }
 async fn hello(
