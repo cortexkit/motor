@@ -336,6 +336,7 @@ fn refuse_before_start(
     reason: RefusalReason,
     error: impl std::fmt::Display,
     detail: Option<String>,
+    retry_after_ms: Option<u64>,
     now: u64,
 ) {
     if let Some(detail) = detail.as_deref() {
@@ -347,6 +348,12 @@ fn refuse_before_start(
     job.terminal(Outcome::RefusedBeforeStart { reason }, now);
     if let Some(detail) = detail {
         job.terminal = job.terminal.take().map(|t| t.with_refusal_detail(detail));
+    }
+    if let Some(retry_after_ms) = retry_after_ms {
+        job.terminal = job
+            .terminal
+            .take()
+            .map(|t| t.with_retry_after_ms(retry_after_ms));
     }
 }
 
@@ -1125,6 +1132,21 @@ impl Drop for PendingStart {
 const START_RETRY_MS: u64 = 1000;
 const START_RETRY_MAX_MS: u64 = 60_000;
 
+/// The bounds on the `retry_after_ms` hint a capacity refusal carries, in
+/// milliseconds. The hint reports the median recent queue wait, so a caller
+/// waits as long as jobs are usually waiting instead of guessing.
+///
+/// The floor is one backoff step of a job whose start failed
+/// (`START_RETRY_MS`): a job that arrives while another is still being set up
+/// waits for that setup before it can start, so a hint below it would send the
+/// caller back before anything could free the capacity it is waiting for. The
+/// ceiling is `START_RETRY_MAX_MS`, the longest the runner itself backs off
+/// before retrying a failed start: a median past it says the queue is not
+/// clearing on any schedule the runner observes, and a longer hint would keep a
+/// caller waiting while its own deadline drains instead of letting it decide.
+const CAPACITY_RETRY_MIN_MS: u64 = START_RETRY_MS;
+const CAPACITY_RETRY_MAX_MS: u64 = START_RETRY_MAX_MS;
+
 /// Retry state of a queued job whose last start attempt failed.
 #[derive(Default)]
 struct StartRetry {
@@ -1806,6 +1828,7 @@ impl Runner {
                 RefusalReason::LostToRestart,
                 "runner restarted during a background fill",
                 Some("runner restarted during a background fill".into()),
+                None,
                 now,
             );
             atomic_json(
@@ -1846,6 +1869,7 @@ impl Runner {
                     RefusalReason::LostToRestart,
                     "runner restarted before the job could start",
                     Some("runner restarted before the job could start".into()),
+                    None,
                     now,
                 );
                 atomic_json(&record, &job)?;
@@ -2841,6 +2865,7 @@ impl Runner {
                 reason.clone(),
                 error,
                 detail,
+                None,
                 self.now(),
             );
             job.state = JobState::Tombstone;
@@ -3193,6 +3218,7 @@ impl Runner {
                 reason,
                 error,
                 Some(detail),
+                None,
                 self.now(),
             );
             job.state = JobState::Tombstone;
@@ -3290,6 +3316,7 @@ impl Runner {
                 transfer_refusal(&error),
                 &error,
                 Some(detail),
+                None,
                 self.now(),
             );
             job.state = JobState::Tombstone;
@@ -4027,6 +4054,7 @@ impl Runner {
                 RefusalReason::TransferInterrupted,
                 "attach found no recorded admission or upload",
                 Some("attach found no recorded admission or upload".into()),
+                None,
                 self.now(),
             );
             job.state = JobState::Tombstone;
@@ -4312,7 +4340,6 @@ impl Runner {
         let mut inner = self.core.inner.lock().unwrap();
         let now = self.now();
         let index = DispatchIndex::build(&inner);
-        self.update_queue_wait_clocks(&inner, now, &index);
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
             (!inner.starting.contains(&id) || self.core.config.vm_instance())
@@ -4362,6 +4389,12 @@ impl Runner {
                 .into_iter()
                 .flat_map(|request| request.env.values().cloned()),
         );
+        // Why a caller was sent back while the runner could not start it: a
+        // job waiting for enough free permits, or for another job to release
+        // its workspace or its checkout, may be able to start once that passes.
+        // `queue_wait_phase` names the phase from the same dispatch index, so a
+        // job behind one that can never fit keeps no hint.
+        let retry_after_ms = self.queue_clear_retry_after_ms(&inner, &index, id);
         if spill && !stalled {
             // Keep the legacy outcome so old clients know the job never started,
             // but do not count a move to hosted capacity as a runner refusal.
@@ -4393,6 +4426,7 @@ impl Runner {
                 },
                 &detail,
                 Some(safe_detail),
+                retry_after_ms,
                 self.now(),
             );
         }
@@ -4479,6 +4513,37 @@ impl Runner {
         (head.gate_job() || fill || aged)
             && (held.saturating_add(head.weight) > self.core.config.max_weight
                 || Self::start_deferred(inner, head.id, now))
+    }
+
+    /// The `retry_after_ms` hint for a job refused because its queue wait ran
+    /// out, or `None` when waiting cannot help it. Only the wait phases that
+    /// clear on their own get one: enough free permits, or a workspace or
+    /// checkout that the running job holding it will release. A job waiting
+    /// behind a gate job, a cache fill, an older job, or an upload or setup step
+    /// has nothing that a wait is known to end. The value is the median queue
+    /// wait of jobs started in the last hour (`health.queue_wait_1h.p50_ms`),
+    /// clamped to `CAPACITY_RETRY_MIN_MS..=CAPACITY_RETRY_MAX_MS` for the
+    /// reasons on those constants. With no recent start the median is zero,
+    /// which is no sample rather than a short wait, so the hint is omitted.
+    fn queue_clear_retry_after_ms(
+        &self,
+        inner: &Inner,
+        index: &DispatchIndex,
+        id: Uuid,
+    ) -> Option<u64> {
+        let phase = self.queue_wait_phase(inner, index, id)?;
+        if !matches!(
+            phase,
+            "permits" | "workspace owner" | "queued workspace job" | SIBLING_USER_WAIT
+        ) {
+            return None;
+        }
+        self.core
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recent_queue_wait_p50(self.now())
+            .map(|p50_ms| p50_ms.clamp(CAPACITY_RETRY_MIN_MS, CAPACITY_RETRY_MAX_MS))
     }
 
     /// Whether a cache fill of `weight` permits may start while foreground
@@ -5566,6 +5631,7 @@ impl Runner {
                     RefusalReason::RunnerDraining,
                     "runner draining before queued command started",
                     Some("runner draining before queued command started".into()),
+                    None,
                     self.now(),
                 );
                 self.save(&job)?;
@@ -5795,6 +5861,7 @@ impl Runner {
                 reason,
                 &detail,
                 Some(safe_detail),
+                None,
                 self.now(),
             );
             self.save(&refused)?;
@@ -6165,6 +6232,7 @@ impl Runner {
                 reason,
                 &safe_detail,
                 Some(safe_detail.clone()),
+                None,
                 self.now(),
             );
             j.state = JobState::Tombstone;
@@ -6490,6 +6558,7 @@ impl Runner {
                 RefusalReason::WorkspaceSetupFailed,
                 &error,
                 Some(format!("execution gate was not opened: {reason}")),
+                None,
                 self.now(),
             );
             finished.state = JobState::Tombstone;
@@ -6873,6 +6942,7 @@ impl Runner {
             RefusalReason::WorkspaceSetupFailed,
             &detail,
             Some(safe),
+            None,
             self.now(),
         );
         finished.state = JobState::Tombstone;
