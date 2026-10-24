@@ -21,6 +21,23 @@ class InstallScriptTests(unittest.TestCase):
         owner_failure = next(line for line in script.splitlines() if "Cannot set trusted parent owner" in line)
         self.assertIn("elevated administrator shell", owner_failure)
 
+    def test_every_directory_the_runner_requires_private_is_protected_by_install(self):
+        # hyperv.ps1 refuses a required directory that isn't SYSTEM or
+        # Administrators owned with a private ACL. A directory the installer only
+        # creates implicitly, as a parent, keeps its creator as owner on Windows
+        # client editions, so each one needs its own Protect-RunnerPath.
+        hyperv = (HERE / "hyperv.ps1").read_text()
+        install = (HERE / "install.ps1").read_text()
+        listed = re.search(r"foreach \(\$path in @\((\$Root, [^)]*)\)\) \{\s*if \(-not \(Test-Path -LiteralPath \$path -PathType Container\)\)", hyperv)
+        self.assertIsNotNone(listed, "the required private directory list moved")
+        required = [path.strip().strip('"') for path in listed.group(1).split(",")]
+        self.assertIn("$Root\\state", required)
+        protected = set(re.findall(r'Protect-RunnerPath "?(\$Root[^" ]*)"? \$nativeLogPath', install))
+        protected |= set(re.findall(r"Protect-RunnerPath (\$Root) \$nativeLogPath", install))
+        for path in required:
+            with self.subTest(path=path):
+                self.assertIn(path, protected)
+
     def test_local_user_descriptions_fit_windows_limit(self):
         found = 0
         for script in sorted(HERE.glob("*.ps1")):

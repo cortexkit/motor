@@ -44,6 +44,9 @@ $installation = @{ schema=1; root=$Root; accounts=@{}; enhanced_session_before=(
 function Save-Installation { $installation | ConvertTo-Json -Depth 6 | Set-Content "$Root\installation.json" -Encoding UTF8 }
 Save-Installation
 foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks','staging','state\ally','state\ally\local-registry-cache','evidence','service-home')) { New-Item "$Root\$directory" -ItemType Directory -Force | Out-Null }
+# `state` is created implicitly as the parent of state\ally, so it gets its
+# own protection: the runner checks its owner and ACL like the others.
+Protect-RunnerPath "$Root\state" $nativeLogPath
 Protect-RunnerPath "$Root\state\ally" $nativeLogPath
 Protect-RunnerPath "$Root\state\ally\local-registry-cache" $nativeLogPath
 Protect-RunnerPath "$Root\staging" $nativeLogPath
