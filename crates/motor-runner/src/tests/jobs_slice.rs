@@ -3,48 +3,40 @@
 //! slice too small for the floor every job requests makes the job refuse
 //! before it starts instead of being OOM-killed by the slice on arrival.
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-/// Answers the engine's systemd queries from this test's fake manager and
-/// records any slice query that ran while the runner's state lock was held.
+/// A fake systemd for the engine's queries that can make the slice reply
+/// slow, so a test can see whether the reply was waited for under the state
+/// lock.
 struct FakeManager {
-    slice: String,
-    /// Set while the test holds the state lock itself, to model admission.
-    lock_held: Arc<AtomicBool>,
-    queries_under_lock: Arc<AtomicUsize>,
+    slice: Mutex<String>,
+    /// How long a slice query takes to answer.
+    delay: Mutex<Duration>,
 }
 
 impl FakeManager {
-    fn hook(slice: impl Into<String>) -> (crate::systemd::CommandHook, Arc<AtomicUsize>) {
-        let under_lock = Arc::new(AtomicUsize::new(0));
+    /// A manager whose 24 GiB slice is read from `slice`.
+    fn hook(slice: impl Into<String>) -> (crate::systemd::CommandHook, Arc<FakeManager>) {
         let manager = Arc::new(FakeManager {
-            slice: slice.into(),
-            lock_held: Arc::new(AtomicBool::new(false)),
-            queries_under_lock: under_lock.clone(),
+            slice: Mutex::new(slice.into()),
+            delay: Mutex::new(Duration::ZERO),
         });
-        let hook: crate::systemd::CommandHook = Arc::new(move |args| {
-            if args
-                == [
-                    "show",
-                    "--property=MemoryHigh,MemoryMax",
-                    "motor-jobs.slice",
-                ]
-                && manager.lock_held.load(AtomicOrdering::SeqCst)
-            {
-                manager
-                    .queries_under_lock
-                    .fetch_add(1, AtomicOrdering::SeqCst);
-            }
-            Ok(manager.reply(args))
-        });
-        (hook, under_lock)
+        let for_hook = manager.clone();
+        let hook: crate::systemd::CommandHook = Arc::new(move |args| Ok(for_hook.reply(args)));
+        (hook, manager)
+    }
+
+    fn set_slice(&self, slice: String) {
+        *self.slice.lock().unwrap() = slice;
     }
 
     fn reply(&self, args: &[&str]) -> std::process::Output {
         let stdout = match args {
             ["show", "--property=MemoryHigh,MemoryMax", "motor-jobs.slice"] => {
-                self.slice.clone().into_bytes()
+                std::thread::sleep(*self.delay.lock().unwrap());
+                self.slice.lock().unwrap().clone().into_bytes()
             }
+            // The isolated path asks this once at startup: a manager new
+            // enough for `PrivatePIDs` keeps the test free of accounts.
             ["show", "--property=Version", "--value"] => b"259.0".to_vec(),
             // Unit listings and the like only matter to a start, which these
             // tests never reach; an empty reply keeps them quiet.
@@ -56,6 +48,10 @@ impl FakeManager {
             stderr: Vec::new(),
         }
     }
+}
+
+fn slice_reply(max: u64) -> String {
+    format!("MemoryHigh=1\nMemoryMax={max}\n")
 }
 
 /// A refusal keeps a job record and no execution: its cpus, process and
@@ -88,7 +84,7 @@ fn assert_refused_without_start(
 #[test]
 fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let f = Fixture::new();
-    let (hook, _) = FakeManager::hook(format!("MemoryHigh=1\nMemoryMax={}\n", (16 << 30) - 1));
+    let (hook, _) = FakeManager::hook(slice_reply((16 << 30) - 1));
     let mut config = f.config();
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
@@ -113,7 +109,7 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
 #[test]
 fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     let f = Fixture::new();
-    let (hook, _) = FakeManager::hook(format!("MemoryHigh=1\nMemoryMax={}\n", 16 << 30));
+    let (hook, _) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
@@ -132,57 +128,71 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     runner.cancel(request.job_id).unwrap();
 }
 
-/// The probe answers a slice query only while the test holds the state lock,
-/// which is exactly when `Runner::accept` holds it, so it does record a query
-/// that admission issued there.
+/// Admission holds the runner's state lock, which every other admission,
+/// status reply and cancel waits for. Reading the slice there would stall all
+/// of them for as long as systemd takes to answer, so admission uses the
+/// ceiling the runner already recorded: with a slow manager, no hold of the
+/// state lock comes near the slow-hold threshold (100 ms).
 #[cfg(target_os = "linux")]
 #[test]
-fn state_lock_probe_answers_a_slice_query_issued_under_the_lock() {
+fn admission_reads_the_recorded_slice_ceiling_without_waiting_under_the_state_lock() {
     let f = Fixture::new();
-    let (hook, under_lock) = FakeManager::hook(format!("MemoryHigh=1\nMemoryMax={}\n", 16 << 30));
+    let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(hook);
     let runner = Runner::open(config).unwrap();
-    under_lock.store(true, AtomicOrdering::SeqCst);
-    let counted = {
-        let _ = runner.core.inner.lock().unwrap();
-        runner.accept(f.run("true").0).unwrap();
-        under_lock.load(AtomicOrdering::SeqCst)
-    };
-    under_lock.store(false, AtomicOrdering::SeqCst);
-    assert_eq!(
-        counted, 1,
-        "the probe records a query issued under the lock"
+    // Every later slice read is slow, as a loaded host's systemctl can be.
+    *manager.delay.lock().unwrap() = Duration::from_millis(300);
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(0)
+    ));
+    runner.cancel(request.job_id).unwrap();
+    let slow: Vec<_> = runner
+        .core
+        .inner
+        .site_holds()
+        .into_iter()
+        .filter(|(_, holds)| holds.longest >= crate::state_lock::SLOW_HOLD)
+        .collect();
+    assert!(
+        slow.is_empty(),
+        "admission waited for the slice under the state lock: {slow:?}"
     );
 }
 
-/// Admission runs under the runner's state lock; asking systemd for the slice
-/// there would stall every other admission, status reply and cancel. The fake
-/// manager records a slice query made while the lock is held, so this fails if
-/// admission ever starts one there.
+/// The runner re-reads the slice on every maintenance pass, again without the
+/// state lock, and admission refuses by the new ceiling.
 #[cfg(target_os = "linux")]
 #[test]
-fn admission_never_queries_the_slice_while_holding_the_state_lock() {
+fn maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
     let f = Fixture::new();
-    let (hook, under_lock) = FakeManager::hook(format!("MemoryHigh=1\nMemoryMax={}\n", 16 << 30));
+    let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
     config.isolate_jobs = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(hook);
     let runner = Runner::open(config).unwrap();
-    let (request, _) = f.run("true");
-    under_lock.store(true, AtomicOrdering::SeqCst);
-    let counted = {
-        let _ = runner.core.inner.lock().unwrap();
-        runner.accept(request.clone()).unwrap();
-        under_lock.load(AtomicOrdering::SeqCst)
-    };
-    under_lock.store(false, AtomicOrdering::SeqCst);
-    assert_eq!(
-        counted, 0,
-        "admission ran a slice query under the state lock"
+    manager.set_slice(slice_reply((16 << 30) - 1));
+    *manager.delay.lock().unwrap() = Duration::from_millis(300);
+    runner.maintenance().unwrap();
+    let (request, _) = f.run("touch must-not-start");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+    ));
+    let slow: Vec<_> = runner
+        .core
+        .inner
+        .site_holds()
+        .into_iter()
+        .filter(|(_, holds)| holds.longest >= crate::state_lock::SLOW_HOLD)
+        .collect();
+    assert!(
+        slow.is_empty(),
+        "maintenance waited for the slice under the state lock: {slow:?}"
     );
-    runner.cancel(request.job_id).unwrap();
 }
