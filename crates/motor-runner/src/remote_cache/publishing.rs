@@ -17,18 +17,19 @@ use crate::remote_cache::provisioning::{Reread, Status, Unavailable};
 use crate::remote_cache::publication::{self, PublishPolicy};
 use crate::storage::encode_identity;
 use crate::storage::{Catalog, StoreIdentity};
+use serde::{Deserialize, Serialize};
 
 /// What the runner last decided about the remote cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct State {
     /// The runner switch, as far as this role may honour it. It is false on
     /// every host that never writes the cache, and without job isolation.
-    switch: bool,
+    pub(crate) switch: bool,
     /// The tenant's `enabled` from the latest config that parsed. `None` until
     /// one has, so a first read never looks like a switch-off.
-    enabled: Option<bool>,
-    status: Status,
-    identity: Option<StoreIdentity>,
+    pub(crate) enabled: Option<bool>,
+    pub(crate) status: Status,
+    pub(crate) identity: Option<StoreIdentity>,
 }
 
 impl State {
@@ -52,28 +53,64 @@ impl State {
         self.identity = reread.identity.as_ref().map(encode_identity);
     }
 
-    /// The cache is publishing: the runner switch is on, its tenant has it
-    /// enabled and a complete generation is active.
+    /// The cache is publishing: the runner switch is on, its tenant has the
+    /// cache enabled and a complete generation is active.
     pub(crate) fn publishing(&self) -> bool {
         self.switch && self.enabled == Some(true) && self.identity.is_some()
     }
 
+    /// Whether the store itself is usable, as opposed to merely configured:
+    /// a `cache_unavailable` decision (a reused generation, a prefix that does
+    /// not match its tenant) stops the cache even while `enabled` is on.
+    /// Publication reads this together with [`State::publishing`].
+    fn store_usable(&self) -> bool {
+        self.status == Status::Available
+    }
+
     /// The store identity a request admitted now would be signed for, if any.
     pub(crate) fn identity(&self) -> Option<StoreIdentity> {
-        if self.publishing() {
+        if self.publishing() && self.store_usable() {
             self.identity.clone()
         } else {
             None
         }
     }
 
-    /// The policy every fill, reuse decision and publication record reads.
+    /// The policy every fill, reuse decision and publication record reads. It
+    /// publishes only while the cache is on and its store is usable.
     pub(crate) fn policy(&self, config: &crate::Config) -> PublishPolicy {
         PublishPolicy {
-            switch: self.switch,
+            switch: self.publishing() && self.store_usable(),
             refresh_period: config.refresh_period,
             retry_interval: config.publish_retry_interval,
-            identity: self.identity.clone(),
+            identity: self.identity(),
+        }
+    }
+
+    /// The transition the next re-read is compared against, once this state
+    /// has been acted on and saved.
+    pub(crate) fn seen(&self) -> Seen {
+        Seen {
+            switch: self.switch,
+            publishing: self.publishing(),
+        }
+    }
+
+    /// Folds the switch state this runner acted on before it stopped into
+    /// `state`, so a configuration flipped while it was stopped is a
+    /// transition at the first re-read rather than a first read.
+    ///
+    /// A runner that never saw the switch on starts from nothing, exactly as
+    /// it did before the switch existed; one that had it on remembers being
+    /// publishing, so an unchanged configuration at startup keeps its records
+    /// and a flip while stopped arrives as the transition it was.
+    pub(crate) fn restore(state: &mut State, is_switch: bool, seen: Seen) {
+        if !is_switch {
+            return;
+        }
+        state.switch = true;
+        if seen.publishing {
+            state.enabled = Some(true);
         }
     }
 
@@ -111,6 +148,30 @@ impl State {
     }
 }
 
+/// The switch state the runner last acted on, so a change made while it was
+/// stopped is still an off-to-on transition at the first re-read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Seen {
+    /// Whether the runner switch was on when this state was last saved.
+    pub(crate) switch: bool,
+    /// Whether the cache was publishing then.
+    pub(crate) publishing: bool,
+}
+
+impl Seen {
+    /// Keeps a catalog that never published from carrying the field, so an
+    /// older runner reads the same bytes it wrote.
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    pub(crate) fn new(switch: bool) -> Self {
+        Self {
+            switch,
+            publishing: false,
+        }
+    }
+}
+
 /// What acting on a state change did, for the caller that saves the catalog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Changed {
@@ -127,8 +188,8 @@ pub(crate) fn idle() -> State {
 
 #[cfg(test)]
 impl State {
-    /// A state that is publishing in `identity`, with the switch on, for tests
-    /// that drive the rest of the runner through the publication rules.
+    /// A state that is publishing into `identity`, with the switch on, for
+    /// tests that drive the rest of the runner through the publication rules.
     pub(crate) fn publishing_in(identity: StoreIdentity) -> Self {
         Self {
             switch: true,

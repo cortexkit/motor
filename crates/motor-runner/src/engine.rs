@@ -783,6 +783,13 @@ struct Inner {
     evicting_dependencies: BTreeSet<PathBuf>,
     evicting_caches: BTreeSet<PathBuf>,
     maintained_ms: u64,
+    /// The remote cache's switch state this runner last acted on; saved with
+    /// the catalog so a change made while it was stopped is still a
+    /// transition at the first re-read.
+    publishing_seen: crate::remote_cache::publishing::Seen,
+    /// When the remote cache's refresh timer last ran, in runner-clock
+    /// milliseconds. Only a publishing runner uses it.
+    refreshed_ms: Option<u64>,
     /// Workspaces being set up without the state lock held, by workspace key
     /// (`base:<root>` for a warm build): a prepare materializing a workspace,
     /// or a job whose checkout and target are being made ready before launch.
@@ -1527,7 +1534,12 @@ impl Runner {
                 "remote cache publishing state changed; publication records forgotten"
             );
         }
-        if !changed.refill {
+        // The switch state is saved with the catalog whatever it was, so the
+        // next start compares against what this run actually saw.
+        let seen = state.seen();
+        let seen_changed = inner.publishing_seen != seen;
+        inner.publishing_seen = seen;
+        if !changed.refill && !seen_changed {
             return Ok(false);
         }
         self.catalog(&mut inner)?;
@@ -2071,22 +2083,25 @@ impl Runner {
             None
         };
         let sibling_fences = config.sibling_fences();
-        let publishing_switch = {
-            #[cfg(unix)]
-            {
-                config.isolate_jobs && !config.boat_profile && !config.tenant_vm
-            }
-            #[cfg(not(unix))]
-            {
-                false
-            }
-        };
+        // The switch is honoured only with job isolation, and only the build
+        // server ever writes the cache.
+        let publishing_switch = config.isolate_jobs
+            && !config.boat_profile
+            && !config.tenant_vm
+            && !config.vm_instance();
+        // A configuration flipped while the runner was stopped is still a
+        // transition, not a first read: the switch state the previous run
+        // last acted on is restored before the first re-read.
+        let mut publishing_state = crate::remote_cache::publishing::State::new(publishing_switch);
+        crate::remote_cache::publishing::State::restore(
+            &mut publishing_state,
+            publishing_switch,
+            catalog.publishing_seen,
+        );
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
-                publishing: Mutex::new(crate::remote_cache::publishing::State::new(
-                    publishing_switch,
-                )),
+                publishing: Mutex::new(publishing_state),
                 tenant_events,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
@@ -2112,6 +2127,8 @@ impl Runner {
                     dispatch: 0,
                     dropping: BTreeSet::new(),
                     maintained_ms: now,
+                    publishing_seen: crate::remote_cache::publishing::Seen::default(),
+                    refreshed_ms: None,
                     reserved: BTreeMap::new(),
                     starting: BTreeSet::new(),
                     transfers: BTreeSet::new(),
@@ -5775,10 +5792,28 @@ impl Runner {
         // needs from the mirror is read without the state lock (each read runs
         // git); then the list is made again under the lock, and only
         // repositories still wanting the same build are queued.
-        let desired: Vec<_> = Self::desired_bases(&inner)
+        let policy = self.publishing_policy();
+        // The refresh timer runs on its own schedule: it needs no job arrival,
+        // and it queues through the publication gate like every other caller.
+        let refresh_due = policy.publishing()
+            && inner
+                .refreshed_ms
+                .is_none_or(|last| now.saturating_sub(last) >= publication::REFRESH_TICK_MS);
+        if refresh_due {
+            inner.refreshed_ms = Some(now);
+        }
+        let mut wanted: Vec<(String, BaseRequest)> = Self::desired_bases(&inner)
             .into_iter()
             .filter(|(_, desired)| self.warm_builds_enabled(&desired.tip))
             .collect();
+        if refresh_due {
+            for (root, desired) in self.refresh_bases(&inner, &policy, now) {
+                if !wanted.iter().any(|(queued, _)| *queued == root) {
+                    wanted.push((root, desired));
+                }
+            }
+        }
+        let desired = wanted;
         let mut queued = Ok(false);
         if !desired.is_empty() {
             drop(inner);
@@ -5832,6 +5867,44 @@ impl Runner {
         }
         queued?;
         dispatched
+    }
+
+    /// Repositories the refresh timer wants a recache fill of now: a local fill
+    /// record whose publication is no longer fresh, and no fill already queued
+    /// or running for them. The fill is at the repository's recorded `desired`
+    /// tip, with no fetch. A dependency-free shortcut record has nothing to
+    /// publish and is never queued here.
+    fn refresh_bases(
+        &self,
+        inner: &Inner,
+        policy: &publication::PublishPolicy,
+        now: u64,
+    ) -> Vec<(String, BaseRequest)> {
+        inner
+            .catalog
+            .repositories
+            .iter()
+            .filter(|(root, repository)| {
+                !inner.jobs.values().any(|j| {
+                    j.base
+                        && j.terminal.is_none()
+                        && j.request
+                            .as_ref()
+                            .is_some_and(|r| r.repository_root == **root)
+                }) && repository
+                    .filled_descriptor
+                    .as_deref()
+                    .is_some_and(|descriptor| {
+                        publication::expired(policy, repository, descriptor, now)
+                    })
+            })
+            .filter_map(|(root, repository)| {
+                repository
+                    .desired
+                    .clone()
+                    .map(|desired| (root.clone(), desired))
+            })
+            .collect()
     }
 
     /// Repositories whose desired warm build is not filled, has not failed

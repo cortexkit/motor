@@ -312,3 +312,7 @@ pub(crate) fn forget_other_stores(catalog: &mut Catalog, identity: &StoreIdentit
         repository.publish_failures.clear();
     }
 }
+
+#[cfg(test)]
+#[path = "publication_tests.rs"]
+mod tests;
