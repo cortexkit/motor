@@ -2780,6 +2780,72 @@ async fn capacity_refusal_without_recent_starts_carries_no_retry_hint() {
     assert_eq!(record.retry_after_ms(), None);
 }
 
+/// The withdrawal that refuses a job refreshes its queue-wait clock first, so
+/// the record reports the wait up to the withdrawal, not up to the pass before.
+#[tokio::test]
+async fn withdrawal_refusal_reports_the_wait_up_to_the_withdrawal() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-clock-holder").await;
+    let (mut waiting, bytes) = job_at(&f, "clock-withdraw", "true");
+    waiting.weight_hint = Some(2);
+    waiting.queue_wait_limit_s = 0;
+    f.submit(&runner, &waiting, &bytes);
+    until(|| {
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&waiting.job_id)
+            .is_some_and(|job| job.state == JobState::Queued)
+    })
+    .await;
+    // A pass starts the queue-wait clock. It cannot refuse or start the job
+    // here: a limit of zero only stops what has already been measured.
+    runner.tick().unwrap();
+    runner.maintenance().unwrap();
+    let started = runner
+        .job_status(waiting.job_id)
+        .unwrap()
+        .queue_wait_ms
+        .unwrap_or_else(|| {
+            panic!(
+                "the clock must be counting: {}",
+                runner_diagnostics(&runner)
+            )
+        });
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(started + 300_000),
+        "time since the last pass must count toward the job: {}",
+        runner_diagnostics(&runner)
+    );
+    let outcome = runner
+        .withdraw(waiting.job_id)
+        .unwrap_or_else(|error| panic!("withdrawing failed: {error}"));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "{}",
+        runner_diagnostics(&runner)
+    );
+    let record = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    drop(holder);
+    assert_eq!(
+        record.queue_wait_ms, 300_000,
+        "the withdrawal must count the wait up to itself, not up to the pass before; record: {record:?}"
+    );
+}
+
 /// A spill withdrawal becomes a hosted job: its caller is never refused, so it
 /// is not sent a hint either, even for a wait that would clear on its own.
 #[tokio::test]

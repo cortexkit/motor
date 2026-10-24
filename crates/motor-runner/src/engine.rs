@@ -4340,6 +4340,10 @@ impl Runner {
         let mut inner = self.core.inner.lock().unwrap();
         let now = self.now();
         let index = DispatchIndex::build(&inner);
+        // Refresh the clock first: the refusal below records the job's
+        // queue_wait_ms, and its detail names the holders that were holding it
+        // at the withdrawal.
+        self.update_queue_wait_clocks(&inner, now, &index);
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
             (!inner.starting.contains(&id) || self.core.config.vm_instance())
