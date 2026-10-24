@@ -393,8 +393,11 @@ filter before filling its inherited directory. If root can use the syscall, the
 job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
 kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
 returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
-syscall filter. The result records the
-root control, errno and kernel release. That INCONCLUSIVE does not block the
+syscall filter. The check reads only that root control and the job's inheritance
+report (its `file_setattr_errno` and the three refused setter ioctls), never the
+fill's exit code, errno or byte count: the refusal happens before the fill, so a
+256 MiB partial fill that exits 0 and a full fill that exits 73 are judged the
+same way. The result records the root control, errno and kernel release. That INCONCLUSIVE does not block the
 verdict only when the check's own control shows the kernel lacks the syscall
 (`file_setattr_supported` false and errno 38, Linux ENOSYS): no job can call it
 there either, and the seccomp rule that denies it on newer kernels is covered by
