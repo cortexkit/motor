@@ -62,40 +62,60 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, reason: Refusal) {
     );
 }
 
-#[derive(Clone, Default)]
-struct Buffer(Arc<Mutex<Vec<u8>>>);
-impl std::io::Write for Buffer {
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Appends to the calling thread's capture buffer.
+struct ThreadBuffer;
+impl std::io::Write for ThreadBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        CAPTURED.with(|captured| captured.borrow_mut().extend_from_slice(bytes));
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
-/// Captures this thread's log lines. One subscriber is registered per
-/// `Logs` and reused by every `capture`: registering subscribers while other
-/// tests log can make tracing drop events, so tests keep registrations few.
-struct Logs {
-    buffer: Buffer,
-    dispatch: tracing::Dispatch,
+/// The capture subscriber shared by every test in this file. While exactly
+/// one subscriber is registered, tracing decides a log statement's interest
+/// from whichever thread first reaches it, so a statement first reached on a
+/// thread without a subscriber stays disabled for every thread. Two
+/// subscribers that are never dropped keep that shortcut off for the rest of
+/// the test run; `Logs::capture` also rebuilds interest, re-enabling any
+/// statement disabled before they existed.
+fn capture_dispatch() -> &'static tracing::Dispatch {
+    static DISPATCH: std::sync::OnceLock<(tracing::Dispatch, tracing::Dispatch)> =
+        std::sync::OnceLock::new();
+    &DISPATCH
+        .get_or_init(|| {
+            let capture = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
+                "[host]",
+                ThreadBuffer,
+            ));
+            let spare = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
+                "[host]",
+                std::io::sink(),
+            ));
+            (capture, spare)
+        })
+        .0
 }
-impl Default for Logs {
-    fn default() -> Self {
-        let buffer = Buffer::default();
-        let dispatch = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
-            "[host]",
-            buffer.clone(),
-        ));
-        Self { buffer, dispatch }
-    }
-}
+/// Captures the log lines the calling thread (one test) emits inside
+/// `capture`. Each test starts with an empty buffer.
+struct Logs;
 impl Logs {
+    fn new() -> Self {
+        CAPTURED.with(|captured| captured.borrow_mut().clear());
+        Self
+    }
     fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
-        tracing::dispatcher::with_default(&self.dispatch, f)
+        tracing::dispatcher::with_default(capture_dispatch(), || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        })
     }
     fn text(&self) -> String {
-        String::from_utf8(self.buffer.0.lock().unwrap().clone()).unwrap()
+        CAPTURED.with(|captured| String::from_utf8(captured.borrow().clone()).unwrap())
     }
     fn count(&self, name: &str) -> usize {
         self.text().lines().filter(|l| l.contains(name)).count()
@@ -124,7 +144,7 @@ fn storage_threshold_is_the_floor_plus_suspend_reserve_plus_margin() {
 
 #[test]
 fn storage_latch_refuses_one_byte_below_threshold_and_releases_only_after_the_margin() {
-    let logs = Logs::default();
+    let logs = Logs::new();
     let mut h = host_with(vec![("vm", tenant_one())]);
     h.enforce_storage();
     let now = NOW * 1000;
@@ -174,7 +194,7 @@ fn storage_latch_refuses_one_byte_below_threshold_and_releases_only_after_the_ma
 
 #[test]
 fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse() {
-    let logs = Logs::default();
+    let logs = Logs::new();
     let now = NOW * 1000;
     let mut h = host_with(vec![("vm", tenant_one())]);
     h.enforce_storage();
@@ -281,7 +301,7 @@ fn two_tenants_use_the_larger_storage_term() {
 
 #[test]
 fn free_memory_follows_the_guest_sample_with_the_reserve_and_freshness_bound() {
-    let logs = Logs::default();
+    let logs = Logs::new();
     let mut h = host_with(vec![("vm", tenant_one())]);
     let now = NOW * 1000;
     // No valid capacity file: no reserve is known, so nothing is advertised.
