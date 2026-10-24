@@ -38,6 +38,64 @@ overlay and host-only tenant agent enabled, but the runner disabled until
 `rootfs_sha256` and the image toolchain `versions`. Image toolchain pins belong
 to the tenant-image builder, not this provisioning tool.
 
+## Host capacity and the jobs slice
+
+Before provisioning, install `/etc/motor-host/capacity.json` as a root-owned
+regular file, mode 0644 (group/world write permission is refused). It must
+contain exactly these six byte-valued, nonnegative u64 integers:
+
+```json
+{
+  "windows_vm_bytes": 17179869184,
+  "host_reserve_bytes": 6442450944,
+  "jobs_min_bytes": 25769803776,
+  "storage_margin_bytes": 8589934592,
+  "growth_allowance_bytes": 68719476736,
+  "tenant_memory_reserve_bytes": 2147483648
+}
+```
+
+`jobs_min_bytes` must be positive. It may be smaller than `windows_vm_bytes`,
+but their sum must fit in u64. Missing, unreadable or invalid capacity input
+refuses provisioning without writes.
+Memory fit uses `/proc/meminfo`'s `MemTotal` in checked bytes, not `MemAvailable`:
+
+```text
+sum((guest_ram_mib + memory_headroom_mib) * 1048576 for every tenant)
+    + windows_vm_bytes + host_reserve_bytes + jobs_min_bytes <= MemTotal
+```
+
+Apply the slice budget before provisioning or installing new host binaries:
+
+```sh
+sudo python3 script/tenant-provision/provision.py apply-jobs-slice
+```
+
+Under `provision.lock`, this checks fit over every registered tenant and refuses
+while any tenant has a `resize.json`. That journal records an unfinished sizing
+change; the slice budget must stay fixed until the resize is resumed or aborted.
+It refuses before changing anything when
+the slice's `MemoryCurrent` is above the proposed `MemoryHigh`, naming the usage.
+It writes `/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf`, runs
+`systemctl daemon-reload`, and verifies the live `MemoryMax` is no higher than
+the budget. Apply or read-back failures are errors; inspect the drop-in and
+live limits before retrying. The drop-in is written even if the slice is not
+installed yet. Provisioning requires its exact rendered bytes and checks the
+live cap too; an unloaded, `not-found` slice requires the same exact file.
+
+`MemoryMax = jobs_min_bytes + windows_vm_bytes` and
+`MemoryHigh = MemoryMax - floor(MemoryMax / 6)`. The slice holds the Windows VM
+plus direct Linux jobs: `jobs_min_bytes` is what direct Linux jobs keep when
+Windows uses its full allowance. The example values render exactly:
+
+```ini
+[Slice]
+MemoryMax=42949672960
+MemoryHigh=35791394134
+```
+
+## Tenant allocation
+
 Provisioning checks **bytes** before allocating anything for the tenant: disk
 quota + suspend RAM + host floor, plus RAM and the temporary placeholder when a
 new size base is needed. On a host that also runs `motor-runner serve`, it reads
@@ -100,6 +158,6 @@ automatic `remove_tenant`. The procedure and how to undo a removal are in
 `docs/hosted-host.md`. Tests: `test_remove_tenant_*`,
 `test_removal_layout_is_the_one_the_helper_removes`.
 
-Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
+Portable tests (including the capacity suite): `python3 scripts/run-script-tests.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

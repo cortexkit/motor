@@ -17,6 +17,12 @@ spec = importlib.util.spec_from_file_location("provision", Path(__file__).with_n
 assert spec is not None and spec.loader is not None
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
+capacity_spec = importlib.util.spec_from_file_location("test_capacity", Path(__file__).with_name("test_capacity.py"))
+assert capacity_spec is not None and capacity_spec.loader is not None
+capacity_tests = importlib.util.module_from_spec(capacity_spec)
+capacity_spec.loader.exec_module(capacity_tests)
+# The script-test runner enters through this file, including the capacity suite.
+CapacityTests = capacity_tests.CapacityTests
 # Kept before setUp replaces it, for the one test that reads a fake /proc.
 REAL_RUNNER_PROCESSES = p.runner_processes
 # The real host paths, kept before setUp points them into a scratch directory.
@@ -48,9 +54,16 @@ class ProvisionTests(unittest.TestCase):
         # runner_processes would read this machine's real /proc; tests that need
         # a runner pass one explicitly.
         self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", PROVISION=self.root / "provision",
-                                         BINDINGS=self.root / "host/tenants.json",
-                                         runner_processes=lambda: [])
+                                          BINDINGS=self.root / "host/tenants.json",
+                                          JOBS_DROP_IN=self.root / "jobs.conf",
+                                          read_capacity=lambda: {"windows_vm_bytes": 16 * 1024**3,
+                                                                 "host_reserve_bytes": 6 * 1024**3,
+                                                                 "jobs_min_bytes": 24 * 1024**3},
+                                          memtotal_bytes=lambda: 128 * 1024**3,
+                                          slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
+                                          runner_processes=lambda: [])
         self.patch.start()
+        p.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n")
         for directory in [p.REGISTRY, p.PROVISION, p.BINDINGS.parent, p.ROOT / "tenants"]:
             directory.mkdir(parents=True)
         self.image = self.root / "tenant-images/v1"
