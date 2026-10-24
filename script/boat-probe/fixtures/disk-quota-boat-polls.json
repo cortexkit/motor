@@ -1,0 +1,289 @@
+{
+ "_about": "Recorded from the Boat prepared-image verify of motor-boat-prepared-4c7dcddb0148 at source revision 458c633321354f5e73a0782bdc76aaf1d5a78b46 (results.json runner_host.disk_quota and the api log). Responses are copied verbatim.",
+ "large": {
+  "run_id": "c136466a630b449086f01e0f7f3db96a",
+  "sandbox": "bx_r2mvygkg",
+  "setter_positive_control": {
+   "request": 1075599392,
+   "clear_succeeded": true,
+   "before_flags": 2147484160,
+   "after_flags": 2147483648,
+   "before_project": 0,
+   "after_project": 0,
+   "file_setattr_supported": false,
+   "file_setattr_errno": 38,
+   "kernel_release": "6.8.0-138-generic"
+  },
+  "deep_cleanup": {
+   "ready": true,
+   "leases": [],
+   "root_free_bytes": 118912626688,
+   "xfs_free_bytes": 67010224128
+  },
+  "baseline_seed_client": {
+   "exit_code": 0,
+   "stdout": "{\"code\":0,\"stderr\":\"\",\"stdout\":\"baseline-seeded\\n\",\"terminal\":{\"bundle_bytes\":0,\"execution_ended\":true,\"job_id\":\"01a17025-eb0f-7450-be2e-968339830bb0\",\"outcome\":{\"code\":0,\"type\":\"exit\"},\"queue_wait_ms\":11,\"ran\":\"remote\",\"refusal_detail\":\"rule=retained_exit; memory.peak=74559488 memory.max=13776191488 memory.max_hit=false memory.events[last_available,max=0,oom=0,oom_kill=0] ExecMainCode=0 ExecMainStatus=0 workspace[free_bytes=34289049600,free_inodes=65514] runner_state[free_bytes=66955411456,free_inodes=33551170]; retained job exit status\",\"tree_hash\":\"937ec24eed013f41c0fa5776d9c8ecf48c4b6a19\",\"wall_ms\":199,\"workspace_changes\":[]}}\n",
+   "stderr": "boat_probe +0.001s job submitted\n[ck-motor] WARN motor_module::default_tip: default branch verification failed; cache fill skipped repository=/Users/motor-probe/motor/.cortexkit/boat-job-6hljuhd3 category=network reason=error: No such remote 'origin' elapsed_ms=2\n[ck-motor] INFO motor_module::transport: runner handshake advanced job_or_workspace_id=01a17025-eb0f-7450-be2e-968339830bb0 step=hello_send elapsed_ms=0\n[ck-motor] INFO motor_module::transport: runner handshake advanced job_or_workspace_id=01a17025-eb0f-7450-be2e-968339830bb0 step=hello_recv elapsed_ms=0\n[ck-motor] INFO motor_module::transport: runner handshake complete job_or_workspace_id=01a17025-eb0f-7450-be2e-968339830bb0 elapsed_ms=44\nboat_probe +0.090s accepted job_id=01a17025-eb0f-7450-be2e-968339830bb0 queue_position=0\nboat_probe +0.818s started queue_wait_ms=11\nboat_probe +1.028s first output seq=1\nboat_probe +1.068s terminal after 1 output records\n"
+  },
+  "reused_target_at_limit": {
+   "phase": "at-limit",
+   "lane": "reused_target",
+   "errno": null,
+   "bytes_written": 268435456,
+   "fill_target_bytes": 268435456,
+   "inheritance": {
+    "project": 15,
+    "child_project": 15,
+    "setters_refused": [
+     1075599392,
+     1074292226,
+     1074030082
+    ],
+    "file_setattr_errno": 38
+   },
+   "projects": {
+    "workspace": 15,
+    "target": 15,
+    "home": 15,
+    "tmp": 15,
+    "var_tmp": 15,
+    "stdout": 15,
+    "stderr": 15,
+    "exit": 15,
+    "cache-stats": 15
+   },
+   "baseline_bytes": 67108864,
+   "baseline_project_ids": [
+    15
+   ],
+   "released_logical_bytes": 0,
+   "fill_relative": "quota-inheritance-child-ffe54c1a8e144892b8e94066d200b67b/boat-quota-fill",
+   "probe_token": "5e46315821fe4948b08cfc04b6fb84ac",
+   "root_free_bytes": 118069493760,
+   "xfs_free_bytes": 66686984192,
+   "lease": {
+    "project": 15,
+    "roots": [
+     "/Users/motor-probe/motor/.cortexkit/boat-job-6hljuhd3",
+     "/Users/motor-probe/motor/.cortexkit/boat-job-6hljuhd3/target",
+     "/var/lib/motor-boat/state/boat/sandboxes/01a17025-efac-7461-9e15-783218210d87",
+     "/var/lib/motor-boat/state/boat/spools/01a17025-efac-7461-9e15-783218210d87"
+    ],
+    "blocks": 67108864,
+    "inodes": 65689,
+    "growth_bytes": 34289061888,
+    "initial_blocks": 138040,
+    "phase": "active"
+   },
+   "before": {
+    "root_free_bytes": 118069608448,
+    "xfs_free_bytes": 66955419648,
+    "physical_allowance_bytes": 34359738368,
+    "kernel_usage": {
+     "hard_bytes": 34359738368,
+     "used_bytes": 70688768
+    }
+   },
+   "job_id": "01a17025-efac-7461-9e15-783218210d87",
+   "kernel_usage": {
+    "hard_bytes": 34359738368,
+    "used_bytes": 339124224
+   },
+   "host_fill_path": "/Users/motor-probe/motor/.cortexkit/boat-job-6hljuhd3/target/quota-inheritance-child-ffe54c1a8e144892b8e94066d200b67b/boat-quota-fill",
+   "retained_allocated_bytes": 268435456,
+   "kernel_hard_limit_warning": false
+  },
+  "reused_target_client": {
+   "exit_code": 0,
+   "stdout": "{\"code\":0,\"stderr\":\"\",\"stdout\":\"{\\\"phase\\\": \\\"at-limit\\\", \\\"lane\\\": \\\"reused_target\\\", \\\"errno\\\": null, \\\"bytes_written\\\": 268435456, \\\"fill_target_bytes\\\": 268435456, \\\"inheritance\\\": {\\\"project\\\": 15, \\\"child_project\\\": 15, \\\"setters_refused\\\": [1075599392, 1074292226, 1074030082], \\\"file_setattr_errno\\\": 38}, \\\"projects\\\": {\\\"workspace\\\": 15, \\\"target\\\": 15, \\\"home\\\": 15, \\\"tmp\\\": 15, \\\"var_tmp\\\": 15, \\\"stdout\\\": 15, \\\"stderr\\\": 15, \\\"exit\\\": 15, \\\"cache-stats\\\": 15}, \\\"baseline_bytes\\\": 67108864, \\\"baseline_project_ids\\\": [15], \\\"released_logical_bytes\\\": 0, \\\"fill_relative\\\": \\\"quota-inheritance-child-ffe54c1a8e144892b8e94066d200b67b/boat-quota-fill\\\", \\\"probe_token\\\": \\\"5e46315821fe4948b08cfc04b6fb84ac\\\"}\\n\",\"terminal\":{\"bundle_bytes\":0,\"execution_ended\":true,\"job_id\":\"01a17025-efac-7461-9e15-783218210d87\",\"outcome\":{\"code\":0,\"type\":\"exit\"},\"queue_wait_ms\":14,\"ran\":\"remote\",\"refusal_detail\":\"rule=retained_exit; memory.peak=192462848 memory.max=13776191488 memory.max_hit=false memory.events[last_available,max=0,oom=0,oom_kill=0] ExecMainCode=0 ExecMainStatus=0 workspace[free_bytes=34356158464,free_inodes=65515] runner_state[free_bytes=67022503936,free_inodes=33551166]; retained job exit status\",\"tree_hash\":\"937ec24eed013f41c0fa5776d9c8ecf48c4b6a19\",\"wall_ms\":1611,\"workspace_changes\":[]}}\n",
+   "stderr": "boat_probe +0.033s job submitted\n[ck-motor] WARN motor_module::default_tip: default branch verification failed; cache fill skipped repository=/Users/motor-probe/motor/.cortexkit/boat-job-6hljuhd3 category=network reason=error: No such remote 'origin' elapsed_ms=2\n[ck-motor] INFO motor_module::transport: runner handshake advanced job_or_workspace_id=01a17025-efac-7461-9e15-783218210d87 step=hello_send elapsed_ms=0\n[ck-motor] INFO motor_module::transport: runner handshake advanced job_or_workspace_id=01a17025-efac-7461-9e15-783218210d87 step=hello_recv elapsed_ms=0\n[ck-motor] INFO motor_module::transport: runner handshake complete job_or_workspace_id=01a17025-efac-7461-9e15-783218210d87 elapsed_ms=1\nboat_probe +0.137s accepted job_id=01a17025-efac-7461-9e15-783218210d87 queue_position=0\nboat_probe +0.713s started queue_wait_ms=14\nboat_probe +1.964s first output seq=1\nboat_probe +2.526s terminal after 1 output records\n"
+  },
+  "reused_target_cleanup_poll": {
+   "ok": true,
+   "type": "command.status",
+   "success": true,
+   "processId": 39139,
+   "pid": 39139,
+   "status": "exited",
+   "known": true,
+   "running": false,
+   "exitCode": 0,
+   "signal": null,
+   "oomKilled": false,
+   "command": "sudo -n /usr/bin/python3 -c '\nimport json, os, pathlib, time\nstate = pathlib.Path('\"'\"'/var/lib/motor-boat/state/boat'\"'\"')\ndeadline = time.monotonic() + 90\nwhile time.monotonic() < deadline:\n    leases = list((state/'\"'\"'boat-quotas'\"'\"').glob('\"'\"'*.json'\"'\"'))\n    ready = pathlib.Path('\"'\"'/run/motor/endpoint-ready'\"'\"').exists()\n    if not leases and ready:\n        def free(path):\n            value = os.statvfs(path)\n            return value.f_bavail * value.f_frsize\n        print(json.dumps(dict(ready=ready, leases=[], root_free_bytes=free('\"'\"'/'\"'\"'), xfs_free_bytes=free('\"'\"'/var/lib/motor-boat'\"'\"'))))\n        break\n    time.sleep(.2)\nelse:\n    raise SystemExit('\"'\"'quota cleanup/readiness did not settle'\"'\"')\n'",
+   "cwd": ".",
+   "startedAt": "2026-10-24T23:01:39.368Z",
+   "finishedAt": "2026-10-24T23:01:39.633Z",
+   "stdout": "",
+   "stderr": "",
+   "stdoutTruncated": false,
+   "stderrTruncated": false,
+   "logPath": "/home/user/.ascii/processes/39139.log",
+   "errLogPath": "/home/user/.ascii/processes/39139.err.log"
+  }
+ },
+ "default": {
+  "run_id": "af18066a894046748aa6117ea6e34be7",
+  "sandbox": "bx_atnwq688",
+  "setter_positive_control": {
+   "request": 1075599392,
+   "clear_succeeded": true,
+   "before_flags": 2147484160,
+   "after_flags": 2147483648,
+   "before_project": 0,
+   "after_project": 0,
+   "file_setattr_supported": true,
+   "file_setattr_errno": 0,
+   "kernel_release": "7.0.0-38-generic"
+  },
+  "deep_cleanup": {
+   "ready": true,
+   "leases": [],
+   "root_free_bytes": 38725746688,
+   "xfs_free_bytes": 67010224128
+  },
+  "retained_target_at_limit": {
+   "phase": "at-limit",
+   "lane": "retained_target",
+   "errno": 28,
+   "bytes_written": 12842958848,
+   "fill_target_bytes": 0,
+   "inheritance": {
+    "project": 20,
+    "child_project": 20,
+    "setters_refused": [
+     1075599392,
+     1074292226,
+     1074030082
+    ],
+    "file_setattr_errno": 38
+   },
+   "projects": {
+    "workspace": 20,
+    "target": 20,
+    "home": 20,
+    "tmp": 20,
+    "var_tmp": 20,
+    "stdout": 20,
+    "stderr": 20,
+    "exit": 20,
+    "cache-stats": 20
+   },
+   "baseline_bytes": 0,
+   "baseline_project_ids": [],
+   "released_logical_bytes": 0,
+   "fill_relative": "quota-inheritance-child-8ab14faf7318425b98d196a5efedf861/boat-quota-fill",
+   "probe_token": "e6556b8b792d4532b7fbec6a725f3fba",
+   "root_free_bytes": 25835581440,
+   "xfs_free_bytes": 54180540416,
+   "lease": {
+    "project": 20,
+    "roots": [
+     "/Users/motor-probe/motor/.cortexkit/boat-job-ghd7uxui",
+     "/Users/motor-probe/motor/.cortexkit/boat-job-ghd7uxui/target",
+     "/var/lib/motor-boat/state/boat/sandboxes/01a17027-fc89-716e-90ea-868119b543d4",
+     "/var/lib/motor-boat/state/boat/spools/01a17027-fc89-716e-90ea-868119b543d4"
+    ],
+    "blocks": 25091392,
+    "inodes": 65688,
+    "growth_bytes": 12843225088,
+    "initial_blocks": 6968,
+    "phase": "active"
+   },
+   "before": {
+    "root_free_bytes": 38683488256,
+    "xfs_free_bytes": 67022159872,
+    "physical_allowance_bytes": 12846575616,
+    "kernel_usage": {
+     "hard_bytes": 12846792704,
+     "used_bytes": 3579904
+    }
+   },
+   "job_id": "01a17027-fc89-716e-90ea-868119b543d4",
+   "kernel_usage": {
+    "hard_bytes": 12846792704,
+    "used_bytes": 12846538752
+   },
+   "host_fill_path": "/Users/motor-probe/motor/.cortexkit/boat-job-ghd7uxui/target/quota-inheritance-child-8ab14faf7318425b98d196a5efedf861/boat-quota-fill",
+   "retained_allocated_bytes": 12842958848,
+   "kernel_hard_limit_warning": true
+  },
+  "retained_target_pre_stop": {
+   "job_running": true,
+   "allocated_bytes": 12842958848,
+   "root_free_bytes": 25835569152,
+   "xfs_free_bytes": 54180540416
+  },
+  "retained_target_pre_stop_storage": {
+   "mountinfo": "27 32 0:24 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw\n28 32 0:25 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n29 32 0:7 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=3470556k,nr_inodes=867639,mode=755,inode64\n30 29 0:26 / /dev/pts rw,nosuid,noexec,relatime shared:3 - devpts devpts rw,gid=5,mode=620,ptmxmode=000\n31 32 0:27 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=812748k,mode=755,inode64\n32 2 253:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw\n33 27 0:8 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:8 - securityfs securityfs rw\n34 29 0:28 / /dev/shm rw,nosuid,nodev shared:4 - tmpfs tmpfs rw,inode64\n35 31 0:29 / /run/lock rw,nosuid,nodev,noexec,relatime shared:6 - tmpfs tmpfs rw,size=5120k,inode64\n36 27 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n37 27 0:31 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:10 - pstore none rw\n38 27 0:32 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:11 - bpf bpf rw,mode=700\n40 28 0:33 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw,fd=32,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=5177\n41 29 0:23 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:14 - mqueue mqueue rw\n42 27 0:9 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:15 - debugfs debugfs rw\n43 29 0:34 / /dev/hugepages rw,nosuid,nodev,relatime shared:16 - hugetlbfs hugetlbfs rw,pagesize=2M\n44 27 0:14 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:17 - tracefs tracefs rw\n45 27 0:35 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:18 - fusectl fusectl rw\n46 27 0:21 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:19 - configfs configfs rw\n47 29 0:36 / /dev/binderfs rw,relatime shared:20 - binder binder rw,max=1048576\n50 32 253:15 / /boot/efi rw,relatime shared:31 - vfat /dev/vda15 rw,fmask=0022,dmask=0022,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro\n52 40 0:38 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:47 - binfmt_misc binfmt_misc rw\n288 31 0:59 / /run/user/1000 rw,nosuid,nodev,relatime shared:519 - tmpfs tmpfs rw,size=812744k,nr_inodes=203186,mode=700,uid=1000,gid=1000,inode64\n546 288 0:61 / /run/user/1000/gvfs rw,nosuid,nodev,relatime shared:547 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000,group_id=1000\n59 42 0:14 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:167 - tracefs tracefs rw\n150 288 0:57 / /run/user/1000/doc rw,nosuid,nodev,relatime shared:429 - fuse.portal portal rw,user_id=1000,group_id=1000\n111 32 253:1 /home/user /var/lib/ascii-lazy/real rw,relatime - ext4 /dev/vda1 rw\n520 32 253:1 /Users /var/lib/ascii-lazy/sysbind/Users rw,relatime - ext4 /dev/vda1 rw\n556 32 253:1 /app /var/lib/ascii-lazy/sysbind/app rw,relatime - ext4 /dev/vda1 rw\n617 32 253:1 /etc /var/lib/ascii-lazy/sysbind/etc rw,relatime - ext4 /dev/vda1 rw\n669 32 253:1 /home/ubuntu /var/lib/ascii-lazy/sysbind/home/ubuntu rw,relatime - ext4 /dev/vda1 rw\n689 32 253:1 /srv /var/lib/ascii-lazy/sysbind/srv rw,relatime - ext4 /dev/vda1 rw\n708 32 253:1 /usr /var/lib/ascii-lazy/sysbind/usr rw,relatime - ext4 /dev/vda1 rw\n724 32 253:1 /var/lib/apt /var/lib/ascii-lazy/sysbind/var/lib/apt rw,relatime - ext4 /dev/vda1 rw\n766 32 253:1 /var/lib/dpkg /var/lib/ascii-lazy/sysbind/var/lib/dpkg rw,relatime - ext4 /dev/vda1 rw\n858 32 253:1 /var/lib/fwupd /var/lib/ascii-lazy/sysbind/var/lib/fwupd rw,relatime - ext4 /dev/vda1 rw\n874 32 253:1 /var/lib/motor-boat /var/lib/ascii-lazy/sysbind/var/lib/motor-boat rw,relatime - ext4 /dev/vda1 rw\n890 32 253:1 /var/lib/ubuntu-advantage /var/lib/ascii-lazy/sysbind/var/lib/ubuntu-advantage rw,relatime - ext4 /dev/vda1 rw\n906 32 253:1 /var/lib/update-notifier /var/lib/ascii-lazy/sysbind/var/lib/update-notifier rw,relatime - ext4 /dev/vda1 rw\n922 32 253:1 /var/log/apt /var/lib/ascii-lazy/sysbind/var/log/apt rw,relatime - ext4 /dev/vda1 rw\n938 32 253:1 /var/spool /var/lib/ascii-lazy/sysbind/var/spool rw,relatime - ext4 /dev/vda1 rw\n954 32 253:1 /var/lib/docker/volumes /var/lib/ascii-lazy/sysbind/dvol rw,relatime - ext4 /dev/vda1 rw\n970 32 253:1 /home /home rw,relatime - ext4 /dev/vda1 rw\n1050 32 253:1 /etc /etc rw,relatime - ext4 /dev/vda1 rw\n1115 32 253:1 /usr /usr rw,relatime - ext4 /dev/vda1 rw\n1429 32 0:62 / /var/lib/ascii-lazy/retired/etc rw,relatime shared:218 - fuse ascii-lazyfs-sys rw,user_id=0,group_id=0,default_permissions,allow_other\n1430 32 0:64 / /var/lib/ascii-lazy/retired/home rw,nosuid,nodev,relatime shared:900 - fuse ascii-lazyfs rw,user_id=0,group_id=0,default_permissions,allow_other\n1433 32 0:71 / /var/lib/ascii-lazy/retired/usr rw,relatime shared:506 - fuse ascii-lazyfs-sys rw,user_id=0,group_id=0,default_permissions,allow_other\n994 32 7:0 / /var/lib/motor-boat rw,noatime shared:1003 - xfs /dev/loop0 rw,inode64,logbufs=8,logbsize=32k,prjquota\n1158 32 7:0 /state/workspaces /Users rw,noatime shared:1003 - xfs /dev/loop0 rw,inode64,logbufs=8,logbsize=32k,prjquota\n",
+   "boot_id": "bc54cabe-c54f-4ac0-a153-2d161f94134d",
+   "findmnt": {
+    "/var/lib/motor-boat": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/var/lib/motor-boat\",\n         \"source\": \"/dev/loop0\",\n         \"fstype\": \"xfs\"\n      }\n   ]\n}\n",
+    "/Users": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/Users\",\n         \"source\": \"/dev/loop0[/state/workspaces]\",\n         \"fstype\": \"xfs\"\n      }\n   ]\n}\n"
+   },
+   "backing_file": "/var/lib/motor-boat.xfs",
+   "expected_backing": true,
+   "backing_allocated_blocks": 25718872,
+   "users_bind": true,
+   "prepared": {
+    "state": [
+     "/var/lib/motor-boat",
+     "xfs",
+     "/dev/loop0"
+    ],
+    "users": [
+     "/Users",
+     "xfs",
+     "/dev/loop0"
+    ],
+    "reflink": true,
+    "identity": [
+     1792,
+     128,
+     33554560
+    ],
+    "boot_id": "bc54cabe-c54f-4ac0-a153-2d161f94134d",
+    "verified_monotonic_ns": 345106629752
+   },
+   "units": {
+    "motor-boat.service": {
+     "ExecMainStartTimestampMonotonic": "345335548",
+     "ActiveState": "active"
+    },
+    "motor-boat-host.service": {
+     "ExecMainStartTimestampMonotonic": "348595431",
+     "ActiveState": "active"
+    },
+    "var-lib-motor\\x2dboat.mount": {
+     "ActiveState": "active"
+    },
+    "Users.mount": {
+     "ActiveState": "active"
+    }
+   }
+  },
+  "journal_cursor_poll": {
+   "ok": true,
+   "type": "command.status",
+   "success": true,
+   "processId": 45014,
+   "pid": 45014,
+   "status": "exited",
+   "known": true,
+   "running": false,
+   "exitCode": 0,
+   "signal": null,
+   "oomKilled": false,
+   "command": "sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor",
+   "cwd": ".",
+   "startedAt": "2026-10-24T23:04:38.084Z",
+   "finishedAt": "2026-10-24T23:04:38.104Z",
+   "stdout": "-- No entries --\n-- cursor: s=4c4ce718decd416491c455c60388f086;i=2000;b=bc54cabec54f4ac0a1532d161f94134d;m=1dce7402;t=65e9e1ed82b65;x=f298a0d395997b89\n",
+   "stderr": "",
+   "stdoutTruncated": false,
+   "stderrTruncated": false,
+   "logPath": "/home/user/.ascii/processes/45014.log",
+   "errLogPath": "/home/user/.ascii/processes/45014.err.log"
+  }
+ }
+}

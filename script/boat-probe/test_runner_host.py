@@ -11,6 +11,7 @@ import tempfile
 import tarfile
 import base64
 import hashlib
+import re
 import shlex
 import unittest
 
@@ -1159,6 +1160,124 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                 runner.quota_reclaimed(after)
                 runner.check.assert_called_once_with('disk_quota.backing_allocation_dropped_after_resume', passed,
                                                      {'before': before, 'after': after})
+
+
+class RecordedDiskQuotaPollTests(unittest.TestCase):
+    """Replays the Boat command results that stopped the disk-quota phase of the
+    prepared-image verify at revision 458c6333 (fixtures/disk-quota-boat-polls.json)."""
+
+    @staticmethod
+    def recorded():
+        return json.loads(Path(__file__).with_name('fixtures').joinpath('disk-quota-boat-polls.json').read_text())
+
+    def replay(self, size, lanes, responses):
+        """Run the disk-quota phase with the recorded guest results; `responses`
+        maps a predicate on the guest command to its recorded Boat status."""
+        import disk_quota
+        recorded = self.recorded()[size]
+        probe = Mock()
+        probe.data = {}
+        runner = host.RunnerHost(probe)
+        runner.route = Mock(return_value=['ssh'])
+        runner.check_job = Mock()
+        cleanups = iter(responses.pop('cleanup'))
+        def ok(value):
+            return {'exitCode': 0, 'stdout': json.dumps(value) + '\n', 'stderr': '', 'status': 'exited'}
+        def execute(sid, command, **kwargs):
+            if shlex.quote(disk_quota.POSITIVE_CONTROL) in command:
+                return ok(recorded['setter_positive_control'])
+            if shlex.quote(disk_quota.CLEANUP) in command:
+                return next(cleanups)
+            for matches, response in responses.items():
+                if matches in command:
+                    return response
+            raise AssertionError('unexpected guest command: ' + command[:200])
+        runner.execute = Mock(side_effect=execute)
+        child = Mock(returncode=0)
+        child.poll.return_value = 0
+        return recorded, runner, probe, child, patch.object(disk_quota, 'LANES', lanes), \
+            patch.object(host, 'tunnel', return_value=contextlib.nullcontext('address')), \
+            patch.object(host, '_quota_popen', return_value=child), patch.object(host, 'EMPTY_OUTPUT_REPOLL_SECONDS', 0, create=True)
+
+    def test_recorded_large_empty_cleanup_poll_is_a_named_failure(self):
+        # Large run: the reused_target job finished and was recorded, then Boat
+        # reported the cleanup wait (process 39139) exited 0 with empty stdout.
+        recorded = self.recorded()['large']
+        poll = recorded['reused_target_cleanup_poll']
+        self.assertEqual((poll['status'], poll['exitCode'], poll['stdout'], poll['stderr']), ('exited', 0, '', ''))
+        deep = {'exitCode': 0, 'stdout': json.dumps(recorded['deep_cleanup']) + '\n', 'status': 'exited'}
+        observer = {'exitCode': 0, 'stdout': json.dumps(recorded['reused_target_at_limit']) + '\n', 'status': 'exited'}
+        _, runner, probe, child, *patches = self.replay('large', ('reused_target',), {
+            'cleanup': [deep, poll], 'EXPECTED_TOKEN=': observer})
+        client = recorded['reused_target_client']
+        child.communicate.return_value = (client['stdout'], client['stderr'])
+        probe.command_status.return_value = poll
+        with patches[0], patches[1], patches[2], patches[3], \
+             patch.object(host, 'process', return_value=recorded['baseline_seed_client']):
+            with self.assertRaisesRegex(ValueError, r'^disk_quota cleanup after lane reused_target: guest command exited 0 '
+                                                    r'with empty stdout .*5 re-polls of Boat process 39139'):
+                runner.disk_quota(recorded['sandbox'], Path('.'), 'public', Path('.'), Path('client'))
+        self.assertEqual(probe.command_status.call_count, host.EMPTY_OUTPUT_REPOLLS)
+        probe.command_status.assert_called_with(recorded['sandbox'], 39139)
+        row = runner.data['disk_quota']['lanes']['reused_target']
+        self.assertEqual(row['result']['code'], 0)
+        self.assertNotIn('cleanup', row)
+        failure = runner.data['guest_failures'][-1]
+        self.assertEqual((failure['label'], failure['reason']), ('disk_quota cleanup after lane reused_target', 'empty stdout'))
+        self.assertEqual(runner.data['empty_output_repolls'][-1]['output_arrived'], False)
+
+    def test_late_guest_output_after_an_empty_exited_poll_is_used_and_recorded(self):
+        poll = self.recorded()['large']['reused_target_cleanup_poll']
+        probe = Mock()
+        probe.data = {}
+        runner = host.RunnerHost(probe)
+        runner.execute = Mock(return_value=poll)
+        late = dict(poll, stdout='{"ready": true, "leases": []}\n')
+        probe.command_status.side_effect = [poll, late]
+        with patch.object(host, 'EMPTY_OUTPUT_REPOLL_SECONDS', 0):
+            self.assertEqual(runner.guest_json('bx', 'cleanup', 'cleanup step'), {'ready': True, 'leases': []})
+        self.assertEqual(probe.command_status.call_count, 2)
+        self.assertEqual(runner.data['empty_output_repolls'][0]['output_arrived'], True)
+        self.assertNotIn('guest_failures', runner.data)
+        # Output that is present but not JSON is named too, with what was printed.
+        runner.execute = Mock(return_value=dict(poll, stdout='Traceback\n'))
+        with self.assertRaisesRegex(ValueError, r"^cleanup step: guest command stdout is not JSON .*'Traceback"):
+            runner.guest_json('bx', 'cleanup', 'cleanup step')
+
+    def test_recorded_default_journal_cursor_after_no_entries_line_is_used(self):
+        # Default run: journalctl printed "-- No entries --" (it always does
+        # with --lines=0) and then the cursor, on the second line.
+        recorded = self.recorded()['default']
+        poll = recorded['journal_cursor_poll']
+        self.assertTrue(poll['stdout'].startswith('-- No entries --\n-- cursor: '))
+        def ok(value):
+            return {'exitCode': 0, 'stdout': json.dumps(value) + '\n', 'status': 'exited'}
+        _, runner, probe, child, *patches = self.replay('default', (), {
+            'cleanup': [ok(recorded['deep_cleanup'])],
+            'EXPECTED_TOKEN=': ok(recorded['retained_target_at_limit']),
+            'OBSERVATION=': ok(recorded['retained_target_pre_stop']),
+            shlex.quote(host.STORAGE_STATE): ok(recorded['retained_target_pre_stop_storage']),
+            '--show-cursor': poll})
+        child.poll.return_value = None
+        child.communicate.return_value = ('', 'client interrupted')
+        probe.request.return_value = {}
+        with patches[0], patches[1], patches[2], patches[3], \
+             patch.object(host, 'process', return_value={'exit_code': 0, 'stdout': json.dumps(dict(code=0, terminal={}, stdout='deep'))}):
+            runner.disk_quota(recorded['sandbox'], Path('.'), 'public', Path('.'), Path('client'))
+        record = runner.data['disk_quota']
+        self.assertTrue(record['stopped_with_retained_target'])
+        self.assertEqual(record['lanes']['retained_target']['eviction_journal_cursor'],
+                         's=4c4ce718decd416491c455c60388f086;i=2000;b=bc54cabec54f4ac0a1532d161f94134d;'
+                         'm=1dce7402;t=65e9e1ed82b65;x=f298a0d395997b89')
+        probe.request.assert_called_once_with('POST', f"/sandboxes/{recorded['sandbox']}/stop", {})
+
+    def test_missing_or_ambiguous_journal_cursor_names_what_journalctl_printed(self):
+        for stdout in ('-- No entries --\n', '', None, '-- cursor: \n', '-- cursor: a\n-- cursor: b\n'):
+            with self.subTest(stdout=stdout):
+                with self.assertRaisesRegex(ValueError, r'did not provide exactly one pre-stop eviction cursor line.*journalctl printed '
+                                            + re.escape(repr(stdout))):
+                    host.journal_cursor(stdout)
+        self.assertEqual(host.journal_cursor('-- cursor: s=1;i=2\n'), 's=1;i=2')
 
 
 if __name__ == "__main__":
