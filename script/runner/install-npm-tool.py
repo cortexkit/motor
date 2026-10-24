@@ -65,7 +65,10 @@ def extract(archive, destination):
                 if not (member.isfile() or member.isdir()):
                     raise ValueError("release member is not a file or directory: " + member.name)
                 members.append(member)
-            bundle.extractall(destination, members=members)
+            # The tar filter drops the archive's owner fields, so running as
+            # root yields root's files whatever uid the release was packed
+            # with; Python before 3.14 would otherwise restore it by chown.
+            bundle.extractall(destination, members=members, filter="tar")
     finally:
         os.umask(previous)
 
