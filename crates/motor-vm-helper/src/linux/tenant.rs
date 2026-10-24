@@ -1,10 +1,12 @@
 //! Ordinary-file Firecracker snapshots, independent of job UFFD/hugepage VMs.
+mod activation;
 mod capacity;
 use super::{fs, process, tenant_network};
 use crate::{
     config::Config,
     tenant::{
-        Backend, Registry, SnapshotKey, StartRefusal, StartRefusalCase, StartResult, REGISTRY,
+        Backend, Registry, ResizeActivation, SnapshotKey, StartRefusal, StartRefusalCase,
+        StartResult, REGISTRY,
     },
     Error, Result,
 };
@@ -561,6 +563,41 @@ impl Backend for LinuxTenants {
         api(&vm.root, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
         vm.paused = false;
         Ok(())
+    }
+    fn staged_resize(&mut self, r: &Registry) -> Result<Option<ResizeActivation>> {
+        activation::read_staged(&r.disk.with_file_name("runner-args.staged"))
+    }
+    fn apply_resize(&mut self, tenant: &str, activation: &ResizeActivation) -> Result<()> {
+        self.agent(
+            tenant,
+            json!({"op":"apply_resize", "runner_args":activation.runner_args}),
+        )
+    }
+    fn sync_disk(&mut self, tenant: &str) -> Result<()> {
+        self.vm(tenant)?.disk.sync_all()?;
+        Ok(())
+    }
+    fn post_grow_check(&mut self, r: &Registry) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let device = std::fs::symlink_metadata(&r.disk)?.dev();
+        let registries = self
+            .registries()?
+            .into_iter()
+            .map(|registry| {
+                let dev = std::fs::symlink_metadata(&registry.disk)?.dev();
+                Ok((registry, dev))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let on_device = registries
+            .into_iter()
+            .filter_map(|(r, dev)| (dev == device).then_some(r))
+            .collect::<Vec<_>>();
+        let capacity =
+            capacity::read_capacity(Path::new(capacity::CONFIG)).map_err(|e| Error(e.message))?;
+        capacity.check_post_grow(&on_device, activation::available(&r.disk)?)
+    }
+    fn complete_resize(&mut self, r: &Registry, activation: &ResizeActivation) -> Result<()> {
+        activation::complete(&r.disk.with_file_name("runner-args.staged"), activation)
     }
     fn prepare(&mut self, tenant: &str) -> Result<()> {
         self.agent(tenant, json!({"op":"prepare_snapshot","kind":"suspend"}))

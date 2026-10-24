@@ -140,7 +140,8 @@ with direct Linux jobs. `MemoryHigh` is `max - floor(max / 6)`. The
 pinned 40 GiB drop-in is `tests/vectors/jobs-slice-capacity.conf`.
 
 A policy refusal replies with `result: "start_refused"`, a typed `case` of
-`capacity_json`, `fit`, `live_cap`, `drop_in`, `resize_journal` or `oom`, and a
+`capacity_json`, `fit`, `live_cap`, `drop_in`, `resize_journal`, `oom`,
+`activation` or `post_grow_space`, and a
 diagnostic `message`. These refusals do not disable Stop, Metrics, removal or
 startup reconciliation. Both snapshot load paths verify the VMM is named
 `firecracker` and set and read back `oom_score_adj=-500` before snapshot load.
@@ -155,3 +156,46 @@ real load paths. Stop motor-host and motor-vm-helper first, set
 `--features linux-service-tests` in a delegated service. This lane requires
 root, systemd, KVM and the pinned jailer
 and Firecracker; it is not part of the portable suite.
+
+## Staged resize activation
+
+Provisioning publishes `tenants/<tenant>/runner-args.staged` as a root-owned,
+mode 0600 regular file. The helper opens it without following symlinks and
+requires exactly two JSON fields: `runner_args` (a string, at most 16 KiB decoded)
+and `quota_grew` (a boolean). Unknown or missing fields refuse the start.
+`tests/vectors/runner-args-staged.json` pins the producer/consumer bytes.
+Arguments use the guest's whitespace-separated tenant-runner option grammar,
+not shell syntax: host backend, tenant mode, veth networking, matching positive
+u32 weight/slot limits, numeric cache/floor values, and both `/Users` and `/home`
+workspace and owned-workspace roots. The optional state root is `/tenant/state`.
+The helper validates this grammar before sending anything to the guest.
+
+A pending activation forces a cold base load, even if a saved snapshot matches.
+After drive PATCH and resume, the helper sends `apply_resize` on the agent
+channel with the staged `runner_args`. The guest reply must acknowledge its grow,
+argument write and durability barriers. Only after that reply does the helper
+fsync its open disk file. When `quota_grew` is true, it then checks host available
+bytes against the operating requirement on the disk's filesystem:
+
+```
+max(host_floor_bytes + (idle_suspend_s > 0 ? guest_ram_mib * 2^20 : 0))
+    + 2 * storage_margin_bytes + growth_allowance_bytes
+```
+
+The maximum includes every registered tenant on that filesystem; all arithmetic
+is checked. Equality passes. The durable `quota_grew` value, not the current
+device and filesystem sizes, decides whether retries need this check. An
+activation without quota growth does not probe free space. After these steps the helper unlinks the
+staged file and fsyncs its parent directory. A failed directory barrier restores
+the staged intent before returning failure.
+
+An activation or post-grow failure returns `start_refused` before wake succeeds,
+retains the staged intent, and uses the same `prepare_stop`, stop, clear-running
+sequence as Stop. If guest preparation fails, the unclean and running markers
+remain for recovery. A failed stop cannot make a pending activation adoptable.
+The next start cold-boots and re-delivers the same intent idempotently. Portable
+tests cover ordered activation, space boundaries, no-growth, guest and host
+barrier refusals, clean-stop recovery and re-delivery. These helper doubles do
+not exercise real XFS growth or guest-side barriers; those need separate
+validation on a disposable tenant, on a dedicated root/KVM host with a
+resize-capable tenant image.
