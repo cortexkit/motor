@@ -1,6 +1,6 @@
 //! Local WMI/COM adapter for MSFT_Volume.Format (Storagewmi.mof).
 
-use super::{FormatOptions, FormatResult, StorageProvider, Volume, remaining_ms};
+use super::{FormatOptions, FormatResult, FormatValue, StorageProvider, Volume, remaining_ms};
 use std::{io, sync::OnceLock, time::Instant};
 use windows::{
     Win32::{
@@ -8,7 +8,9 @@ use windows::{
         System::{
             Com::*,
             Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE},
-            Variant::{VARIANT, VT_BSTR, VT_EMPTY, VT_I4, VT_NULL, VT_UI4},
+            Variant::{
+                VARIANT, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I4, VT_NULL, VT_UI4, VT_UNKNOWN,
+            },
             Wmi::*,
         },
     },
@@ -78,6 +80,34 @@ fn return_value(object: &IWbemClassObject) -> io::Result<u32> {
             "cache WMI Format has no numeric ReturnValue",
         )),
     }
+}
+
+fn extended_status(object: &IWbemClassObject) -> io::Result<String> {
+    let value = property(object, w!("ExtendedStatus"))?;
+    let embedded: IWbemClassObject = match value.vt() {
+        VT_BSTR => return Ok(unsafe { value.Anonymous.Anonymous.Anonymous.bstrVal.to_string() }),
+        VT_NULL | VT_EMPTY => return Ok(String::new()),
+        VT_UNKNOWN => {
+            let unknown = unsafe { value.Anonymous.Anonymous.Anonymous.punkVal.as_ref() }
+                .ok_or_else(|| io::Error::other("null embedded status object"))?;
+            com("read embedded status", unknown.cast())?
+        }
+        VT_DISPATCH => {
+            let dispatch = unsafe { value.Anonymous.Anonymous.Anonymous.pdispVal.as_ref() }
+                .ok_or_else(|| io::Error::other("null embedded status object"))?;
+            com("read embedded status", dispatch.cast())?
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "unexpected ExtendedStatus variant {}",
+                value.vt().0
+            )));
+        }
+    };
+    com("render embedded status", unsafe {
+        embedded.GetObjectText(0)
+    })
+    .map(|text| text.to_string())
 }
 
 pub(super) struct Provider {
@@ -232,18 +262,15 @@ impl StorageProvider for Provider {
         let input = com("create Format parameters", unsafe {
             signature.SpawnInstance(0)
         })?;
-        for (name, value) in [
-            (w!("FileSystem"), VARIANT::from(options.filesystem)),
-            (w!("FileSystemLabel"), VARIANT::from(options.label)),
-            (
-                w!("AllocationUnitSize"),
-                VARIANT::from(options.allocation_unit_size),
-            ),
-            (w!("Full"), VARIANT::from(options.full)),
-            (w!("Force"), VARIANT::from(options.force)),
-        ] {
+        for (name, value) in options.parameters() {
+            let name = BSTR::from(name);
+            let value = match value {
+                FormatValue::Text(value) => VARIANT::from(value),
+                FormatValue::Number(value) => VARIANT::from(value),
+                FormatValue::Boolean(value) => VARIANT::from(value),
+            };
             com("set Format parameter", unsafe {
-                input.Put(name, 0, &value, 0)
+                input.Put(PCWSTR(name.as_ptr()), 0, &value, 0)
             })?;
         }
         remaining_ms(deadline)?;
@@ -276,7 +303,10 @@ impl StorageProvider for Provider {
         let output = com("Format output", unsafe { call.GetResultObject(0) })?;
         Ok(Some(FormatResult {
             return_value: return_value(&output)?,
-            extended_status: string(&output, w!("ExtendedStatus"))?,
+            // The embedded diagnostic may be a serialized string or a COM
+            // object. A diagnostic decoding failure must not hide ReturnValue.
+            extended_status: extended_status(&output)
+                .unwrap_or_else(|error| format!("unavailable: {error}")),
         }))
     }
 }
