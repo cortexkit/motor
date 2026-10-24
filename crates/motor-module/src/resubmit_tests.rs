@@ -278,7 +278,10 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
     let motor = Motor::with_connector(
         config,
         &scratch.join("state"),
-        Arc::new(ResubmitPeer { log: log.clone() }),
+        Arc::new(ResubmitPeer {
+            log: log.clone(),
+            end: super::queue_tests::ResubmitEnd::Exit,
+        }),
     )
     .unwrap();
     assert!(motor.hosted_state(before_id).is_none());

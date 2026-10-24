@@ -543,7 +543,7 @@ impl Motor {
                 other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
             })
         } else {
-            detail
+            self.with_spill_attempt(id, detail)
         };
         let detail = if self
             .hosted_state(id)
@@ -1298,6 +1298,7 @@ impl Motor {
                 } else {
                     detail
                 };
+                let detail = self.with_spill_attempt(id, detail);
                 let mut terminal =
                     TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
                         .with_ran(Ran::None)
@@ -1494,6 +1495,37 @@ impl Motor {
         }
         runner.truncate(end);
         Some(runner + &hosted)
+    }
+    /// Name the earlier spill attempt in the refusal detail of a job that a
+    /// spill sent back to the build server. Such a job could not be placed on
+    /// a hosted runner and went back to the build-server queue under a new ID;
+    /// when it is then refused there, the caller learns that the hosted route
+    /// was already tried and why it failed (the broker code stored when the
+    /// job was resubmitted, such as `hosted_provisioning`), which bears on
+    /// whether to try again. `spill_attempted=<code>` goes after the build
+    /// server's own detail; if appending it would exceed the detail size
+    /// limit, the build server's detail is shortened to leave room for it.
+    /// Jobs never sent back keep the detail unchanged.
+    fn with_spill_attempt(&self, id: Uuid, detail: Option<String>) -> Option<String> {
+        let Some(code) = self.storage.job(id).and_then(|job| {
+            job.build_server_job_id?;
+            job.hosted?.hosted_code
+        }) else {
+            return detail;
+        };
+        let note = format!("spill_attempted={code}");
+        let Some(mut detail) = detail.filter(|d| !d.is_empty()) else {
+            return Some(bounded_detail(note));
+        };
+        let separator = "; ";
+        let mut end = detail
+            .len()
+            .min(REFUSAL_DETAIL_MAX_BYTES.saturating_sub(note.len() + separator.len()));
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        Some(bounded_detail(detail + separator + &note))
     }
     /// The ID the build server knows this job by. It differs from the caller's
     /// job ID only after a spilled job whose hosted route failed before any Run
@@ -1982,6 +2014,10 @@ impl Motor {
                         self.shadows.terminal(id, &terminal);
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+                    if !hosted && matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+                        terminal.refusal_detail =
+                            self.with_spill_attempt(id, terminal.refusal_detail.take());
+                    }
                     if hosted {
                         log_hosted_terminal(id, &terminal);
                     }

@@ -760,7 +760,10 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
     let motor = Motor::with_connector(
         config(&h, &repo),
         &scratch.0.join("state"),
-        Arc::new(super::queue_tests::ResubmitPeer { log: log.clone() }),
+        Arc::new(super::queue_tests::ResubmitPeer {
+            log: log.clone(),
+            end: super::queue_tests::ResubmitEnd::Exit,
+        }),
     )
     .unwrap();
     assert!(motor.hosted_state(id).is_none());

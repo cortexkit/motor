@@ -200,7 +200,21 @@ refused. The exact rules are in
 5.6). The field is the same one signing refusals use, so a client that already
 reads it needs no change, and can wait out the hint and retry remotely instead of
 running the job somewhere else. The runner computes the hint, so it appears once
-the runner is deployed: `ck-motor` only passes the terminal record through.
+the runner is deployed: `ck-motor` passes the hint through as the runner set
+it.
+
+A spilled job that no hosted runner received goes back to the build server
+under a new build-server ID. If the build server then refuses it, at admission
+or when its queue wait runs out, `ck-motor` appends
+`; spill_attempted=<code>` to the refusal detail, where `<code>` is the broker
+code that sent the job back (for example `hosted_capacity` or
+`hosted_provisioning`), so the caller knows the hosted route was already
+tried. If appending the note would exceed the refusal detail size limit, the
+build server's part is shortened to leave room for it. A job that ran gets no
+note, and a job that never spilled keeps the build server's refusal detail
+unchanged. Tests:
+`refusal_after_a_failed_spill_names_the_spill_attempt`,
+`spill_attempt_note_keeps_within_the_refusal_detail_limit`.
 
 Tests: `capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
 `capacity_retry_hint_is_clamped_to_its_bounds`,
