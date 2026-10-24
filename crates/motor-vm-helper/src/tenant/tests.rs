@@ -10,6 +10,7 @@ pub(crate) fn registry(name: &str) -> Registry {
         suspend: root.join("suspend"),
         image_version: "v1".into(),
         vcpu_ceiling: 2,
+        max_weight: None,
         guest_ram_mib: 18432,
         disk_quota_bytes: 21474836480,
         cpuset: "0-1".into(),
@@ -54,6 +55,8 @@ struct Fake {
     snapshot_uncertain: bool,
     stop_failures: u32,
     record_failures: u32,
+    start_failure: Option<StartRefusalCase>,
+    oom_failures: u32,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -72,6 +75,8 @@ impl Default for Fake {
             snapshot_uncertain: false,
             stop_failures: 0,
             record_failures: 0,
+            start_failure: None,
+            oom_failures: 0,
         }
     }
 }
@@ -93,7 +98,141 @@ fn key(generation: u64) -> SnapshotKey {
         generation,
     }
 }
+
+#[test]
+fn registry_budget_defaults_without_rewriting_keyless_records() {
+    let r = registry("a");
+    let bytes = serde_json::to_value(&r).unwrap();
+    assert!(bytes.get("max_weight").is_none());
+    let old: Registry = serde_json::from_value(bytes.clone()).unwrap();
+    assert_eq!(old.budget(), old.vcpu_ceiling);
+    assert_eq!(serde_json::to_value(&old).unwrap(), bytes);
+    let mut explicit = bytes;
+    explicit["max_weight"] = json!(64);
+    let r: Registry = serde_json::from_value(explicit.clone()).unwrap();
+    r.validate("a").unwrap();
+    assert_eq!(r.budget(), 64);
+    for invalid in [
+        json!(0),
+        json!(1),
+        json!(4294967296_u64),
+        json!("64"),
+        json!(null),
+        json!(1.5),
+    ] {
+        explicit["max_weight"] = invalid;
+        assert!(!serde_json::from_value::<Registry>(explicit.clone())
+            .is_ok_and(|r| r.validate("a").is_ok()));
+    }
+}
+
+#[test]
+fn start_refusals_precede_wake_and_do_not_disable_maintenance_operations() {
+    for case in [
+        StartRefusalCase::CapacityJson,
+        StartRefusalCase::Fit,
+        StartRefusalCase::LiveCap,
+        StartRefusalCase::DropIn,
+        StartRefusalCase::ResizeJournal,
+    ] {
+        let mut c = Controller(Fake {
+            start_failure: Some(case),
+            saved: Some(key(4)),
+            ..Fake::default()
+        });
+        for op in [Operation::Ensure, Operation::Restore] {
+            let reply = c.handle("a", op).unwrap().reply;
+            assert!(matches!(reply, Reply::StartRefused { case: actual, .. } if actual == case));
+            assert_eq!(c.0.calls, ["check-start"]);
+            assert_eq!(c.0.generation, 4);
+            assert_eq!(c.0.saved, Some(key(4)));
+            assert!(!c.0.running && !c.0.marker && !c.0.present);
+            c.0.calls.clear();
+        }
+        assert!(matches!(
+            c.handle("a", Operation::Stop).unwrap().reply,
+            Reply::Tenant { running: false, .. }
+        ));
+        assert!(matches!(
+            c.handle("a", Operation::Metrics).unwrap().reply,
+            Reply::TenantMetrics { .. }
+        ));
+        assert!(matches!(
+            c.handle("a", Operation::Remove).unwrap().reply,
+            Reply::Removed { .. }
+        ));
+        assert_eq!(
+            c.0.calls,
+            ["registry", "registry", "metrics", "registry", "remove"]
+        );
+    }
+}
+
+#[test]
+fn oom_refusal_never_falls_back_or_changes_snapshots_and_generation() {
+    for saved in [false, true] {
+        for failure in ["oom write", "oom readback"] {
+            for count in [1, u32::MAX] {
+                let mut c = Controller(Fake {
+                    saved: saved.then(|| key(4)),
+                    fail: failure,
+                    oom_failures: count,
+                    ..Fake::default()
+                });
+                let response = c.handle("a", Operation::Ensure).unwrap();
+                let reply = serde_json::to_value(response.reply).unwrap();
+                assert_eq!(reply["result"], "start_refused");
+                assert_eq!(reply["case"], "oom");
+                assert!(reply["message"].as_str().unwrap().contains(failure));
+                assert_eq!(c.0.saved, saved.then(|| key(4)));
+                assert_eq!(c.0.generation, 4);
+                assert!(!c.0.running && !c.0.marker && !c.0.present);
+                let expected_load = if saved {
+                    "load-saved-tap"
+                } else {
+                    "load-base-size-tap"
+                };
+                assert_eq!(
+                    c.0.calls,
+                    [
+                        "registry",
+                        "egress",
+                        expected_load,
+                        "stop",
+                        "clear-running-marker"
+                    ]
+                );
+                assert!(!c.0.calls.iter().any(|call| matches!(
+                    call.as_str(),
+                    "unlink-fsync" | "generation-fsync" | "resume" | "drive"
+                )));
+                if count == 1 {
+                    assert!(
+                        matches!(c.handle("a", Operation::Restore).unwrap().reply, Reply::Tenant { running: true, restored, generation: 5, .. } if restored == saved)
+                    );
+                } else {
+                    assert!(matches!(
+                        c.handle("a", Operation::Restore).unwrap().reply,
+                        Reply::StartRefused {
+                            case: StartRefusalCase::Oom,
+                            ..
+                        }
+                    ));
+                    assert_eq!(c.0.generation, 4);
+                    assert_eq!(c.0.saved, saved.then(|| key(4)));
+                }
+            }
+        }
+    }
+}
 impl Backend for Fake {
+    fn check_start(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
+        if let Some(case) = self.start_failure {
+            self.calls.push("check-start".into());
+            return Err(start_refused(case, "injected failure"));
+        }
+        Ok(())
+    }
     fn unclean(&mut self, _: &Registry) -> Result<bool> {
         Ok(self.unclean)
     }
@@ -155,7 +294,7 @@ impl Backend for Fake {
     fn snapshot_uncertain(&self, _: &str) -> bool {
         self.snapshot_uncertain
     }
-    fn load(&mut self, _: &str, _: &Registry, saved: bool) -> Result<()> {
+    fn load(&mut self, _: &str, _: &Registry, saved: bool) -> StartResult<()> {
         self.running = true;
         // The real backend writes the marker just before the VMM spawns.
         self.marker = true;
@@ -163,7 +302,39 @@ impl Backend for Fake {
             "load-saved-tap"
         } else {
             "load-base-size-tap"
-        })
+        })?;
+        if self.oom_failures > 0 {
+            self.oom_failures -= 1;
+            #[cfg(target_os = "linux")]
+            {
+                return crate::linux::tenant::guarded_snapshot_load(
+                    PathBuf::from("/no-api-on-refused-load").as_path(),
+                    if saved { "suspend" } else { "base" },
+                    "mtap1",
+                    || {
+                        crate::linux::tenant::protect_vmm_with(
+                            |name| {
+                                if name == "comm" {
+                                    Ok("firecracker\n".into())
+                                } else {
+                                    Err(std::io::Error::other("injected read failure"))
+                                }
+                            },
+                            |_| {
+                                if self.fail == "oom write" {
+                                    Err(std::io::Error::other("injected write failure"))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                    },
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(start_refused(StartRefusalCase::Oom, self.fail).into());
+        }
+        Ok(())
     }
     fn drive(&mut self, _: &str, _: &Registry) -> Result<()> {
         self.call("drive")
