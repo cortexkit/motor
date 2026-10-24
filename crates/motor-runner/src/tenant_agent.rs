@@ -14,7 +14,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod diagnostics;
 pub(crate) mod dns;
-pub(crate) use dns::DIRECTORY as DNS_DIRECTORY;
 mod network;
 mod paths;
 mod runner_socket;
@@ -924,7 +923,7 @@ mod tests {
         // that survives its runner's restart and is gone after the VM boots
         // again, which is what tells a helper's unit whether to bind it.
         assert_eq!(DNS_MARKER, "/run/motor-tenant-dns");
-        assert!(Path::new(DNS_DIRECTORY).is_absolute());
+        assert!(Path::new(dns::DIRECTORY).is_absolute());
     }
 
     #[tokio::test]
