@@ -250,6 +250,9 @@ pub struct StartRefusal {
     pub case: StartRefusalCase,
     pub message: String,
 }
+// Only the Linux helper checks capacity before a start; other builds compile the
+// portable types for their tests.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn start_refused(case: StartRefusalCase, error: impl std::fmt::Display) -> StartRefusal {
     StartRefusal {
         case,
