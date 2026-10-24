@@ -2,13 +2,12 @@
 
 use motor_winagent::cache::{
     BASIC_DATA_PARTITION, CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout,
-    cache_partition, format_arguments, partition_kind, require_uninitialized, storage_serial,
+    cache_partition, partition_kind, require_uninitialized, storage_serial,
 };
 use motor_winagent::cache_steps::{CacheReporter, CacheStep};
 use std::{
-    io::{self, Write},
+    io,
     mem::{offset_of, size_of, zeroed},
-    process::{Command, Stdio},
     ptr::{null, null_mut},
     thread,
     time::{Duration, Instant},
@@ -619,37 +618,8 @@ impl CacheStorage for WindowsStorage {
                 CacheStep::UpdateProperties,
             )?;
 
-            // format.com runs without a shell and is killed at the deadline.
-            // /Y suppresses its confirmation prompt; the piped answer covers
-            // builds that still ask. Output is discarded to keep the wait bounded.
             let volume = self.new_volume()?;
-            let mut child = Command::new("C:\\Windows\\System32\\format.com")
-                .args(format_arguments(&volume)?)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            if let Some(mut input) = child.stdin.take() {
-                let _ = input.write_all(b"Y\r\n");
-            }
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) if status.success() => return Ok(()),
-                    Ok(Some(status)) => {
-                        return Err(io::Error::other(format!("cache format failed: {status}")));
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    result => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(result.err().unwrap_or_else(|| {
-                            io::Error::new(io::ErrorKind::TimedOut, "cache format timed out")
-                        }));
-                    }
-                }
-            }
+            motor_winagent::cache_format::run(&volume, deadline)
         })
     }
 
