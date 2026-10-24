@@ -243,6 +243,14 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:8], ('install','-d','-o','root','-g','root','-m','0755'))
         self.assertTrue({'/usr/local/bin','/usr/local/libexec','/etc/systemd/system','/etc/ssh/sshd_config.d','/etc/motor','/etc/motor/tenant'} <= set(run.call_args.args[8:]))
 
+    def test_jobs_memory_policy_is_installed_from_shared_runner_source(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(install, 'run'):
+            systemd = Path(directory)
+            install.install_units(systemd)
+            source = install.ROOT / 'script/runner/units/system/motor-jobs.slice'
+            self.assertEqual((systemd / 'motor-jobs.slice').read_bytes(), source.read_bytes())
+            self.assertIn('script/runner/units/system/motor-jobs.slice', install.RUNNER_INPUTS)
+
     def test_absent_tool_home_is_created_root_owned_before_tools_install(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(install, 'run') as run:
             home = Path(tmp, 'ubuntu')

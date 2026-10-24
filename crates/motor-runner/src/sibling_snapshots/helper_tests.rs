@@ -141,6 +141,9 @@ fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbour
     let w = |path: &Path| word(path).unwrap();
     for expected in [
         "--service-type=exec".to_string(),
+        "--property=Slice=motor-jobs.slice".into(),
+        "--property=OOMScoreAdjust=900".into(),
+        "--property=OOMPolicy=kill".into(),
         // The unit stays loaded after a successful exit, so the runner can
         // read how its main process ended.
         "--property=RemainAfterExit=yes".into(),

@@ -136,7 +136,7 @@ fn rendered_argv(
 
 /// SHA-256 of the rendered argv of every remote case below.
 const REMOTE_PINNED_SHA256: &str =
-    "cf4ef2cf8e4d35710fab5313332f4d6d0af667af3e4472ac6004e3e361f3ed2e";
+    "d0c5e14f6b3969f851e9f8b6e2c346e59a4947eaf07f2d64713eceeef26fee12";
 
 /// Every unit kind, rendered with and without forwarders: the forwarder starts
 /// are the only difference, they come right after the gate, and with no

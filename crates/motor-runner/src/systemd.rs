@@ -4,6 +4,42 @@ use std::{
     time::Duration,
 };
 
+// PID 1 starts these system services, independently of the user manager's
+// protected runner processes. OOMPolicy also stops surviving job descendants.
+pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
+    "--property=Slice=motor-jobs.slice",
+    "--property=OOMScoreAdjust=900",
+    "--property=OOMPolicy=kill",
+];
+
+/// Refuse execution rather than let systemd synthesize an uncapped implicit slice
+/// when an operator has not yet installed the shared memory policy.
+pub(crate) fn require_job_memory_budget() -> io::Result<()> {
+    let output = systemctl(
+        &[
+            "show",
+            "--property=MemoryHigh,MemoryMax",
+            "motor-jobs.slice",
+        ],
+        false,
+    )?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let number = |key| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    if output.status.success()
+        && number("MemoryHigh=")
+            .zip(number("MemoryMax="))
+            .is_some_and(|(high, max)| high > 0 && high < max && max < u64::MAX)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
+    }
+}
+
 #[cfg(test)]
 pub(crate) type CommandHook = std::sync::Arc<dyn Fn(&[&str]) -> io::Result<Output> + Send + Sync>;
 
@@ -213,14 +249,16 @@ pub(crate) fn wait_until_active(
 ) -> io::Result<bool> {
     let mut polling = PollBackoff::activation();
     loop {
+        if expired()? {
+            return Ok(false);
+        }
         if systemctl(&["is-active", "--quiet", unit], true)?
             .status
             .success()
         {
-            return Ok(true);
-        }
-        if expired()? {
-            return Ok(false);
+            // The launcher may have died while systemctl was running. The
+            // service is still behind its stdin gate and must be discarded.
+            return Ok(!expired()?);
         }
         wait(polling.next_delay());
     }

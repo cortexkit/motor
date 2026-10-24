@@ -764,6 +764,7 @@ fn reference_proc_protections(user: &str) -> io::Result<Vec<(String, bool)>> {
         "--collect",
         "--service-type=exec",
     ]);
+    command.args(crate::systemd::JOB_MEMORY_PROPERTIES);
     for property in [
         format!("User={user}"),
         format!("Group={user}"),

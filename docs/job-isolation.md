@@ -211,7 +211,7 @@ host that runs jobs (the build server, a Boat sandbox and a hosted tenant VM)
 these hold, and callers may rely on them:
 
 - The job's process runs in the cgroup of its own transient system service,
-  `/proc/self/cgroup` reads `0::/system.slice/motor-job-<uuid>.service`, with a
+  `/proc/self/cgroup` reads `0::/motor.slice/motor-jobs.slice/motor-job-<uuid>.service`, with a
   UUID in lowercase hyphenated form. It is the id of the runner that started the
   unit and need not equal the job id the caller sees: a hosted job runs under
   the tenant runner's own id. The name comes from one function, `host_unit_name`
@@ -228,6 +228,43 @@ A caller that checks these should check the full shape (slice, prefix, UUID
 and suffix), not a prefix, and refuse when any of them differs. The live Boat
 probe checks PID 1 and `/proc/1/cgroup` (4.1); the cgroup path shape and
 ownership are not covered by a test.
+
+4.4.3. All job and cache-writer services, snapshot dependency helpers, Windows
+preparation and QEMU services share `motor-jobs.slice`. Its `MemoryHigh=75%`
+throttles and reclaims before `MemoryMax=85%` invokes cgroup OOM; percentages
+refer to physical host RAM, so the same policy scales down on Boat and tenant
+VMs. Swap is disabled for this slice. The remaining 15% is headroom for the
+runner and system, not a reservation against unrelated host workloads. The
+per-job limits remain unchanged. A slice cap bounds actual aggregate use,
+unlike charging admission for each job's declared maximum, which would reject
+low-memory jobs unnecessarily. CPU admission is unchanged.
+
+Work services have `OOMScoreAdjust=900` and `OOMPolicy=kill`, so an OOM victim's
+remaining processes are stopped. Runners stay outside that slice at `-900`.
+Their `OOMPolicy=continue` keeps a killed launcher or permission-helper child
+from making systemd stop the control-plane service as well.
+The unprivileged build-server user manager cannot lower an inherited OOM score:
+`script/runner/install-units.sh` therefore installs a privileged
+`user@<operator-uid>.service` drop-in as well as the user runner units and the
+system slice. Drain every instance and reboot before using the new negative
+user-service score; reloading alone does not change the running user manager.
+Boat and tenant runners are system services, so PID 1 can set their score
+directly. The separate root permission-repair CLI raises its own score to 900;
+root runners' in-process permission walks are still part of the runner.
+
+Launch refuses a missing/unbounded slice rather than silently using systemd's
+implicit unlimited slice. A killed launcher before gate release is setup
+refusal, not an executed/lost job. A victim of an ancestor OOM still increments
+its own `oom_kill` counter even if its own `max` and `oom` counters stay zero;
+the existing OOM counts and per-job vCPU advice remain available. More vCPUs
+raise only the per-job limit, not the shared host budget.
+
+Tests: `installed_units_reserve_host_memory_and_protect_user_runners`,
+`missing_or_unbounded_job_slice_refuses_execution`,
+`dead_launcher_never_counts_as_a_started_job_even_if_unit_is_active`,
+`ancestor_slice_oom_keeps_victim_counters_and_vcpu_advice`, and the operator-only
+`isolated_job_memory_budget_and_oom_priority_protect_runner` (real cgroup limits,
+job membership and `/proc` OOM scores; it does not exhaust host RAM).
 
 4.5. The command runs as `bash -c <command>` with the request's working
 directory. Its environment is the request's filtered variables (5.1) with the

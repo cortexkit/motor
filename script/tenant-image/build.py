@@ -28,6 +28,7 @@ RUNNER_INPUTS = (
     "script/runner/toolchain-parity.py", "script/runner/cargo-seed.py",
     "script/runner/syscall-surface.py",
     "script/runner/job-account.py",
+    "script/runner/units/system/motor-jobs.slice",
     "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
     "script/tenant-image/guest/root_paths.py",
 )

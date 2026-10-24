@@ -201,6 +201,13 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
         }
         if args.iter().any(|s| s == "windows-prepare") {
             assert!(args.iter().any(|s| s == "--property=User=motor-prep"));
+            for property in [
+                "--property=Slice=motor-jobs.slice",
+                "--property=OOMScoreAdjust=900",
+                "--property=OOMPolicy=kill",
+            ] {
+                assert!(args.iter().any(|s| s == property), "missing {property}");
+            }
             assert!(args.iter().any(|s| s == "--pipe"));
             assert!(!args.iter().any(|s| s.contains("PrivateNetwork")));
             let plan = Path::new(args.last().unwrap());
@@ -1523,6 +1530,9 @@ async fn windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_o
         "--wait",
         "--collect",
         "--property=User=motor-qemu",
+        "--property=Slice=motor-jobs.slice",
+        "--property=OOMScoreAdjust=900",
+        "--property=OOMPolicy=kill",
         "--property=SupplementaryGroups=kvm",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",

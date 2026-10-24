@@ -2,6 +2,10 @@
 Description=CortexKit motor-runner (exec-remote/v1 runner, instance main)
 
 [Service]
+# Requires the operator's user@UID.service drop-in installed by install-units.sh.
+OOMScoreAdjust=-900
+# A killed setup/launcher child must not stop the control-plane service.
+OOMPolicy=continue
 Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup

@@ -742,6 +742,8 @@ fn runner_command(
         "--unit=motor-tenant-runner",
         "--collect",
         "--service-type=exec",
+        "--property=OOMScoreAdjust=-900",
+        "--property=OOMPolicy=continue",
         "--setenv=CARGO_HOME=/tenant/cargo-home",
         "--property=PrivateMounts=yes",
         "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
@@ -799,6 +801,8 @@ mod tests {
             .map(|word| word.to_str().unwrap())
             .collect();
         assert!(words.contains(&"--property=PrivateMounts=yes"));
+        assert!(words.contains(&"--property=OOMScoreAdjust=-900"));
+        assert!(words.contains(&"--property=OOMPolicy=continue"));
         assert!(words.contains(
             &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
         ));

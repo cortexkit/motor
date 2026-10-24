@@ -57,6 +57,7 @@ RUNNER_INPUTS = (
     'script/runner/cargo-seed.py',
     'script/runner/syscall-surface.py',
     'script/runner/job-account.py',
+    'script/runner/units/system/motor-jobs.slice',
     'script/runner/sysctl/60-motor-inotify.conf',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
     'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
@@ -642,6 +643,8 @@ def install_units(systemd=Path("/etc/systemd/system")):
             (systemd / name).unlink(missing_ok=True)
     for name in UNITS:
         (systemd / name).write_text((HERE / name).read_text())
+    (systemd / "motor-jobs.slice").write_text(
+        (ROOT / "script/runner/units/system/motor-jobs.slice").read_text())
 
 
 def accounts():
@@ -690,7 +693,7 @@ def configure(pins, revision):
     Path("/etc/motor/tenant").mkdir(parents=True, exist_ok=True)
     Path("/etc/motor/tenant/id").unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    run("systemd-analyze", "verify", *("/etc/systemd/system/" + name for name in UNITS))
+    run("systemd-analyze", "verify", *("/etc/systemd/system/" + name for name in (*UNITS, "motor-jobs.slice")))
     run("systemctl", "enable", "motor-boat.service", "motor-boat-identity.service")
 
 

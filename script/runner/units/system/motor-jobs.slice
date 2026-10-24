@@ -1,0 +1,9 @@
+[Unit]
+Description=Shared memory budget for motor jobs and dependency helpers
+
+[Slice]
+# Percentages use physical host RAM, not the sum of per-job MemoryMax values.
+# Reclaim/throttle first; a hard cap leaves headroom for the runner and system.
+MemoryHigh=75%
+MemoryMax=85%
+MemorySwapMax=0
