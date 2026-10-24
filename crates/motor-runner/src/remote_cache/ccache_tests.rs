@@ -32,7 +32,8 @@ fn ccache_rollout_refuses_unprovisioned_roles_and_unpinned_binaries() {
 fn all_roles_use_private_remote_only_ccache_without_compiler_wrappers() {
     let forwarder = Forwarder::new(Tool::Ccache, 4182);
     for role in [HostRole::BuildServer, HostRole::Boat, HostRole::TenantVm] {
-        let mut env = super::super::environment::delta(role, &[forwarder.clone()], "b", "r");
+        let mut env =
+            super::super::environment::delta(role, std::slice::from_ref(&forwarder), "b", "r");
         env.extend(environment(&forwarder, false, "/caller/project"));
         assert_eq!(
             env,

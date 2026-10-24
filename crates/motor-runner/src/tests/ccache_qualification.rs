@@ -50,9 +50,13 @@ fn stats(env: &BTreeMap<String, String>) -> Vec<u8> {
     output.stdout
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires pinned ccache 4.12.3, sccache and native C/C++ compilers on the build server"]
-async fn pinned_ccache_no_cargo_fill_publishes_and_private_reader_hits_http_remote() {
+fn pinned_ccache_no_cargo_fill_publishes_and_private_reader_hits_http_remote() {
+    // The cache owns a separate Tokio runtime, which must outlive block_on and
+    // be dropped in this synchronous context, including on an assertion panic.
+    let cache = FakeCache::new();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
     assert!(ccache::installed(
         crate::remote_cache::provisioning::HostRole::BuildServer
     ));
@@ -64,7 +68,6 @@ async fn pinned_ccache_no_cargo_fill_publishes_and_private_reader_hits_http_remo
     let f = Fixture::new();
     fs::write(f.main.join("unit.c"), "int answer(void) { return 42; }\n").unwrap();
     fs::write(f.main.join("unit.cpp"), "int cpp_answer() { return 43; }\n").unwrap();
-    let cache = FakeCache::new();
     let fill_port = free_port();
     let transport = cache.transport(&[(Tool::Ccache, fill_port)]);
     let sockets = transport
@@ -230,4 +233,5 @@ async fn pinned_ccache_no_cargo_fill_publishes_and_private_reader_hits_http_remo
         403
     );
     eprintln!("ccache {}: published {} keys; reader remote_storage_hit={}, remote_storage_error=0, remote_storage_timeout=0; exit codes {cached:?}", ccache::VERSION, publication.keys.len(), reader_stats[ccache::REMOTE_HIT]);
+    });
 }

@@ -142,8 +142,8 @@ fn rendered_argv(
 const REMOTE_PINNED_SHA256: &str =
     "c20b3f34052769f35470cd8a8fb6abf91ae9bfe48d65c2e8eebb8b17069f9991";
 
-/// Every unit kind, rendered with and without forwarders: the forwarder starts
-/// are the only difference, they come right after the gate, and with no
+/// Every unit kind, rendered with and without forwarders: only forwarder starts
+/// and active-tool statistics change. Forwarders start right after the gate; with no
 /// forwarders nothing changes at all (the argv pinned in `command_golden`
 /// covers the unchanged units byte for byte).
 #[test]
@@ -209,7 +209,23 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
                     "{name}: {with}"
                 );
                 assert_eq!(with.matches(&starts).count(), 1, "{name}: {with}");
-                let stripped = with.replacen(&starts, "", 1);
+                let ccache_stats =
+                    "ccache --print-stats >/motor-output/ccache-stats 2>/dev/null || true; ";
+                // When the ccache forwarder is enabled, assert its added stats
+                // capture exactly once, then remove only that capture so the
+                // pinned digest and comparison with no-forwarder argv remain
+                // unchanged.
+                let normalized = if durable
+                    && tools
+                        .iter()
+                        .any(|forwarder| forwarder.tool() == Tool::Ccache)
+                {
+                    assert_eq!(with.matches(ccache_stats).count(), 1, "{name}: {with}");
+                    with.replacen(ccache_stats, "", 1)
+                } else {
+                    with.clone()
+                };
+                let stripped = normalized.replacen(&starts, "", 1);
                 let stats_command = " sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true;";
                 let expected = if durable && env.is_empty() && !fill {
                     assert_eq!(stripped.matches(stats_command).count(), 1, "{name}: {with}");
@@ -222,7 +238,7 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
                     "== {name} durable={durable} cached={}\n",
                     !env.is_empty()
                 ));
-                pinned.push_str(&with);
+                pinned.push_str(&normalized);
             }
         }
     }
