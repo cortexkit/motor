@@ -16,22 +16,20 @@ from build_storage import DiskMeter, FREE_FLOOR, GIB, assert_unmounted, choose_b
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+PARITY_FILES = tuple((REPO / "script/runner/parity-files.txt").read_text().splitlines())
 BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
              "init=/sbin/motor-init net.ifnames=0 ipv6.disable=1 "
              "systemd.unified_cgroup_hierarchy=1")
 RUNNER_INPUTS = (
     "script/runner/tools.txt", "script/runner/install-tools.sh",
-    "script/runner/toolchain.json",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
     "script/runner/build-git.sh", "script/runner/install-binaryen.py",
-    "script/runner/toolchain-parity.py", "script/runner/cargo-seed.py",
-    "script/runner/syscall-surface.py",
     "script/runner/job-account.py",
     "script/runner/units/system/motor-jobs.slice",
     "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
     "script/tenant-image/guest/root_paths.py",
-)
+) + tuple(f"script/runner/{name}" for name in PARITY_FILES)
 
 
 def digest(path):

@@ -115,7 +115,7 @@ def install_tools(pins):
         install_file(BUILD / name, PREFIX / name)
     parity_dir = PREFIX / "parity"
     parity_dir.mkdir(mode=0o755)
-    for name in ("toolchain.json", "toolchain-parity.py", "cargo-seed.py", "syscall-surface.py"):
+    for name in shared.parity.PARITY_FILES:
         install_file(BUILD / "script/runner" / name, parity_dir / name)
     # Only immutable binaries and toolchains enter the image, not install caches.
     os.environ.update(CARGO_HOME=str(PREFIX / "cargo"), RUSTUP_HOME=str(PREFIX / "rustup"),

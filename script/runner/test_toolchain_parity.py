@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import contextlib
 import copy
@@ -8,7 +9,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 from types import SimpleNamespace
@@ -22,6 +25,51 @@ if spec is None or spec.loader is None:
     raise ImportError("cannot load toolchain parity checker")
 parity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parity)
+
+
+class ParityBundleTests(unittest.TestCase):
+    def test_declared_files_load_without_the_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in parity.PARITY_FILES:
+                shutil.copy2(parity.HERE / name, root / name)
+            result = subprocess.run([sys.executable, '-I', str(root / 'toolchain-parity.py'), '--help'],
+                                    cwd=root, text=True, capture_output=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn('--capture', result.stdout)
+
+    def test_declared_files_cover_sibling_imports(self):
+        imported = set()
+        original = importlib.util.spec_from_file_location
+
+        def record(name, location, *args, **kwargs):
+            path = Path(location).resolve()
+            if path.parent == parity.HERE:
+                imported.add(path.name)
+            return original(name, location, *args, **kwargs)
+
+        with patch.object(importlib.util, 'spec_from_file_location', side_effect=record):
+            spec = importlib.util.spec_from_file_location('isolated_parity', parity.HERE / 'toolchain-parity.py')
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        # The AST scan finds literal sibling imports even in uncalled functions
+        # and ordinary imports that do not use spec_from_file_location.
+        for name in module.PARITY_FILES:
+            if not name.endswith('.py'):
+                continue
+            for node in ast.walk(ast.parse((parity.HERE / name).read_text())):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if node.value.endswith('.py') and Path(node.value).name == node.value:
+                        imported.add(node.value)
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or '']
+                    for dependency in modules:
+                        sibling = parity.HERE / (dependency.split('.')[0] + '.py')
+                        if sibling.is_file():
+                            imported.add(sibling.name)
+        self.assertFalse(imported - set(module.PARITY_FILES),
+                         f'undeclared sibling imports: {sorted(imported - set(module.PARITY_FILES))}')
 
 
 class SyscallSurfaceTests(unittest.TestCase):

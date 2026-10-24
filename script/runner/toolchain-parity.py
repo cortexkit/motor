@@ -14,6 +14,7 @@ import shutil
 import subprocess
 
 HERE = Path(__file__).resolve().parent
+PARITY_FILES = tuple((HERE / "parity-files.txt").read_text().splitlines())
 MANIFEST = HERE / "toolchain.json"
 LOCAL_BIN = Path("/usr/local/bin")
 # A tenant VM binds the tenant's own directories over these image paths before

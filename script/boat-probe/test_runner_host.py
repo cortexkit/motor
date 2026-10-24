@@ -107,10 +107,12 @@ class RunnerHostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp, 'wasm32-unknown-unknown')
             target.mkdir()
-            checker = Path(tmp, 'checker.py')
-            checker.write_text('from pathlib import Path\ndef check(manifest, role, job, gnu_test_sha256=None, cargo_registry=None):\n'
+            for name in host.PARITY_FILES:
+                Path(tmp, name).write_text((host.PARITY_DIR / name).read_text())
+            checker = Path(tmp, 'toolchain-parity.py')
+            checker.write_text(checker.read_text() + '\ndef check(manifest, role, job, gnu_test_sha256=None, cargo_registry=None):\n'
                                f'    return {{"passed": Path({str(target)!r}).is_dir(), "job": job, "syscalls": len(syscall_surface.expectations(job))}}\n')
-            with patch.object(host, 'PARITY_SCRIPT', checker):
+            with patch.object(host, 'PARITY_DIR', Path(tmp)):
                 source = host.parity_source(job=True)
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 exec(source, {})

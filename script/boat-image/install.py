@@ -53,15 +53,12 @@ APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourcepa
                '-o', 'APT::Get::AllowUnauthenticated=false']
 RUNNER_INPUTS = (
     'script/runner/tools.txt', 'script/runner/install-tools.sh',
-    'script/runner/toolchain.json', 'script/runner/toolchain-parity.py',
-    'script/runner/cargo-seed.py',
-    'script/runner/syscall-surface.py',
     'script/runner/job-account.py',
     'script/runner/units/system/motor-jobs.slice',
     'script/runner/sysctl/60-motor-inotify.conf',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
     'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
-)
+) + tuple(f'script/runner/{name}' for name in parity.PARITY_FILES)
 # motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
 TOOL_HOME = Path("/home/ubuntu")
 # Boat's base ships /usr/local as uid 1000: the provider's sandbox account,

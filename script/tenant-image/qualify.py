@@ -29,6 +29,7 @@ from build_storage import mounts_under, require_private_view
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+PARITY_FILES = tuple((REPO / "script/runner/parity-files.txt").read_text().splitlines())
 ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
@@ -269,7 +270,7 @@ def stage_javascript_fixtures(fixture, source=JAVASCRIPT_FIXTURES):
 def parity_inputs(image, repo=REPO):
     manifest = json.loads((image / 'manifest.json').read_text())
     inventory = json.loads((image / 'tools.json').read_text())['parity']
-    for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py', 'syscall-surface.py'):
+    for name in PARITY_FILES:
         relative = 'script/runner/' + name
         actual = hashlib.sha256((repo / relative).read_bytes()).hexdigest()
         if actual != manifest['versions']['runner_inputs_sha256'][relative]:
@@ -545,7 +546,7 @@ class Harness:
             shutil.copyfile(HERE / "guest/hosted_qualify.py", dest / "run.py")
             # The guest checks ownership with this checkout's rule, not the image's copy.
             shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")
-            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py", "syscall-surface.py"):
+            for name in PARITY_FILES:
                 shutil.copyfile(REPO / "script/runner" / name, dest / name)
             (dest / "gnutest.sha256").write_text(self.gnu_test_sha256)
             shutil.copyfile(self.args.runner_test_binary.resolve(), dest / "runner-tests")
@@ -628,7 +629,7 @@ class Harness:
             fixture.mkdir()
             self.run("git", "init", "--quiet", fixture)
             (fixture / "input").write_text("tenant image qualification\n")
-            for name in ("toolchain-parity.py", "toolchain.json", "cargo-seed.py", "syscall-surface.py"):
+            for name in PARITY_FILES:
                 shutil.copyfile(REPO / "script/runner" / name, fixture / name)
             stage_javascript_fixtures(fixture)
             self.run("git", "-C", fixture, "add", ".")
