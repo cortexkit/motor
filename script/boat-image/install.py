@@ -2,6 +2,7 @@
 """Root-only Boat fleet host installation; private Cargo seed is tenant-1-only."""
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import importlib.util
@@ -489,11 +490,14 @@ def install_pnpm(manifest):
         raise ValueError("pnpm registry integrity differs from the manifest pin")
     archive = BUILD / "downloads/pnpm.tgz"
     urllib.request.urlretrieve(metadata["dist"]["tarball"], archive)
-    if digest(archive, "sha512") != source["sha512"]:
+    # The pin is npm's integrity form (base64 SHA-512); digest() and the
+    # installer work in hex, so compare in one form.
+    expected = base64.b64decode(source["sha512"], validate=True).hex()
+    if digest(archive, "sha512") != expected:
         raise ValueError("pnpm integrity mismatch")
     run("/usr/bin/python3", str(ROOT / "script/runner/install-npm-tool.py"),
         "--prefix", "/usr/local", "--name", name, "--archive", str(archive),
-        "--sha512", source["sha512"], "--url", metadata["dist"]["tarball"])
+        "--sha512", expected, "--url", metadata["dist"]["tarball"])
 
 
 def install_rust(manifest, installer):

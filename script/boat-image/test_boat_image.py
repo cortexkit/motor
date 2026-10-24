@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Portable recipe integrity tests, not proof of a functioning Boat host."""
+import base64
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -1248,10 +1250,12 @@ class PnpmInstallTests(unittest.TestCase):
     def test_pnpm_is_installed_from_its_pinned_release_not_by_npm(self):
         manifest = self.manifest()
         source = manifest["tools"]["pnpm"]["source"]
+        # The real digest runs on the downloaded bytes: the pin is npm's base64
+        # integrity, digest() is hex, and a mocked digest hid that mismatch.
+        source["sha512"] = base64.b64encode(hashlib.sha512(b"release").digest()).decode()
         tarball = "https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz"
         with patch.object(install.urllib.request, "urlretrieve",
                           side_effect=lambda url, path: Path(path).write_bytes(b"release")) as retrieve, \
-             patch.object(install, "digest", return_value=source["sha512"]), \
              patch.object(install.urllib.request, "urlopen",
                           return_value=io.BytesIO(json.dumps({"dist": {
                               "integrity": "sha512-" + source["sha512"], "tarball": tarball}}).encode())) as metadata, \
@@ -1268,7 +1272,7 @@ class PnpmInstallTests(unittest.TestCase):
         # registry integrity the manifest records.
         self.assertEqual(option["--prefix"], "/usr/local")
         self.assertEqual(option["--name"], "pnpm")
-        self.assertEqual(option["--sha512"], source["sha512"])
+        self.assertEqual(option["--sha512"], hashlib.sha512(b"release").hexdigest())
         self.assertEqual(option["--url"], tarball)
         self.assertEqual(retrieve.call_args.args[0], tarball)
         self.assertEqual(retrieve.call_args.args[1], self.build / "downloads/pnpm.tgz")
