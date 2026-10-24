@@ -193,7 +193,7 @@ fn storage_latch_refuses_one_byte_below_threshold_and_releases_only_after_the_ma
 }
 
 #[test]
-fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse() {
+fn restarted_host_between_threshold_and_release_still_refuses() {
     let logs = Logs::new();
     let now = NOW * 1000;
     let mut h = host_with(vec![("vm", tenant_one())]);
@@ -203,32 +203,49 @@ fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse()
     refused(h.claim(claims(JOB), now), Refusal::HostFull);
     // Above the threshold is not low, so nothing is logged yet.
     assert_eq!(logs.count("host_storage_low"), 0);
+}
 
-    for (low_logs, (capacity, free, detail)) in (1..).zip([
-        (
-            Ok(capacity_values()),
-            Err("statvfs failed".to_owned()),
-            "statvfs failed",
-        ),
-        (
-            Err("capacity.json missing".to_owned()),
-            Ok(u64::MAX),
-            "capacity.json missing",
-        ),
-    ]) {
-        let mut h = host_with(vec![("vm", tenant_one())]);
-        h.enforce_storage();
-        logs.capture(|| h.observe_storage(capacity, free));
-        assert!(h.storage_refusing());
-        refused(h.claim(claims(JOB), now), Refusal::HostFull);
-        assert!(logs.text().contains(detail), "{}", logs.text());
-        assert_eq!(logs.count("host_storage_low"), low_logs);
-        // After a failed probe the latch clears only at the release point.
-        observe(&mut h, 144 * GIB - 1);
-        assert!(h.storage_refusing());
-        observe(&mut h, 144 * GIB);
-        assert!(!h.storage_refusing());
-    }
+/// A probe that fails sets the latch, both on a host that starts latched and
+/// on one whose latch had cleared, logs the failure once, and clears only at
+/// the release point.
+fn failed_probe_fails_closed(capacity: Result<Capacity, String>, free: Result<u64, String>) {
+    let detail = match (&capacity, &free) {
+        (Err(detail), _) | (_, Err(detail)) => detail.clone(),
+        _ => unreachable!("a failed probe"),
+    };
+    let logs = Logs::new();
+    let now = NOW * 1000;
+    let mut h = host_with(vec![("vm", tenant_one())]);
+    h.enforce_storage();
+    logs.capture(|| h.observe_storage(capacity.clone(), free.clone()));
+    assert!(h.storage_refusing());
+    refused(h.claim(claims(JOB), now), Refusal::HostFull);
+    assert!(logs.text().contains(&detail), "{}", logs.text());
+    assert_eq!(logs.count("host_storage_low"), 1);
+    observe(&mut h, 144 * GIB);
+    assert!(!h.storage_refusing());
+    h.claim(claims(JOB), now).unwrap();
+    // A released latch sets again on the next failed probe.
+    logs.capture(|| h.observe_storage(capacity, free));
+    assert!(h.storage_refusing());
+    refused(h.claim(claims(JOB2), now), Refusal::HostFull);
+    assert_eq!(h.heartbeat(now, 0, true).free_vcpus, 0);
+    assert_eq!(logs.count("host_storage_low"), 2, "{}", logs.text());
+    // After a failed probe the latch clears only at the release point.
+    observe(&mut h, 144 * GIB - 1);
+    assert!(h.storage_refusing());
+    observe(&mut h, 144 * GIB);
+    assert!(!h.storage_refusing());
+}
+
+#[test]
+fn failed_free_space_probe_refuses_until_the_release_point() {
+    failed_probe_fails_closed(Ok(capacity_values()), Err("statvfs failed".to_owned()));
+}
+
+#[test]
+fn invalid_capacity_file_refuses_until_the_release_point() {
+    failed_probe_fails_closed(Err("capacity.json missing".to_owned()), Ok(u64::MAX));
 }
 
 #[test]
