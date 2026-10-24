@@ -2035,7 +2035,8 @@ fn tenant_bun_is_mounted_where_jobs_look_for_it() {
 #[test]
 fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools() {
     let f = Fixture::new();
-    let report = check_javascript_setup(&installed_tools(), &f.scratch.join("check")).unwrap();
+    let tools = installed_tools();
+    let report = check_javascript_setup(&tools, &f.scratch.join("check")).unwrap();
     for lockfile in [
         "bun/bun.lock",
         "npm/package-lock.json",
@@ -2043,7 +2044,9 @@ fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools
     ] {
         assert!(report.contains(lockfile), "{report}");
     }
-    assert!(report.contains("/home/ubuntu/.bun/bin/bun"), "{report}");
+    // The report names the configured Bun, not one found on PATH.
+    let bun = tools.executable("bun");
+    assert!(report.contains(&*bun.to_string_lossy()), "{report}");
     let empty = f.scratch.join("no-tools");
     fs::create_dir(&empty).unwrap();
     let error = check_javascript_setup(
