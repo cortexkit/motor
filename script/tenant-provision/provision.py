@@ -34,6 +34,8 @@ CAPACITY_KEYS = {"windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes", "st
 U32_MAX = 2**32 - 1
 # motor-runner's default free-space floor (crates/motor-runner/src/engine.rs,
 # DEFAULT_FREE_SPACE_FLOOR_BYTES): below it the runner refuses jobs.
+# Between it and the runner's higher eviction threshold the runner deletes idle
+# workspaces and caches by design; nothing fails there.
 RUNNER_DEFAULT_FLOOR = 128 * 1024**3
 # The VMM ranks below jobs (+900) and above runners (-900) with the kernel's
 # OOM killer, so a host OOM prefers a job over the tenant's VM.
@@ -765,9 +767,6 @@ def trusted(path):
             raise ValueError(f"path must be root-owned, non-writable and not a symlink: {p}")
 
 
-# motor-runner's default free-space floor, declared above: below it the runner
-# refuses jobs. Between it and the runner's higher eviction threshold the runner
-# deletes idle workspaces and caches by design; nothing fails there.
 # The runner's options that take no value; every other option takes one.
 RUNNER_FLAGS = {"--tenant-vm", "--boat-profile"}
 

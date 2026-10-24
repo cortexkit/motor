@@ -268,12 +268,11 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.events, [])
 
     def test_storage_requirement_pinned_to_the_cutover_figures(self):
-        # Tenant 1 after the cutover: 78 GiB, idle off and a 600 GiB disk, so
-        # the suspend reserve is not counted. The measured figures fall about
-        # 6 GiB between the two published readings (the operating requirement
-        # plus 2 GiB of mkfs metadata and the base's 78.5 GiB should total
-        # 312.5 GiB, the spec publishes 309,774,516,224 bytes); this pin
-        # records the computed rule, not either reading.
+        # A 78 GiB tenant with idle off and a 600 GiB disk: the suspend reserve
+        # is not counted, so the threshold is the 128 GiB host floor plus the
+        # 8 GiB storage margin, the requirement adds the margin again and the
+        # 64 GiB growth allowance, and the pre-operation figure adds 2 GiB of
+        # mkfs metadata and the absent base's RAM plus placeholder.
         tenant = dict(tenant="tenant-1", guest_ram_mib=79872, idle_suspend_s=0,
                       host_floor_bytes=128 * GIB, disk_quota_bytes=600 * GIB)
         self.assertEqual(p.storage_threshold(tenant, CAPACITY), 136 * GIB)

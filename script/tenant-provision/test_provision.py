@@ -572,14 +572,16 @@ class ProvisionTests(unittest.TestCase):
             p.provision(c, execute=execute, runners=runner)
         execute.assert_not_called()
         self.assertFalse((p.ROOT / "tenants" / c["tenant"]).exists())
-        # On another filesystem the same host passes, and room for the floor on
-        # this one admits the tenant: the tenant's own bytes and the floor fit.
+        # With the runner's state outside the tenant's filesystem, the same
+        # host passes.
         ample = needed + floor
         with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample})), \
                 mock.patch.object(p, "device", side_effect=lambda path: 1 if path == state else 2):
             p.provision(c, execute=execute, runners=runner)
         execute.reset_mock()
         c2 = dict(c, tenant="b", vm="vm-b", tap_index=2)
+        # Sharing the filesystem admits the tenant too, with room for its
+        # requirement and the runner's floor on top.
         with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample + floor})):
             p.provision(c2, execute=execute, runners=runner)
         execute.assert_called()
