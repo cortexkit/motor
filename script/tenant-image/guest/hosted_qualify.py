@@ -355,6 +355,11 @@ def main():
     if f"test {TEST} ... ok" not in output or "1 passed; 0 failed; 0 ignored;" not in output:
         raise RuntimeError("the exact ignored isolation test did not run once successfully")
     print("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored", flush=True)
+    # The host records backing-file blocks between these allocation and trim
+    # barriers, once from the base and once after a real helper suspend/restore.
+    from discard_fixture import guest_cycle
+    guest_cycle("cold")
+    guest_cycle("warm")
     # The final real job creates this file. Checking units afterward includes
     # failures from attachment, isolation and the post-restore job, not just boot.
     deadline = time.monotonic() + 600

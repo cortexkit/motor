@@ -10,10 +10,14 @@ use std::{
 static FROZEN: AtomicBool = AtomicBool::new(false);
 static DRAINED: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn frozen() -> bool {
+    FROZEN.load(Ordering::Acquire)
+}
+
 /// Why the runner cannot be snapshotted now, or None when it is idle. The
 /// runner reports `running_jobs` as a list of jobs, not a count; anything
 /// missing or malformed counts as busy, so a snapshot never captures a job.
-fn busy(value: &Value) -> Option<String> {
+pub(super) fn busy(value: &Value) -> Option<String> {
     if value["ok"] != true {
         return Some(format!("runner status unavailable: {value}"));
     }
@@ -42,7 +46,7 @@ fn busy(value: &Value) -> Option<String> {
         running.join(", ")
     ))
 }
-fn mounted(path: &str) -> io::Result<bool> {
+pub(super) fn mounted(path: &str) -> io::Result<bool> {
     Ok(fs::read_to_string("/proc/self/mountinfo")?
         .lines()
         .any(|line| line.split_whitespace().nth(4) == Some(path)))

@@ -167,6 +167,7 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
         assert_unmounted(stage, mountinfo_reader)
         manifest = {
             "version": version, "versions": pins, "boot_args": BOOT_ARGS,
+            "capabilities": ["sparse-v1", "resize-v1"],
             "kernel_sha256": digest(stage / "kernel/vmlinux"),
             "rootfs_sha256": digest(stage / "rootfs"),
             "runner_sha256": digest(stage / "motor-runner"),
