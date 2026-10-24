@@ -30,6 +30,9 @@ pub(crate) struct State {
     pub(crate) enabled: Option<bool>,
     pub(crate) status: Status,
     pub(crate) identity: Option<StoreIdentity>,
+    /// The gateway's write-breaker deadline, refreshed by its owner before
+    /// queueing fills. A half-open probe does not extend this window.
+    pub(crate) write_breaker_open_until: Option<tokio::time::Instant>,
 }
 
 impl State {
@@ -43,6 +46,7 @@ impl State {
                 detail: "not read yet".to_string(),
             }),
             identity: None,
+            write_breaker_open_until: None,
         }
     }
 
@@ -84,6 +88,9 @@ impl State {
             refresh_period: config.refresh_period,
             retry_interval: config.publish_retry_interval,
             identity: self.identity(),
+            write_breaker_open: self
+                .write_breaker_open_until
+                .is_some_and(|until| tokio::time::Instant::now() < until),
         }
     }
 
@@ -93,6 +100,7 @@ impl State {
         Seen {
             switch: self.switch,
             publishing: self.publishing(),
+            identity: self.identity.clone(),
         }
     }
 
@@ -112,6 +120,7 @@ impl State {
         if seen.publishing {
             state.enabled = Some(true);
         }
+        state.identity = seen.identity;
     }
 
     /// Brings the catalog's publication records in line with this state, given
@@ -133,11 +142,21 @@ impl State {
         let Some(identity) = &self.identity else {
             return changed;
         };
-        let entered = !was.publishing();
+        let entered = !was.switch || was.enabled != Some(true);
         if entered {
             publication::forget(catalog);
             changed.refill = true;
-        } else if was.identity.as_ref() != Some(identity) {
+        } else if was
+            .identity
+            .as_ref()
+            .is_some_and(|previous| previous != identity)
+            || catalog.repositories.values().any(|repository| {
+                repository
+                    .publications
+                    .values()
+                    .any(|record| &record.identity != identity)
+            })
+        {
             publication::forget_other_stores(catalog, identity);
             changed.refill = true;
         }
@@ -150,12 +169,16 @@ impl State {
 
 /// The switch state the runner last acted on, so a change made while it was
 /// stopped is still an off-to-on transition at the first re-read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Seen {
     /// Whether the runner switch was on when this state was last saved.
     pub(crate) switch: bool,
     /// Whether the cache was publishing then.
     pub(crate) publishing: bool,
+    /// Retained across restart so a re-read can distinguish key rotation from
+    /// a store change even when the previous fill never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<StoreIdentity>,
 }
 
 impl Seen {
@@ -168,6 +191,7 @@ impl Seen {
         Self {
             switch,
             publishing: false,
+            identity: None,
         }
     }
 }
@@ -180,12 +204,6 @@ pub(crate) struct Changed {
     pub(crate) refill: bool,
 }
 
-/// The initial state of a runner that never publishes, for the hosts and
-/// configurations that must behave exactly as before the remote store existed.
-pub(crate) fn idle() -> State {
-    State::new(false)
-}
-
 #[cfg(test)]
 impl State {
     /// A state that is publishing into `identity`, with the switch on, for
@@ -196,6 +214,7 @@ impl State {
             enabled: Some(true),
             status: Status::Available,
             identity: Some(identity),
+            write_breaker_open_until: None,
         }
     }
 }

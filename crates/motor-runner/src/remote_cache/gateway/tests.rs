@@ -84,6 +84,15 @@ pub(crate) struct FakeStore {
 }
 
 impl FakeStore {
+    pub(crate) fn status(&self, status: Option<u16>) {
+        self.set(|knobs| knobs.status = status);
+    }
+    pub(crate) fn delay(&self, delay: Option<Duration>) {
+        self.set(|knobs| knobs.respond_after = delay);
+    }
+    pub(crate) fn clear(&self) {
+        self.objects.lock().unwrap().clear();
+    }
     fn set(&self, change: impl FnOnce(&mut Knobs)) {
         change(&mut self.knobs.lock().unwrap());
     }
@@ -342,14 +351,19 @@ pub(crate) fn stored(tool: Tool, key: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Harness {
-    gateway: Gateway,
-    store: Arc<FakeStore>,
-    generations: Arc<Switchable>,
+pub(crate) struct Harness {
+    pub(crate) gateway: Gateway,
+    pub(crate) store: Arc<FakeStore>,
+    pub(crate) generations: Arc<Switchable>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn writer_for(&self, tool: Tool, adapter: Adapter) -> Arc<Binding> {
+        let generation = self.generations.admit().unwrap();
+        self.gateway
+            .write_binding(&generation.tenant, tool, adapter)
+    }
+    pub(crate) fn new() -> Self {
         Self::with_limits(Limits::default())
     }
     fn with_limits(limits: Limits) -> Self {
@@ -395,7 +409,7 @@ impl Harness {
         conn.write_all(request).await.unwrap();
         read_reply(&mut conn, head).await.expect("a response head")
     }
-    async fn get(&self, binding: &Arc<Binding>, path: &str) -> Reply {
+    pub(crate) async fn get(&self, binding: &Arc<Binding>, path: &str) -> Reply {
         self.raw(
             binding,
             format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes(),
@@ -411,7 +425,7 @@ impl Harness {
         )
         .await
     }
-    async fn put(&self, binding: &Arc<Binding>, path: &str, body: &[u8]) -> Reply {
+    pub(crate) async fn put(&self, binding: &Arc<Binding>, path: &str, body: &[u8]) -> Reply {
         let mut request = format!(
             "PUT {path} HTTP/1.1\r\nhost: x\r\nauthorization: dummy\r\ncontent-length: {}\r\n\r\n",
             body.len()
@@ -427,8 +441,8 @@ fn s3(key: &str) -> String {
 }
 
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// The whole announced body arrived.

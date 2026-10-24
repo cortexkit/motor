@@ -202,16 +202,10 @@ fn read_output(state: &Path, id: motor_protocol::Uuid, name: &str) -> io::Result
 pub(crate) fn sccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
     let value = statistics(state, id)?;
     let stats = value.get("stats").unwrap_or(&value);
-    let errors = ["cache_write_errors", "cache_errors"]
-        .iter()
-        .filter_map(|counter| stats.get(*counter))
-        .try_fold(0u64, |total, value| -> io::Result<u64> {
-            let count = count_in(value).ok_or_else(|| {
-                io::Error::other("statistics report a write-error count that is not a number")
-            })?;
-            Ok(total.saturating_add(count))
-        })?;
-    Ok(errors)
+    stats
+        .get("cache_write_errors")
+        .and_then(count_in)
+        .ok_or_else(|| io::Error::other("statistics lack a numeric cache_write_errors counter"))
 }
 
 /// A counter's value, whether it is a bare number or sccache's

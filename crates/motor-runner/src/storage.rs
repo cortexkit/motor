@@ -198,6 +198,9 @@ pub(crate) struct Job {
     /// of that fill were written.
     #[serde(default)]
     pub fill_started_ms: Option<u64>,
+    /// Store active when the fill was launched, not when it was queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_identity: Option<StoreIdentity>,
     pub kill: Option<(Killed, u64)>,
     /// Durable isolated stream positions, advanced atomically with replay chunks.
     #[serde(default)]
@@ -313,6 +316,7 @@ impl Job {
             base: false,
             writer_descriptor: None,
             fill_started_ms: None,
+            fill_identity: None,
             kill: None,
             stdout_offset: 0,
             stderr_offset: 0,
@@ -479,6 +483,7 @@ pub(crate) fn encode_identity(
 
 impl StoreIdentity {
     /// The same identity in the form the gateway signs and tags requests with.
+    #[cfg(test)]
     pub(crate) fn provisioned(&self) -> crate::remote_cache::provisioning::StoreIdentity {
         crate::remote_cache::provisioning::StoreIdentity {
             endpoint: self.endpoint.clone(),
@@ -515,7 +520,7 @@ pub(crate) struct PublicationRecord {
 }
 
 /// The last fill of one descriptor that failed to publish, with the number of
-/// consecutive attempts that ended that way.
+/// consecutive attempts that failed as builds (not merely remote writes).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PublishFailure {
     pub started_ms: u64,

@@ -5,8 +5,8 @@
 //! Every trusted fill runs in recache mode while the cache is publishing, so a
 //! fill recompiles and rewrites everything it produces. A fill that publishes
 //! records itself; a fill whose writes failed is remembered, so that it is not
-//! retried on every job arrival, and so that a descriptor whose publications
-//! keep failing is finally held like any other failing descriptor.
+//! retried on every job arrival. Repeated build failures eventually hold the
+//! descriptor like any other failing build; PUT-only failures remain retryable.
 //!
 //! The same policy decides whether a recorded fill may be reused. Without the
 //! remote store a fill record is exactly the reuse rule that existed before,
@@ -20,14 +20,10 @@ use crate::storage::{Catalog, PublicationRecord, PublishFailure, PublishedKey, R
 /// is what bounds how old a publication may be.
 pub(crate) const REFRESH_TICK_MS: u64 = 60 * 60 * 1000;
 
-/// After this many fills of one descriptor in a row failed to publish, the
+/// After this many fills of one descriptor in a row failed as builds, the
 /// descriptor is held until it changes or the runner restarts, exactly as a
 /// fill that fails as a build is held.
 pub(crate) const PUBLISH_RETRY_ATTEMPTS: u32 = 3;
-
-const MINUTE_MS: u64 = 60_000;
-const HOUR_MS: u64 = 60 * MINUTE_MS;
-const DAY_MS: u64 = 24 * HOUR_MS;
 
 /// A fill's own view of whether it published.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,16 +36,6 @@ pub(crate) enum Outcome {
     Failed { reason: String },
 }
 
-impl Outcome {
-    /// A fill's publication decision from the reason it did or did not publish.
-    pub(crate) fn from_fill(decision: Result<Vec<PublishedKey>, String>) -> Outcome {
-        match decision {
-            Ok(keys) => Outcome::Published { keys },
-            Err(reason) => Outcome::Failed { reason },
-        }
-    }
-}
-
 /// Whether a fill of a descriptor may be queued now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Gate {
@@ -57,7 +43,7 @@ pub(crate) enum Gate {
     Queue,
     /// A failed publication of it is younger than the retry interval.
     Wait,
-    /// Its publications failed [`PUBLISH_RETRY_ATTEMPTS`] times in a row, so
+    /// Its builds failed [`PUBLISH_RETRY_ATTEMPTS`] times in a row, so
     /// nothing more is queued until the descriptor changes or the runner
     /// restarts.
     Held,
@@ -76,6 +62,9 @@ pub(crate) struct PublishPolicy {
     /// actually be used; `None` while the cache is unavailable or its tenant
     /// has it switched off.
     pub identity: Option<StoreIdentity>,
+    /// Only the breaker's open window blocks a fill; an elapsed window must
+    /// admit a fill so its first write can probe the store.
+    pub write_breaker_open: bool,
 }
 
 impl PublishPolicy {
@@ -86,6 +75,7 @@ impl PublishPolicy {
             refresh_period: default_refresh_period(),
             retry_interval: default_publish_retry_interval(),
             identity: None,
+            write_breaker_open: false,
         }
     }
 
@@ -201,10 +191,8 @@ pub(crate) fn reusable(
 }
 
 /// Whether `descriptor` needs a refresh fill now: it has a local fill record
-/// and a publication record this store holds, and that record is no longer
-/// reusable. A descriptor that was never published is filled by the ordinary
-/// rules instead, and a dependency-free shortcut record has nothing to
-/// publish, so neither is ever queued by the refresh timer.
+/// but no reusable publication, including a first fill whose PUTs failed.
+/// A dependency-free shortcut has nothing to publish and never needs refresh.
 pub(crate) fn expired(
     policy: &PublishPolicy,
     repository: &Repository,
@@ -214,18 +202,17 @@ pub(crate) fn expired(
     if repository.recorded_without_writer.contains(descriptor) {
         return false;
     }
-    repository.publications.contains_key(descriptor)
+    policy.publishing()
+        && repository.filled_descriptors.contains_key(descriptor)
         && !reusable(policy, repository, descriptor, now)
 }
 
 /// The publication gate for one descriptor: whether a fill of it may start
 /// now. A descriptor with no failure marker is queued at once. A failure
 /// younger than the retry interval waits for the next attempt; once
-/// [`PUBLISH_RETRY_ATTEMPTS`] fills in a row have failed, the descriptor is
-/// held until it changes or the runner restarts. The gate does not look at the
-/// write breaker: a breaker past its open window admits the next request as
-/// its probe, so the fill's first write is what tests the store after an
-/// outage.
+/// [`PUBLISH_RETRY_ATTEMPTS`] builds in a row have failed, the descriptor is
+/// held until it changes or the runner restarts. Only the write breaker's open
+/// window blocks a fill: after it elapses the fill's first write probes the store.
 pub(crate) fn gate(
     policy: &PublishPolicy,
     repository: &Repository,
@@ -234,6 +221,9 @@ pub(crate) fn gate(
 ) -> Gate {
     if !policy.publishing() {
         return Gate::Queue;
+    }
+    if policy.write_breaker_open {
+        return Gate::Wait;
     }
     let Some(failure) = repository.publish_failures.get(descriptor) else {
         return Gate::Queue;
@@ -248,8 +238,8 @@ pub(crate) fn gate(
 }
 
 /// Records a publication of `descriptor`, which clears its failure marker, or
-/// a failed publication, whose marker then carries the number of fills in a
-/// row that failed. A publication without a known store identity is not
+/// a failed publication, whose marker counts consecutive failed builds. A
+/// successful build resets that count even if its PUTs failed. Without a known store identity it is not
 /// recorded: nothing says which store it went to.
 pub(crate) fn record(
     repository: &mut Repository,
@@ -257,6 +247,7 @@ pub(crate) fn record(
     started_ms: u64,
     outcome: &Outcome,
     identity: Option<&StoreIdentity>,
+    fill_succeeded: bool,
 ) {
     match outcome {
         Outcome::Published { keys } => {
@@ -274,10 +265,14 @@ pub(crate) fn record(
             );
         }
         Outcome::Failed { .. } => {
-            let attempts = repository
-                .publish_failures
-                .get(descriptor)
-                .map_or(1, |failure| failure.attempts.saturating_add(1));
+            let attempts = if fill_succeeded {
+                0
+            } else {
+                repository
+                    .publish_failures
+                    .get(descriptor)
+                    .map_or(1, |failure| failure.attempts.saturating_add(1))
+            };
             repository.publish_failures.insert(
                 descriptor.to_string(),
                 PublishFailure {

@@ -21,6 +21,7 @@ fn policy(identity: Option<StoreIdentity>) -> PublishPolicy {
         refresh_period: std::time::Duration::from_secs(14 * 24 * 60 * 60),
         retry_interval: std::time::Duration::from_secs(6 * 60 * 60),
         identity,
+        write_breaker_open: false,
     }
 }
 
@@ -43,6 +44,7 @@ fn published(repository: &mut Repository, descriptor: &str, identity: &StoreIden
             }],
         },
         Some(identity),
+        true,
     );
 }
 
@@ -95,6 +97,7 @@ fn while_publishing_a_record_is_reusable_only_young_and_unfailed() {
             reason: "store refused it".into(),
         },
         None,
+        false,
     );
     assert!(
         !reusable(&p, &f, "d1", 2 * DAY),
@@ -120,6 +123,7 @@ fn the_gate_waits_out_the_retry_interval_and_then_holds_the_descriptor() {
             reason: "put refused".into(),
         },
         None,
+        false,
     );
     assert_eq!(
         gate(&p, &f, "d1", HOUR + 5 * HOUR),
@@ -137,6 +141,7 @@ fn the_gate_waits_out_the_retry_interval_and_then_holds_the_descriptor() {
             reason: "put refused".into(),
         },
         None,
+        false,
     );
     record(
         &mut f,
@@ -146,6 +151,7 @@ fn the_gate_waits_out_the_retry_interval_and_then_holds_the_descriptor() {
             reason: "put refused".into(),
         },
         None,
+        false,
     );
     assert_eq!(f.publish_failures["d1"].attempts, PUBLISH_RETRY_ATTEMPTS);
     assert_eq!(gate(&p, &f, "d1", HOUR + 30 * DAY), Gate::Held);
@@ -166,10 +172,9 @@ fn the_refresh_timer_targets_expired_publications_but_never_a_shortcut_record() 
     let mut shortcut = filled("d2");
     shortcut.recorded_without_writer.insert("d2".into());
     assert!(!expired(&p, &shortcut, "d2", 100 * DAY));
-    // Neither does a descriptor that was never published: it is filled by the
-    // ordinary rules instead.
+    // The timer also retries a local fill that never published, without a job arrival.
     let local = filled("d3");
-    assert!(!expired(&p, &local, "d3", 100 * DAY));
+    assert!(expired(&p, &local, "d3", 100 * DAY));
     // With the cache not publishing the timer queues nothing at all.
     assert!(!expired(&PublishPolicy::idle(), &f, "d1", 100 * DAY));
 }
@@ -183,6 +188,7 @@ fn a_publication_without_a_store_identity_is_not_recorded() {
         HOUR,
         &Outcome::Published { keys: Vec::new() },
         None,
+        true,
     );
     assert!(!f.publications.contains_key("d1"));
 }
@@ -198,6 +204,7 @@ fn forgetting_clears_records_and_markers_but_keeps_local_fills() {
         HOUR,
         &Outcome::Failed { reason: "x".into() },
         None,
+        false,
     );
     catalog.repositories.insert("/r".into(), repository);
     forget(&mut catalog);
@@ -361,9 +368,10 @@ fn a_change_made_while_stopped_is_still_a_transition() {
     let seen = Seen {
         switch: true,
         publishing: true,
+        identity: Some(store("gen-1")),
     };
     let mut state = State::new(true);
-    State::restore(&mut state, true, seen);
+    State::restore(&mut state, true, seen.clone());
     // It remembers the switch was on and the cache enabled, so an unchanged
     // re-read keeps its records. The store is not known to be usable until
     // that re-read arrives, which is the decision the restore does not make.
@@ -372,7 +380,7 @@ fn a_change_made_while_stopped_is_still_a_transition() {
     assert!(state.identity().is_none());
     let config = crate::Config::new(std::path::PathBuf::from("/tmp/catalog"), "restore");
     assert!(!state.policy(&config).publishing());
-    State::restore(&mut state, true, seen);
+    State::restore(&mut state, true, seen.clone());
     let mut reread = crate::remote_cache::provisioning::Reread {
         activated: true,
         previous_identity: None,
@@ -412,6 +420,7 @@ fn the_switch_state_round_trips_through_the_catalog() {
     catalog.publishing_seen = Seen {
         switch: true,
         publishing: true,
+        identity: Some(store("fleet")),
     };
     let json = serde_json::to_value(&catalog).unwrap();
     let back: Catalog = serde_json::from_value(json).unwrap();
