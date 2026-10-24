@@ -63,8 +63,8 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, reason: Refusal) {
 }
 
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
-impl std::io::Write for Logs {
+struct Buffer(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for Buffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(bytes);
         Ok(bytes.len())
@@ -73,13 +73,29 @@ impl std::io::Write for Logs {
         Ok(())
     }
 }
+/// Captures this thread's log lines. One subscriber is registered per
+/// `Logs` and reused by every `capture`: registering subscribers while other
+/// tests log can make tracing drop events, so tests keep registrations few.
+struct Logs {
+    buffer: Buffer,
+    dispatch: tracing::Dispatch,
+}
+impl Default for Logs {
+    fn default() -> Self {
+        let buffer = Buffer::default();
+        let dispatch = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
+            "[host]",
+            buffer.clone(),
+        ));
+        Self { buffer, dispatch }
+    }
+}
 impl Logs {
     fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
-        let subscriber = motor_protocol::logging::LineSubscriber::new("[host]", self.clone());
-        tracing::subscriber::with_default(subscriber, f)
+        tracing::dispatcher::with_default(&self.dispatch, f)
     }
     fn text(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        String::from_utf8(self.buffer.0.lock().unwrap().clone()).unwrap()
     }
     fn count(&self, name: &str) -> usize {
         self.text().lines().filter(|l| l.contains(name)).count()
@@ -168,7 +184,7 @@ fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse()
     // Above the threshold is not low, so nothing is logged yet.
     assert_eq!(logs.count("host_storage_low"), 0);
 
-    for (capacity, free, detail) in [
+    for (low_logs, (capacity, free, detail)) in (1..).zip([
         (
             Ok(capacity_values()),
             Err("statvfs failed".to_owned()),
@@ -179,15 +195,14 @@ fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse()
             Ok(u64::MAX),
             "capacity.json missing",
         ),
-    ] {
-        let logs = Logs::default();
+    ]) {
         let mut h = host_with(vec![("vm", tenant_one())]);
         h.enforce_storage();
         logs.capture(|| h.observe_storage(capacity, free));
         assert!(h.storage_refusing());
         refused(h.claim(claims(JOB), now), Refusal::HostFull);
         assert!(logs.text().contains(detail), "{}", logs.text());
-        assert_eq!(logs.count("host_storage_low"), 1);
+        assert_eq!(logs.count("host_storage_low"), low_logs);
         // After a failed probe the latch clears only at the release point.
         observe(&mut h, 144 * GIB - 1);
         assert!(h.storage_refusing());
