@@ -121,6 +121,15 @@ pub(crate) struct Prepared {
 /// Owns the prepared service and mount configuration. Tests can substitute a
 /// launcher to observe dispatch without requiring systemd or a job account.
 pub(crate) trait IsolationLauncher: Send + Sync {
+    #[cfg(unix)]
+    fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[crate::remote_cache::transport::Forwarder],
+    )> {
+        None
+    }
     fn launch(
         &self,
         command: &str,
@@ -133,6 +142,14 @@ pub(crate) trait IsolationLauncher: Send + Sync {
 
 #[cfg(target_os = "linux")]
 impl IsolationLauncher for crate::isolation::Sandbox {
+    fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[crate::remote_cache::transport::Forwarder],
+    )> {
+        self.cache_generation()
+    }
     fn launch(
         &self,
         command: &str,
@@ -683,6 +700,49 @@ impl Backend for HostBackend {
                         config,
                         siblings: snapshots.mounts(),
                     });
+            let remote_plan = config.unit_remote_cache(s.base);
+            let mut remote = None;
+            if let (Some((generation, forwarders)), Some(runtime)) =
+                (&remote_plan, &config.remote_cache_runtime)
+            {
+                let cargo = path.join("Cargo.toml").is_file();
+                let declaration = if s.base && config.base_commands.is_empty() {
+                    crate::writer::declaration::read(
+                        &trees.mirror(&r.repository_root),
+                        &r.snapshot_commit,
+                    )
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                let tools: Vec<_> = forwarders
+                    .iter()
+                    .map(|f| f.tool())
+                    .filter(|tool| match tool {
+                        crate::remote_cache::gateway::Tool::Sccache => {
+                            cargo
+                                || (s.base
+                                    && declaration.as_ref().is_some_and(|d| {
+                                        d.fills.iter().any(|f| {
+                                            f.tool == crate::writer::declaration::Tool::Sccache
+                                        })
+                                    }))
+                        }
+                        crate::remote_cache::gateway::Tool::Ccache => {
+                            !s.base
+                                || declaration.as_ref().is_some_and(|d| {
+                                    d.fills
+                                        .iter()
+                                        .any(|f| f.tool == crate::writer::declaration::Tool::Ccache)
+                                })
+                        }
+                    })
+                    .collect();
+                if !tools.is_empty() {
+                    remote = runtime.transport(&generation.tenant, &tools).ok();
+                }
+            }
             let sandbox = setup_step(
                 "prepare isolated job sandbox",
                 crate::setup_log::phase("prepare isolated sandbox", || {
@@ -699,7 +759,7 @@ impl Backend for HostBackend {
                             &r.tree_hash,
                             &crate::isolation::JavascriptTools::for_config(config),
                             config.boat_profile,
-                            None,
+                            remote.as_ref(),
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(
@@ -718,13 +778,15 @@ impl Backend for HostBackend {
                             config.shared_compile_cache(),
                             snapshots.as_ref(),
                             &crate::isolation::JavascriptTools::for_config(config),
-                            None,
+                            remote.as_ref(),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
                     // unit for exceeding the memory limit (Result=oom-kill), then
                     // resets the unit so systemd unloads it. Keep it loaded until then.
                     .map(|sandbox| {
+                        let sandbox = sandbox
+                            .with_cache_generation(remote_plan.as_ref().map(|(g, _)| g.clone()));
                         #[cfg(test)]
                         let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
                         sandbox
@@ -1039,7 +1101,7 @@ fn compile_cache_environment(
     prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    scrub_inherited_cache_environment(config, setup, env);
+    scrub_inherited_cache_environment(config, setup, prepared, env);
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
         // Without the shared cache an isolated Rust job still builds in the same fixed
@@ -1052,7 +1114,7 @@ fn compile_cache_environment(
                 crate::compile_cache::TARGET.into(),
             );
         }
-        return remote_cache_environment(config, setup, env);
+        return remote_cache_environment(config, setup, prepared, env);
     }
     if let Some(wrapper) = &prepared.wrapper {
         env.insert(
@@ -1085,7 +1147,7 @@ fn compile_cache_environment(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = setup;
-    remote_cache_environment(config, setup, env)
+    remote_cache_environment(config, setup, prepared, env)
 }
 
 /// A cache fill, or a job whose workspace root is a Cargo workspace.
@@ -1097,24 +1159,25 @@ fn rust_job(setup: &Setup) -> bool {
             .is_file()
 }
 
-/// The runner's own environment can carry sccache and AWS settings (an
-/// operator's shell, an inherited unit, a caller request that reached the
-/// allowlist). None of them may shape a job: they would either override the
-/// local level-1 settings the runner adds afterwards or point the tool at a
-/// store this job may not use. They are removed only while the remote cache
-/// can be on for this unit, because with it off every job environment must be
-/// exactly what it was before the cache existed, operator settings included;
-/// scrubbing always runs before anything is added, so it never removes a
-/// value the runner generated.
+/// Remove inherited cache settings before adding runner-generated values.
+/// Build-server isolation always sanitizes its local cache environment. Hosted
+/// units sanitize only when prepared with remote sockets, preserving their
+/// baseline otherwise. Using the prepared unit also avoids a tenant switch
+/// change between preparation and launch changing which values are removed.
 pub(crate) fn scrub_inherited_cache_environment(
     config: &Config,
     setup: &Setup,
+    prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) {
-    // The writer branch below runs for every fill on every host type, but only
-    // the build server's fills and its Rust jobs ever reach the cache: every
-    // other unit must keep exactly the environment base gave it.
-    if config.remote_cache_available(setup.base).is_none() {
+    // Keep removing inherited cache settings on the build server; the remote
+    // cache switch does not control this cleanup.
+    let local = config.isolate_jobs && !config.boat_profile && !config.tenant_vm;
+    let remote = prepared
+        .sandbox
+        .as_ref()
+        .is_some_and(|sandbox| sandbox.cache_generation().is_some());
+    if !local && !remote {
         return;
     }
     // Declared C/C++ fills and jobs need not contain a Cargo manifest.
@@ -1139,24 +1202,39 @@ pub(crate) fn scrub_inherited_cache_environment(
 /// It is on only when the runner switch, the cache tenant's `enabled` state
 /// and job isolation all hold: without isolation a job runs as the runner's
 /// own account and could open the keys, so the switch is ignored there. The
-/// gateway's generation is the authority on `enabled`. Nothing starts the
-/// gateway yet, so no unit is switched on and every role keeps today's
-/// environment; `remote_cache_job_environment` is what a switched-on unit
-/// would add on top of that baseline.
+/// prepared sandbox is the authority on which sockets were successfully bound.
 fn remote_cache_environment(
     config: &Config,
     setup: &Setup,
+    prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    let Some((generation, forwarders)) = config.unit_remote_cache(setup.base) else {
+    #[cfg(target_os = "linux")]
+    let remote = prepared
+        .sandbox
+        .as_ref()
+        .and_then(|sandbox| sandbox.cache_generation());
+    #[cfg(not(target_os = "linux"))]
+    let remote: Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[crate::remote_cache::transport::Forwarder],
+    )> = {
+        let _ = prepared;
+        None
+    };
+    let Some((generation, forwarders)) = remote else {
         return Ok(());
     };
     remote_cache_job_environment(
         crate::remote_cache::provisioning::HostRole::of(config),
-        &forwarders,
-        &generation,
+        forwarders,
+        generation,
         setup.base,
-        &setup.request.workspace_key,
+        if setup.base {
+            &setup.request.cwd
+        } else {
+            &setup.request.workspace_key
+        },
         env,
     );
     Ok(())
@@ -1185,6 +1263,7 @@ pub(crate) fn remote_cache_job_environment(
             .any(|f| f.tool() == crate::remote_cache::gateway::Tool::Sccache)
     {
         delta.extend(crate::remote_cache::environment::fill_values());
+        delta.insert("SCCACHE_RECACHE".into(), "1".into());
         delta.insert(
             "SCCACHE_S3_RW_MODE".into(),
             crate::remote_cache::environment::READ_WRITE_MODE.into(),

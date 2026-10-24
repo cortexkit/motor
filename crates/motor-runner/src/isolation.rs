@@ -2014,6 +2014,7 @@ pub(crate) struct Sandbox {
     /// The remote cache forwarders the unit's shell starts before its
     /// command, one per active tool; empty when the unit has no remote cache.
     cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
+    cache_generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2731,6 +2732,7 @@ impl Sandbox {
         fs::create_dir_all(&output)?;
         let mut grant_paths = Vec::new();
         let mut writer_grants = Vec::new();
+        let mut remote = remote;
         let output_names = cache_output_names(
             remote.is_some_and(|r| r.has_tool(crate::remote_cache::gateway::Tool::Ccache)),
         );
@@ -2905,11 +2907,17 @@ impl Sandbox {
                 fs::write(&cargo_check, crate::writer::fill::CARGO_CHECK)?;
                 fs::set_permissions(cargo_check, fs::Permissions::from_mode(0o755))?;
             }
-            if remote.is_some() {
+            if let Some(transport) = remote {
                 // The forwarder holds no key, so the unit may read and run it.
                 let forwarder = tools.join(transport::FORWARDER_NAME);
-                fs::copy(prepare_cache_forwarder(state)?, &forwarder)?;
-                fs::set_permissions(&forwarder, fs::Permissions::from_mode(0o755))?;
+                let prepared = prepare_cache_forwarder(state).and_then(|source| {
+                    fs::copy(source, &forwarder)?;
+                    fs::set_permissions(&forwarder, fs::Permissions::from_mode(0o755))
+                });
+                if let Err(error) = prepared {
+                    transport.failed("forwarder preparation", &error);
+                    remote = None;
+                }
             }
             read_only.push(bind(&tools, Path::new("/motor-tools"))?);
             mount_destinations.push(PathBuf::from("/motor-tools"));
@@ -2923,16 +2931,25 @@ impl Sandbox {
             } else {
                 (transport::Role::Job(&job), USER)
             };
-            let sockets = remote.open(&directory, role)?;
+            let sockets = remote.open(&directory, role).and_then(|sockets| {
+                grant_sockets(&sockets.paths(), account)?;
+                Ok(sockets)
+            });
             // Connecting needs write access to the socket file. Only this
             // unit's account gets it, and the directory is bound into this
             // unit's sandbox alone.
-            grant_sockets(&sockets.paths(), account)?;
-            read_only.push(bind(&directory, Path::new(transport::SANDBOX_SOCKETS))?);
-            mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
-            cache_forwarders = sockets.forwarders().to_vec();
-            if runtime.2.set(sockets).is_err() {
-                return Err(io::Error::other("sandbox cache sockets were opened twice"));
+            match sockets {
+                Ok(sockets) => match bind(&directory, Path::new(transport::SANDBOX_SOCKETS)) {
+                    Ok(mount) => {
+                        read_only.push(mount);
+                        mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
+                        cache_forwarders = sockets.forwarders().to_vec();
+                        let _ = runtime.2.set(sockets);
+                        remote.ready();
+                    }
+                    Err(error) => remote.failed("socket mount", &error),
+                },
+                Err(error) => remote.failed("socket bind or grant", &error),
             }
         }
         // Copy the supervisor into the read-only tool mount. Bind only existing
@@ -3039,7 +3056,29 @@ impl Sandbox {
             pid_init: None,
             provider_unset_env: Vec::new(),
             cache_forwarders,
+            cache_generation: None,
         })
+    }
+
+    pub(crate) fn with_cache_generation(
+        mut self,
+        generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
+    ) -> Self {
+        if !self.cache_forwarders.is_empty() {
+            self.cache_generation = generation;
+        }
+        self
+    }
+
+    pub(crate) fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[transport::Forwarder],
+    )> {
+        self.cache_generation
+            .as_deref()
+            .map(|generation| (generation, self.cache_forwarders.as_slice()))
     }
 
     /// See [`Sandbox::retain_failed`].

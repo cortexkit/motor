@@ -50,17 +50,13 @@ fn set_publishing(runner: &Runner, state: State) {
 }
 
 fn restore_publishing(runner: &Runner) {
-    let seen = runner
-        .core
-        .inner
-        .lock()
-        .unwrap()
-        .catalog
-        .publishing_seen
-        .clone();
-    let mut state = State::new(true);
-    State::restore(&mut state, true, seen);
-    *runner.core.publishing.lock().unwrap() = state;
+    // These unisolated fixtures inject publishing rather than enabling the
+    // production switch. Reopening correctly records their real switch as off;
+    // restore the injected policy before testing publication continuity.
+    set_publishing(
+        runner,
+        State::publishing_in(generation("1", TENANT).identity().recorded()),
+    );
     runner
         .observe_publishing(reread(generation("1", TENANT).identity().recorded(), true))
         .unwrap();
@@ -160,17 +156,6 @@ fn cargo_command(f: &Fixture, command: &str) {
     fs::create_dir_all(f.main.join("src")).unwrap();
     fs::write(f.main.join("src/lib.rs"), "").unwrap();
     commit(&f.main, "Cargo warm command\n");
-}
-
-fn declared_runner(f: &Fixture) -> Runner {
-    let mut config = fill_config(f);
-    config.base_commands.clear();
-    let runner = Runner::open(config).unwrap();
-    set_publishing(
-        &runner,
-        State::publishing_in(generation("1", TENANT).identity().recorded()),
-    );
-    runner
 }
 
 fn release_path(f: &Fixture) -> PathBuf {
@@ -296,6 +281,35 @@ const SCCACHE_OK: &str =
     r#"{"stats":{"cache_misses":{"counts":{}},"cache_write_errors":0,"cache_errors":9}}"#;
 
 async fn settle(f: &Fixture, runner: &Runner, job: &Job) {
+    // Successful publishing fixtures need real write evidence too. Tests that
+    // exercise failed or missing statistics install their own ledger first.
+    let h = Harness::new();
+    if !runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .fill_ledgers
+        .contains_key(&job.id)
+    {
+        let tool = if f.main.join("Cargo.toml").is_file() {
+            Tool::Sccache
+        } else {
+            Tool::Ccache
+        };
+        let binding = attach(
+            runner,
+            job,
+            &h,
+            tool,
+            Some(if tool == Tool::Sccache {
+                SCCACHE_OK
+            } else {
+                CCACHE_OK
+            }),
+        );
+        assert_eq!(h.put(&binding, "fixture", b"entry").await.status, 200);
+    }
     fs::write(release_path(f), "").unwrap();
     until(|| {
         let inner = runner.core.inner.lock().unwrap();
@@ -1069,9 +1083,11 @@ fn a_real_fill_records_its_publication() {
     bounded(|| {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let f = Fixture::new();
-            declare(&f, "printf filled > command-marker");
-            let runner = declared_runner(&f);
-            warm(&f, &runner).await;
+            declare(&f, &controlled_command(&f));
+            let runner = controlled_runner(&f);
+            submit_reader(&f, &runner).await;
+            let job = running_fill(&runner, 0).await;
+            settle(&f, &runner, &job).await;
             let record = repository(&f, &runner);
             assert_eq!(count_fills(&runner), 1);
             assert!(record

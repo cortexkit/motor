@@ -26,9 +26,8 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
-// Nothing in a production build starts the remote cache yet, and its gateway
-// and sandbox transport only ever run on Linux job hosts, so outside Linux
-// tests some of it is unreachable.
+// The sandbox transport runs on Linux job hosts. Some component diagnostics
+// and test seams are only used by portable tests.
 #[cfg(unix)]
 #[cfg_attr(any(not(test), not(target_os = "linux")), allow(dead_code))]
 mod remote_cache;

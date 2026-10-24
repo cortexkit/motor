@@ -44,6 +44,9 @@ mod platform_refusal;
 mod publication;
 #[path = "tests/refusals.rs"]
 mod refusals;
+#[cfg(target_os = "linux")]
+#[path = "tests/remote_cache_rollout.rs"]
+mod remote_cache_rollout;
 #[path = "tests/repository_retirement.rs"]
 mod repository_retirement;
 #[path = "tests/return_paths.rs"]

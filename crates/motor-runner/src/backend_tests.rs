@@ -726,6 +726,7 @@ fn inherited_sccache_and_aws_settings_follow_the_switch_state() {
         fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
         let mut config = Config::new(scratch.join("state"), "main");
         config.isolate_jobs = isolate;
+        config.remote_cache = !boat && !tenant;
         config.boat_profile = boat;
         config.tenant_vm = tenant;
         let mut setup = setup(scratch.path());
@@ -766,7 +767,7 @@ fn inherited_sccache_and_aws_settings_follow_the_switch_state() {
         assert_eq!(env["RUSTFLAGS"], "-C debuginfo=1", "fill={fill}");
     }
 
-    // Boat and tenant VMs never have the cache on, for a job or a fill, so
+    // Boat and tenant VMs leave the runner switch off in these baseline cases, so
     // the scrub never runs for them. What their units keep is base's own
     // answer: every SCCACHE_* value is stripped because these profiles have no
     // shared compile cache, while an AWS setting, which base never touched,

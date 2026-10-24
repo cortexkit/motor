@@ -176,12 +176,14 @@ fn health_reports_reserved_permits_pending_jobs_and_optional_wire_fields() {
         "permits_held",
         "permits_cap",
         "queue_wait_1h",
+        "remote_cache",
     ] {
         legacy.as_object_mut().unwrap().remove(key);
     }
     let decoded: RunnerHealth = serde_json::from_value(legacy.clone()).unwrap();
     assert!(decoded.load_1m.is_none());
     assert!(decoded.queue_wait_1h.is_none());
+    assert!(decoded.remote_cache.is_none());
     assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
 }
 

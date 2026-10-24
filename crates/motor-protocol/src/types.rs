@@ -223,6 +223,58 @@ pub struct RunnerHealth {
     pub permits_cap: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_1h: Option<HealthQueueWait>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cache: Option<RemoteCacheHealth>,
+}
+
+/// Credential-free gateway telemetry, not compiler-cache reuse statistics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCacheHealth {
+    pub state: RemoteCacheState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub sccache: RemoteCacheToolHealth,
+    pub ccache: RemoteCacheToolHealth,
+    /// Opaque repository hashes, rather than repository URLs or tenant names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repositories: BTreeMap<String, RemoteCacheRepositoryHealth>,
+    /// The runner keeps at most 16 summaries to bound the health payload.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repositories_omitted: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCacheState {
+    Off,
+    Available,
+    CacheUnavailable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCacheToolHealth {
+    pub hits: u64,
+    pub probes: u64,
+    pub misses: u64,
+    pub breaker_open: u64,
+    pub errors: u64,
+    pub refusals: RemoteCacheRefusals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCacheRefusals {
+    pub read: u64,
+    pub write: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCacheRepositoryHealth {
+    pub publication_age_ms: Option<u64>,
+    pub shortcut: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_descriptor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

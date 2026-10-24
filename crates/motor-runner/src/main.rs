@@ -337,7 +337,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend]",
+              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend] [--remote-cache true|false]",
         )),
     }
 }
@@ -401,6 +401,18 @@ fn configure_options(
             .ok_or_else(|| io::Error::other("missing option value"))?;
         match arg.as_str() {
             "--instance" => config.instance = value,
+            "--remote-cache" => config.remote_cache = value.parse().map_err(io::Error::other)?,
+            "--remote-cache-forwarder-port" => {
+                let (tool, port) = value
+                    .split_once(':')
+                    .ok_or_else(|| io::Error::other("expected tool:port"))?;
+                if !matches!(tool, "sccache" | "ccache") {
+                    return Err(io::Error::other("unknown cache tool"));
+                }
+                config
+                    .remote_cache_forwarder_ports
+                    .insert(tool.into(), port.parse().map_err(io::Error::other)?);
+            }
             "--state-root" => config.state_root = value.into(),
             "--tenant-socket-dir" => config.tenant_socket_dir = Some(value.into()),
             "--build-slot-root" => config.build_slot_root = value.into(),
@@ -542,6 +554,24 @@ fn daemon_core_reservation_is_disabled_only_by_an_explicit_flag() {
     )
     .unwrap();
     assert!(!config.reserve_daemon_core);
+}
+
+#[test]
+fn remote_cache_requires_explicit_opt_in() {
+    let mut config = Config::new("/unused", "main");
+    assert!(!config.remote_cache);
+    configure_options(
+        &mut config,
+        ["--remote-cache".into(), "true".into()].into_iter(),
+    )
+    .unwrap();
+    assert!(config.remote_cache);
+    configure_options(
+        &mut config,
+        ["--remote-cache".into(), "false".into()].into_iter(),
+    )
+    .unwrap();
+    assert!(!config.remote_cache);
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {
