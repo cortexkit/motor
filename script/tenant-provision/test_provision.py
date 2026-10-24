@@ -21,8 +21,14 @@ capacity_spec = importlib.util.spec_from_file_location("test_capacity", Path(__f
 assert capacity_spec is not None and capacity_spec.loader is not None
 capacity_tests = importlib.util.module_from_spec(capacity_spec)
 capacity_spec.loader.exec_module(capacity_tests)
-# The script-test runner enters through this file, including the capacity suite.
+resize_spec = importlib.util.spec_from_file_location("test_resize", Path(__file__).with_name("test_resize.py"))
+assert resize_spec is not None and resize_spec.loader is not None
+resize_tests = importlib.util.module_from_spec(resize_spec)
+resize_spec.loader.exec_module(resize_tests)
+# The script-test runner enters through this file, including the capacity and
+# resize suites.
 CapacityTests = capacity_tests.CapacityTests
+ResizeTests = resize_tests.ResizeTests
 # Kept before setUp replaces it, for the one test that reads a fake /proc.
 REAL_RUNNER_PROCESSES = p.runner_processes
 # The real host paths, kept before setUp points them into a scratch directory.
