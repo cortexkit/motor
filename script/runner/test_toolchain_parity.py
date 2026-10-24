@@ -910,6 +910,52 @@ class ParityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Binaryen'):
                     parity.validate(manifest)
 
+    def test_pnpm_release_pin_names_the_registry_archive_and_its_commands(self):
+        parity.validate(self.manifest)
+        pnpm = self.manifest['tools']['pnpm']
+        self.assertEqual(pnpm['source']['package'], 'pnpm@' + pnpm['version'])
+        self.assertEqual(pnpm['layout']['root'], '/usr/local/lib/node_modules/pnpm')
+        # The images install this release themselves; a pin that names another
+        # package, a different registry or no integrity must not be range-checked
+        # into acceptance.
+        for change in ({'package': 'pnpm@11.2.0'},
+                       {'registry': 'https://mirror.example/'},
+                       {'sha512': 'latest'},
+                       {'sha512': pnpm['source']['sha512'][:-4]},
+                       {}):
+            with self.subTest(change=change):
+                manifest = copy.deepcopy(self.manifest)
+                manifest['tools']['pnpm']['source'] = {**pnpm['source'], **change} if change else {}
+                with self.assertRaisesRegex(ValueError, 'pnpm'):
+                    parity.validate(manifest)
+
+    def test_every_pnpm_command_must_be_an_alias_into_the_package_tree(self):
+        parity.validate(self.manifest)
+        self.assertEqual([name for name in parity.PNPM_COMMANDS], ['pnpm', 'pn', 'pnpx', 'pnx'])
+        changes = {'pn': {'version_from': None},
+                   'pnpx': {'realpath_suffix': '/lib/node_modules/corepack/dist/pnpx.js'},
+                   'pnx': {'path': '/usr/bin/pnx'}}
+        for name, change in changes.items():
+            with self.subTest(command=name):
+                manifest = copy.deepcopy(self.manifest)
+                for key, value in change.items():
+                    if value is None:
+                        manifest['tools'][name].pop(key)
+                    else:
+                        manifest['tools'][name][key] = value
+                with self.assertRaisesRegex(ValueError, 'pnpm command'):
+                    parity.validate(manifest)
+        with self.subTest(command='missing'):
+            manifest = copy.deepcopy(self.manifest)
+            del manifest['tools']['pnx']
+            with self.assertRaisesRegex(ValueError, 'pnpm command'):
+                parity.validate(manifest)
+        with self.subTest(layout='unknown command'):
+            manifest = copy.deepcopy(self.manifest)
+            manifest['tools']['pnpm']['layout']['commands'].append('/usr/local/bin/pn2')
+            with self.assertRaisesRegex(ValueError, 'pnpm install layout'):
+                parity.validate(manifest)
+
     def test_git_source_pin_follows_the_measured_version(self):
         parity.validate(self.manifest)
         for change in ({'version': 'git version 2.54.0'}, {'version': 'git version 2.53'},

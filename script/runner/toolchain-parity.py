@@ -386,6 +386,8 @@ def validate(manifest, role="build-server"):
     bun = manifest["tools"].get("bun")
     if bun is not None:
         validate_bun(bun, manifest)
+    if "pnpm" in manifest["tools"]:
+        validate_pnpm(manifest["tools"])
     for name, spec in manifest["tools"].items():
         source = spec.get("version_from")
         if source and (source not in manifest["tools"]
@@ -432,6 +434,47 @@ def validate_git(spec):
     packages = source.get("build_packages")
     if not packages or not all(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) for name in packages):
         raise ValueError("invalid git build packages")
+
+
+# pnpm's own command names, as measured on the build server. Its registry
+# package declares `pnpm` and `pnpx`; `pn` and `pnx` are names the install must
+# supply too, because the runner finds JavaScript tools by the name it runs.
+PNPM_COMMANDS = ("pnpm", "pn", "pnpx", "pnx")
+PNPM_ROOT = "/usr/local/lib/node_modules/pnpm"
+# The part of that tree a command's resolved path must end with: the manifest
+# stores realpath_suffix values relative to /usr/local, as npm's links are.
+PNPM_SUFFIX = PNPM_ROOT.removeprefix("/usr/local")
+
+
+def validate_pnpm(tools):
+    """The pnpm release pin and the tree it installs: a registry package and
+    integrity, the npm global layout beneath /usr/local, and the command names
+    and links the build server measured there. The image installers unpack
+    that same release (`script/runner/install-npm-tool.py`), not `npm install
+    --global`, so a pin that names no reachable release must fail here."""
+    spec = tools["pnpm"]
+    release = "pnpm@" + spec.get("version", "")
+    source = spec.get("source", {})
+    if (not re.fullmatch(r"pnpm@\d+\.\d+\.\d+", release)
+            or source.get("registry") != "https://registry.npmjs.org/" or source.get("package") != release):
+        raise ValueError("invalid pnpm release pin")
+    if not re.fullmatch(r"[A-Za-z0-9+/]{86}==|[A-Za-z0-9+/]{85}==", source.get("sha512", "")):
+        raise ValueError("invalid pnpm registry integrity")
+    layout = spec.get("layout", {})
+    if (layout.get("root") != PNPM_ROOT or tuple(layout.get("commands", ())) !=
+            tuple("/usr/local/bin/" + name for name in PNPM_COMMANDS)):
+        raise ValueError("invalid pnpm install layout")
+    if spec.get("path") != "/usr/local/bin/pnpm":
+        raise ValueError("invalid pnpm command path")
+    # pnpm is measured by running it, so it names no other tool for its
+    # version; every other name is an alias that takes pnpm's version and must
+    # be reached through its npm link into the package tree.
+    for name in PNPM_COMMANDS[1:]:
+        command = tools.get(name) or {}
+        suffix = command.get("realpath_suffix") or ""
+        if (command.get("version_from") != "pnpm" or command.get("path") != "/usr/local/bin/" + name
+                or not suffix.startswith(PNPM_SUFFIX + "/bin/")):
+            raise ValueError("pnpm command is not pinned to the pnpm release: " + name)
 
 
 def validate_bun(spec, manifest):

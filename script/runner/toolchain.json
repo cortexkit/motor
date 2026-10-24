@@ -703,7 +703,21 @@
       "version_from": "pnpm"
     },
     "pnpm": {
+      "layout": {
+        "root": "/usr/local/lib/node_modules/pnpm",
+        "commands": [
+          "/usr/local/bin/pnpm",
+          "/usr/local/bin/pn",
+          "/usr/local/bin/pnpx",
+          "/usr/local/bin/pnx"
+        ]
+      },
       "path": "/usr/local/bin/pnpm",
+      "source": {
+        "registry": "https://registry.npmjs.org/",
+        "package": "pnpm@11.1.2",
+        "sha512": "QVYcwll0cx51RVwUaDcb50xapft2IbUNQFbSIkUWCfEUEvI/1gLmFp8eBgRmZB95hZfhvpYaEGiINqZ7FlaUmQ=="
+      },
       "version": "11.1.2"
     },
     "pnpx": {
