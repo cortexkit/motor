@@ -377,13 +377,16 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
+/// Job ids and claimed vCPUs of the Run frames a build-server double received.
+type RunLog = Arc<Mutex<Vec<(Uuid, Option<u32>)>>>;
+
 /// A build server that serves Linux claims of up to 16 vCPUs and refuses a
 /// larger one before start with `runner_full`, naming its limit, as it does
 /// when Linux jobs are confined to a CPU list under `--max-weight 16`.
 #[derive(Default)]
 struct SixteenVcpuRunner {
     /// Each Run frame received: job id and claimed vCPUs.
-    runs: Arc<Mutex<Vec<(Uuid, Option<u32>)>>>,
+    runs: RunLog,
     /// Replaces the refusal detail, to exercise the detail size limit.
     detail: Mutex<Option<String>>,
 }
@@ -568,7 +571,7 @@ async fn twenty_one_vcpu_canary_qualifies_against_the_78_gib_guest_advertisement
         Some(21)
     );
     let h = Harness::new(Behavior::CompleteRun).await;
-    // CLOUD's ceilings for ovh-1.
+    // The broker's per-host vCPU ceiling for the build server's tenant host.
     h.broker.lock().unwrap().knobs.max_vcpus = Some(21);
     let mut model = TenantCapacity::new(64, TENANT_1_STOPPED_FREE_MEM_MIB);
     model.heartbeat();
