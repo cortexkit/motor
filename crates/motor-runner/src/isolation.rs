@@ -148,6 +148,7 @@ fn writer_cache_acl(directory: bool, runner_write: bool) -> String {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
     // chmod on an extended ACL only closes its mask. Remove latent group grants
     // before another named-user grant can recompute that mask and reopen them.
@@ -163,6 +164,14 @@ pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
             ])
             .arg(state),
     )
+}
+
+/// A portable test has no sandbox account, so the grant that lets the job
+/// account traverse the runner state has nothing to apply to; it would only
+/// need root. The operator fixtures cover the real grant.
+#[cfg(test)]
+pub(crate) fn prepare_private_state(_state: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::Result<()> {

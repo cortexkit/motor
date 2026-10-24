@@ -26,6 +26,11 @@ fn engine_replies(max: u64) -> crate::systemd::CommandHook {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn open_without_private_state(mut config: Config) -> Runner {
+    todo!()
+}
+
 /// A refusal keeps a job record and no execution: its cpus, process and
 /// setup time stay empty, the queue stays empty, and the command never ran.
 fn assert_refused_without_start(runner: &Runner, f: &Fixture, request: &Run) {
@@ -58,7 +63,7 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     // no shared toolchain tree to prepare, so admission reads the slice alone.
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies((16 << 30) - 1));
-    let runner = Runner::open(config).unwrap();
+    let runner = open_without_private_state(config);
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
@@ -80,7 +85,7 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies(16 << 30));
     let floor = config.memory_floor_gib;
-    let runner = Runner::open(config).unwrap();
+    let runner = open_without_private_state(config);
     let (request, _) = f.run("true");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
