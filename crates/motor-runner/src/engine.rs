@@ -723,6 +723,16 @@ impl Config {
     }
 }
 
+/// The refusal for a remembered slice ceiling. A host set up below the floor
+/// every job unit requests is misconfigured, not busy, so the refusal is
+/// `WorkspaceSetupFailed`: callers do not treat that as a capacity signal to
+/// retry, which waiting could never clear.
+fn slice_memory_refusal(floor: u64, remembered: u64) -> Option<(RefusalReason, String)> {
+    let budget = crate::systemd::JobMemoryBudget::from_max(remembered)?;
+    crate::backend::slice_refusal(floor, budget)
+        .map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
+}
+
 /// The memory ceiling the jobs slice puts on a job unit, when there is one.
 /// The runner records it at startup and on every maintenance pass, outside the
 /// state lock; an empty record means no reading is kept, which leaves job
@@ -3193,13 +3203,11 @@ impl Runner {
             .core
             .slice_budget
             .load(std::sync::atomic::Ordering::Relaxed);
-        let budget = crate::systemd::JobMemoryBudget::from_max(max)?;
         #[cfg(test)]
         let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
         #[cfg(not(test))]
         let floor = crate::backend::memory_floor();
-        crate::backend::slice_refusal(floor, budget)
-            .map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
+        slice_memory_refusal(floor, max)
     }
 
     /// Read the jobs slice's limits and remember the memory ceiling for

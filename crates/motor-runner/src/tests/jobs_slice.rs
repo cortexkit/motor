@@ -215,3 +215,19 @@ fn isolated_maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
         "maintenance waited for the slice under the state lock: {slow:?}"
     );
 }
+
+/// The refusal rule itself, without a runner: a remembered ceiling below the
+/// floor refuses as a setup fault, a usable ceiling does not, and no reading
+/// at all (`NO_JOB_MEMORY_BUDGET`) never refuses.
+#[test]
+fn a_slice_below_the_floor_is_a_setup_refusal_and_a_missing_reading_is_none() {
+    let floor = 16 << 30;
+    let (reason, detail) = crate::engine::slice_memory_refusal(floor, floor - 1).unwrap();
+    assert_eq!(reason, RefusalReason::WorkspaceSetupFailed);
+    assert!(detail.contains("memory floor"), "{detail}");
+    assert_eq!(crate::engine::slice_memory_refusal(floor, floor), None);
+    assert_eq!(
+        crate::engine::slice_memory_refusal(floor, crate::systemd::NO_JOB_MEMORY_BUDGET),
+        None
+    );
+}

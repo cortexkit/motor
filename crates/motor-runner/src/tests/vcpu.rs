@@ -55,6 +55,12 @@ fn oom_advice_stops_recommending_more_vcpus_when_the_slice_caps_the_limit() {
         capped.contains("already at the maximum of 8 vCPUs"),
         "{capped}"
     );
+    // Through the whole detail: a 30-vCPU job needs 112742891520 bytes, above
+    // the 24 GiB slice, so more vCPUs are not the answer and the OOM figures
+    // still name the job's own limit.
+    let whole = crate::engine::oom_memory_limit_detail(&config, 30, 32);
+    assert!(!whole.contains("Request more vCPUs"), "{whole}");
+    assert!(whole.contains("per-job memory limit of 105 GiB"), "{whole}");
     // A slice above every admissible request changes nothing.
     config.slice_budget_probe = Some(112_742_891_520);
     let raised = crate::engine::oom_memory_limit_detail(&config, 2, 8);
