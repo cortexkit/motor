@@ -267,6 +267,40 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.tree(), before)
         self.assertEqual(self.events, [])
 
+    def test_storage_requirement_pinned_to_the_cutover_figures(self):
+        # Tenant 1 after the cutover: 78 GiB, idle off and a 600 GiB disk, so
+        # the suspend reserve is not counted. The measured figures fall about
+        # 6 GiB between the two published readings (the operating requirement
+        # plus 2 GiB of mkfs metadata and the base's 78.5 GiB should total
+        # 312.5 GiB, the spec publishes 309,774,516,224 bytes); this pin
+        # records the computed rule, not either reading.
+        tenant = dict(tenant="tenant-1", guest_ram_mib=79872, idle_suspend_s=0,
+                      host_floor_bytes=128 * GIB, disk_quota_bytes=600 * GIB)
+        self.assertEqual(p.storage_threshold(tenant, CAPACITY), 136 * GIB)
+        self.assertEqual(p.operating_requirement(tenant, CAPACITY), 223875170304 - 512 * MIB)
+        self.assertEqual(p.pre_operation_free_bytes(tenant, CAPACITY, True), 225485783040)
+        self.assertEqual(p.pre_operation_free_bytes(tenant, CAPACITY, False),
+                         225485783040 + 79872 * MIB + 512 * MIB)
+
+    def test_storage_requirement_counts_idle_reserve_and_the_larger_tenant(self):
+        tenant = dict(tenant="tenant-1", guest_ram_mib=79872, idle_suspend_s=0,
+                      host_floor_bytes=128 * GIB, disk_quota_bytes=600 * GIB)
+        idle = dict(tenant, idle_suspend_s=600)
+        # Idle suspend reserves the guest's RAM, so both figures rise by it.
+        self.assertEqual(p.storage_threshold(idle, CAPACITY) - p.storage_threshold(tenant, CAPACITY), 79872 * MIB)
+        self.assertEqual(p.pre_operation_free_bytes(idle, CAPACITY, True) - p.pre_operation_free_bytes(tenant, CAPACITY, True),
+                         79872 * MIB)
+        # A second tenant with a larger host floor sets a higher threshold.
+        big = dict(tenant="tenant-2", guest_ram_mib=79872, idle_suspend_s=0,
+                   host_floor_bytes=256 * GIB, disk_quota_bytes=600 * GIB)
+        self.assertGreater(p.storage_threshold(big, CAPACITY), p.storage_threshold(tenant, CAPACITY))
+
+    def test_host_floor_below_the_direct_runner_floor_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "at least the direct runner floor"):
+            p.checked(dict(tenant="a", sub="acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", vm="vm-a", image_version="v1",
+                           vcpu_ceiling=2, guest_ram_mib=18432, disk_quota_bytes=20 * GIB, cpuset="0-1",
+                           tap_index=1, host_floor_bytes=p.RUNNER_DEFAULT_FLOOR - 1, resolvers=["1.1.1.1"]))
+
     def test_live_cap_exact_limit_and_not_found_require_exact_dropin(self):
         p.apply_jobs_slice()
         p.verify_jobs_slice(CAPACITY)

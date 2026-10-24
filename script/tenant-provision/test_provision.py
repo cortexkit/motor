@@ -44,7 +44,7 @@ SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
 def config():
     return p.checked(dict(tenant="a", sub="acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", vm="vm-a", image_version="v1", vcpu_ceiling=2,
                           guest_ram_mib=18432, disk_quota_bytes=21474836480, cpuset="0-1", tap_index=1, idle_suspend_s=60,
-                          host_floor_bytes=2147483648, resolvers=["1.1.1.1"]))
+                          host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, resolvers=["1.1.1.1"]))
 
 
 class ProvisionTests(unittest.TestCase):
@@ -58,7 +58,10 @@ class ProvisionTests(unittest.TestCase):
                                           JOBS_DROP_IN=self.root / "jobs.conf",
                                           read_capacity=lambda: {"windows_vm_bytes": 16 * 1024**3,
                                                                  "host_reserve_bytes": 6 * 1024**3,
-                                                                 "jobs_min_bytes": 24 * 1024**3},
+                                                                 "jobs_min_bytes": 24 * 1024**3,
+                                                                 "storage_margin_bytes": 8 * 1024**3,
+                                                                 "growth_allowance_bytes": 64 * 1024**3,
+                                                                 "tenant_memory_reserve_bytes": 2 * 1024**3},
                                           memtotal_bytes=lambda: 128 * 1024**3,
                                           slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
                                           runner_processes=lambda: [])
@@ -551,7 +554,6 @@ class ProvisionTests(unittest.TestCase):
         (p.base_path(c, self.image)).mkdir(parents=True)
         for name in ("base.vmstate", "base.memory"):
             (p.base_path(c, self.image) / name).write_bytes(b"x")
-        consumed = c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576
         state = self.root / "runner-state"
         floor = 128 * 1024**3
         # The lower-floor runner does not decide; the highest floor on the
@@ -562,19 +564,23 @@ class ProvisionTests(unittest.TestCase):
             if args[0] == "fallocate":
                 args[-1].write_bytes(b"allocated")
         execute = mock.Mock(side_effect=allocate)
-        free = type("Usage", (), {"free": consumed + floor - 1})
-        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
-                self.assertRaisesRegex(ValueError, r"would leave 127\.9 GiB free .* below motor-runner pid 4242's refusal floor 128\.0 GiB"):
+        needed = p.pre_operation_free_bytes(c, p.read_capacity(), True)
+        # One byte short of the host requirement is refused before the runner
+        # is consulted at all.
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": needed - 1})), \
+                self.assertRaisesRegex(ValueError, f"provisioning needs {needed} free bytes"):
             p.provision(c, execute=execute, runners=runner)
         execute.assert_not_called()
         self.assertFalse((p.ROOT / "tenants" / c["tenant"]).exists())
-        # A runner whose state is on another filesystem does not count.
-        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
+        # On another filesystem the same host passes, and room for the floor on
+        # this one admits the tenant: the tenant's own bytes and the floor fit.
+        ample = needed + floor
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample})), \
                 mock.patch.object(p, "device", side_effect=lambda path: 1 if path == state else 2):
             p.provision(c, execute=execute, runners=runner)
         execute.reset_mock()
         c2 = dict(c, tenant="b", vm="vm-b", tap_index=2)
-        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": consumed + floor})):
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample + floor})):
             p.provision(c2, execute=execute, runners=runner)
         execute.assert_called()
 
