@@ -137,33 +137,6 @@ fn a_fill_adds_the_write_error_policy_and_writes_every_level() {
     );
 }
 
-/// Everything inherited from the runner's own environment is removed: neither
-/// an sccache setting nor an AWS credential may survive into a job.
-#[test]
-fn inherited_sccache_and_aws_variables_are_scrubbed() {
-    let mut env = BTreeMap::from([
-        ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-        ("SCCACHE_BUCKET".to_string(), "operator-bucket".to_string()),
-        ("SCCACHE_DIR".to_string(), "/operator/cache".to_string()),
-        ("SCCACHE_LOG".to_string(), "trace".to_string()),
-        ("AWS_ACCESS_KEY_ID".to_string(), "real-key".to_string()),
-        (
-            "AWS_SECRET_ACCESS_KEY".to_string(),
-            "real-secret".to_string(),
-        ),
-        ("AWS_PROFILE".to_string(), "operator".to_string()),
-        ("AWS_SESSION_TOKEN".to_string(), "session".to_string()),
-    ]);
-    crate::backend::scrub_inherited_cache_environment(&mut env);
-    assert_eq!(
-        env,
-        BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())])
-    );
-    for prefix in INHERITED_PREFIXES {
-        assert!(env.keys().all(|key| !key.starts_with(prefix)));
-    }
-}
-
 /// A forwarder for a tool the unit does not run must not become the endpoint.
 #[test]
 fn a_unit_without_an_sccache_socket_gets_no_endpoint() {

@@ -1031,7 +1031,7 @@ fn compile_cache_environment(
     prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    scrub_inherited_cache_environment(env);
+    scrub_inherited_cache_environment(config, setup, env);
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
         // Without the shared cache an isolated Rust job still builds in the same fixed
@@ -1059,14 +1059,6 @@ fn compile_cache_environment(
         crate::compile_cache::reader_environment(env, config.sccache_size_gib);
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
-            // A fill always waits for every read-write level it writes: the
-            // publication decision reads the remote write failures from these
-            // statistics, whatever the switch state was when the fill started.
-            crate::remote_cache::environment::fill_values()
-                .into_iter()
-                .for_each(|(key, value)| {
-                    env.insert(key, value);
-                });
             env.insert("CARGO_INCREMENTAL".into(), "1".into());
             env.insert(
                 "SCCACHE_SERVER_UDS".into(),
@@ -1101,9 +1093,30 @@ fn rust_job(setup: &Setup) -> bool {
 /// operator's shell, an inherited unit, a caller request that reached the
 /// allowlist). None of them may shape a job: they would either override the
 /// local level-1 settings the runner adds afterwards or point the tool at a
-/// store this job may not use. Scrubbing happens before anything is added, so
-/// it never removes a value the runner generated.
-pub(crate) fn scrub_inherited_cache_environment(env: &mut BTreeMap<String, String>) {
+/// store this job may not use. They are removed only while the remote cache
+/// can be on for this unit, because with it off every job environment must be
+/// exactly what it was before the cache existed, operator settings included;
+/// scrubbing always runs before anything is added, so it never removes a
+/// value the runner generated.
+pub(crate) fn scrub_inherited_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    env: &mut BTreeMap<String, String>,
+) {
+    // The writer branch below runs for every fill on every host type, but only
+    // the build server's fills and its Rust jobs ever reach the cache: every
+    // other unit must keep exactly the environment base gave it.
+    if config.remote_cache_available(setup.base).is_none() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if !(setup.base || rust_job(setup)) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !setup.base {
+        return;
+    }
     env.retain(|key, _| {
         !crate::remote_cache::environment::INHERITED_PREFIXES
             .iter()

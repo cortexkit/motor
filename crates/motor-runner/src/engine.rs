@@ -525,8 +525,27 @@ impl Config {
         // Nothing starts the gateway yet, so no generation is ever served and
         // no unit gets a socket or a forwarder. Wiring the gateway into
         // startup supplies the generation and the unit's forwarders here.
-        let _ = fill;
+        let _ = (fill, self.remote_cache_available(fill));
         None
+    }
+    /// Whether the remote compile cache can be on for a job or a fill of this
+    /// runner at all, before provisioning is read: the runner switch must be
+    /// set, that switch must be honoured (which needs job isolation), and only
+    /// the build server may write the cache, so no other role can ever have a
+    /// fill with it on.
+    ///
+    /// This is about the role, not about whether a writer account exists right
+    /// now: a role that may write is a role whose unit gets the cache
+    /// environment, and a missing account fails the fill itself later.
+    #[cfg(unix)]
+    pub(crate) fn remote_cache_available(&self, fill: bool) -> Option<()> {
+        if !self.isolate_jobs || self.boat_profile || self.tenant_vm {
+            return None;
+        }
+        if fill && self.vm_instance() {
+            return None;
+        }
+        Some(())
     }
     /// Endpoint for one trusted Linux build that populates the compiler cache,
     /// independent of the runner's state paths.
