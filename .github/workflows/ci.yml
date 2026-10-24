@@ -42,6 +42,18 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 11.1.2
+      # The runner starts node, npm and pnpm from the fixed paths in
+      # script/runner/toolchain.json, not from PATH. The setup actions install
+      # them under the tool cache, so link the pinned ones where the build
+      # server keeps them.
+      - name: Build-server JavaScript tool layout
+        run: |
+          for tool in node npm pnpm; do
+            sudo ln -sf "$(command -v "$tool")" "/usr/local/bin/$tool"
+          done
+          /usr/local/bin/node --version
+          /usr/local/bin/npm --version
+          /usr/local/bin/pnpm --version
       - name: Tool versions
         run: |
           node --version
