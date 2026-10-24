@@ -809,6 +809,44 @@ impl Drop for Fixture {
         }
     }
 }
+/// A job unit asks for the slice's `MemoryMax` at most, and keeps its own
+/// smaller request. This starts a real sandbox, so it is an operator fixture:
+///
+/// ```text
+/// cargo test -p motor-runner --lib -- --ignored isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice
+/// ```
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and the motor-job account: it starts a real job unit"]
+fn isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice() {
+    let slice = crate::systemd::read_job_memory_budget().unwrap();
+    let f = Fixture::new();
+    let memory_max = |sandbox: &Sandbox, vcpus: u32| {
+        let command = sandbox
+            .command("true", &f.workspace, &[], true, &[], vcpus)
+            .unwrap();
+        command
+            .get_args()
+            .filter_map(|arg| arg.to_str())
+            .find_map(|arg| arg.strip_prefix("--property=MemoryMax="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // A request above the slice runs under the slice's own ceiling.
+    let large = f
+        .sandbox()
+        .with_slice_budget(slice)
+        .with_memory_floor_gib(Some(16));
+    assert!(crate::backend::memory_max(30, Some(16)) > slice.max);
+    assert_eq!(memory_max(&large, 30), slice.max);
+    // A request below it keeps the job's own limit.
+    assert_eq!(
+        memory_max(&large, 2),
+        crate::backend::memory_max(2, Some(16))
+    );
+}
+
 fn output(
     sandbox: &Sandbox,
     command: &str,

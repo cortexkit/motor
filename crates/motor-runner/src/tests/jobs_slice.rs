@@ -2,6 +2,17 @@
 //! `motor-jobs.slice`: a unit's `MemoryMax` is clamped to the slice's, and a
 //! slice too small for the floor every job requests makes the job refuse
 //! before it starts instead of being OOM-killed by the slice on arrival.
+//!
+//! The tests that open a runner with job isolation are `isolated_*` operator
+//! fixtures: the isolated path checks the `motor-job` account and grants it
+//! access to the host trees, which needs a provisioned host. Run them on a
+//! dedicated Linux host as root, for example:
+//!
+//! ```text
+//! cargo test -p motor-runner --lib -- --ignored isolated_jobs_slice
+//! ```
+//!
+//! The rest run anywhere.
 use super::*;
 
 /// A fake systemd for the engine's queries that can make the slice reply
@@ -82,7 +93,9 @@ fn assert_refused_without_start(
 /// get bigger while the job waits, so nothing calls for a retry.
 #[cfg(target_os = "linux")]
 #[test]
-fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
+// Needs the motor-job account and host access grants: see the module docs.
+#[ignore = "requires the motor-job account, root, and a host with the runner units"]
+fn isolated_jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let f = Fixture::new();
     let (hook, _) = FakeManager::hook(slice_reply((16 << 30) - 1));
     let mut config = f.config();
@@ -107,7 +120,9 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
 /// `MemoryMax` is clamped, and the slice's own OOM killer reports an overrun.
 #[cfg(target_os = "linux")]
 #[test]
-fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
+// Needs the motor-job account and host access grants: see the module docs.
+#[ignore = "requires the motor-job account, root, and a host with the runner units"]
+fn isolated_jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     let f = Fixture::new();
     let (hook, _) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
@@ -135,7 +150,9 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
 /// state lock comes near the slow-hold threshold (100 ms).
 #[cfg(target_os = "linux")]
 #[test]
-fn admission_reads_the_recorded_slice_ceiling_without_waiting_under_the_state_lock() {
+// Needs the motor-job account and host access grants: see the module docs.
+#[ignore = "requires the motor-job account, root, and a host with the runner units"]
+fn isolated_admission_reads_the_recorded_slice_ceiling_without_waiting_under_the_state_lock() {
     let f = Fixture::new();
     let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
@@ -168,7 +185,9 @@ fn admission_reads_the_recorded_slice_ceiling_without_waiting_under_the_state_lo
 /// state lock, and admission refuses by the new ceiling.
 #[cfg(target_os = "linux")]
 #[test]
-fn maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
+// Needs the motor-job account and host access grants: see the module docs.
+#[ignore = "requires the motor-job account, root, and a host with the runner units"]
+fn isolated_maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
     let f = Fixture::new();
     let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
     let mut config = f.config();
