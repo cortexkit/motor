@@ -598,8 +598,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS peer-boot-event-before-start-is-rejected'
         $count++
         $script:peerBootPoll = 0
-        $script:peerBootUnrelated = New-PeerEvent 45 $otherXml
-        $script:peerBootCurrent = New-PeerEvent 46 $upperXml
+        # A real event's RecordId equals the EventRecordID in its XML, which is
+        # what the match reports, so each fixture event carries its XML's id.
+        $script:peerBootUnrelated = New-PeerEvent 43 $otherXml
+        $script:peerBootCurrent = New-PeerEvent 42 $upperXml
         function global:Get-WinEvent {
             [CmdletBinding()]
             param([hashtable]$FilterHashtable)
@@ -614,7 +616,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $eventPath = Join-Path $peerBootRoot 'peer-boot-fixture.xml'
         $bootMatch = Wait-RunnerPeerBoot $victimVm $since $eventPath
         $queryEvidence = Get-Content -LiteralPath ($eventPath + '.queries.json') -Raw | ConvertFrom-Json
-        if ($script:peerBootPoll -lt 2 -or $bootMatch.record_id -ne 46 -or $queryEvidence.queries.Count -lt 2) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
+        if ($script:peerBootPoll -lt 2 -or $bootMatch.record_id -ne 42 -or $queryEvidence.queries.Count -lt 2) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
         Write-Host 'PASS peer-boot-polls-past-unrelated-event-and-retains-queries'
         $count++
         Remove-Item Function:\Get-WinEvent
