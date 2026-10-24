@@ -126,6 +126,11 @@ pub struct Config {
     /// also avoid their SMT siblings while the shared slot lock is held.
     pub windows_cpus: Option<String>,
     pub windows_slot_lock: Option<PathBuf>,
+    /// Host CPUs Linux jobs may use, in CPU-list syntax. When set, no core is
+    /// kept back for the daemon and `max_weight`, not the list's length, is the
+    /// largest vCPU claim admitted; a larger claim is refused before start
+    /// instead of waiting. Windows avoidance still applies within the list.
+    pub linux_cpus: Option<String>,
     pub(crate) windows: Option<Arc<crate::windows::VmConfig>>,
     pub(crate) windows_runtime: Arc<crate::windows::Runtime>,
     #[cfg(test)]
@@ -418,6 +423,7 @@ impl Config {
             macos_runtime: Arc::default(),
             windows_cpus: None,
             windows_slot_lock: None,
+            linux_cpus: None,
             windows: None,
             windows_runtime: Arc::new(crate::windows::Runtime::default()),
             #[cfg(test)]
@@ -1700,6 +1706,17 @@ impl Runner {
                     "--windows-cpus and --windows-slot-lock must be supplied together on the Linux runner",
                 ));
             }
+        };
+        // Confine after Windows avoidance so the Windows CPUs are checked
+        // against every online CPU, not only the listed ones.
+        let cpus = match &config.linux_cpus {
+            None => cpus,
+            Some(_) if config.vm_instance() => {
+                return Err(invalid(
+                    "--linux-cpus applies only to a runner serving Linux jobs",
+                ));
+            }
+            Some(list) => cpus.confine(&crate::cpu::parse_list(list)?, config.max_weight)?,
         };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
@@ -3083,11 +3100,26 @@ impl Runner {
     }
 
     fn cpu_refusal(&self, claim: u32) -> Option<(RefusalReason, String)> {
-        if claim == 0 || claim > self.core.cpus.capacity() {
-            Some((RefusalReason::RunnerFull, format!(
-                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; daemon core reservation {})",
-                self.core.cpus.capacity(), self.core.config.daemon_core_reservation()
-            )))
+        let limit = self.core.cpus.claim_limit();
+        if claim == 0 || claim > limit {
+            let basis = match &self.core.config.linux_cpus {
+                // A confined runner refuses what it could never admit, rather
+                // than accepting a claim above max_weight that would wait forever.
+                Some(list) => format!(
+                    "max_weight limit; Linux jobs share {} CPUs ({list})",
+                    self.core.cpus.capacity()
+                ),
+                None => format!(
+                    "allocatable CPU limit; daemon core reservation {}",
+                    self.core.config.daemon_core_reservation()
+                ),
+            };
+            Some((
+                RefusalReason::RunnerFull,
+                format!(
+                    "vcpu request {claim} is outside the supported range 1..={limit} ({basis})"
+                ),
+            ))
         } else {
             None
         }
@@ -7619,7 +7651,7 @@ impl Runner {
                 .unwrap_or(false);
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
-            oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.capacity())
+            oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.claim_limit())
         });
         if let Some(detail) = &memory_limit_detail {
             #[cfg(test)]

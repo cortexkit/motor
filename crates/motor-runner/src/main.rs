@@ -449,6 +449,7 @@ fn configure_options(
             "--vm-config" => config.vm_config = Some(value.into()),
             "--windows-cpus" => config.windows_cpus = Some(value),
             "--windows-slot-lock" => config.windows_slot_lock = Some(value.into()),
+            "--linux-cpus" => config.linux_cpus = Some(value),
             "--job" => job = value.parse::<motor_protocol::Uuid>().ok(),
             "--drain-timeout-s" => {
                 drain_timeout_s = value.parse::<u64>().map_err(io::Error::other)?
@@ -662,6 +663,21 @@ mod tests {
             config.windows_slot_lock,
             Some("/srv/build/motor-windows/slot.lock".into())
         );
+    }
+
+    #[test]
+    fn linux_cpu_list_is_opt_in_and_preserved() {
+        let mut config = Config::new("unused", "main");
+        assert!(config.linux_cpus.is_none());
+        configure_options(
+            &mut config,
+            ["--linux-cpus", "12-15,28-31", "--max-weight", "16"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(config.linux_cpus.as_deref(), Some("12-15,28-31"));
+        assert_eq!(config.max_weight, 16);
     }
 
     #[test]
