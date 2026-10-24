@@ -53,7 +53,6 @@ fn capacity_json_is_strict_and_requires_every_input() {
         valid
             .to_string()
             .replace("\"jobs_min_bytes\":25769803776", "\"jobs_min_bytes\":0"),
-        valid.to_string().replace("17179869184", "25769803777"),
     ] {
         assert_eq!(
             Capacity::parse(bad.as_bytes()).unwrap_err().case,
@@ -61,6 +60,10 @@ fn capacity_json_is_strict_and_requires_every_input() {
             "{bad}"
         );
     }
+    // The Windows VM's allowance sits on top of jobs_min_bytes, so a Windows
+    // allowance above the Linux floor is a valid configuration.
+    let larger_windows = valid.to_string().replace("17179869184", "25769803777");
+    Capacity::parse(larger_windows.as_bytes()).unwrap();
     let mut overflow = valid;
     overflow["windows_vm_bytes"] = json!(1);
     overflow["jobs_min_bytes"] = json!(u64::MAX);

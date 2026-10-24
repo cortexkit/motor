@@ -26,11 +26,10 @@ impl Capacity {
     fn parse(bytes: &[u8]) -> std::result::Result<Self, StartRefusal> {
         let capacity: Self =
             serde_json::from_slice(bytes).map_err(|error| start_refused(CapacityJson, error))?;
-        if capacity.jobs_min_bytes == 0 || capacity.windows_vm_bytes > capacity.jobs_min_bytes {
-            return Err(start_refused(
-                CapacityJson,
-                "requires jobs_min_bytes >= 1 and windows_vm_bytes <= jobs_min_bytes",
-            ));
+        // The Windows VM shares the jobs slice but has its own allowance on top
+        // of jobs_min_bytes, so the two are not compared.
+        if capacity.jobs_min_bytes == 0 {
+            return Err(start_refused(CapacityJson, "requires jobs_min_bytes >= 1"));
         }
         capacity.memory_max()?;
         Ok(capacity)
