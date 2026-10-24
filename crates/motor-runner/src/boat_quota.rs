@@ -25,6 +25,12 @@ const INODE_RESERVE: u64 = 8192;
 pub(crate) const MIN_COLD_CAP_BYTES: u64 = 8 << 30;
 pub(crate) const READY_FREE_BYTES: u64 =
     PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES + MIN_COLD_CAP_BYTES;
+// Linux's FS_IOC_FS{GET,SET}XATTR request numbers. ioctl's request type is
+// `c_ulong` under glibc but `c_int` under musl (the hosted tenant runner is a
+// static musl build), so these stay `u32` and are cast to `libc::Ioctl` at the
+// call; the bit pattern survives either conversion.
+const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ColdCache {
@@ -234,14 +240,14 @@ impl QuotaSystem for System {
     fn attributes(&self, file: &File) -> io::Result<FsXattr> {
         let mut attr = FsXattr::default();
         // SAFETY: FS_IOC_FSGETXATTR writes a correctly sized live fsxattr.
-        if unsafe { libc::ioctl(file.as_raw_fd(), 0x801c581f_u64, &mut attr) } == -1 {
+        if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSGETXATTR as libc::Ioctl, &mut attr) } == -1 {
             return Err(io::Error::last_os_error());
         }
         Ok(attr)
     }
     fn set_attributes(&self, file: &File, attr: &FsXattr) -> io::Result<()> {
         // SAFETY: FS_IOC_FSSETXATTR reads a correctly sized live fsxattr.
-        if unsafe { libc::ioctl(file.as_raw_fd(), 0x401c5820_u64, attr) } == -1 {
+        if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSSETXATTR as libc::Ioctl, attr) } == -1 {
             return Err(io::Error::last_os_error());
         }
         Ok(())

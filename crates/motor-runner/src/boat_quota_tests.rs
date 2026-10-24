@@ -682,7 +682,7 @@ fn reflink_baseline_cannot_turn_released_logical_charge_into_extra_physical_grow
             .open(&path)
             .unwrap();
         assert_eq!(
-            unsafe { libc::ioctl(output.as_raw_fd(), 0x40049409_u64, input.as_raw_fd()) },
+            unsafe { libc::ioctl(output.as_raw_fd(), 0x40049409_u32 as libc::Ioctl, input.as_raw_fd()) },
             0,
             "this regression requires reflink-capable scratch"
         );
