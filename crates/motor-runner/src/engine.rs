@@ -1732,7 +1732,15 @@ impl Runner {
         };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
-            config.private_pids = crate::systemd::job_private_pids(config.boat_profile)?;
+            // The runner's own command hook answers this query in tests, so a
+            // test can run the isolated path without a host manager.
+            config.private_pids = match crate::backend::systemctl(
+                &config,
+                &["show", "--property=Version", "--value"],
+            ) {
+                Ok(output) => crate::systemd::manager_private_pids(&output, config.boat_profile)?,
+                Err(error) => return Err(error),
+            };
             if config.boat_profile {
                 config.boat_unset_environment = crate::systemd::provider_environment_names()?;
             }
