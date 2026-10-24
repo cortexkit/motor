@@ -1,12 +1,13 @@
 //! The host capacity file, `/etc/motor-host/capacity.json`.
 //!
 //! The operator writes it once per host; provisioning, the VM helper and
-//! motor-host all read the same six byte values. motor-host uses two of them:
+//! motor-host all read the same six byte values. Beyond validating the file, motor-host uses two of them:
 //! `storage_margin_bytes`, which sets the storage refusal threshold and its
 //! release point, and `tenant_memory_reserve_bytes`, which is subtracted from
 //! every tenant's advertised free memory. A file that is missing, unreadable,
-//! malformed, or not protected from other users is never used: the caller
-//! treats it like a failed free-space probe and refuses new leases.
+//! malformed, or not protected from other users is never used: a host that
+//! enforces the storage refusal treats it like a failed free-space probe and
+//! refuses new leases.
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use std::io::Read;

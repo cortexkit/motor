@@ -240,7 +240,7 @@ can give a job, not the host's: a tenant that is not running advertises its gues
 RAM, so the broker can place the lease that wakes it; a running tenant
 advertises the `mem_available_bytes` its runner reports in the `status` health
 reply, sampled every 15 seconds. Both are floored to MiB and reduced by
-`tenant_memory_reserve_bytes`, saturating at 0. A running tenant whose reply
+`tenant_memory_reserve_bytes` (rounded up to whole MiB), saturating at 0. A running tenant whose reply
 lacks the field, whose probe failed, or whose sample is older than 30 seconds
 advertises 0 and logs `tenant_memory_unavailable` naming the case. Without a
 valid capacity file no memory is advertised. Each heartbeat field is the maximum

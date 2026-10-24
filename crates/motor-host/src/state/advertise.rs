@@ -24,7 +24,8 @@ pub(crate) struct StorageLatch {
     /// and the provider sandbox construct hosts without it.
     enforced: bool,
     latched: bool,
-    /// Set when `host_storage_low` has been logged for the current low period.
+    /// Set once per low period, so `host_storage_low` is logged once (only
+    /// an enforcing host logs it).
     low_logged: bool,
 }
 impl Default for StorageLatch {
@@ -258,10 +259,10 @@ impl Host {
     /// tenant that is not running advertises its guest RAM, so the broker can
     /// place the lease that wakes it; a running tenant advertises its guest's
     /// measured available memory. Both are floored to MiB and reduced by
-    /// `tenant_memory_reserve_bytes`, saturating at 0. A running tenant
-    /// without a usable sample, a start-refused tenant, and any tenant while
-    /// no valid capacity file has been read advertise 0. Logs each running
-    /// tenant's unusable-sample case once when it starts.
+    /// `tenant_memory_reserve_bytes` rounded up to whole MiB, saturating at
+    /// 0. A running tenant without a usable sample, a start-refused tenant,
+    /// and any tenant while no valid capacity file has been read advertise 0.
+    /// Logs each running tenant's unusable-sample case once when it starts.
     pub fn free_mem_mib(&mut self, now_ms: u64) -> u64 {
         let tenants: Vec<Tenant> = self.tenants.values().cloned().collect();
         tenants

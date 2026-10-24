@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-/// The owner's values for ovh-1.
+/// The production capacity values for the first hosted tenant host.
 fn capacity_values() -> Capacity {
     Capacity {
         windows_vm_bytes: 16 * GIB,

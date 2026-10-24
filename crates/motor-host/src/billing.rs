@@ -353,8 +353,8 @@ impl Host {
     }
     pub fn heartbeat(&self, now_ms: u64, free_mem_mib: u64, healthy: bool) -> Heartbeat {
         Heartbeat {
-            // While host storage is low no lease is admitted, so none is
-            // advertised either.
+            // While host storage is low, new leases are refused, so no free
+            // vCPUs are advertised and the broker places no new work here.
             free_vcpus: if self.storage_refusing() {
                 0
             } else {
