@@ -118,10 +118,10 @@ pub(crate) fn lockfiles(
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const PREFLIGHT: &str = include_str!("preflight.py");
 
-/// Whether the untrusted tree at `path` has a root Cargo manifest. The writer
-/// shell runs its Cargo preflight from this file, because the fill does not
-/// carry the tip's file list; the manifest is checked in the tree being
-/// compiled, not in the commit, so the two cannot disagree about a Cargo fill.
+/// The writer shell's gate on Cargo's offline preflight. It looks for the root
+/// manifest in the tree it is about to compile, because the shell does not
+/// carry the tip's file list; a tree without one has nothing for Cargo to
+/// check, and its declared fill runs alone.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const CARGO_CHECK: &str = include_str!("cargo-check.sh");
 

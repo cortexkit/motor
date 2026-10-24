@@ -101,11 +101,9 @@ pub(crate) fn read(mirror: &Path, commit: &str) -> io::Result<Option<Declaration
 
 /// Parse `.motor/cache.toml`.
 ///
-/// A Cargo tree already owns its fill through `[workspace.metadata.motor]`, so
-/// a table it cannot have meant is refused with what to change; a tree the
-/// runner has no warm command for is refused for the same reason: silently
-/// dropping a declaration would leave the repository warm from something other
-/// than what it declared.
+/// Every refusal names what to change. A file the runner cannot read is refused
+/// rather than ignored: dropping a declaration would leave the repository warm
+/// from something other than what it declared.
 pub(crate) fn parse(text: &str) -> Result<Declaration, String> {
     let document: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
     for key in document.keys() {
@@ -155,14 +153,14 @@ pub(crate) fn parse(text: &str) -> Result<Declaration, String> {
     Ok(Declaration { fills: steps })
 }
 
-/// Refuse a pattern that is absolute, always matches nothing, or can step
-/// above the root it is matched against.
+/// Refuse a pattern that is empty, absolute, names a parent directory, or can
+/// select no file at all.
 ///
-/// The last three cases are answered by the matcher itself rather than by a
-/// second reading of the syntax here, so what the parser accepts and what a
-/// pattern actually matches cannot drift apart. The `.` and `..` names are
-/// named patterns rather than literals: `.` describes every name, and `..`
-/// describes a parent, which no tree entry is.
+/// "Selects no file" is answered by the matcher, using a sample path the
+/// pattern itself names, rather than by a second reading of the wildcard syntax
+/// here: what the parser accepts and what a pattern matches cannot then drift
+/// apart. Only a `..` segment is refused outright, because that is the one shape
+/// that reaches outside the repository it is matched against.
 fn check_pattern(pattern: &str) -> Result<(), String> {
     if pattern.trim().is_empty() {
         return Err("empty descriptor-inputs pattern".into());
