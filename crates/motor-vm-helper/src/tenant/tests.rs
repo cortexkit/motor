@@ -10,6 +10,7 @@ pub(crate) fn registry(name: &str) -> Registry {
         suspend: root.join("suspend"),
         image_version: "v1".into(),
         vcpu_ceiling: 2,
+        max_weight: None,
         guest_ram_mib: 18432,
         disk_quota_bytes: 21474836480,
         cpuset: "0-1".into(),

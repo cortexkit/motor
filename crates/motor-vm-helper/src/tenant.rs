@@ -49,6 +49,8 @@ pub struct Registry {
     pub suspend: PathBuf,
     pub image_version: String,
     pub vcpu_ceiling: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_weight: Option<u32>,
     pub guest_ram_mib: u64,
     pub disk_quota_bytes: u64,
     pub cpuset: String,
@@ -74,6 +76,9 @@ fn default_io_weight() -> u32 {
     100
 }
 impl Registry {
+    pub fn budget(&self) -> u32 {
+        self.max_weight.unwrap_or(self.vcpu_ceiling)
+    }
     pub fn validate(&self, tenant: &str) -> Result<()> {
         validate_name(tenant)?;
         validate_name(&self.image_version)?;
@@ -84,6 +89,7 @@ impl Registry {
             || self.tap_index == 0
             || self.tap_index == 255
             || !(1..=256).contains(&self.vcpu_ceiling)
+            || self.budget() < self.vcpu_ceiling
             || self.guest_ram_mib == 0
             || self.disk_quota_bytes == 0
             || !(1..=10000).contains(&self.io_weight)
