@@ -984,6 +984,9 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                                   dict(job_running=True, allocated_bytes=2**30),
                                   dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)])
                 def execute(sid, command, **kwargs):
+                    if '--show-cursor' in command:
+                        order.append('journal_cursor')
+                        return {'stdout': '-- cursor: saved-before-stop\n'}
                     if 'backing_allocated_blocks' in command:
                         order.append('backing_allocation')
                     return {'stdout': json.dumps(next(responses))}
@@ -999,8 +1002,9 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                      patch.object(host, '_quota_popen', return_value=child):
                     if valid:
                         runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
-                        self.assertEqual(order, ['backing_allocation', 'stop', 'archived', 'terminate'])
+                        self.assertEqual(order, ['backing_allocation', 'journal_cursor', 'stop', 'archived', 'terminate'])
                         self.assertTrue(runner.data['disk_quota']['stopped_with_retained_target'])
+                        self.assertEqual(runner.data['disk_quota']['lanes']['retained_target']['eviction_journal_cursor'], 'saved-before-stop')
                         self.assertFalse(runner.data['disk_quota']['reserve_assurance']['sufficiency_proven'])
                     else:
                         with self.assertRaisesRegex(ValueError, 'retained target'):

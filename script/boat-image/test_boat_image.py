@@ -592,6 +592,27 @@ class RecipeTests(unittest.TestCase):
                 start.watch_storage(pause=pause)
             self.assertEqual(polls, ['unhealthy'] * 3)
 
+    def test_idle_25gb_workspace_reclamation_restores_watcher_health(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            xfs_free = 33_494_822_912
+            polls = []
+            def stats(path):
+                return Mock(f_bavail=(60 << 30) if str(path) == '/' else xfs_free,
+                            f_frsize=1, f_favail=10000)
+            def pause(_):
+                nonlocal xfs_free
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 1:
+                    # Runner eviction and FITRIM recover the retained workspace;
+                    # only the watcher may turn the new sample into healthy state.
+                    xfs_free += 25_501_368_320
+                else:
+                    raise InterruptedError('observed healthy recovery')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy', 'healthy'])
+
     def test_capacity_sample_cannot_overwrite_a_newer_locked_withdrawal(self):
         with self.storage_watch_paths() as (_, marker, health):
             available = {'root': 64 << 30}

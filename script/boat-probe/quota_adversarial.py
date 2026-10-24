@@ -133,3 +133,23 @@ def free(path):
 assert min(free('/'), free('/var/lib/motor-boat')) >= 24 * 1024**3
 print(json.dumps(dict(job_running=True, allocated_bytes=metadata.st_blocks*512, root_free_bytes=free('/'), xfs_free_bytes=free('/var/lib/motor-boat'))))
 '''
+
+
+def resume_eviction_source(workspace, cursor):
+    return 'WORKSPACE=' + repr(workspace) + '\nCURSOR=' + repr(cursor) + '\n' + r'''
+import json, os, re, subprocess
+result = subprocess.run(['journalctl', '--unit=motor-boat.service', '--after-cursor=' + CURSOR,
+                         '--no-pager', '--output=json'], check=True, capture_output=True, text=True)
+events = []
+path_field = re.compile(r'\bpath=(?:"' + re.escape(WORKSPACE) + r'"|' + re.escape(WORKSPACE) + r')(?:\s|$)')
+for line in result.stdout.splitlines():
+    message = re.sub(r'\x1b\[[0-9;]*m', '', json.loads(line).get('MESSAGE', ''))
+    if 'runner disk eviction' in message and path_field.search(message):
+        events.append(message)
+def free(path):
+    value = os.statvfs(path)
+    return value.f_bavail * value.f_frsize
+print(json.dumps(dict(workspace=WORKSPACE, workspace_absent=not os.path.lexists(WORKSPACE),
+                     eviction_logged=any('runner disk eviction failed' not in event for event in events),
+                     events=events, root_free_bytes=free('/'), xfs_free_bytes=free('/var/lib/motor-boat'))))
+'''

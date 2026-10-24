@@ -80,6 +80,18 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+impl Config {
+    pub(crate) fn boat_workspace_trash_roots(&self) -> Vec<PathBuf> {
+        if !self.boat_profile {
+            return Vec::new();
+        }
+        self.owned_workspace_roots
+            .iter()
+            .map(|root| root.join(format!(".motor-boat-trash-{}", self.instance)))
+            .collect()
+    }
+}
+
 /// Count allocated inode blocks physically, without following symlinks or
 /// crossing mounts. Shared reflink extents are counted per inode, not reclaimed
 /// bytes; only the free-space probe can establish that deletion met the floor.
@@ -412,6 +424,8 @@ impl Runner {
                 .iter()
                 .filter_map(|p| p.canonicalize().ok()),
         );
+        let active_protected = protected.clone();
+        protected.extend(self.core.config.boat_workspace_trash_roots());
         let roots: Vec<_> = self
             .core
             .config
@@ -454,7 +468,7 @@ impl Runner {
         }
         // These are the runner's actual upload, deletion and launch staging
         // roots. Never scan /srv/build or infer ownership from directory names.
-        for kind in [
+        let state_roots = [
             "spools",
             "trash",
             "sandboxes",
@@ -462,17 +476,32 @@ impl Runner {
             "git-deps",
             "js-installs",
             "js-manager-caches",
-        ] {
+        ]
+        .into_iter()
+        .map(|kind| (kind, self.core.trees.state.join(kind)));
+        let workspace_trash = self
+            .core
+            .config
+            .boat_workspace_trash_roots()
+            .into_iter()
+            .map(|root| ("boat-workspace-trash", root));
+        for (kind, root) in state_roots.chain(workspace_trash) {
             if kind == "boat-quarantine" && !self.core.config.boat_profile {
                 continue;
             }
-            let root = self.core.trees.state.join(kind);
             let Ok(entries) = fs::read_dir(&root) else {
                 continue;
             };
+            #[cfg(target_os = "linux")]
+            if kind == "boat-workspace-trash" {
+                Self::validate_boat_workspace_trash(&root)?;
+            }
+            if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+                continue;
+            }
             let canonical_root = root.canonicalize()?;
             let canonical_state = self.core.trees.state.canonicalize()?;
-            if !canonical_root.starts_with(&canonical_state) {
+            if kind != "boat-workspace-trash" && !canonical_root.starts_with(&canonical_state) {
                 continue;
             }
             for entry in entries {
@@ -495,6 +524,8 @@ impl Runner {
                     javascript_entry_lock(&self.core.trees.state, &path)?.is_none()
                 } else if kind == "git-deps" {
                     dependency_roots.contains(&path) || inner.evicting_dependencies.contains(&path)
+                } else if kind == "boat-workspace-trash" {
+                    active_protected.iter().any(|owned| overlaps(&path, owned))
                 } else if matches!(kind, "trash" | "boat-quarantine") {
                     false
                 } else {
@@ -850,8 +881,49 @@ impl Runner {
         self.core.config.boat_profile
             && (candidate.workspace.is_some()
                 || candidate.path.parent() == Some(self.trash().as_path())
+                || self.boat_workspace_garbage(&candidate.path)
                 || candidate.path.parent()
                     == Some(self.core.trees.state.join("boat-quarantine").as_path()))
+    }
+
+    fn boat_workspace_garbage(&self, path: &Path) -> bool {
+        self.core
+            .config
+            .boat_workspace_trash_roots()
+            .iter()
+            .any(|root| path.parent() == Some(root.as_path()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn boat_workspace_trash(&self, path: &Path) -> io::Result<PathBuf> {
+        // /Users is a bind mount. Even on the same XFS device, renaming from
+        // that mount into runner-state trash fails with EXDEV. Retire under
+        // the workspace root instead, keeping atomic detachment before the
+        // bounded, no-follow deletion (and retry inventory) runs.
+        self.core
+            .config
+            .owned_workspace_roots
+            .iter()
+            .zip(self.core.config.boat_workspace_trash_roots())
+            .filter(|(root, _)| path != *root && path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, trash)| trash)
+            .ok_or_else(|| io::Error::other("Boat workspace has no eviction root"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_boat_workspace_trash(trash: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(trash)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other(
+                "Boat workspace trash must be runner-private",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -864,9 +936,17 @@ impl Runner {
             0
         });
         let retired = if candidate.workspace.is_some() {
-            fs::create_dir_all(self.trash())?;
-            let retired = self.trash().join(format!("boat-cache-{}", Uuid::now_v7()));
+            use std::os::unix::fs::DirBuilderExt;
+            let trash = self.boat_workspace_trash(&candidate.path)?;
+            match fs::DirBuilder::new().mode(0o700).create(&trash) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                result => result?,
+            }
+            Self::validate_boat_workspace_trash(&trash)?;
+            let retired = trash.join(format!("boat-cache-{}", Uuid::now_v7()));
             fs::rename(&candidate.path, &retired)?;
+            File::open(&trash)?.sync_all()?;
+            File::open(candidate.path.parent().unwrap())?.sync_all()?;
             retired
         } else {
             candidate.path.clone()
@@ -1027,7 +1107,7 @@ impl Runner {
                             || (self.core.config.boat_profile
                                 && parent == self.core.trees.state.join("boat-quarantine"))
                             || staging.as_deref() == Some(parent)
-                    });
+                    }) || self.boat_workspace_garbage(&c.path);
                     if (c.cache_disk
                         && now.saturating_sub(c.last_used_ms) <= SOFT_PRESSURE_MIN_AGE_MS)
                         || (!garbage
