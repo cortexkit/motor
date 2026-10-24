@@ -791,6 +791,9 @@ struct Inner {
     /// publication is decided.
     fill_ledgers: BTreeMap<Uuid, Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>>,
     base_finishes: BTreeMap<Uuid, BaseFinish>,
+    /// Settlement workers cannot share execution's `finalizing` claim: an
+    /// exiting launch/monitor may clear that claim while cleanup still runs.
+    base_settling: BTreeSet<Uuid>,
     drain_deadline: Option<std::time::Instant>,
     jobs: BTreeMap<Uuid, Job>,
     pending_replays: BTreeSet<Uuid>,
@@ -986,15 +989,18 @@ struct BaseCleanup {
     publication: Option<(StoreIdentity, publication::Outcome)>,
 }
 
-/// Retained until an already-terminal fill's settlement is durably saved.
+/// Retained until a fill's terminal and catalog result are durably saved.
 /// A failed thread spawn or a worker unwind leaves it available to the timer.
-#[derive(Clone)]
 struct BaseFinish {
     request: Run,
     success: bool,
     failure: Option<String>,
     recorded: bool,
+    cleanup: Option<BaseCleanup>,
+    terminal: Option<Job>,
 }
+
+const BASE_SCRATCH_CLEANUP_ATTEMPTS: usize = 3;
 
 /// Clears an in-memory marker that was set under the state lock. Its owner
 /// normally clears it with `clear`, under a state lock it already holds; if
@@ -2172,6 +2178,7 @@ impl Runner {
                     cache_fills: BTreeMap::new(),
                     fill_ledgers: BTreeMap::new(),
                     base_finishes: BTreeMap::new(),
+                    base_settling: BTreeSet::new(),
                     drain_deadline: None,
                     jobs,
                     pending_replays: BTreeSet::new(),
@@ -2542,6 +2549,10 @@ impl Runner {
             && inner.reserved.is_empty()
             && inner.preparing.is_empty()
             && inner.admitting.is_empty()
+            && inner.base_finishes.is_empty()
+            && inner.base_settling.is_empty()
+            && inner.finalizing.is_empty()
+            && inner.writer.is_none()
         {
             let jobs = inner.jobs.values().filter(|j| j.terminal.is_none()).count() as u64;
             state.result = Some(DrainResult::Recoverable { jobs });
@@ -3958,6 +3969,7 @@ impl Runner {
         if inner.drain_deadline.is_some() {
             return Ok(false);
         }
+        let settling = Self::base_settlement_pending(inner, root);
         let BasePlan {
             tip,
             command,
@@ -3990,6 +4002,11 @@ impl Runner {
             }
         };
         repository.requested_descriptor = Some(descriptor.clone());
+        if settling {
+            // Keep the latest desired tip, but do not queue a successor until
+            // the previous attempt's result and cleanup have been settled.
+            return Ok(true);
+        }
         if !explicit_command && dependency_free {
             // With no dependency units to cache, recording success is the fill.
             // Remember no-op records so a later explicit command with identical
@@ -4503,7 +4520,7 @@ impl Runner {
                 .backend
                 .cancel(&self.core.config, &inner.jobs[&id], true)?;
         }
-        if inner.finalizing.contains(&id) {
+        if inner.finalizing.contains(&id) || inner.base_finishes.contains_key(&id) {
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
             return Ok(());
         }
@@ -4525,7 +4542,7 @@ impl Runner {
                 let signalling = log.lock_signalling();
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
-                if inner.finalizing.contains(&id) {
+                if inner.finalizing.contains(&id) || inner.base_finishes.contains_key(&id) {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
                     return Ok(());
                 }
@@ -5789,7 +5806,7 @@ impl Runner {
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
             }
-            if inner.finalizing.contains(&id) {
+            if inner.finalizing.contains(&id) || inner.base_finishes.contains_key(&id) {
                 continue;
             }
             let job = inner.jobs[&id].clone();
@@ -6011,18 +6028,20 @@ impl Runner {
             .repositories
             .iter()
             .filter(|(root, repository)| {
-                !inner.jobs.values().any(|j| {
-                    j.base
-                        && j.terminal.is_none()
-                        && j.request
-                            .as_ref()
-                            .is_some_and(|r| r.repository_root == **root)
-                }) && repository
-                    .filled_descriptor
-                    .as_deref()
-                    .is_some_and(|descriptor| {
-                        publication::expired(policy, repository, descriptor, now)
+                !Self::base_settlement_pending(inner, root)
+                    && !inner.jobs.values().any(|j| {
+                        j.base
+                            && j.terminal.is_none()
+                            && j.request
+                                .as_ref()
+                                .is_some_and(|r| r.repository_root == **root)
                     })
+                    && repository
+                        .filled_descriptor
+                        .as_deref()
+                        .is_some_and(|descriptor| {
+                            publication::expired(policy, repository, descriptor, now)
+                        })
             })
             .filter_map(|(root, repository)| {
                 repository
@@ -6043,6 +6062,7 @@ impl Runner {
             .filter_map(|(root, g)| {
                 let desired = g.desired.as_ref()?;
                 (g.requested_descriptor != g.filled_descriptor
+                    && !Self::base_settlement_pending(inner, root)
                     && (g.failed_descriptor.is_none()
                         || g.failed_descriptor != g.requested_descriptor)
                     && !inner.jobs.values().any(|j| {
@@ -6055,6 +6075,13 @@ impl Runner {
                 .then(|| (root.clone(), desired.clone()))
             })
             .collect()
+    }
+
+    fn base_settlement_pending(inner: &Inner, root: &str) -> bool {
+        inner
+            .base_finishes
+            .values()
+            .any(|pending| pending.request.repository_root == root)
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
@@ -6091,6 +6118,7 @@ impl Runner {
                 // still waits for the foreground queue to empty.
                 if job.base
                     && (inner.writer.is_some()
+                        || !inner.base_finishes.is_empty()
                         || inner
                             .evicting_caches
                             .contains(&self.core.config.sccache_dir())
@@ -6836,9 +6864,20 @@ impl Runner {
             .terminal
             .take()
             .map(|t| t.with_refusal_detail(detail));
-        self.save(&failed)?;
-        inner.jobs.insert(job.id, failed);
-        self.finish_base(inner, job.request.as_ref().unwrap(), false, None)
+        // Preserve the intended terminal before any fallible disk work. The
+        // settlement worker saves it without holding the scheduler state lock.
+        inner
+            .base_finishes
+            .entry(job.id)
+            .or_insert_with(|| BaseFinish {
+                request: job.request.as_ref().unwrap().clone(),
+                success: false,
+                failure: Some(error.to_string()),
+                recorded: false,
+                cleanup: None,
+                terminal: Some(failed),
+            });
+        self.start_base_finish(inner, job.id)
     }
     fn failed_launch(
         &self,
@@ -7278,7 +7317,10 @@ impl Runner {
             let log = self.job_log(id);
             let _signalling = log.lock_signalling();
             let mut inner = self.core.inner.lock().unwrap();
-            if inner.jobs[&id].terminal.is_some() || !inner.finalizing.insert(id) {
+            if inner.jobs[&id].terminal.is_some()
+                || inner.base_finishes.contains_key(&id)
+                || !inner.finalizing.insert(id)
+            {
                 return Ok(());
             }
             inner.jobs[&id].clone()
@@ -7558,7 +7600,7 @@ impl Runner {
             if execution_ended || status.is_ok() {
                 inner.ended_executions.insert(id);
             }
-            if !inner.finalizing.insert(id) {
+            if inner.base_finishes.contains_key(&id) || !inner.finalizing.insert(id) {
                 return Ok(());
             }
             inner.jobs[&id].clone()
@@ -7964,6 +8006,20 @@ impl Runner {
             // under this lock hold; the catalog is saved, and the next warm
             // build is planned from the mirror, after it is released.
             let cleanup = base_cleanup.expect("a warm build is cleaned up before its terminal");
+            if cleanup.scratch.is_err() {
+                inner.base_finishes.entry(id).or_insert_with(|| BaseFinish {
+                    request,
+                    success,
+                    failure: (!fill_failure.is_empty()).then(|| fill_failure.join("; ")),
+                    recorded: false,
+                    cleanup: Some(cleanup),
+                    terminal: None,
+                });
+                let spawned = self.start_base_finish(&mut inner, id);
+                drop(inner);
+                spawned?;
+                return Ok(());
+            }
             self.record_base(
                 &mut inner,
                 &request,
@@ -8070,6 +8126,8 @@ impl Runner {
                 success,
                 failure,
                 recorded: false,
+                cleanup: None,
+                terminal: None,
             });
         self.start_base_finish(inner, r.job_id)
     }
@@ -8077,7 +8135,7 @@ impl Runner {
     /// Claim a pending settlement while holding state, then do its work on a
     /// separate thread. No cleanup resources move until that thread starts.
     fn start_base_finish(&self, inner: &mut Inner, id: Uuid) -> io::Result<()> {
-        if !inner.finalizing.insert(id) {
+        if !inner.base_settling.insert(id) {
             return Ok(());
         }
         let runner = self.clone();
@@ -8087,17 +8145,56 @@ impl Runner {
             }
         });
         if spawned.is_err() {
-            inner.finalizing.remove(&id);
+            inner.base_settling.remove(&id);
         }
         spawned
     }
 
     fn settle_base(&self, id: Uuid) -> io::Result<()> {
         let marker = Marker::new(self, move |inner| {
-            inner.finalizing.remove(&id);
+            if let Some(pending) = inner.base_finishes.get_mut(&id) {
+                if !pending.recorded {
+                    // An interrupted worker may have consumed its write ledger
+                    // or ACL result. Retrying must not turn missing evidence
+                    // into a successful publication.
+                    pending.success = false;
+                    pending.failure.get_or_insert_with(|| {
+                        "fill settlement was interrupted before recording its result".into()
+                    });
+                }
+            }
+            inner.base_settling.remove(&id);
         });
-        let pending = self.core.inner.lock().unwrap().base_finishes[&id].clone();
-        if !pending.recorded {
+        let (request, success, failure, recorded, prepared, terminal) = {
+            let mut inner = self.core.inner.lock().unwrap();
+            let pending = inner.base_finishes.get_mut(&id).unwrap();
+            (
+                pending.request.clone(),
+                pending.success,
+                pending.failure.clone(),
+                pending.recorded,
+                pending.cleanup.take(),
+                pending.terminal.clone(),
+            )
+        };
+        if let Some(terminal) = terminal {
+            let mut delay = Duration::from_millis(50);
+            loop {
+                self.long_work("base_terminal_save");
+                match self.save(&terminal) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(job_id = %id, %error, "fill setup terminal save will be retried");
+                        std::thread::park_timeout(delay);
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+            let mut inner = self.core.inner.lock().unwrap();
+            inner.jobs.insert(id, terminal);
+            inner.base_finishes.get_mut(&id).unwrap().terminal = None;
+        }
+        if !recorded {
             let (fill, ledgers, identity) = {
                 let mut inner = self.core.inner.lock().unwrap();
                 (
@@ -8107,26 +8204,26 @@ impl Runner {
                 )
             };
             self.long_work("base_cleanup");
-            let mut cleanup = self.clean_base(id, fill);
+            let mut cleanup = prepared.unwrap_or_else(|| self.clean_base(id, fill));
             let mut delay = Duration::from_millis(50);
-            while let Err(error) = &cleanup.scratch {
+            for _ in 1..BASE_SCRATCH_CLEANUP_ATTEMPTS {
+                let Err(error) = &cleanup.scratch else {
+                    break;
+                };
                 tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
                 std::thread::park_timeout(delay);
                 delay = (delay * 2).min(Duration::from_secs(5));
+                self.long_work("base_scratch_retry");
                 cleanup.scratch = self.clean_base(id, None).scratch;
             }
-            cleanup.publication = identity.map(|identity| {
-                let outcome = self.fill_publication(&identity, id, &ledgers);
-                (identity, outcome)
-            });
+            if cleanup.publication.is_none() {
+                cleanup.publication = identity.map(|identity| {
+                    let outcome = self.fill_publication(&identity, id, &ledgers);
+                    (identity, outcome)
+                });
+            }
             let mut inner = self.core.inner.lock().unwrap();
-            self.record_base(
-                &mut inner,
-                &pending.request,
-                pending.success,
-                pending.failure,
-                cleanup,
-            )?;
+            self.record_base(&mut inner, &request, success, failure, cleanup)?;
             // Re-running record_base would count the same failed build twice.
             inner.base_finishes.get_mut(&id).unwrap().recorded = true;
         }
@@ -8146,12 +8243,12 @@ impl Runner {
             let mut inner = self.core.inner.lock().unwrap();
             inner.base_finishes.remove(&id);
             marker.clear(&mut inner);
-            inner.catalog.repositories[&pending.request.repository_root]
+            inner.catalog.repositories[&request.repository_root]
                 .desired
                 .clone()
         };
         if let Some(next) = next {
-            self.queue_next_base(&pending.request.repository_root, &next)?;
+            self.queue_next_base(&request.repository_root, &next)?;
         }
         Ok(())
     }
@@ -8198,9 +8295,9 @@ impl Runner {
 
     /// Record a settled warm build in memory, from `clean_base`'s results:
     /// give back the writer slot and record the fill's result in the
-    /// catalog. The caller saves the catalog. If the scratch directory could
-    /// not be released, this returns that error before anything changes, and
-    /// the build keeps the writer slot.
+    /// catalog. The caller saves the catalog. After bounded cleanup retries,
+    /// a scratch error fails the attempt but releases the writer; the leftover
+    /// directory remains for startup garbage collection.
     fn record_base(
         &self,
         inner: &mut Inner,
@@ -8217,7 +8314,17 @@ impl Runner {
         } else {
             success
         };
-        cleanup.scratch?;
+        let success = if let Err(error) = cleanup.scratch {
+            let detail = format!("scratch cleanup deferred to garbage collection: {error}");
+            failure = Some(
+                failure
+                    .map(|previous| format!("{previous}; {detail}"))
+                    .unwrap_or(detail),
+            );
+            false
+        } else {
+            success
+        };
         if inner.writer == Some(r.job_id) {
             inner.writer = None;
         }

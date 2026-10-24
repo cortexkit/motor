@@ -9,6 +9,9 @@ use crate::remote_cache::publication as policy;
 use crate::remote_cache::publishing::State;
 use crate::storage::{PublicationRecord, PublishedKey, StoreIdentity};
 
+#[path = "publication_settlement.rs"]
+mod settlement;
+
 const HOUR: u64 = 60 * 60 * 1000;
 const DAY: u64 = 24 * HOUR;
 
