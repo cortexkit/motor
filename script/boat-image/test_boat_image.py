@@ -620,6 +620,27 @@ class RecipeTests(unittest.TestCase):
                 start.watch_storage()
             self.assertFalse(marker.exists())
 
+    def test_storage_watch_starts_before_endpoint_runtime_directory_exists(self):
+        with self.storage_watch_paths() as (_, old_marker, health):
+            marker = old_marker.parent / 'motor' / 'endpoint-ready'
+            self.assertFalse(marker.parent.exists())
+            notifications = []
+            def notify(message):
+                notifications.append(message)
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                self.assertFalse(marker.exists())
+                raise InterruptedError('first healthy poll completed')
+            with patch.object(start, 'ENDPOINT_READY', marker), self.assertRaisesRegex(InterruptedError, 'first healthy poll'):
+                start.watch_storage(pause=pause, notify=notify)
+            self.assertEqual(notifications, ['READY=1'])
+            self.assertEqual(marker.parent.stat().st_mode & 0o777, 0o755)
+            withdrawal = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())
+            self.assertEqual(withdrawal['rule'], 'storage_watch_failed: first healthy poll completed')
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
     def test_storage_watch_withdraws_before_logging_even_when_logging_fails(self):
         with self.storage_watch_paths() as (_, marker, health):
             def pause(_):

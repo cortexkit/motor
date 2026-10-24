@@ -21,7 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any
+from typing import Any, Optional
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
@@ -65,9 +65,10 @@ def command(argv):
         return {'argv':argv, 'exit_code':result.returncode, 'stdout':result.stdout, 'stderr':result.stderr}
     except (OSError, subprocess.TimeoutExpired) as error:
         return {'argv':argv, 'error':str(error)}
-for unit in ('motor-boat-restored.service','motor-boat-storage.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
+for unit in ('motor-boat-restored.service','motor-boat-storage.service','motor-boat-storage-watch.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'):
     out[unit] = {'status':command(['/usr/bin/systemctl','status','--no-pager','-l',unit]),
                  'journal':command(['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])}
+out['list_jobs'] = command(['/usr/bin/systemctl','list-jobs','--no-pager'])
 print(json.dumps(out))
 '''
 
@@ -209,24 +210,48 @@ data['pid_namespace']['inherited_fds'] = exec_inherited_fds
 data['process_visibility']['runner_signal_probe'] = next(row for row in data['pid_namespace']['signals'] if row['pid'] == RUNNER_PID)
 print(json.dumps(data))
 '''
-HOST = SOURCE + r'''
+SERVICE_STATE = r'''
+import pathlib, subprocess
+
+def service_state(unit):
+    state = dict(line.split('=', 1) for line in subprocess.check_output(
+        ['systemctl','show',unit,'--property=ControlGroup','--property=MainPID',
+         '--property=ActiveState','--property=SubState'], text=True).splitlines() if '=' in line)
+    group, pid = state.get('ControlGroup', ''), int(state.get('MainPID', '0'))
+    result = {'active_state':state.get('ActiveState'), 'sub_state':state.get('SubState'),
+              'cgroup':group, 'main_pid':pid, 'memory.current':None,
+              'provider_environment_names':[], 'argv':[]}
+    if group:
+        try:
+            path = pathlib.Path('/sys/fs/cgroup') / group.lstrip('/')
+            result['memory.current'] = (path/'memory.current').read_text().strip()
+        except OSError as error:
+            result['memory_error'] = str(error)
+    else:
+        result['memory_error'] = 'unit has no cgroup: ' + str(result['active_state']) + '/' + str(result['sub_state'])
+    if pid > 0:
+        try:
+            names = {v.split(b'=',1)[0].decode() for v in pathlib.Path('/proc/'+str(pid)+'/environ').read_bytes().split(b'\0') if b'=' in v}
+            result['provider_environment_names'] = sorted(k for k in names if k == 'ASCII_TOKEN' or k.startswith('BOAT_'))
+        except OSError as error:
+            result['environment_error'] = str(error)
+        try:
+            result['argv'] = [part.decode() for part in pathlib.Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0') if part]
+        except OSError as error:
+            result['cmdline_error'] = str(error)
+    return result
+'''
+
+HOST = SOURCE + SERVICE_STATE + r'''
 import json, os, pathlib, socket, stat, struct, subprocess
 pathlib.Path('/dev/shm/boat-host-canary').write_text('not for jobs')
 def capture(argv):
     p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     return {'exit_code': p.returncode, 'stdout': p.stdout, 'stderr': p.stderr}
 configs = {str(p): p.read_text() for p in pathlib.Path('/etc/ssh/sshd_config.d').glob('*.conf')}
-pid = subprocess.check_output(['systemctl','show','motor-boat','--property=MainPID','--value'], text=True).strip()
-names = {v.split(b'=',1)[0].decode() for v in pathlib.Path('/proc/'+pid+'/environ').read_bytes().split(b'\0') if b'=' in v}
-idle = {}
-for unit in ('motor-boat', 'motor-boat-bridge', 'motor-boat-host'):
-    group = subprocess.check_output(['systemctl','show',unit,'--property=ControlGroup','--value'], text=True).strip()
-    path = pathlib.Path('/sys/fs/cgroup') / group.lstrip('/')
-    idle[unit] = {'cgroup': group, 'memory.current': (path/'memory.current').read_text().strip()}
-    main_pid = subprocess.check_output(['systemctl','show',unit,'--property=MainPID','--value'], text=True).strip()
-    idle[unit]['main_pid'] = int(main_pid)
-    unit_names = {v.split(b'=',1)[0].decode() for v in pathlib.Path('/proc/'+main_pid+'/environ').read_bytes().split(b'\0') if b'=' in v}
-    idle[unit]['provider_environment_names'] = sorted(k for k in unit_names if k == 'ASCII_TOKEN' or k.startswith('BOAT_'))
+idle = {unit:service_state(unit) for unit in ('motor-boat', 'motor-boat-bridge', 'motor-boat-host')}
+pid = idle['motor-boat']['main_pid']
+names = idle['motor-boat']['provider_environment_names']
 sshd_pids = []
 for path in pathlib.Path('/proc').iterdir():
     if path.name.isdecimal():
@@ -262,7 +287,7 @@ for path in [pathlib.Path('/run/motor-tenant'), *[pathlib.Path('/run/motor-tenan
 def endpoint_config():
     # The configuration the running endpoint was started with (its --sandbox argument).
     try:
-        argv = [part.decode() for part in pathlib.Path('/proc/'+str(idle['motor-boat-host']['main_pid'])+'/cmdline').read_bytes().split(b'\0') if part]
+        argv = idle['motor-boat-host']['argv']
         path = argv[argv.index('--sandbox') + 1]
         return path, json.loads(pathlib.Path(path).read_text())
     except (OSError, ValueError, IndexError) as error:
@@ -277,7 +302,7 @@ def state_disk():
 endpoint_path, endpoint = endpoint_config()
 sizing = {'nproc': int(subprocess.check_output(['nproc'], text=True).strip()),
           'affinity_cpus': len(os.sched_getaffinity(0)),
-          'runner_argv': [part.decode() for part in pathlib.Path('/proc/'+pid+'/cmdline').read_bytes().split(b'\0') if part],
+          'runner_argv': idle['motor-boat']['argv'],
           'endpoint_config_path': endpoint_path, 'endpoint_config': endpoint, 'state_disk': state_disk()}
 print(json.dumps({'namespaces': {n: os.readlink('/proc/self/ns/'+n) for n in ('net','pid','mnt')},
     'systemd_version':int(subprocess.check_output(['systemctl', '--version'], text=True).split()[1]),
@@ -1059,6 +1084,7 @@ class RunnerHost:
     def __init__(self, probe):
         self.probe = probe
         self.data = {"checks": [], "phases": [], "all_passed": False}
+        self._phase_context: Optional[tuple[str, dict[str, Any]]] = None
         probe.data["runner_host"] = self.data
 
     def check(self, name, passed, evidence, status=None, reason=None):
@@ -1066,25 +1092,51 @@ class RunnerHost:
         if row['status'] == 'FAIL':
             row['reason'] = reason or f"required check {name} did not meet its acceptance criteria; observed values are attached as evidence"
         self.data["checks"].append(row)
+        phase = self._phase_context
+        if row['status'] == 'FAIL' and phase is not None:
+            sid, record = phase
+            self.unit_diagnostics(sid, record)
         self.probe.checkpoint()
 
     def check_job(self, name, result, expected, *, signal=None, marker=None, exact_stdout=None):
         failure = lifecycle_failure(result, expected, signal=signal, marker=marker, exact_stdout=exact_stdout)
         self.check(name, failure is None, result, reason=failure)
 
+    def unit_diagnostics(self, sid, failure):
+        """Keep the first failure's unit state before later work or cleanup changes it."""
+        if 'diagnostic_command' in failure or 'diagnostics_error' in failure:
+            return
+        try:
+            diagnostics = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DIAGNOSTICS), poll_seconds=220)
+            failure['diagnostic_command'] = diagnostics
+            if diagnostics.get('exitCode') == 0 and not diagnostics.get('stdoutTruncated'):
+                failure['unit_diagnostics'] = json.loads(diagnostics['stdout'])
+        except Exception as error:
+            failure['diagnostics_error'] = str(error)
+        try:
+            self.probe.checkpoint()
+        except Exception as error:
+            failure['diagnostics_checkpoint_error'] = str(error)
+
+    @contextlib.contextmanager
+    def phase_evidence(self, sid, record):
+        previous = self._phase_context
+        self._phase_context = (sid, record)
+        try:
+            yield
+        except Exception as error:
+            record['error'] = str(error)
+            self.unit_diagnostics(sid, record)
+            raise
+        finally:
+            self._phase_context = previous
+
     def execute(self, sid, command, timeout=120):
         result = self.probe.execute(sid, command, poll_seconds=timeout)
         if result.get("exitCode") != 0 or result.get("stdoutTruncated") or result.get("stderrTruncated"):
             failure = {'command': command, 'result': result}
             self.data.setdefault('guest_failures', []).append(failure)
-            try:
-                diagnostics = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DIAGNOSTICS), poll_seconds=100)
-                failure['diagnostic_command'] = diagnostics
-                if diagnostics.get('exitCode') == 0 and not diagnostics.get('stdoutTruncated'):
-                    failure['unit_diagnostics'] = json.loads(diagnostics['stdout'])
-            except Exception as error:
-                failure['diagnostics_error'] = str(error)
-            self.probe.checkpoint()
+            self.unit_diagnostics(sid, failure)
             raise ValueError("guest command failed or truncated; see runner_host.guest_failures unit_diagnostics: " + json.dumps(result))
         return result
 
@@ -1256,6 +1308,12 @@ class RunnerHost:
               pre_swap_install=None, hydrated_at=None):
         record = {"name": label}
         self.data["phases"].append(record)
+        with self.phase_evidence(sid, record):
+            return self._phase(sid, label, directory, public, repository, client, record,
+                               first_started, pre_swap_install, hydrated_at)
+
+    def _phase(self, sid, label, directory, public, repository, client, record,
+               first_started=None, pre_swap_install=None, hydrated_at=None):
         argv = self.route(sid, directory, public)
         upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed-expected.json')
         if label == 'snapshot_clone':
@@ -1452,17 +1510,23 @@ class RunnerHost:
         self.probe.checkpoint()
 
     def replay_cleanup(self, sid):
-        result = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout'])
-        self.data['deferred_cleanup_replay'] = result
-        self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(result), result)
+        record = self.data['deferred_cleanup_replay'] = {}
+        with self.phase_evidence(sid, record):
+            record.update(json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout']))
+            self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(record), record)
 
     def disk_quota(self, sid, directory, public, repository, client):
         import disk_quota
-        import quota_adversarial
-        import uuid
         record: dict[str, Any] = {'reserve_assurance': {
             'floor_bytes': disk_quota.RESERVE_BYTES, 'scope': 'floor_enforcement_only', 'sufficiency_proven': False}}
         self.data['disk_quota'] = record
+        with self.phase_evidence(sid, record):
+            return self._disk_quota(sid, directory, public, repository, client, record)
+
+    def _disk_quota(self, sid, directory, public, repository, client, record):
+        import disk_quota
+        import quota_adversarial
+        import uuid
         control = record['setter_positive_control'] = json.loads(self.execute(
             sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
         self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)

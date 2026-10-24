@@ -87,7 +87,7 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.git_pushurl_check({'code': 0, 'stdout': json.dumps(dict(passing, passed=False))})[0])
         crashed = {'code': 1, 'stdout': ''}
         self.assertEqual((False, crashed), host.git_pushurl_check(crashed))
-        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
         self.assertIn("('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text()))", phase)
 
     def test_wasm_opt_job_requires_version_120_and_a_completed_round_trip(self):
@@ -99,7 +99,7 @@ class RunnerHostTests(unittest.TestCase):
         self.assertFalse(host.wasm_opt_check({'code': 0, 'stdout': json.dumps(dict(report, version='wasm-opt version 116'))})[0])
         invalid = dict(report, round_trip_sha256='not-a-digest')
         self.assertFalse(host.wasm_opt_check({'code': 0, 'stdout': json.dumps(invalid)})[0])
-        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
         self.assertIn("('wasm_opt_120_round_trip', 'python3 -c ' + shlex.quote(WASM_OPT_PROBE.read_text()))", phase)
         self.assertIn("label + '.' + name, *wasm_opt_check(parsed)", phase)
 
@@ -120,7 +120,7 @@ class RunnerHostTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 exec(source, {})
             self.assertFalse(json.loads(output.getvalue())['passed'])
-            phase = __import__('inspect').getsource(host.RunnerHost.phase)
+            phase = __import__('inspect').getsource(host.RunnerHost._phase)
             self.assertIn("label + '.toolchain_parity'", phase)
             self.assertIn('("job_toolchain_parity", "cargo --version', phase)
 
@@ -145,7 +145,7 @@ class RunnerHostTests(unittest.TestCase):
         for bad in (dict(report, offender_count=1, offenders=['/usr/local/bin: uid=1001 gid=1001']),
                     dict(report, entries=0), {}):
             self.assertFalse(host.root_paths_passed(bad))
-        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
         self.assertIn("label + '.root_owned_paths'", phase)
 
     def test_idle_reclaim_seeds_missing_state_via_service_and_observes_reclaim(self):
@@ -607,11 +607,89 @@ class RunnerHostTests(unittest.TestCase):
         with patch.object(host.subprocess, 'run', command), contextlib.redirect_stdout(output):
             exec(host.DIAGNOSTICS, {})
         data = json.loads(output.getvalue())
-        self.assertEqual(set(data), {'motor-boat-restored.service','motor-boat-storage.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'})
+        jobs = data.pop('list_jobs')
+        self.assertEqual(jobs['argv'], ['/usr/bin/systemctl', 'list-jobs', '--no-pager'])
+        self.assertEqual(jobs['exit_code'], 0)
+        self.assertEqual(set(data), {'motor-boat-restored.service','motor-boat-storage.service','motor-boat-storage-watch.service',r'var-lib-motor\x2dboat.mount','Users.mount','motor-boat.service','motor-boat-host.service','motor-boat-identity.service','motor-boat-bridge.service'})
         for unit, record in data.items():
             self.assertEqual(record['status']['exit_code'], 3)
             self.assertEqual(record['status']['argv'], ['/usr/bin/systemctl','status','--no-pager','-l',unit])
             self.assertEqual(record['journal']['argv'], ['/usr/bin/journalctl','-u',unit,'-b','--no-pager','-n','200'])
+
+    def test_phase_failed_check_captures_units_before_the_next_guest_action(self):
+        probe = Mock(data={})
+        diagnostics = {'motor-boat-host.service': {'status': 'inactive'}, 'list_jobs': {'stdout': 'no jobs'}}
+        probe.execute.return_value = {'exitCode': 0, 'stdout': json.dumps(diagnostics)}
+        lane = host.RunnerHost(probe)
+        def phase(*args):
+            lane.check('initial.armed.endpoint_ready_within_bound', False, {'ready': False})
+            self.assertEqual(lane.data['phases'][0]['unit_diagnostics'], diagnostics)
+            lane.check('initial.armed.ready_marker_is_exact_id', False, {})
+            raise ValueError('endpoint never started')
+        with patch.object(lane, '_phase', side_effect=phase), self.assertRaisesRegex(ValueError, 'endpoint never started'):
+            lane.phase('sandbox', 'initial', None, None, None, None)
+        probe.execute.assert_called_once_with('sandbox', 'sudo -n /usr/bin/python3 -c ' + shlex.quote(host.DIAGNOSTICS), poll_seconds=220)
+        self.assertEqual(lane.data['phases'][0]['error'], 'endpoint never started')
+        self.assertEqual([row['status'] for row in lane.data['checks']], ['FAIL', 'FAIL'])
+        self.assertIsNone(lane._phase_context)
+
+    def test_phase_exception_keeps_original_error_when_diagnostic_collection_fails(self):
+        for response in ('unreachable', 'truncated', 'malformed'):
+            with self.subTest(response=response):
+                probe = Mock(data={})
+                if response == 'unreachable':
+                    probe.execute.side_effect = RuntimeError('sandbox unreachable')
+                elif response == 'truncated':
+                    probe.execute.return_value = {'exitCode': 0, 'stdout': '{', 'stdoutTruncated': True}
+                else:
+                    probe.execute.return_value = {'exitCode': 0, 'stdout': '{'}
+                lane = host.RunnerHost(probe)
+                with patch.object(lane, '_phase', side_effect=ValueError('original phase error')), self.assertRaisesRegex(ValueError, 'original phase error'):
+                    lane.phase('sandbox', 'initial', None, None, None, None)
+                record = lane.data['phases'][0]
+                self.assertEqual(record['error'], 'original phase error')
+                self.assertNotIn('unit_diagnostics', record)
+                self.assertTrue('diagnostic_command' in record or 'diagnostics_error' in record)
+                probe.execute.assert_called_once()
+
+    def test_successful_phase_does_not_collect_failure_diagnostics(self):
+        probe = Mock(data={})
+        lane = host.RunnerHost(probe)
+        with patch.object(lane, '_phase', return_value={'name': 'initial'}):
+            self.assertEqual(lane.phase('sandbox', 'initial', None, None, None, None), {'name': 'initial'})
+        probe.execute.assert_not_called()
+
+    def test_inactive_service_reports_state_without_reading_root_cgroup_or_proc_zero(self):
+        scope = {}
+        exec(host.SERVICE_STATE, scope)
+        with patch.object(host.subprocess, 'check_output', return_value='ActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\n'), \
+             patch.object(Path, 'read_text', side_effect=AssertionError('inactive unit has no memory cgroup')), \
+             patch.object(Path, 'read_bytes', side_effect=AssertionError('PID zero has no process files')):
+            state = scope['service_state']('motor-boat-host')
+        self.assertEqual(state, {'active_state': 'inactive', 'sub_state': 'dead', 'main_pid': 0, 'cgroup': '',
+                                 'memory.current': None, 'memory_error': 'unit has no cgroup: inactive/dead',
+                                 'provider_environment_names': [], 'argv': []})
+
+    def test_service_state_samples_running_unit_and_reports_disappearing_processes(self):
+        scope = {}
+        exec(host.SERVICE_STATE, scope)
+        with patch.object(host.subprocess, 'check_output', return_value='ActiveState=active\nSubState=running\nMainPID=123\nControlGroup=/system.slice/motor-boat-host.service\n'), \
+             patch.object(Path, 'read_text', return_value='12345\n') as read, \
+             patch.object(Path, 'read_bytes', side_effect=[b'HOME=/root\0BOAT_ID=secret\0', b'motor-host\0--sandbox\0/etc/motor/sandbox.json\0']):
+            state = scope['service_state']('motor-boat-host')
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(state['memory.current'], '12345')
+        self.assertEqual(state['main_pid'], 123)
+        self.assertEqual(state['provider_environment_names'], ['BOAT_ID'])
+        self.assertEqual(state['argv'], ['motor-host', '--sandbox', '/etc/motor/sandbox.json'])
+        with patch.object(host.subprocess, 'check_output', return_value='ActiveState=inactive\nSubState=dead\nMainPID=123\nControlGroup=/system.slice/motor-boat-host.service\n'), \
+             patch.object(Path, 'read_text', side_effect=FileNotFoundError('cgroup removed')), \
+             patch.object(Path, 'read_bytes', side_effect=FileNotFoundError('process exited')):
+            state = scope['service_state']('motor-boat-host')
+        self.assertIsNone(state['memory.current'])
+        self.assertEqual(state['memory_error'], 'cgroup removed')
+        self.assertEqual(state['environment_error'], 'process exited')
+        self.assertEqual(state['cmdline_error'], 'process exited')
 
     def hang_fixture(self, tmp):
         """A /proc, cgroup and runner state tree: runner 100 with two threads,
@@ -726,7 +804,7 @@ class RunnerHostTests(unittest.TestCase):
         failed = {'argv': ['client']}
         lane.client_failure_diagnostics('bx_1', failed)
         self.assertEqual(failed['sandbox_diagnostics_error'], 'timed out polling command 7')
-        phase = __import__('inspect').getsource(host.RunnerHost.phase)
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
         failure = phase.index('failure = "motor client failed: " + json.dumps(result)')
         collect = phase.index('self.client_failure_diagnostics(sid, record[name])')
         self.assertLess(failure, collect)
