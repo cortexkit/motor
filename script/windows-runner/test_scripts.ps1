@@ -82,6 +82,17 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS native-command-exit-code-ignores-stderr-and-logs-it'
         $count++
 
+        # A directory an elevated administrator creates on a client edition of
+        # Windows is owned by that user; Protect-RunnerPath must leave it owned
+        # by Administrators, or the runner and uninstaller refuse it.
+        $ownedRoot = Join-Path $nativeFixtureRoot 'protected-owner'
+        New-Item -ItemType Directory -Path $ownedRoot | Out-Null
+        Protect-RunnerPath $ownedRoot $nativeLog
+        $owner = (Get-Acl -LiteralPath $ownedRoot).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne 'S-1-5-32-544') { throw "FAIL protect-runner-path-sets-administrators-owner (owner $owner)" }
+        Write-Host 'PASS protect-runner-path-sets-administrators-owner'
+        $count++
+
         $partialRoot = Join-Path $nativeFixtureRoot 'partial-install'
         New-Item -ItemType Directory -Path $partialRoot | Out-Null
         $partialSid = 'S-1-5-21-111-222-333-1001'

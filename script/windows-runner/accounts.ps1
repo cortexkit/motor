@@ -73,6 +73,13 @@ function Protect-RunnerPath {
     $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @(
         $Path, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '/Q'
     ) -Operation "protect runner path $Path" -LogPath $LogPath
+    # On Windows client editions a directory an elevated administrator creates
+    # is owned by that user, not by Administrators, and the runner refuses a
+    # private directory with any other owner. icacls can't set the owner in the
+    # same call as the grants.
+    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @(
+        $Path, '/setowner', '*S-1-5-32-544', '/Q'
+    ) -Operation "set runner path owner $Path" -LogPath $LogPath
 }
 
 function ConvertTo-RunnerNativeArgument {
