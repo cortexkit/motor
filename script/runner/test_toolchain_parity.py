@@ -171,6 +171,40 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual({'version': None, 'exit_code': 1},
                          parity.tool_version('/usr/local/bin/pnpx', {}, {}, 'pnpm'))
 
+    def test_package_alias_sorting_before_its_package_still_takes_its_version(self):
+        # pn sorts before pnpm, so capture must measure pnpm first.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'bin').mkdir()
+            (root / 'bin/rustup').write_text('proxy fixture')
+            manifest = {'cargo_home': str(root), 'rustup_home': str(root), 'tools': {
+                'pn': {'path': '/usr/local/bin/pn', 'version_from': 'pnpm'},
+                'pnpm': {'path': '/usr/local/bin/pnpm'}}}
+            def output(*args, **kwargs):
+                if args[0] == 'dpkg-query' or args[1:] == ('toolchain', 'list'):
+                    return ''
+                if args[1:] == ('default',):
+                    return 'stable (default)'
+                return 'rustup 1.29.1'
+            def version(path, env):
+                if Path(path).name != 'pnpm':
+                    raise AssertionError('only pnpm itself is executed: ' + str(path))
+                return {'version': '11.1.2', 'exit_code': 0}
+            original_read = Path.read_text
+            def read(path, *args, **kwargs):
+                return 'ID=ubuntu\n' if str(path) == '/etc/os-release' else original_read(path, *args, **kwargs)
+            which = {name: '/usr/local/bin/' + name for name in ('pn', 'pnpm')}
+            with patch.object(parity, 'output', side_effect=output), \
+                 patch.object(parity.shutil, 'which', side_effect=lambda name, path=None: which.get(name)), \
+                 patch.object(parity, 'binary_version', side_effect=version), \
+                 patch.object(parity.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                 patch.object(parity.syscall_surface, 'capture', return_value={}), \
+                 patch.object(parity.seed, 'capture', return_value={}), \
+                 patch.object(Path, 'read_text', read):
+                tools = parity.capture(manifest)['tools']
+        self.assertEqual(('11.1.2', 0), (tools['pn']['version'], tools['pn']['exit_code']))
+        self.assertEqual(('11.1.2', 0), (tools['pnpm']['version'], tools['pnpm']['exit_code']))
+
     def test_sccache_inventory_never_runs_a_cache_process(self):
         with patch.object(parity.subprocess, "run") as run:
             for name in ("sccache", "sccache-0.18.0-stock"):
@@ -586,7 +620,7 @@ class ParityTests(unittest.TestCase):
     def test_build_server_job_visible_tools_are_in_the_catalogue(self):
         actual = self.observed()
         actual['local_bin_entries'].extend(
-            ('bun-1.3.14', 'node22', 'corepack', 'npx', 'pnpx', 'pnx'))
+            ('bun-1.3.14', 'node22', 'corepack', 'npx', 'pn', 'pnpx', 'pnx'))
         errors = self.report(actual)['errors']
         self.assertFalse(errors, errors)
 
