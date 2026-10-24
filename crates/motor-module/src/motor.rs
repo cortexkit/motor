@@ -310,10 +310,12 @@ impl Motor {
                 "routed to hosted (hosted_repositories)");
         } else if self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
-            && (!self.config.hosted_fleet_routing || crate::hosted::validate(&request).is_ok())
+            && (!self.config.hosted_fleet_routing
+                || (!gate_job && crate::hosted::validate(&request).is_ok()))
         {
             let mut route = crate::HostedJobState::new(&self.config);
             route.fleet_routed = self.config.hosted_fleet_routing;
+            route.fleet_no_spill = route.fleet_routed && request.network.is_some();
             route.hosted_no_fallback = route.fleet_routed;
             self.storage.hosted_route(id, route)?;
         }

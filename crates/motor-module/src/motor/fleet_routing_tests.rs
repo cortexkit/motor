@@ -33,17 +33,26 @@ fn fleet_config_defaults_off_and_roundtrips() {
         .unwrap()
         .remove("fleet_routed")
         .is_none());
+    assert!(old_wire
+        .as_object_mut()
+        .unwrap()
+        .remove("fleet_no_spill")
+        .is_none());
     let old_route: crate::HostedJobState = serde_json::from_value(old_wire).unwrap();
     assert!(!old_route.fleet_routed);
+    assert!(!old_route.fleet_no_spill);
     assert!(serde_json::from_str::<Config>(r#"{"shadow_to_hosted":true}"#).is_err());
 }
 
 #[tokio::test]
-async fn fleet_linux_default_platform_and_gate_jobs_allow_hosted_spill() {
+async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_direct() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
-    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let mut config = config(&h);
+    config.spill_to_hosted = true;
+    config.spill_after_s = 0;
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (platform, timeout, gate) in [
         (None, 10, false),
         (Some(Platform::Linux), 7200, false),
@@ -64,30 +73,39 @@ async fn fleet_linux_default_platform_and_gate_jobs_allow_hosted_spill() {
             .unwrap();
         let id = stream.job_id;
         let (_, terminal) = records(stream).await;
-        assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-        let state = motor.hosted_state(id).unwrap();
-        assert!(state.fleet_routed && state.run_sent && state.hosted_no_fallback);
-        assert!(!state.repository_routed);
-        let restored: crate::HostedJobState =
-            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-        assert!(restored.fleet_routed && restored.capacity_routed());
+        if gate {
+            assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
+            assert!(motor.hosted_state(id).is_none());
+            assert!(motor.storage.job(id).unwrap().gate_job);
+            assert!(!lease_bodies(&h)
+                .iter()
+                .any(|body| body["job_id"] == id.to_string()));
+        } else {
+            assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+            let state = motor.hosted_state(id).unwrap();
+            assert!(state.fleet_routed && state.run_sent && state.hosted_no_fallback);
+            assert!(!state.repository_routed && !state.fleet_no_spill);
+            let restored: crate::HostedJobState =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            assert!(restored.fleet_routed && restored.capacity_routed());
+        }
     }
     let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies.len(), 2);
     assert_eq!(
         bodies
             .iter()
             .map(|b| b["timeout_s"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        [10, 7200, 600]
+        [10, 7200]
     );
     for body in bodies {
         assert_eq!(body["platform"], "linux-x64");
         assert_eq!(body["allow_spill"], true);
         assert_eq!(body["avoid_host"], serde_json::Value::Null);
     }
-    assert_eq!(h.runs.load(Ordering::SeqCst), 3);
-    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 2);
+    assert_eq!(peer.0.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -203,23 +221,58 @@ async fn fleet_network_keeps_the_opt_in_before_capture_or_contact() {
     for enabled in [false, true] {
         let h = Harness::new(Behavior::CompleteRun).await;
         let (scratch, repo) = committed_repo();
+        if enabled {
+            h.lease_replies.lock().unwrap().extend([
+                (503, serde_json::json!({"error":"no_capacity"}), "0"),
+                (503, serde_json::json!({"error":"no_capacity"}), "1"),
+            ]);
+        }
         let mut config = config(&h);
         config.network_routing = enabled;
         // Capture would fail if the disabled network path reached snapshotting.
         config.inject_snapshot_failure = !enabled;
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-        let mut request = request(&repo);
-        request.network = Some(Network::Outbound);
-        let stream = motor.run(request).unwrap();
+        let mut net_request = request(&repo);
+        net_request.network = Some(Network::Outbound);
+        let stream = motor.run(net_request).unwrap();
+        let id = stream.job_id;
+        let route = motor.hosted_state(id).unwrap();
+        assert!(route.fleet_no_spill);
+        assert!(route.lease_request.is_none());
+        let restored: crate::HostedJobState =
+            serde_json::from_value(serde_json::to_value(&route).unwrap()).unwrap();
+        assert!(restored.fleet_no_spill);
         let (_, terminal) = records(stream).await;
         if enabled {
             assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+            {
+                let bodies = h.lease_bodies.lock().unwrap();
+                assert_eq!(bodies.len(), 3);
+                assert!(bodies.iter().all(|body| body == &bodies[0]));
+                let hashes: Vec<_> = bodies
+                    .iter()
+                    .map(|body| motor_lease::sha256_hex(body))
+                    .collect();
+                assert!(hashes.iter().all(|hash| hash == &hashes[0]));
+                let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+                assert_eq!(body["job_id"], id.to_string());
+                assert_eq!(body["net"], true);
+                assert_eq!(body["allow_spill"], false);
+            }
+            let route = motor.hosted_state(id).unwrap();
+            assert_eq!(route.placement_attempts, 1);
+            assert_eq!(route.lease_request.unwrap().allow_spill, Some(false));
+            let non_net = motor.run(request(&repo)).unwrap();
+            let non_net_id = non_net.job_id;
+            let (_, terminal) = records(non_net).await;
+            assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+            assert!(!motor.hosted_state(non_net_id).unwrap().fleet_no_spill);
             let bodies = lease_bodies(&h);
-            assert_eq!(bodies.len(), 1);
-            assert_eq!(bodies[0]["net"], true);
-            assert_eq!(bodies[0]["allow_spill"], true);
-            assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+            assert_eq!(bodies.len(), 4);
+            assert_eq!(bodies[3]["net"], false);
+            assert_eq!(bodies[3]["allow_spill"], true);
+            assert_eq!(h.runs.load(Ordering::SeqCst), 2);
         } else {
             assert_eq!(
                 terminal.outcome,

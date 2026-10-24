@@ -78,6 +78,10 @@ pub struct HostedJobState {
     /// so capacity waits and pre-Run correction survive configuration changes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_routed: bool,
+    /// Outbound-network fleet jobs cannot run on Boat. Store the restriction
+    /// before requesting a lease so retries and restarts keep the same policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) fleet_no_spill: bool,
     /// Set durably just before ck-motor sends the Run frame to a hosted
     /// runner. Until then no runner holds the command, so whatever happened to
     /// the lease, the job provably never ran; afterwards it may have.
@@ -904,7 +908,7 @@ impl Client {
         let allow_spill = !job
             .hosted
             .as_ref()
-            .is_some_and(|state| state.repository_routed);
+            .is_some_and(|state| state.repository_routed || state.fleet_no_spill);
         let route = job.hosted.as_ref().map_or("hosted", |state| {
             if state.spill_wait_ms.is_some() {
                 "spill"
