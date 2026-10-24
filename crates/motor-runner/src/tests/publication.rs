@@ -1160,12 +1160,11 @@ async fn the_refresh_timer_skips_a_shortcut_record() {
         .catalog
         .repositories
         .insert(f.root.clone(), record);
-    {
+    let candidates = {
         let inner = runner.core.inner.lock().unwrap();
-        assert!(runner
-            .refresh_bases(&inner, &runner.publishing_policy(), runner.now())
-            .is_empty());
-    }
+        runner.refresh_bases(&inner, &runner.publishing_policy(), runner.now())
+    };
+    assert!(candidates.is_empty());
     runner.tick().unwrap();
     runner.tick().unwrap();
     assert_eq!(count_fills(&runner), 0);
