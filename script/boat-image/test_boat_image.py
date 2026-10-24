@@ -1011,6 +1011,110 @@ class RecipeTests(unittest.TestCase):
                 install.release_manifest(root)
 
 
+class AptInstallTests(unittest.TestCase):
+    def test_held_installed_packages_are_skipped_and_recorded(self):
+        def execute(*args, **kwargs):
+            if args == ('apt-mark', 'showhold'):
+                self.assertTrue(kwargs['capture'])
+                return 'openssh-server\nsystemd'
+            if args == ('dpkg-query', '-W', '-f=${db:Status-Status}\t${Version}', 'openssh-server'):
+                self.assertTrue(kwargs['capture'])
+                return 'installed\t1:9.6p1-3ubuntu13.8'
+            if args[:2] == ('apt-get', 'install'):
+                return ''
+            self.fail(f'unexpected command: {args}')
+        with patch.object(install, 'run', side_effect=execute) as run:
+            record = install.apt_install(['python3', 'openssh-server', 'git'])
+        self.assertEqual(record, {'openssh-server': '1:9.6p1-3ubuntu13.8'})
+        self.assertEqual(run.call_args.args[-2:], ('python3', 'git'))
+        self.assertNotIn('openssh-server', run.call_args.args)
+        self.assertEqual(run.call_args.args[:2], ('apt-get', 'install'))
+
+    def test_held_missing_package_fails_before_install(self):
+        missing = install.subprocess.CalledProcessError(1, 'dpkg-query')
+        for status in (missing, 'config-files\t1:9.6p1', 'unpacked\t1:9.6p1', 'not-installed\t', 'installed\t'):
+            def execute(*args, **kwargs):
+                if args == ('apt-mark', 'showhold'):
+                    return 'openssh-server'
+                if args[:2] == ('dpkg-query', '-W'):
+                    if isinstance(status, Exception):
+                        raise status
+                    return status
+                self.fail(f'package installation must not run: {args}')
+            with self.subTest(status=status), patch.object(install, 'run', side_effect=execute):
+                with self.assertRaisesRegex(RuntimeError, 'required held package openssh-server is not installed'):
+                    install.apt_install(['python3', 'openssh-server'])
+
+    def test_unheld_packages_keep_normal_install_arguments(self):
+        with patch.object(install, 'run', return_value='') as run:
+            self.assertEqual(install.apt_install(['python3', 'git']), {})
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args, ('apt-mark', 'showhold'))
+        self.assertEqual(run.call_args.args,
+                         ('apt-get', 'install', *install.APT_OPTIONS, '-y', '--no-install-recommends', 'python3', 'git'))
+
+    def test_all_held_packages_need_no_install(self):
+        with patch.object(install, 'run', side_effect=['python3', 'installed\t3.12.3']) as run:
+            self.assertEqual(install.apt_install(['python3']), {'python3': '3.12.3'})
+        self.assertEqual(run.call_count, 2)
+        self.assertFalse(any(call.args[:2] == ('apt-get', 'install') for call in run.call_args_list))
+
+    def test_recipe_never_overrides_or_removes_holds(self):
+        source = (HERE / 'install.py').read_text()
+        self.assertNotIn('--allow-change-held-packages', source)
+        self.assertNotIn('unhold', source)
+
+    def test_image_inventory_records_held_packages(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            root = Path(tmp)
+            for directory in ('etc/apt', 'srv/build', 'var/lib/motor-boat'):
+                (root / directory).mkdir(parents=True)
+            (root / 'etc/os-release').write_text('VERSION_ID="24.04"\n')
+            (root / 'srv/build/boat-provider-audit.json').write_text('{}')
+            args = Mock(revision='abc', apt_preflight_only=False, cargo_seed_manifest=Path('seed.json'),
+                        cargo_seed_archive=Path('seed.tar'), cargo_seed_sha256='a' * 64,
+                        acknowledge_tenant_one_private_cache=True)
+            stack.enter_context(patch.object(install.argparse.ArgumentParser, 'parse_args', return_value=args))
+            stack.enter_context(patch.object(install.os, 'geteuid', return_value=0))
+            stack.enter_context(patch.object(install.os, 'chdir'))
+            stack.enter_context(patch.dict(install.os.environ))
+            stack.enter_context(patch.object(install, 'Path', side_effect=lambda path: root / str(path).lstrip('/')))
+            for name, value in (('BUILD', root / 'srv/build'), ('STATE', root / 'var/lib/motor-boat'),
+                                ('APT_LISTS', root / 'var/lib/apt/lists/motor-boat')):
+                stack.enter_context(patch.object(install, name, value))
+            for name in ('validate', 'apt_update', 'target_directories', 'accounts', 'tools', 'configure',
+                         'service_preflight', 'install_permission_helper'):
+                stack.enter_context(patch.object(install, name))
+            for name in ('release_manifest', 'boat_base_layout', 'tool_home'):
+                stack.enter_context(patch.object(install, name, return_value={}))
+            stack.enter_context(patch.object(install, 'digest', return_value='a' * 64))
+            stack.enter_context(patch.object(install.parity.seed, 'verified_manifest', return_value={}))
+            stack.enter_context(patch.object(install.parity.seed, 'install', return_value={}))
+            stack.enter_context(patch.object(install.parity, 'check', return_value={'passed': True}))
+            stack.enter_context(patch.object(install.root_paths, 'require', return_value={}))
+            def execute(*command, **kwargs):
+                if command[:3] == ('git', '-C', str(install.ROOT)):
+                    return 'abc' if command[3] == 'rev-parse' else ''
+                if command[:2] == ('systemctl', 'show'):
+                    return '255.4'
+                if command == ('apt-mark', 'showhold'):
+                    return 'openssh-server'
+                if command == ('dpkg-query', '-W', '-f=${db:Status-Status}\t${Version}', 'openssh-server'):
+                    return 'installed\t1:9.6p1-3ubuntu13.8'
+                return ''
+            run = stack.enter_context(patch.object(install, 'run', side_effect=execute))
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.main()
+            inventory = json.loads((root / 'var/lib/motor-boat/inventory.json').read_text())
+        self.assertEqual(inventory['apt_held_packages'], {'openssh-server': '1:9.6p1-3ubuntu13.8'})
+        command = next(call.args for call in run.call_args_list if call.args[:2] == ('apt-get', 'install'))
+        self.assertNotIn('openssh-server', command)
+        for package in manifest['apt_packages']['required']:
+            if package != 'openssh-server':
+                self.assertIn(package, command)
+
+
 class BoatBaseLayoutTests(unittest.TestCase):
     """Boat's base image ships /usr/local owned by its sandbox account, with
     the provider's Go, rustup, Cargo and Ruby installs inside Ubuntu's skeleton

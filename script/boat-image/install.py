@@ -342,6 +342,28 @@ def apt_update(attempts=3, pause=time.sleep):
         pause(2 ** attempt)
 
 
+def apt_install(packages):
+    # Boat holds provider-managed packages such as sshd. Keep those installed
+    # versions rather than asking apt to upgrade them or overriding the holds.
+    held = set(run("apt-mark", "showhold", capture=True).splitlines())
+    skipped = {}
+    for package in packages:
+        if package not in held:
+            continue
+        try:
+            status = run("dpkg-query", "-W", "-f=${db:Status-Status}\t${Version}", package, capture=True)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"required held package {package} is not installed; refusing to change its hold") from error
+        state, _, version = status.partition("\t")
+        if state != "installed" or not version:
+            raise RuntimeError(f"required held package {package} is not installed; refusing to change its hold")
+        skipped[package] = version
+    requested = [package for package in packages if package not in held]
+    if requested:
+        run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *requested)
+    return skipped
+
+
 def archive_preflight(pins, fetch=urllib.request.urlopen, pause=time.sleep):
     urls = [f"{pins['ubuntu_archive']}/dists/{suite}/InRelease" for suite in ('noble', 'noble-updates')]
     urls.append(f"{pins['ubuntu_security']}/dists/noble-security/InRelease")
@@ -722,7 +744,7 @@ def main():
     run("apt-mark", "hold", "systemd", "systemd-sysv", "libsystemd-shared", "openssh-server")
     packages = (manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["boat"]
                 + manifest["tools"]["git"]["source"]["build_packages"])
-    run("apt-get", "install", *APT_OPTIONS, "-y", "--no-install-recommends", *packages)
+    held_packages = apt_install(packages)
     # Boat's base ships Ubuntu's `at`, whose /usr/bin/at is setuid and owned by
     # the daemon account, so the root-owned path check refuses it. The build
     # server has no `at` and nothing here schedules jobs with it, so the image
@@ -766,7 +788,8 @@ def main():
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),
                       cargo_seed=seed_inventory, tool_home=home, boat_base_layout=base_layout,
                       root_owned_paths=owned,
-                     packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
+                       packages=run("dpkg-query", "-W", capture=True), apt_release_files=releases,
+                       apt_held_packages=held_packages,
                       parity=parity_result,
                       provider_before_install=json.loads(Path('/srv/build/boat-provider-audit.json').read_text()))
     (STATE / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
