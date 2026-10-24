@@ -2718,7 +2718,7 @@ async fn capacity_retry_hint_is_clamped_to_its_bounds() {
     // pull the median down. One sample sits below the floor and the other
     // above the ceiling of the documented bounds.
     for (sample_ms, expected) in [
-        (2_000, CAPACITY_RETRY_MIN_MS),
+        (500, CAPACITY_RETRY_MIN_MS),
         (500_000, CAPACITY_RETRY_MAX_MS),
     ] {
         let f = Fixture::new();
