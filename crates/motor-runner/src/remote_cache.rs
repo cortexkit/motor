@@ -5,6 +5,7 @@
 //! sockets and signs their requests with that generation; the transport
 //! creates each unit's sockets and the forwarders that expose them inside the
 //! unit's sandbox. Nothing in the runner starts any of them yet.
+pub(crate) mod environment;
 pub(crate) mod gateway;
 pub(crate) mod provisioning;
 pub(crate) mod transport;

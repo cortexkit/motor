@@ -258,12 +258,12 @@ class ParityTests(unittest.TestCase):
                     self.assertEqual(["syscall fchmodat2.EMPTY_PATH: expected ['OK'], observed errno 38"],
                                      [error for error in errors if error.startswith('syscall ')])
 
-    def report(self, actual, job=False, role='build-server'):
+    def report(self, actual, job=False, role='build-server', remote_cache_on=False):
         captured = copy.deepcopy(actual)
         captured['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
         with patch.object(parity, 'capture', return_value=captured):
             return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test',
-                                cargo_registry=self.registry())
+                                cargo_registry=self.registry(), remote_cache_on=remote_cache_on)
 
     def test_missing_registry_crate_fails_boat_qualification(self):
         actual = self.observed('boat')
@@ -512,6 +512,106 @@ class ParityTests(unittest.TestCase):
         actual['job_environment']['PATH'] = '/usr/local/bin:/usr/bin:/bin'
         self.assertFalse(self.report(actual, job=True)['passed'])
 
+    def switched_on(self, role):
+        """`role`'s job as it measures with the remote cache on."""
+        actual = self.observed(role, job=True)
+        actual['job_environment'].update(parity.remote_cache_environment.environment(role))
+        if role != 'build-server':
+            # No shared compile cache, so the runner's own sccache is the
+            # wrapper; there is no supervisor file or backend beside it.
+            actual['compile_wrapper'].update(
+                resolved='/motor-tools/sccache', supervisor_cache=None, backend=None,
+                backend_readonly=None, wrapper_readonly=True)
+        return actual
+
+    def test_every_role_qualifies_in_both_switch_states(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role, state='off'):
+                self.assertEqual([], self.report(self.observed(role, job=True), job=True, role=role)['errors'])
+            with self.subTest(role=role, state='on'):
+                report = self.report(self.switched_on(role), job=True, role=role, remote_cache_on=True)
+                self.assertEqual([], report['errors'])
+                self.assertTrue(report['remote_cache'])
+
+    def test_switch_state_is_part_of_the_job_contract(self):
+        # Leftovers of the other state are drift, not accepted extras, and the
+        # remote delta is required only while the cache is on.
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role, state='on'):
+                report = self.report(self.observed(role, job=True), job=True, role=role,
+                                     remote_cache_on=True)
+                self.assertFalse(report['passed'])
+                self.assertIn("job SCCACHE_S3_RW_MODE: expected 'READ_ONLY'",
+                              '\n'.join(report['errors']))
+                if role != 'build-server':
+                    self.assertIn('job RUSTC_WRAPPER: expected', '\n'.join(report['errors']))
+            with self.subTest(role=role, state='off'):
+                report = self.report(self.switched_on(role), job=True, role=role)
+                self.assertFalse(report['passed'])
+                # The delta's variables are not part of the switch-off contract.
+                self.assertIn('job SCCACHE_S3_RW_MODE: expected None', '\n'.join(report['errors']))
+                self.assertIn('job SCCACHE_S3_USE_SSL: expected None', '\n'.join(report['errors']))
+
+    def test_switch_on_role_markers_are_checked(self):
+        # The bucket and region come from the provisioning generation, so the
+        # comparison pins them to what the job reported rather than to a value.
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role, field='endpoint'):
+                actual = self.switched_on(role)
+                actual['job_environment']['SCCACHE_ENDPOINT'] = 'http://127.0.0.1:1'
+                report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                self.assertIn('job SCCACHE_ENDPOINT: expected', '\n'.join(report['errors']))
+            if role == 'build-server':
+                actual = self.switched_on(role)
+                del actual['job_environment']['SCCACHE_MULTILEVEL_CHAIN']
+                report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                self.assertIn('job SCCACHE_MULTILEVEL_CHAIN', '\n'.join(report['errors']))
+            else:
+                # Without level 1 there is no chain at all, and the wrapper is
+                # the read-only /motor-tools copy.
+                actual = self.switched_on(role)
+                actual['job_environment']['SCCACHE_MULTILEVEL_CHAIN'] = 'disk,s3'
+                report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                self.assertIn('job SCCACHE_MULTILEVEL_CHAIN: expected None',
+                              '\n'.join(report['errors']))
+                actual = self.switched_on(role)
+                actual['compile_wrapper']['resolved'] = '/srv/build/cargo-home/bin/sccache'
+                report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                self.assertIn('compiler wrapper resolution', '\n'.join(report['errors']))
+                actual = self.switched_on(role)
+                actual['compile_wrapper']['wrapper_readonly'] = False
+                report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                self.assertIn('compiler cache wrapper_readonly', '\n'.join(report['errors']))
+
+    def test_switch_on_capture_collects_the_remote_variables(self):
+        def capture(remote_cache_on):
+            with patch.object(parity, 'output', return_value='stub'), \
+                 patch.object(parity.Path, 'iterdir', return_value=iter(())), \
+                 patch.object(parity.Path, 'glob', return_value=iter(())), \
+                 patch.object(parity.shutil, 'which', return_value=None), \
+                 patch.object(parity, 'runtime_capture', return_value={}), \
+                 patch.object(parity.syscall_surface, 'capture', return_value={}):
+                return parity.capture(parity.role_manifest(self.manifest, 'boat', True),
+                                      job=True, role='boat', remote_cache_on=remote_cache_on)
+
+        on, off = capture(True), capture(False)
+        translated = {name: parity.remote_cache_environment.expand(value)
+                      for name, value in parity.remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE['boat'].items()}
+        for name, value in translated.items():
+            # The capture reads os.environ, so a local shell may already export
+            # one of these names; what matters is that the name is collected.
+            self.assertIn(name, on['job_environment'])
+        # RUSTC_WRAPPER is a Boat baseline name that is absent (None) with the
+        # switch off; every other remote name appears only when it is on.
+        self.assertIsNone(off['job_environment']['RUSTC_WRAPPER'])
+        declared = {**self.manifest['job_environment'],
+                    **self.manifest['job_environment_by_role']['boat']}
+        for name in set(translated) - set(declared):
+            self.assertNotIn(name, off['job_environment'])
+        # A switch-on job resolves the runner's wrapper from PATH, so the
+        # capture has to record the wrapper contract either way.
+        self.assertIn('compile_wrapper', on)
+
     def test_boat_cache_artifact_hashes_bind_the_build_record_to_live_binaries(self):
         actual = self.observed('boat')
         actual['sccache_artifacts'] = {'inputs_sha256': self.manifest['sccache']['inputs_sha256'], 'binaries': {
@@ -540,7 +640,7 @@ class ParityTests(unittest.TestCase):
     def test_capture_cli_measures_the_tools_the_manifest_names(self):
         seen = []
         with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture']), \
-             patch.object(parity, 'capture', side_effect=lambda manifest=None, job=False, role=None: seen.append(manifest) or {}), \
+             patch.object(parity, 'capture', side_effect=lambda manifest=None, job=False, role=None, **_: seen.append(manifest) or {}), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(parity.main(), 0)
         self.assertEqual(1, len(seen))
@@ -552,7 +652,9 @@ class ParityTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, parity.main())
         self.assertEqual('/tenant/cargo-home', capture.call_args.args[0]['cargo_home'])
-        self.assertEqual({'job': True, 'role': 'tenant'}, capture.call_args.kwargs)
+        # The switch state is passed through; it defaults to the switch-off
+        # contract, which is what this command line asks for.
+        self.assertEqual({'job': True, 'role': 'tenant', 'remote_cache_on': False}, capture.call_args.kwargs)
 
     def test_check_cli_fails_when_git_version_differs_from_the_server(self):
         actual = self.observed()

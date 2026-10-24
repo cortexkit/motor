@@ -136,7 +136,7 @@ fn rendered_argv(
 
 /// SHA-256 of the rendered argv of every remote case below.
 const REMOTE_PINNED_SHA256: &str =
-    "cf4ef2cf8e4d35710fab5313332f4d6d0af667af3e4472ac6004e3e361f3ed2e";
+    "f1418b27abd1b38f0366adf06d557c9d44b8f6ef91b3e22aab488f4d093fadbf";
 
 /// Every unit kind, rendered with and without forwarders: the forwarder starts
 /// are the only difference, they come right after the gate, and with no
@@ -192,6 +192,10 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
         let remote = with_forwarders(make(name), tools);
         let mut plain = make(name);
         plain.id = remote.id;
+        // sccache statistics are captured once its integration is on, which
+        // also covers a job unit without a local cache directory. A fill's
+        // shell already captures them, so only a job's shell gains that part.
+        let fill = name == "writer";
         for durable in [true, false] {
             for env in [&[][..], &cached[..]] {
                 let with = rendered_argv(&remote, &f, durable, env);
@@ -201,7 +205,15 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
                     "{name}: {with}"
                 );
                 assert_eq!(with.matches(&starts).count(), 1, "{name}: {with}");
-                assert_eq!(with.replacen(&starts, "", 1), without, "{name}");
+                let stripped = with.replacen(&starts, "", 1);
+                let stats_command = " sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true;";
+                let expected = if durable && env.is_empty() && !fill {
+                    assert_eq!(stripped.matches(stats_command).count(), 1, "{name}: {with}");
+                    stripped.replacen(stats_command, "", 1)
+                } else {
+                    stripped
+                };
+                assert_eq!(expected, without, "{name}");
                 pinned.push_str(&format!(
                     "== {name} durable={durable} cached={}\n",
                     !env.is_empty()

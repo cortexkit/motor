@@ -3078,7 +3078,14 @@ impl Sandbox {
             None
         };
         let mut cmd = crate::privilege::command("/usr/bin/systemd-run");
-        let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR");
+        // sccache statistics are captured whenever its integration is on, which
+        // a build-server job shows by its local cache directory and a Boat or
+        // tenant VM job by its wrapper alone; neither sets the other's marker.
+        let cached = env.iter().any(|(key, _)| key == "SCCACHE_DIR")
+            || self
+                .cache_forwarders
+                .iter()
+                .any(|forwarder| forwarder.tool() == crate::remote_cache::gateway::Tool::Sccache);
         // Output is a read-only directory with fixed writable file bind mounts,
         // so an exit file cannot be created or replaced by rename here. A normal
         // exit overwrites a preallocated block without truncation; if the shell is killed mid-write, the failed

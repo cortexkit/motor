@@ -507,6 +507,27 @@ impl Config {
         // directory in an empty cache, which fails on the read-only mount.
         !self.boat_profile && !self.tenant_vm
     }
+    /// The remote compile cache's active generation and this unit's cache
+    /// forwarders, or `None` while the cache is not usable for the unit.
+    ///
+    /// The gateway serves a generation only when the runner switch, the cache
+    /// tenant's `enabled` state and job isolation all hold. Without isolation a
+    /// job runs as the runner's own account, which can open the cache keys, so
+    /// the switch is ignored there.
+    #[cfg(unix)]
+    pub(crate) fn unit_remote_cache(
+        &self,
+        fill: bool,
+    ) -> Option<(
+        std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>,
+        Vec<crate::remote_cache::transport::Forwarder>,
+    )> {
+        // Nothing starts the gateway yet, so no generation is ever served and
+        // no unit gets a socket or a forwarder. Wiring the gateway into
+        // startup supplies the generation and the unit's forwarders here.
+        let _ = fill;
+        None
+    }
     /// Endpoint for one trusted Linux build that populates the compiler cache,
     /// independent of the runner's state paths.
     #[cfg(target_os = "linux")]

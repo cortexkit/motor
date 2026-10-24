@@ -596,6 +596,115 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
     }
 }
 
+/// Nothing inherited from the runner's environment survives into any job, on
+/// every host type: an operator's sccache or AWS settings would otherwise
+/// override the local level-1 settings the runner adds, or point sccache at a
+/// store this job may not use.
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_sccache_and_aws_settings_never_reach_a_job() {
+    for (boat, tenant) in [(false, false), (true, false), (false, true)] {
+        let scratch = ScratchDir::new("motor-cache-scrub");
+        fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = true;
+        config.boat_profile = boat;
+        config.tenant_vm = tenant;
+        // A request may name RUST_* and CARGO_* only, so inherited values
+        // reach the runner through its own environment, not through Run::env.
+        let mut setup = setup(scratch.path());
+        setup
+            .request
+            .env
+            .insert("RUSTFLAGS".into(), "-C debuginfo=1".into());
+        let prepared = Prepared {
+            cwd: scratch.path().into(),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: None,
+            vm: None,
+        };
+        let mut env = BTreeMap::from([
+            ("SCCACHE_BUCKET".to_string(), "operator-bucket".to_string()),
+            ("SCCACHE_DIR".to_string(), "/operator/cache".to_string()),
+            ("AWS_ACCESS_KEY_ID".to_string(), "real-key".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "real-secret".to_string(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED".to_string(), "false".to_string()),
+            ("RUSTFLAGS".to_string(), "-C debuginfo=1".to_string()),
+        ]);
+        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        let case = format!("boat={boat} tenant={tenant}");
+        assert!(
+            env.keys().all(|key| !key.starts_with("AWS_")),
+            "{case}: {env:?}"
+        );
+        let expected = if boat || tenant {
+            // These roles keep no cache at all with the switch off.
+            None
+        } else {
+            // The build server's own read-only level 1 replaces the inherited
+            // directory rather than sitting beside it.
+            Some("/motor-cache")
+        };
+        assert_eq!(
+            env.get("SCCACHE_DIR").map(String::as_str),
+            expected,
+            "{case}: {env:?}"
+        );
+        assert_eq!(env["RUSTFLAGS"], "-C debuginfo=1", "{case}");
+    }
+}
+
+/// With the switch on, each role's job environment is its switch-off
+/// environment plus exactly the remote delta, and the test that carries the
+/// delta to a real job environment is the one below. Until the gateway is
+/// wired into startup the runner serves no generation, so this checks the
+/// switch-off path the runner takes today and the delta function the switch-on
+/// path will use.
+#[cfg(target_os = "linux")]
+#[test]
+fn switched_off_jobs_keep_their_environment_and_serve_no_generation() {
+    for (boat, tenant) in [(false, false), (true, false), (false, true)] {
+        let scratch = ScratchDir::new("motor-cache-off");
+        fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = true;
+        config.boat_profile = boat;
+        config.tenant_vm = tenant;
+        let setup = setup(scratch.path());
+        assert!(config.unit_remote_cache(setup.base).is_none());
+        let prepared = Prepared {
+            cwd: scratch.path().into(),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: None,
+            vm: None,
+        };
+        let mut env = BTreeMap::new();
+        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        let case = format!("boat={boat} tenant={tenant}");
+        assert!(
+            env.keys().all(|key| !key.starts_with("AWS_")),
+            "{case}: {env:?}"
+        );
+        if boat || tenant {
+            assert!(!env.contains_key("RUSTC_WRAPPER"), "{case}: {env:?}");
+            assert!(
+                !env.keys().any(|key| key.starts_with("SCCACHE_")),
+                "{case}: {env:?}"
+            );
+        } else {
+            assert_eq!(env["RUSTC_WRAPPER"], "sccache", "{case}");
+            assert_eq!(env["SCCACHE_DIR"], "/motor-cache", "{case}");
+            assert!(!env.contains_key("SCCACHE_S3_RW_MODE"), "{case}");
+            assert!(!env.contains_key("SCCACHE_MULTILEVEL_CHAIN"), "{case}");
+        }
+    }
+}
+
 #[test]
 fn a_long_job_command_in_the_unit_description_does_not_refuse_the_listing() {
     // systemd-run puts the whole command line in the description column, so
