@@ -1059,8 +1059,9 @@ fn compile_cache_environment(
         crate::compile_cache::reader_environment(env, config.sccache_size_gib);
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
-            // Reader keys hash a compile cwd and Cargo environment. A fill
-            // must produce the same ones while writing with recache.
+            // A fill always waits for every read-write level it writes: the
+            // publication decision reads the remote write failures from these
+            // statistics, whatever the switch state was when the fill started.
             crate::remote_cache::environment::fill_values()
                 .into_iter()
                 .for_each(|(key, value)| {
@@ -1115,9 +1116,10 @@ pub(crate) fn scrub_inherited_cache_environment(env: &mut BTreeMap<String, Strin
 /// It is on only when the runner switch, the cache tenant's `enabled` state
 /// and job isolation all hold: without isolation a job runs as the runner's
 /// own account and could open the keys, so the switch is ignored there. The
-/// gateway's generation is the authority on `enabled`; until this slice wires
-/// the gateway into startup no generation is served, so the switch stays off
-/// and a switch-on test drives `remote_cache_job_environment` directly.
+/// gateway's generation is the authority on `enabled`. Nothing starts the
+/// gateway yet, so no unit is switched on and every role keeps today's
+/// environment; `remote_cache_job_environment` is what a switched-on unit
+/// would add on top of that baseline.
 fn remote_cache_environment(
     config: &Config,
     setup: &Setup,
