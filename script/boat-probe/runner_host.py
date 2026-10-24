@@ -1332,6 +1332,7 @@ class RunnerHost:
             self.readiness(label, self.wait_endpoint(sid, install['started_monotonic']), sid)
         elif label == 'resumed':
             self.existing_then_reinstall(sid, label, record, hydrated_at)
+            self.resumed_workspace_eviction(sid, record)
         else:
             self.arm_then_install(sid, label, record)
         record['kernel_release'] = self.execute(sid, 'uname -r')['stdout'].strip()
@@ -1542,6 +1543,19 @@ class RunnerHost:
         self.check('disk_quota.backing_allocation_dropped_after_resume',
                    disk_quota.backing_allocation_dropped(before, storage), evidence)
 
+    def resumed_workspace_eviction(self, sid, phase):
+        import disk_quota
+        import quota_adversarial
+        row = self.data['disk_quota']['lanes'][disk_quota.RETAINED_LANE]
+        before = row['at_limit']
+        workspace = before['lease']['roots'][0]
+        evidence = phase['workspace_eviction'] = json.loads(self.execute(
+            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(
+                quota_adversarial.resume_eviction_source(workspace, row['eviction_journal_cursor'])))['stdout'])
+        ready = phase['existing_then_reinstall']['first']['ready']
+        for name, passed in disk_quota.resume_eviction_checks(before, evidence, ready).items():
+            self.check('resumed.' + name, passed, {'before': before, 'after': evidence, 'ready': ready})
+
     def _disk_quota(self, sid, directory, public, repository, client, record):
         import disk_quota
         import quota_adversarial
@@ -1595,6 +1609,10 @@ class RunnerHost:
                                 raise ValueError('retained target job is no longer live before snapshot')
                             row['pre_stop_storage'] = json.loads(self.execute(
                                 sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+                            cursor = self.execute(sid, 'sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor')['stdout'].strip()
+                            if not cursor.startswith('-- cursor: '):
+                                raise ValueError('runner journal did not provide a pre-stop eviction cursor')
+                            row['eviction_journal_cursor'] = cursor.removeprefix('-- cursor: ')
                             # Keep the job at its barrier so idle eviction cannot
                             # remove the full target before the provider snapshots it.
                             record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})

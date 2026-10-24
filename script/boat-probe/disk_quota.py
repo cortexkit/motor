@@ -132,6 +132,18 @@ def backing_allocation_dropped(before, after):
             and 0 <= after['backing_allocated_blocks'] < before['backing_allocated_blocks'])
 
 
+def resume_eviction_checks(before, after, ready):
+    roots = before.get('lease', {}).get('roots', [])
+    floor = RESERVE_BYTES + (64 << 20) + (8 << 30)
+    return {
+        'retained_workspace_was_present': before.get('retained_allocated_bytes', 0) > 0 and bool(roots),
+        'idle_workspace_evicted_before_jobs': bool(roots) and after.get('workspace') == roots[0]
+            and after.get('workspace_absent') is True and after.get('eviction_logged') is True,
+        'cold_capacity_and_readiness_recovered': ready is True
+            and min(after.get('root_free_bytes', 0), after.get('xfs_free_bytes', 0)) >= floor,
+    }
+
+
 def job(lane, token=None):
     if lane not in LANES + (RETAINED_LANE,):
         raise ValueError('unknown quota probe lane')

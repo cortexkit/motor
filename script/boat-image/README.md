@@ -658,6 +658,26 @@ withdrawn while either filesystem cannot leave that cold cap. Active streams
 continue while readiness is withdrawn. Idle pressure cleanup restores capacity
 without waiting for a new booking. These thresholds are not a measured upper
 bound on snapshot scratch or a promise that arbitrary builds fit.
+Boat atomically detaches cached workspaces into a runner-private
+`.motor-boat-trash-<instance>` directory under their authorized workspace root
+(`/Users` in the image), not into runner-state trash. Although both paths have the
+same XFS device, `/Users` is a separate bind mount: renaming into state trash
+would fail with `EXDEV`. Detachment retains the disk and tree-access locks and
+the workspace-dropping claim that prevents concurrent setup or admission;
+bounded no-follow deletion and later upkeep collect the trash,
+including after a restart. Job paths and sibling aliases cannot overlap this
+private storage. Ordinary build-server pressure eviction deletes workspaces in
+place, so it does not perform this cross-mount rename.
+`boat_workspace_trash_uses_workspace_mount_not_state_mount` checks the placement;
+`boat_upkeep_retries_detached_workspace_garbage_after_restart` checks retry;
+the operator-only
+`isolated_boat_idle_bind_workspace_evicts_trims_and_recovers_cold_capacity`
+exercises the real bind-mount boundary. The resumed quota probe requires the
+retained workspace to disappear and its successful eviction to be logged after
+the cursor captured with `journalctl --unit=motor-boat.service --show-cursor`
+immediately before stop. A cursor identifies a position in that service's logs,
+so an earlier eviction cannot satisfy the resumed check. Cold capacity and
+readiness must recover before any new job is submitted.
 The fleet defaults remain 128 GiB hard / twice that (256 GiB) soft. The existing
 `--free-space-floor-bytes` flag sets the floor; new
 `--free-space-eviction-bytes` optionally overrides the soft goal and must exceed

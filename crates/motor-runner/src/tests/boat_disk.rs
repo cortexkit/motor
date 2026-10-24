@@ -542,6 +542,133 @@ fn idle_boat_runner_frees_its_disk_after_a_job_filled_it_and_admits_again() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn boat_workspace_trash_uses_workspace_mount_not_state_mount() {
+    let f = Fixture::new();
+    let runner = Runner::open(boat_config(&f, |_| Ok(60 * GIB))).unwrap();
+    let path = PathBuf::from(&f.key);
+    let trash = runner.boat_workspace_trash(&path).unwrap();
+    assert_eq!(trash, f.scratch.join("remote/.motor-boat-trash-e2e"));
+    assert_ne!(trash, runner.trash());
+    assert!(runner.boat_workspace_trash(&f.scratch).is_err());
+    assert!(crate::writer::validate_paths(
+        runner.config(),
+        text(&trash.join("job")),
+        None,
+        &[],
+        &[],
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_upkeep_retries_detached_workspace_garbage_after_restart() {
+    use std::os::unix::fs::DirBuilderExt;
+    let f = Fixture::new();
+    let garbage = f
+        .scratch
+        .join("remote/.motor-boat-trash-e2e/boat-cache-leftover");
+    let pending = garbage.clone();
+    let config = boat_config(&f, move |_| {
+        Ok(if pending.exists() { 31 * GIB } else { 60 * GIB })
+    });
+    let runner = Runner::open(config.clone()).unwrap();
+    fs::create_dir_all(garbage.parent().unwrap().parent().unwrap()).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(garbage.parent().unwrap())
+        .unwrap();
+    fs::create_dir(&garbage).unwrap();
+    fs::write(garbage.join("partial"), "unfinished bounded collection").unwrap();
+    drop(runner);
+    let runner = Runner::open(config).unwrap();
+    runner.disk_upkeep().unwrap();
+    assert!(!garbage.exists());
+    assert!(runner.runner_status().disk.unwrap().last_eviction.is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires trusted operator host sudo and mount privileges; never run on shared runners"]
+fn isolated_boat_idle_bind_workspace_evicts_trims_and_recovers_cold_capacity() {
+    let f = Fixture::new();
+    let volume = f.scratch.join("workspace-volume");
+    let view = f.scratch.join("Users");
+    fs::create_dir_all(&volume).unwrap();
+    fs::create_dir(&view).unwrap();
+    struct BindMount(PathBuf);
+    impl Drop for BindMount {
+        fn drop(&mut self) {
+            assert!(Command::new("sudo")
+                .args(["-n", "umount", "--"])
+                .arg(&self.0)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+    assert!(Command::new("sudo")
+        .args(["-n", "mount", "--bind"])
+        .arg(&volume)
+        .arg(&view)
+        .status()
+        .unwrap()
+        .success());
+    let _mount = BindMount(view.clone());
+    let filled = view.join("cached-workspace");
+    let trims = Arc::new(AtomicU64::new(0));
+    let mut config = boat_config(&f, {
+        let filled = filled.clone();
+        // Model a 25 GB cache on a 64 GiB volume, plus other volume contents.
+        // No allocation of tens of gigabytes is needed to exercise rename(2).
+        move |_| {
+            Ok(if filled.exists() {
+                33_494_822_912
+            } else {
+                33_494_822_912 + 25_501_368_320
+            })
+        }
+    });
+    config.workspace_roots = vec![view.clone()];
+    config.owned_workspace_roots = vec![view.clone()];
+    config.boat_storage_trim = {
+        let (filled, trims) = (filled.clone(), trims.clone());
+        Arc::new(move || {
+            assert!(!filled.exists(), "trim must follow atomic eviction");
+            trims.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    };
+    let runner = Runner::open(config).unwrap();
+    workspace(&runner, &filled, runner.now() - 1);
+    fs::create_dir_all(runner.trash()).unwrap();
+    assert_eq!(
+        fs::rename(&filled, runner.trash().join("old-destination"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EXDEV)
+    );
+    runner.disk_upkeep().unwrap();
+    assert!(!filled.exists());
+    assert_eq!(trims.load(Ordering::SeqCst), 1);
+    assert!(
+        (runner.config().free_space_probe)(&runner.core.trees.state).unwrap()
+            >= crate::boat_quota::READY_FREE_BYTES
+    );
+    assert_eq!(
+        runner
+            .runner_status()
+            .disk
+            .unwrap()
+            .last_eviction
+            .unwrap()
+            .path,
+        text(&filled)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn idle_boat_runner_recovers_outer_capacity_only_after_eviction_and_trim() {
     let f = Fixture::new();
     let filled = f.scratch.join("remote/worktrees/b");

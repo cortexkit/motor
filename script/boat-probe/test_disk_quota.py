@@ -1,11 +1,43 @@
 import errno
+import contextlib
+import io
 import json
 import unittest
+from unittest.mock import Mock, patch
 
 import disk_quota
+import quota_adversarial
 
 
 class DiskQuotaChecks(unittest.TestCase):
+    def test_resume_requires_retained_workspace_eviction_and_ready_capacity(self):
+        before = dict(retained_allocated_bytes=25_501_368_320, lease=dict(roots=['/Users/repo']))
+        after = dict(workspace='/Users/repo', workspace_absent=True, eviction_logged=True,
+                     root_free_bytes=60 << 30, xfs_free_bytes=60 << 30)
+        self.assertTrue(all(disk_quota.resume_eviction_checks(before, after, True).values()))
+        for change in ({'workspace_absent': False}, {'eviction_logged': False}, {'workspace': '/Users/other'},
+                       {'root_free_bytes': 33_494_822_912}, {'xfs_free_bytes': 33_494_822_912}):
+            with self.subTest(change=change):
+                self.assertFalse(all(disk_quota.resume_eviction_checks(before, dict(after, **change), True).values()))
+        self.assertFalse(all(disk_quota.resume_eviction_checks({}, after, True).values()))
+        self.assertFalse(all(disk_quota.resume_eviction_checks(before, after, False).values()))
+
+    def test_resume_journal_requires_success_for_exact_workspace_after_cursor(self):
+        source = quota_adversarial.resume_eviction_source('/Users/repo', 'saved-cursor')
+        for message, passed in (
+            ('runner disk eviction path=/Users/repo bytes=25501368320', True),
+            ('runner disk eviction failed path=/Users/repo error=EXDEV', False),
+            ('runner disk eviction path=/Users/repo-other bytes=25501368320', False),
+            ('runner disk eviction path=/Users/other bytes=25501368320', False),
+        ):
+            with self.subTest(message=message), contextlib.redirect_stdout(io.StringIO()) as output, \
+                 patch('subprocess.run', return_value=Mock(stdout=json.dumps({'MESSAGE': message}))) as run, \
+                 patch('os.path.lexists', return_value=False), \
+                 patch('os.statvfs', return_value=Mock(f_bavail=60 << 30, f_frsize=1)):
+                exec(compile(source, '<resume-eviction>', 'exec'), {})
+                self.assertEqual(json.loads(output.getvalue())['eviction_logged'], passed)
+                self.assertIn('--after-cursor=saved-cursor', run.call_args.args[0])
+
     def test_backing_allocation_requires_a_real_drop_on_the_expected_image(self):
         before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)
         after = dict(before, backing_allocated_blocks=100)
