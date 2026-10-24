@@ -318,7 +318,10 @@ start backoff, so a caller's deadline is never spent on a hint longer than the
 runner's experience of the queue.
 
 The runner sets this hint, because only it knows the phase a job was waiting
-in; `ck-motor` passes the terminal record through unchanged. A deployment that
+in; `ck-motor` passes the hint through as the runner set it (it adds a
+`spill_attempted=` note to the refusal detail of a spilled job that went back
+to the build server, see
+[module.md](module.md#retry-hints-on-capacity-refusals)). A deployment that
 wants existing jobs to start carrying it therefore ships a new runner, not a
 new `ck-motor`: until the runner is upgraded, capacity refusals keep arriving
 without a hint.
@@ -451,14 +454,29 @@ excluded. Cancellation still removes a queued job, and the request's execution
 timeout starts when its command starts. The `queue_wait_ms` in `started` and in
 the terminal record is this same counted wait, so a job that waited only behind
 its own workspace reports 0. `job_status_reply.waiting_on` reports the
-current blocker, such as `workspace owner` (a job in this same workspace),
+current blocker of a job waiting to start, and is absent for a job that is
+not: `workspace owner` (a job in this same workspace),
 `sibling user of this checkout` (a job in another workspace that uses this
 directory as a sibling; the refusal detail then names those jobs and their
-workspaces in `sibling_users=[...]`), `queued workspace job` or `permits`;
-it is free text, so clients show an unknown value as is. A plain heartbeat never
-authorizes withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
-`only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`
-(`crates/motor-module/src/queue_tests.rs`).
+workspaces in `sibling_users=[...]`), `queued workspace job`, `permits`, or,
+for a job that would fit but waits behind a queue head that waits for free
+permits, `gate job ahead`, `cache fill ahead needs more free permits` or
+`older job ahead needs more free permits`. It is the same label a queue-wait
+refusal detail gives as `waiting_on=`. The clock runs while a job waits for
+permits or behind such a head, so a spill-watched job in either wait spills
+once its heartbeat wait reaches the spill wait; it pauses while only the job's
+own workspace owner or a sibling user of its checkout holds it, so such a job
+does not spill.
+The value is free text, so clients show an unknown value as is. A plain
+heartbeat never authorizes withdrawal. Tests:
+`queue_heartbeats_are_additive_in_both_upgrade_orders`
+(`crates/motor-protocol/tests/it/contract.rs`),
+`only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`,
+`capacity_waits_behind_a_queue_head_spill_after_the_spill_wait`,
+`checkout_waits_never_spill` (`crates/motor-module/src/queue_tests.rs`),
+`job_status_names_a_gate_job_ahead_as_the_reason` and
+`only_capacity_waits_run_the_queue_clock_a_spill_watches`
+(`crates/motor-runner/src/tests/gate_priority.rs`).
 
 8.2. `withdraw {job_id}` with no reason asks to withdraw a job past its
 queue-wait limit; `reason: "transfer_stalled"` withdraws a job whose upload

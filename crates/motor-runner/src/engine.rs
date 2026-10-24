@@ -4580,7 +4580,17 @@ impl Runner {
                     }
                     .into()
                 }),
-            waiting_on: self.queue_wait_phase(&inner, &index, id).map(str::to_owned),
+            // The same label the queue-wait refusal detail carries, so a job
+            // blocked behind a gate job says so before its budget runs out.
+            // A job that is not waiting to start (running, finished) has none.
+            waiting_on: self
+                .queue_wait_phase(&inner, &index, id)
+                .is_some()
+                .then(|| {
+                    let heads = index.heads(&inner, now);
+                    let (label, _) = self.queue_wait_label(&inner, &heads, &index, id, now);
+                    label.to_owned()
+                }),
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
                 .and_then(|p| p.unit)
@@ -4831,6 +4841,57 @@ impl Runner {
             .fold(0u32, |held, j| held.saturating_add(j.weight))
     }
 
+    /// The `waiting_on` label for a queued job, and the queue head ahead of it
+    /// that holds it back for capacity, if one does.
+    ///
+    /// Both the per-job status reply and the queue-wait refusal detail report
+    /// this one label, so a client reading either sees the same reason. When
+    /// the job would fit and a head ahead of it holds the queue, the label
+    /// names that head's kind: a gate job, a cache fill, or an older job past
+    /// its backfill grace, waiting for enough free permits (the scheduler
+    /// stops smaller jobs overtaking it so it cannot starve).
+    fn queue_wait_label(
+        &self,
+        inner: &Inner,
+        heads: &[Uuid],
+        index: &DispatchIndex,
+        id: Uuid,
+        now: u64,
+    ) -> (&'static str, Option<(Uuid, bool)>) {
+        let phase = self
+            .queue_wait_phase(inner, index, id)
+            .unwrap_or(QUEUE_ORDER_WAIT);
+        if phase != QUEUE_ORDER_WAIT {
+            return (phase, None);
+        }
+        let blocking = self.blocking_head(inner, heads, id, index.weight, now);
+        let label = match blocking {
+            Some((_, true)) => "gate job ahead",
+            Some((head, false)) if inner.jobs[&head].base => {
+                "cache fill ahead needs more free permits"
+            }
+            Some((_, false)) => "older job ahead needs more free permits",
+            None => QUEUE_ORDER_WAIT,
+        };
+        (label, blocking)
+    }
+
+    /// Whether `waiting_on` names a wait for capacity that could clear on its
+    /// own: enough free permits, or a queue head ahead waiting for them. A job
+    /// that stops smaller jobs overtaking it still takes permits, so those
+    /// waits are capacity waits too. A job held behind its own workspace, a
+    /// sibling checkout or a queued workspace job needs that job to finish and
+    /// its checkout to be released, which a hosted runner cannot do for it.
+    fn capacity_wait(waiting_on: &str) -> bool {
+        matches!(
+            waiting_on,
+            "permits"
+                | "gate job ahead"
+                | "cache fill ahead needs more free permits"
+                | "older job ahead needs more free permits"
+        )
+    }
+
     /// The first queue head ahead of `id` that stops later heads from being
     /// started for capacity, with whether it is a gate job (see
     /// `holds_back_later_heads`).
@@ -4899,10 +4960,12 @@ impl Runner {
         id: Uuid,
     ) -> Option<u64> {
         let phase = self.queue_wait_phase(inner, index, id)?;
-        if !matches!(
-            phase,
-            "permits" | "workspace owner" | "queued workspace job" | SIBLING_USER_WAIT
-        ) {
+        if !(Self::capacity_wait(phase)
+            || matches!(
+                phase,
+                "workspace owner" | "queued workspace job" | SIBLING_USER_WAIT
+            ))
+        {
             return None;
         }
         self.core
@@ -5121,27 +5184,7 @@ impl Runner {
                 )
             })
             .collect();
-        let mut blocking_head = None;
-        let phase = self
-            .queue_wait_phase(inner, index, id)
-            .unwrap_or("queue order");
-        let phase = if phase == "queue order" {
-            // This job would fit, so a job ahead of it holds the queue: a gate
-            // job, a cache fill, or an older job past its backfill grace,
-            // waiting for enough free permits (the scheduler stops smaller
-            // jobs overtaking it so it cannot starve). Name that job.
-            blocking_head = self.blocking_head(inner, &heads, id, index.weight, now);
-            match blocking_head {
-                Some((_, true)) => "gate job ahead",
-                Some((head, false)) if inner.jobs[&head].base => {
-                    "cache fill ahead needs more free permits"
-                }
-                Some((_, false)) => "older job ahead needs more free permits",
-                None => "queue order",
-            }
-        } else {
-            phase
-        };
+        let (phase, blocking_head) = self.queue_wait_label(inner, &heads, index, id, now);
         let blocking = blocking_head
             .map(|(head, _)| {
                 format!(
@@ -8647,6 +8690,10 @@ impl Runner {
 /// job in this same workspace, so a client can tell an earlier job of its own
 /// from another repository's job that uses this checkout.
 const SIBLING_USER_WAIT: &str = "sibling user of this checkout";
+
+/// The `waiting_on` value for a queued job that none of the named blockers
+/// holds: the scheduler has not reached it yet in this queue order.
+const QUEUE_ORDER_WAIT: &str = "queue order";
 
 /// Build from retained state once per dispatch, then update only the selected
 /// job's weight, checkout reservations and CPU claims after each start.

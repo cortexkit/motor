@@ -614,11 +614,33 @@ pub(crate) struct BuildServerLog {
 /// with a transfer_interrupted tombstone.
 pub(crate) struct ResubmitPeer {
     pub log: Arc<std::sync::Mutex<BuildServerLog>>,
+    /// What happens to a Run that is not a spill-watched first submission.
+    pub end: ResubmitEnd,
 }
+/// How the fake build server ends a Run that is not a spill-watched first
+/// submission.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ResubmitEnd {
+    /// It starts after a short queue wait and exits 7.
+    Exit,
+    /// It is admitted, then refused when its queue wait runs out, behind a
+    /// gate job, with the refusal detail `QUEUE_REFUSAL_DETAIL`.
+    QueueRefused,
+    /// It is refused at admission as runner_full, with the refusal detail
+    /// `ADMISSION_REFUSAL_DETAIL`.
+    AdmissionRefused,
+}
+pub(crate) const QUEUE_REFUSAL_DETAIL: &str =
+    "waiting_on=gate job ahead; blocked_by=job=01a16f1d-0000-7000-8000-000000000000 permits=12";
+pub(crate) const ADMISSION_REFUSAL_DETAIL: &str = "runner draining for maintenance";
 impl ResubmitPeer {
     pub(crate) fn new() -> Self {
+        Self::ending(ResubmitEnd::Exit)
+    }
+    pub(crate) fn ending(end: ResubmitEnd) -> Self {
         Self {
             log: Arc::default(),
+            end,
         }
     }
 }
@@ -655,6 +677,7 @@ impl Connector for ResubmitPeer {
         _: Uuid,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
         let log = self.log.clone();
+        let end = self.end;
         Box::pin(async move {
             let (client, mut peer) = tokio::io::duplex(65536);
             tokio::spawn(async move {
@@ -684,6 +707,20 @@ impl Connector for ResubmitPeer {
                         Frame::Run(run) => {
                             let id = run.job_id;
                             log.lock().unwrap().runs.push((id, run.queue_wait_limit_s));
+                            if run.queue_wait_limit_s != 0 && end == ResubmitEnd::AdmissionRefused {
+                                let refusal = Refusal {
+                                    job_id: Some(id),
+                                    transfer_id: None,
+                                    reason: RefusalReason::RunnerFull,
+                                    disk_full: None,
+                                    retry_after_ms: None,
+                                    detail: Some(ADMISSION_REFUSAL_DETAIL.into()),
+                                };
+                                write_frame_async(&mut peer, &Frame::Refusal(refusal))
+                                    .await
+                                    .unwrap();
+                                return;
+                            }
                             let accepted = Frame::Accepted(Accepted::new(id, 0));
                             write_frame_async(&mut peer, &accepted).await.unwrap();
                             let waiting = Frame::Heartbeat {
@@ -692,6 +729,23 @@ impl Connector for ResubmitPeer {
                             write_frame_async(&mut peer, &waiting).await.unwrap();
                             if run.queue_wait_limit_s == 0 {
                                 continue;
+                            }
+                            if end == ResubmitEnd::QueueRefused {
+                                let terminal = TerminalRecord::new(
+                                    id,
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::QueueWaitExceeded,
+                                    },
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .with_ran(Ran::None)
+                                .with_refusal_detail(QUEUE_REFUSAL_DETAIL);
+                                write_frame_async(&mut peer, &Frame::Terminal(terminal))
+                                    .await
+                                    .unwrap();
+                                return;
                             }
                             // Queue briefly: a job still spill-watched would be
                             // withdrawn here.
@@ -895,6 +949,21 @@ async fn run_spilled_with_timeout(
     limit: Duration,
     timeout: u64,
 ) -> Vec<StreamRecord> {
+    run_job_records(motor, id, repo, wait, limit, timeout, true).await
+}
+
+/// Runs a job with the given queue-wait limit and timeout in seconds, spill
+/// eligible or not, and returns every record the caller received, up to and
+/// including its terminal.
+async fn run_job_records(
+    motor: &Motor,
+    id: Uuid,
+    repo: &Path,
+    wait: u64,
+    limit: Duration,
+    timeout: u64,
+    spill: bool,
+) -> Vec<StreamRecord> {
     motor
         .storage
         .create(id, wait, None, Some("test".into()), false)
@@ -909,7 +978,7 @@ async fn run_spilled_with_timeout(
             id,
             (request, crate::ReturnOptions::default()),
             Vec::new(),
-            (wait, true),
+            (wait, spill),
             &tx,
             wake,
         )
@@ -964,6 +1033,9 @@ pub(crate) fn assert_one_build_server_job(id: Uuid, records: &[StreamRecord]) {
     assert_eq!(terminals[0].job_id, id);
     assert_eq!(terminals[0].outcome, Outcome::Exit { code: 7 });
     assert_eq!(terminals[0].ran, Some(Ran::Remote));
+    // A job that ran keeps the build server's terminal as it was: only a
+    // refusal names the earlier spill attempt.
+    assert_eq!(terminals[0].refusal_detail, None);
     assert!(
         matches!(records.last(), Some(StreamRecord::Terminal(_))),
         "{records:?}"
@@ -1550,4 +1622,359 @@ async fn boat_lease_stating_sandbox_memory_runs_on_boat() {
     );
     assert_eq!(log.lock().unwrap().runs, vec![(id, 0)]);
     assert_eq!(boat.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A spilled job that the broker could not place goes back to the build
+/// server; when the build server then refuses it, whether at admission or
+/// when its queue wait runs out, the refusal detail keeps the build server's
+/// own reason and adds `spill_attempted=` with the broker code that sent the
+/// job back. A job that never spilled, refused the same way, keeps the build
+/// server's detail exactly.
+#[tokio::test]
+async fn refusal_after_a_failed_spill_names_the_spill_attempt() {
+    for (end, runner_detail) in [
+        (ResubmitEnd::QueueRefused, QUEUE_REFUSAL_DETAIL),
+        (ResubmitEnd::AdmissionRefused, ADMISSION_REFUSAL_DETAIL),
+    ] {
+        let broker = crate::hosted::test_http::Http::new(|path, _| {
+            if path == "/v1/leases" {
+                (503, serde_json::json!({"error": "no_capacity"}))
+            } else {
+                (404, serde_json::json!({"error": "job_unknown"}))
+            }
+        })
+        .await;
+        let scratch = ScratchDir::new("motor-spill-attempted");
+        let repo = fixture_repo(&scratch);
+        let peer = ResubmitPeer::ending(end);
+        let log = peer.log.clone();
+        let motor = Motor::with_connector(
+            spill_config(&broker.url),
+            &scratch.join("state"),
+            Arc::new(peer),
+        )
+        .unwrap();
+        let terminal = |records: &[StreamRecord]| match records.last() {
+            Some(StreamRecord::Terminal(terminal)) => terminal.clone(),
+            other => panic!("{end:?}: expected a terminal, got {other:?}"),
+        };
+
+        let id = Uuid::now_v7();
+        let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+        assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+        let spilled = terminal(&records);
+        assert_eq!(spilled.job_id, id);
+        assert!(
+            matches!(spilled.outcome, Outcome::RefusedBeforeStart { .. }),
+            "{end:?}: {spilled:?}"
+        );
+        assert_eq!(
+            spilled.refusal_detail.as_deref(),
+            Some(format!("{runner_detail}; spill_attempted=hosted_capacity").as_str()),
+            "{end:?}"
+        );
+
+        let never_spilled = Uuid::now_v7();
+        let records = run_job_records(
+            &motor,
+            never_spilled,
+            &repo,
+            30,
+            Duration::from_secs(30),
+            30,
+            false,
+        )
+        .await;
+        let refused = terminal(&records);
+        assert!(
+            matches!(refused.outcome, Outcome::RefusedBeforeStart { .. }),
+            "{end:?}: {refused:?}"
+        );
+        assert_eq!(
+            refused.refusal_detail.as_deref(),
+            Some(runner_detail),
+            "{end:?}"
+        );
+    }
+}
+
+/// The spill note keeps within the refusal detail size limit: a build-server
+/// detail that, with the note appended, would exceed the limit is shortened to
+/// leave room for the whole note. The note
+/// stands alone when the build server gave no detail, and a job that was not
+/// sent back to the build server, routed hosted or never spilled, keeps its
+/// detail.
+#[tokio::test]
+async fn spill_attempt_note_keeps_within_the_refusal_detail_limit() {
+    let scratch = ScratchDir::new("motor-spill-attempted-limit");
+    let config = spill_config("http://127.0.0.1:1");
+    let motor = Motor::with_connector(
+        config.clone(),
+        &scratch.join("state"),
+        Arc::new(ResubmitPeer::new()),
+    )
+    .unwrap();
+    let (resubmitted, hosted, plain) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for id in [resubmitted, hosted, plain] {
+        motor
+            .storage
+            .create(id, 30, None, Some("test".into()), false)
+            .unwrap();
+    }
+    for id in [resubmitted, hosted] {
+        let mut route = crate::HostedJobState::new(&config);
+        route.spill_wait_ms = Some(45_000);
+        route.hosted_code = Some("hosted_provisioning".into());
+        motor.storage.hosted_route(id, route).unwrap();
+    }
+    motor
+        .storage
+        .resubmitted(resubmitted, Uuid::now_v7(), "hosted_provisioning")
+        .unwrap();
+    let note = "; spill_attempted=hosted_provisioning";
+
+    let long = "é".repeat(REFUSAL_DETAIL_MAX_BYTES);
+    let detail = motor
+        .with_spill_attempt(resubmitted, Some(long.clone()))
+        .unwrap();
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES, "{}", detail.len());
+    assert!(detail.ends_with(note), "{detail}");
+    assert!(long.starts_with(detail.strip_suffix(note).unwrap()));
+    assert_eq!(
+        motor.with_spill_attempt(resubmitted, None).as_deref(),
+        Some("spill_attempted=hosted_provisioning")
+    );
+    for id in [hosted, plain] {
+        assert_eq!(
+            motor.with_spill_attempt(id, Some("waiting_on=permits".into())),
+            Some("waiting_on=permits".into())
+        );
+        assert_eq!(motor.with_spill_attempt(id, None), None);
+    }
+}
+
+/// A build server whose job waits in its queue, with a heartbeat each second
+/// as the runner sends one. The runner's queue clock runs while a job waits
+/// for capacity, whether for free permits or behind a queue head that waits
+/// for them (a gate job, a cache fill, an older job past its backfill grace),
+/// so its heartbeat's queue wait grows; it pauses while the job waits for its
+/// own workspace owner or a sibling user of its checkout, so the wait stays
+/// put. A withdrawal ends the job with a queue-wait refusal naming `label`,
+/// marked as a spill withdrawal when it asked to spill, as the runner does.
+struct QueuedPeer {
+    label: &'static str,
+    clock_runs: bool,
+    /// Each withdrawal: whether it asked to spill, and the queue wait the
+    /// peer had reported by then.
+    withdraws: Arc<std::sync::Mutex<Vec<(bool, u64)>>>,
+}
+impl Connector for QueuedPeer {
+    fn connect(
+        &self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        let (label, clock_runs) = (self.label, self.clock_runs);
+        let withdraws = self.withdraws.clone();
+        Box::pin(async move {
+            let (client, mut peer) = tokio::io::duplex(65536);
+            tokio::spawn(async move {
+                let _ = read_frame_async(&mut peer).await.unwrap();
+                let hello = Frame::Hello {
+                    return_paths: false,
+                    return_chunked: false,
+                    sibling_paths: false,
+                    protocol_version: PROTOCOL_VERSION,
+                    started: true,
+                    default_branch_tip: false,
+                    gate_jobs: true,
+                    platforms: Vec::new(),
+                };
+                write_frame_async(&mut peer, &hello).await.unwrap();
+                write_frame_async(&mut peer, &Frame::Accepted(Accepted::new(id, 0)))
+                    .await
+                    .unwrap();
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                );
+                let mut waited_ms = 0u64;
+                loop {
+                    tokio::select! {
+                        _ = heartbeat.tick() => {
+                            if clock_runs {
+                                waited_ms += 1_000;
+                            }
+                            let beat = Frame::Heartbeat { queue_wait_ms: Some(waited_ms) };
+                            if write_frame_async(&mut peer, &beat).await.is_err() {
+                                return;
+                            }
+                        }
+                        frame = read_frame_async(&mut peer) => match frame {
+                            Ok(Some(Frame::Withdraw { spill, .. })) => {
+                                withdraws.lock().unwrap().push((spill, waited_ms));
+                                let reply = Frame::WithdrawReply {
+                                    outcome: WithdrawOutcome::Withdrawn,
+                                };
+                                write_frame_async(&mut peer, &reply).await.unwrap();
+                                let prefix = if spill {
+                                    motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
+                                } else {
+                                    ""
+                                };
+                                let terminal = TerminalRecord::new(
+                                    id,
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::QueueWaitExceeded,
+                                    },
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .with_ran(Ran::None)
+                                .with_refusal_detail(format!(
+                                    "{prefix}waiting_on={label}; requested_permits=2"
+                                ));
+                                write_frame_async(&mut peer, &Frame::Terminal(terminal))
+                                    .await
+                                    .unwrap();
+                                return;
+                            }
+                            Ok(Some(_)) => {}
+                            _ => return,
+                        },
+                    }
+                }
+            });
+            Ok(Box::new(client) as Box<dyn Duplex>)
+        })
+    }
+}
+
+/// Follows a spill-watched job with a 300-second queue-wait budget and a
+/// 45-second spill wait on a `QueuedPeer` for up to `seconds` seconds.
+/// Returns the peer's withdrawals, the second the first one arrived, the
+/// stream's result if it ended, and the job's hosted route.
+async fn follow_queued(
+    label: &'static str,
+    clock_runs: bool,
+    seconds: u64,
+) -> (
+    Vec<(bool, u64)>,
+    Option<u64>,
+    Option<io::Result<bool>>,
+    Option<crate::HostedJobState>,
+) {
+    let scratch = ScratchDir::new("motor-spill-queue-head");
+    let withdraws = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = Config {
+        spill_to_hosted: true,
+        spill_after_s: 45,
+        ..Config::default()
+    };
+    let motor = Motor::with_connector(
+        config,
+        &scratch,
+        Arc::new(QueuedPeer {
+            label,
+            clock_runs,
+            withdraws: withdraws.clone(),
+        }),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 300, None, None, false).unwrap();
+    let mut channel = Channel::open(motor.connector.as_ref(), id).await.unwrap();
+    assert!(matches!(
+        channel.next().await.unwrap(),
+        Incoming::Frame(Frame::Accepted(_))
+    ));
+    let (tx, _records) = mpsc::channel(32);
+    let (_wake, wake) = watch::channel(false);
+    let follower = motor.clone();
+    let follow = tokio::spawn(async move {
+        follower
+            .follow_inner(id, 0, Some(channel), &tx, wake, Some(45))
+            .await
+    });
+    let mut first_withdraw = None;
+    for second in 1..=seconds {
+        advance_and_drain(Duration::from_secs(1)).await;
+        if first_withdraw.is_none() && !withdraws.lock().unwrap().is_empty() {
+            first_withdraw = Some(second);
+        }
+        if follow.is_finished() {
+            break;
+        }
+    }
+    let result = if follow.is_finished() {
+        Some(follow.await.unwrap())
+    } else {
+        follow.abort();
+        None
+    };
+    let withdraws = withdraws.lock().unwrap().clone();
+    (withdraws, first_withdraw, result, motor.hosted_state(id))
+}
+
+/// A job behind a gate job, a cache fill or an older job that waits for free
+/// permits is in a capacity wait, as one waiting for free permits itself is:
+/// the runner's heartbeat reports a growing queue wait for it, so once that
+/// reaches spill_after_s ck-motor withdraws it asking to spill, and it moves
+/// to a hosted runner. ck-motor decides from that heartbeat wait, not from the
+/// label; the runner's side, which wait runs the clock, is pinned by the
+/// runner test `only_capacity_waits_run_the_queue_clock_a_spill_watches`.
+/// This also held before the runner named a gate job in its status reply.
+#[tokio::test(start_paused = true)]
+async fn capacity_waits_behind_a_queue_head_spill_after_the_spill_wait() {
+    for label in [
+        "permits",
+        "gate job ahead",
+        "older job ahead needs more free permits",
+        "cache fill ahead needs more free permits",
+    ] {
+        let (withdraws, first, result, route) = follow_queued(label, true, 120).await;
+        // The withdrawal goes out when the heartbeat wait reaches 45 s; the
+        // peer may count its own 45th second just before or just after it
+        // reads the withdrawal.
+        let [(spill, waited_ms)] = withdraws.as_slice() else {
+            panic!("{label}: one withdrawal expected: {withdraws:?}")
+        };
+        assert!(*spill, "{label}: the withdrawal must ask to spill");
+        assert!(
+            (44_000..=45_000).contains(waited_ms),
+            "{label}: {waited_ms}"
+        );
+        assert!(
+            first.is_some_and(|second| (45..=46).contains(&second)),
+            "{label}: spilled at the spill wait, not before: {first:?}"
+        );
+        assert!(
+            matches!(result, Some(Ok(true))),
+            "{label}: the stream hands the job to a hosted runner: {result:?}"
+        );
+        let route = route.unwrap_or_else(|| panic!("{label}: no hosted route"));
+        assert!(
+            route.spill_wait_ms.is_some_and(|ms| ms >= 45_000),
+            "{label}"
+        );
+    }
+}
+
+/// A job waiting for its own workspace owner, or for a sibling user of its
+/// checkout, needs that job to finish and release the checkout, which a
+/// hosted runner cannot do for it. The runner pauses its queue clock, so its
+/// heartbeat wait never reaches the spill wait: ck-motor neither withdraws it
+/// nor spills it, however long the wait lasts.
+#[tokio::test(start_paused = true)]
+async fn checkout_waits_never_spill() {
+    for label in ["workspace owner", "sibling user of this checkout"] {
+        let (withdraws, first, result, route) = follow_queued(label, false, 400).await;
+        assert!(withdraws.is_empty(), "{label}: {withdraws:?}");
+        assert_eq!(first, None, "{label}");
+        assert!(
+            result.is_none(),
+            "{label}: the job stays queued: {result:?}"
+        );
+        assert!(route.is_none(), "{label}");
+    }
 }
