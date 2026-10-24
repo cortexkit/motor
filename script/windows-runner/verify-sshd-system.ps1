@@ -17,6 +17,9 @@ try {
 } catch {
     $result.error = [string]$_
 }
-[IO.File]::WriteAllText($ResultPath, (ConvertTo-Json -InputObject $result -Depth 4 -Compress), [Text.UTF8Encoding]::new($false))
+# The installer polls for this file, so write it whole and then rename it into place.
+$partial = $ResultPath + '.partial'
+[IO.File]::WriteAllText($partial, (ConvertTo-Json -InputObject $result -Depth 4 -Compress), [Text.UTF8Encoding]::new($false))
+Move-Item -LiteralPath $partial -Destination $ResultPath
 if (-not $result.success) { exit 1 }
 exit 0
