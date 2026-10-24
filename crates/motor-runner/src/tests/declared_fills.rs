@@ -162,8 +162,8 @@ fn a_tree_without_cargo_warms_from_its_declaration() {
         ("make clean && make -j2 && make check".to_string(), true),
         "a declared fill is the warm plan, and it is explicit"
     );
-    // A Cargo tree keeps Cargo's own rules; its declaration is refused by the
-    // policy that reads it, not merged into the warm plan here.
+    // A Cargo tree runs Cargo's own warm command first and the declared steps
+    // after it, in the same fill.
     fs::write(
         f.main.join("Cargo.toml"),
         "[workspace]\n[workspace.metadata.motor]\nwarm-commands = [\"cargo build\"]\n",
@@ -172,7 +172,10 @@ fn a_tree_without_cargo_warms_from_its_declaration() {
     let cargo = commit(&f.main, "cargo tree").0;
     assert_eq!(
         workspace::warm_plan(&f.main, &cargo),
-        ("cargo build".to_string(), true)
+        (
+            "cargo build && make clean && make -j2 && make check".to_string(),
+            true
+        )
     );
 }
 

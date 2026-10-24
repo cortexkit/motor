@@ -135,8 +135,12 @@ fn rendered_argv(
 }
 
 /// SHA-256 of the rendered argv of every remote case below.
+///
+/// Updated when the writer shell began asking an installed script whether the
+/// tree it is about to compile has a root `Cargo.toml`, so a declared fill
+/// without one is not skipped; only the `writer` cases changed.
 const REMOTE_PINNED_SHA256: &str =
-    "666657e1ce2225346d8688f5127a63b64e4d240ba87494593c2eda823d4b4351";
+    "c20b3f34052769f35470cd8a8fb6abf91ae9bfe48d65c2e8eebb8b17069f9991";
 
 /// Every unit kind, rendered with and without forwarders: the forwarder starts
 /// are the only difference, they come right after the gate, and with no

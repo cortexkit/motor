@@ -3672,13 +3672,19 @@ impl Runner {
     /// `queue_base_planned` reads them if it queues one.
     fn base_plan(&self, root: &str, tip: &str, with_fill: bool) -> BasePlan {
         let mirror = self.core.trees.mirror(root);
-        let (command, explicit_command) = if self.core.config.base_commands.is_empty() {
-            workspace::warm_plan(&mirror, tip)
+        // The override, the repository's declaration and Cargo's own warm
+        // command are all read here so `fill_identity` can tell which of them
+        // produced the command the fill will run.
+        let overridden = !self.core.config.base_commands.is_empty();
+        let (command, declared) = if overridden {
+            (self.core.config.base_commands.join(" && "), false)
         } else {
-            (self.core.config.base_commands.join(" && "), true)
+            let (steps, declared) = workspace::warm_steps(&mirror, tip);
+            (steps.join(" && "), declared)
         };
+        let explicit_command = overridden || declared;
         let (descriptor, dependency_free) =
-            self.fill_identity(&mirror, tip, &command, explicit_command);
+            self.fill_identity(&mirror, tip, &command, overridden);
         BasePlan {
             tip: tip.to_owned(),
             command,
@@ -3701,9 +3707,9 @@ impl Runner {
         mirror: &Path,
         tip: &str,
         command: &str,
-        explicit_command: bool,
+        overridden: bool,
     ) -> (io::Result<String>, bool) {
-        let declares = self.core.config.base_commands.is_empty();
+        let declares = !overridden;
         let declaration = if declares {
             // A declaration that does not parse fails the tip: a fill of
             // something other than what the repository declared is worse than
@@ -3728,8 +3734,10 @@ impl Runner {
             declaration.as_ref(),
             &compilers,
         );
-        let dependency_free = !explicit_command
-            && descriptor.is_ok()
+        // A declaration's steps are always run, so the shortcut that records a
+        // fill without running one only applies to a graph that has neither a
+        // declaration nor an override.
+        let dependency_free = descriptor.is_ok()
             && crate::writer::fill::dependency_free(mirror, tip, declaration.as_ref())
                 .unwrap_or(false);
         (descriptor, dependency_free)
@@ -7292,12 +7300,15 @@ impl Runner {
             if !job.base && crate::writer::fill::reader_missed(&self.core.trees.state, id) {
                 let r = job.request.as_ref().unwrap();
                 let mirror = self.core.trees.mirror(&r.repository_root);
-                let (command, explicit) = if self.core.config.base_commands.is_empty() {
-                    workspace::warm_plan(&mirror, &r.snapshot_commit)
+                let (steps, declared) = if self.core.config.base_commands.is_empty() {
+                    workspace::warm_steps(&mirror, &r.snapshot_commit)
                 } else {
-                    (self.core.config.base_commands.join(" && "), true)
+                    (self.core.config.base_commands.clone(), false)
                 };
-                self.fill_identity(&mirror, &r.snapshot_commit, &command, explicit)
+                let (command, declared) = (steps.join(" && "), declared);
+                let overridden = !self.core.config.base_commands.is_empty();
+                let _ = declared;
+                self.fill_identity(&mirror, &r.snapshot_commit, &command, overridden)
                     .0
                     .ok()
             } else {
