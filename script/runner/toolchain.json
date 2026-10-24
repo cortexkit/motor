@@ -35,9 +35,13 @@
       "git": "1:2.53.0-1ubuntu1.1",
       "gnu-coreutils": "9.7-3ubuntu2.1",
       "iproute2": "6.19.0-1ubuntu1.1",
+      "libfontconfig-dev": "2.17.1-3ubuntu1",
       "libsqlite3-dev": "3.46.1-9ubuntu0.3",
       "libssl-dev": "3.5.5-1ubuntu3.7",
       "libvulkan1": "1.4.341.0-1",
+      "libwayland-dev": "1.24.0-2",
+      "libx11-xcb-dev": "2:1.8.13-1ubuntu0.1",
+      "libxkbcommon-x11-dev": "1.13.1-1",
       "lld": "1:21.1.6-71",
       "mesa-vulkan-drivers": "26.0.8-1ubuntu0.3",
       "nftables": "1.1.6-1",
@@ -87,10 +91,14 @@
       "xvfb",
       "x11-apps",
       "mesa-vulkan-drivers",
-      "libvulkan1"
+      "libvulkan1",
+      "libfontconfig-dev",
+      "libwayland-dev",
+      "libx11-xcb-dev",
+      "libxkbcommon-x11-dev"
     ]
   },
-  "capture_sha256": "dcaea31b0e0566440d80e14545b76ce181131404b8d0a7733b9730f4586536d2",
+  "capture_sha256": "679c1f888e9768d961fbc81956fe3c775b1366e7ec7571db8867e47f4fc75cd1",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
