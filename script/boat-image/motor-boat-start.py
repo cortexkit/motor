@@ -236,8 +236,6 @@ def check_storage():
     options = subprocess.check_output(['/usr/bin/findmnt', '-n', '-o', 'OPTIONS', '--target', str(STATE)], text=True)
     if not ({'prjquota', 'pquota'} & set(options.strip().split(','))):
         raise RuntimeError('Boat state disk requires enforced XFS project quotas')
-    if 'discard' not in options.strip().split(','):
-        raise RuntimeError('Boat state disk requires discard to reclaim sparse backing space')
     geometry = subprocess.check_output(['/usr/sbin/xfs_info', str(STATE)], text=True)
     if not re.search(r'\breflink=1\b', geometry):
         raise RuntimeError(f'{STATE} does not have XFS reflink enabled')
@@ -322,7 +320,7 @@ def withdraw_storage(reason='storage_watch_starting'):
             STORAGE_HEALTH.unlink(missing_ok=True)
             write_storage_health('unhealthy', reason=reason)
         volumes = {}
-        for name, path in [('runner_state', STATE), ('workspace', USERS)]:
+        for name, path in [('runner_state', STATE), ('workspace', USERS), ('root', Path('/'))]:
             try:
                 stats = os.statvfs(path)
                 volumes[name] = {'volume': str(path), 'free_bytes': stats.f_bavail * stats.f_frsize,
@@ -360,6 +358,17 @@ def quota_capacity_ready():
         value = os.statvfs(path)
         return value.f_bavail * value.f_frsize
     return min(free(STATE), free('/')) >= QUOTA_READY_FREE_BYTES
+
+
+def trim_storage():
+    expected = tuple(json.loads(STORAGE_EVIDENCE.read_text())['identity'])
+    if storage_identity() != expected:
+        raise RuntimeError('refusing to trim changed Boat storage')
+    state_mount(mounts())
+    # Batch discard after idle eviction instead of adding synchronous discard
+    # to job writes. FITRIM also reclaims free extents restored in a snapshot:
+    # online discard only sees extents freed since the mount began.
+    subprocess.run(['/usr/sbin/fstrim', '--verbose', str(STATE)], check=True, timeout=30)
 
 
 def watch_storage(pause=time.sleep, notify=None):
@@ -444,6 +453,8 @@ def main():
         return watch_storage()
     if sys.argv[1:] == ['--withdraw-storage']:
         return withdraw_storage()
+    if sys.argv[1:] == ['--trim-storage']:
+        return trim_storage()
     if sys.argv[1:] == ['--check-mountpoints']:
         for path in (STATE, USERS):
             empty_mountpoint(path)

@@ -104,6 +104,25 @@ pub(crate) fn withdraw_ready() -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn trim_storage() -> io::Result<()> {
+    // Bound the whole helper, including cold reads after a provider restore.
+    // The helper separately bounds FITRIM; timeout kills a stuck helper too.
+    let output = crate::systemd::output(crate::privilege::command("/usr/bin/timeout").args([
+        "--kill-after=5s",
+        "40s",
+        "/usr/bin/python3",
+        "/usr/local/libexec/motor-boat-start.py",
+        "--trim-storage",
+    ]))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot trim Boat state disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn job_roots(
     workspace: &Path,
     target: &Path,
@@ -700,6 +719,43 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trim_helper_is_bounded_and_propagates_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [0, 1, 124] {
+            let called = std::rc::Rc::new(std::cell::Cell::new(false));
+            crate::systemd::with_process_hook(
+                Box::new({
+                    let called = called.clone();
+                    move |command| {
+                        called.set(true);
+                        let args: Vec<_> = std::iter::once(command.get_program())
+                            .chain(command.get_args())
+                            .map(|arg| arg.to_str().unwrap())
+                            .collect();
+                        assert!(args.ends_with(&[
+                            "/usr/bin/timeout",
+                            "--kill-after=5s",
+                            "40s",
+                            "/usr/bin/python3",
+                            "/usr/local/libexec/motor-boat-start.py",
+                            "--trim-storage",
+                        ]));
+                        Ok(std::process::Output {
+                            status: std::process::ExitStatus::from_raw(code << 8),
+                            stdout: Vec::new(),
+                            stderr: b"trim diagnostic".to_vec(),
+                        })
+                    }
+                }),
+                || {
+                    assert_eq!(trim_storage().is_ok(), code == 0);
+                    assert!(called.get());
+                },
+            );
+        }
+    }
+
     #[test]
     fn job_roots_include_reused_trees_and_all_private_writable_storage() {
         assert_eq!(
