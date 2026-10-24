@@ -2,7 +2,6 @@
 """Root-only Boat fleet host installation; private Cargo seed is tenant-1-only."""
 
 import argparse
-import base64
 import fcntl
 import hashlib
 import importlib.util
@@ -52,7 +51,7 @@ APT_OPTIONS = ['-o', 'Dir::Etc::sourcelist=/dev/null', '-o', 'Dir::Etc::sourcepa
                '-o', 'Dir::State::lists=' + str(APT_LISTS), '-o', 'Acquire::AllowInsecureRepositories=false',
                '-o', 'APT::Get::AllowUnauthenticated=false']
 RUNNER_INPUTS = (
-    'script/runner/tools.txt', 'script/runner/install-tools.sh',
+    'script/runner/tools.txt', 'script/runner/install-tools.sh', 'script/runner/install-npm-tool.py',
     'script/runner/job-account.py',
     'script/runner/units/system/motor-jobs.slice',
     'script/runner/sysctl/60-motor-inotify.conf',
@@ -469,6 +468,32 @@ def freeze_stable(manifest, toolchain, spec, host):
     run('cp', '-a', '--reflink=auto', str(root / numbered) + '/.', str(root / toolchain))
 
 
+def install_pnpm(manifest):
+    """Install pnpm from the release toolchain.json pins, as root's files under
+    umask 022, into the npm global layout beneath /usr/local.
+
+    `npm install --global` as root cannot give that: it creates its directories
+    with the caller's umask, and it makes a command's target executable with
+    chmod, a step no archive extraction repeats. Everything root runs from
+    /usr/local must be root's with no group or other write, and pnpm's commands
+    are exactly such targets. install-npm-tool.py unpacks the same registry
+    archive and writes the same npm bin links instead (see that script)."""
+    spec = manifest["tools"]["pnpm"]
+    source = spec["source"]
+    name = source["package"].split("@", 1)[0]
+    metadata = json.loads(urllib.request.urlopen(source["registry"] + source["package"], timeout=60).read())
+    algorithm, published = metadata["dist"]["integrity"].split("-", 1)
+    if algorithm != "sha512" or published != source["sha512"]:
+        raise ValueError("pnpm registry integrity differs from the manifest pin")
+    archive = BUILD / "downloads/pnpm.tgz"
+    urllib.request.urlretrieve(metadata["dist"]["tarball"], archive)
+    if digest(archive, "sha512") != source["sha512"]:
+        raise ValueError("pnpm integrity mismatch")
+    run("/usr/bin/python3", str(ROOT / "script/runner/install-npm-tool.py"),
+        "--prefix", "/usr/local", "--name", name, "--archive", str(archive),
+        "--sha512", source["sha512"], "--url", metadata["dist"]["tarball"])
+
+
 def install_rust(manifest, installer):
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
     # rustup replaces itself with the newest release during `toolchain install`
@@ -537,15 +562,7 @@ def tools(manifest, role="boat"):
     install_rust(manifest, path)
     node = published(f"https://nodejs.org/dist/v{pins['node']}/", f"node-v{pins['node']}-linux-x64.tar.xz")
     extract(node, "/usr/local", "-J", "--strip-components=1")
-    metadata = json.loads(urllib.request.urlopen(f"https://registry.npmjs.org/pnpm/{pins['pnpm']}", timeout=60).read())
-    algorithm, encoded = metadata["dist"]["integrity"].split("-", 1)
-    if algorithm != "sha512":
-        raise ValueError("pnpm registry integrity is not SHA-512")
-    pnpm = BUILD / "downloads/pnpm.tgz"
-    urllib.request.urlretrieve(metadata["dist"]["tarball"], pnpm)
-    if bytes.fromhex(digest(pnpm, "sha512")) != base64.b64decode(encoded, validate=True):
-        raise ValueError("pnpm integrity mismatch")
-    run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts", str(pnpm))
+    install_pnpm(manifest)
     bun = published(f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/", "bun-linux-x64.zip")
     run("unzip", "-qo", str(bun), "-d", str(BUILD / "downloads"))
     # The tenant image keeps Bun out of /home, which a tenant VM covers with the
